@@ -1,0 +1,4 @@
+{"id":"d1","body":"keep replies concise and terse","reinforced":3}
+{"id":"d2","body":"please reply in vietnamese","reinforced":3}
+{"id":"d3","body":"prefer pnpm over npm as my package manager","reinforced":4}
+{"id":"d4","body":"the backend is rust with tokio and axum","reinforced":4}

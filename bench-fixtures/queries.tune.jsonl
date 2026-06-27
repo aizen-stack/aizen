@@ -1,0 +1,18 @@
+{"id":"t1","query":"device code authentication","acceptable":["device-code-auth"],"intent":"qa"}
+{"id":"t2","query":"web cors port","acceptable":["web-port-3010"],"intent":"qa"}
+{"id":"t3","query":"nginx reverse proxy hmr websocket","acceptable":["nginx-proxy"],"intent":"qa"}
+{"id":"t4","query":"conventional commit scope","acceptable":["commit-style"],"intent":"qa"}
+{"id":"t5","query":"which javascript toolchain does the developer favor","acceptable":["pnpm-preference"],"intent":"qa","tags":["paraphrase"]}
+{"id":"t6","query":"keep replies short and in the local tongue","acceptable":["vietnamese-terse"],"intent":"qa","tags":["paraphrase"]}
+{"id":"t7","query":"token login button two factor","acceptable":["auth-strategy"],"intent":"qa"}
+{"id":"t8","query":"which namespaces hold the relational entities","acceptable":["router-schemas"],"intent":"qa","tags":["paraphrase"]}
+{"id":"t9","query":"bao giờ thì được phép phát hành phiên bản mới lên hệ thống","acceptable":["vn-deploy"],"intent":"qa","tags":["paraphrase","vn"]}
+{"id":"t10","query":"đồ uống ưa thích lúc sớm trong ngày là gì","acceptable":["vn-coffee"],"intent":"qa","tags":["paraphrase","vn"]}
+{"id":"t11","query":"lập trình viên dùng trình soạn thảo nào","acceptable":["vn-editor"],"intent":"qa","tags":["paraphrase","vn"]}
+{"id":"t12","query":"kho lưu trữ dữ liệu chính của dự án là gì","acceptable":["vn-db"],"intent":"qa","tags":["paraphrase","vn"]}
+{"id":"t13","query":"cần chạy kiểm thử lúc nào trước khi gộp nhánh","acceptable":["vn-test"],"intent":"qa","tags":["paraphrase","vn"]}
+{"id":"t14","query":"phía máy chủ được viết bằng ngôn ngữ nào","acceptable":["vn-lang"],"intent":"qa","tags":["paraphrase","vn"]}
+{"id":"t15","query":"ai phải duyệt thay đổi mã nguồn","acceptable":["vn-review"],"intent":"qa","tags":["paraphrase","vn"]}
+{"id":"t16","query":"có được lưu khóa bí mật trong mã nguồn không","acceptable":["vn-secret"],"intent":"qa","tags":["paraphrase","vn"]}
+{"id":"t17","query":"nhóm họp đồng bộ công việc vào lúc nào","acceptable":["vn-meeting"],"intent":"qa","tags":["paraphrase","vn"]}
+{"id":"t18","query":"dữ liệu được sao lưu vào thời điểm nào","acceptable":["vn-backup"],"intent":"qa","tags":["paraphrase","vn"]}

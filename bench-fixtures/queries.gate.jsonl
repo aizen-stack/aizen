@@ -1,0 +1,10 @@
+{"id":"g1","query":"how does login auth work","acceptable":["auth-strategy"],"intent":"qa"}
+{"id":"g2","query":"rate limit per api key","acceptable":["rate-limit-per-key"],"intent":"qa"}
+{"id":"g3","query":"prompt cache key hash","acceptable":["prompt-cache-invariant"],"intent":"qa"}
+{"id":"g4","query":"how to verify edits with typecheck","acceptable":["tsc-verify"],"intent":"agentic"}
+{"id":"g5","query":"combo virtual model billing","acceptable":["combo-routing"],"intent":"qa"}
+{"id":"g6","query":"valkey redis replacement","acceptable":["valkey-redis"],"intent":"qa"}
+{"id":"g7","query":"ef core migrations startup","acceptable":["migrations-ef"],"intent":"qa"}
+{"id":"g8","query":"do not edit dist build output","acceptable":["dont-edit-dist"],"intent":"agentic"}
+{"id":"g9","query":"admin console token env","acceptable":["admin-token"],"intent":"qa"}
+{"id":"g10","query":"postgres schemas split","acceptable":["router-schemas"],"intent":"qa"}

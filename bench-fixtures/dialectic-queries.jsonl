@@ -1,0 +1,7 @@
+{"id":"q-verbosity","query":"should my replies be terse or verbose?","kind":"profile","dim":"verbosity"}
+{"id":"q-tooling","query":"which package manager should I use?","kind":"profile","dim":"tooling"}
+{"id":"q-language-settled-over-cf","query":"would you reply in vietnamese?","kind":"profile","dim":"language"}
+{"id":"q-stack","query":"tell me about axum","kind":"profile","dim":"stack"}
+{"id":"q-counterfactual","query":"would you want me to rewrite the whole module in haskell?","kind":"abstain","reason":"counterfactual_novel"}
+{"id":"q-nomatch","query":"what is the airspeed velocity of an unladen swallow?","kind":"abstain","reason":"no_match"}
+{"id":"q-insufficient","query":"should I ask first or just proceed?","kind":"abstain","reason":"insufficient_evidence","dim":"autonomy"}

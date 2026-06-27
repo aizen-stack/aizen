@@ -1,0 +1,98 @@
+[package]
+name = "aizen"
+version = "0.1.0"
+edition = "2021"
+description = "Aizen first-party agentic coding CLI — OpenAI-compatible, hermes-style provider-agnostic API client"
+license = "MIT"
+
+# The product brand is Aizen → `aizen` is the command. `ng` stays as a short alias (same binary),
+# so existing muscle-memory / docs keep working. Both targets share `src/main.rs`.
+[[bin]]
+name = "aizen"
+path = "src/main.rs"
+
+[[bin]]
+name = "ng"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "process", "time", "signal", "sync", "net"] }
+# rustls-tls (pure-Rust TLS) so we don't need native OpenSSL on the Windows GNU toolchain
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+futures-util = "0.3"
+eventsource-stream = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+# Memory subsystem (all pure-Rust / static — preserves single-binary, rustls-only posture)
+regex = "1"
+once_cell = "1"
+# Fuzzy near-match bridge for the BM25 lexical floor (P6.5/P7): Jaro-Winkler over tokens to
+# catch typos / morphology the diacritic fix doesn't cover. Pure-Rust, zero deps, tiny —
+# single static binary preserved.
+strsim = "0.11"
+# NFC Unicode normalization for the tokenizer (Vietnamese diacritics, P6). ALREADY in the
+# dependency tree via url→idna→idna_adapter with `compiled_data` (icu_normalizer_data is
+# linked), so declaring it as a direct dep is ZERO marginal binary cost and keeps the
+# pure-Rust single static binary (objdump-clean). Verified vs Cargo.lock 2026-06-25.
+icu_normalizer = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Interactive landing menu (`ng` with no args): arrow-key select + colors + hidden key entry.
+# Pure-Rust (console → windows-sys on Windows), keeps the single static binary. `password`
+# adds the hidden API-key prompt; default features dropped to stay lean.
+dialoguer = { version = "0.11", default-features = false, features = ["password"] }
+# Colored banner output (dialoguer's companion; already in the tree → no extra binary cost).
+# Enables Windows VT + honors NO_COLOR / non-TTY automatically.
+console = "0.15"
+# URL parsing/joining for the katana-style crawler (resolve relative links, host/scope checks).
+# Pure-Rust, no native deps → single static binary preserved.
+url = "2"
+# First-party content search (`search_files`): ripgrep's OWN directory-walk crate — respects
+# .gitignore, skips hidden dirs, has a built-in glob override (globset, pulled transitively). Paired
+# with the `regex` crate already in the tree for line matching. This is the exact pure-Rust walker rg
+# is built on — no C/C++ → single static binary preserved. Removes the "rg must be on PATH" footgun.
+ignore = "0.4"
+# MCP remote-app OAuth 2.1 (PKCE S256) — lets `ng apps` sign into Linear/Notion/Slack/Gmail/Atlassian
+# the way Hermes does (the apps people actually want, all OAuth-only). `ring` (SHA-256 for the PKCE
+# challenge + a CSPRNG) and `getrandom` are BOTH already in the dependency tree via reqwest→rustls
+# (verified vs Cargo.lock 2026-06-27), so declaring them direct is ZERO marginal binary cost and adds
+# NO new C toolchain requirement (rustls already links ring). base64url is hand-rolled (no dep). The
+# loopback redirect catcher uses tokio's `net` feature (added above) — still one pure-Rust static binary.
+ring = "0.17"
+getrandom = "0.2"
+
+# Dense semantic tier (P5) — OPT-IN only. The default build stays pure-Rust (lexical floor).
+# `fancy-regex` (not the default `onig`) keeps the regex backend pure-Rust; `local-only`
+# drops hf-hub/TLS so models load from a local dir we manage. NOTE: `tokenizers` still pulls
+# `esaxx-rs` (C++), so `--features dense` needs a C/C++ toolchain at build time.
+model2vec-rs = { version = "0.2", optional = true, default-features = false, features = ["fancy-regex", "local-only"] }
+
+# WebSocket client — used by (a) the Discord two-way bot gateway (`wss://`, needs TLS) and (b) the
+# opt-in CDP browser tools (`ws://localhost`, no TLS). `rustls-tls-webpki-roots` reuses the
+# `tokio-rustls`/`rustls`/`webpki-roots` already pulled by reqwest (verified in Cargo.lock) → ZERO
+# new crates, ZERO `*-sys`/openssl, NO C toolchain. Pure-Rust single static binary preserved. We
+# NEVER bundle a browser engine (servo/CEF = C++) and NEVER use a Discord SDK (serenity = heavy dep).
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+
+[features]
+# Enable the model2vec semantic embedder. Build: `cargo build --features dense`.
+dense = ["dep:model2vec-rs"]
+# Enable the CDP browser tools (browser_navigate/snapshot/click/type/eval). Build: `cargo build --features browser`.
+# (`tokio-tungstenite` is now a base dep — the Discord bot needs it — so this just gates the tools.)
+browser = []
+
+[profile.release]
+strip = true
+lto = "thin"
+
+# Image (vision) input — encode a pasted clipboard image into a data URL for OpenAI-compatible
+# vision models (paste a screenshot straight into the chat box with Ctrl-V). Clipboard access is
+# DESKTOP-ONLY: `arboard` needs X11/Wayland libraries on Linux at runtime, which would break the
+# headless single static binary that `ng serve` ships as — so the clipboard path (arboard + a
+# pure-Rust PNG encode of the raw RGBA pixels) is target-gated to Windows/macOS. Both crates are
+# pure-Rust there (clipboard-win links only system DLLs), so the single-static-binary posture holds
+# (objdump-verified). Linux/headless builds pull neither.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+png = "0.17"

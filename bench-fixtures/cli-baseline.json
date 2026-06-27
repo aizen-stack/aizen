@@ -1,0 +1,9 @@
+{
+  "query_count": 10,
+  "recall_at_5": 1.0,
+  "recall_at_10": 1.0,
+  "mrr": 1.0,
+  "precision_at_5": 0.5033333333333333,
+  "ndcg_at_5": 1.0,
+  "noise_rate": 0.4966666666666667
+}

@@ -1,0 +1,8 @@
+{"id":"verbosity-terse","facts":[{"body":"keep replies concise and terse","reinforced":3},{"body":"be brief and to the point","source":"user_explicit"}],"dim":"verbosity","kind":"scalar","label":"terse","min_confidence":0.3}
+{"id":"language-vietnamese","facts":[{"body":"please reply in vietnamese","reinforced":2}],"dim":"language","kind":"choice","value":"vietnamese"}
+{"id":"tooling-pnpm-over-npm","facts":[{"body":"prefer pnpm over npm","reinforced":2}],"dim":"tooling","kind":"ranked","contains":["pnpm"],"excludes":["npm"]}
+{"id":"tooling-avoid-yarn","facts":[{"body":"I prefer pnpm as my package manager","reinforced":4},{"body":"avoid yarn in this repo","source":"user_explicit"}],"dim":"tooling","kind":"ranked","contains":["pnpm"],"excludes":["yarn"]}
+{"id":"stack-rust-tokio-axum","facts":[{"body":"the backend is rust with tokio and axum"}],"dim":"stack","kind":"ranked","contains":["rust"]}
+{"id":"frustrations-force-push","facts":[{"body":"never force-push to main","source":"user_explicit","reinforced":2}],"dim":"frustrations","kind":"ranked"}
+{"id":"autonomy-asks-first","facts":[{"body":"ask first before you commit anything","source":"user_explicit","reinforced":2}],"dim":"autonomy","kind":"scalar","label":"asks first"}
+{"id":"verbosity-insufficient-no-signal","facts":[{"body":"the deployment window is on friday"}],"dim":"verbosity","kind":"insufficient"}

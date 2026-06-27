@@ -1,0 +1,23 @@
+{
+  "name": "review-changes",
+  "tasks": [
+    {
+      "id": "correctness",
+      "role": "reviewer",
+      "prompt": "Review the Rust code under src/ for correctness bugs (logic errors, panics, unwrap on None, off-by-one, race conditions). Report each as file:line + one sentence. If none, say so."
+    },
+    {
+      "id": "security",
+      "role": "reviewer",
+      "prompt": "Review the code under src/ for security issues (path traversal, command injection, unvalidated input, secret leakage). Report each as file:line + one sentence. If none, say so."
+    },
+    {
+      "id": "tests",
+      "role": "tester",
+      "prompt": "Run `cargo test` and report the pass/fail counts and any failing test names. Do not edit anything."
+    }
+  ],
+  "synthesis": {
+    "prompt": "Merge the review findings and test results into one prioritized list (highest severity first). Deduplicate, and note which task surfaced each item. End with a one-line go/no-go verdict."
+  }
+}

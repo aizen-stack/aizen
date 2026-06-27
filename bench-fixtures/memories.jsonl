@@ -1,0 +1,26 @@
+{"id":"auth-strategy","name":"auth-strategy","description":"single browser-redirect login, 7-day session","type":"reference","body":"Auth = one browser-redirect login button, 7-day session, no embedded API key UI."}
+{"id":"pnpm-preference","name":"pnpm-preference","description":"prefers pnpm over npm","type":"user","body":"User prefers pnpm over npm; uses vitest as the test runner."}
+{"id":"combo-routing","name":"combo-routing","description":"opaque virtual-model combo routing","type":"project","body":"Combo = virtual ModelCatalog entry; bill combo price; hide the real upstream model from users."}
+{"id":"prompt-cache-invariant","name":"prompt-cache-invariant","description":"prompt_hash folds model and tools","type":"reference","body":"Prompt cache keyed by prompt_hash folding model, tools, response_format, seed; compression runs before hashing."}
+{"id":"rate-limit-per-key","name":"rate-limit-per-key","description":"per upstream key sliding window","type":"reference","body":"Rate limit is per upstream API key via Valkey sliding-window Lua ZSET, default 15 RPM."}
+{"id":"device-code-auth","name":"device-code-auth","description":"RFC 8628 device code deferred","type":"project","body":"Backend device-code RFC-8628 authentication endpoint not built yet; CLI uses paste-JWT stopgap for now."}
+{"id":"tsc-verify","name":"tsc-verify","description":"verify with typecheck not full suite","type":"feedback","body":"Verify edits with npx tsc --noEmit typecheck, not the full test suite which is slow and flaky here."}
+{"id":"vietnamese-terse","name":"vietnamese-terse","description":"communicates in Vietnamese, terse","type":"user","body":"User communicates in Vietnamese; wants terse, code-first answers with minimal preamble."}
+{"id":"migrations-ef","name":"migrations-ef","description":"EF Core migrations at startup","type":"reference","body":"EF Core migrations applied at API startup via MigrateAsync; design-time factory reads ConnectionStrings Postgres."}
+{"id":"valkey-redis","name":"valkey-redis","description":"Valkey 8 drop-in for Redis","type":"reference","body":"Cache and queue is Valkey 8, a RESP-compatible Redis replacement; config key ConnectionStrings Redis unchanged."}
+{"id":"dont-edit-dist","name":"dont-edit-dist","description":"never edit generated dist files","type":"feedback","body":"AVOID editing files under dist; they are build output and edits get clobbered. Edit source and regenerate."}
+{"id":"web-port-3010","name":"web-port-3010","description":"web dev runs on port 3010 CORS","type":"project","body":"Web dev server runs on port 3010; it must be in the API CORS allowlist or the browser blocks login."}
+{"id":"admin-token","name":"admin-token","description":"admin console needs NEXTGEN_ADMIN_TOKEN","type":"reference","body":"Admin console plane is dark until NEXTGEN_ADMIN_TOKEN is set in env and apps admin env local."}
+{"id":"commit-style","name":"commit-style","description":"conventional commits, scoped","type":"user","body":"Commit messages use conventional commits with a scope, for example feat combo redesign."}
+{"id":"nginx-proxy","name":"nginx-proxy","description":"nginx port 80 proxies to host web dev","type":"reference","body":"nginx at port 80 proxies the site to the host web dev server host docker internal 3000 including the HMR websocket."}
+{"id":"router-schemas","name":"router-schemas","description":"seven postgres schemas split","type":"reference","body":"Both EF contexts tables live in seven Postgres schemas: identity billing providers catalog usage relay ops."}
+{"id":"vn-deploy","name":"lich-trien-khai","description":"chỉ triển khai thứ sáu","type":"project","body":"Chỉ triển khai sản phẩm vào thứ sáu hàng tuần; tránh đẩy bản cập nhật vào cuối tuần."}
+{"id":"vn-coffee","name":"thoi-quen-ca-phe","description":"cà phê đen buổi sáng","type":"user","body":"Người dùng thường uống cà phê đen không đường mỗi sáng trước khi bắt đầu công việc."}
+{"id":"vn-editor","name":"trinh-soan-thao","description":"dùng Neovim để lập trình","type":"user","body":"Người dùng dùng trình soạn thảo Neovim cho mọi công việc lập trình hằng ngày."}
+{"id":"vn-db","name":"co-so-du-lieu","description":"PostgreSQL là kho lưu trữ chính","type":"project","body":"Dự án dùng cơ sở dữ liệu PostgreSQL làm kho lưu trữ dữ liệu chính."}
+{"id":"vn-test","name":"kiem-thu","description":"chạy kiểm thử trước khi gộp","type":"feedback","body":"Luôn chạy kiểm thử đầy đủ trước khi gộp nhánh vào nhánh chính."}
+{"id":"vn-lang","name":"ngon-ngu-may-chu","description":"máy chủ viết bằng Rust","type":"project","body":"Toàn bộ phần xử lý phía máy chủ được viết bằng ngôn ngữ Rust."}
+{"id":"vn-review","name":"duyet-ma-nguon","description":"mã nguồn phải được duyệt","type":"feedback","body":"Mọi thay đổi mã nguồn phải được một người khác duyệt trước khi nhập vào nhánh chính."}
+{"id":"vn-secret","name":"bao-mat-khoa","description":"không lưu khóa bí mật trong mã","type":"feedback","body":"Tuyệt đối không lưu khóa bí mật hay mật khẩu trực tiếp trong mã nguồn."}
+{"id":"vn-meeting","name":"hop-nhom","description":"họp nhóm sáng thứ hai","type":"project","body":"Nhóm họp ngắn mỗi sáng thứ hai để đồng bộ công việc trong tuần."}
+{"id":"vn-backup","name":"sao-luu","description":"sao lưu dữ liệu mỗi đêm","type":"project","body":"Hệ thống tự động sao lưu dữ liệu mỗi đêm lúc nửa đêm."}
