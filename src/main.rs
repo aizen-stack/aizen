@@ -3109,6 +3109,7 @@ async fn run_menu_sticky() -> Result<()> {
                 let cfg = AgentConfig {
                     auto_approve: yolo_enabled(),
                     smart_approve: smart_approve_enabled(),
+                    context_window: resolve_ctx_window(&model).0,
                     ..AgentConfig::default()
                 };
 
@@ -3131,7 +3132,13 @@ async fn run_menu_sticky() -> Result<()> {
                     let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
                         client::stream_chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
                     };
-                    let fut = agent::run_agent_loop(chat, &cfg, &registry, &mut history);
+                    // Non-streaming summarizer for mid-loop auto-compaction (keeps the streamed display clean).
+                    let summarize = move |msgs: Vec<Message>| async move {
+                        client::chat_with_tools(http_ref, base, key, model_ref, &msgs, &[])
+                            .await
+                            .map(|t| t.content.unwrap_or_default())
+                    };
+                    let fut = agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, &mut history);
                     tokio::select! {
                         r = fut => Some(r),
                         // Match only a REAL signal: if the keyboard thread exits (read_key error/EOF)
@@ -3316,7 +3323,12 @@ async fn run_menu_plain() -> Result<()> {
         let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
             client::stream_chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
         };
-        match agent::run_agent_loop(chat, &cfg, &registry, &mut history).await {
+        let summarize = move |msgs: Vec<Message>| async move {
+            client::chat_with_tools(http_ref, base, key, model_ref, &msgs, &[])
+                .await
+                .map(|t| t.content.unwrap_or_default())
+        };
+        match agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, &mut history).await {
             // `clarify` paused the turn — show the question, loop back for the answer (the next
             // typed message continues this conversation). No post-turn learning: not done yet.
             Ok(AgentOutcome { stop: StopReason::AwaitingInput(q), .. }) => {
