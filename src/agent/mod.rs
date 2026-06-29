@@ -161,6 +161,11 @@ pub struct AgentConfig {
     /// summarized in place. `0` disables compaction (the loop falls back to the one-shot wrap-up
     /// nudge). Requires `context_window > 0`.
     pub compact_at_pct: u8,
+    /// Max gate-triggered fix rounds in the verify/repair loop: after an editing run, a failing
+    /// typecheck injects the errors and loops back for a fix, up to this many times (then the model
+    /// is allowed to finish). `1` = the old one-shot behavior; `0` disables looping entirely (the
+    /// gate still needs `enable_verify_gate`). Only re-fires after the model makes NEW edits.
+    pub max_verify_attempts: usize,
 }
 
 impl Default for AgentConfig {
@@ -178,6 +183,7 @@ impl Default for AgentConfig {
             keep_recent_tool_results: 8,
             clear_tool_result_min_chars: 1024,
             compact_at_pct: 80,
+            max_verify_attempts: 2,
         }
     }
 }
@@ -288,7 +294,7 @@ where
     let mut extended = false;
     let mut last_sig: Option<String> = None;
     let mut recovery_used = false;
-    let mut verify_nudged = false;
+    let mut verify_attempts = 0usize;
     let mut made_edits = false;
     let mut context_warned = false;
     let mut iter = 0usize;
@@ -387,11 +393,14 @@ where
         // CLASSIFY: the structured tool_calls array is the source of truth (a gateway may
         // emit finish_reason="stop"/"end_turn" alongside tool calls — ignore it here).
         if turn.tool_calls.is_empty() {
-            // VERIFY GATE (F2): after an editing run, run a fast typecheck once before Done.
-            // On failure, record the premature "done", inject the errors, and grant one fix
-            // turn. Best-effort: an unknown project / missing toolchain → no-op.
-            if cfg.enable_verify_gate && made_edits && !verify_nudged {
-                verify_nudged = true;
+            // VERIFY/REPAIR GATE (F2): after an editing run, run a fast typecheck before Done. On
+            // failure, record the premature "done", inject the errors, and loop back for a fix — up
+            // to `max_verify_attempts` rounds (a bounded repair loop, not one-shot). `made_edits` is
+            // consumed here so the gate re-fires only after the model makes NEW edits; a model that
+            // re-asserts "done" without editing is allowed to finish. Best-effort: an unknown
+            // project / missing toolchain → no-op.
+            if cfg.enable_verify_gate && made_edits && verify_attempts < cfg.max_verify_attempts {
+                made_edits = false; // consume — re-arm only on fresh edits next round
                 // Canonicalize to match the tool-registry root (`builtin::resolve_root`), so the
                 // gate typechecks the same tree the file tools were confined to.
                 let cwd = std::env::current_dir()
@@ -402,9 +411,11 @@ where
                 {
                     if !cfg.quiet {
                         let line = format!(
-                            "→ verify: {} {}",
+                            "→ verify: {} {} (attempt {}/{})",
                             result.command,
-                            if result.passed { "passed" } else { "FAILED" }
+                            if result.passed { "passed" } else { "FAILED" },
+                            verify_attempts + 1,
+                            cfg.max_verify_attempts,
                         );
                         if crate::ui::tui::active() {
                             crate::ui::tui::emit_line(&line);
@@ -413,6 +424,7 @@ where
                         }
                     }
                     if !result.passed {
+                        verify_attempts += 1;
                         // Record the premature "done" before the user gate-failure message.
                         // Normalize content to "" (never null): an assistant turn with neither
                         // content nor tool_calls is malformed (400) on strict gateways.
@@ -1034,6 +1046,7 @@ mod tests {
             keep_recent_tool_results: 8,
             clear_tool_result_min_chars: 1024,
             compact_at_pct: 80,
+            max_verify_attempts: 2,
         }
     }
 
