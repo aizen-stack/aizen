@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::cli_config::{self, DiscordConfig};
+use crate::core::cli_config::{self, DiscordConfig};
 
 const API_BASE: &str = "https://discord.com/api/v10";
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -124,14 +124,41 @@ pub struct Incoming {
     pub content: String,
 }
 
-/// Connect + run the gateway receive loop forever, forwarding allowed messages to `tx`. Reconnects
-/// with a short backoff on any drop/error (a fresh IDENTIFY each time — RESUME is a later refinement).
+/// A permanent gateway close (bad token / a required intent not enabled). Reconnecting on these just
+/// re-IDENTIFYs every few seconds, which Discord rate-limits and will eventually ban the token for —
+/// so `run_gateway` gives up instead of looping. Carried as an `anyhow` cause and downcast below.
+#[derive(Debug)]
+struct FatalClose(String);
+impl std::fmt::Display for FatalClose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for FatalClose {}
+
+/// Connect + run the gateway receive loop, forwarding allowed messages to `tx`. Reconnects with
+/// EXPONENTIAL backoff (1s→60s, reset after a healthy session) on transient drops, but STOPS on a
+/// permanent close (bad token / missing intent) so we never IDENTIFY-storm Discord into a ban.
 pub async fn run_gateway(token: String, cfg: DiscordConfig, tx: mpsc::Sender<Incoming>) {
+    let mut backoff = 1u64;
     loop {
+        let start = tokio::time::Instant::now();
         if let Err(e) = gateway_once(&token, &cfg, &tx).await {
             eprintln!("[discord gateway] {e}");
+            if e.downcast_ref::<FatalClose>().is_some() {
+                eprintln!("[discord gateway] permanent failure — not reconnecting (fix the token / enable the intent, then restart).");
+                return;
+            }
+            // A session that stayed up a while was healthy → reconnect promptly; a fast-flapping link
+            // backs off so we don't hammer IDENTIFY.
+            if start.elapsed() >= Duration::from_secs(60) {
+                backoff = 1;
+            }
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(60);
+        } else {
+            backoff = 1;
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -191,7 +218,17 @@ async fn gateway_once(token: &str, cfg: &DiscordConfig, tx: &mpsc::Sender<Incomi
                 let text = match frame {
                     WsMessage::Text(t) => t.as_str().to_string(),
                     WsMessage::Ping(p) => { ws.send(WsMessage::Pong(p)).await.ok(); continue; }
-                    WsMessage::Close(_) => bail!("gateway sent Close (check the bot token + that MESSAGE_CONTENT intent is enabled)"),
+                    WsMessage::Close(frame) => {
+                        let code = frame.as_ref().map(|f| u16::from(f.code));
+                        // 4004 auth failed · 4010-4013 bad shard/intents/version · 4014 disallowed
+                        // (privileged) intent — all permanent; reconnecting would IDENTIFY-storm.
+                        if matches!(code, Some(4004 | 4010 | 4011 | 4012 | 4013 | 4014)) {
+                            return Err(anyhow::Error::new(FatalClose(format!(
+                                "gateway closed with permanent code {code:?} — bad token or a required intent (e.g. MESSAGE_CONTENT) is not enabled in the Developer Portal"
+                            ))));
+                        }
+                        bail!("gateway sent Close (code {code:?}) — reconnecting");
+                    }
                     _ => continue,
                 };
                 let v: Value = match serde_json::from_str(&text) { Ok(v) => v, Err(_) => continue };

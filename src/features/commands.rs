@@ -52,11 +52,11 @@ pub struct CustomCommand {
 
 /// `~/.nextgen/commands/`.
 fn global_dir() -> PathBuf {
-    crate::config::nextgen_home().join("commands")
+    crate::core::config::nextgen_home().join("commands")
 }
 /// `<repo-root>/.nextgen/commands/` — repo-root-aware (R4), so it loads even from a subdir.
 fn project_dir() -> PathBuf {
-    crate::config::project_nextgen_dir().join("commands")
+    crate::core::config::project_nextgen_dir().join("commands")
 }
 
 /// All custom commands, project entries overriding global ones of the same name. Sorted by name.

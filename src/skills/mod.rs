@@ -22,7 +22,9 @@
 //! pulls the full body on demand via the `skill_load` tool, and may persist a new one via
 //! `skill_save`. Same anti-bloat posture as memory: the prompt carries only the index, not bodies.
 
-use crate::config::nextgen_home;
+pub mod registry;
+
+use crate::core::config::nextgen_home;
 use crate::memory::frontmatter;
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
@@ -62,7 +64,7 @@ pub fn skills_dir() -> PathBuf {
 /// `<repo-root>/.nextgen/skills/` — skills a cloned repo ships, merged OVER the HOME ones (project
 /// wins on a same-name collision). Repo-root-aware (R4).
 pub fn project_skills_dir() -> PathBuf {
-    crate::config::project_nextgen_dir().join("skills")
+    crate::core::config::project_nextgen_dir().join("skills")
 }
 
 /// File-safe slug for a skill name (lowercase alnum + `-`/`_`; collapses the rest to `-`).
@@ -264,7 +266,7 @@ mod tests {
     use super::*;
 
     fn with_home<T>(tag: &str, f: impl FnOnce() -> T) -> T {
-        let _g = crate::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-skill-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("NEXTGEN_HOME", &dir);

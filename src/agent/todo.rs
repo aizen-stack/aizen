@@ -71,16 +71,19 @@ pub fn render_block(items: &[Todo]) -> String {
         return String::new();
     }
     let mut out = String::new();
-    out.push_str(&style("todos:").color256(crate::splash::ACCENT).to_string());
+    out.push_str(&style("todos:").color256(crate::ui::splash::ACCENT).to_string());
     out.push('\n');
     for t in items {
         let g = glyph(t.status);
         let line = match t.status {
-            Status::Done => style(format!(" {g} {}", t.content)).dim().strikethrough().to_string(),
-            Status::InProgress => {
-                format!(" {} {}", style(g).color256(crate::splash::ACCENT).bold(), style(&t.content).bold())
+            // Design: green ✓ + struck, muted text · moonlight ▸ + bright active row · faint ○ + muted.
+            Status::Done => {
+                format!(" {} {}", crate::ui::theme::ok(g), style(&t.content).dim().strikethrough())
             }
-            Status::Pending => format!(" {g} {}", t.content),
+            Status::InProgress => {
+                format!(" {} {}", style(g).color256(crate::ui::splash::ACCENT).bold(), style(&t.content).bold())
+            }
+            Status::Pending => format!(" {} {}", crate::ui::theme::faint(g), crate::ui::theme::muted(&t.content)),
         };
         out.push_str(&line);
         out.push('\n');
@@ -148,8 +151,8 @@ impl Tool for TodoWrite {
         // Show the checklist to the USER (scroll region above the pinned box, or stderr).
         let block = render_block(&items);
         if !block.is_empty() {
-            if crate::tui::active() {
-                crate::tui::emit_line(&block);
+            if crate::ui::tui::active() {
+                crate::ui::tui::emit_line(&block);
             } else {
                 eprintln!("{block}");
             }

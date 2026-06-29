@@ -16,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Default cap on retained checkpoints (config `timemachine_keep`; `Some(0)` = unlimited). Beyond
 /// this, the OLDEST checkpoints are auto-pruned on each save so the timeline can't grow without
@@ -93,10 +94,16 @@ fn save_ledger(root: &Path, l: &Ledger) -> Result<()> {
     std::fs::write(&p, serde_json::to_string_pretty(l)? + "\n").with_context(|| format!("writing {}", p.display()))
 }
 
-/// A unique temp index path inside the git dir (cleaned up after use).
+/// Monotonic counter so two `current_tree` calls in the same process never share one temp index.
+static TM_INDEX_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A unique temp index path inside the git dir (cleaned up after use). Keyed by PID **and** a
+/// per-call counter: a bare-PID name let two concurrent `current_tree` callers share one index file
+/// and race each other's `add -A` / `write-tree` (the confirmed checkpoint-corruption path).
 fn temp_index(root: &Path) -> Result<PathBuf> {
     let git_dir = git_at(root, None, &["rev-parse", "--git-dir"])?;
-    Ok(root.join(git_dir).join(format!("ng_tm_index_{}", std::process::id())))
+    let seq = TM_INDEX_SEQ.fetch_add(1, Ordering::Relaxed);
+    Ok(root.join(git_dir).join(format!("ng_tm_index_{}_{seq}", std::process::id())))
 }
 
 /// The tree sha for the CURRENT working tree (everything `add -A` would stage). Uses a temp index so
@@ -104,10 +111,16 @@ fn temp_index(root: &Path) -> Result<PathBuf> {
 fn current_tree(root: &Path) -> Result<String> {
     let idx = temp_index(root)?;
     let _ = std::fs::remove_file(&idx);
-    git_at(root, Some(&idx), &["add", "-A"])?;
-    let tree = git_at(root, Some(&idx), &["write-tree"]);
+    // Run add+write-tree, then remove the temp index on EVERY exit path. Previously an `add -A`
+    // failure returned early via `?` and leaked the index file — and since each call now uses a
+    // unique name, repeated failures would accumulate distinct orphan files in .git/ instead of
+    // overwriting one.
+    let result = (|| {
+        git_at(root, Some(&idx), &["add", "-A"])?;
+        git_at(root, Some(&idx), &["write-tree"])
+    })();
     let _ = std::fs::remove_file(&idx);
-    tree
+    result
 }
 
 // ── public API ──────────────────────────────────────────────────────────────────
@@ -157,7 +170,7 @@ fn save_in(root: &Path, label: &str, auto: bool) -> Result<Snapshot> {
     ledger.snapshots.push(snap.clone());
     ledger.cursor = Some(ledger.snapshots.len() - 1);
     // Cap the timeline so heavy checkpointing can't fill the repo.
-    let keep = crate::cli_config::load().timemachine_keep.unwrap_or(DEFAULT_KEEP);
+    let keep = crate::core::cli_config::load().timemachine_keep.unwrap_or(DEFAULT_KEEP);
     enforce_retention(root, &mut ledger, keep);
     save_ledger(root, &ledger)?;
     Ok(snap)
@@ -230,7 +243,7 @@ fn restore_in(root: &Path, id: u32) -> Result<Snapshot> {
         .iter()
         .find(|s| s.id == id)
         .cloned()
-        .with_context(|| format!("no checkpoint #{id} (see `ng time list`)"))?;
+        .with_context(|| format!("no checkpoint #{id} (see `aizen time list`)"))?;
 
     // Safety: if the working tree differs from every saved snapshot, capture it first so nothing is
     // lost — then you can come back to "now" via the timeline.
@@ -260,7 +273,7 @@ pub fn undo() -> Result<Snapshot> {
     let root = repo_root()?;
     let ledger = load_ledger(root.as_path());
     if ledger.snapshots.is_empty() {
-        bail!("no checkpoints yet — save one with `ng time save`");
+        bail!("no checkpoints yet — save one with `aizen time save`");
     }
     let cur = ledger.cursor.unwrap_or(ledger.snapshots.len() - 1);
     if cur == 0 {
@@ -314,13 +327,19 @@ impl crate::agent::tools::Tool for Checkpoint {
             "additionalProperties": false
         })
     }
+    // NOT concurrency-safe: `save` mutates shared repo state (allocates a monotonic snapshot id,
+    // `git update-ref refs/ng/tm/<id>`, and a read-modify-write of the ledger). Two parallel
+    // checkpoint calls would clobber each other's ref / drop a snapshot, so force the serial path.
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
     fn execute(&self, args: &serde_json::Value) -> Result<String> {
         if !is_repo() {
             return Ok("error: not a git repository — checkpoints need git (run `git init`)".to_string());
         }
         let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("").trim();
         let snap = save(label, false)?;
-        Ok(format!("checkpoint #{} saved ({}). Restore later with `ng time restore {}`.", snap.id, if snap.label.is_empty() { "no label" } else { &snap.label }, snap.id))
+        Ok(format!("checkpoint #{} saved ({}). Restore later with `aizen time restore {}`.", snap.id, if snap.label.is_empty() { "no label" } else { &snap.label }, snap.id))
     }
 }
 

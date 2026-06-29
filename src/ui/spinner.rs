@@ -27,7 +27,7 @@ impl Spinner {
         }
         let label = label.to_string();
         let flag = stop.clone();
-        let accent = crate::splash::ACCENT;
+        let accent = crate::ui::splash::ACCENT;
         let handle = std::thread::spawn(move || {
             let term = Term::stdout();
             let mut i = 0usize;

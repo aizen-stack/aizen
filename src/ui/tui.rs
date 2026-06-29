@@ -2,9 +2,9 @@
 //! of the terminal that stays visible even while the agent is working, with three properties the
 //! plain line-REPL can't give:
 //!
-//! 1. **Pinned input box** — an ANSI scroll region (`ESC[{top};{bot}r`) reserves the bottom rows for
-//!    the box; all agent output scrolls in the region *above* it, so the box never scrolls away and
-//!    empty boxes never stack up.
+//! 1. **Pinned borderless prompt** — an ANSI scroll region (`ESC[{top};{bot}r`) reserves the bottom
+//!    rows for a borderless footer (a faint rule · the HUD · the moonlit `❯` prompt); all agent output
+//!    scrolls in the region *above* it, so the prompt never scrolls away and never stacks up.
 //! 2. **Continuous chat** — a background thread owns the keyboard and pushes each submitted line onto
 //!    an unbounded queue. You can keep typing (and queue messages) while the agent runs; the REPL
 //!    drains the queue and auto-fires the next one when the current turn finishes.
@@ -17,8 +17,8 @@
 //! When the TUI isn't active (the one-shot `ng chat`/`agent` subcommands, pipes, CI) every entry
 //! point degrades to a plain `print!` so nothing changes for non-interactive use.
 
-use crate::splash::ACCENT;
-use crate::theme;
+use crate::ui::splash::ACCENT;
+use crate::ui::theme;
 use console::{measure_text_width, style, Key, Term};
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
@@ -28,7 +28,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-/// Footer height in rows: status line + top border + input line + bottom border.
+/// Footer height in rows: faint rule + HUD status line + blank breather + the `❯` prompt line.
 const FOOTER: u16 = 4;
 
 /// Max rows the live slash palette draws above the input box.
@@ -64,7 +64,7 @@ pub const SLASH: &[(&str, &str)] = &[
     ("cost", "session token cost"),
     ("tokens", "context token status"),
     ("clear", "new conversation"),
-    ("quit", "exit ng"),
+    ("quit", "exit aizen"),
 ];
 
 /// Rows the palette painted last time — so a shrinking/closing palette clears its stale lines.
@@ -91,9 +91,32 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// cancel when working, quit when idle) AND by `paint_box` (the box's working indicator).
 static WORKING: AtomicBool = AtomicBool::new(false);
 
+/// Cooperative cancel flag, set by the input thread on Esc/Ctrl-C while the agent is working.
+///
+/// The REPL races the turn future against `cancel.recv()` in a `select!`, but `select!` can only
+/// observe the cancel when the future YIELDS (returns Pending). While a synchronous tool runs — a
+/// `shell_run` busy-wait of up to 120s, a parallel read batch — the future never yields, so Esc was
+/// silently ignored until the tool finished. This flag bridges that gap: the input thread sets it
+/// immediately, the synchronous tool path (the shell poll loop) polls it and aborts the child, and
+/// the agent loop yields once it's set so the `select!` can finally drop the turn.
+static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Request cancellation of the in-flight turn (called by the input thread on Esc while working).
+pub fn request_cancel() {
+    CANCEL_REQUESTED.store(true, Ordering::Relaxed);
+}
+/// Whether a cancel has been requested — polled by the synchronous tool path + the agent loop.
+pub fn cancel_requested() -> bool {
+    CANCEL_REQUESTED.load(Ordering::Relaxed)
+}
+/// Clear the cancel flag (called by the REPL at each turn boundary so a stale Esc can't kill the next).
+pub fn clear_cancel() {
+    CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+}
+
 /// Braille frames for the animated working indicator (a lone background thread advances this while
 /// `WORKING`, so the spinner spins even when no token is streaming — e.g. before the first byte or
-/// during a long tool call). Gold, drawn by [`paint_box`].
+/// during a long tool call). Moonlight silver, drawn by [`paint_box`].
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Current spinner frame index (advanced by the ticker thread; read by `paint_box`).
 static WORK_FRAME: AtomicUsize = AtomicUsize::new(0);
@@ -323,6 +346,23 @@ fn truncate_to_width(s: &str, max: usize) -> String {
     out
 }
 
+/// Style the HUD string: the whole line is muted, but the mode chip pops so the active approval mode
+/// reads at a glance (the one spot of colour in an otherwise quiet status line). Per the design,
+/// `⚡ yolo` burns warm **gold** (the reserved warm accent) while `◆ smart` stays calm **moonlight** —
+/// the colour itself signals "this mode runs hot" vs "this mode is careful". Operates on the
+/// already-truncated PLAIN string, so it never splits an ANSI escape.
+fn style_hud(s: &str) -> String {
+    if let Some(i) = s.find('⚡') {
+        let (head, tail) = s.split_at(i);
+        return format!("{}{}", theme::muted(head), theme::warn(tail)); // yolo → gold
+    }
+    if let Some(i) = s.find('◆') {
+        let (head, tail) = s.split_at(i);
+        return format!("{}{}", theme::muted(head), theme::accent(tail)); // smart → moonlight
+    }
+    theme::muted(s).to_string()
+}
+
 // ── ANSI helpers (written into a String, flushed under the lock) ──────────────────────────────
 fn set_region(buf: &mut String, top: u16, bot: u16) {
     buf.push_str(&format!("\x1b[{top};{bot}r"));
@@ -378,7 +418,7 @@ fn paint_palette(buf: &mut String, r: &Render, top_row: u16, w: usize) {
         goto(buf, top_row - 1 - i as u16, 1);
         clear_line(buf);
         let is_sel = mi == sel;
-        let icon = crate::icons::g(crate::icons::slash(name));
+        let icon = crate::ui::icons::g(crate::ui::icons::slash(name));
         let marker = if is_sel { style("›").color256(ACCENT).bold().to_string() } else { " ".to_string() };
         let nm = if is_sel {
             style(format!("/{name}")).color256(ACCENT).bold().to_string()
@@ -398,18 +438,26 @@ fn paint_palette(buf: &mut String, r: &Render, top_row: u16, w: usize) {
     LAST_PAL.store(vis as u16, Ordering::Relaxed);
 }
 
-/// Append the box (status + 3 lines) at the bottom `FOOTER` rows and leave the cursor at the input
-/// text position. Pure string-building; the caller writes+flushes under the lock.
+/// Append the borderless footer at the bottom `FOOTER` rows and leave the cursor at the input text
+/// position. The footer is four stacked rows — a faint full-width rule, the HUD status line, a blank
+/// breather, and the moonlit `❯` prompt — so the chat reads as one continuous column with no box around
+/// it (the rule is the only thing dividing the live prompt from the scrolling transcript above).
+/// Pure string-building; the caller writes+flushes under the lock.
 fn paint_box(buf: &mut String, r: &Render) {
     let w = r.cols.max(20) as usize;
-    let inner = w.saturating_sub(4); // " ❯ " + trailing space
+    let inner = w.saturating_sub(3); // "> " prefix (2 cells) + a 1-col right margin
     let top_row = r.rows.saturating_sub(FOOTER) + 1;
 
-    // live slash palette, just above the status line (overlays the bottom of the scroll region)
+    // live slash palette, just above the footer band (overlays the bottom of the scroll region)
     paint_palette(buf, r, top_row, w);
 
-    // status line: muted "model · tokens · …" on the left, a state pill on the right edge of meaning
+    // row 1: a faint full-width rule — the borderless divider between transcript and footer.
     goto(buf, top_row, 1);
+    clear_line(buf);
+    buf.push_str(&theme::faint("─".repeat(w)).to_string());
+
+    // row 2: HUD — muted "model · tokens · …" on the left, a state pill on the right edge of meaning.
+    goto(buf, top_row + 1, 1);
     clear_line(buf);
     let work = if WORKING.load(Ordering::Relaxed) {
         let frame = SPIN[WORK_FRAME.load(Ordering::Relaxed) % SPIN.len()];
@@ -417,45 +465,41 @@ fn paint_box(buf: &mut String, r: &Render) {
         format!(
             "{} {} {}",
             style(frame).color256(ACCENT).bold(),
-            theme::accent("working"),
+            theme::muted("working"),
             theme::faint(format!("· {secs}s · Esc to stop"))
         )
     } else {
         format!("{} {}", theme::ok("●"), theme::faint("ready"))
     };
-    // Bound the status to the box width so the right-side pill always fits and the line can never
-    // wrap onto a second row (a wrapped status is the other way the footer visually "doubles").
+    // Bound the status so the right-side pill always fits and the line can never wrap onto a second
+    // row (a wrapped HUD is how the footer visually "doubles").
     let avail = w.saturating_sub(measure_text_width(&work) + 3);
     let status = truncate_to_width(&r.status, avail);
-    buf.push_str(&format!("{}   {work}", theme::muted(&status)));
+    buf.push_str(&format!("{}   {work}", style_hud(&status)));
 
-    // top border
-    goto(buf, top_row + 1, 1);
+    // row 3: a blank breather between the HUD and the prompt (matches the airy mockup spacing).
+    goto(buf, top_row + 2, 1);
     clear_line(buf);
-    buf.push_str(&style(format!("╭{}╮", "─".repeat(w.saturating_sub(2)))).color256(ACCENT).to_string());
 
-    // input line — scroll so the cursor is visible
-    let mut scroll = 0usize;
-    if r.cursor >= inner {
-        scroll = r.cursor + 1 - inner;
-    }
-    let end = (scroll + inner).min(r.draft.len());
+    // row 4: the moonlit `❯` prompt — scroll so the cursor is visible.
     let imgtag = if r.images > 0 {
         style(format!("[{}img] ", r.images)).color256(ACCENT).to_string()
     } else {
         String::new()
     };
-    // `shown` = the box content, `shown_w` = its visible width, `caret_off` = the caret column from
-    // the text start. An empty box shows a dim placeholder; a multi-line draft is collapsed to a chip.
-    let (shown, shown_w, caret_off) = if r.draft.is_empty() && r.images == 0 {
-        // Empty box → dim placeholder hint; the caret rests at the text start (col 5).
+    // Per-char DISPLAY width (CJK/emoji = 2, combining marks = 0). All horizontal math below is in
+    // cells, not chars, so wide glyphs place the caret correctly and the row never overflows/wraps.
+    let cellw = |c: char| measure_text_width(&c.to_string());
+    // `shown` = the prompt content, `caret_off` = the caret offset from the text start in CELLS. An
+    // empty prompt shows a dim placeholder; a multi-line draft is collapsed to a chip.
+    let (shown, caret_off) = if r.draft.is_empty() && r.images == 0 {
+        // Empty prompt → dim placeholder hint; the caret rests at the text start (col 3).
         let ph: String = "Type a message  ·  / for commands  ·  Esc to exit".chars().take(inner).collect();
-        let w = ph.chars().count();
-        (theme::faint(ph).italic().to_string(), w, 0)
+        (theme::faint(ph).italic().to_string(), 0)
     } else if r.draft.contains(&'\n') {
         // A multi-line draft is (almost always) a PASTE → collapse it to a single chip: line count +
-        // a peek of the first non-empty line. The box stays one row and the model still receives the
-        // whole text on submit. Mirrors the Claude-CLI "[Pasted N lines]" affordance.
+        // a peek of the first non-empty line. The prompt stays one row and the model still receives
+        // the whole text on submit. Mirrors the Claude-CLI "[Pasted N lines]" affordance.
         let text: String = r.draft.iter().collect();
         let nlines = text.lines().count().max(1);
         let first = text.lines().find(|l| !l.trim().is_empty()).map(str::trim).unwrap_or("");
@@ -469,33 +513,47 @@ fn paint_box(buf: &mut String, r: &Render) {
             head
         };
         let chip: String = chip.chars().take(inner).collect();
-        let w = chip.chars().count();
-        (style(chip).color256(ACCENT).to_string(), w, w) // caret parks at the end of the chip
+        let wc = measure_text_width(&chip);
+        (style(chip).color256(ACCENT).to_string(), wc) // caret parks at the end of the chip
     } else {
-        let s: String = r.draft[scroll..end].iter().collect();
-        (s, end - scroll, r.cursor - scroll)
+        // Width-aware horizontal scroll: walk LEFT from the cursor accumulating cell widths until the
+        // window would exceed `inner` (keeping a cell for the caret), then emit chars forward until the
+        // cell budget is full. caret_off is the cell width of draft[scroll..cursor].
+        let mut scroll = r.cursor;
+        let mut used = 0usize;
+        while scroll > 0 {
+            let w = cellw(r.draft[scroll - 1]);
+            if used + w > inner.saturating_sub(1) {
+                break;
+            }
+            used += w;
+            scroll -= 1;
+        }
+        let caret_off: usize = r.draft[scroll..r.cursor].iter().map(|&c| cellw(c)).sum();
+        let mut shown = String::new();
+        let mut w = 0usize;
+        for &c in &r.draft[scroll..] {
+            let cw = cellw(c);
+            if w + cw > inner {
+                break;
+            }
+            shown.push(c);
+            w += cw;
+        }
+        (shown, caret_off)
     };
-    let pad = inner.saturating_sub(shown_w);
-    goto(buf, top_row + 2, 1);
-    clear_line(buf);
-    buf.push_str(&format!(
-        "{l} {arrow} {imgtag}{shown}{sp}{l}",
-        l = style("│").color256(ACCENT),
-        arrow = style("❯").color256(ACCENT).bold(),
-        sp = " ".repeat(pad)
-    ));
-
-    // bottom border
     goto(buf, top_row + 3, 1);
     clear_line(buf);
-    buf.push_str(&style(format!("╰{}╯", "─".repeat(w.saturating_sub(2)))).color256(ACCENT).to_string());
+    buf.push_str(&format!(
+        "{arrow} {imgtag}{shown}",
+        arrow = style("❯").color256(ACCENT).bold()
+    ));
 
-    // Leave the cursor at the text insertion point. The visible prefix is `│ ❯ ` = 4 cells, so
-    // text starts at column 5; the insertion point before draft index (cursor - scroll) is at
-    // column 5 + imgtag + (cursor - scroll). (Was 4 — an off-by-one that parked the caret one cell
-    // left, on the space after `❯`, so it looked stuck at the start and never reached the text end.)
-    let col = 4 + imgtag_visible_len(r.images) + caret_off + 1;
-    goto(buf, top_row + 2, col as u16);
+    // Leave the cursor at the text insertion point. The visible prefix is `❯ ` = 2 cells, so text
+    // starts at column 3; the insertion point before draft index (cursor - scroll) is at
+    // column 3 + imgtag + caret_off.
+    let col = 2 + imgtag_visible_len(r.images) + caret_off + 1;
+    goto(buf, top_row + 3, col as u16);
 }
 
 /// Visible width of the `[Nimg] ` prefix (0 when no images) — kept in sync with `paint_box`.
@@ -802,7 +860,15 @@ fn input_loop(
                     if sub_tx.send(Submission::Slash(name)).is_err() {
                         return;
                     }
-                    let _ = resume_rx.recv();
+                    // Park to hand stdin to the REPL's dialoguer menu — but ONLY when idle. While the
+                    // agent is working the REPL is blocked in its turn `select!` and won't consume this
+                    // Slash until the turn ends; parking now would freeze ALL input (typing, queueing,
+                    // even Esc) for the whole turn — the confirmed "can't chat while working" freeze.
+                    // When working: leave it queued, keep reading keys; the REPL runs it after the turn.
+                    if !WORKING.load(Ordering::Relaxed) {
+                        while resume_rx.try_recv().is_ok() {} // discard resume buffered by a deferred slash
+                        let _ = resume_rx.recv();
+                    }
                     continue;
                 }
                 let trimmed = line.trim().to_string();
@@ -813,11 +879,15 @@ fn input_loop(
                     history.push(trimmed.clone());
                 }
                 if let Some(cmd) = trimmed.strip_prefix('/').filter(|_| images == 0) {
-                    // Hand stdin to the REPL's dialoguer menu, then park until it unparks us.
                     if sub_tx.send(Submission::Slash(cmd.to_string())).is_err() {
                         return;
                     }
-                    let _ = resume_rx.recv();
+                    // Park to hand stdin to the dialoguer menu only when idle (see the pick branch):
+                    // parking mid-turn would freeze all input until the turn ends.
+                    if !WORKING.load(Ordering::Relaxed) {
+                        while resume_rx.try_recv().is_ok() {} // discard resume buffered by a deferred slash
+                        let _ = resume_rx.recv();
+                    }
                 } else {
                     // Image data URLs aren't carried here (the box only tracks a count); the REPL
                     // resolves attachments — for now we forward the text and image count is folded in
@@ -831,7 +901,8 @@ fn input_loop(
             }
             Key::Escape | Key::Char('\u{3}') | Key::Char('\u{4}') => {
                 if WORKING.load(Ordering::Relaxed) {
-                    let _ = cancel_tx.send(());
+                    request_cancel(); // cooperative: lets a running tool (e.g. a long shell) abort now
+                    let _ = cancel_tx.send(()); // and wake the REPL's select! at the next yield point
                 } else {
                     let empty = {
                         let mut r = render().lock().unwrap();
@@ -873,7 +944,7 @@ fn input_loop(
             }
             Key::Char('\u{f}') => {
                 // Ctrl-O: grab a clipboard screenshot (Win+Shift+S) as a vision attachment.
-                if let Ok(Some(url)) = crate::image_input::clipboard_image_data_url() {
+                if let Ok(Some(url)) = crate::ui::image_input::clipboard_image_data_url() {
                     push_pending_image(url);
                     render().lock().unwrap().images = pending_image_count();
                     repaint();
@@ -1067,8 +1138,9 @@ mod tests {
     }
 
     #[test]
-    fn paint_box_fits_within_width_and_has_borders() {
-        WORKING.store(true, Ordering::Relaxed);
+    fn paint_box_is_borderless_with_rule_and_prompt() {
+        // Structure-only (no WORKING assertion: that atomic is shared + mutated by sibling tests in
+        // parallel, so the work-pill text is racy — the borderless shape is what this guards).
         let r = Render {
             cols: 40,
             rows: 24,
@@ -1080,15 +1152,14 @@ mod tests {
         };
         let mut buf = String::new();
         paint_box(&mut buf, &r);
-        assert!(buf.contains('╭') && buf.contains('╮'), "has a top border");
-        assert!(buf.contains('╰') && buf.contains('╯'), "has a bottom border");
-        assert!(buf.contains('❯'), "has the input arrow");
-        assert!(buf.contains("working"), "shows the working indicator");
-        WORKING.store(false, Ordering::Relaxed);
+        assert!(buf.contains('─'), "has the faint footer rule");
+        assert!(buf.contains('❯'), "has the borderless moonlit prompt");
+        assert!(!buf.contains('╭') && !buf.contains('╮'), "no box border");
+        assert!(!buf.contains('│'), "no box sides");
     }
 
-    /// The caret must land at the text insertion point: prefix `│ ❯ ` is 4 cells → text at col 5,
-    /// so an empty draft parks the caret at col 5 and N typed chars push it to col 5+N. Guards the
+    /// The caret must land at the text insertion point: prefix `❯ ` is 2 cells → text at col 3,
+    /// so an empty draft parks the caret at col 3 and N typed chars push it to col 3+N. Guards the
     /// off-by-one that stranded the caret one cell left (looked stuck at the start).
     #[test]
     fn caret_lands_at_text_insertion_point() {
@@ -1110,11 +1181,16 @@ mod tests {
         };
         let mut buf = String::new();
         paint_box(&mut buf, &mk("", 0));
-        assert_eq!(last_goto_col(&buf), 5, "empty draft → caret at text start (col 5)");
+        assert_eq!(last_goto_col(&buf), 3, "empty draft → caret at text start (col 3)");
 
         buf.clear();
         paint_box(&mut buf, &mk("hello", 5));
-        assert_eq!(last_goto_col(&buf), 10, "caret after 5 chars → col 10");
+        assert_eq!(last_goto_col(&buf), 8, "caret after 5 chars → col 8");
+
+        // Wide glyphs (CJK) are 2 cells each → the caret offset must be in CELLS, not chars.
+        buf.clear();
+        paint_box(&mut buf, &mk("你好", 2));
+        assert_eq!(last_goto_col(&buf), 7, "2 CJK chars = 4 cells → caret at col 3+4=7");
     }
 
     #[test]
@@ -1136,9 +1212,9 @@ mod tests {
         paint_box(&mut buf, &r);
         assert!(buf.contains("3 lines pasted"), "chip shows the line count");
         assert!(!buf.contains("Không nhắc là AI"), "interior lines are collapsed, not shown raw");
-        // The collapsed input row must still fit the box width (no wrap).
+        // The collapsed prompt row must still fit the width (no wrap).
         let top = r.rows - FOOTER + 1;
-        let start = buf.find(&format!("\x1b[{};1H", top + 2)).unwrap();
+        let start = buf.find(&format!("\x1b[{};1H", top + 3)).unwrap();
         let rest = &buf[start..];
         let end = rest[1..].find('\x1b').map(|i| start + 1 + i).unwrap_or(buf.len());
         assert!(measure_text_width(&buf[start..end]) <= 60, "collapsed row fits the box width");
@@ -1170,13 +1246,14 @@ mod tests {
         };
         let mut buf = String::new();
         paint_box(&mut buf, &r);
-        // Slice the status row out by its two bracketing cursor-moves (status line → top border),
-        // then measure visible width (measure_text_width strips the SGR/clear codes in between).
+        // The HUD sits on the 2nd footer row (after the rule). Slice it out by its two bracketing
+        // cursor-moves (HUD row → blank row), then measure visible width (measure_text_width strips
+        // the SGR/clear codes in between).
         let top = r.rows - FOOTER + 1;
-        let start = buf.find(&format!("\x1b[{top};1H")).unwrap();
-        let end = buf.find(&format!("\x1b[{};1H", top + 1)).unwrap();
+        let start = buf.find(&format!("\x1b[{};1H", top + 1)).unwrap();
+        let end = buf.find(&format!("\x1b[{};1H", top + 2)).unwrap();
         let row = &buf[start..end];
-        assert!(measure_text_width(row) <= 30, "status row fits the box width (no wrap)");
+        assert!(measure_text_width(row) <= 30, "HUD row fits the width (no wrap)");
     }
 
     #[test]

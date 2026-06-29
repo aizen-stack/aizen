@@ -6,7 +6,7 @@
 //! errors rather than silently running on the wrong one). The hard `cmd_guard` floor still protects
 //! the unattended run, so a scheduled agent can't be tricked into a catastrophic shell command.
 
-use crate::config::nextgen_home;
+use crate::core::config::nextgen_home;
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
@@ -56,7 +56,7 @@ fn cron_dir() -> PathBuf {
     nextgen_home().join("cron")
 }
 fn slug(name: &str) -> String {
-    crate::skill::sanitize_name(name)
+    crate::skills::sanitize_name(name)
 }
 fn spec_path(name: &str) -> PathBuf {
     cron_dir().join(format!("{}.json", slug(name)))
@@ -85,8 +85,8 @@ fn add(name: &str, schedule: &str, task: &str) -> Result<()> {
     // Validate the schedule up front (so we don't register a half-baked OS entry).
     validate_schedule(schedule)?;
 
-    let cfg = crate::cli_config::load();
-    let exe = std::env::current_exe().context("resolving the ng executable path")?;
+    let cfg = crate::core::cli_config::load();
+    let exe = std::env::current_exe().context("resolving the aizen executable path")?;
     let exe = exe.display().to_string();
 
     std::fs::create_dir_all(cron_dir()).context("creating ~/.aizen/cron")?;
@@ -134,7 +134,7 @@ fn list() -> Result<()> {
         }
     }
     if !found {
-        println!("(no scheduled jobs — add one with `ng cron add <name> --schedule daily@09:00 --task \"…\"`)");
+        println!("(no scheduled jobs — add one with `aizen cron add <name> --schedule daily@09:00 --task \"…\"`)");
     }
     Ok(())
 }

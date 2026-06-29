@@ -15,11 +15,11 @@
 //! overrides it (`synthesis.model`). We do NOT auto-"escalate to a stronger tier" — the CLI is
 //! provider-agnostic and cannot know a gateway's tier names; tiering is the spec author's choice.
 
-use crate::agent::builtin::role_registry;
-use crate::agent::task_tool::build_subagent_prompt;
+use crate::agent::builtin::{agent_registry, role_registry};
+use crate::agent::task_tool::{build_agent_subagent_prompt, build_subagent_prompt};
 use crate::agent::{run_agent, AgentConfig, StopReason};
-use crate::client::{chat_with_tools, stream_chat};
-use crate::types::{Message, ToolDef};
+use crate::llm::client::{chat_with_tools, stream_chat};
+use crate::core::types::{Message, ToolDef};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
@@ -40,6 +40,10 @@ pub struct WorkflowTask {
     pub id: String,
     #[serde(default = "default_role")]
     pub role: String,
+    /// Optional specialist slug (see [`crate::agents`]). When set and it resolves, this task runs as
+    /// that specialist (superseding `role`), mirroring the `task` tool's `agent` param.
+    #[serde(default)]
+    pub agent: Option<String>,
     pub prompt: String,
     /// Optional per-task model override (mixture-of-agents: diversify WHICH model runs WHICH task —
     /// e.g. a cheap model scouts, a strong one reviews). Mirrors `Synthesis.model`; the spec author
@@ -181,11 +185,24 @@ async fn run_one_task(
     date: &str,
     task: &WorkflowTask,
 ) -> TaskOutcome {
-    // Mixture-of-agents: this task runs on its own model override if the spec set one, else the
-    // workflow default. The subagent prompt's `<environment>` reflects the model that truly ran it.
-    let task_model = task.model.as_deref().unwrap_or(model);
-    let registry = role_registry(&task.role, root);
-    let system = build_subagent_prompt(&task.role, root, task_model, date);
+    // A resolvable `agent` slug supersedes `role` (the specialist/fusion path), mirroring the `task`
+    // tool. Model precedence: per-task `model` > the specialist's `def.model` > the workflow default.
+    let spec = task
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(crate::agents::load);
+    let (label, task_model, registry, system) = match &spec {
+        Some(def) => {
+            let m = task.model.as_deref().or(def.model.as_deref()).unwrap_or(model);
+            (def.slug(), m, agent_registry(def, root), build_agent_subagent_prompt(def, root, m, date))
+        }
+        None => {
+            let m = task.model.as_deref().unwrap_or(model);
+            (task.role.clone(), m, role_registry(&task.role, root), build_subagent_prompt(&task.role, root, m, date))
+        }
+    };
 
     let client = http.clone();
     let base = base_url.to_string();
@@ -218,7 +235,7 @@ async fn run_one_task(
             };
             TaskOutcome {
                 id: task.id.clone(),
-                role: task.role.clone(),
+                role: label.clone(),
                 model: task_model.to_string(),
                 status: status.to_string(),
                 summary: o.final_text.unwrap_or_else(|| "(no final answer)".to_string()),
@@ -227,7 +244,7 @@ async fn run_one_task(
         }
         Err(e) => TaskOutcome {
             id: task.id.clone(),
-            role: task.role.clone(),
+            role: label.clone(),
             model: task_model.to_string(),
             status: "error".to_string(),
             summary: format!("error: {e}"),
@@ -312,6 +329,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_task_with_agent_and_defaults_none() {
+        let json = r#"{
+            "name": "spec",
+            "tasks": [
+                {"id": "review", "agent": "code-reviewer", "prompt": "review the diff"},
+                {"id": "impl", "prompt": "implement X"}
+            ]
+        }"#;
+        let spec: WorkflowSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.tasks[0].agent.as_deref(), Some("code-reviewer"));
+        assert!(spec.tasks[1].agent.is_none(), "agent is optional; defaults to None");
+        assert_eq!(spec.tasks[1].role, "coder", "no agent ⇒ role still defaults to coder");
+    }
+
+    #[test]
     fn parses_per_task_model_override() {
         let json = r#"{
             "name": "moa",
@@ -354,7 +386,7 @@ mod tests {
     async fn blank_task_id_rejected() {
         let spec = WorkflowSpec {
             name: "blank".into(),
-            tasks: vec![WorkflowTask { id: "  ".into(), role: "coder".into(), prompt: "x".into(), model: None }],
+            tasks: vec![WorkflowTask { id: "  ".into(), role: "coder".into(), agent: None, prompt: "x".into(), model: None }],
             synthesis: None,
         };
         let http = reqwest::Client::new();
@@ -369,8 +401,8 @@ mod tests {
         let spec = WorkflowSpec {
             name: "dup".into(),
             tasks: vec![
-                WorkflowTask { id: "a".into(), role: "coder".into(), prompt: "x".into(), model: None },
-                WorkflowTask { id: "a".into(), role: "coder".into(), prompt: "y".into(), model: None },
+                WorkflowTask { id: "a".into(), role: "coder".into(), agent: None, prompt: "x".into(), model: None },
+                WorkflowTask { id: "a".into(), role: "coder".into(), agent: None, prompt: "y".into(), model: None },
             ],
             synthesis: None,
         };

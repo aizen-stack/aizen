@@ -94,7 +94,7 @@ impl RegistrySkill {
 
 /// The configured registry base (default `agentskill.sh`).
 pub fn registry_base() -> String {
-    crate::cli_config::load()
+    crate::core::cli_config::load()
         .skill_registry
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_REGISTRY.to_string())
@@ -141,7 +141,7 @@ pub async fn fetch_body(sk: &RegistrySkill) -> Result<String> {
 
 /// Search → pick the exact-slug match (else the first hit) → fetch + save locally. Returns the
 /// saved skill. Used by both the `ng skill install` CLI and the `skill_install` agent tool.
-pub async fn install(query: &str) -> Result<crate::skill::Skill> {
+pub async fn install(query: &str) -> Result<crate::skills::Skill> {
     let hits = search(query, DEFAULT_LIMIT).await?;
     if hits.is_empty() {
         bail!("no skill on {} matches '{query}'", registry_base());
@@ -153,10 +153,10 @@ pub async fn install(query: &str) -> Result<crate::skill::Skill> {
         .unwrap_or(&hits[0])
         .clone();
     let body_md = fetch_body(&chosen).await?;
-    let parsed = crate::skill::parse_markdown(&body_md, &crate::skill::sanitize_name(&chosen.name));
+    let parsed = crate::skills::parse_markdown(&body_md, &crate::skills::sanitize_name(&chosen.name));
     let name = if parsed.name.trim().is_empty() { chosen.name.clone() } else { parsed.name.clone() };
-    crate::skill::save(&name, &parsed.description, &parsed.when, &parsed.body)?;
-    Ok(crate::skill::Skill { name, ..parsed })
+    crate::skills::save(&name, &parsed.description, &parsed.when, &parsed.body)?;
+    Ok(crate::skills::Skill { name, ..parsed })
 }
 
 /// Bridge an async future to the sync `Tool::execute` path (multi-thread runtime worker only;
@@ -233,7 +233,7 @@ impl Tool for SkillInstall {
     fn execute(&self, args: &Value) -> Result<String> {
         let slug = args.get("slug").and_then(|v| v.as_str()).context("missing required string arg 'slug'")?;
         let sk = block(install(slug))?;
-        Ok(format!("installed '{}'.\n\n{}", sk.name, crate::skill::render_loaded(&sk)))
+        Ok(format!("installed '{}'.\n\n{}", sk.name, crate::skills::render_loaded(&sk)))
     }
 }
 

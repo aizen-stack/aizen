@@ -15,7 +15,7 @@
 //! (fusion, cache, bench, graceful fallback) in tests — it is NOT semantic and will not
 //! beat the lexical floor on paraphrase; that's what the real backend is for.
 
-use crate::config;
+use crate::core::config;
 use crate::memory::tokenize::tokenize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -168,7 +168,7 @@ impl EmbeddingCache {
 #[cfg(feature = "dense")]
 pub mod model2vec {
     use super::Embedder;
-    use crate::config;
+    use crate::core::config;
     use anyhow::{Context, Result};
     use model2vec_rs::model::StaticModel;
 

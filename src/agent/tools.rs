@@ -5,7 +5,7 @@
 //! description says when to use it AND when NOT to (point at the sibling tool instead).
 //! Execution is synchronous — tools are local (memory / fs / subprocess).
 
-use crate::types::ToolDef;
+use crate::core::types::ToolDef;
 use anyhow::Result;
 use serde_json::Value;
 

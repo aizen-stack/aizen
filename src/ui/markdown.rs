@@ -10,17 +10,17 @@
 //!   conversation history, so the model never sees our decoration.
 //! - **Passthrough off-TTY.** Constructed with `decorate=false` for pipes/CI → `push` returns the
 //!   text verbatim (no gutter, no borders, no ANSI), so captured output is byte-identical to before.
-//! - **Gutter.** Every assistant line carries a gold `▌ ` gutter — a continuous bar that marks the
-//!   whole turn as the assistant's voice and separates it from `❯` user echoes and `⚙` tool traces.
+//! - **Gutter.** Every assistant line carries a moonlight `▌ ` gutter — a continuous bar that marks
+//!   the whole turn as the assistant's voice and separates it from `❯` user echoes and `⚙` tool traces.
 //! - **Best-effort syntax highlight.** Code-fence bodies get a light, language-aware pass (strings /
 //!   comments / numbers / keywords). It never mangles code: anything unrecognised stays default.
 
-use crate::theme;
+use crate::ui::theme;
 use console::{measure_text_width, style};
 
-/// A left-edge bar marking assistant output. Gold, quiet.
+/// A left-edge bar marking assistant output. Moonlight silver — the design's `border-left:2px #c3ccd8`.
 fn gutter() -> String {
-    format!("{} ", theme::accent_dim("▌"))
+    format!("{} ", theme::accent("▌"))
 }
 
 /// Streaming Markdown → styled-terminal renderer. One per assistant turn.
@@ -142,7 +142,7 @@ impl MarkdownStream {
 
         // blank line → continuous gutter (rhythm)
         if ls.is_empty() {
-            out.push_str(theme::accent_dim("▌").to_string().as_str());
+            out.push_str(theme::accent("▌").to_string().as_str());
             out.push('\n');
             return;
         }

@@ -360,7 +360,7 @@ mod tests {
     use super::*;
 
     fn with_home<T>(tag: &str, f: impl FnOnce() -> T) -> T {
-        let _g = crate::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-self-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("NEXTGEN_HOME", &dir);

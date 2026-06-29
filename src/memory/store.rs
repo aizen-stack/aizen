@@ -4,7 +4,7 @@
 //! P1 scope: load/list/add/get over plain markdown. Atomic-write + locking +
 //! caps/eviction land in P4; this keeps the write path simple and correct first.
 
-use crate::config;
+use crate::core::config;
 use crate::memory::dimension::Dimension;
 use crate::memory::frontmatter::{self, Frontmatter};
 use crate::memory::provenance::ProvenanceKind;
@@ -78,6 +78,10 @@ pub struct MemoryEntry {
     pub valid_to: Option<String>,
     /// Id of the fact that replaced this one (set together with `valid_to`).
     pub superseded_by: Option<String>,
+    /// Set when the user EXPLICITLY denied promoting this fact to the always-on core (the CorePromote
+    /// deny path). The fact stays searchable in the long tail but is excluded from `frozen_core::build`,
+    /// so an explicit "no" is honored. Serialized as `noCore: true`; absent → false.
+    pub core_denied: bool,
     /// Topical dimension (B1) — DERIVED on load by `dimension::classify`, not stored.
     pub dimension: Dimension,
 }
@@ -103,6 +107,7 @@ impl Default for MemoryEntry {
             updated: None,
             valid_to: None,
             superseded_by: None,
+            core_denied: false,
             dimension: Dimension::Other,
         }
     }
@@ -166,6 +171,8 @@ impl MemoryEntry {
             .get("supersededBy")
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty());
+        let core_denied =
+            fm.get("noCore").map(|s| s.trim().eq_ignore_ascii_case("true")).unwrap_or(false);
         Ok(MemoryEntry {
             id,
             path: path.to_path_buf(),
@@ -185,6 +192,7 @@ impl MemoryEntry {
             updated,
             valid_to,
             superseded_by,
+            core_denied,
             dimension,
         })
     }
@@ -292,6 +300,8 @@ pub struct LearnedWrite<'a> {
     pub source: ProvenanceKind,
     pub confidence: f64,
     pub session_id: &'a str,
+    /// Exclude this fact from the always-on frozen core (set on the CorePromote deny-downgrade).
+    pub no_core: bool,
 }
 
 const LEARNED_KEY_ORDER: &[&str] = &[
@@ -308,6 +318,7 @@ const LEARNED_KEY_ORDER: &[&str] = &[
     "lastRetrieved",
     "validTo",
     "supersededBy",
+    "noCore",
 ];
 
 /// Pick a free filename stem for `name`, appending `-2`, `-3`, … on collision.
@@ -342,6 +353,7 @@ struct LearnedRecord<'a> {
     last_retrieved: &'a str,
     valid_to: &'a str,
     superseded_by: &'a str,
+    no_core: bool,
 }
 
 fn render_learned(r: &LearnedRecord) -> String {
@@ -368,6 +380,9 @@ fn render_learned(r: &LearnedRecord) -> String {
     }
     if !r.superseded_by.trim().is_empty() {
         fields.insert("supersededBy".to_string(), r.superseded_by.trim().to_string());
+    }
+    if r.no_core {
+        fields.insert("noCore".to_string(), "true".to_string());
     }
     frontmatter::serialize(&fields, r.body, LEARNED_KEY_ORDER)
 }
@@ -399,6 +414,7 @@ pub fn add_learned_in(dir: &Path, w: &LearnedWrite) -> Result<String> {
         last_retrieved: "",
         valid_to: "",
         superseded_by: "",
+        no_core: w.no_core,
     });
     write_atomic(&path, &content)?;
     Ok(id)
@@ -440,6 +456,7 @@ pub fn reinforce(entry: &MemoryEntry, session_id: &str) -> Result<u32> {
     let valid_to = fm.get("validTo").unwrap_or("").to_string();
     let superseded_by = fm.get("supersededBy").unwrap_or("").to_string();
     let last_retrieved = fm.get("lastRetrieved").unwrap_or("").to_string();
+    let no_core = fm.get("noCore").map(|s| s.trim().eq_ignore_ascii_case("true")).unwrap_or(false);
     let content = render_learned(&LearnedRecord {
         name,
         description,
@@ -455,6 +472,7 @@ pub fn reinforce(entry: &MemoryEntry, session_id: &str) -> Result<u32> {
         last_retrieved: &last_retrieved,
         valid_to: &valid_to,
         superseded_by: &superseded_by,
+        no_core, // preserve an explicit deny across reinforcement
     });
     write_atomic(&entry.path, &content)?;
     Ok(reinforced)
@@ -480,6 +498,7 @@ pub fn mark_superseded(entry: &MemoryEntry, by_id: &str) -> Result<()> {
     let sessions: u32 = fm.get("sessions").and_then(|s| s.trim().parse().ok()).unwrap_or(entry.sessions);
     let last_session = fm.get("lastSession").unwrap_or("").to_string();
     let last_retrieved = fm.get("lastRetrieved").unwrap_or("").to_string();
+    let no_core = fm.get("noCore").map(|s| s.trim().eq_ignore_ascii_case("true")).unwrap_or(false);
     let content = render_learned(&LearnedRecord {
         name,
         description,
@@ -495,6 +514,7 @@ pub fn mark_superseded(entry: &MemoryEntry, by_id: &str) -> Result<()> {
         last_retrieved: &last_retrieved,
         valid_to: &today(),
         superseded_by: by_id,
+        no_core,
     });
     write_atomic(&entry.path, &content)?;
     Ok(())

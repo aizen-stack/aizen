@@ -22,16 +22,60 @@ const UA: &str = concat!("aizen/", env!("CARGO_PKG_VERSION"));
 /// Cap the characters returned to the model so one page can't blow the context window.
 const FETCH_CAP: usize = 20_000;
 const REQUEST_TIMEOUT_SECS: u64 = 20;
+/// Max HTTP redirects we follow manually (each one re-vetted by the SSRF floor).
+const MAX_REDIRECTS: usize = 5;
 
 /// A short-lived HTTP client for a single web call (its own pool; bound to the current runtime
 /// when first driven by `block_on`). rustls + webpki-roots (reqwest's `rustls-tls`) reach any
 /// public HTTPS host without system certs.
+///
+/// SSRF: auto-redirects are DISABLED (`Policy::none`). reqwest would otherwise transparently follow
+/// up to 10 redirects, and a public page returning `Location: http://169.254.169.254/…` (cloud
+/// metadata) would be fetched WITHOUT passing the `net_guard` floor again. `web_fetch` follows
+/// redirects manually instead, re-vetting every hop. (See `fetch_guarded`.)
 fn client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(UA)
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building HTTP client")
+}
+
+/// GET `url`, following redirects MANUALLY so the SSRF floor (`net_guard::guard_url_async`) re-vets
+/// every hop's target — closing the "public URL → 302 → 169.254.169.254" metadata-exfiltration hole.
+/// The caller has already vetted the initial `url`. Returns the final (status, content-type, body).
+async fn fetch_guarded(c: &reqwest::Client, url: &str) -> Result<(reqwest::StatusCode, String, String)> {
+    let mut url = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        let resp = c.get(&url).send().await.with_context(|| format!("GET {url} failed"))?;
+        let status = resp.status();
+        if matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
+            let loc = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| anyhow::anyhow!("redirect ({status}) with no usable Location header"))?;
+            // Resolve a possibly-relative Location against the current URL, then re-run the SSRF floor.
+            let next = reqwest::Url::parse(&url)
+                .ok()
+                .and_then(|base| base.join(loc).ok())
+                .ok_or_else(|| anyhow::anyhow!("bad redirect target '{loc}'"))?
+                .to_string();
+            crate::core::net_guard::guard_url_async(&next).await?;
+            url = next;
+            continue;
+        }
+        let ctype = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let text = resp.text().await.context("reading response body")?;
+        return Ok((status, ctype, text));
+    }
+    bail!("too many redirects (> {MAX_REDIRECTS})")
 }
 
 /// Drive an async future from the sync `Tool::execute` path (see the module note on the invariant).
@@ -68,20 +112,12 @@ impl Tool for WebFetch {
             bail!("url must be an absolute http(s) URL");
         }
         // SSRF floor: refuse loopback / private / link-local (cloud metadata) targets.
-        crate::net_guard::guard_url(url)?;
+        crate::core::net_guard::guard_url(url)?;
         let url = url.to_string();
         let (status, ctype, text) = block(async {
             let c = client()?;
-            let resp = c.get(&url).send().await.with_context(|| format!("GET {url} failed"))?;
-            let status = resp.status();
-            let ctype = resp
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            let text = resp.text().await.context("reading response body")?;
-            anyhow::Ok((status, ctype, text))
+            // Manual redirect-following with a per-hop SSRF re-check (see `fetch_guarded`).
+            fetch_guarded(&c, &url).await
         })?;
         let looks_html = ctype.contains("html") || text.trim_start().starts_with('<');
         let content = if looks_html { html_to_text(&text) } else { text };
@@ -181,14 +217,14 @@ impl Tool for WebCrawl {
     fn execute(&self, args: &Value) -> Result<String> {
         let url = args.get("url").and_then(|v| v.as_str()).context("missing required string arg 'url'")?;
         // SSRF floor on the seed (followed links are vetted per-fetch inside crawl).
-        crate::net_guard::guard_url(url)?;
+        crate::core::net_guard::guard_url(url)?;
         let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(1).clamp(0, 3) as usize;
         let max_pages = args.get("max_pages").and_then(|v| v.as_u64()).unwrap_or(40).clamp(1, 200) as usize;
         let scope = match args.get("scope").and_then(|v| v.as_str()) {
-            Some(s) => crate::crawl::Scope::parse(s)?,
-            None => crate::crawl::Scope::Strict,
+            Some(s) => crate::features::crawl::Scope::parse(s)?,
+            None => crate::features::crawl::Scope::Strict,
         };
-        let opts = crate::crawl::CrawlOptions {
+        let opts = crate::features::crawl::CrawlOptions {
             seeds: vec![url.to_string()],
             max_depth: depth,
             max_pages,
@@ -198,7 +234,7 @@ impl Tool for WebCrawl {
         };
         let report = block(async {
             let c = client()?;
-            crate::crawl::crawl(&c, &opts).await
+            crate::features::crawl::crawl(&c, &opts).await
         })?;
         if report.found.is_empty() {
             return Ok(format!("(crawl of {url} found no URLs)"));

@@ -13,7 +13,7 @@ pub mod decay;
 pub mod dedup;
 pub mod supersede;
 
-use crate::config;
+use crate::core::config;
 use anyhow::Result;
 
 /// Outcome of a `compact` pass.

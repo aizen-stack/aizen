@@ -1,29 +1,30 @@
-//! The single source of truth for the `ng` TUI palette — the "Studio" identity: one warm gold
-//! accent + a small, restrained set of semantic colours (ok / error / warn / link) + a code-syntax
-//! sub-palette. Everything is 256-colour (universally supported; no truecolor dependency), routed
-//! through `console::style` so `NO_COLOR` and non-TTY output are auto-stripped.
+//! The single source of truth for the Aizen TUI palette — the **moonlight** identity: one calm
+//! silver-blue accent + a small, restrained set of semantic colours (ok / error / warn / link) + a
+//! code-syntax sub-palette. Everything is 256-colour (universally supported; no truecolor
+//! dependency), routed through `console::style` so `NO_COLOR` and non-TTY output are auto-stripped.
 //!
-//! Discipline: NOT a rainbow. Gold carries brand + structure (borders, prompt, gutter, tool names,
-//! headings). The semantic colours appear only where they MEAN something (green = success/added,
-//! red = error/removed, blue = links/inline-code, amber = warnings). Anything else is neutral grey.
+//! Discipline: NOT a rainbow. The silver moonlight carries brand + structure (prompt, gutter, tool
+//! names, headings) — Aizen "holds the moon", so the whole UI is moonlit, not gilded. **Gold is
+//! reserved** for one thing: the `⚡ yolo` mode chip + warnings (the one warm spot that should pull
+//! the eye). The other semantic colours appear only where they MEAN something (green = success/added,
+//! salmon = error/removed, blue = links/inline-code). Anything else is neutral grey.
 //!
 //! Use the helpers (`accent`, `ok`, `err`, …) instead of scattering raw `color256(..)` calls so the
 //! palette can be retuned in one place.
 //!
-//! Aizen brand palette (from the official logo, for reference / future retune):
-//!   ink #0d0d0c · paper #f7f6f3 · indigo #243a73 (藍染 = "indigo dyeing", the namesake) ·
-//!   gold-noir #b0894c (≈ 256-colour 137) · crimson-noir #993030. The terminal uses the *noir*
-//!   reading: a silver-white wordmark + a gold mark on the dark ground — the warm gold below is the
-//!   gold-noir variant. To match the brand gold exactly, set ACCENT to 137.
+//! Mapped from the claude.ai/design "Aizen CLI" spec:
+//!   moonlight #c3ccd8 (≈ 252, ACCENT) · dim silver #b6c0cf (≈ 248, ACCENT_DIM) · gold #d8b46a
+//!   (≈ 179, WARN — yolo only) · green #5fbf7f (≈ 71, OK) · salmon #c98a82 (≈ 174, ERR) ·
+//!   faint #56544c (≈ 240, FAINT). The PetalMark + wordmark are silver-white on the dark ground.
 
 use console::{style, StyledObject};
 use std::fmt::Display;
 
 // ── core palette (256-colour indices) ───────────────────────────────────────────
-/// Warm gold — brand + structure (borders, prompt arrow, gutter, tool names, headings).
-pub const ACCENT: u8 = 178;
-/// Darker gold — rules / borders that should sit quieter than the accent.
-pub const ACCENT_DIM: u8 = 136;
+/// Moonlight silver — brand + structure (prompt arrow, assistant gutter, tool names, headings).
+pub const ACCENT: u8 = 252;
+/// Dim silver — secondary moonlight: tool arguments/values, the `◆ smart` chip, quiet rules/borders.
+pub const ACCENT_DIM: u8 = 248;
 /// Neutral grey for secondary text (the old `.dim()` role, but a defined shade).
 pub const MUTED: u8 = 245;
 /// Very faint grey — separators, the code-block rule, timestamps.
@@ -32,9 +33,9 @@ pub const FAINT: u8 = 240;
 // ── semantic (used ONLY where the colour carries meaning) ────────────────────────
 /// Success / confirmation / added.
 pub const OK: u8 = 71;
-/// Error / failure / removed.
-pub const ERR: u8 = 167;
-/// Warning / caution.
+/// Error / failure / removed — a soft "noir" salmon (#c98a82), not a glaring red.
+pub const ERR: u8 = 174;
+/// Warning / caution — the reserved warm gold (#d8b46a): the `⚡ yolo` chip + cautions, nothing else.
 pub const WARN: u8 = 179;
 /// Links + inline code (a calm blue, distinct from the gold accent).
 pub const LINK: u8 = 110;

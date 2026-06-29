@@ -246,7 +246,7 @@ pub fn run(split: &str, update_baseline: bool, hybrid: bool) -> Result<()> {
             }
             Err(_) => {
                 println!(
-                    "no baseline yet — run `ng bench memory --update-baseline` to capture one."
+                    "no baseline yet — run `aizen bench memory --update-baseline` to capture one."
                 );
             }
         }

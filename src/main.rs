@@ -4,33 +4,32 @@
 //!   ng chat    — OpenAI-compatible streaming chat (the v0 "call API like hermes" layer)
 //!   ng memory  — the standalone, best-for-CLI memory brain (see linked-riding-mochi.md)
 
+// ─── module tree ────────────────────────────────────────────────────────────
+// Domains that own a folder: the agent loop, the memory brain, personas, benches.
 mod agent;
-mod app_catalog;
+mod agents; // delegatable specialist sub-agent library (agency-agents format)
 mod bench;
-mod cli_config;
-mod client;
-mod commands;
-mod config;
-mod crawl;
-mod cron;
-mod icons;
-mod image_input;
-mod markdown;
-mod discord;
 mod memory;
-mod net_guard;
-mod notify;
 mod persona;
-mod skill;
-mod skill_registry;
-mod soul;
-mod timemachine;
-mod spinner;
-mod splash;
-mod telegram;
-mod theme;
-mod tui;
-mod types;
+// Grouped by role (the src/ reorg — see each folder's mod.rs for what it holds):
+mod channels; // telegram · discord · notify
+mod core; // types · config · cli_config · net_guard
+mod features; // crawl · timemachine · cron · commands
+mod llm; // the OpenAI-compatible chat client
+mod skills; // skill store + registry
+mod ui; // tui · theme · markdown · spinner · splash · icons · image_input
+
+// The reorg moved 23 top-level files into the folders above. These re-exports keep the
+// call sites in THIS file referring to the modules by their short names (no behavior
+// change) — every other file already uses the new `crate::<group>::<mod>` paths.
+use crate::agent::app_catalog;
+use crate::channels::{discord, notify, telegram};
+use crate::core::{cli_config, config, types};
+use crate::features::{commands, crawl, cron, timemachine};
+use crate::llm::client;
+use crate::persona::soul;
+use crate::skills::{self as skill, registry as skill_registry};
+use crate::ui::{icons, image_input, splash, theme, tui};
 
 use agent::{AgentConfig, AgentOutcome, StopReason};
 use anyhow::{anyhow, Context, Result};
@@ -56,6 +55,7 @@ enum Commands {
     /// Stream a chat completion from an OpenAI-compatible endpoint.
     Chat(ChatArgs),
     /// Run the agentic loop: the model uses tools (memory + files + shell) to do a task.
+    /// (For the library of specialist sub-agents you can DELEGATE to, see `agents`.)
     Agent(AgentArgs),
     /// Run a workflow: fan out a set of role-scoped sub-agents (from a JSON spec), then
     /// synthesize their results into one answer (mixture-of-agents).
@@ -129,6 +129,13 @@ enum Commands {
         #[command(subcommand)]
         cmd: Option<AppsCmd>,
     },
+    /// Specialist sub-agents you can delegate to (the "agency-agents" library): list · show · where ·
+    /// install · remove · enable · disable. Drop-in compatible with `.claude/agents/` markdown.
+    #[command(name = "agents")]
+    Agents {
+        #[command(subcommand)]
+        cmd: Option<AgentsCmd>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -162,6 +169,67 @@ enum AppsCmd {
     Remove {
         /// The key shown by `ng apps list`.
         name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentsCmd {
+    /// List installed specialists (grouped by division; ● pinned to <agents> / ○ not).
+    List {
+        /// Only this division (e.g. engineering).
+        #[arg(short, long)]
+        division: Option<String>,
+        /// Only this source: aizen-home | claude-home | aizen-project | claude-project.
+        #[arg(short, long)]
+        source: Option<String>,
+        /// Only the agents pinned to the always-on <agents> index.
+        #[arg(short, long)]
+        enabled: bool,
+        /// Machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print one specialist's full card (frontmatter + body).
+    Show {
+        /// Agent name or slug (from `aizen agents list`).
+        name: String,
+    },
+    /// Show the four source directories and how many agents each holds.
+    Where,
+    /// Install agents into ~/.aizen/agents from a GitHub repo (owner/repo), a git/.md URL, or a local dir.
+    Install {
+        /// owner/repo, an https git URL, a single `.md` URL, or a local directory path.
+        source: String,
+        /// Don't prompt for confirmation before writing.
+        #[arg(short, long)]
+        yes: bool,
+        /// Pin every installed agent to the always-on <agents> index afterwards.
+        #[arg(long)]
+        enable_all: bool,
+        /// For a single `.md` URL: save it under this name (else from frontmatter/URL).
+        #[arg(long)]
+        as_name: Option<String>,
+    },
+    /// Remove an installed agent (HOME tree only) and unpin it.
+    Remove {
+        /// Agent name or slug.
+        name: String,
+    },
+    /// Pin an agent (or --all) to the always-on <agents> index so the model can see it.
+    Enable {
+        /// Agent name or slug (omit with --all).
+        name: Option<String>,
+        /// Pin every installed agent.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Unpin an agent (or --all) from the always-on <agents> index (still dispatchable by slug).
+    Disable {
+        /// Agent name or slug (omit with --all).
+        name: Option<String>,
+        /// Unpin every agent.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -666,6 +734,7 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Apps { cmd } => run_apps(cmd).await,
+        Commands::Agents { cmd } => run_agents(cmd).await,
     }
 }
 
@@ -679,7 +748,7 @@ async fn run_apps(cmd: Option<AppsCmd>) -> Result<()> {
         Some(AppsCmd::Search { query, limit }) => {
             let q = query.join(" ");
             if q.trim().is_empty() {
-                return Err(anyhow!("usage: ng apps search <keywords>"));
+                return Err(anyhow!("usage: aizen apps search <keywords>"));
             }
             let hits = app_catalog::dedupe_latest(
                 app_catalog::search(q.trim(), limit.unwrap_or(20).clamp(1, 50)).await?,
@@ -690,7 +759,7 @@ async fn run_apps(cmd: Option<AppsCmd>) -> Result<()> {
             }
             println!(
                 "{}",
-                style(format!("{} result(s) from {} — `ng apps add <name>` to connect:", hits.len(), app_catalog::registry_base())).dim()
+                style(format!("{} result(s) from {} — `aizen apps add <name>` to connect:", hits.len(), app_catalog::registry_base())).dim()
             );
             for s in &hits {
                 let name = style(&s.name).color256(splash::ACCENT);
@@ -715,7 +784,7 @@ async fn run_apps(cmd: Option<AppsCmd>) -> Result<()> {
                 crate::agent::mcp::invalidate();
                 println!("{}", style(format!("✓ disconnected '{name}'.")).color256(splash::ACCENT));
             } else {
-                println!("no connected app keyed '{name}' (see `ng apps list`).");
+                println!("no connected app keyed '{name}' (see `aizen apps list`).");
             }
             Ok(())
         }
@@ -725,7 +794,7 @@ async fn run_apps(cmd: Option<AppsCmd>) -> Result<()> {
 /// Render the featured catalog with connection badges.
 fn apps_print_list() {
     let installed = app_catalog::installed_keys();
-    println!("{}", style("Apps — connect via the MCP registry (`ng apps add <key>`):").bold());
+    println!("{}", style("Apps — connect via the MCP registry (`aizen apps add <key>`):").bold());
     for f in app_catalog::FEATURED {
         let on = installed.iter().any(|k| k == f.key);
         let badge = if on { style("✓").color256(splash::ACCENT).to_string() } else { style("○").dim().to_string() };
@@ -746,7 +815,7 @@ fn apps_print_list() {
     }
     println!(
         "\n{}",
-        style("details: `ng apps info <key>`   ·   search: `ng apps search <keywords>`   ·   remove: `ng apps remove <key>`").dim()
+        style("details: `aizen apps info <key>`   ·   search: `aizen apps search <keywords>`   ·   remove: `aizen apps remove <key>`").dim()
     );
 }
 
@@ -766,7 +835,7 @@ async fn apps_add(name: &str) -> Result<()> {
     let viable: Vec<app_catalog::RegistryServer> = hits.into_iter().filter(|s| app_catalog::is_viable(s)).collect();
     if viable.is_empty() {
         return Err(anyhow!(
-            "no connectable '{label}' server found on the registry (only legacy sse-only entries, which ng's client doesn't speak). Run `ng apps search {query}` to explore."
+            "no connectable '{label}' server found on the registry (only legacy sse-only entries, which aizen's client doesn't speak). Run `aizen apps search {query}` to explore."
         ));
     }
     let default_idx = app_catalog::pick_best(&viable, &prefer)
@@ -817,7 +886,7 @@ async fn apps_add(name: &str) -> Result<()> {
     // Runtime-aware: prefer a transport whose runner is actually on PATH (don't wire an npx server
     // when Node isn't installed if a remote would work).
     let choice = app_catalog::pick_transport_for_install(&server)
-        .context("this server declares no transport ng can use")?;
+        .context("this server declares no transport aizen can use")?;
     let repo = server.repository.as_ref().map(|r| r.url.clone()).unwrap_or_default();
     println!("{}", style(format!("→ {}", server.name)).color256(splash::ACCENT));
     if !server.description.is_empty() {
@@ -909,7 +978,7 @@ async fn apps_add(name: &str) -> Result<()> {
             ),
             Err(e) => println!(
                 "{}",
-                style(format!("connected '{key}', but sign-in didn't finish — {e:#}\n  finish it with `ng apps login {key}`."))
+                style(format!("connected '{key}', but sign-in didn't finish — {e:#}\n  finish it with `aizen apps login {key}`."))
                     .yellow()
             ),
         }
@@ -933,7 +1002,7 @@ fn print_entry_summary(entry: &serde_json::Value, key: Option<&str>) {
         println!("  {} {}", style("host     ").dim(), style(app_catalog::host_of(url)).dim());
         if entry.get("auth").and_then(|v| v.as_str()) == Some("oauth") {
             let signed = key.map(crate::agent::mcp_oauth::has_token).unwrap_or(false);
-            let state = if signed { "signed in".to_string() } else { "not signed in — `ng apps login <key>`".to_string() };
+            let state = if signed { "signed in".to_string() } else { "not signed in — `aizen apps login <key>`".to_string() };
             println!("  {} oauth ({state})", style("auth     ").dim());
         }
     } else if let Some(cmd) = entry.get("command").and_then(|v| v.as_str()) {
@@ -973,7 +1042,7 @@ fn mask_secret(v: &str) -> String {
 /// secrets MASKED) plus a LIVE probe (handshake + the tools it actually exposes, or why it failed).
 async fn apps_info(key: &str) -> Result<()> {
     let Some(entry) = app_catalog::installed_entry(key) else {
-        return Err(anyhow!("no connected app keyed '{key}' — see `ng apps list`"));
+        return Err(anyhow!("no connected app keyed '{key}' — see `aizen apps list`"));
     };
     println!("{}", style(key).color256(splash::ACCENT).bold());
     print_entry_summary(&entry, Some(key));
@@ -1067,6 +1136,15 @@ const SERVE_HELP: &str = "Aizen is listening. Send a message to chat with the ag
 asking). /new (or /reset) starts a fresh conversation · /resume shows how much context is kept · \
 /help shows this.";
 
+/// Discord has no inline approval routing yet (unlike Telegram's ✓/✗ buttons), so destructive ops
+/// are auto-DENIED on a plain message — the agent simply skips them. This help text says so honestly
+/// instead of promising an approval prompt that never arrives. Use `/agent ` to run autonomously.
+const DISCORD_HELP: &str = "Aizen is listening. Send a message to chat with the agent \
+(read-only tools work as-is). Discord can't show approval prompts yet, so file edits / shell are \
+SKIPPED unless you prefix with `/agent ` to run fully autonomously (no approval needed). \
+Follow-ups keep context, so \"now fix it\" works. /new (or /reset) starts a fresh conversation · \
+/help shows this.";
+
 /// Split a string into <=`max`-char chunks (Telegram's message cap is 4096).
 fn chunk_text(s: &str, max: usize) -> Vec<String> {
     let chars: Vec<char> = s.chars().collect();
@@ -1096,7 +1174,7 @@ async fn run_agent_capture(
     let frozen = memory::refresh_frozen_core();
     let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let system = agent::build_system_prompt(&cwd, std::env::consts::OS, &date, model, Some(&frozen));
+    let system = agent::build_top_level_system_prompt(&cwd, std::env::consts::OS, &date, model, Some(&frozen));
     let registry = agent::builtin::default_registry_with_task(
         http.clone(),
         base_url.to_string(),
@@ -1187,7 +1265,16 @@ async fn run_serve_turn(
     let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
         client::chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
     };
-    let outcome = agent::run_agent_loop(chat, &cfg, &registry, history).await?;
+    // Mid-loop auto-compaction for long serve sessions: a NON-streaming summarize closure over the
+    // same endpoint. `cap_session` below stays only as a hard backstop (compaction usually keeps the
+    // history well under its cap).
+    let summarize = move |msgs: Vec<Message>| async move {
+        client::chat_with_tools(http_ref, base, key, model_ref, &msgs, &[])
+            .await
+            .map(|t| t.content.unwrap_or_default())
+    };
+    let outcome =
+        agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, history).await?;
 
     // Memory is the moat — passively learn durable facts from this turn (free; core stays gated).
     maybe_learn_memory(history);
@@ -1208,14 +1295,14 @@ async fn run_serve() -> Result<()> {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    let (client, cfg) = telegram::configured().context("telegram not configured — run `ng telegram setup` first")?;
+    let (client, cfg) = telegram::configured().context("telegram not configured — run `aizen telegram setup` first")?;
     let (base_url, api_key, model) =
-        resolve_endpoint(None, None, None).context("configure the model endpoint first (run `ng config`)")?;
+        resolve_endpoint(None, None, None).context("configure the model endpoint first (run `aizen config`)")?;
     let http = http_client()?;
 
     telegram::set_daemon_active(true);
     let client = Arc::new(client);
-    eprintln!("{}", style(format!("ng serve — listening on Telegram (Ctrl-C to stop). chats: {:?}", cfg.allowed_chat_ids)).dim());
+    eprintln!("{}", style(format!("aizen serve — listening on Telegram (Ctrl-C to stop). chats: {:?}", cfg.allowed_chat_ids)).dim());
 
     let (tx, mut rx) = mpsc::channel::<(i64, String)>(64);
 
@@ -1351,7 +1438,7 @@ fn run_time(cmd: TimeCmd) -> Result<()> {
 fn print_timeline() -> Result<()> {
     let (snaps, cursor) = timemachine::timeline()?;
     if snaps.is_empty() {
-        println!("(no checkpoints yet — `ng time save [label]`, or /checkpoint in the REPL)");
+        println!("(no checkpoints yet — `aizen time save [label]`, or /checkpoint in the REPL)");
         return Ok(());
     }
     for (i, s) in snaps.iter().enumerate() {
@@ -1366,7 +1453,7 @@ fn print_timeline() -> Result<()> {
     }
     let keep = cli_config::load().timemachine_keep.unwrap_or(50);
     let limit = if keep == 0 { "unlimited".to_string() } else { format!("auto-prune oldest past {keep}") };
-    println!("{}", style(format!("{} checkpoint(s) · {limit} · `ng time prune`/`clear` to tidy", snaps.len())).dim());
+    println!("{}", style(format!("{} checkpoint(s) · {limit} · `aizen time prune`/`clear` to tidy", snaps.len())).dim());
     Ok(())
 }
 
@@ -1433,7 +1520,7 @@ async fn run_discord(cmd: DiscordCmd) -> Result<()> {
 }
 
 async fn discord_test() -> Result<()> {
-    let (client, _) = discord::configured().context("Discord bot not set up — run `ng discord setup`")?;
+    let (client, _) = discord::configured().context("Discord bot not set up — run `aizen discord setup`")?;
     let name = client.get_me().await?;
     println!("{}", style(format!("✓ bot token valid — @{name}")).color256(splash::ACCENT));
     Ok(())
@@ -1512,7 +1599,7 @@ async fn discord_setup() -> Result<()> {
 
     cfg.discord = Some(d);
     cli_config::save(&cfg)?;
-    println!("\n{}", style("Saved. Start the bot with:  ng discord serve").color256(splash::ACCENT));
+    println!("\n{}", style("Saved. Start the bot with:  aizen discord serve").color256(splash::ACCENT));
     Ok(())
 }
 
@@ -1524,15 +1611,15 @@ async fn run_discord_serve() -> Result<()> {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    let (client, cfg) = discord::configured().context("Discord bot not configured — run `ng discord setup`")?;
+    let (client, cfg) = discord::configured().context("Discord bot not configured — run `aizen discord setup`")?;
     let (base_url, api_key, model) =
-        resolve_endpoint(None, None, None).context("configure the model endpoint first (run `ng config`)")?;
+        resolve_endpoint(None, None, None).context("configure the model endpoint first (run `aizen config`)")?;
     let http = http_client()?;
     let token = cfg.resolved_token().context("no bot token")?;
     let client = Arc::new(client);
     eprintln!(
         "{}",
-        style(format!("ng serve — listening on Discord (Ctrl-C to stop). channels: {:?}", cfg.allowed_channel_ids)).dim()
+        style(format!("aizen serve — listening on Discord (Ctrl-C to stop). channels: {:?}", cfg.allowed_channel_ids)).dim()
     );
 
     let (tx, mut rx) = mpsc::channel::<discord::Incoming>(64);
@@ -1549,7 +1636,7 @@ async fn run_discord_serve() -> Result<()> {
         };
         let trimmed = inc.content.trim();
         if trimmed == "/help" || trimmed == "/start" {
-            let _ = client.send_message(inc.channel_id, SERVE_HELP).await;
+            let _ = client.send_message(inc.channel_id, DISCORD_HELP).await;
             continue;
         }
         if trimmed == "/new" || trimmed == "/reset" {
@@ -1659,8 +1746,8 @@ impl Integration {
     fn blurb(&self) -> &'static str {
         match self {
             Integration::AppCatalog => "GitHub · Notion · Slack · Linear · Spotify · Google (via MCP)",
-            Integration::Telegram => "control ng from your phone (bot + approval prompts)",
-            Integration::Discord => "two-way bot (chat + run the agent) and/or one-way notify webhook",
+            Integration::Telegram => "control aizen from your phone (bot + approval prompts)",
+            Integration::Discord => "two-way bot (chat + run the agent; no approval prompts yet) and/or one-way notify webhook",
             Integration::Notify(c) => c.blurb(),
         }
     }
@@ -1833,7 +1920,7 @@ async fn discord_app_menu() -> Result<()> {
     let items = [
         "Set up two-way bot  (token + channel id)",
         "Test the bot token",
-        "Start the bot daemon  (ng discord serve — Ctrl-C to stop)",
+        "Start the bot daemon  (aizen discord serve — Ctrl-C to stop)",
         "Set up one-way notify webhook",
         "Disable the bot",
         "Back",
@@ -2395,7 +2482,7 @@ async fn telegram_menu() -> Result<()> {
         "Set up / reconfigure  (paste @BotFather token, capture chat id)",
         "Send a test message",
         "Status",
-        "Start daemon  (control ng from your phone — Ctrl-C to stop)",
+        "Start daemon  (control aizen from your phone — Ctrl-C to stop)",
         "Disable  (remove the bot config)",
         "Back",
     ];
@@ -2454,8 +2541,8 @@ async fn telegram_setup() -> Result<()> {
 
     cfg.telegram = Some(tg);
     cli_config::save(&cfg)?;
-    let _ = client.send_message(chat, "✅ Aizen connected. Run `ng serve`, then send /help.").await;
-    println!("\n{}", style("Saved. Start the daemon with:  ng serve").color256(splash::ACCENT));
+    let _ = client.send_message(chat, "✅ Aizen connected. Run `aizen serve`, then send /help.").await;
+    println!("\n{}", style("Saved. Start the daemon with:  aizen serve").color256(splash::ACCENT));
     Ok(())
 }
 
@@ -2474,7 +2561,7 @@ async fn poll_for_chat_id(client: &telegram::Client) -> Result<i64> {
             }
         }
     }
-    anyhow::bail!("timed out waiting for a message — run `ng telegram setup` again")
+    anyhow::bail!("timed out waiting for a message — run `aizen telegram setup` again")
 }
 
 // ───────────────────────────── interactive landing menu ─────────────────────────────
@@ -2616,10 +2703,10 @@ fn read_input_box(history: &[String]) -> Result<Option<(String, Vec<String>)>> {
         match key {
             Key::Enter => {
                 let text: String = chars.iter().collect();
-                // Collapse the 3-line box into a single compact `❯ …` echo (nothing when empty), so
+                // Collapse the 3-line box into a single compact `> …` echo (nothing when empty), so
                 // the scrollback reads as a clean transcript instead of a stack of empty boxes — AND
                 // so the box's presence is the unambiguous "your turn to type" signal (no box +
-                // spinner/⚙ traces = the agent is working).
+                // spinner/⊙ traces = the agent is working).
                 term.move_cursor_down(1).ok(); // → bottom border
                 term.clear_line().ok();
                 term.move_cursor_up(1).ok(); // → middle line
@@ -2748,8 +2835,8 @@ async fn run_menu() -> Result<()> {
     use std::io::IsTerminal;
     let forced = std::env::var_os("NG_MENU").is_some();
     if !forced && !std::io::stdin().is_terminal() {
-        println!("ng — Aizen agentic CLI");
-        println!("Run `ng --help` for commands, or `ng config` to set up the endpoint + key.");
+        println!("aizen — Aizen agentic CLI");
+        println!("Run `aizen --help` for commands, or `aizen config` to set up the endpoint + key.");
         return Ok(());
     }
     icons::set_tier(cli_config::load().icons.as_deref()); // apply the persisted icon style
@@ -2777,9 +2864,9 @@ fn prompt_mcp_trust(server_count: usize) {
     let theme = ui_theme();
     println!(
         "\n{}",
-        style(format!("⚠ This repo ships {server_count} MCP tool server(s) (./.aizen/mcp.json).")).color256(crate::theme::WARN)
+        style(format!("⚠ This repo ships {server_count} MCP tool server(s) (./.aizen/mcp.json).")).color256(crate::ui::theme::WARN)
     );
-    println!("{}", style("MCP servers can run commands on your machine — only trust repos you trust.").color256(crate::theme::FAINT));
+    println!("{}", style("MCP servers can run commands on your machine — only trust repos you trust.").color256(crate::ui::theme::FAINT));
     let ok = Confirm::with_theme(&theme)
         .with_prompt("Trust this repo and load its MCP servers?")
         .default(false)
@@ -2792,7 +2879,7 @@ fn prompt_mcp_trust(server_count: usize) {
         println!("{}", style("✓ trusted — its tools are now available.").color256(splash::ACCENT));
     } else {
         let _ = crate::agent::mcp::dismiss_project();
-        println!("{}", style("skipped — run `ng mcp trust` anytime to enable.").color256(crate::theme::FAINT));
+        println!("{}", style("skipped — run `aizen mcp trust` anytime to enable.").color256(crate::ui::theme::FAINT));
     }
 }
 
@@ -2838,16 +2925,16 @@ async fn first_run_onboarding() {
     if !proceed {
         println!(
             "\n{}",
-            style("No problem — run `ng config` whenever you're ready. Type /help inside for a tour.")
-                .color256(crate::theme::FAINT)
+            style("No problem — run `aizen config` whenever you're ready. Type /help inside for a tour.")
+                .color256(crate::ui::theme::FAINT)
         );
         return;
     }
 
     if let Err(e) = config_wizard().await {
         // A cancelled/failed wizard shouldn't abort the launch — fall through into the menu.
-        eprintln!("{} {e}", style("setup:").color256(crate::theme::WARN));
-        eprintln!("{}", style("You can finish later with `ng config`.").color256(crate::theme::FAINT));
+        eprintln!("{} {e}", style("setup:").color256(crate::ui::theme::WARN));
+        eprintln!("{}", style("You can finish later with `aizen config`.").color256(crate::ui::theme::FAINT));
         return;
     }
 
@@ -2861,14 +2948,20 @@ async fn first_run_onboarding() {
         .unwrap_or(false);
     if connect {
         if let Err(e) = apps_menu().await {
-            eprintln!("{} {e}", style("apps:").color256(crate::theme::WARN));
+            eprintln!("{} {e}", style("apps:").color256(crate::ui::theme::WARN));
         }
     }
 
     println!(
         "\n{} {}",
         style("✓ You're all set.").color256(splash::ACCENT).bold(),
-        style("Type to chat · / for commands · /apps for integrations.").color256(crate::theme::FAINT)
+        style("Type to chat · / for commands · /apps for integrations.").color256(crate::ui::theme::FAINT)
+    );
+    // Discovery nudge for the specialist library (never auto-installs — just points the way).
+    println!(
+        "{}",
+        style("Tip: add specialist sub-agents with `aizen agents install msitarzewski/agency-agents`.")
+            .color256(crate::ui::theme::FAINT)
     );
 }
 
@@ -3019,8 +3112,12 @@ async fn run_menu_sticky() -> Result<()> {
                     ..AgentConfig::default()
                 };
 
-                tui::set_working(true);
+                tui::clear_cancel(); // fresh turn → forget any Esc from a previous one
                 while input.cancel.try_recv().is_ok() {} // drain any stale cancel
+                // Arm LAST: the keyboard thread only queues a cancel once WORKING is true, so flipping
+                // it after the clear+drain guarantees no Esc meant for THIS turn gets swallowed in the
+                // arming window.
+                tui::set_working(true);
 
                 // Run the turn racing a cancel signal; on cancel the future is DROPPED at its current
                 // await (model stream / verify gate), which aborts the in-flight request. Because the
@@ -3037,7 +3134,11 @@ async fn run_menu_sticky() -> Result<()> {
                     let fut = agent::run_agent_loop(chat, &cfg, &registry, &mut history);
                     tokio::select! {
                         r = fut => Some(r),
-                        _ = input.cancel.recv() => None,
+                        // Match only a REAL signal: if the keyboard thread exits (read_key error/EOF)
+                        // its cancel_tx drops and recv() resolves to None — the `Some(())` pattern
+                        // fails, tokio disables this branch, and the turn completes instead of being
+                        // spuriously killed with "(interrupted by user)".
+                        Some(()) = input.cancel.recv() => None,
                     }
                 };
                 tui::set_working(false);
@@ -3555,7 +3656,7 @@ fn current_system_prompt(model: &str) -> String {
     let frozen = memory::refresh_frozen_core();
     let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    agent::build_system_prompt(&cwd, std::env::consts::OS, &date, model, Some(&frozen))
+    agent::build_top_level_system_prompt(&cwd, std::env::consts::OS, &date, model, Some(&frozen))
 }
 
 /// Reset the conversation to just the system prompt (fresh session / model change). Rebuilds the
@@ -3663,7 +3764,7 @@ fn print_cost(history: &[Message], model: &str) {
             }
             _ => line.push_str(&format!(
                 "  ·  {}",
-                style("set rates for a $ estimate: ng config set --price-in <$/1M> --price-out <$/1M>").dim()
+                style("set rates for a $ estimate: aizen config set --price-in <$/1M> --price-out <$/1M>").dim()
             )),
         }
         // Prompt-cache payoff (only when the provider reported cache reads → confirms caching works).
@@ -3880,7 +3981,7 @@ fn print_status_line(history: &[Message], model: &str) {
     let turns = history.iter().filter(|m| m.role == "user").count();
     let tg = if telegram::is_configured() { "  ·  📱 telegram" } else { "" };
     let yolo = if yolo_enabled() {
-        format!("  ·  {}", style("⚡ yolo").color256(splash::ACCENT))
+        format!("  ·  {}", style("⚡ yolo").color256(theme::WARN)) // reserved gold — runs hot
     } else {
         String::new()
     };
@@ -3904,70 +4005,22 @@ fn print_status_line(history: &[Message], model: &str) {
 }
 
 /// How many trailing user turns to keep verbatim when compacting (the rest is summarized).
-const COMPACT_KEEP_TURNS: usize = 3;
+const COMPACT_KEEP_TURNS: usize = agent::compact::KEEP_TURNS;
 
-/// Truncate to `max` chars with a `…[+N chars]` marker (char-safe, never splits a codepoint).
+/// Truncate to `max` chars with a `…[+N chars]` marker (delegates to the shared compaction core).
 fn truncate_chars(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}… [+{} chars]", chars[..max].iter().collect::<String>(), chars.len() - max)
-    }
+    agent::compact::truncate_chars(s, max)
 }
 
-/// Render conversation messages into a compact transcript for summarization. Tool payloads are
-/// truncated so the summary call stays cheap.
+/// Render conversation messages into a compact transcript (delegates to the shared compaction core).
 fn render_transcript(msgs: &[Message]) -> String {
-    let mut out = String::new();
-    for m in msgs {
-        let body = m.content.as_deref().unwrap_or("").trim();
-        match m.role.as_str() {
-            "user" => out.push_str(&format!("User: {body}\n")),
-            "assistant" if !m.tool_calls.is_empty() => {
-                if !body.is_empty() {
-                    out.push_str(&format!("Assistant: {body}\n"));
-                }
-                let calls: Vec<String> = m
-                    .tool_calls
-                    .iter()
-                    .map(|c| format!("{}({})", c.function.name, truncate_chars(&c.function.arguments, 160)))
-                    .collect();
-                out.push_str(&format!("Assistant→tools: {}\n", calls.join(", ")));
-            }
-            "assistant" => out.push_str(&format!("Assistant: {body}\n")),
-            "tool" => out.push_str(&format!("Tool result: {}\n", truncate_chars(body, 600))),
-            "system" => out.push_str(&format!("Note: {}\n", truncate_chars(body, 600))),
-            other => out.push_str(&format!("{other}: {body}\n")),
-        }
-    }
-    out
+    agent::compact::render_transcript(msgs)
 }
 
-/// Compute the compaction cut index: the kept tail starts here. It's always a `user` message, so
-/// the summarized block never ends mid-turn and the tail never begins with an orphan `tool` result
-/// (a dangling tool message 400s on strict gateways). Keeps the last `COMPACT_KEEP_TURNS` user
-/// turns verbatim. Returns `None` when the conversation is too short to be worth compacting.
-fn plan_compact_cut(history: &[Message]) -> Option<usize> {
-    // User messages (skipping the system prompt at index 0) are the clean turn boundaries.
-    let user_idxs: Vec<usize> =
-        history.iter().enumerate().skip(1).filter(|(_, m)| m.role == "user").map(|(i, _)| i).collect();
-    if user_idxs.len() < 2 {
-        return None;
-    }
-    let keep = COMPACT_KEEP_TURNS.min(user_idxs.len() - 1).max(1);
-    let cut = user_idxs[user_idxs.len() - keep];
-    if cut <= 1 {
-        None
-    } else {
-        Some(cut)
-    }
-}
-
-/// Summarize older turns to free context. Keeps the system prompt + the last `COMPACT_KEEP_TURNS`
-/// user turns verbatim; the block between is replaced by one model-written summary (a `system`
-/// message). The tail is cut at a USER-message boundary so no orphan `tool` result survives (a
-/// dangling tool message 400s on strict gateways). Returns (tokens_before, tokens_after).
+/// Summarize older turns to free context. Thin wrapper over [`agent::compact::compact_history`] that
+/// supplies a NON-streaming summarize closure over this session's endpoint. Returns
+/// (tokens_before, tokens_after). Same core the agent loop uses, so the REPL and `ng serve` compact
+/// identically.
 async fn compact_history(
     history: &mut Vec<Message>,
     http: &reqwest::Client,
@@ -3975,41 +4028,12 @@ async fn compact_history(
     key: &str,
     model: &str,
 ) -> Result<(usize, usize)> {
-    let before = session_tokens(history);
-    let cut = plan_compact_cut(history)
-        .ok_or_else(|| anyhow!("conversation too short to compact (need at least 2 turns)"))?;
-    let older = &history[1..cut];
-    if older.is_empty() {
-        anyhow::bail!("nothing older to compact");
-    }
-
-    let transcript = render_transcript(older);
-    let sys = Message::system(
-        "You compress a coding-assistant conversation to conserve context. Write a DENSE summary \
-         that preserves: the user's goals and explicit requests, decisions made, files/paths \
-         touched, commands run and their outcomes, important code/config, and any OPEN or \
-         UNFINISHED tasks. Use terse bullet points. Do NOT invent anything not in the transcript.",
-    );
-    let usr = Message::user(format!("Conversation to summarize:\n\n{transcript}"));
-    let turn = client::chat_with_tools(http, base, key, model, &[sys, usr], &[])
-        .await
-        .context("summarization call failed")?;
-    let summary = turn.content.unwrap_or_default();
-    if summary.trim().is_empty() {
-        anyhow::bail!("the model returned an empty summary");
-    }
-
-    let system_prompt = history[0].clone();
-    let tail: Vec<Message> = history[cut..].to_vec();
-    let mut rebuilt = Vec::with_capacity(2 + tail.len());
-    rebuilt.push(system_prompt);
-    rebuilt.push(Message::system(format!(
-        "[Earlier conversation auto-compacted to conserve context]\n{}",
-        summary.trim()
-    )));
-    rebuilt.extend(tail);
-    *history = rebuilt;
-    Ok((before, session_tokens(history)))
+    let summarize = move |msgs: Vec<Message>| async move {
+        client::chat_with_tools(http, base, key, model, &msgs, &[])
+            .await
+            .map(|t| t.content.unwrap_or_default())
+    };
+    agent::compact::compact_history(history, summarize, COMPACT_KEEP_TURNS).await
 }
 
 /// `/compact` — resolve the endpoint, then summarize older turns now (manual compaction).
@@ -4256,15 +4280,15 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
         }
         "checkpoint" | "snapshot" | "cp" => match timemachine::save(arg, false) {
             Ok(s) => tui::emit_line(&format!("{} #{} saved", style("✓ checkpoint").color256(splash::ACCENT), s.id)),
-            Err(e) => tui::emit_line(&style(format!("checkpoint: {e}")).color256(crate::theme::WARN).to_string()),
+            Err(e) => tui::emit_line(&style(format!("checkpoint: {e}")).color256(crate::ui::theme::WARN).to_string()),
         },
         "undo" => match timemachine::undo() {
             Ok(s) => tui::emit_line(&format!("{} checkpoint #{}", style("⏪ rewound to").color256(splash::ACCENT), s.id)),
-            Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::theme::WARN).to_string()),
+            Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::ui::theme::WARN).to_string()),
         },
         "redo" => match timemachine::redo() {
             Ok(s) => tui::emit_line(&format!("{} checkpoint #{}", style("⏩ re-applied").color256(splash::ACCENT), s.id)),
-            Err(e) => tui::emit_line(&style(format!("redo: {e}")).color256(crate::theme::WARN).to_string()),
+            Err(e) => tui::emit_line(&style(format!("redo: {e}")).color256(crate::ui::theme::WARN).to_string()),
         },
         // A user-defined command (`~/.nextgen/commands/<name>.md`) → expand its template and run it
         // as a normal chat turn. Falls back to "unknown" only when no command matches.
@@ -4469,13 +4493,13 @@ fn resolve_endpoint(
     let cfg = cli_config::load();
     let base_url = base_url
         .or(cfg.base_url)
-        .context("no base URL — run `ng config` (interactive setup), or pass --base-url / set NG_BASE_URL")?;
+        .context("no base URL — run `aizen config` (interactive setup), or pass --base-url / set NG_BASE_URL")?;
     let api_key = api_key
         .or(cfg.api_key)
-        .context("no API key — run `ng config` (interactive setup), or pass --api-key / set NG_API_KEY")?;
+        .context("no API key — run `aizen config` (interactive setup), or pass --api-key / set NG_API_KEY")?;
     let model = model
         .or(cfg.model)
-        .context("no model — run `ng config` (interactive setup) or `ng models` to list, or pass --model / set NG_MODEL")?;
+        .context("no model — run `aizen config` (interactive setup) or `aizen models` to list, or pass --model / set NG_MODEL")?;
     Ok((base_url, api_key, model))
 }
 
@@ -4484,10 +4508,10 @@ fn resolve_base_key(base_url: Option<String>, api_key: Option<String>) -> Result
     let cfg = cli_config::load();
     let base_url = base_url
         .or(cfg.base_url)
-        .context("no base URL — pass --base-url, set NG_BASE_URL, or run `ng config set --base-url <url>`")?;
+        .context("no base URL — pass --base-url, set NG_BASE_URL, or run `aizen config set --base-url <url>`")?;
     let api_key = api_key
         .or(cfg.api_key)
-        .context("no API key — pass --api-key, set NG_API_KEY, or run `ng config set --api-key <key>`")?;
+        .context("no API key — pass --api-key, set NG_API_KEY, or run `aizen config set --api-key <key>`")?;
     Ok((base_url, api_key))
 }
 
@@ -4580,7 +4604,7 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                 cfg.timemachine_keep = Some(k); // 0 = unlimited
             }
             cli_config::save(&cfg)?;
-            println!("{} {}", crate::theme::ok("✓"), style("saved").color256(splash::ACCENT));
+            println!("{} {}", crate::ui::theme::ok("✓"), style("saved").color256(splash::ACCENT));
             print_config(&cfg);
             Ok(())
         }
@@ -4720,9 +4744,9 @@ async fn config_wizard() -> Result<()> {
     let width = tui::width().clamp(46, 72);
     println!();
     println!("{}", style("Aizen · setup").bold().color256(splash::ACCENT));
-    println!("{}", style(cli_config::config_path().display()).color256(crate::theme::FAINT));
-    println!("{}", style("Enter keeps the shown default at each step · Ctrl-C cancels").color256(crate::theme::FAINT));
-    println!("{}", style("─".repeat(width)).color256(crate::theme::ACCENT_DIM));
+    println!("{}", style(cli_config::config_path().display()).color256(crate::ui::theme::FAINT));
+    println!("{}", style("Enter keeps the shown default at each step · Ctrl-C cancels").color256(crate::ui::theme::FAINT));
+    println!("{}", style("─".repeat(width)).color256(crate::ui::theme::ACCENT_DIM));
     // Group the steps under gold section headers so the flow reads as Connection → Model → Behavior.
     let step = |label: &str| {
         println!("\n{} {}", style("◆").color256(splash::ACCENT), style(label).color256(splash::ACCENT).bold());
@@ -4806,7 +4830,7 @@ async fn config_wizard() -> Result<()> {
         }
     }
     if cfg.model.is_none() {
-        anyhow::bail!("a model is required (run `ng models` to list them)");
+        anyhow::bail!("a model is required (run `aizen models` to list them)");
     }
 
     // 4) context window — drives the `% context` HUD + the auto-compact trigger. The model pick
@@ -4904,9 +4928,9 @@ async fn config_wizard() -> Result<()> {
     icons::set_tier(cfg.icons.as_deref()); // apply immediately for the "Saved" preview below
 
     cli_config::save(&cfg)?;
-    println!("\n{} {}", crate::theme::ok("✓"), style("Saved.").color256(splash::ACCENT).bold());
+    println!("\n{} {}", crate::ui::theme::ok("✓"), style("Saved.").color256(splash::ACCENT).bold());
     print_config(&cfg);
-    println!("{}", style("Ready — type a message, or run:  ng chat -p \"hello\"").color256(crate::theme::FAINT));
+    println!("{}", style("Ready — type a message, or run:  aizen chat -p \"hello\"").color256(crate::ui::theme::FAINT));
     Ok(())
 }
 
@@ -4934,7 +4958,7 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
     if !any_ctx {
         println!("\n{}", style("(this provider doesn't report context windows — the HUD estimates by model name)").dim());
     }
-    println!("\nset a default: `ng config set --model <id>`");
+    println!("\nset a default: `aizen config set --model <id>`");
     Ok(())
 }
 
@@ -4972,7 +4996,7 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         .unwrap_or_else(|_| ".".to_string());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let system =
-        agent::build_system_prompt(&cwd, std::env::consts::OS, &date, &model, Some(&frozen));
+        agent::build_top_level_system_prompt(&cwd, std::env::consts::OS, &date, &model, Some(&frozen));
 
     // Registry includes the `task` sub-agent tool (depth 0); a spawned sub-agent uses a
     // role-scoped registry WITHOUT `task` (no recursion).
@@ -5017,7 +5041,7 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         // One-shot `ng agent` is non-interactive: there is no next message to answer with, so
         // surface the question and exit rather than hang. Re-run in the REPL to answer it.
         StopReason::AwaitingInput(q) => eprintln!(
-            "\n[the agent needs clarification — re-run interactively (`ng`) to answer]\n❓ {q}"
+            "\n[the agent needs clarification — re-run interactively (`aizen`) to answer]\n❓ {q}"
         ),
     }
     Ok(())
@@ -5085,7 +5109,7 @@ fn run_persona(cmd: PersonaCmd) -> Result<()> {
             let active_slug = cli_config::load().persona.as_deref().map(skill::sanitize_name);
             let ps = persona::list();
             if ps.is_empty() {
-                println!("(no personas yet — `ng persona new <name>`, or /persona in the REPL)");
+                println!("(no personas yet — `aizen persona new <name>`, or /persona in the REPL)");
                 return Ok(());
             }
             for p in &ps {
@@ -5122,7 +5146,7 @@ fn run_persona(cmd: PersonaCmd) -> Result<()> {
         }
         PersonaCmd::Use { name } => {
             let p = persona::load(&name)
-                .ok_or_else(|| anyhow::anyhow!("no persona '{name}' (see `ng persona list`)"))?;
+                .ok_or_else(|| anyhow::anyhow!("no persona '{name}' (see `aizen persona list`)"))?;
             let mut cfg = cli_config::load();
             cfg.persona = Some(p.name.clone());
             cli_config::save(&cfg)?;
@@ -5140,7 +5164,7 @@ fn run_persona(cmd: PersonaCmd) -> Result<()> {
             let slug = match name {
                 Some(n) => skill::sanitize_name(&n),
                 None => persona::active_slug()
-                    .ok_or_else(|| anyhow::anyhow!("no active persona — pass a name or `ng persona use <name>`"))?,
+                    .ok_or_else(|| anyhow::anyhow!("no active persona — pass a name or `aizen persona use <name>`"))?,
             };
             let label = persona::load(&slug).map(|p| p.name).unwrap_or_else(|| slug.clone());
             persona_self_view(&slug, &label);
@@ -5148,7 +5172,7 @@ fn run_persona(cmd: PersonaCmd) -> Result<()> {
         }
         PersonaCmd::Remember { text, importance } => {
             let slug = persona::active_slug()
-                .ok_or_else(|| anyhow::anyhow!("no active persona — `ng persona use <name>` first"))?;
+                .ok_or_else(|| anyhow::anyhow!("no active persona — `aizen persona use <name>` first"))?;
             let imp = importance
                 .unwrap_or_else(|| {
                     persona::self_mem::episode_importance(&text, 0, persona::self_mem::looks_like_correction(&text))
@@ -5164,13 +5188,13 @@ fn run_persona(cmd: PersonaCmd) -> Result<()> {
             match persona::prompt_block() {
                 Some(p) => println!("<persona>\n{}\n</persona>", p.trim()),
                 None => {
-                    println!("(no persona active — `ng persona use <name>`)");
+                    println!("(no persona active — `aizen persona use <name>`)");
                     return Ok(());
                 }
             }
             match persona::self_block() {
                 Some(s) => println!("\n<self>\n{}\n</self>", s.trim()),
-                None => println!("\n(no <self> yet — the character has no self-memory; `ng persona remember \"...\"`)"),
+                None => println!("\n(no <self> yet — the character has no self-memory; `aizen persona remember \"...\"`)"),
             }
             Ok(())
         }
@@ -5188,7 +5212,7 @@ fn run_soul(cmd: Option<SoulCmd>) -> Result<()> {
                     soul::soul_path().display()
                 ),
                 None => println!(
-                    "(no operating identity yet — set one with `ng soul set` or edit {})",
+                    "(no operating identity yet — set one with `aizen soul set` or edit {})",
                     soul::soul_path().display()
                 ),
             }
@@ -5231,7 +5255,7 @@ async fn run_skill(cmd: SkillCmd) -> Result<()> {
         SkillCmd::List => {
             let skills = skill::list();
             if skills.is_empty() {
-                println!("(no skills — add one with `ng skill add <name>`, or /skills in the REPL)");
+                println!("(no skills — add one with `aizen skill add <name>`, or /skills in the REPL)");
                 return Ok(());
             }
             for s in &skills {
@@ -5245,7 +5269,7 @@ async fn run_skill(cmd: SkillCmd) -> Result<()> {
                 println!("{}", skill::render_loaded(&sk));
                 Ok(())
             }
-            None => anyhow::bail!("no skill named '{name}' (try `ng skill list`)"),
+            None => anyhow::bail!("no skill named '{name}' (try `aizen skill list`)"),
         },
         SkillCmd::Add { name, description, when, body } => {
             let body = match body {
@@ -5273,7 +5297,7 @@ async fn run_skill(cmd: SkillCmd) -> Result<()> {
         SkillCmd::Search { query, limit } => {
             let q = query.join(" ");
             if q.trim().is_empty() {
-                anyhow::bail!("a search query is required, e.g. `ng skill search deploy fastapi`");
+                anyhow::bail!("a search query is required, e.g. `aizen skill search deploy fastapi`");
             }
             let hits = skill_registry::search(&q, limit.unwrap_or(20).clamp(1, 50)).await?;
             if hits.is_empty() {
@@ -5282,7 +5306,7 @@ async fn run_skill(cmd: SkillCmd) -> Result<()> {
             }
             println!(
                 "{}",
-                style(format!("{} result(s) from {} — install with `ng skill install <owner/name>`", hits.len(), skill_registry::registry_base())).dim()
+                style(format!("{} result(s) from {} — install with `aizen skill install <owner/name>`", hits.len(), skill_registry::registry_base())).dim()
             );
             for sk in &hits {
                 println!("{}", sk.summary_line());
@@ -5327,6 +5351,473 @@ fn read_stdin(ctx: &'static str) -> Result<String> {
     Ok(buf.strip_prefix('\u{FEFF}').unwrap_or(&buf).trim().to_string())
 }
 
+// ── `aizen agents …` — the specialist sub-agent library (agency-agents format) ──
+
+/// A classified install source for `aizen agents install`.
+#[derive(Debug, PartialEq)]
+enum InstallSource {
+    /// `owner/repo` → cloned from github.com.
+    GitHubShorthand(String),
+    /// A full git URL (https `.git`/repo, `git@…`, `ssh://…`).
+    GitUrl(String),
+    /// A single `.md` agent file fetched over http(s).
+    FileUrl(String),
+    /// A local directory tree.
+    LocalDir(std::path::PathBuf),
+}
+
+/// Classify an install source string. Pure (no IO except an existing-dir probe) so it's unit-testable.
+fn classify_source(raw: &str) -> Result<InstallSource> {
+    let s = raw.trim();
+    if s.is_empty() {
+        anyhow::bail!("an install source is required (owner/repo, a git/.md URL, or a local dir)");
+    }
+    // http(s): a single .md file vs a git repo.
+    if s.starts_with("http://") || s.starts_with("https://") {
+        let path_only = s.split(['?', '#']).next().unwrap_or(s);
+        if path_only.to_ascii_lowercase().ends_with(".md") {
+            return Ok(InstallSource::FileUrl(s.to_string()));
+        }
+        return Ok(InstallSource::GitUrl(s.to_string()));
+    }
+    // scp-like / ssh git URLs, or any bare `*.git`.
+    if s.starts_with("git@") || s.starts_with("ssh://") || s.ends_with(".git") {
+        return Ok(InstallSource::GitUrl(s.to_string()));
+    }
+    // Explicit local-path forms, a Windows drive (`C:\…`), or an existing directory.
+    let drive = {
+        let b = s.as_bytes();
+        b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+    };
+    let looks_local = s.starts_with("./")
+        || s.starts_with("../")
+        || s.starts_with(".\\")
+        || s.starts_with("..\\")
+        || s.starts_with('/')
+        || s.starts_with('\\')
+        || drive;
+    if looks_local || std::path::Path::new(s).is_dir() {
+        return Ok(InstallSource::LocalDir(std::path::PathBuf::from(s)));
+    }
+    // GitHub shorthand: exactly `owner/repo` (one slash, both halves non-empty, no whitespace).
+    let parts: Vec<&str> = s.split('/').collect();
+    if parts.len() == 2 && parts.iter().all(|p| !p.is_empty() && !p.contains(char::is_whitespace)) {
+        return Ok(InstallSource::GitHubShorthand(s.to_string()));
+    }
+    anyhow::bail!(
+        "unrecognized source '{raw}' — use owner/repo, an https git URL, a `.md` URL, or a local directory"
+    );
+}
+
+async fn run_agents(cmd: Option<AgentsCmd>) -> Result<()> {
+    match cmd {
+        None => {
+            agents_default_view();
+            Ok(())
+        }
+        Some(AgentsCmd::List { division, source, enabled, json }) => {
+            agents_list(division.as_deref(), source.as_deref(), enabled, json)
+        }
+        Some(AgentsCmd::Show { name }) => match agents::load(&name) {
+            Some(def) => {
+                println!("{}", agents::render_card(&def));
+                Ok(())
+            }
+            None => anyhow::bail!("no agent named '{name}' (try `aizen agents list`)"),
+        },
+        Some(AgentsCmd::Where) => {
+            agents_where();
+            Ok(())
+        }
+        Some(AgentsCmd::Install { source, yes, enable_all, as_name }) => {
+            agents_install(&source, yes, enable_all, as_name.as_deref()).await
+        }
+        Some(AgentsCmd::Remove { name }) => {
+            if agents::delete_home(&name)? {
+                let _ = agents::set_enabled(&name, false);
+                println!("removed '{name}' from ~/.aizen/agents and unpinned it");
+            } else {
+                println!("(no agent named '{name}' under ~/.aizen/agents — `aizen agents where` shows the dirs)");
+            }
+            Ok(())
+        }
+        Some(AgentsCmd::Enable { name, all }) => agents_set_enabled(name.as_deref(), all, true),
+        Some(AgentsCmd::Disable { name, all }) => agents_set_enabled(name.as_deref(), all, false),
+    }
+}
+
+/// Bare `aizen agents`: list when any exist, else the install nudge.
+fn agents_default_view() {
+    if agents::has_any() {
+        let _ = agents_list(None, None, false, false);
+    } else {
+        agents_nudge();
+    }
+}
+
+fn agents_nudge() {
+    println!("No specialist agents yet. Install the agency-agents library with:");
+    println!("  {}", style("aizen agents install msitarzewski/agency-agents").color256(splash::ACCENT));
+    println!("…or drop `.md` personas into ~/.aizen/agents (or ~/.claude/agents).");
+}
+
+fn agents_list(division: Option<&str>, source: Option<&str>, enabled_only: bool, json: bool) -> Result<()> {
+    let enabled = agents::enabled_set();
+    let is_enabled = |slug: &str| enabled.as_ref().map(|e| e.contains(slug)).unwrap_or(false);
+
+    let mut all = agents::list();
+    if let Some(d) = division {
+        let d = d.to_lowercase();
+        all.retain(|a| a.division.as_deref() == Some(d.as_str()));
+    }
+    if let Some(src) = source {
+        let src = src.to_lowercase();
+        all.retain(|a| a.source.label() == src);
+    }
+    if enabled_only {
+        all.retain(|a| is_enabled(&a.slug()));
+    }
+
+    if json {
+        let arr: Vec<serde_json::Value> = all
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "slug": a.slug(),
+                    "name": a.name,
+                    "description": a.description,
+                    "division": a.division,
+                    "source": a.source.label(),
+                    "model": a.model,
+                    "tools": a.tools,
+                    "enabled": is_enabled(&a.slug()),
+                    "path": a.source_path.display().to_string(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+        return Ok(());
+    }
+
+    if all.is_empty() {
+        if agents::has_any() {
+            println!("(no agents match the filter)");
+        } else {
+            agents_nudge();
+        }
+        return Ok(());
+    }
+
+    let mut by_div: std::collections::BTreeMap<String, Vec<&agents::AgentDef>> = std::collections::BTreeMap::new();
+    for a in &all {
+        by_div
+            .entry(a.division.clone().unwrap_or_else(|| "(no division)".to_string()))
+            .or_default()
+            .push(a);
+    }
+    let total = all.len();
+    let enabled_count = all.iter().filter(|a| is_enabled(&a.slug())).count();
+    for (div, items) in &by_div {
+        println!("{}", style(format!("{div} ({})", items.len())).bold());
+        for a in items {
+            let mark = if is_enabled(&a.slug()) {
+                style("●").color256(splash::ACCENT).to_string()
+            } else {
+                style("○").dim().to_string()
+            };
+            let desc: String = a.description.chars().take(80).collect();
+            println!("  {} {}  —  {}", mark, a.slug(), desc.replace('\n', " "));
+        }
+    }
+    let hint = if enabled.is_some() {
+        format!("{total} agent(s) · {enabled_count} pinned to <agents>. Dispatch: task(agent=\"<slug>\").")
+    } else {
+        format!("{total} agent(s) · none pinned — `aizen agents enable <slug>` to advertise them.")
+    };
+    println!("{}", style(hint).dim());
+    Ok(())
+}
+
+fn agents_where() {
+    println!("Specialist agent sources (lower → higher precedence):");
+    for (src, dir, n) in agents::source_counts() {
+        let status = if !dir.exists() {
+            style("(absent)").dim().to_string()
+        } else {
+            format!("{n} agent(s)")
+        };
+        println!("  {:<16} {}  [{}]", src.label(), dir.display(), status);
+    }
+    println!(
+        "{}",
+        style("Installs write to ~/.aizen/agents; a higher-precedence dir wins on a slug collision.").dim()
+    );
+}
+
+fn agents_set_enabled(name: Option<&str>, all: bool, on: bool) -> Result<()> {
+    if all {
+        agents::set_all_enabled(on)?;
+        println!(
+            "{} all agents {} the <agents> index",
+            if on { "pinned" } else { "unpinned" },
+            if on { "to" } else { "from" }
+        );
+        return Ok(());
+    }
+    let name = name.context("provide an agent name, or pass --all")?;
+    let def = agents::load(name)
+        .with_context(|| format!("no agent named '{name}' (try `aizen agents list`)"))?;
+    agents::set_enabled(&def.slug(), on)?;
+    println!(
+        "{} '{}' {} the <agents> index",
+        if on { "pinned" } else { "unpinned" },
+        def.slug(),
+        if on { "to" } else { "from" }
+    );
+    Ok(())
+}
+
+fn confirm_write(prompt: &str) -> Result<bool> {
+    Ok(Confirm::with_theme(&ui_theme())
+        .with_prompt(prompt)
+        .default(true)
+        .interact_opt()
+        .ok()
+        .flatten()
+        .unwrap_or(false))
+}
+
+/// A filesystem-safe directory name from a repo slug/URL (last segment, `.git` stripped).
+fn sanitize_repo_name(s: &str) -> String {
+    let base = s.trim_end_matches('/').rsplit(['/', ':', '\\']).next().unwrap_or(s);
+    let base = base.trim_end_matches(".git");
+    let cleaned: String = base
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+        .collect();
+    let cleaned = cleaned.trim_matches(['-', '.']).to_string();
+    if cleaned.is_empty() { "agents".to_string() } else { cleaned }
+}
+
+fn unique_n() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
+/// `git clone --depth 1` (shallow, quiet, NO submodule recursion) into `dest`. Cloning runs NO repo
+/// code — it only reads files. `--no-recurse-submodules` stops a hostile `.gitmodules` from making git
+/// fetch arbitrary (possibly internal) submodule URLs we never vetted.
+fn git_clone_shallow(url: &str, dest: &std::path::Path) -> Result<()> {
+    let out = std::process::Command::new("git")
+        .args(["clone", "--depth", "1", "--no-recurse-submodules", "--quiet", url])
+        .arg(dest)
+        .output()
+        .context("running `git clone` (is git installed and on PATH?)")?;
+    if !out.status.success() {
+        anyhow::bail!("git clone failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// Extract the host from a NON-http(s) git URL (`git@host:path`, `ssh://[user@]host[:port]/path`,
+/// `git://host/path`) so the SSRF floor can guard it too. `None` if no host is discernible.
+fn git_url_host(url: &str) -> Option<String> {
+    let non_empty = |s: &str| {
+        let s = s.trim();
+        if s.is_empty() { None } else { Some(s.to_string()) }
+    };
+    // scp-like: [user@]host:path (no scheme).
+    if url.starts_with("git@") || (url.contains('@') && url.contains(':') && !url.contains("://")) {
+        let after_at = url.rsplit('@').next().unwrap_or(url);
+        return non_empty(after_at.split(':').next().unwrap_or(after_at));
+    }
+    let rest = url.strip_prefix("ssh://").or_else(|| url.strip_prefix("git://"))?;
+    let after_at = rest.rsplit('@').next().unwrap_or(rest);
+    non_empty(after_at.split(['/', ':']).next().unwrap_or(after_at))
+}
+
+/// Copy every `*.md` that `looks_like_agent` from `src` (recursively, dotdirs skipped) into
+/// `dest_root`, preserving the relative subpath. Returns `(copied, skipped)`.
+fn copy_agent_tree(src: &std::path::Path, dest_root: &std::path::Path) -> Result<(usize, usize)> {
+    let mut copied = 0;
+    let mut skipped = 0;
+    copy_agent_walk(src, src, dest_root, &mut copied, &mut skipped, 0)?;
+    Ok((copied, skipped))
+}
+
+fn copy_agent_walk(
+    dir: &std::path::Path,
+    src_root: &std::path::Path,
+    dest_root: &std::path::Path,
+    copied: &mut usize,
+    skipped: &mut usize,
+    depth: usize,
+) -> Result<()> {
+    if depth > 12 {
+        return Ok(());
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue; // skip .git, dotfiles
+        }
+        // Never follow symlinks out of an UNTRUSTED cloned tree (a symlinked `x.md` could pull in a
+        // file outside the repo; a symlinked dir could escape it). The loader treats the user's own
+        // dirs as trusted, but install copies third-party content, so refuse symlinks here.
+        if e.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+            continue;
+        }
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            copy_agent_walk(&p, src_root, dest_root, copied, skipped, depth + 1)?;
+        } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("md")) {
+            let Ok(content) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            if !agents::looks_like_agent(&content) {
+                *skipped += 1;
+                continue;
+            }
+            let rel = p.strip_prefix(src_root).unwrap_or(&p);
+            let dest = dest_root.join(rel);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            std::fs::write(&dest, content).with_context(|| format!("writing {}", dest.display()))?;
+            *copied += 1;
+        }
+    }
+    Ok(())
+}
+
+async fn agents_install(source: &str, yes: bool, enable_all: bool, as_name: Option<&str>) -> Result<()> {
+    let classified = classify_source(source)?;
+    println!(
+        "{}",
+        style("⚠ agent bodies are third-party system prompts — they run as sub-agents with edit/shell scope. Review before pinning.").dim()
+    );
+    match classified {
+        InstallSource::FileUrl(url) => {
+            crate::core::net_guard::guard_url_async(&url).await?;
+            if !yes && !confirm_write(&format!("Fetch and install the agent at {url}?"))? {
+                println!("cancelled.");
+                return Ok(());
+            }
+            let http = http_client()?;
+            let resp = http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+            if !resp.status().is_success() {
+                anyhow::bail!("upstream returned HTTP {}", resp.status());
+            }
+            let text = resp.text().await.context("reading response body")?;
+            if !agents::looks_like_agent(&text) {
+                anyhow::bail!("that URL isn't an agent (needs frontmatter `name:` + a non-empty body)");
+            }
+            let stem = url.trim_end_matches('/').rsplit('/').next().unwrap_or("agent");
+            let stem = stem.split(['?', '#']).next().unwrap_or(stem).trim_end_matches(".md");
+            let stem = if stem.is_empty() { "agent" } else { stem }; // e.g. a URL ending in "/.md"
+            let path = agents::save_home(&text, as_name.unwrap_or(stem))?;
+            println!("installed 1 agent → {}", path.display());
+            if enable_all {
+                agents::set_all_enabled(true)?;
+                println!("…and pinned all agents to <agents>.");
+            }
+            Ok(())
+        }
+        InstallSource::LocalDir(dir) => {
+            if !dir.is_dir() {
+                anyhow::bail!("not a directory: {}", dir.display());
+            }
+            if !yes && !confirm_write(&format!("Install agents from {}?", dir.display()))? {
+                println!("cancelled.");
+                return Ok(());
+            }
+            let label = dir.file_name().and_then(|s| s.to_str()).unwrap_or("local");
+            let dest = agents::agents_dir().join(sanitize_repo_name(label));
+            std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
+            let (copied, skipped) = copy_agent_tree(&dir, &dest)?;
+            crate::core::config::harden_dir(&agents::agents_dir());
+            finish_install(copied, skipped, &dest, enable_all)
+        }
+        InstallSource::GitHubShorthand(slug) => {
+            install_from_git(&format!("https://github.com/{slug}.git"), &slug, yes, enable_all).await
+        }
+        InstallSource::GitUrl(url) => {
+            let label = sanitize_repo_name(&url);
+            install_from_git(&url, &label, yes, enable_all).await
+        }
+    }
+}
+
+async fn install_from_git(url: &str, label: &str, yes: bool, enable_all: bool) -> Result<()> {
+    // SSRF floor — guard the destination host whatever the git transport is.
+    if url.starts_with("https://") || url.starts_with("http://") {
+        crate::core::net_guard::guard_url_async(url).await?;
+    } else if let Some(host) = git_url_host(url) {
+        // ssh:// / git@ / git:// never go through the http(s) guard; guard the resolved host directly
+        // so an internal endpoint (e.g. git@10.0.0.5:…) can't be reached past the floor.
+        crate::core::net_guard::guard_url_async(&format!("https://{host}")).await?;
+    }
+    if !yes && !confirm_write(&format!("Clone {url} and install its agents into ~/.aizen/agents?"))? {
+        println!("cancelled.");
+        return Ok(());
+    }
+    let repo = sanitize_repo_name(label);
+    let dest = agents::agents_dir().join(&repo);
+    let staging = std::env::temp_dir().join(format!("aizen-agents-clone-{}-{}", std::process::id(), unique_n()));
+    let _ = std::fs::remove_dir_all(&staging);
+    println!("{}", style(format!("cloning {url} …")).dim());
+
+    let url_s = url.to_string();
+    let staging_c = staging.clone();
+    let clone_res = tokio::task::spawn_blocking(move || git_clone_shallow(&url_s, &staging_c))
+        .await
+        .context("clone task panicked")?;
+
+    // Always clean the staging clone, whether or not the copy succeeds.
+    let outcome = (|| -> Result<(usize, usize)> {
+        clone_res?;
+        std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
+        let counts = copy_agent_tree(&staging, &dest)?;
+        crate::core::config::harden_dir(&agents::agents_dir());
+        Ok(counts)
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+
+    let (copied, skipped) = outcome?;
+    finish_install(copied, skipped, &dest, enable_all)
+}
+
+fn finish_install(copied: usize, skipped: usize, dest: &std::path::Path, enable_all: bool) -> Result<()> {
+    if copied == 0 {
+        // Nothing landed. Use `remove_dir` (empty-only), NOT `remove_dir_all`: it removes the dir we
+        // just created but can never wipe pre-existing user files in a same-named directory.
+        let _ = std::fs::remove_dir(dest);
+        anyhow::bail!(
+            "no agents found ({skipped} non-agent file(s) skipped) — the source had no `*.md` with frontmatter `name:` + a body"
+        );
+    }
+    println!(
+        "installed {copied} agent(s) → {} ({skipped} non-agent file(s) skipped)",
+        dest.display()
+    );
+    if enable_all {
+        agents::set_all_enabled(true)?;
+        println!("…and pinned all agents to <agents>.");
+    } else {
+        println!(
+            "{}",
+            style("none are pinned yet — `aizen agents enable <slug>` (or re-run with --enable-all) to advertise them.").dim()
+        );
+    }
+    println!("{}", style("review: `aizen agents list` · `aizen agents show <slug>`").dim());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5355,6 +5846,49 @@ mod tests {
         assert_eq!(ctx_window_for("deepseek-chat"), 64_000);
         assert_eq!(ctx_window_for("gpt-4o-mini"), 128_000); // default family
         assert_eq!(ctx_window_for("some-unknown-model"), 128_000); // fallback
+    }
+
+    #[test]
+    fn classify_source_covers_the_matrix() {
+        use super::InstallSource::*;
+        // GitHub shorthand
+        assert_eq!(classify_source("msitarzewski/agency-agents").unwrap(), GitHubShorthand("msitarzewski/agency-agents".into()));
+        // git URLs (https repo, .git, scp-like, ssh)
+        assert_eq!(classify_source("https://github.com/owner/repo").unwrap(), GitUrl("https://github.com/owner/repo".into()));
+        assert_eq!(classify_source("https://github.com/owner/repo.git").unwrap(), GitUrl("https://github.com/owner/repo.git".into()));
+        assert_eq!(classify_source("git@github.com:owner/repo.git").unwrap(), GitUrl("git@github.com:owner/repo.git".into()));
+        assert_eq!(classify_source("ssh://git@host/owner/repo").unwrap(), GitUrl("ssh://git@host/owner/repo".into()));
+        // single .md file (plain + query-stripped)
+        assert_eq!(classify_source("https://example.com/a/code-reviewer.md").unwrap(), FileUrl("https://example.com/a/code-reviewer.md".into()));
+        assert_eq!(classify_source("https://example.com/x.md?token=abc").unwrap(), FileUrl("https://example.com/x.md?token=abc".into()));
+        // local dir forms
+        assert!(matches!(classify_source("./local").unwrap(), LocalDir(_)));
+        assert!(matches!(classify_source("/abs/path").unwrap(), LocalDir(_)));
+        assert!(matches!(classify_source(".\\win").unwrap(), LocalDir(_)));
+        assert!(matches!(classify_source("C:\\Users\\me\\agents").unwrap(), LocalDir(_)));
+        // errors: not a path, not a url, not owner/repo
+        assert!(classify_source("a/b/c").is_err(), "3-segment is not shorthand");
+        assert!(classify_source("two words").is_err());
+        assert!(classify_source("   ").is_err());
+    }
+
+    #[test]
+    fn sanitize_repo_name_extracts_clean_dir() {
+        assert_eq!(sanitize_repo_name("msitarzewski/agency-agents"), "agency-agents");
+        assert_eq!(sanitize_repo_name("https://github.com/owner/repo.git"), "repo");
+        assert_eq!(sanitize_repo_name("git@github.com:owner/repo.git"), "repo");
+        assert_eq!(sanitize_repo_name("/some/local/My Agents"), "My-Agents");
+    }
+
+    #[test]
+    fn git_url_host_extracts_host_for_ssrf_guard() {
+        assert_eq!(git_url_host("git@github.com:owner/repo.git").as_deref(), Some("github.com"));
+        assert_eq!(git_url_host("git@10.0.0.5:a/b.git").as_deref(), Some("10.0.0.5"));
+        assert_eq!(git_url_host("ssh://git@host.example/owner/repo").as_deref(), Some("host.example"));
+        assert_eq!(git_url_host("ssh://host:22/path").as_deref(), Some("host"));
+        assert_eq!(git_url_host("git://internal/repo").as_deref(), Some("internal"));
+        // http(s) are guarded on the path directly, not via this extractor.
+        assert_eq!(git_url_host("https://github.com/o/r"), None);
     }
 
     #[test]
@@ -5428,7 +5962,7 @@ mod tests {
             Message::user("u3"),
             Message::assistant("a3"),
         ];
-        let cut = plan_compact_cut(&h).expect("should compact");
+        let cut = agent::compact::plan_compact_cut(&h, COMPACT_KEEP_TURNS).expect("should compact");
         // Tail MUST begin at a user message → never an orphan `tool` result.
         assert_eq!(h[cut].role, "user", "cut index {cut} is not a user boundary");
         assert!(cut > 1, "must summarize at least one older message");
@@ -5438,11 +5972,12 @@ mod tests {
 
     #[test]
     fn compact_keeps_short_conversations_intact() {
-        assert_eq!(plan_compact_cut(&[Message::system("s")]), None);
-        assert_eq!(plan_compact_cut(&[Message::system("s"), Message::user("u")]), None);
+        let k = COMPACT_KEEP_TURNS;
+        assert_eq!(agent::compact::plan_compact_cut(&[Message::system("s")], k), None);
+        assert_eq!(agent::compact::plan_compact_cut(&[Message::system("s"), Message::user("u")], k), None);
         // one full turn (1 user) → not worth compacting
         assert_eq!(
-            plan_compact_cut(&[Message::system("s"), Message::user("u"), Message::assistant("a")]),
+            agent::compact::plan_compact_cut(&[Message::system("s"), Message::user("u"), Message::assistant("a")], k),
             None
         );
         // two turns → compact, tail starts at the 2nd user
@@ -5453,7 +5988,7 @@ mod tests {
             Message::user("u2"),
             Message::assistant("a2"),
         ];
-        assert_eq!(plan_compact_cut(&two), Some(3));
+        assert_eq!(agent::compact::plan_compact_cut(&two, k), Some(3));
         assert_eq!(two[3].role, "user");
     }
 

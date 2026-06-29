@@ -141,7 +141,7 @@ pub async fn run_verify_gate(cwd: &Path, timeout_secs: u64) -> Option<VerifyGate
 /// The user-message text injected when the gate fails (the model's one fix-turn prompt).
 pub fn format_gate_failure(r: &VerifyGateResult) -> String {
     format!(
-        "[ng verify] `{}` FAILED ({} ms). Fix these errors before reporting the task done:\n\n{}",
+        "[aizen verify] `{}` FAILED ({} ms). Fix these errors before reporting the task done:\n\n{}",
         r.command, r.duration_ms, r.output
     )
 }

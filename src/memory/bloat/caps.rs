@@ -4,7 +4,7 @@
 //! brings one back). Curated facts (manual / user-explicit / imported) are EXEMPT: a
 //! deliberately-authored fact is never auto-evicted.
 
-use crate::config;
+use crate::core::config;
 use crate::memory::provenance::ProvenanceKind;
 use crate::memory::store::{self, MemoryEntry};
 use anyhow::{Context, Result};
@@ -110,6 +110,7 @@ mod tests {
             source: ProvenanceKind::Inferred,
             confidence: 0.8,
             session_id: "s",
+            no_core: false,
         };
         let id = store::add_learned(&w).unwrap();
         // back-date created/updated so the LRU order is deterministic in the test

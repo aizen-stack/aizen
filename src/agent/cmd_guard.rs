@@ -37,7 +37,13 @@ static BLOCKLIST: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         // AND GNU long flags in any order (rm --recursive --force / , rm -r --force ~), incl.
         // --no-preserve-root. The flag list is arbitrary tokens; at least one recursive/force token
         // must precede a root target. (`[a-z-]+` lets long flags like --no-preserve-root match.)
-        (r"(?i)\brm\s+(-{1,2}[a-z-]+\s+)*(-[a-z]*[rf][a-z]*|--recursive|--force|--no-preserve-root)(\s+-{1,2}[a-z-]+)*\s+(/|/\*|~|\$HOME)(\s|$)",
+        // The root target accepts every POSIX spelling of "/" — bare `/`, `//`, `/.`, `/./`, `/..`
+        // (parent-of-root IS root) — plus `/*`, `~`, `$HOME`. `classify` also retries the match on a
+        // quote-stripped copy so `rm -rf "/"`, `/""`, `""/`, `rm -r"f" /` (the shell removes the
+        // quotes before rm sees them) can't smuggle a root target past the floor. NON-root paths
+        // (`/etc`, `/home/u/tmp`) have a non-slash/non-dot char after the leading slash, so the run
+        // stops and the trailing `(\s|$)` fails → they correctly stay `Ask`.
+        (r"(?i)\brm\s+(-{1,2}[a-z-]+\s+)*(-[a-z]*[rf][a-z]*|--recursive|--force|--no-preserve-root)(\s+-{1,2}[a-z-]+)*\s+(/+(\.+/*)*|/\*|~|\$HOME)(\s|$)",
             "recursive delete of a filesystem root"),
         (r"(?i)\brm\b[^\n|;&]*\b--no-preserve-root\b", "rm --no-preserve-root"),
         // Filesystem creation over a whole device.
@@ -51,7 +57,7 @@ static BLOCKLIST: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         (r"(?i)\b(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(sh|bash|zsh|python3?|perl)\b",
             "pipe a remote script straight into a shell"),
         // World-writable recursive chmod from a root.
-        (r"(?i)\bchmod\s+(-[a-z]*\s+)*-?R[a-z]*\s+0*777\s+(/|/\*|~)(\s|$)", "recursive chmod 777 on a root"),
+        (r"(?i)\bchmod\s+(-[a-z]*\s+)*-?R[a-z]*\s+0*777\s+(/+(\.+/*)*|/\*|~)(\s|$)", "recursive chmod 777 on a root"),
         // Windows: format a drive, or recursive force-delete of a drive root.
         (r"(?i)\bformat\s+[a-z]:", "format a Windows drive"),
         (r"(?i)\b(del|erase)\s+(/[a-z]\s+)*[a-z]:\\?(\s|\*|$)", "force-delete a Windows drive root"),
@@ -94,9 +100,15 @@ pub fn classify(command: &str) -> Verdict {
     }
     let norm = collapse_ws(cmd);
 
-    // 1) Hard floor first — scan the whole string so chaining can't hide a blocked op.
+    // 1) Hard floor first — scan the whole string so chaining can't hide a blocked op. Match against
+    // BOTH the normalized command AND a quote-stripped copy: the shell removes quotes before the
+    // program runs (`rm -rf "/"`, `/""`, `""/`, `rm -r"f" /` all reach `rm` as a root delete), so the
+    // floor must see what the program will actually receive. (Matching both keeps patterns that rely
+    // on literal chars working; a rare false-positive on a quoted *mention* like `echo "rm -rf /"`
+    // fails safe by blocking, which is acceptable for a catastrophic-only floor.)
+    let unquoted = strip_quotes(&norm);
     for (re, reason) in BLOCKLIST.iter() {
-        if re.is_match(&norm) {
+        if re.is_match(&norm) || re.is_match(&unquoted) {
             return Verdict::Blocked((*reason).to_string());
         }
     }
@@ -116,6 +128,14 @@ pub fn classify(command: &str) -> Verdict {
 /// Collapse runs of whitespace to single spaces (so patterns don't need `\s+` everywhere).
 fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A copy of the command with ALL shell quote characters removed — mirrors what the shell strips
+/// before the program runs (`rm -rf /""`, `/''`, `""/`, `rm -r"f" /` all reach `rm` as a root delete).
+/// Used ONLY to harden the hard-floor match; the read-only/allow path keeps using the un-stripped form
+/// (staying conservative there is fine). Quotes anywhere — surrounding, empty, or embedded — collapse.
+fn strip_quotes(s: &str) -> String {
+    s.chars().filter(|c| *c != '\'' && *c != '"').collect()
 }
 
 /// Split a command on shell chaining operators (`|`, `||`, `&&`, `;`, `&`) into segments.
@@ -172,6 +192,19 @@ mod tests {
         assert!(blocked("rm -fr /"));
         assert!(blocked("sudo rm -rf --no-preserve-root /"));
         assert!(blocked("rm -rf ~"));
+        // Root-equivalent spellings the bare-`/` pattern used to miss (the confirmed floor bypass).
+        assert!(blocked("rm -rf //"));
+        assert!(blocked("rm -rf /."));
+        assert!(blocked("rm -rf /./"));
+        assert!(blocked("rm -rf /.."));
+        // Quoted root targets — the shell strips the quotes, so the floor must too (anywhere).
+        assert!(blocked("rm -rf \"/\""));
+        assert!(blocked("rm -rf '/'"));
+        assert!(blocked("rm -rf /\"\""));
+        assert!(blocked("rm -rf /''"));
+        assert!(blocked("rm -rf \"\"/"));
+        assert!(blocked("rm -rf /.\"\""));
+        assert!(blocked("rm -r\"f\" /"), "quotes embedded inside the flag");
         // GNU long flags (the hole the short-flag-only pattern missed).
         assert!(blocked("rm --recursive --force /"));
         assert!(blocked("rm --force --recursive /"));
@@ -205,6 +238,10 @@ mod tests {
         assert!(!blocked("rm --recursive --force node_modules")); // long flags, non-root target → Ask
         assert!(!blocked("rm -rf ./build"));
         assert!(!blocked("rm file.txt"));
+        // The broadened root pattern must NOT swallow real subdirectories under / (regression guard).
+        assert!(!blocked("rm -rf /home/user/project"));
+        assert!(!blocked("rm -rf /tmp/cache"));
+        assert!(!blocked("rm -rf /var/log/app"));
         assert!(!blocked("git reset --hard HEAD"));
         assert!(!blocked("dd if=in.img of=out.img"));
         assert_eq!(classify("rm -rf target"), Verdict::Ask);

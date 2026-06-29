@@ -87,7 +87,7 @@ fn now() -> i64 {
 
 /// `~/.aizen/mcp-tokens/` — the per-server token cache directory.
 pub fn tokens_dir() -> PathBuf {
-    crate::config::nextgen_home().join("mcp-tokens")
+    crate::core::config::nextgen_home().join("mcp-tokens")
 }
 
 /// Token-cache path for one server key (sanitized so a `/` in a key can't escape the dir).
@@ -417,9 +417,26 @@ async fn wait_for_code(listener: tokio::net::TcpListener, expected_state: &str) 
             Ok(Err(e)) => bail!("loopback accept failed: {e}"),
             Err(_) => bail!("timed out after {}s waiting for the sign-in redirect", AUTH_TIMEOUT.as_secs()),
         };
-        let mut buf = [0u8; 8192];
-        let n = sock.read(&mut buf).await.unwrap_or(0);
-        let req = String::from_utf8_lossy(&buf[..n]);
+        // Accumulate across reads until we have at least the request line (CRLF). A single read() is
+        // NOT guaranteed to deliver the whole line — when the auth server appends a long
+        // state/code/iss query or a proxy segments the request, the first read can arrive truncated,
+        // which used to parse a partial path, find no `code`, and hang sign-in to the 300s timeout.
+        let mut data: Vec<u8> = Vec::with_capacity(8192);
+        let mut tmp = [0u8; 4096];
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), sock.read(&mut tmp)).await {
+                Ok(Ok(0)) => break, // EOF
+                Ok(Ok(m)) => {
+                    data.extend_from_slice(&tmp[..m]);
+                    // Have the request line (CRLF), or hit a sane cap → stop reading and parse.
+                    if data.windows(2).any(|w| w == b"\r\n") || data.len() >= 16 * 1024 {
+                        break;
+                    }
+                }
+                _ => break, // read error or a stalled client (per-read timeout) — parse what we have
+            }
+        }
+        let req = String::from_utf8_lossy(&data);
         let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("/");
         let parsed = url::Url::parse(&format!("http://127.0.0.1{path}")).ok();
         let (mut code, mut state, mut err) = (None, None, None);
@@ -537,7 +554,7 @@ pub async fn authorize(key: &str, server_url: &str, cfg: &OAuthConfig, www_authe
 /// Refresh an expired/invalid access token using the cached refresh token; persist + return the new
 /// set. The refresh token is preserved if the server doesn't rotate it.
 pub async fn refresh(key: &str, t: &TokenSet) -> Result<TokenSet> {
-    let rt = t.refresh_token.clone().context("no refresh token — run `ng apps login` again")?;
+    let rt = t.refresh_token.clone().context("no refresh token — run `aizen apps login` again")?;
     let client = http_client()?;
     let scope = t.scope.clone().unwrap_or_default();
     let resource = t.resource.clone().unwrap_or_default();

@@ -8,7 +8,7 @@
 //!                   but ONLY after confirmation (auto-learned facts never silently
 //!                   enter the always-injected prompt).
 
-use crate::config::MemorySettings;
+use crate::core::config::MemorySettings;
 use crate::memory::learning::extract_free::Candidate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

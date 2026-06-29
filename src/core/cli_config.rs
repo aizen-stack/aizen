@@ -6,7 +6,7 @@
 //! The key is stored in plaintext (standard for a CLI credential file, like `~/.aws/credentials`)
 //! but the file is tightened to owner-only (0600) on Unix at write time — see `save`.
 
-use crate::config::nextgen_home;
+use crate::core::config::nextgen_home;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -175,7 +175,7 @@ pub fn load() -> CliConfig {
             if !WARNED.swap(true, Ordering::Relaxed) {
                 eprintln!(
                     "warning: {} is corrupt ({e}); using defaults. A .bak copy is kept before any \
-                     re-save — run `ng config` to repair.",
+                     re-save — run `aizen config` to repair.",
                     path.display()
                 );
             }
@@ -192,7 +192,7 @@ pub fn save(cfg: &CliConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
-        crate::config::harden_dir(parent);
+        crate::core::config::harden_dir(parent);
     }
     // If the file on disk is currently corrupt, preserve it as `.bak` before we clobber it — so a
     // hand-edit typo or a partial write doesn't silently destroy the rest of the user's settings.
@@ -203,7 +203,7 @@ pub fn save(cfg: &CliConfig) -> Result<()> {
     }
     let json = serde_json::to_string_pretty(cfg)?;
     std::fs::write(&path, json + "\n").with_context(|| format!("writing {}", path.display()))?;
-    crate::config::harden_file(&path);
+    crate::core::config::harden_file(&path);
     Ok(())
 }
 
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_disk() {
-        let _g = crate::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-cfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("NEXTGEN_HOME", &dir);

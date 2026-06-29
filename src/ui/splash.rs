@@ -1,19 +1,20 @@
-//! The `ng` landing splash — a hermes-style title + a bordered panel listing the agent's tools
-//! and the CLI's commands. One cohesive gold accent (no rainbow), rich structure. Rendered once
-//! when you open the interactive menu (bare `ng`). [`render`] builds it as a string (so the sticky
-//! TUI can print it into its scroll region); [`print`] writes that string to stdout.
+//! The Aizen landing splash — a hermes-style title + a bordered panel listing the agent's tools
+//! and the CLI's commands. One cohesive moonlight-silver accent (no rainbow), rich structure.
+//! Rendered once when you open the interactive menu (bare `aizen`). [`render`] builds it as a string
+//! (so the sticky TUI can print it into its scroll region); [`print`] writes that string to stdout.
 
-use crate::cli_config;
+use crate::core::cli_config;
 use console::{measure_text_width, style};
 use std::fmt::Write as _;
 use std::io::IsTerminal as _;
 
-/// Silver gradient for the 5 title rows (near-white → darker grey), 256-color. The block-art logo
-/// stays metallic silver — a deliberate contrast against the gold accent (classic silver+gold pair).
+/// Silver gradient for the 5 title rows (near-white → darker grey), 256-color. The block-art wordmark
+/// is metallic silver-white — the brightest note in the moonlight palette, the way the design renders
+/// the AIZEN wordmark at #f5f4f0 over the dark ground.
 const TITLE: [u8; 5] = [255, 253, 251, 248, 245];
-/// The single brand accent — now the warm gold from [`crate::theme`] (the "Studio" identity), shared
-/// across the whole TUI so borders / headers / item names / the input box all speak one colour.
-pub const ACCENT: u8 = crate::theme::ACCENT;
+/// The single brand accent — the moonlight silver from [`crate::ui::theme`], shared across the whole
+/// TUI so headers / item names / the input box all speak one colour ("the one who holds the moon").
+pub const ACCENT: u8 = crate::ui::theme::ACCENT;
 const INNER: usize = 78;
 
 /// Agent tools, grouped (mirrors `agent::builtin` — keep in sync). Conditional/dynamic tools
@@ -164,9 +165,9 @@ fn sixel_rle(out: &mut String, ch: char, n: usize) {
     }
 }
 
-/// The sun as a TRUE raster image via the sixel protocol — smooth petals, gold, on a transparent
-/// ground. This is the only way to show the actual vector logo in a terminal (Windows Terminal &
-/// other sixel terminals). `petal_mask` rasterised at 200² then packed into 6-row sixel bands.
+/// The sun as a TRUE raster image via the sixel protocol — smooth petals, moonlight silver, on a
+/// transparent ground. This is the only way to show the actual vector logo in a terminal (Windows
+/// Terminal & other sixel terminals). `petal_mask` rasterised at 200² then packed into 6-row sixel bands.
 fn sun_sixel() -> String {
     const W: usize = 200;
     const H: usize = 200;
@@ -175,7 +176,7 @@ fn sun_sixel() -> String {
     // Raster attributes "Pan;Pad;Ph;Pv = 1:1 pixel aspect (else P1=0 means 2:1 → the sun renders
     // stretched/oval) + the image size. Proven libsixel pattern; honoured by Windows Terminal et al.
     let _ = write!(s, "\"1;1;{W};{H}");
-    s.push_str("#1;2;69;54;30"); // register colour 1 = brand gold #b0894c (sixel uses 0–100 RGB)
+    s.push_str("#1;2;82;83;85"); // register colour 1 = moonlight silver #d2d4d9 (sixel uses 0–100 RGB)
     for band in (0..H).step_by(6) {
         s.push_str("#1");
         let (mut run_ch, mut run_n) = ('\u{0}', 0usize);
@@ -269,21 +270,27 @@ fn push_title(out: &mut String, word: &str) {
         let line: String = word.chars().map(|c| glyph(c)[row]).collect::<Vec<_>>().join(" ");
         let _ = writeln!(out, "  {}", style(line).color256(TITLE[row]).bold());
     }
-    let _ = writeln!(out, "  {}", style("ARTIFICIAL INTELLIGENCE AGENT").color256(crate::theme::MUTED));
+    let _ = writeln!(out, "  {}", style("ARTIFICIAL INTELLIGENCE AGENT").color256(crate::ui::theme::MUTED));
     out.push('\n');
 }
 
 // ── bordered panel ───────────────────────────────────────────────────────────
 
 fn rule(out: &mut String, left: &str, right: &str) {
-    let _ = writeln!(out, "{}", style(format!("{left}{}{right}", "─".repeat(INNER + 2))).color256(ACCENT));
+    // The frame sits one step quieter than the content so the panel reads as a calm moonlit border,
+    // not a bright cage (the design keeps panel chrome near-invisible).
+    let _ = writeln!(
+        out,
+        "{}",
+        style(format!("{left}{}{right}", "─".repeat(INNER + 2))).color256(crate::ui::theme::ACCENT_DIM)
+    );
 }
 
 /// Append one boxed line, padding the (possibly styled) content to the inner width. Uses
 /// `measure_text_width` so ANSI color codes don't throw off the alignment.
 fn boxline(out: &mut String, content: &str) {
     let pad = INNER.saturating_sub(measure_text_width(content));
-    let b = style("│").color256(ACCENT);
+    let b = style("│").color256(crate::ui::theme::ACCENT_DIM);
     let _ = writeln!(out, "{b} {content}{} {b}", " ".repeat(pad));
 }
 
@@ -339,14 +346,14 @@ pub fn render() -> String {
 
     boxline(
         &mut out,
-        &format!("{}{}", crate::icons::g(crate::icons::hdr_tools()), style("Agent tools").color256(ACCENT).bold()),
+        &format!("{}{}", crate::ui::icons::g(crate::ui::icons::hdr_tools()), style("Agent tools").color256(ACCENT).bold()),
     );
     for (label, items) in TOOL_GROUPS {
         boxline(
             &mut out,
             &format!(
                 "  {}{} {}",
-                crate::icons::g(crate::icons::tool_group(label)),
+                crate::ui::icons::g(crate::ui::icons::tool_group(label)),
                 style(format!("{label:<9}")).dim(),
                 style(*items).color256(ACCENT)
             ),
@@ -357,7 +364,7 @@ pub fn render() -> String {
         &mut out,
         &format!(
             "  {}{} {}",
-            crate::icons::g(crate::icons::tool_group("browser")),
+            crate::ui::icons::g(crate::ui::icons::tool_group("browser")),
             style(format!("{:<9}", "browser")).dim(),
             style(BROWSER_TOOLS).color256(ACCENT)
         ),
@@ -366,7 +373,7 @@ pub fn render() -> String {
 
     boxline(
         &mut out,
-        &format!("{}{}", crate::icons::g(crate::icons::hdr_commands()), style("Commands").color256(ACCENT).bold()),
+        &format!("{}{}", crate::ui::icons::g(crate::ui::icons::hdr_commands()), style("Commands").color256(ACCENT).bold()),
     );
     // Indent is 2 cols → wrap to INNER-2 so styled lines never overrun the right border.
     for line in wrap_items(COMMANDS, " · ", INNER - 2) {

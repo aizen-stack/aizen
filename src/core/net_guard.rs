@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn opt_out_env_disables_the_guard() {
         // Serialize against other env-mutating tests via the shared home lock (any global lock works).
-        let _g = crate::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("AIZEN_ALLOW_PRIVATE_NET", "1");
         assert!(guard_url("http://127.0.0.1/").is_ok(), "opt-out env permits private");
         std::env::remove_var("AIZEN_ALLOW_PRIVATE_NET");

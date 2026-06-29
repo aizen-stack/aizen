@@ -91,14 +91,14 @@ fn default_true() -> bool {
 
 /// HOME MCP config (`~/.nextgen/mcp.json`) — the personal servers.
 pub fn config_path() -> PathBuf {
-    crate::config::nextgen_home().join("mcp.json")
+    crate::core::config::nextgen_home().join("mcp.json")
 }
 
 /// PROJECT-local MCP config (`<repo-root>/.nextgen/mcp.json`) — servers a cloned repo ships. Loaded
 /// (merged OVER HOME, project wins by key) ONLY when the repo is TRUSTED — auto-loading a cloned
 /// repo's tool servers is a supply-chain exec surface, so it's gated behind a first-run trust prompt.
 pub fn project_config_path() -> PathBuf {
-    crate::config::project_nextgen_dir().join("mcp.json")
+    crate::core::config::project_nextgen_dir().join("mcp.json")
 }
 
 /// Read + parse one mcp.json. `Ok(None)` when absent/empty (the common case — MCP is opt-in).
@@ -147,7 +147,7 @@ struct TrustStore {
 }
 
 fn trust_path() -> PathBuf {
-    crate::config::nextgen_home().join("mcp_trust.json")
+    crate::core::config::nextgen_home().join("mcp_trust.json")
 }
 fn load_trust() -> TrustStore {
     std::fs::read_to_string(trust_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
@@ -162,7 +162,7 @@ fn save_trust(t: &TrustStore) -> Result<()> {
 
 /// Canonical string key for the current project root (best-effort canonicalization).
 fn project_key() -> String {
-    let root = crate::config::project_root();
+    let root = crate::core::config::project_root();
     std::fs::canonicalize(&root).unwrap_or(root).to_string_lossy().to_string()
 }
 
@@ -532,7 +532,7 @@ struct NeedsAuth {
 }
 impl std::fmt::Display for NeedsAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "needs sign-in — run `ng apps login {}`", self.key)
+        write!(f, "needs sign-in — run `aizen apps login {}`", self.key)
     }
 }
 impl std::error::Error for NeedsAuth {}
@@ -712,13 +712,21 @@ impl Connection {
         // JSON-RPC protocol error). Feed that back to the model as an `Err` so it can recover.
         if result.get("isError").and_then(|b| b.as_bool()).unwrap_or(false) {
             let msg = render_content(&result);
-            // An isError whose content is empty / image-only / placeholder would otherwise hand the
-            // model a blank error — fall back to the full result so the failure is actionable.
-            let msg = if msg.trim().is_empty() || msg.trim_start().starts_with('[') {
-                serde_json::to_string(&result).unwrap_or(msg)
-            } else {
-                msg
-            };
+            // An isError whose content is empty / image-only would otherwise hand the model a blank
+            // error — fall back to the full result. Detect "no usable text" STRUCTURALLY (is there a
+            // non-empty text block?), NOT by sniffing a leading '[' — many real errors legitimately
+            // start with one (e.g. "[Errno 2] No such file"), and discarding those degraded the error.
+            let has_text = result
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|items| {
+                    items.iter().any(|i| {
+                        i.get("type").and_then(|t| t.as_str()) == Some("text")
+                            && i.get("text").and_then(|t| t.as_str()).is_some_and(|s| !s.trim().is_empty())
+                    })
+                })
+                .unwrap_or(false);
+            let msg = if has_text { msg } else { serde_json::to_string(&result).unwrap_or(msg) };
             bail!("{msg}");
         }
         Ok(render_content(&result))
@@ -954,7 +962,7 @@ async fn probe_www_authenticate(url: &str) -> Option<String> {
 /// the full PKCE flow (browser + loopback) → cache the token → invalidate the manager so the next
 /// message reconnects WITH the bearer. Used by `ng apps login` / `ng mcp login`.
 pub async fn login(key: &str) -> Result<()> {
-    let cfg = load_config()?.context("no mcp.json — add an app first (`ng apps add <name>`)")?;
+    let cfg = load_config()?.context("no mcp.json — add an app first (`aizen apps add <name>`)")?;
     let sc = cfg.servers.get(key).with_context(|| format!("no app keyed '{key}' in mcp.json"))?;
     let url = sc.url.clone().context("`login` applies only to remote (url) servers")?;
     if sc.auth.as_deref() != Some("oauth") {
@@ -1052,6 +1060,16 @@ pub fn invalidate() {
     *MANAGER.write().unwrap() = None;
 }
 
+/// FNV-1a 64-bit hash — a small stable hash used for de-collision suffixes (no crypto needs).
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 1469598103934665603;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    h
+}
+
 /// Sanitize a server/tool name into the `[a-z0-9_]` charset the tool-name grammar expects.
 fn slug(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1062,7 +1080,14 @@ fn slug(s: &str) -> String {
             out.push('_');
         }
     }
-    out.trim_matches('_').to_string()
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() {
+        // All-non-ASCII (CJK like "検索") or punctuation-only ("--") names slug to "" and would all
+        // collide on `mcp__` / `mcp_<server>_`. Fall back to a short stable hash of the ORIGINAL so
+        // distinct names stay distinguishable. (Execution still routes via the unmodified remote name.)
+        return format!("x{:x}", fnv1a(s) & 0xffffff);
+    }
+    out
 }
 
 /// Tool names must satisfy the provider grammar `^[a-zA-Z0-9_-]{1,64}$`. A long server+tool pair can
@@ -1078,12 +1103,7 @@ fn qualified_name(server: &str, tool: &str) -> String {
         return full;
     }
     // Deterministic short suffix from the full name, then truncate the head to fit.
-    let mut h: u64 = 1469598103934665603; // FNV-1a
-    for b in full.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(1099511628211);
-    }
-    let suffix = format!("_{:x}", h & 0xffffff); // 6 hex + '_'
+    let suffix = format!("_{:x}", fnv1a(&full) & 0xffffff); // 6 hex + '_'
     let head_len = MAX_TOOL_NAME - suffix.len();
     let head: String = full.chars().take(head_len).collect();
     format!("{head}{suffix}")
@@ -1135,7 +1155,7 @@ pub fn summary() -> String {
     // Surface an untrusted project mcp.json up front (it's deliberately NOT loaded yet).
     let trust_note = match project_trust_prompt() {
         Some(n) => format!(
-            "⚠ this repo ships {n} project MCP server(s) at {} — not loaded.\n  Run `ng mcp trust` to enable them (they can run commands).\n\n",
+            "⚠ this repo ships {n} project MCP server(s) at {} — not loaded.\n  Run `aizen mcp trust` to enable them (they can run commands).\n\n",
             project_config_path().display()
         ),
         None => String::new(),
@@ -1226,9 +1246,24 @@ impl Tool for McpTool {
         };
         block(async move {
             let mut c = conn.lock().await;
-            tokio::time::timeout(CALL_TIMEOUT, c.call_tool(&name, &args))
-                .await
-                .map_err(|_| anyhow!("MCP tool '{server}/{name}' timed out after {}s", CALL_TIMEOUT.as_secs()))?
+            match tokio::time::timeout(CALL_TIMEOUT, c.call_tool(&name, &args)).await {
+                Ok(r) => r,
+                Err(_) => {
+                    // The dropped read can leave the stdio BufReader desynced from message boundaries.
+                    // invalidate() nulls the cached Manager so the NEXT turn's registry build reconnects
+                    // from scratch. NOTE it does NOT repair the CURRENT turn: the live McpTools still
+                    // hold Arc<Mutex<Connection>> clones of this (now desynced) connection, so a repeat
+                    // call to the same server this turn keeps re-timing-out until the next message
+                    // rebuilds the registry. (A same-turn in-place reconnect would need a poison flag on
+                    // Connection; deferred — CALL_TIMEOUT is rare and the next turn self-heals.)
+                    drop(c);
+                    invalidate();
+                    Err(anyhow!(
+                        "MCP tool '{server}/{name}' timed out after {}s (connection reset)",
+                        CALL_TIMEOUT.as_secs()
+                    ))
+                }
+            }
         })
     }
 }
@@ -1245,6 +1280,11 @@ mod tests {
         assert_eq!(slug("git-tools"), "git_tools");
         assert_eq!(slug("Weird@@Name!!"), "weird__name"); // inner non-alnum → _, trimmed ends
         assert_eq!(qualified_name("My Server", "read-file"), "mcp_my_server_read_file");
+        // Non-ASCII / punctuation-only names must NOT collapse to "" (the collision bug): each gets a
+        // short stable hash so distinct names stay distinguishable.
+        assert!(slug("検索").starts_with('x') && slug("検索").len() > 1);
+        assert_ne!(slug("検索"), slug("コード"), "distinct non-ASCII names stay distinct");
+        assert!(slug("--").starts_with('x'));
     }
 
     #[test]
@@ -1272,7 +1312,7 @@ mod tests {
 
     #[test]
     fn project_mcp_merges_only_when_trusted() {
-        let _g = crate::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::env::temp_dir().join(format!("ng-mcp-home-{}", std::process::id()));
         let proj = std::env::temp_dir().join(format!("ng-mcp-proj-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -1408,7 +1448,7 @@ mod tests {
 
     #[test]
     fn load_config_absent_is_none() {
-        let _g = crate::config::TEST_HOME_LOCK.lock().unwrap();
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("ng-mcp-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("NEXTGEN_HOME", &tmp);

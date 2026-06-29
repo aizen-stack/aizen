@@ -18,7 +18,7 @@ pub mod score;
 pub mod store;
 pub mod tokenize;
 
-use crate::config::{self, MemorySettings};
+use crate::core::config::{self, MemorySettings};
 use crate::memory::dimension::Dimension;
 use crate::memory::learning::{LearnOptions, LearnReport};
 use crate::memory::provenance::ProvenanceKind;
@@ -303,7 +303,7 @@ pub fn cmd_list() -> Result<()> {
     entries.retain(|e| e.is_active());
     entries.sort_by(|a, b| a.id.cmp(&b.id));
     if entries.is_empty() {
-        println!("(no active memories yet — `ng memory add ...`)");
+        println!("(no active memories yet — `aizen memory add ...`)");
         return Ok(());
     }
     for e in &entries {
@@ -316,7 +316,7 @@ pub fn cmd_list() -> Result<()> {
     }
     println!("\n{} memories", entries.len());
     if superseded > 0 {
-        println!("({superseded} superseded — hidden; `ng memory as-of <date>` to view history)");
+        println!("({superseded} superseded — hidden; `aizen memory as-of <date>` to view history)");
     }
     Ok(())
 }
@@ -455,7 +455,7 @@ pub fn answer_about_user(query: &str) -> Result<dialectic::Answer> {
 pub fn cmd_frozen(_rebuild: bool) -> Result<()> {
     let served = refresh_frozen_core();
     if served.trim().is_empty() {
-        println!("(frozen core empty — add `type=user` memories or a STYLE.md, e.g. `ng memory add me -t user -b \"...\"`)");
+        println!("(frozen core empty — add `type=user` memories or a STYLE.md, e.g. `aizen memory add me -t user -b \"...\"`)");
         return Ok(());
     }
     let entries = store::load_all()?;
@@ -503,13 +503,13 @@ fn print_learn_report(r: &LearnReport, dry_run: bool) {
         println!("★ core       {f}{tag}");
     }
     for id in &r.queued_review {
-        println!("? review     {id} (run `ng memory review`){tag}");
+        println!("? review     {id} (run `aizen memory review`){tag}");
     }
     for (fact, why) in &r.rejected {
         println!("✗ rejected   {fact}  — {why}");
     }
     for id in &r.archived {
-        println!("⌁ archived   {id} (over inferred-cap; `ng memory restore {id}`)");
+        println!("⌁ archived   {id} (over inferred-cap; `aizen memory restore {id}`)");
     }
     if r.dropped > 0 {
         println!("  ({} low-confidence candidate(s) dropped)", r.dropped);
@@ -523,7 +523,7 @@ pub fn cmd_style() -> Result<()> {
             println!("# user style ({})", config::style_path().display());
             println!("\n{body}");
         }
-        None => println!("(no STYLE.md yet — learned via `ng memory learn` core-promotion, or edit {} directly)", config::style_path().display()),
+        None => println!("(no STYLE.md yet — learned via `aizen memory learn` core-promotion, or edit {} directly)", config::style_path().display()),
     }
     Ok(())
 }
@@ -554,6 +554,7 @@ pub fn cmd_review(promote: Option<String>, clear: bool) -> Result<()> {
             source: item.source,
             confidence: item.confidence,
             session_id: &learning::default_session_id(),
+            no_core: false, // accepting a reviewed item → eligible for the core like any user fact
         };
         let id = store::add_learned(&w)?;
         let _ = std::fs::remove_file(&item.path);
@@ -569,7 +570,7 @@ pub fn cmd_review(promote: Option<String>, clear: bool) -> Result<()> {
         println!("[{:.2}] {} — {}", e.confidence, e.id, e.body);
     }
     println!(
-        "\n{} item(s). Promote: `ng memory review --promote <id>`; discard all: `ng memory review --clear`",
+        "\n{} item(s). Promote: `aizen memory review --promote <id>`; discard all: `aizen memory review --clear`",
         queued.len()
     );
     Ok(())
@@ -606,7 +607,7 @@ pub fn cmd_supersede(old: &str, new: &str) -> Result<()> {
         anyhow::bail!("'{old}' and '{new}' are the same memory");
     }
     store::mark_superseded(&old_e, &new_e.id)?;
-    println!("superseded '{}' → '{}' (history kept; see `ng memory as-of <date>`)", old_e.id, new_e.id);
+    println!("superseded '{}' → '{}' (history kept; see `aizen memory as-of <date>`)", old_e.id, new_e.id);
     Ok(())
 }
 
@@ -629,7 +630,7 @@ pub fn cmd_archive_list() -> Result<()> {
     for e in &arch {
         println!("[{}] {} — {}", e.mtype.as_str(), e.id, e.body);
     }
-    println!("\n{} archived. Restore: `ng memory restore <id>`", arch.len());
+    println!("\n{} archived. Restore: `aizen memory restore <id>`", arch.len());
     Ok(())
 }
 

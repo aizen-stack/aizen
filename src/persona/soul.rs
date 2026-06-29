@@ -14,7 +14,7 @@
 //! `<agent_identity>` tag) and secret/injection-scanned (the shipped `threat_scan`, per line). Any
 //! tripped line drops the WHOLE block — fail-closed, a poisoned identity is never injected.
 
-use crate::config::nextgen_home;
+use crate::core::config::nextgen_home;
 use crate::memory::learning::sanitize_facts::threat_scan;
 use crate::memory::render::sanitize_body;
 use anyhow::{Context, Result};
@@ -47,7 +47,7 @@ pub fn read_raw() -> Option<String> {
 /// Write SOUL.md (creates `~/.nextgen/`). Empty body errors (use `clear` to remove).
 pub fn write(body: &str) -> Result<PathBuf> {
     if body.trim().is_empty() {
-        anyhow::bail!("the SOUL body is empty (use `ng soul clear` to remove it)");
+        anyhow::bail!("the SOUL body is empty (use `aizen soul clear` to remove it)");
     }
     let dir = nextgen_home();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -128,7 +128,7 @@ mod tests {
     use super::*;
 
     fn with_home<T>(tag: &str, f: impl FnOnce() -> T) -> T {
-        let _g = crate::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-soul-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("NEXTGEN_HOME", &dir);

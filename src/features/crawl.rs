@@ -98,7 +98,7 @@ pub async fn crawl(client: &reqwest::Client, opts: &CrawlOptions) -> Result<Craw
             bail!("seed must be an http(s) URL: {s}");
         }
         // SSRF floor: a private/loopback/link-local seed is refused up front (clear error).
-        crate::net_guard::guard_url_async(u.as_str()).await?;
+        crate::core::net_guard::guard_url_async(u.as_str()).await?;
         seed_urls.push(normalize(&u));
     }
     if seed_urls.is_empty() {
@@ -172,7 +172,7 @@ pub async fn crawl(client: &reqwest::Client, opts: &CrawlOptions) -> Result<Craw
 async fn fetch_body(client: &reqwest::Client, url: &Url, timeout: u64) -> Option<(String, String)> {
     // SSRF floor: skip any URL that resolves to a private/loopback/link-local address. Best-effort
     // (recon shouldn't abort on one blocked link) — the seed is also vetted by the caller.
-    if crate::net_guard::guard_url_async(url.as_str()).await.is_err() {
+    if crate::core::net_guard::guard_url_async(url.as_str()).await.is_err() {
         return None;
     }
     let resp = client
@@ -273,14 +273,31 @@ fn normalize(u: &Url) -> Url {
     u
 }
 
-/// Root domain = last two dot-labels (heuristic; ignores multi-label eTLDs like `co.uk`).
+/// Common multi-label public suffixes (eTLDs) where the registrable domain is the last THREE labels,
+/// not two. Hardcoded (no `psl` dep → keeps the single static binary) — covers the cases people hit.
+const MULTI_LABEL_SUFFIXES: &[&str] = &[
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "net.uk", "sch.uk", "ltd.uk", "plc.uk",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au",
+    "co.jp", "ne.jp", "or.jp", "go.jp", "ac.jp",
+    "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz",
+    "co.in", "co.kr", "co.za", "com.br", "com.cn", "com.sg", "com.hk", "com.mx", "com.tr",
+];
+
+/// The registrable domain of a host — the last two dot-labels, or three when the last two form a
+/// known multi-label public suffix. Without the suffix list, `foo.example.co.uk` collapses to
+/// `co.uk`, which under `Scope::Subdomain` admits EVERY `*.co.uk` host — letting the crawler wander
+/// unrelated sites across the whole eTLD (the confirmed scope bug). Three labels keeps it to
+/// `example.co.uk`.
 fn root_domain(host: &str) -> String {
-    let labels: Vec<&str> = host.rsplit('.').collect();
-    if labels.len() >= 2 {
-        format!("{}.{}", labels[1], labels[0])
-    } else {
-        host.to_string()
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    let n = labels.len();
+    if n < 2 {
+        return host;
     }
+    let last2 = format!("{}.{}", labels[n - 2], labels[n - 1]);
+    let take = if n >= 3 && MULTI_LABEL_SUFFIXES.contains(&last2.as_str()) { 3 } else { 2 };
+    labels[n - take..].join(".")
 }
 
 fn in_scope(u: &Url, scope_hosts: &[String], scope: Scope) -> bool {
@@ -348,6 +365,14 @@ mod tests {
         assert_eq!(root_domain("a.b.example.com"), "example.com");
         assert_eq!(root_domain("example.com"), "example.com");
         assert_eq!(root_domain("localhost"), "localhost");
+        // Multi-label eTLDs keep the registrable domain (the scope-bleed fix), not the bare suffix.
+        assert_eq!(root_domain("foo.example.co.uk"), "example.co.uk");
+        assert_eq!(root_domain("bbc.co.uk"), "bbc.co.uk");
+        assert_ne!(
+            root_domain("foo.example.co.uk"),
+            root_domain("bbc.co.uk"),
+            "different registrable domains under co.uk no longer collapse together"
+        );
     }
 
     #[test]

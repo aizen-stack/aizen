@@ -6,7 +6,7 @@
 //! into `core.next` and only promoted to `core.active` at the NEXT session start. So a
 //! memory learned/edited this session never mutates the live prefix — it lands next run.
 
-use crate::config;
+use crate::core::config;
 use crate::memory::bloat::decay;
 use crate::memory::render::{est_tokens, render_block};
 use crate::memory::store::{MemoryEntry, MemoryType};
@@ -40,10 +40,12 @@ pub fn build(entries: &[MemoryEntry], style_body: Option<&str>, max_tokens: usiz
     let today = decay::today();
     let half_life = config::MemorySettings::default().recency_half_life_days;
 
-    // The rest (non-style user facts), salience-greedy then newest-first.
+    // The rest (non-style user facts), salience-greedy then newest-first. `core_denied` facts are
+    // excluded: the user explicitly denied promoting them to the always-on prompt, so they stay
+    // searchable in the long tail but never enter this block (honoring that "no").
     let mut rest: Vec<MemoryEntry> = entries
         .iter()
-        .filter(|e| e.mtype == MemoryType::User && e.is_active())
+        .filter(|e| e.mtype == MemoryType::User && e.is_active() && !e.core_denied)
         .cloned()
         .collect();
     rest.sort_by(|a, b| {
@@ -213,7 +215,7 @@ mod tests {
 
     #[test]
     fn refresh_active_adopts_fresh_immediately() {
-        let _g = crate::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-fc-refresh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("NEXTGEN_HOME", &dir);

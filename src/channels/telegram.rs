@@ -19,7 +19,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 use crate::agent::tools::Tool;
-use crate::cli_config::{self, TelegramConfig};
+use crate::core::cli_config::{self, TelegramConfig};
 
 const API_BASE: &str = "https://api.telegram.org/bot";
 const APPROVAL_TIMEOUT_SECS: u64 = 300;
@@ -247,11 +247,26 @@ pub async fn request_approval(prompt: &str) -> Option<bool> {
 async fn self_poll_for_approval(client: &Client, id: &str) -> bool {
     let start = tokio::time::Instant::now();
     let mut offset = 0i64;
+    let mut warned_conflict = false;
     while start.elapsed() < Duration::from_secs(APPROVAL_TIMEOUT_SECS) {
         let updates = match client.get_updates(offset, 20).await {
             Ok(u) => u,
-            Err(_) => {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            Err(e) => {
+                // 409 Conflict = another process (almost always a running `ng serve` daemon) already
+                // owns getUpdates for this bot token. Telegram allows only ONE poller per token, so
+                // the two steal each other's callbacks and approvals get lost. Surface it ONCE
+                // (instead of a silent 1s retry storm) and back off — the owner should approve in the
+                // daemon, or stop one of the two processes. (A cross-process daemon lockfile so the
+                // standalone never self-polls when a daemon owns the token is the complete fix.)
+                if !warned_conflict && e.to_string().contains("409") {
+                    warned_conflict = true;
+                    eprintln!(
+                        "[telegram] getUpdates 409 Conflict — another process (likely `ng serve`) is \
+                         already polling this bot token; this standalone approval may not receive the \
+                         callback. Approve in that process, or stop it."
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(if warned_conflict { 3 } else { 1 })).await;
                 continue;
             }
         };
@@ -303,7 +318,7 @@ impl Tool for TelegramSend {
     fn execute(&self, args: &Value) -> Result<String> {
         let text = args.get("text").and_then(|v| v.as_str()).context("missing required string arg 'text'")?;
         block(async {
-            let (client, cfg) = configured().context("telegram not configured (run `ng telegram setup`)")?;
+            let (client, cfg) = configured().context("telegram not configured (run `aizen telegram setup`)")?;
             let chat = first_chat(&cfg).context("no allowed_chat_ids configured")?;
             client.send_message(chat, text).await?;
             anyhow::Ok(())
@@ -338,7 +353,7 @@ impl Tool for TelegramAsk {
         match block(request_approval(q)) {
             Some(true) => Ok("approved".to_string()),
             Some(false) => Ok("denied (or timed out)".to_string()),
-            None => Ok("error: telegram not configured (run `ng telegram setup`)".to_string()),
+            None => Ok("error: telegram not configured (run `aizen telegram setup`)".to_string()),
         }
     }
 }

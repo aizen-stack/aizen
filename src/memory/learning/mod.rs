@@ -15,7 +15,7 @@ pub mod route;
 pub mod sanitize_facts;
 pub mod signals;
 
-use crate::config::{self, MemorySettings};
+use crate::core::config::{self, MemorySettings};
 use crate::memory::bloat;
 use crate::memory::frozen_core;
 use crate::memory::provenance::ProvenanceKind;
@@ -131,6 +131,7 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
                         source: provenance,
                         confidence: c.confidence,
                         session_id: &opts.session_id,
+                        no_core: false,
                     };
                     let id = store::add_learned_in(&config::review_dir(), &w)?;
                     report.queued_review.push(id);
@@ -139,7 +140,7 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
                 }
             }
             Route::Store => {
-                apply_store(&clean, &c.mtype, provenance, c.confidence, opts, &mut existing, &s, &mut report)?;
+                apply_store(&clean, &c.mtype, provenance, c.confidence, false, opts, &mut existing, &s, &mut report)?;
             }
             Route::CorePromote => {
                 let confirmed = confirm_core(&clean, opts);
@@ -150,8 +151,10 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
                     style_changed = true;
                     report.core_promoted.push(clean);
                 } else {
-                    // never silently into the core — downgrade to a normal user-fact store
-                    apply_store(&clean, &MemoryType::User, provenance, c.confidence, opts, &mut existing, &s, &mut report)?;
+                    // Denied promotion → downgrade to a normal user-fact store, but mark it `no_core`
+                    // so it stays searchable in the long tail yet NEVER re-enters the always-on frozen
+                    // core (which packs all other type=user facts). This honors the explicit "no".
+                    apply_store(&clean, &MemoryType::User, provenance, c.confidence, true, opts, &mut existing, &s, &mut report)?;
                 }
             }
         }
@@ -182,6 +185,7 @@ fn apply_store(
     mtype: &MemoryType,
     provenance: ProvenanceKind,
     confidence: f64,
+    no_core: bool,
     opts: &LearnOptions,
     existing: &mut Vec<MemoryEntry>,
     s: &MemorySettings,
@@ -224,6 +228,7 @@ fn apply_store(
                 source: provenance,
                 confidence,
                 session_id: &opts.session_id,
+                no_core,
             };
             let id = store::add_learned(&w)?;
             // reflect the insert in-memory so the next candidate this run dedups against it
@@ -369,6 +374,19 @@ mod tests {
             assert!(!r.added.is_empty(), "denied promotion downgrades to a normal store");
             let style = std::fs::read_to_string(config::style_path()).unwrap_or_default();
             assert!(!style.to_lowercase().contains("vietnamese"), "STYLE.md must be untouched");
+            // The downgraded fact is stored & searchable, but flagged no-core so it NEVER re-enters
+            // the always-on frozen core (the explicit deny is honored — bug #4).
+            let entries = store::load_all().unwrap();
+            let denied = entries
+                .iter()
+                .find(|e| e.body.to_lowercase().contains("vietnamese"))
+                .expect("the denied fact is stored in the long tail");
+            assert!(denied.core_denied, "denied fact is stored with the no-core flag");
+            let core = crate::memory::frozen_core::build(&entries, None, 4000);
+            assert!(
+                !core.source_ids.contains(&denied.id),
+                "denied fact must stay OUT of the always-on core"
+            );
         });
     }
 

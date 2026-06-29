@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 use crate::agent::tools::Tool;
-use crate::cli_config::{self, CliConfig, NotifyConfig};
+use crate::core::cli_config::{self, CliConfig, NotifyConfig};
 
 const SEND_TIMEOUT_SECS: u64 = 15;
 /// Discord rejects a message body over 2000 chars (HTTP 400) → truncate with a marker.

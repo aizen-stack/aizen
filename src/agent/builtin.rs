@@ -77,7 +77,7 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     register_skill_registry(&mut r);
     register_telegram(&mut r);
     register_notify(&mut r);
-    r.register(Box::new(crate::timemachine::Checkpoint));
+    r.register(Box::new(crate::features::timemachine::Checkpoint));
     r.register(Box::new(FileEdit::new(root.to_path_buf())));
     r.register(Box::new(MultiEdit::new(root.to_path_buf())));
     r.register(Box::new(ShellRun::new(root.to_path_buf())));
@@ -106,7 +106,7 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
 /// Advertise `skill_load` only when at least one skill exists (else it'd be a dead tool with an
 /// empty `<skills>` index). Available to every registry.
 fn register_skill_load(r: &mut ToolRegistry) {
-    if crate::skill::has_any() {
+    if crate::skills::has_any() {
         r.register(Box::new(SkillLoad));
     }
 }
@@ -114,24 +114,24 @@ fn register_skill_load(r: &mut ToolRegistry) {
 /// The agentskill.sh marketplace tools (`skill_search`/`skill_install`) — ALWAYS available (their
 /// whole point is finding a skill when you have none locally). Every registry.
 fn register_skill_registry(r: &mut ToolRegistry) {
-    r.register(Box::new(crate::skill_registry::SkillSearch));
-    r.register(Box::new(crate::skill_registry::SkillInstall));
+    r.register(Box::new(crate::skills::registry::SkillSearch));
+    r.register(Box::new(crate::skills::registry::SkillInstall));
 }
 
 /// Advertise the Telegram tools only when a bot token + allowed chat are configured (otherwise
 /// they'd be dead tools that just error). Available to every registry.
 fn register_telegram(r: &mut ToolRegistry) {
-    if crate::telegram::is_configured() {
-        r.register(Box::new(crate::telegram::TelegramSend));
-        r.register(Box::new(crate::telegram::TelegramAsk));
+    if crate::channels::telegram::is_configured() {
+        r.register(Box::new(crate::channels::telegram::TelegramSend));
+        r.register(Box::new(crate::channels::telegram::TelegramAsk));
     }
 }
 
 /// Advertise the `notify` broadcast tool only when at least one outbound channel (Discord / Slack /
 /// webhook) is configured — otherwise it'd be a dead tool that just errors. Every registry.
 fn register_notify(r: &mut ToolRegistry) {
-    if crate::notify::any_configured() {
-        r.register(Box::new(crate::notify::Notify));
+    if crate::channels::notify::any_configured() {
+        r.register(Box::new(crate::channels::notify::Notify));
     }
 }
 
@@ -158,14 +158,12 @@ pub fn default_registry_with_task(
     Ok(r)
 }
 
-/// Build a READ/WRITE-scoped registry for a sub-agent of the given `role`. NEVER includes the
-/// `task` tool → a sub-agent physically cannot dispatch further sub-agents (recursion guard).
-/// Scoping is deterministic (documented in `system_prompt.md`):
-/// Every role also gets the read-only web research tools (`web_search`/`web_fetch`).
-/// - `coder` → all builtins (read/glob/edit/shell + memory + web)
-/// - `tester` → read/glob + shell + memory + web (no `file_edit`)
-/// - `planner` / `reviewer` / unknown → read-only (read/glob + memory + web)
-pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
+/// The read-only tool base shared by EVERY sub-agent registry (role- or specialist-scoped): memory +
+/// read/glob/search + web research + skill_load/registry + telegram/notify (when configured) +
+/// checkpoint. NEVER includes `task` (recursion guard), edit/shell (added per-scope by the caller),
+/// or the top-level-only tools (todo/process/clarify/mcp/persona_create). Factored out so
+/// `role_registry` and `agent_registry` cannot drift.
+fn subagent_read_only_base(root: &Path) -> ToolRegistry {
     use crate::agent::web_tools::{WebCrawl, WebFetch, WebSearch};
     let mut r = ToolRegistry::new();
     r.register(Box::new(MemorySearch));
@@ -181,7 +179,19 @@ pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
     register_skill_registry(&mut r);
     register_telegram(&mut r);
     register_notify(&mut r);
-    r.register(Box::new(crate::timemachine::Checkpoint));
+    r.register(Box::new(crate::features::timemachine::Checkpoint));
+    r
+}
+
+/// Build a READ/WRITE-scoped registry for a sub-agent of the given `role`. NEVER includes the
+/// `task` tool → a sub-agent physically cannot dispatch further sub-agents (recursion guard).
+/// Scoping is deterministic (documented in `system_prompt.md`):
+/// Every role also gets the read-only web research tools (`web_search`/`web_fetch`).
+/// - `coder` → all builtins (read/glob/edit/shell + memory + web)
+/// - `tester` → read/glob + shell + memory + web (no `file_edit`)
+/// - `planner` / `reviewer` / unknown → read-only (read/glob + memory + web)
+pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
+    let mut r = subagent_read_only_base(root);
     match role {
         "coder" => {
             r.register(Box::new(FileEdit::new(root.to_path_buf())));
@@ -196,6 +206,71 @@ pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
         _ => {}
     }
     r
+}
+
+/// Build a tool registry for a dispatched SPECIALIST agent (see [`crate::agents`]). Same read-only
+/// base as [`role_registry`], plus a destructive scope derived from the persona's `tools:` frontmatter:
+/// - EMPTY `tools:` → **coder scope** (file_edit + multi_edit + shell_run + skill_save) — the locked
+///   default; no wider than the trusted `coder` sub-agent (the `cmd_guard` floor + per-op approval
+///   still apply underneath).
+/// - non-empty `tools:` → exactly those, mapped by name (Claude-Code casing accepted via the alias
+///   map in [`canonical_subagent_tool`]; duplicates collapsed).
+///
+/// Capability invariants (a third-party persona body is UNTRUSTED): this NEVER grants `task`
+/// (recursion guard) or the top-level-only tools `todo`/`process`/`clarify`/`persona_create`/`mcp_*`
+/// — they map to `None` and are silently dropped even if listed. Unknown names are ignored
+/// (forward-compatible). Never calls `publish_active_tools` (only the top-level registry does).
+pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistry {
+    let mut r = subagent_read_only_base(root);
+    if def.tools.is_empty() {
+        // Locked default: coder scope.
+        r.register(Box::new(FileEdit::new(root.to_path_buf())));
+        r.register(Box::new(MultiEdit::new(root.to_path_buf())));
+        r.register(Box::new(ShellRun::new(root.to_path_buf())));
+        r.register(Box::new(SkillSave));
+        return r;
+    }
+    let mut granted: HashSet<&'static str> = HashSet::new();
+    for raw in &def.tools {
+        let Some(canon) = canonical_subagent_tool(raw) else {
+            continue; // read-only (already in base), forbidden, or unknown
+        };
+        if !granted.insert(canon) {
+            continue; // dedup
+        }
+        match canon {
+            "file_edit" => r.register(Box::new(FileEdit::new(root.to_path_buf()))),
+            "multi_edit" => r.register(Box::new(MultiEdit::new(root.to_path_buf()))),
+            "shell_run" => r.register(Box::new(ShellRun::new(root.to_path_buf()))),
+            "skill_save" => r.register(Box::new(SkillSave)),
+            _ => unreachable!("canonical_subagent_tool only yields grantable destructive tools"),
+        }
+    }
+    r
+}
+
+/// Map a requested tool name (a persona's `tools:` entry, possibly in Claude-Code casing) to the
+/// canonical name of a GRANTABLE destructive tool, or `None`. `None` covers three cases, all meaning
+/// "don't add it": read-only tools (already in the base — `Read`/`Grep`/`Glob`/…), forbidden tools
+/// (`task`/`todo`/`process`/`clarify`/`persona_create`/`mcp_*`), and unknown names. This is the single
+/// structural choke-point for the capability invariant: only these four strings can ever be returned,
+/// so nothing else can be granted to a specialist.
+fn canonical_subagent_tool(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        // editing
+        "edit" | "write" | "file_edit" | "fileedit" | "str_replace" | "str_replace_editor" => {
+            Some("file_edit")
+        }
+        "multiedit" | "multi_edit" => Some("multi_edit"),
+        // shell
+        "bash" | "shell" | "shell_run" | "shellrun" | "run" | "run_command" | "terminal" => {
+            Some("shell_run")
+        }
+        // skill authoring
+        "skill_save" | "skillsave" => Some("skill_save"),
+        // read-only (already in base) / forbidden / unknown → not grantable.
+        _ => None,
+    }
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -315,6 +390,13 @@ impl Tool for MemorySearch {
             "required": ["query"],
             "additionalProperties": false
         })
+    }
+    // NOT concurrency-safe: memory::search has a WRITE side effect (record_reuse → record_retrieval,
+    // a read-modify-write of per-fact files, plus the shared embedding cache under `dense`). Two
+    // parallel searches would race and lose reinforcement counts / clobber the cache, so keep it on
+    // the serial path even though it reads like a read-only tool.
+    fn is_concurrency_safe(&self) -> bool {
+        false
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let query = str_arg(args, "query")?;
@@ -925,10 +1007,20 @@ impl Tool for ShellRun {
 
         let timeout = Duration::from_secs(SHELL_TIMEOUT_SECS);
         let start = Instant::now();
+        let mut cancelled = false;
         let status = loop {
             match child.try_wait()? {
                 Some(st) => break Some(st),
                 None => {
+                    // User pressed Esc (cooperative cancel) — kill the child now instead of blocking
+                    // the whole turn up to the timeout. This is what makes Esc responsive during a
+                    // long command (the confirmed "can't cancel while a tool runs" bug).
+                    if crate::ui::tui::cancel_requested() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        cancelled = true;
+                        break None;
+                    }
                     if start.elapsed() >= timeout {
                         let _ = child.kill();
                         let _ = child.wait();
@@ -942,7 +1034,17 @@ impl Tool for ShellRun {
         let stderr = eh.join().unwrap_or_default();
 
         match status {
-            None => Ok(format!("error: command timed out after {SHELL_TIMEOUT_SECS}s (killed)\n{stdout}").trim_end().to_string()),
+            None if cancelled => Ok("error: command cancelled by the user (Esc)".to_string()),
+            None => {
+                // Surface stderr too (the success branch already does) so a killed build's diagnostics
+                // aren't lost to the model — they're often the most useful part of a timeout.
+                let mut s = format!("error: command timed out after {SHELL_TIMEOUT_SECS}s (killed)\n{stdout}");
+                if !stderr.trim().is_empty() {
+                    s.push_str("\n[stderr]\n");
+                    s.push_str(&stderr);
+                }
+                Ok(s.trim_end().to_string())
+            }
             Some(st) => {
                 let mut s = format!("exit {}\n", st.code().unwrap_or(-1));
                 s.push_str(&stdout);
@@ -997,10 +1099,10 @@ impl Tool for SkillLoad {
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let name = str_arg(args, "name")?;
-        match crate::skill::load(name) {
-            Some(sk) => Ok(crate::skill::render_loaded(&sk)),
+        match crate::skills::load(name) {
+            Some(sk) => Ok(crate::skills::render_loaded(&sk)),
             None => {
-                let avail: Vec<String> = crate::skill::list().into_iter().map(|s| s.name).collect();
+                let avail: Vec<String> = crate::skills::list().into_iter().map(|s| s.name).collect();
                 Ok(format!("(no skill named '{name}'; available: {})", avail.join(", ")))
             }
         }
@@ -1043,7 +1145,7 @@ impl Tool for SkillSave {
         let body = str_arg(args, "body")?;
         let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
         let when = args.get("when").and_then(|v| v.as_str()).unwrap_or("");
-        let path = crate::skill::save(name, description, when, body)?;
+        let path = crate::skills::save(name, description, when, body)?;
         Ok(format!("saved skill '{name}' → {}", path.display()))
     }
 }
@@ -1499,7 +1601,7 @@ mod tests {
 
     #[test]
     fn persona_create_writes_and_activates() {
-        let _g = crate::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-persona-tool-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("NEXTGEN_HOME", &dir);
@@ -1518,7 +1620,7 @@ mod tests {
             .unwrap();
         assert!(out.contains("created persona 'Sherlock'"));
         assert!(out.contains("switched to it"));
-        assert_eq!(crate::cli_config::load().persona.as_deref(), Some("Sherlock"));
+        assert_eq!(crate::core::cli_config::load().persona.as_deref(), Some("Sherlock"));
         let p = crate::persona::load("sherlock").expect("persona card written");
         assert_eq!(p.role, "a sharp consulting detective");
 
@@ -1527,7 +1629,7 @@ mod tests {
             .execute(&serde_json::json!({"name":"Watson","body":"A loyal chronicler.","activate":false}))
             .unwrap();
         assert!(out2.contains("not active"));
-        assert_eq!(crate::cli_config::load().persona.as_deref(), Some("Sherlock"), "still Sherlock");
+        assert_eq!(crate::core::cli_config::load().persona.as_deref(), Some("Sherlock"), "still Sherlock");
 
         // missing required body → error (no half-formed card)
         assert!(t.execute(&serde_json::json!({"name":"Empty"})).is_err());

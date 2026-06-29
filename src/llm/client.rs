@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use std::io::Write;
 
-use crate::types::{
+use crate::core::types::{
     CacheControl, ChatChunk, ChatRequest, ChatResponse, FunctionCall, Message, StreamOptions, ToolCall,
     ToolCallDelta, ToolDef, Usage,
 };
@@ -181,17 +181,7 @@ pub async fn fetch_models_info(
     }
 
     let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
-        .bearer_auth(api_key)
-        .send()
-        .await
-        .with_context(|| format!("request to {url} failed"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let detail = resp.text().await.unwrap_or_default();
-        bail!("upstream returned HTTP {status}: {detail}");
-    }
+    let resp = send_with_retry(|| client.get(&url).bearer_auth(api_key)).await?;
     let parsed: ModelsResp = resp.json().await.context("parsing models response")?;
     Ok(parsed
         .data
@@ -208,6 +198,82 @@ pub async fn fetch_models_info(
         .collect())
 }
 
+/// Transient upstream statuses worth a retry (rate-limit + gateway/server errors). A permanent 4xx
+/// (auth, bad request) is NOT here — retrying it just wastes a round-trip and money.
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+/// Exponential backoff CEILING (ms): `base * 2^attempt`, capped, floored at 1. Pure + monotonic so
+/// it can be unit-tested; the live delay adds jitter under this ceiling (see `backoff_ms`).
+fn backoff_ceiling_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
+    base_ms.saturating_mul(1u64 << attempt.min(20)).min(cap_ms).max(1)
+}
+
+/// A small random u64 from the OS CSPRNG (already a dep) — for backoff jitter only.
+fn rand_u64() -> u64 {
+    let mut b = [0u8; 8];
+    let _ = getrandom::getrandom(&mut b);
+    u64::from_le_bytes(b)
+}
+
+/// Full-jitter backoff: a uniform delay in `[ceil/2, ceil]`. Jitter spreads retries so a fleet of
+/// callers doesn't thunder back in lock-step after a shared 503.
+fn backoff_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
+    let ceil = backoff_ceiling_ms(attempt, base_ms, cap_ms);
+    let half = ceil / 2;
+    half + (rand_u64() % (ceil - half + 1))
+}
+
+/// `Retry-After` as ms (integer-seconds form only), capped at 30s so a hostile header can't park us.
+/// The HTTP-date form is ignored (falls back to exponential backoff).
+fn retry_after_ms(resp: &reqwest::Response) -> Option<u64> {
+    let v = resp.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let secs: u64 = v.trim().parse().ok()?;
+    Some(secs.saturating_mul(1000).min(30_000))
+}
+
+/// Send a request with bounded retry + exponential backoff. `build` is re-invoked per attempt
+/// because `.send()` consumes the `RequestBuilder`. Retries transport errors and transient upstream
+/// statuses (429/5xx), honoring `Retry-After`; a permanent non-2xx (or exhausted retries) reads the
+/// body and returns the SAME `upstream returned HTTP {status}: {detail}` error the call sites used
+/// before this layer existed. A 2xx `Response` is returned untouched for the caller to parse/stream.
+async fn send_with_retry<F>(build: F) -> Result<reqwest::Response>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    const MAX_RETRIES: u32 = 3;
+    const BASE_MS: u64 = 400;
+    const CAP_MS: u64 = 8_000;
+    let mut attempt: u32 = 0;
+    loop {
+        match build().send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return Ok(resp);
+                }
+                if is_retryable_status(status.as_u16()) && attempt < MAX_RETRIES {
+                    let delay = retry_after_ms(&resp).unwrap_or_else(|| backoff_ms(attempt, BASE_MS, CAP_MS));
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    continue;
+                }
+                let detail = resp.text().await.unwrap_or_default();
+                bail!("upstream returned HTTP {status}: {detail}");
+            }
+            Err(e) => {
+                if attempt < MAX_RETRIES {
+                    let delay = backoff_ms(attempt, BASE_MS, CAP_MS);
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    continue;
+                }
+                return Err(anyhow!(e)).context("request failed after retries");
+            }
+        }
+    }
+}
 
 /// The outcome of one non-streaming tool-calling turn.
 pub struct ChatTurn {
@@ -237,36 +303,39 @@ pub async fn stream_chat(
         messages,
         stream: true,
         temperature: None,
-        max_tokens: crate::cli_config::load().max_tokens,
+        max_tokens: crate::core::cli_config::load().max_tokens,
         tools: Vec::new(),
         tool_choice: None,
         parallel_tool_calls: None,
         stream_options: None,
     };
 
-    let mut spin = Some(crate::spinner::Spinner::start("thinking"));
+    let mut spin = Some(crate::ui::spinner::Spinner::start("thinking"));
 
-    let resp = client
-        .post(&url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("request to {url} failed"))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        spin.take();
-        let detail = resp.text().await.unwrap_or_default();
-        bail!("upstream returned HTTP {status}: {detail}");
-    }
+    let resp = match send_with_retry(|| client.post(&url).bearer_auth(api_key).json(&body)).await {
+        Ok(r) => r,
+        Err(e) => {
+            spin.take();
+            return Err(e);
+        }
+    };
 
     let mut stream = resp.bytes_stream().eventsource();
     let mut full = String::new();
     let mut stdout = std::io::stdout();
 
+    // Capture a mid-stream transport error and break rather than `?`-ing out, so the closing
+    // newline below still runs (a clean line break before the error surfaces) — same invariant
+    // as `stream_chat_with_tools`.
+    let mut stream_err: Option<anyhow::Error> = None;
     while let Some(event) = stream.next().await {
-        let event = event.map_err(|e| anyhow!("SSE stream error: {e}"))?;
+        let event = match event {
+            Ok(e) => e,
+            Err(e) => {
+                stream_err = Some(anyhow!("SSE stream error: {e}"));
+                break;
+            }
+        };
 
         // OpenAI signals end-of-stream with a literal `data: [DONE]`.
         if event.data.trim() == "[DONE]" {
@@ -297,6 +366,9 @@ pub async fn stream_chat(
 
     spin.take();
     println!();
+    if let Some(e) = stream_err {
+        return Err(e);
+    }
     Ok(full)
 }
 
@@ -314,7 +386,7 @@ pub async fn chat_with_tools(
     tools: &[ToolDef],
 ) -> Result<ChatTurn> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let cfg = crate::cli_config::load();
+    let cfg = crate::core::cli_config::load();
     let mut msgs = messages.to_vec();
     let mut tool_defs = tools.to_vec();
     // Stamp on cache_enabled alone — the system/history breakpoints pay off even with no tools
@@ -335,19 +407,7 @@ pub async fn chat_with_tools(
         stream_options: None, // non-streaming responses carry `usage` natively
     };
 
-    let resp = client
-        .post(&url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("request to {url} failed"))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let detail = resp.text().await.unwrap_or_default();
-        bail!("upstream returned HTTP {status}: {detail}");
-    }
+    let resp = send_with_retry(|| client.post(&url).bearer_auth(api_key).json(&body)).await?;
 
     let parsed: ChatResponse = resp.json().await.context("parsing chat-completions response")?;
     if let Some(u) = &parsed.usage {
@@ -367,9 +427,19 @@ pub async fn chat_with_tools(
 
 /// Reassembles streamed `delta.tool_calls[]` fragments into whole `ToolCall`s, keyed by index.
 /// `id`/`name` land once (first fragment for an index); `arguments` pieces concatenate.
+///
+/// Robustness: spec-compliant providers tag every fragment with an `index`, but `ToolCallDelta.index`
+/// is `#[serde(default)]` → a provider that OMITS index sends every fragment as index 0. Two distinct
+/// parallel tool calls would then merge onto slot 0 (second id/name clobbers the first; the two
+/// argument strings concatenate into one broken JSON blob). So when a fragment carries a non-empty
+/// `id`, we route by id (via `id_index`) and allocate a fresh slot if index 0 is already claimed by a
+/// different id — keeping the common compliant case (id+index first, then index-only arg fragments)
+/// unchanged.
 #[derive(Default)]
 pub struct ToolCallAccumulator {
     calls: BTreeMap<usize, AccCall>,
+    /// Maps a seen tool-call `id` → the slot key it owns (for index-omitting providers).
+    id_index: std::collections::HashMap<String, usize>,
 }
 
 #[derive(Default)]
@@ -382,7 +452,31 @@ struct AccCall {
 impl ToolCallAccumulator {
     pub fn ingest(&mut self, deltas: &[ToolCallDelta]) {
         for d in deltas {
-            let e = self.calls.entry(d.index).or_default();
+            // Resolve which slot this fragment belongs to. Default: key by `index`. But a non-empty
+            // `id` takes precedence — if we've seen the id, reuse its slot; if it's new and `d.index`
+            // is already held by a DIFFERENT id (the index-omitting collision), allocate a fresh slot.
+            let key = match d.id.as_deref().filter(|s| !s.is_empty()) {
+                Some(id) => {
+                    if let Some(&k) = self.id_index.get(id) {
+                        k
+                    } else {
+                        let collides = self
+                            .calls
+                            .get(&d.index)
+                            .map(|e| !e.id.is_empty() && e.id != id)
+                            .unwrap_or(false);
+                        let k = if collides {
+                            self.calls.keys().last().map(|m| m + 1).unwrap_or(d.index)
+                        } else {
+                            d.index
+                        };
+                        self.id_index.insert(id.to_string(), k);
+                        k
+                    }
+                }
+                None => d.index,
+            };
+            let e = self.calls.entry(key).or_default();
             if let Some(id) = &d.id {
                 if !id.is_empty() {
                     e.id = id.clone();
@@ -427,7 +521,7 @@ pub async fn stream_chat_with_tools(
     tools: &[ToolDef],
 ) -> Result<ChatTurn> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let cfg = crate::cli_config::load();
+    let cfg = crate::core::cli_config::load();
     let mut msgs = messages.to_vec();
     let mut tool_defs = tools.to_vec();
     // See chat_with_tools: stamp on cache_enabled alone (system/history breakpoints help no-tool calls too).
@@ -450,21 +544,15 @@ pub async fn stream_chat_with_tools(
     // streams back. TTY-only (silent no-op on pipes/CI). Cleared before any output is printed.
     // Suppressed under the sticky TUI — its box shows the "⚡ working…" indicator instead, and a
     // carriage-return spinner would fight the pinned footer.
-    let mut spin = if crate::tui::active() { None } else { Some(crate::spinner::Spinner::start("thinking")) };
+    let mut spin = if crate::ui::tui::active() { None } else { Some(crate::ui::spinner::Spinner::start("thinking")) };
 
-    let resp = client
-        .post(&url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("request to {url} failed"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        spin.take(); // clear the spinner before surfacing the error
-        let detail = resp.text().await.unwrap_or_default();
-        bail!("upstream returned HTTP {status}: {detail}");
-    }
+    let resp = match send_with_retry(|| client.post(&url).bearer_auth(api_key).json(&body)).await {
+        Ok(r) => r,
+        Err(e) => {
+            spin.take(); // clear the spinner before surfacing the error
+            return Err(e);
+        }
+    };
 
     let mut stream = resp.bytes_stream().eventsource();
     let mut full = String::new();
@@ -473,12 +561,23 @@ pub async fn stream_chat_with_tools(
     let mut think = ThinkFilter::default(); // suppress `<think>…</think>` reasoning from the display
     // Render Markdown for the DISPLAY only (history keeps the raw text via `full`). Decorate when
     // we own an interactive terminal (sticky TUI or a TTY one-shot); pipes/CI pass through verbatim.
-    let decorate = crate::tui::active() || std::io::IsTerminal::is_terminal(&std::io::stdout());
-    let cols = crate::tui::width(); // wrap to the box width (not a separately-probed window edge)
-    let mut md = crate::markdown::MarkdownStream::new(decorate, cols);
+    let decorate = crate::ui::tui::active() || std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let cols = crate::ui::tui::width(); // wrap to the box width (not a separately-probed window edge)
+    let mut md = crate::ui::markdown::MarkdownStream::new(decorate, cols);
 
+    // A mid-stream transport error (timeout, gateway drop, truncated body) must NOT short-circuit
+    // with `?` here: that would skip the `think.finish()` / `md.finish()` cleanup below, stranding
+    // the terminal with a half-rendered line or an UNCLOSED code-fence box that corrupts every
+    // subsequent turn. Capture the error, break, flush the display to a clean state, THEN propagate.
+    let mut stream_err: Option<anyhow::Error> = None;
     while let Some(event) = stream.next().await {
-        let event = event.map_err(|e| anyhow!("SSE stream error: {e}"))?;
+        let event = match event {
+            Ok(e) => e,
+            Err(e) => {
+                stream_err = Some(anyhow!("SSE stream error: {e}"));
+                break;
+            }
+        };
         if event.data.trim() == "[DONE]" {
             break;
         }
@@ -487,9 +586,14 @@ pub async fn stream_chat_with_tools(
         }
         match serde_json::from_str::<ChatChunk>(&event.data) {
             Ok(chunk) => {
-                // The final chunk (choices empty) carries real token usage when we asked for it.
+                // Record usage ONLY on the final chunk (choices empty). Spec-compliant OpenAI sends
+                // usage=null until then, but some gateways (vLLM/LiteLLM/OpenRouter) attach a
+                // CUMULATIVE usage object to EVERY chunk — without this guard an N-chunk stream sums it
+                // N times and inflates /cost (and calls_with_usage) ~N×.
                 if let Some(u) = &chunk.usage {
-                    cost_meter().record(u);
+                    if chunk.choices.is_empty() {
+                        cost_meter().record(u);
+                    }
                 }
                 if let Some(choice) = chunk.choices.first() {
                     // A dedicated reasoning channel (`reasoning_content`/`reasoning`) is the model
@@ -505,7 +609,7 @@ pub async fn stream_chat_with_tools(
                             full.push_str(&shown); // history keeps the RAW markdown
                             let rendered = md.push(&shown); // styled, complete lines (gutter, md, code)
                             if !rendered.is_empty() {
-                                crate::tui::emit(&rendered); // sticky TUI funnel (plain print! when inactive)
+                                crate::ui::tui::emit(&rendered); // sticky TUI funnel (plain print! when inactive)
                             }
                         }
                     }
@@ -530,15 +634,23 @@ pub async fn stream_chat_with_tools(
         full.push_str(&tail);
         let rendered = md.push(&tail);
         if !rendered.is_empty() {
-            crate::tui::emit(&rendered);
+            crate::ui::tui::emit(&rendered);
         }
     }
     let closing = md.finish(); // flush the final partial line + close any dangling code fence
     if !closing.is_empty() {
-        crate::tui::emit(&closing);
+        crate::ui::tui::emit(&closing);
     }
     if !full.is_empty() {
-        crate::tui::emit("\n"); // one blank line of breathing room before the next turn
+        crate::ui::tui::emit("\n"); // one blank line of breathing room before the next turn
+    }
+
+    // The display is now clean (fence closed, partial line flushed) — surface any transport error
+    // that interrupted the stream. The partial `full` / tool-calls are intentionally discarded: a
+    // truncated tool-call's arguments JSON is unparseable, so feeding it back would be worse than a
+    // clean turn failure the caller can retry.
+    if let Some(e) = stream_err {
+        return Err(e);
     }
 
     Ok(ChatTurn {
@@ -617,7 +729,44 @@ fn partial_suffix(s: &str, tag: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::FunctionDelta;
+    use crate::core::types::FunctionDelta;
+
+    #[test]
+    fn retry_classifier_only_retries_transient_statuses() {
+        for s in [429u16, 500, 502, 503, 504] {
+            assert!(is_retryable_status(s), "{s} should be retryable");
+        }
+        for s in [200u16, 400, 401, 403, 404, 422, 501] {
+            assert!(!is_retryable_status(s), "{s} should NOT be retryable");
+        }
+    }
+
+    #[test]
+    fn backoff_ceiling_is_monotonic_and_capped() {
+        let (base, cap) = (400u64, 8_000u64);
+        let seq: Vec<u64> = (0..6).map(|a| backoff_ceiling_ms(a, base, cap)).collect();
+        // base * 2^attempt until the cap, never decreasing, never above the cap, never zero.
+        assert_eq!(seq[0], 400);
+        assert_eq!(seq[1], 800);
+        assert_eq!(seq[2], 1600);
+        for w in seq.windows(2) {
+            assert!(w[1] >= w[0], "ceiling must not decrease: {seq:?}");
+        }
+        assert!(seq.iter().all(|&d| d >= 1 && d <= cap), "every delay in [1, cap]: {seq:?}");
+        assert_eq!(*seq.last().unwrap(), cap, "saturates at the cap");
+    }
+
+    #[test]
+    fn backoff_jitter_stays_within_half_to_ceiling() {
+        let (base, cap) = (400u64, 8_000u64);
+        for attempt in 0..6 {
+            let ceil = backoff_ceiling_ms(attempt, base, cap);
+            for _ in 0..50 {
+                let d = backoff_ms(attempt, base, cap);
+                assert!(d >= ceil / 2 && d <= ceil, "jitter {d} outside [{}, {ceil}]", ceil / 2);
+            }
+        }
+    }
 
     #[test]
     fn cost_meter_sums_real_usage_and_ignores_empty() {
@@ -726,12 +875,12 @@ mod tests {
     #[test]
     fn delta_captures_both_reasoning_field_names() {
         // DeepSeek-style `reasoning_content` and OpenRouter-style `reasoning` both land in the field.
-        let a: crate::types::Delta = serde_json::from_str(r#"{"reasoning_content":"thinking…"}"#).unwrap();
+        let a: crate::core::types::Delta = serde_json::from_str(r#"{"reasoning_content":"thinking…"}"#).unwrap();
         assert_eq!(a.reasoning_content.as_deref(), Some("thinking…"));
-        let b: crate::types::Delta = serde_json::from_str(r#"{"reasoning":"thinking…"}"#).unwrap();
+        let b: crate::core::types::Delta = serde_json::from_str(r#"{"reasoning":"thinking…"}"#).unwrap();
         assert_eq!(b.reasoning_content.as_deref(), Some("thinking…"));
         // Plain content chunk leaves the reasoning channel empty.
-        let c: crate::types::Delta = serde_json::from_str(r#"{"content":"hi"}"#).unwrap();
+        let c: crate::core::types::Delta = serde_json::from_str(r#"{"content":"hi"}"#).unwrap();
         assert!(c.reasoning_content.is_none());
     }
 

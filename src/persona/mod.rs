@@ -23,10 +23,11 @@
 
 pub mod reflect;
 pub mod self_mem;
+pub mod soul;
 
-use crate::config::nextgen_home;
+use crate::core::config::nextgen_home;
 use crate::memory::frontmatter;
-use crate::skill::sanitize_name; // shared slug rule
+use crate::skills::sanitize_name; // shared slug rule
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -50,7 +51,7 @@ pub fn personas_dir() -> PathBuf {
 
 /// `<repo-root>/.nextgen/personas/` — personas a cloned repo ships, merged OVER HOME (project wins).
 pub fn project_personas_dir() -> PathBuf {
-    crate::config::project_nextgen_dir().join("personas")
+    crate::core::config::project_nextgen_dir().join("personas")
 }
 
 fn path_for(name: &str) -> PathBuf {
@@ -152,7 +153,7 @@ pub fn delete(name: &str) -> Result<bool> {
 
 /// The currently-active persona (config `persona = "<name>"`), if set + loadable.
 pub fn active() -> Option<Persona> {
-    let name = crate::cli_config::load().persona?;
+    let name = crate::core::cli_config::load().persona?;
     load(&name)
 }
 
@@ -160,9 +161,9 @@ pub fn active() -> Option<Persona> {
 /// HUD/menu show it cleanly. Errors if no such persona — never points the config at a ghost.
 pub fn set_active(name: &str) -> Result<()> {
     let p = load(name).with_context(|| format!("no persona named '{name}'"))?;
-    let mut cfg = crate::cli_config::load();
+    let mut cfg = crate::core::cli_config::load();
     cfg.persona = Some(p.name);
-    crate::cli_config::save(&cfg)
+    crate::core::cli_config::save(&cfg)
 }
 
 /// The filename slug of the active persona (the key for its `<slug>.self/` store). `None` when no
@@ -209,7 +210,7 @@ mod tests {
     use super::*;
 
     fn with_home<T>(tag: &str, f: impl FnOnce() -> T) -> T {
-        let _g = crate::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-persona-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("NEXTGEN_HOME", &dir);
@@ -238,9 +239,9 @@ mod tests {
         with_home("active", || {
             assert!(prompt_block().is_none(), "no persona active");
             save("Aria", "a mentor", "warm", "Backstory here.").unwrap();
-            let mut cfg = crate::cli_config::load();
+            let mut cfg = crate::core::cli_config::load();
             cfg.persona = Some("Aria".to_string());
-            crate::cli_config::save(&cfg).unwrap();
+            crate::core::cli_config::save(&cfg).unwrap();
             let block = prompt_block().expect("active persona renders");
             assert!(block.contains("You are Aria, a mentor."));
             assert!(block.contains("Backstory here."));
@@ -272,9 +273,9 @@ mod tests {
         with_home("selfblk", || {
             assert!(self_block().is_none(), "no persona, no self block");
             save("Aria", "m", "v", "body").unwrap();
-            let mut cfg = crate::cli_config::load();
+            let mut cfg = crate::core::cli_config::load();
             cfg.persona = Some("Aria".to_string());
-            crate::cli_config::save(&cfg).unwrap();
+            crate::core::cli_config::save(&cfg).unwrap();
             assert!(self_block().is_none(), "active but no experience yet");
             self_mem::record_episode(&sanitize_name("Aria"), "shipped the redesign", 6).unwrap();
             let block = self_block().expect("self block renders once there is experience");
