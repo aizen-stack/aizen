@@ -3112,6 +3112,12 @@ async fn run_menu_sticky() -> Result<()> {
                     context_window: resolve_ctx_window(&model).0,
                     ..AgentConfig::default()
                 };
+                // Bridge LSP config → the manager (per-request timeout; auto-enable if configured).
+                // Control is normally via `/lsp on|off`; `enable_lsp` is the config/flag path.
+                crate::agent::lsp::LSP.set_request_timeout(cfg.lsp_request_timeout_secs);
+                if cfg.enable_lsp {
+                    let _ = crate::agent::lsp::LSP.enable();
+                }
 
                 tui::clear_cancel(); // fresh turn → forget any Esc from a previous one
                 while input.cancel.try_recv().is_ok() {} // drain any stale cancel
@@ -4078,6 +4084,7 @@ const SLASH_CMDS: &[(&str, &str)] = &[
     ("timeline", "time machine — rewind / re-apply code states (git snapshots)"),
     ("checkpoint", "save a restore point of the code now"),
     ("compact", "summarize older turns to free context now"),
+    ("lsp", "type-aware code navigation (references · definition · symbols · diagnostics) — on/off/status/restart"),
     ("yolo", "toggle auto-approve: run file edits & shell WITHOUT asking each time"),
     ("smart", "toggle smart approval: auto-run read-only shell, ask for the rest"),
     ("clear", "start a fresh conversation"),
@@ -4122,6 +4129,7 @@ Commands:
   /timeline          time machine — rewind / re-apply code states (git snapshots); also /undo · /redo
   /checkpoint [note] save a restore point of the working tree now
   /compact           summarize older turns to free context now
+  /lsp [on|off|status|restart]  type-aware navigation + diagnostics via a language server (rust-analyzer · pyright · typescript-language-server); default OFF, servers start lazily
   /yolo              toggle auto-approve — run file edits & shell WITHOUT asking each time
   /smart             toggle smart approval — auto-run read-only shell, ask for the rest
   /clear             start a fresh conversation
@@ -4196,6 +4204,34 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                     &style(format!("compacted: ~{} → ~{} tok", fmt_k(b), fmt_k(a))).color256(splash::ACCENT).to_string(),
                 ),
                 Err(e) => tui::emit_line(&format!("{} {e}", style("compact:").red())),
+            }
+        }
+        "lsp" => {
+            use crate::agent::lsp::LSP;
+            let sub = arg.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            match sub.as_str() {
+                "" | "status" | "st" => tui::emit_line(&LSP.status().render()),
+                "on" | "enable" => match LSP.enable() {
+                    Ok(_) => tui::emit_line(
+                        &style("LSP on — references · definition · symbols · diagnostics (rust/python/js-ts; servers start lazily on first use; rust-analyzer can use ~1–3GB RAM). /lsp off to stop.")
+                            .color256(splash::ACCENT).to_string(),
+                    ),
+                    Err(e) => tui::emit_line(&format!("{} {e}", style("lsp:").red())),
+                },
+                "off" | "disable" => {
+                    LSP.disable();
+                    tui::emit_line(&style("LSP off — servers shut down, RAM reclaimed.").dim().to_string());
+                }
+                "restart" => {
+                    LSP.disable();
+                    match LSP.enable() {
+                        Ok(_) => tui::emit_line(&style("LSP restarted.").dim().to_string()),
+                        Err(e) => tui::emit_line(&format!("{} {e}", style("lsp:").red())),
+                    }
+                }
+                other => tui::emit_line(
+                    &style(format!("usage: /lsp [status|on|off|restart]  (unknown '{other}')")).dim().to_string(),
+                ),
             }
         }
         "yolo" | "auto" | "yes" => {

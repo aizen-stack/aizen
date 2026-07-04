@@ -1,0 +1,575 @@
+//! LSP (Language Server Protocol) subsystem — gives the agent IDE-grade, type-aware code
+//! navigation (find-references / go-to-definition / document & workspace symbols) plus on-demand
+//! diagnostics by talking to a per-language language server (rust-analyzer, pyright,
+//! typescript-language-server, …) over JSON-RPC/stdio, instead of relying on text/grep matching.
+//!
+//! Design (see `.claude/plans/lsp-integration-plan.md`):
+//! - **Default OFF + lazy.** Nothing spawns until the user enables it AND a query actually needs it.
+//! - **Robust ("không crash").** A missing / slow / hung / crashing server never aborts the agent
+//!   turn — worst case it degrades to "lsp unavailable" and the agent falls back to grep. A server
+//!   that dies is respawned at most [`MAX_RESPAWNS`] times, then marked disabled for the session
+//!   (`/lsp restart` resets).
+//! - **Language-neutral core + a per-language server table** ([`discovery`]). Adding a language is
+//!   one row.
+//! - **async→sync bridge.** [`LspManager`] owns its OWN dedicated tokio runtime; the `MainLoop`s and
+//!   all LSP requests run there, and the synchronous `Tool::execute` dispatches a request onto that
+//!   runtime and blocks on a std channel ([`std::sync::mpsc`]) — never `block_on` on a runtime
+//!   worker (which would panic), so it's safe on any thread the tool happens to run on.
+
+pub mod discovery;
+pub mod jobobject;
+pub mod server;
+pub mod tools;
+pub mod uri;
+
+use anyhow::{anyhow, bail, Result};
+use once_cell::sync::Lazy;
+use server::{DefHit, DiagItem, DocSym, LspServer, RefHit, WsSym};
+use std::collections::HashMap;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::runtime::{Builder, Handle, Runtime};
+
+/// The process-global LSP manager. One per CLI process; servers are spawned lazily and reused.
+pub static LSP: Lazy<LspManager> = Lazy::new(LspManager::new);
+
+/// A crashed server is respawned at most this many times per session before being marked disabled
+/// (never a tight restart loop — plan §2 decision 5). `/lsp restart` resets the counters.
+const MAX_RESPAWNS: u32 = 2;
+
+/// Status snapshot for the `/lsp status` command.
+pub struct LspStatus {
+    pub enabled: bool,
+    pub servers: Vec<ServerStatus>,
+}
+
+pub struct ServerStatus {
+    pub lang: &'static str,
+    pub root: PathBuf,
+    pub indexed: bool,
+    pub alive: bool,
+}
+
+impl LspStatus {
+    /// Human-readable summary for `/lsp status`.
+    pub fn render(&self) -> String {
+        if !self.enabled {
+            return "LSP: off — `/lsp on` to enable type-aware code navigation.".to_string();
+        }
+        if self.servers.is_empty() {
+            return "LSP: on — no server running yet (starts lazily on the first symbol query)."
+                .to_string();
+        }
+        let mut s = String::from("LSP: on\n");
+        for sv in &self.servers {
+            let state = if !sv.alive {
+                "dead"
+            } else if sv.indexed {
+                "ready"
+            } else {
+                "indexing…"
+            };
+            s.push_str(&format!("  {} [{}]  {}\n", sv.lang, state, sv.root.display()));
+        }
+        s.trim_end().to_string()
+    }
+}
+
+pub struct LspManager {
+    enabled: AtomicBool,
+    /// Per-request wall-clock cap (seconds); set from `AgentConfig.lsp_request_timeout_secs`.
+    request_timeout_secs: AtomicU64,
+    /// The dedicated runtime the servers + requests run on. Built on [`enable`](Self::enable).
+    runtime: Mutex<Option<Runtime>>,
+    /// Live servers, keyed by `"<lang>\0<root>"`. `Arc` so query tasks can hold one independently.
+    servers: Mutex<HashMap<String, Arc<LspServer>>>,
+    /// Respawns-after-death per server key; capped at [`MAX_RESPAWNS`] per session.
+    restarts: Mutex<HashMap<String, u32>>,
+}
+
+impl LspManager {
+    fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            request_timeout_secs: AtomicU64::new(20),
+            runtime: Mutex::new(None),
+            servers: Mutex::new(HashMap::new()),
+            restarts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Set the per-request timeout (seconds, min 1). Called from config at startup / `/lsp on`.
+    pub fn set_request_timeout(&self, secs: u64) {
+        self.request_timeout_secs.store(secs.max(1), Ordering::Relaxed);
+    }
+
+    fn request_timeout(&self) -> Duration {
+        Duration::from_secs(self.request_timeout_secs.load(Ordering::Relaxed).max(1))
+    }
+
+    /// Turn LSP on for this session: build the dedicated runtime if needed. Idempotent. Does NOT
+    /// spawn any server yet — servers start lazily on first use.
+    pub fn enable(&self) -> Result<()> {
+        let mut guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            let rt = Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .thread_name("aizen-lsp")
+                .build()
+                .map_err(|e| anyhow!("failed to start the LSP runtime: {e}"))?;
+            *guard = Some(rt);
+        }
+        // Fresh session semantics: `/lsp restart` (disable+enable) also resets the give-up counters.
+        self.restarts.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.enabled.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Turn LSP off: drop all servers (each `Drop` aborts its mainloop → `kill_on_drop` + the
+    /// Windows Job Object reap the child tree) and shut the runtime down. Reclaims the servers' RAM.
+    pub fn disable(&self) {
+        self.enabled.store(false, Ordering::Relaxed);
+        let servers: Vec<Arc<LspServer>> = self
+            .servers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, v)| v)
+            .collect();
+        self.restarts.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let rt = self.runtime.lock().unwrap_or_else(|e| e.into_inner()).take();
+        // Teardown blocks (the graceful shutdown handshake + dropping the runtime waits on its
+        // workers) and must not run inside another runtime — hand it to a plain OS thread.
+        std::thread::spawn(move || {
+            if let Some(rt) = rt {
+                rt.block_on(async {
+                    for s in &servers {
+                        // best-effort graceful shutdown→exit; `Drop` is the hard backstop.
+                        let _ = tokio::time::timeout(Duration::from_secs(5), s.shutdown()).await;
+                    }
+                });
+                drop(rt); // drop the runtime explicitly (joins its workers)
+            }
+            // Drop the server Arcs → `LspServer::drop` aborts each mainloop task → `kill_on_drop`
+            // (+ Job Object on Windows) reaps the child tree.
+            drop(servers);
+        });
+    }
+
+    pub fn status(&self) -> LspStatus {
+        let servers = self
+            .servers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|s| ServerStatus {
+                lang: s.spec.lang,
+                root: s.root.clone(),
+                indexed: s.is_indexed(),
+                alive: s.is_alive(),
+            })
+            .collect();
+        LspStatus { enabled: self.is_enabled(), servers }
+    }
+
+    /// Find references to `symbol` (by NAME) within the project that owns `anchor` (a file in the
+    /// project, or the project directory). Returns a formatted, capped result string for the model,
+    /// or an `Err` the tool surfaces as a clean "unavailable" message (never aborting the turn).
+    pub fn references(&self, anchor: &Path, symbol: &str, include_decl: bool) -> Result<String> {
+        let sym = symbol.to_string();
+        let hint = anchor.is_file().then(|| anchor.to_path_buf());
+        self.run_query(anchor, "references", move |s| async move {
+            let hits = s.references_by_name(hint.as_deref(), &sym, include_decl).await?;
+            Ok(format_hits(&s.root, &sym, &hits))
+        })
+    }
+
+    /// Resolve `symbol` (by NAME) to its definition and return the definition source text inline.
+    pub fn definition(&self, anchor: &Path, symbol: &str) -> Result<String> {
+        let sym = symbol.to_string();
+        let hint = anchor.is_file().then(|| anchor.to_path_buf());
+        self.run_query(anchor, "definition", move |s| async move {
+            let def = s.definition_by_name(hint.as_deref(), &sym).await?;
+            Ok(format_def(&s.root, &sym, &def))
+        })
+    }
+
+    /// Structural outline (symbols, no bodies) of one file.
+    pub fn document_symbols(&self, file: &Path) -> Result<String> {
+        let f = file.to_path_buf();
+        self.run_query(file, "documentSymbol", move |s| async move {
+            let syms = s.document_symbols(&f).await?;
+            Ok(format_doc_symbols(&s.root, &f, &syms))
+        })
+    }
+
+    /// Project-wide fuzzy symbol search by name (`max` caps the rendered hits).
+    pub fn workspace_symbols(&self, anchor: &Path, query: &str, max: usize) -> Result<String> {
+        let q = query.to_string();
+        self.run_query(anchor, "workspace/symbol", move |s| async move {
+            let syms = s.workspace_symbols(&q).await?;
+            Ok(format_ws_symbols(&s.root, &q, &syms, max))
+        })
+    }
+
+    /// Current diagnostics for one file (pull-preferred, push-fallback — see `server::diagnostics`).
+    pub fn diagnostics(&self, file: &Path) -> Result<String> {
+        let f = file.to_path_buf();
+        self.run_query(file, "diagnostics", move |s| async move {
+            let items = s.diagnostics(&f).await?;
+            Ok(format_diagnostics(&s.root, &f, &items))
+        })
+    }
+
+    /// The shared async→sync bridge: detect the project for `anchor`, get/spawn its server, run
+    /// `f(server)` on the dedicated runtime under the request timeout, and block the calling (tool)
+    /// thread on a std channel until the result lands. Panic-free on any thread.
+    fn run_query<T, F, Fut>(&self, anchor: &Path, op: &'static str, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<LspServer>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+    {
+        if !self.is_enabled() {
+            bail!("LSP is off — enable it with `/lsp on`");
+        }
+        let (spec, root) = discovery::detect(anchor).ok_or_else(|| {
+            anyhow!("no supported language project found at/above {}", anchor.display())
+        })?;
+        let timeout = self.request_timeout();
+        let handle = self.handle()?;
+        let server = self.get_or_spawn(spec, &root, &handle, timeout)?;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        handle.spawn(async move {
+            let r = tokio::time::timeout(timeout, f(server)).await;
+            let _ = tx.send(match r {
+                Ok(inner) => inner,
+                Err(_) => Err(anyhow!(
+                    "LSP {op} timed out after {timeout:?} (the server may still be indexing — try again)"
+                )),
+            });
+        });
+        rx.recv_timeout(timeout + Duration::from_secs(3))
+            .map_err(|_| anyhow!("LSP request did not return"))?
+    }
+
+    fn handle(&self) -> Result<Handle> {
+        self.runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|rt| rt.handle().clone())
+            .ok_or_else(|| anyhow!("LSP runtime is not running"))
+    }
+
+    /// Get the live server for `(lang, root)`, spawning + initializing it on the runtime if needed.
+    /// A dead server (crashed / EOF) is evicted and respawned up to [`MAX_RESPAWNS`] times, then the
+    /// key is disabled for the session. Blocks the caller via a std channel while the (possibly
+    /// slow, cold-index) handshake runs.
+    fn get_or_spawn(
+        &self,
+        spec: &'static discovery::ServerSpec,
+        root: &Path,
+        handle: &Handle,
+        timeout: Duration,
+    ) -> Result<Arc<LspServer>> {
+        let key = format!("{}\0{}", spec.lang, root.display());
+        {
+            let mut servers = self.servers.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = servers.get(&key) {
+                if s.is_alive() {
+                    return Ok(Arc::clone(s));
+                }
+                // Dead server: evict + count the respawn (bounded — never a restart storm).
+                servers.remove(&key);
+                *self.restarts.lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_insert(0) += 1;
+            }
+        }
+        let respawns =
+            self.restarts.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied().unwrap_or(0);
+        if respawns > MAX_RESPAWNS {
+            bail!(
+                "the {} language server crashed repeatedly — disabled for this session (`/lsp restart` to reset)",
+                spec.lang
+            );
+        }
+        // Not installed → graceful error (caller turns it into "unavailable", never a crash).
+        let bin = discovery::resolve_server_binary(spec)?;
+        let init_timeout = timeout.max(Duration::from_secs(30)); // generous for cold indexing
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root_owned = root.to_path_buf();
+        handle.spawn(async move {
+            let r = LspServer::spawn(spec, &bin, &root_owned, init_timeout).await;
+            let _ = tx.send(r);
+        });
+        let server = rx
+            .recv_timeout(init_timeout + Duration::from_secs(5))
+            .map_err(|_| anyhow!("LSP server did not start in time"))??;
+        let server = Arc::new(server);
+        self.servers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, Arc::clone(&server));
+        Ok(server)
+    }
+}
+
+/// Path relative to the workspace root, for display. `strip_prefix` alone misses on Windows: the
+/// root is canonicalized (`\\?\C:\…`) while server URIs decode to plain, lowercase-drive paths
+/// (`c:\…`) — so fall back to a verbatim-prefix-stripped, case-insensitive prefix match.
+fn rel_display(root: &Path, path: &Path) -> PathBuf {
+    if let Ok(r) = path.strip_prefix(root) {
+        return r.to_path_buf();
+    }
+    let norm = |p: &Path| {
+        p.to_string_lossy().trim_start_matches(r"\\?\").replace('/', r"\")
+    };
+    let (r, p) = (norm(root), norm(path));
+    if cfg!(windows) && p.len() > r.len() && p[..r.len()].eq_ignore_ascii_case(&r) {
+        return PathBuf::from(p[r.len()..].trim_start_matches('\\'));
+    }
+    path.to_path_buf()
+}
+
+/// Render reference hits as a compact, capped block: `relpath:line:col  snippet` (1-based display).
+fn format_hits(root: &Path, symbol: &str, hits: &[RefHit]) -> String {
+    if hits.is_empty() {
+        return format!("no references found for '{symbol}'");
+    }
+    const MAX: usize = 100;
+    let mut out = format!("{} reference(s) to '{}':\n", hits.len(), symbol);
+    for h in hits.iter().take(MAX) {
+        let rel = rel_display(root, &h.path);
+        out.push_str(&format!("  {}:{}:{}  {}\n", rel.display(), h.line + 1, h.col + 1, h.snippet));
+    }
+    if hits.len() > MAX {
+        out.push_str(&format!("  … (+{} more)\n", hits.len() - MAX));
+    }
+    out.trim_end().to_string()
+}
+
+/// Render a definition: header line + the definition source, fenced for readability.
+fn format_def(root: &Path, symbol: &str, def: &DefHit) -> String {
+    let rel = rel_display(root, &def.path);
+    let mut out =
+        format!("definition of '{}' — {}:{}:{}\n", symbol, rel.display(), def.line + 1, def.col + 1);
+    out.push_str(&def.source);
+    if def.truncated {
+        out.push_str("\n  … (truncated — read the file for the rest)");
+    }
+    out
+}
+
+/// Render a file outline with indentation showing nesting.
+fn format_doc_symbols(root: &Path, file: &Path, syms: &[DocSym]) -> String {
+    let rel = rel_display(root, file);
+    if syms.is_empty() {
+        return format!("no symbols found in {} (empty file or unsupported)", rel.display());
+    }
+    const MAX: usize = 200;
+    let mut out = format!("{} symbol(s) in {}:\n", syms.len(), rel.display());
+    for s in syms.iter().take(MAX) {
+        out.push_str(&format!("  {}{} {}  :{}\n", "  ".repeat(s.depth), s.kind, s.name, s.line + 1));
+    }
+    if syms.len() > MAX {
+        out.push_str(&format!("  … (+{} more)\n", syms.len() - MAX));
+    }
+    out.trim_end().to_string()
+}
+
+/// Render workspace-symbol hits: `kind name  relpath:line`.
+fn format_ws_symbols(root: &Path, query: &str, syms: &[WsSym], max: usize) -> String {
+    if syms.is_empty() {
+        return format!("no symbols matching '{query}'");
+    }
+    let max = max.clamp(1, 100);
+    let mut out = format!("{} symbol(s) matching '{}':\n", syms.len(), query);
+    for s in syms.iter().take(max) {
+        let rel = rel_display(root, &s.path);
+        match s.line {
+            Some(l) => out.push_str(&format!("  {} {}  {}:{}\n", s.kind, s.name, rel.display(), l + 1)),
+            None => out.push_str(&format!("  {} {}  {}\n", s.kind, s.name, rel.display())),
+        }
+    }
+    if syms.len() > max {
+        out.push_str(&format!("  … (+{} more — narrow the query)\n", syms.len() - max));
+    }
+    out.trim_end().to_string()
+}
+
+/// Render diagnostics: severity counts header + `severity line:col  message [code]` rows.
+fn format_diagnostics(root: &Path, file: &Path, items: &[DiagItem]) -> String {
+    let rel = rel_display(root, file);
+    if items.is_empty() {
+        return format!("no diagnostics for {} — clean", rel.display());
+    }
+    const MAX: usize = 50;
+    let errors = items.iter().filter(|d| d.severity == "error").count();
+    let warnings = items.iter().filter(|d| d.severity == "warning").count();
+    let mut out = format!(
+        "{} diagnostic(s) for {} ({} error, {} warning):\n",
+        items.len(),
+        rel.display(),
+        errors,
+        warnings
+    );
+    for d in items.iter().take(MAX) {
+        let first_line = d.message.lines().next().unwrap_or("");
+        let msg: String = first_line.chars().take(300).collect();
+        let more = if d.message.lines().count() > 1 { " …" } else { "" };
+        let code = d.code.as_deref().map(|c| format!(" [{c}]")).unwrap_or_default();
+        out.push_str(&format!("  {} {}:{}  {}{}{}\n", d.severity, d.line + 1, d.col + 1, msg, more, code));
+    }
+    if items.len() > MAX {
+        out.push_str(&format!("  … (+{} more)\n", items.len() - MAX));
+    }
+    out.trim_end().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rel_display_handles_verbatim_and_drive_case() {
+        // Plain prefix → strip_prefix path.
+        assert_eq!(
+            rel_display(Path::new(r"C:\proj"), Path::new(r"C:\proj\src\a.rs")),
+            PathBuf::from(r"src\a.rs")
+        );
+        if cfg!(windows) {
+            // Canonicalized root (`\\?\C:\…`) vs lowercase-drive server path (`c:\…`).
+            assert_eq!(
+                rel_display(Path::new(r"\\?\C:\proj"), Path::new(r"c:\proj\src\a.rs")),
+                PathBuf::from(r"src\a.rs")
+            );
+        }
+        // Unrelated path → unchanged.
+        assert_eq!(
+            rel_display(Path::new(r"C:\proj"), Path::new(r"D:\other\b.rs")),
+            PathBuf::from(r"D:\other\b.rs")
+        );
+    }
+
+    #[test]
+    fn def_formatting() {
+        let def = DefHit {
+            path: PathBuf::from(r"C:\proj\src\lib.rs"),
+            line: 9,
+            col: 4,
+            source: "pub struct Foo {\n    x: u32,\n}".into(),
+            truncated: false,
+        };
+        let out = format_def(Path::new(r"C:\proj"), "Foo", &def);
+        assert!(out.starts_with("definition of 'Foo' — "), "{out}");
+        assert!(out.contains(":10:5"), "1-based position: {out}");
+        assert!(out.contains("pub struct Foo"), "{out}");
+        assert!(!out.contains("truncated"), "{out}");
+        let def_t = DefHit { truncated: true, ..def };
+        assert!(format_def(Path::new(r"C:\proj"), "Foo", &def_t).contains("truncated"));
+    }
+
+    #[test]
+    fn outline_formatting_indents_by_depth() {
+        let syms = vec![
+            DocSym { name: "Outer".into(), kind: "struct", line: 0, depth: 0 },
+            DocSym { name: "field".into(), kind: "field", line: 1, depth: 1 },
+        ];
+        let out = format_doc_symbols(Path::new(r"C:\p"), Path::new(r"C:\p\a.rs"), &syms);
+        assert!(out.contains("2 symbol(s) in a.rs"), "{out}");
+        assert!(out.contains("  struct Outer  :1"), "{out}");
+        assert!(out.contains("    field field  :2"), "depth-1 gets deeper indent: {out}");
+        let empty = format_doc_symbols(Path::new(r"C:\p"), Path::new(r"C:\p\a.rs"), &[]);
+        assert!(empty.contains("no symbols"), "{empty}");
+    }
+
+    #[test]
+    fn ws_symbol_formatting_caps() {
+        let syms: Vec<WsSym> = (0..5)
+            .map(|i| WsSym {
+                name: format!("sym{i}"),
+                kind: "fn",
+                path: PathBuf::from(r"C:\p\a.rs"),
+                line: Some(i),
+            })
+            .collect();
+        let out = format_ws_symbols(Path::new(r"C:\p"), "sym", &syms, 3);
+        assert!(out.contains("5 symbol(s) matching 'sym'"), "{out}");
+        assert!(out.contains("fn sym0  a.rs:1"), "{out}");
+        assert!(out.contains("(+2 more"), "cap marker: {out}");
+        assert!(format_ws_symbols(Path::new(r"C:\p"), "zzz", &[], 3).contains("no symbols matching"));
+    }
+
+    #[test]
+    fn diagnostics_formatting() {
+        let items = vec![
+            DiagItem { line: 2, col: 0, severity: "error", message: "mismatched types\nexpected u32".into(), code: Some("E0308".into()) },
+            DiagItem { line: 5, col: 3, severity: "warning", message: "unused variable".into(), code: None },
+        ];
+        let out = format_diagnostics(Path::new(r"C:\p"), Path::new(r"C:\p\a.rs"), &items);
+        assert!(out.contains("2 diagnostic(s) for a.rs (1 error, 1 warning)"), "{out}");
+        assert!(out.contains("error 3:1  mismatched types … [E0308]"), "first line only + code: {out}");
+        assert!(out.contains("warning 6:4  unused variable"), "{out}");
+        assert!(format_diagnostics(Path::new(r"C:\p"), Path::new(r"C:\p\a.rs"), &[]).contains("clean"));
+    }
+}
+
+#[cfg(test)]
+mod itest {
+    use super::*;
+    use std::path::Path;
+
+    /// End-to-end against THIS repo. Spawns a real rust-analyzer (slow; ~indexing) and requires it
+    /// installed — so it's `#[ignore]`d and skips cleanly when absent. Exercises the WHOLE v1 tool
+    /// surface in one server session (references, definition, outline, workspace symbols,
+    /// diagnostics). Run explicitly:
+    ///   `cargo test --bin aizen lsp::itest -- --ignored --nocapture`
+    #[test]
+    #[ignore = "spawns rust-analyzer (slow; requires it installed)"]
+    fn navigation_end_to_end() {
+        if discovery::resolve_server_binary(&discovery::SERVERS[0]).is_err() {
+            eprintln!("rust-analyzer not installed — skipping LSP end-to-end test");
+            return;
+        }
+        LSP.set_request_timeout(90);
+        LSP.enable().expect("enable lsp");
+        // `AgentConfig` is referenced across many files of this crate → exercises cross-file refs.
+        let anchor = Path::new("src/agent/mod.rs");
+
+        let refs = LSP.references(anchor, "AgentConfig", true).expect("references query failed");
+        eprintln!("--- lsp_references(AgentConfig) ---\n{refs}\n---");
+        assert!(refs.contains("reference(s) to 'AgentConfig'"), "unexpected output:\n{refs}");
+
+        let def = LSP.definition(anchor, "AgentConfig").expect("definition query failed");
+        eprintln!("--- lsp_definition(AgentConfig) ---\n{def}\n---");
+        assert!(def.contains("definition of 'AgentConfig'"), "unexpected output:\n{def}");
+        assert!(def.contains("pub struct AgentConfig"), "definition source inline:\n{def}");
+
+        let outline = LSP.document_symbols(Path::new("src/agent/lsp/mod.rs")).expect("outline failed");
+        eprintln!("--- lsp_document_symbols(lsp/mod.rs) ---\n{outline}\n---");
+        assert!(outline.contains("LspManager"), "unexpected outline:\n{outline}");
+
+        let ws = LSP.workspace_symbols(anchor, "LspManager", 30).expect("workspace symbols failed");
+        eprintln!("--- lsp_workspace_symbol(LspManager) ---\n{ws}\n---");
+        assert!(ws.contains("LspManager"), "unexpected output:\n{ws}");
+
+        let diags = LSP.diagnostics(Path::new("src/agent/lsp/mod.rs")).expect("diagnostics failed");
+        eprintln!("--- lsp_diagnostics(lsp/mod.rs) ---\n{diags}\n---");
+        assert!(
+            diags.contains("diagnostic(s) for") || diags.contains("clean"),
+            "unexpected output:\n{diags}"
+        );
+
+        LSP.disable();
+    }
+}

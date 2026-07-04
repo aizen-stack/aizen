@@ -75,6 +75,25 @@ model2vec-rs = { version = "0.2", optional = true, default-features = false, fea
 # NEVER bundle a browser engine (servo/CEF = C++) and NEVER use a Discord SDK (serenity = heavy dep).
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 
+# LSP client (symbol navigation: find-references / go-to-definition / document & workspace symbols),
+# default-OFF at runtime (AgentConfig.enable_lsp) and spawned lazily per project language. async-lsp
+# is the only mature pure-Rust crate that supports the CLIENT direction on tokio: it gives the client
+# `MainLoop` + request/response-id correlation + tower layers (Concurrency w/ cancellation,
+# CatchUnwind panic-isolation, Lifecycle ordering), and pulls `lsp-types` (protocol structs)
+# transitively — so we don't hand-roll JSON-RPC framing/correlation. Server-binary discovery
+# (PATH + Windows PATHEXT, node servers ship as `.cmd` shims) is hand-rolled in lsp/discovery.rs —
+# the `which` crate was dropped because its `winsafe` dep links `ktmw32`, which the windows-gnu
+# toolchain's slim self-contained MinGW can't resolve. `url` (declared above) does Windows
+# path<->`file://` URI. All pure-Rust → single static binary preserved.
+async-lsp = { version = "0.2", features = ["tokio"] }
+# Adapts tokio child-process pipes (tokio::io::Async{Read,Write}) into the futures-io traits that
+# async-lsp's `MainLoop::run_buffered` expects. `compat` feature only → no extra surface.
+tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
+# `Layer` trait so we can wrap the LSP client router in async-lsp's CatchUnwind middleware (a panic
+# in a handler becomes an error response instead of killing the MainLoop). Trait-only crate, ALREADY
+# in the tree via async-lsp → zero marginal cost.
+tower-layer = "0.3"
+
 [features]
 # Enable the model2vec semantic embedder. Build: `cargo build --features dense`.
 dense = ["dep:model2vec-rs"]
@@ -96,3 +115,13 @@ lto = "thin"
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 png = "0.17"
+
+# Windows Job Object (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) so killing a node-based language server
+# (`typescript-language-server.cmd` → cmd.exe → node.exe) reaps the WHOLE process tree —
+# TerminateProcess/kill_on_drop alone would orphan the real node process. windows-sys is ALREADY in
+# the dependency tree (console/dialoguer/tokio pull it) → zero new crates, pure bindings, single
+# static binary preserved. PINNED to 0.59: 0.60+ switched to `windows-link` raw-dylib linking, which
+# needs MinGW `dlltool.exe` on the *-windows-gnu toolchain (not present here); 0.59 ships classic
+# prebuilt import libs and builds everywhere.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects"] }

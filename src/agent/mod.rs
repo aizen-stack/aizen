@@ -17,6 +17,7 @@ pub mod builtin;
 pub mod clarify;
 pub mod cmd_guard;
 pub mod compact;
+pub mod lsp;
 pub mod mcp;
 pub mod mcp_oauth;
 pub mod process;
@@ -166,6 +167,14 @@ pub struct AgentConfig {
     /// is allowed to finish). `1` = the old one-shot behavior; `0` disables looping entirely (the
     /// gate still needs `enable_verify_gate`). Only re-fires after the model makes NEW edits.
     pub max_verify_attempts: usize,
+    /// Enable the LSP subsystem (type-aware symbol navigation via a per-language server). Default
+    /// OFF: when false, no language server is ever spawned and the LSP tools aren't registered, so
+    /// the agent behaves exactly as without LSP. Servers are spawned lazily per project language
+    /// only after this is on AND a query needs one. Sub-agents/workflows inherit `false`.
+    pub enable_lsp: bool,
+    /// Per-request wall-clock cap (seconds) for an LSP query, so a hung server can never block the
+    /// agent turn. Mirrors Helix's 20s default.
+    pub lsp_request_timeout_secs: u64,
 }
 
 impl Default for AgentConfig {
@@ -184,6 +193,8 @@ impl Default for AgentConfig {
             clear_tool_result_min_chars: 1024,
             compact_at_pct: 80,
             max_verify_attempts: 2,
+            enable_lsp: false,
+            lsp_request_timeout_secs: 20,
         }
     }
 }
@@ -1047,6 +1058,8 @@ mod tests {
             clear_tool_result_min_chars: 1024,
             compact_at_pct: 80,
             max_verify_attempts: 2,
+            enable_lsp: false,
+            lsp_request_timeout_secs: 20,
         }
     }
 

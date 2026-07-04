@@ -89,6 +89,16 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     // `clarify` yields the turn back to the interactive user — meaningless inside an autonomous
     // sub-agent (no user to answer), so it stays top-level only, like todo/process.
     r.register(Box::new(crate::agent::clarify::Clarify));
+    // LSP navigation + diagnostics (top-level only; default OFF). Registered ONLY once the user
+    // runs `/lsp on` (the registry is rebuilt per turn, so it appears next turn). Sub-agents use
+    // `subagent_read_only_base` and deliberately never get it.
+    if crate::agent::lsp::LSP.is_enabled() {
+        r.register(Box::new(crate::agent::lsp::tools::LspReferences::new(root.to_path_buf())));
+        r.register(Box::new(crate::agent::lsp::tools::LspDefinition::new(root.to_path_buf())));
+        r.register(Box::new(crate::agent::lsp::tools::LspDocumentSymbols::new(root.to_path_buf())));
+        r.register(Box::new(crate::agent::lsp::tools::LspWorkspaceSymbol::new(root.to_path_buf())));
+        r.register(Box::new(crate::agent::lsp::tools::LspDiagnostics::new(root.to_path_buf())));
+    }
     // User-configurable MCP servers (`~/.nextgen/mcp.json`) — each remote tool wrapped as
     // `mcp_<server>_<tool>`. Empty (zero cost) when MCP is unconfigured. Top-level only, like
     // todo/process: sub-agents share the same live connections via the global manager but don't
