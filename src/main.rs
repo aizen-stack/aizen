@@ -96,6 +96,11 @@ enum Commands {
     Models(ModelsArgs),
     /// Crawl a website (katana-style): BFS over HTTP, extract links from HTML + endpoints from JS.
     Crawl(CrawlArgs),
+    /// Reach doctor: live-probe every web-access backend and show which serves each platform.
+    Reach {
+        #[command(subcommand)]
+        cmd: ReachCmd,
+    },
     /// Run the long-lived daemon: listen on Telegram, run the agent on incoming messages, and
     /// route destructive-op approvals to your phone.
     Serve,
@@ -367,6 +372,18 @@ enum TelegramCmd {
     Test,
     /// Show the Telegram config (token redacted).
     Show,
+}
+
+#[derive(Subcommand, Debug)]
+enum ReachCmd {
+    /// Live-probe every backend (one tiny request each) and report per-channel health.
+    Doctor {
+        /// Emit the machine-readable report (the Agent-Reach doctor --json contract).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the channel table + which backend served each channel this session (no network).
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -702,6 +719,7 @@ async fn main() -> Result<()> {
         Commands::Config { cmd } => run_config(cmd).await,
         Commands::Models(args) => run_models(args).await,
         Commands::Crawl(args) => run_crawl(args).await,
+        Commands::Reach { cmd } => run_reach(cmd).await,
         Commands::Serve => run_serve().await,
         Commands::Telegram { cmd } => run_telegram(cmd).await,
         Commands::Discord { cmd } => run_discord(cmd).await,
@@ -1125,6 +1143,27 @@ async fn run_crawl(args: CrawlArgs) -> Result<()> {
         ))
         .dim()
     );
+    Ok(())
+}
+
+/// `aizen reach doctor [--json]` / `aizen reach status` — the web-access health check.
+async fn run_reach(cmd: ReachCmd) -> Result<()> {
+    match cmd {
+        ReachCmd::Status => {
+            println!("{}", crate::agent::reach::render_passive());
+        }
+        ReachCmd::Doctor { json } => {
+            if !json {
+                eprintln!("{}", style("probing every backend (a few seconds)…").dim());
+            }
+            let reports = crate::agent::reach::doctor().await;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&crate::agent::reach::report_json(&reports))?);
+            } else {
+                println!("{}", crate::agent::reach::render_report(&reports));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4085,6 +4124,7 @@ const SLASH_CMDS: &[(&str, &str)] = &[
     ("checkpoint", "save a restore point of the code now"),
     ("compact", "summarize older turns to free context now"),
     ("lsp", "type-aware code navigation (references · definition · symbols · diagnostics) — on/off/status/restart"),
+    ("reach", "web-access health check: which backend serves each platform (youtube · twitter · github · hn · wikipedia · feeds · stackexchange · search)"),
     ("yolo", "toggle auto-approve: run file edits & shell WITHOUT asking each time"),
     ("smart", "toggle smart approval: auto-run read-only shell, ask for the rest"),
     ("clear", "start a fresh conversation"),
@@ -4130,6 +4170,7 @@ Commands:
   /checkpoint [note] save a restore point of the working tree now
   /compact           summarize older turns to free context now
   /lsp [on|off|status|restart]  type-aware navigation + diagnostics via a language server (rust-analyzer · pyright · typescript-language-server); default OFF, servers start lazily
+  /reach [doctor|status]  web-access channels: live-probe every backend (doctor) or show what served this session (status); web_fetch/web_search route through these
   /yolo              toggle auto-approve — run file edits & shell WITHOUT asking each time
   /smart             toggle smart approval — auto-run read-only shell, ask for the rest
   /clear             start a fresh conversation
@@ -4231,6 +4272,21 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                 }
                 other => tui::emit_line(
                     &style(format!("usage: /lsp [status|on|off|restart]  (unknown '{other}')")).dim().to_string(),
+                ),
+            }
+        }
+        "reach" => {
+            use crate::agent::reach;
+            let sub = arg.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            match sub.as_str() {
+                "" | "status" | "st" => tui::emit_line(&reach::render_passive()),
+                "doctor" | "dr" | "check" => {
+                    tui::emit_line(&style("probing every backend (a few seconds)…").dim().to_string());
+                    let reports = reach::doctor().await;
+                    tui::emit_line(&reach::render_report(&reports));
+                }
+                other => tui::emit_line(
+                    &style(format!("usage: /reach [status|doctor]  (unknown '{other}')")).dim().to_string(),
                 ),
             }
         }

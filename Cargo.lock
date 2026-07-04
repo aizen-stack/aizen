@@ -43,6 +43,7 @@ dependencies = [
  "console",
  "dialoguer",
  "eventsource-stream",
+ "flate2",
  "futures-util",
  "getrandom 0.2.17",
  "icu_normalizer",

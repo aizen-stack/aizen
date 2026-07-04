@@ -93,6 +93,11 @@ tokio-util = { version = "0.7", default-features = false, features = ["compat"] 
 # in a handler becomes an error response instead of killing the MainLoop). Trait-only crate, ALREADY
 # in the tree via async-lsp → zero marginal cost.
 tower-layer = "0.3"
+# Gzip decompression for the reach layer's StackExchange backend (api.stackexchange.com compresses
+# every response unconditionally). `rust_backend` = miniz_oxide, pure Rust — NO C zlib (this machine
+# has no C toolchain, and the single-static-binary posture must hold). flate2 + miniz_oxide are
+# ALREADY in the dependency tree (verified vs Cargo.lock 2026-07-05) → zero marginal binary cost.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [features]
 # Enable the model2vec semantic embedder. Build: `cargo build --features dense`.

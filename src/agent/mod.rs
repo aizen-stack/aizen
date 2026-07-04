@@ -22,6 +22,7 @@ pub mod mcp;
 pub mod mcp_oauth;
 pub mod process;
 pub mod project_context;
+pub mod reach;
 pub mod search;
 pub mod task_tool;
 pub mod todo;

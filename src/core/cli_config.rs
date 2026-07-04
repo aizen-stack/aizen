@@ -97,6 +97,36 @@ pub struct CliConfig {
     /// webhook under [`NotifyConfig`] — this is a full bot that receives messages and replies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discord: Option<DiscordConfig>,
+    /// Reach layer (platform-aware web access) optional keys — everything works keyless; these only
+    /// raise limits / unlock extras. See `agent::reach` and `/reach`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<ReachConfig>,
+}
+
+/// Optional credentials for the reach layer. All channels have a keyless path; a key only upgrades:
+/// Jina key → higher r.jina.ai quota + unlocks s.jina.ai search fallback; GitHub token → 5000
+/// requests/h instead of 60. Env always wins (see `resolved_*`).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ReachConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jina_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_token: Option<String>,
+}
+
+impl ReachConfig {
+    /// Effective Jina key: `NG_JINA_API_KEY` > `JINA_API_KEY` > config file.
+    pub fn resolved_jina_key(&self) -> Option<String> {
+        env_nonempty("NG_JINA_API_KEY").or_else(|| env_nonempty("JINA_API_KEY")).or_else(|| self.jina_api_key.clone())
+    }
+    /// Effective GitHub token: `NG_GITHUB_TOKEN` > the conventional `GITHUB_TOKEN` > config file.
+    pub fn resolved_github_token(&self) -> Option<String> {
+        env_nonempty("NG_GITHUB_TOKEN").or_else(|| env_nonempty("GITHUB_TOKEN")).or_else(|| self.github_token.clone())
+    }
+}
+
+fn env_nonempty(var: &str) -> Option<String> {
+    std::env::var(var).ok().filter(|s| !s.trim().is_empty())
 }
 
 /// Discord BOT (two-way) config — a bot token (from the Developer Portal) + an allowlist of channel
