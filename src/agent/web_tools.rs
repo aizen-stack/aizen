@@ -7,11 +7,12 @@
 //! transcripts, tweets, GitHub API reads, HN threads, Wikipedia, RSS/Atom, Stack Exchange, and a
 //! direct→Jina chain for everything else). `/reach` shows which backend serves each channel.
 //!
-//! Async-from-sync: `reqwest` is async; the `Tool` trait is sync. We bridge with `block_in_place`
-//! + the CURRENT runtime's `block_on` (same pattern + invariant as `task_tool`). Therefore all
-//! declare `is_concurrency_safe() = false`: the parallel scoped-thread path has no Tokio runtime,
-//! where `block_in_place`/`Handle::current()` would panic. They stay on the serial path (a runtime
-//! worker thread) where the bridge is valid.
+//! Async-from-sync: `reqwest` is async; the `Tool` trait is sync. We bridge through the shared
+//! cancel-aware `tools::block_for_tool`, valid on runtime workers AND on the executor's
+//! `spawn_blocking` threads (tokio's `block_in_place` is a verified pass-through there — pinned by
+//! `tools::tests::bridge_works_inside_spawn_blocking`). Therefore all declare
+//! `is_concurrency_safe() = true`: read-only network fetches are exactly the calls that WIN from
+//! running concurrently in a batch.
 //!
 //! No HTML crate: HTML is reduced to text with a few regexes (strip script/style, drop tags,
 //! decode a handful of entities). Best-effort — good enough to feed a page's prose to the model.
@@ -41,9 +42,10 @@ fn client() -> Result<reqwest::Client> {
         .context("building HTTP client")
 }
 
-/// Drive an async future from the sync `Tool::execute` path (see the module note on the invariant).
-fn block<F: std::future::Future>(f: F) -> F::Output {
-    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+/// Drive an async future from the sync `Tool::execute` path — the shared cancel-aware bridge
+/// (valid on workers AND spawn_blocking threads; Esc aborts the in-flight fetch promptly).
+fn block<T>(f: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    crate::agent::tools::block_for_tool(f)
 }
 
 // ── web_fetch ────────────────────────────────────────────────────────────────
@@ -71,7 +73,7 @@ impl Tool for WebFetch {
         })
     }
     fn is_concurrency_safe(&self) -> bool {
-        false
+        true // read-only network fetch — the concurrent batch is the whole point (see module note)
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let url = args.get("url").and_then(|v| v.as_str()).context("missing required string arg 'url'")?;
@@ -111,7 +113,7 @@ impl Tool for WebSearch {
         })
     }
     fn is_concurrency_safe(&self) -> bool {
-        false
+        true // read-only network fetch — the concurrent batch is the whole point (see module note)
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let query = args
@@ -152,7 +154,7 @@ impl Tool for WebCrawl {
         })
     }
     fn is_concurrency_safe(&self) -> bool {
-        false
+        true // read-only network fetch — the concurrent batch is the whole point (see module note)
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let url = args.get("url").and_then(|v| v.as_str()).context("missing required string arg 'url'")?;
@@ -304,11 +306,11 @@ mod tests {
     }
 
     #[test]
-    fn tools_are_serial_path_only() {
-        // block_in_place would panic on the parallel scoped-thread path → must be false.
-        assert!(!WebFetch.is_concurrency_safe());
-        assert!(!WebSearch.is_concurrency_safe());
-        assert!(!WebCrawl.is_concurrency_safe());
+    fn tools_are_parallel_eligible_read_only() {
+        // The shared bridge is valid on spawn_blocking threads → network reads run concurrently.
+        assert!(WebFetch.is_concurrency_safe());
+        assert!(WebSearch.is_concurrency_safe());
+        assert!(WebCrawl.is_concurrency_safe());
         // Read-only research tools — not approval-gated.
         assert!(!WebFetch.is_destructive());
         assert!(!WebSearch.is_destructive());

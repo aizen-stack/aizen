@@ -256,7 +256,11 @@ enum McpCmd {
 #[derive(Subcommand, Debug)]
 enum SkillCmd {
     /// List saved skills (name — description).
-    List,
+    List {
+        /// Also list other workspaces' zones (skills invisible in this project).
+        #[arg(long)]
+        all_zones: bool,
+    },
     /// Print one skill's full steps.
     Show {
         /// Skill name.
@@ -611,7 +615,11 @@ enum MemoryCmd {
         body: Option<String>,
     },
     /// List all memories.
-    List,
+    List {
+        /// Workspace view: all (default) | global | current | project | a zone slug.
+        #[arg(long)]
+        scope: Option<String>,
+    },
     /// Show one memory by id or name.
     Show { id: String },
     /// Lexically search memories (long tail; excludes frozen-core entries).
@@ -622,6 +630,9 @@ enum MemoryCmd {
         /// Restrict to one topical dimension: style|tooling|workflow|stack|other.
         #[arg(long)]
         dimension: Option<String>,
+        /// Workspace view: all (default) | global | current | project | a zone slug.
+        #[arg(long)]
+        scope: Option<String>,
     },
     /// Show the frozen core (the always-on prompt-prefix block); --rebuild stages a refresh.
     Frozen {
@@ -1220,6 +1231,7 @@ async fn run_agent_capture(
         api_key.to_string(),
         model.to_string(),
         auto_approve,
+        resolve_ctx_window(model).0,
     )?;
     let cfg = AgentConfig { auto_approve, quiet: true, enable_verify_gate: false, ..Default::default() };
 
@@ -1289,6 +1301,7 @@ async fn run_serve_turn(
         api_key.to_string(),
         model.to_string(),
         auto_approve,
+        resolve_ctx_window(model).0,
     )?;
     let cfg = AgentConfig {
         auto_approve,
@@ -1307,10 +1320,14 @@ async fn run_serve_turn(
     // Mid-loop auto-compaction for long serve sessions: a NON-streaming summarize closure over the
     // same endpoint. `cap_session` below stays only as a hard backstop (compaction usually keeps the
     // history well under its cap).
-    let summarize = move |msgs: Vec<Message>| async move {
-        client::chat_with_tools(http_ref, base, key, model_ref, &msgs, &[])
-            .await
-            .map(|t| t.content.unwrap_or_default())
+    let sum_ep = summarizer_endpoint(base, key, model_ref);
+    let summarize = move |msgs: Vec<Message>| {
+        let ep = sum_ep.clone();
+        async move {
+            client::chat_with_tools(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+                .await
+                .map(|t| t.content.unwrap_or_default())
+        }
     };
     let outcome =
         agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, history).await?;
@@ -3021,7 +3038,43 @@ fn status_text(history: &[Message], model: &str) -> String {
         ""
     };
     let todos = crate::agent::todo::status_summary().map(|s| format!("  ·  {s}")).unwrap_or_default();
-    format!("{model}  ·  {toklabel}/{winlabel} tok  ·  {turns} turns  ·  {pct:.0}% ctx{todos}{mode}")
+    let cache = cache_hit_label().map(|s| format!("  ·  {s}")).unwrap_or_default();
+    format!("{model}  ·  {toklabel}/{winlabel} tok  ·  {turns} turns  ·  {pct:.0}% ctx{cache}{todos}{mode}")
+}
+
+/// The summarizer endpoint: `roles.summarizer` routing (env > config > main endpoint). Chore
+/// calls (compaction/handoff summaries) are the classic cheap-model candidates — one config field
+/// and every summary routes there.
+fn summarizer_endpoint(base: &str, key: &str, model: &str) -> cli_config::ResolvedEndpoint {
+    cli_config::resolve_role(
+        "summarizer",
+        &cli_config::ResolvedEndpoint {
+            base_url: base.to_string(),
+            api_key: key.to_string(),
+            model: model.to_string(),
+        },
+    )
+}
+
+/// Eager tool execution during streaming: ON unless disabled by config (`eager_tools: false`) or
+/// the `NG_NO_EAGER` env kill-switch (per-machine escape hatch if a provider's stream framing
+/// misbehaves).
+fn eager_enabled() -> bool {
+    if std::env::var_os("NG_NO_EAGER").is_some() {
+        return false;
+    }
+    cli_config::load().eager_tools.unwrap_or(true)
+}
+
+/// Live prompt-cache hit rate of the MOST RECENT model call (`⛁ 78% cached`), when the provider
+/// reports usage and any tokens actually came from cache. The at-a-glance KV-cache health signal —
+/// a sudden drop to 0% mid-session means something is rewriting the prefix.
+fn cache_hit_label() -> Option<String> {
+    let (prompt, cached, _) = client::cost_meter().last_call()?;
+    if prompt == 0 || cached == 0 {
+        return None;
+    }
+    Some(format!("⛁ {}% cached", cached * 100 / prompt))
 }
 
 /// The sticky-TUI REPL: a background keyboard thread feeds a submission queue while the agent runs,
@@ -3137,6 +3190,7 @@ async fn run_menu_sticky() -> Result<()> {
                     api_key.clone(),
                     model.clone(),
                     false,
+                    resolve_ctx_window(&model).0,
                 ) {
                     Ok(r) => r,
                     Err(e) => {
@@ -3149,11 +3203,14 @@ async fn run_menu_sticky() -> Result<()> {
                     auto_approve: yolo_enabled(),
                     smart_approve: smart_approve_enabled(),
                     context_window: resolve_ctx_window(&model).0,
+                    enable_self_review: cli_config::load().self_review.unwrap_or(false),
                     ..AgentConfig::default()
                 };
                 // Bridge LSP config → the manager (per-request timeout; auto-enable if configured).
                 // Control is normally via `/lsp on|off`; `enable_lsp` is the config/flag path.
                 crate::agent::lsp::LSP.set_request_timeout(cfg.lsp_request_timeout_secs);
+                crate::agent::lsp::LSP
+                    .set_edit_feedback(cli_config::load().lsp_edit_diagnostics.unwrap_or(true));
                 if cfg.enable_lsp {
                     let _ = crate::agent::lsp::LSP.enable();
                 }
@@ -3166,24 +3223,62 @@ async fn run_menu_sticky() -> Result<()> {
                 tui::set_working(true);
 
                 // Run the turn racing a cancel signal; on cancel the future is DROPPED at its current
-                // await (model stream / verify gate), which aborts the in-flight request. Because the
-                // assistant tool-call turn is only appended AFTER the model await returns and tool
-                // execution is synchronous, the dropped future leaves `history` consistent.
+                // await (model stream / tool batch / verify gate), which aborts the in-flight request.
+                // History stays consistent under the drop because the loop PRE-FILLS: the assistant
+                // tool-call turn and one placeholder result per call are appended in a single
+                // synchronous block before any tool await, and real results overwrite the
+                // placeholders as they land (see agent::execute_calls).
                 let result = {
                     let http_ref = &http;
                     let base = base_url.as_str();
                     let key = api_key.as_str();
                     let model_ref = model.as_str();
+                    let registry_ref = &registry;
+                    let cfg_ref = &cfg;
+                    let eager_on = eager_enabled();
                     let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
-                        client::stream_chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
+                        if eager_on {
+                            // Read-only calls start the moment their streamed args complete.
+                            let starter = agent::eager_starter(registry_ref, cfg_ref);
+                            client::stream_chat_with_tools_eager(http_ref, base, key, model_ref, &msgs, &defs, Some(&starter)).await
+                        } else {
+                            client::stream_chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
+                        }
                     };
                     // Non-streaming summarizer for mid-loop auto-compaction (keeps the streamed display clean).
-                    let summarize = move |msgs: Vec<Message>| async move {
-                        client::chat_with_tools(http_ref, base, key, model_ref, &msgs, &[])
-                            .await
-                            .map(|t| t.content.unwrap_or_default())
+                    let sum_ep = summarizer_endpoint(base, key, model_ref);
+                    let summarize = move |msgs: Vec<Message>| {
+                        let ep = sum_ep.clone();
+                        async move {
+                            client::chat_with_tools(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+                                .await
+                                .map(|t| t.content.unwrap_or_default())
+                        }
                     };
-                    let fut = agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, &mut history);
+                    // Optional oracle for self-review: only when `roles.oracle` is explicitly
+                    // configured (a stronger reviewer model); otherwise nudge-mode.
+                    let oracle = cli_config::role_configured("oracle")
+                        .then(|| {
+                            cli_config::resolve_role(
+                                "oracle",
+                                &cli_config::ResolvedEndpoint {
+                                    base_url: base.to_string(),
+                                    api_key: key.to_string(),
+                                    model: model_ref.to_string(),
+                                },
+                            )
+                        })
+                        .map(|ep| {
+                            move |msgs: Vec<Message>| {
+                                let ep = ep.clone();
+                                async move {
+                                    client::chat_with_tools(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+                                        .await
+                                        .map(|t| t.content.unwrap_or_default())
+                                }
+                            }
+                        });
+                    let fut = agent::run_agent_loop_full(chat, summarize, oracle, &cfg, &registry, &mut history);
                     tokio::select! {
                         r = fut => Some(r),
                         // Match only a REAL signal: if the keyboard thread exits (read_key error/EOF)
@@ -3344,6 +3439,7 @@ async fn run_menu_plain() -> Result<()> {
             api_key.clone(),
             model.clone(),
             false,
+            resolve_ctx_window(&model).0,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -3359,21 +3455,55 @@ async fn run_menu_plain() -> Result<()> {
             auto_approve: yolo_enabled(),
             smart_approve: smart_approve_enabled(),
             context_window: resolve_ctx_window(&model).0,
+            enable_self_review: cli_config::load().self_review.unwrap_or(false),
             ..AgentConfig::default()
         };
         let http_ref = &http;
         let base = base_url.as_str();
         let key = api_key.as_str();
         let model_ref = model.as_str();
+        let registry_ref = &registry;
+        let cfg_ref = &cfg;
+        let eager_on = eager_enabled();
         let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
-            client::stream_chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
+            if eager_on {
+                let starter = agent::eager_starter(registry_ref, cfg_ref);
+                client::stream_chat_with_tools_eager(http_ref, base, key, model_ref, &msgs, &defs, Some(&starter)).await
+            } else {
+                client::stream_chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
+            }
         };
-        let summarize = move |msgs: Vec<Message>| async move {
-            client::chat_with_tools(http_ref, base, key, model_ref, &msgs, &[])
-                .await
-                .map(|t| t.content.unwrap_or_default())
+        let sum_ep = summarizer_endpoint(base, key, model_ref);
+        let summarize = move |msgs: Vec<Message>| {
+            let ep = sum_ep.clone();
+            async move {
+                client::chat_with_tools(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+                    .await
+                    .map(|t| t.content.unwrap_or_default())
+            }
         };
-        match agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, &mut history).await {
+        let oracle = cli_config::role_configured("oracle")
+            .then(|| {
+                cli_config::resolve_role(
+                    "oracle",
+                    &cli_config::ResolvedEndpoint {
+                        base_url: base.to_string(),
+                        api_key: key.to_string(),
+                        model: model_ref.to_string(),
+                    },
+                )
+            })
+            .map(|ep| {
+                move |msgs: Vec<Message>| {
+                    let ep = ep.clone();
+                    async move {
+                        client::chat_with_tools(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+                            .await
+                            .map(|t| t.content.unwrap_or_default())
+                    }
+                }
+            });
+        match agent::run_agent_loop_full(chat, summarize, oracle, &cfg, &registry, &mut history).await {
             // `clarify` paused the turn — show the question, loop back for the answer (the next
             // typed message continues this conversation). No post-turn learning: not done yet.
             Ok(AgentOutcome { stop: StopReason::AwaitingInput(q), .. }) => {
@@ -3488,7 +3618,10 @@ async fn maybe_learn_skill(
         if existing.is_empty() { "(none)".to_string() } else { existing.join(", ") },
         transcript
     ));
-    let resp = match client::chat_with_tools(http, base, key, model, &[sys, usr], &[]).await {
+    // Chore-class extraction call → billed to the summarizer role (env/config routing), never
+    // silently to the main model.
+    let ep = summarizer_endpoint(base, key, model);
+    let resp = match client::chat_with_tools(http, &ep.base_url, &ep.api_key, &ep.model, &[sys, usr], &[]).await {
         Ok(t) => t,
         Err(_) => return, // best-effort; never disrupt the REPL
     };
@@ -3515,7 +3648,9 @@ async fn maybe_learn_skill(
     if existing.iter().any(|e| skill::sanitize_name(e) == slug) {
         return;
     }
-    match skill::save(name, "", when, steps) {
+    // Auto-learned procedures are almost always about THIS project → they land in the current
+    // workspace's zone, so another repo's `<skills>` index never pays for them.
+    match skill::save_scoped(name, "", when, steps, true) {
         Ok(_) => tui::emit_line(
             &style(format!("{}learned skill '{name}' — /skills to view/edit/remove", icons::g(icons::learned())))
                 .color256(splash::ACCENT)
@@ -3675,11 +3810,21 @@ async fn run_persona_reflection(
         return;
     }
     let (sys, usr) = persona::reflect::build_reflection_prompt(&persona.name, &persona.role, &episodes);
-    let resp =
-        match client::chat_with_tools(http, base, key, model, &[Message::system(sys), Message::user(usr)], &[]).await {
-            Ok(t) => t,
-            Err(_) => return, // best-effort; never disrupt the REPL
-        };
+    // Chore-class synthesis call → billed to the summarizer role, like every other harness chore.
+    let ep = summarizer_endpoint(base, key, model);
+    let resp = match client::chat_with_tools(
+        http,
+        &ep.base_url,
+        &ep.api_key,
+        &ep.model,
+        &[Message::system(sys), Message::user(usr)],
+        &[],
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(_) => return, // best-effort; never disrupt the REPL
+    };
     let content = resp.content.unwrap_or_default();
     let json = match extract_json_object(&content) {
         Some(j) => j,
@@ -3779,10 +3924,11 @@ fn resolve_ctx_window(model: &str) -> (usize, bool) {
     effective_ctx_window(model, configured)
 }
 
-/// Rough session size in tokens (chars/4, no tokenizer dep) — shared by the HUD + auto-compact.
+/// Rough session size in tokens — shared by the HUD + auto-compact. Delegates to the agent
+/// estimator (content + tool-call payloads + envelopes) plus the tool-schema overhead the loop
+/// last published, so the HUD and the mid-loop guards agree on request size.
 fn session_tokens(history: &[Message]) -> usize {
-    let chars: usize = history.iter().filter_map(|m| m.content.as_ref()).map(|c| c.chars().count()).sum();
-    chars / 4
+    history.iter().map(agent::estimate_message_tokens).sum::<usize>() + agent::schema_overhead_tokens()
 }
 
 /// Compact a token count for display: `12.4K` / `300`.
@@ -3893,7 +4039,11 @@ fn preprocess_input(line: &str) -> InputPre {
     if let Some(rest) = t.strip_prefix('#') {
         let text = rest.trim();
         if text.is_empty() {
-            tui::emit_line(&style("# — type the fact after the # to remember it").dim().to_string());
+            tui::emit_line(
+                &style("# — type the fact after the # to remember it (this project's zone; `#global: …` for everywhere)")
+                    .dim()
+                    .to_string(),
+            );
         } else {
             match memory::remember(text) {
                 Ok(id) => tui::emit_line(&style(format!("🧠 remembered ({id})")).color256(splash::ACCENT).to_string()),
@@ -4052,13 +4202,14 @@ fn print_status_line(history: &[Message], model: &str) {
         0 => String::new(),
         t => style(format!("  ·  ⊟ {t}%")).dim().to_string(), // auto-compact trigger level
     };
+    let cache = cache_hit_label().map(|s| style(format!("  ·  {s}")).dim().to_string()).unwrap_or_default();
     let rest = style(format!(
         "{}{model}  ·  {toklabel}/{winlabel} tok  ·  {turns} turns{tg}",
         icons::g(icons::spark())
     ))
     .dim();
     // emit_line routes into the sticky scroll region (above the box) when active, else plain stdout.
-    tui::emit_line(&format!("\n{rest}  ·  {ctx}{ac}{yolo}"));
+    tui::emit_line(&format!("\n{rest}  ·  {ctx}{ac}{cache}{yolo}"));
 }
 
 /// How many trailing user turns to keep verbatim when compacting (the rest is summarized).
@@ -4085,10 +4236,14 @@ async fn compact_history(
     key: &str,
     model: &str,
 ) -> Result<(usize, usize)> {
-    let summarize = move |msgs: Vec<Message>| async move {
-        client::chat_with_tools(http, base, key, model, &msgs, &[])
-            .await
-            .map(|t| t.content.unwrap_or_default())
+    let sum_ep = summarizer_endpoint(base, key, model);
+    let summarize = move |msgs: Vec<Message>| {
+        let ep = sum_ep.clone();
+        async move {
+            client::chat_with_tools(http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+                .await
+                .map(|t| t.content.unwrap_or_default())
+        }
     };
     agent::compact::compact_history(history, summarize, COMPACT_KEEP_TURNS).await
 }
@@ -4098,6 +4253,26 @@ async fn compact_now(history: &mut Vec<Message>) -> Result<(usize, usize)> {
     let (base, key, model) = resolve_endpoint(None, None, None)?;
     let http = http_client()?;
     compact_history(history, &http, &base, &key, &model).await
+}
+
+/// `/handoff` — one goal-conditioned extraction call over the current history (routed through the
+/// summarizer role, like compaction). Returns the extraction; the caller rebuilds the thread.
+async fn handoff_now(history: &[Message], goal: &str) -> Result<String> {
+    let (base, key, model) = resolve_endpoint(None, None, None)?;
+    let http = http_client()?;
+    if history.len() < 2 {
+        anyhow::bail!("nothing to hand off yet — the conversation is empty");
+    }
+    let ep = summarizer_endpoint(&base, &key, &model);
+    let prompt = agent::compact::handoff_prompt(history, goal);
+    let summary = client::chat_with_tools(&http, &ep.base_url, &ep.api_key, &ep.model, &prompt, &[])
+        .await?
+        .content
+        .unwrap_or_default();
+    if summary.trim().is_empty() {
+        anyhow::bail!("the model returned an empty handoff summary");
+    }
+    Ok(summary.trim().to_string())
 }
 
 enum SlashOutcome {
@@ -4110,6 +4285,7 @@ enum SlashOutcome {
 /// The slash commands, shown in the `/` picker (name, one-line description).
 const SLASH_CMDS: &[(&str, &str)] = &[
     ("help", "show this list"),
+    ("handoff", "start a fresh thread carrying only what matters for a new goal"),
     ("model", "list + pick the model (with context windows)"),
     ("config", "set endpoint + key + model (wizard)"),
     ("memory", "show your profile / search memory"),
@@ -4247,6 +4423,28 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                 Err(e) => tui::emit_line(&format!("{} {e}", style("compact:").red())),
             }
         }
+        "handoff" => {
+            if arg.trim().is_empty() {
+                tui::emit_line(&style("usage: /handoff <new goal> — start a fresh thread carrying only what matters for it").dim().to_string());
+            } else {
+                tui::emit_line(&style("handing off…").dim().to_string());
+                match handoff_now(history, arg.trim()).await {
+                    Ok(summary) => {
+                        // Fresh thread: new system prompt, the goal-relevant extraction seeded as
+                        // context, todos cleared, destructive-op session grants re-armed (like /clear).
+                        rebuild_system(history, model_label);
+                        history.push(Message::system(format!(
+                            "[handoff context from the previous session]\n{summary}"
+                        )));
+                        crate::agent::todo::clear();
+                        tui::reset_session_allow();
+                        tui::emit_line(&style("handoff — fresh thread seeded with the relevant context").color256(splash::ACCENT).to_string());
+                        return SlashOutcome::Submit(arg.trim().to_string());
+                    }
+                    Err(e) => tui::emit_line(&format!("{} {e}", style("handoff:").red())),
+                }
+            }
+        }
         "lsp" => {
             use crate::agent::lsp::LSP;
             let sub = arg.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
@@ -4270,8 +4468,29 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                         Err(e) => tui::emit_line(&format!("{} {e}", style("lsp:").red())),
                     }
                 }
+                "edits" => {
+                    let mode = arg.split_whitespace().nth(1).unwrap_or("").to_ascii_lowercase();
+                    match mode.as_str() {
+                        "on" => {
+                            LSP.set_edit_feedback(true);
+                            tui::emit_line(&style("LSP edit feedback on — new diagnostics fold into edit results.").dim().to_string());
+                        }
+                        "off" => {
+                            LSP.set_edit_feedback(false);
+                            tui::emit_line(&style("LSP edit feedback off.").dim().to_string());
+                        }
+                        _ => tui::emit_line(
+                            &style(format!(
+                                "usage: /lsp edits on|off  (currently {})",
+                                if LSP.edit_feedback_enabled() { "on" } else { "off" }
+                            ))
+                            .dim()
+                            .to_string(),
+                        ),
+                    }
+                }
                 other => tui::emit_line(
-                    &style(format!("usage: /lsp [status|on|off|restart]  (unknown '{other}')")).dim().to_string(),
+                    &style(format!("usage: /lsp [status|on|off|restart|edits on|off]  (unknown '{other}')")).dim().to_string(),
                 ),
             }
         }
@@ -4338,7 +4557,7 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             rebuild_system(history, model_label);
         }
         "memory" | "mem" => {
-            let r = if arg.is_empty() { memory::cmd_profile(false) } else { memory::cmd_search(arg, 5, None) };
+            let r = if arg.is_empty() { memory::cmd_profile(false) } else { memory::cmd_search(arg, 5, None, None) };
             if let Err(e) = r {
                 eprintln!("{} {e}", style("memory:").red());
             }
@@ -5110,6 +5329,7 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         api_key.clone(),
         model.clone(),
         args.yes,
+        resolve_ctx_window(&model).0,
     )?;
     let max = args.max_iters.unwrap_or(25).max(1);
     let cfg = AgentConfig {
@@ -5126,8 +5346,16 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
     let base = base_url.as_str();
     let key = api_key.as_str();
     let model_ref = model.as_str();
+    let registry_ref = &registry;
+    let cfg_ref = &cfg;
+    let eager_on = eager_enabled();
     let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
-        client::stream_chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
+        if eager_on {
+            let starter = agent::eager_starter(registry_ref, cfg_ref);
+            client::stream_chat_with_tools_eager(http_ref, base, key, model_ref, &msgs, &defs, Some(&starter)).await
+        } else {
+            client::stream_chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
+        }
     };
 
     let outcome = agent::run_agent(chat, &cfg, &registry, &system, args.task.trim()).await?;
@@ -5181,9 +5409,11 @@ fn run_memory(cmd: MemoryCmd) -> Result<()> {
             }
             memory::cmd_add(&name, &description, &mtype, body.trim())
         }
-        MemoryCmd::List => memory::cmd_list(),
+        MemoryCmd::List { scope } => memory::cmd_list(scope.as_deref()),
         MemoryCmd::Show { id } => memory::cmd_show(&id),
-        MemoryCmd::Search { query, k, dimension } => memory::cmd_search(&query, k, dimension),
+        MemoryCmd::Search { query, k, dimension, scope } => {
+            memory::cmd_search(&query, k, dimension, scope.as_deref())
+        }
         MemoryCmd::Frozen { rebuild } => memory::cmd_frozen(rebuild),
         MemoryCmd::Learn { text, yes, dry_run } => {
             let text = match text {
@@ -5356,15 +5586,29 @@ fn run_soul(cmd: Option<SoulCmd>) -> Result<()> {
 
 async fn run_skill(cmd: SkillCmd) -> Result<()> {
     match cmd {
-        SkillCmd::List => {
+        SkillCmd::List { all_zones } => {
             let skills = skill::list();
-            if skills.is_empty() {
+            if skills.is_empty() && !all_zones {
                 println!("(no skills — add one with `aizen skill add <name>`, or /skills in the REPL)");
                 return Ok(());
             }
             for s in &skills {
                 let d = if s.description.is_empty() { &s.when } else { &s.description };
-                println!("{}  —  {}", s.name, d);
+                let tag = match s.origin {
+                    skill::SkillOrigin::Global => "",
+                    skill::SkillOrigin::Project => " [project]",
+                    skill::SkillOrigin::Repo => " [repo]",
+                };
+                println!("{}{tag}  —  {}", s.name, d);
+            }
+            if all_zones {
+                let others = skill::list_other_zones();
+                if !others.is_empty() {
+                    println!("\nother workspaces' zones (invisible here):");
+                    for (zone, s) in &others {
+                        println!("{}  [p:{zone}]  —  {}", s.name, s.description);
+                    }
+                }
             }
             Ok(())
         }
@@ -5426,17 +5670,19 @@ async fn run_skill(cmd: SkillCmd) -> Result<()> {
 }
 
 /// GET a markdown skill from `url` and save it (name from `--name` > frontmatter > URL filename).
+/// SSRF-guarded like every other outbound fetch: the URL passes the net_guard floor and the fetch
+/// goes through the shared guarded client (no auto-redirects; every hop re-vetted; body bounded).
 async fn run_skill_fetch(url: &str, name_override: Option<&str>) -> Result<()> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         anyhow::bail!("fetch needs an absolute http(s) URL");
     }
-    let http = http_client()?;
-    let resp = http.get(url).send().await.with_context(|| format!("GET {url}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        anyhow::bail!("upstream returned HTTP {status}");
+    crate::core::net_guard::guard_url_async(url).await?;
+    let http = crate::agent::reach::http::client()?;
+    let resp = crate::agent::reach::http::get(&http, url, &[]).await.with_context(|| format!("GET {url}"))?;
+    if !resp.is_success() {
+        anyhow::bail!("upstream returned HTTP {}", resp.status);
     }
-    let text = resp.text().await.context("reading response body")?;
+    let text = resp.text();
     // Fallback name from the URL's filename (strip a trailing .md).
     let stem = url.trim_end_matches('/').rsplit('/').next().unwrap_or("skill");
     let stem = stem.split(['?', '#']).next().unwrap_or(stem).trim_end_matches(".md");

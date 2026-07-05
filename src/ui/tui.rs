@@ -21,7 +21,7 @@ use crate::ui::splash::ACCENT;
 use crate::ui::theme;
 use console::{measure_text_width, style, Key, Term};
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as stdmpsc;
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -101,9 +101,34 @@ static WORKING: AtomicBool = AtomicBool::new(false);
 /// the agent loop yields once it's set so the `select!` can finally drop the turn.
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Wakes async waiters ([`cancelled`]) the instant a cancel is requested — the flag alone only
+/// serves pollers; racing a long network tool needs an awaitable signal.
+static CANCEL_NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
+
+fn cancel_notify() -> &'static tokio::sync::Notify {
+    CANCEL_NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
 /// Request cancellation of the in-flight turn (called by the input thread on Esc while working).
 pub fn request_cancel() {
     CANCEL_REQUESTED.store(true, Ordering::Relaxed);
+    cancel_notify().notify_waiters();
+}
+
+/// Resolves when a cancel is requested. Missed-wakeup-safe: registers with the Notify FIRST, then
+/// re-checks the flag, so a request landing between check and await is still seen. Never resolves
+/// outside the sticky REPL (nothing else sets the flag) — racing against it is a no-op there.
+pub async fn cancelled() {
+    loop {
+        if cancel_requested() {
+            return;
+        }
+        let notified = cancel_notify().notified();
+        if cancel_requested() {
+            return;
+        }
+        notified.await;
+    }
 }
 /// Whether a cancel has been requested — polled by the synchronous tool path + the agent loop.
 pub fn cancel_requested() -> bool {
@@ -114,12 +139,40 @@ pub fn clear_cancel() {
     CANCEL_REQUESTED.store(false, Ordering::Relaxed);
 }
 
-/// Braille frames for the animated working indicator (a lone background thread advances this while
-/// `WORKING`, so the spinner spins even when no token is streaming — e.g. before the first byte or
-/// during a long tool call). Moonlight silver, drawn by [`paint_box`].
-const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Star frames for the animated working indicator (a lone background thread advances this while
+/// `WORKING`, so it pulses even when no token is streaming — e.g. before the first byte or during a
+/// long tool call). Moonlight silver, drawn by [`paint_box`]. Every frame is exactly one cell.
+const STAR: [&str; 6] = ["✶", "✷", "✸", "✹", "✺", "✻"];
+/// Whimsical present-tense verbs cycled (slowly, every ~3s) in the working pill — the "still
+/// thinking" flavour, Claude-Code style. Purely cosmetic: the elapsed clock + the `↑N tok` counter
+/// are the real liveness signal.
+const VERBS: &[&str] = &[
+    "Đang nghiền ngẫm",
+    "Đang suy tư",
+    "Đang dệt chữ",
+    "Đang mài giũa",
+    "Đang lục lọi",
+    "Đang xâu chuỗi",
+    "Đang chưng cất",
+    "Đang thai nghén",
+    "Đang gọt giũa",
+    "Đang mường tượng",
+    "Đang cân não",
+    "Đang hì hục",
+    "Đang xoay xở",
+    "Đang tính toán",
+    "Đang liên kết ý",
+    "Đang gói ghém",
+];
 /// Current spinner frame index (advanced by the ticker thread; read by `paint_box`).
 static WORK_FRAME: AtomicUsize = AtomicUsize::new(0);
+/// Rough count of streamed OUTPUT characters this turn (÷4 ≈ tokens) — drives the live "↑N tok"
+/// counter in the working pill. Bumped by the streaming client via [`add_stream_chars`]; zeroed at
+/// each turn start (`set_working(true)`).
+static STREAM_CHARS: AtomicU64 = AtomicU64::new(0);
+/// Per-turn seed so the cycling verb doesn't start on the same word every turn — bumped on each
+/// `set_working(true)`. No RNG (keeps the loop deterministic; `Math.random`-free by design).
+static WORK_VERB_SEED: AtomicUsize = AtomicUsize::new(0);
 /// When the current task started — drives the "· Ns" elapsed counter in the working pill. Set on
 /// `set_working(true)`, cleared on `set_working(false)`.
 static WORK_START: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
@@ -133,6 +186,17 @@ fn work_start_slot() -> &'static Mutex<Option<Instant>> {
 /// Seconds since the current task began (0 when idle / not yet started).
 fn work_elapsed_secs() -> u64 {
     work_start_slot().lock().unwrap().map(|t| t.elapsed().as_secs()).unwrap_or(0)
+}
+
+/// Bump the streamed-output character counter (≈ tokens ÷ 4) — called by the streaming client per
+/// content delta so the working pill shows live progress. A cheap relaxed add; harmless off-TTY.
+pub fn add_stream_chars(n: u64) {
+    STREAM_CHARS.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Estimated streamed OUTPUT tokens this turn (chars ÷ 4) for the working pill's `↑N tok`.
+fn stream_tokens() -> u64 {
+    STREAM_CHARS.load(Ordering::Relaxed) / 4
 }
 
 /// Spawn the lone animation ticker (idempotent). While the agent is working it bumps the spinner
@@ -460,13 +524,23 @@ fn paint_box(buf: &mut String, r: &Render) {
     goto(buf, top_row + 1, 1);
     clear_line(buf);
     let work = if WORKING.load(Ordering::Relaxed) {
-        let frame = SPIN[WORK_FRAME.load(Ordering::Relaxed) % SPIN.len()];
+        let frame = STAR[WORK_FRAME.load(Ordering::Relaxed) % STAR.len()];
         let secs = work_elapsed_secs();
+        // Cycle the verb every ~3s, offset per turn so it doesn't always open on the same word.
+        let verb = VERBS[(WORK_VERB_SEED.load(Ordering::Relaxed) + (secs / 3) as usize) % VERBS.len()];
+        let tok = stream_tokens();
+        let toktail = if tok >= 1000 {
+            format!(" · ↑{:.1}K tok", tok as f64 / 1000.0)
+        } else if tok > 0 {
+            format!(" · ↑{tok} tok")
+        } else {
+            String::new()
+        };
         format!(
             "{} {} {}",
             style(frame).color256(ACCENT).bold(),
-            theme::muted("working"),
-            theme::faint(format!("· {secs}s · Esc to stop"))
+            theme::muted(format!("{verb}…")),
+            theme::faint(format!("· {secs}s{toktail} · Esc"))
         )
     } else {
         format!("{} {}", theme::ok("●"), theme::faint("ready"))
@@ -702,6 +776,8 @@ pub fn set_working(working: bool) {
     if working {
         *work_start_slot().lock().unwrap() = Some(Instant::now());
         WORK_FRAME.store(0, Ordering::Relaxed);
+        STREAM_CHARS.store(0, Ordering::Relaxed); // fresh token counter for this turn
+        WORK_VERB_SEED.fetch_add(1, Ordering::Relaxed); // vary the starting verb per turn
         start_ticker();
     } else {
         *work_start_slot().lock().unwrap() = None;
@@ -1131,8 +1207,8 @@ mod tests {
     fn elapsed_counter_is_zero_when_idle_and_frames_are_single_cell() {
         *work_start_slot().lock().unwrap() = None;
         assert_eq!(work_elapsed_secs(), 0, "no task started → 0s");
-        // every braille frame must measure as one cell so the right-edge pill stays aligned
-        for f in SPIN {
+        // every star frame must measure as one cell so the right-edge pill stays aligned
+        for f in STAR {
             assert_eq!(measure_text_width(f), 1, "{f:?} must be a single cell");
         }
     }

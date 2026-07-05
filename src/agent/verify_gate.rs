@@ -25,6 +25,9 @@ pub enum VerifyCommand {
     Npm(String),
     /// TypeScript with a `tsconfig.json` but no script: `npx tsc --noEmit`.
     NpxTsc,
+    /// A project-supplied command from `./.aizen/verify.json` (trust-gated — see
+    /// [`detect_verify_commands`]).
+    Custom(String),
 }
 
 impl VerifyCommand {
@@ -34,6 +37,7 @@ impl VerifyCommand {
             VerifyCommand::Cargo => "cargo check".to_string(),
             VerifyCommand::Npm(script) => format!("npm run {script}"),
             VerifyCommand::NpxTsc => "npx tsc --noEmit".to_string(),
+            VerifyCommand::Custom(c) => c.clone(),
         }
     }
 }
@@ -70,6 +74,53 @@ pub fn detect_verify_command(cwd: &Path) -> Option<VerifyCommand> {
     None
 }
 
+/// The COMMAND LIST for a project: `./.aizen/verify.json` (project-supplied, e.g.
+/// `{"commands": ["cargo test --lib", "cargo clippy"], "timeout_secs": 180}`) when present AND the
+/// project is TRUSTED — auto-running repo-supplied commands is the same supply-chain surface as
+/// project mcp.json, so it sits behind the same `mcp::project_trusted()` gate, plus the cmd_guard
+/// hard floor per command. Otherwise the built-in single detection. Run in order; first failure is
+/// the gate result.
+pub fn detect_verify_commands(cwd: &Path) -> Vec<VerifyCommand> {
+    if let Some(customs) = load_custom_verify(cwd) {
+        if !customs.is_empty() {
+            return customs;
+        }
+    }
+    detect_verify_command(cwd).into_iter().collect()
+}
+
+/// Parse the trusted `./.aizen/verify.json` commands (≤3 honored; Blocked commands dropped).
+/// `None` ⇒ no usable custom file (missing / untrusted / unparseable).
+fn load_custom_verify(cwd: &Path) -> Option<Vec<VerifyCommand>> {
+    let text = std::fs::read_to_string(cwd.join(".aizen").join("verify.json")).ok()?;
+    if !crate::agent::mcp::project_trusted() {
+        return None; // untrusted repo → the file is inert
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some(
+        v.get("commands")?
+            .as_array()?
+            .iter()
+            .filter_map(|c| c.as_str())
+            .take(3)
+            .filter(|c| {
+                !matches!(crate::agent::cmd_guard::classify(c), crate::agent::cmd_guard::Verdict::Blocked(_))
+            })
+            .map(|c| VerifyCommand::Custom(c.to_string()))
+            .collect(),
+    )
+}
+
+/// The custom file's per-command timeout (clamped [10, 600]); `None` when absent/untrusted.
+fn custom_verify_timeout(cwd: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(cwd.join(".aizen").join("verify.json")).ok()?;
+    if !crate::agent::mcp::project_trusted() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("timeout_secs")?.as_u64().map(|t| t.clamp(10, 600))
+}
+
 /// Parse `package.json` and return the first typecheck-flavored script that exists.
 /// Best-effort: a missing/invalid file or absent `scripts` → `None` (no panic).
 fn detect_npm_typecheck_script(pkg: &Path) -> Option<String> {
@@ -95,10 +146,32 @@ fn shell_command(command_line: &str) -> Command {
     }
 }
 
-/// Run the detected verify command in `cwd` with a wall-clock timeout. Returns `None` when there
-/// is nothing to run (unknown project) or the command can't even be spawned (best-effort no-op).
+/// Run the project's verify command LIST in order, stopping at the first failure (its result is
+/// the gate result); all-pass returns the last pass. Returns `None` when there is nothing to run
+/// (unknown project) or nothing could even be spawned (best-effort no-op).
 pub async fn run_verify_gate(cwd: &Path, timeout_secs: u64) -> Option<VerifyGateResult> {
-    let cmd = detect_verify_command(cwd)?;
+    let cmds = detect_verify_commands(cwd);
+    if cmds.is_empty() {
+        return None;
+    }
+    let custom_timeout = custom_verify_timeout(cwd);
+    let mut last_pass: Option<VerifyGateResult> = None;
+    for cmd in cmds {
+        let secs = match cmd {
+            VerifyCommand::Custom(_) => custom_timeout.unwrap_or(timeout_secs),
+            _ => timeout_secs,
+        };
+        match run_one_verify(cwd, &cmd, secs).await {
+            None => continue, // spawn failure (missing toolchain) → best-effort skip
+            Some(r) if !r.passed => return Some(r),
+            Some(r) => last_pass = Some(r),
+        }
+    }
+    last_pass
+}
+
+/// Run ONE verify command in `cwd` with a wall-clock timeout.
+async fn run_one_verify(cwd: &Path, cmd: &VerifyCommand, timeout_secs: u64) -> Option<VerifyGateResult> {
     let command_line = cmd.command_line();
     let start = Instant::now();
 
@@ -138,12 +211,117 @@ pub async fn run_verify_gate(cwd: &Path, timeout_secs: u64) -> Option<VerifyGate
     }
 }
 
-/// The user-message text injected when the gate fails (the model's one fix-turn prompt).
+/// The user-message text injected when the gate fails (the model's one fix-turn prompt). The raw
+/// output is SHAPED first: deduped error blocks, capped counts — a 400-line wall of repeated
+/// errors buys nothing but tokens.
 pub fn format_gate_failure(r: &VerifyGateResult) -> String {
     format!(
         "[aizen verify] `{}` FAILED ({} ms). Fix these errors before reporting the task done:\n\n{}",
-        r.command, r.duration_ms, r.output
+        r.command,
+        r.duration_ms,
+        shape_failure_output(&r.output)
     )
+}
+
+/// Max distinct error blocks/rows surfaced to the model (the rest are counted, not quoted).
+const MAX_ERRORS: usize = 10;
+/// Hard cap on the shaped text.
+const MAX_SHAPED_CHARS: usize = 3_000;
+
+/// Shape a failing verify output: cargo-style error blocks (deduped by header, ≤5 lines each) or
+/// tsc-style error rows (deduped), capped at [`MAX_ERRORS`] with a suppressed-count note; an
+/// unrecognized shape falls back to the raw tail (behavior-preserving floor).
+pub fn shape_failure_output(raw: &str) -> String {
+    let shaped = shape_cargo(raw).or_else(|| shape_tsc(raw));
+    match shaped {
+        Some(s) => head_chars(&s, MAX_SHAPED_CHARS),
+        None => tail_chars(raw, MAX_OUTPUT_CHARS),
+    }
+}
+
+/// Cargo/rustc shape: blocks starting `error[...]` / `error:`, header + up to 5 detail lines,
+/// deduped by header (the same error at N call sites collapses to one block).
+fn shape_cargo(raw: &str) -> Option<String> {
+    let lines: Vec<&str> = raw.lines().collect();
+    let is_err_start = |l: &str| l.starts_with("error[") || l.starts_with("error:");
+    let mut blocks: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut warnings = 0usize;
+    let mut i = 0usize;
+    while i < lines.len() {
+        let l = lines[i];
+        if l.starts_with("warning:") {
+            warnings += 1;
+        }
+        if is_err_start(l) {
+            let mut block: Vec<&str> = vec![l];
+            let mut j = i + 1;
+            while j < lines.len() && block.len() < 6 && !is_err_start(lines[j]) && !lines[j].starts_with("warning:") {
+                if !lines[j].trim().is_empty() {
+                    block.push(lines[j]);
+                }
+                j += 1;
+            }
+            if seen.insert(l.to_string()) {
+                blocks.push(block.join("\n"));
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    let total = blocks.len();
+    let shown = total.min(MAX_ERRORS);
+    let mut out = blocks[..shown].join("\n");
+    let mut extras: Vec<String> = Vec::new();
+    if total > shown {
+        extras.push(format!("+{} more error(s)", total - shown));
+    }
+    if warnings > 0 {
+        extras.push(format!("{warnings} warning(s)"));
+    }
+    if !extras.is_empty() {
+        out.push_str(&format!("\n({} suppressed)", extras.join(", ")));
+    }
+    Some(out)
+}
+
+/// tsc/npm shape: `file(line,col): error TSxxxx: message` rows, deduped by (file, code, message).
+fn shape_tsc(raw: &str) -> Option<String> {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+    static RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?m)^(.+)\((\d+),(\d+)\): error (TS\d+): (.*)$").unwrap());
+    let mut seen = std::collections::HashSet::new();
+    let mut rows: Vec<String> = Vec::new();
+    for c in RE.captures_iter(raw) {
+        if seen.insert(format!("{}|{}|{}", &c[1], &c[4], &c[5])) {
+            rows.push(format!("{} {}:{}  {} {}", &c[1], &c[2], &c[3], &c[4], &c[5]));
+        }
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let total = rows.len();
+    let shown = total.min(MAX_ERRORS);
+    let mut out = rows[..shown].join("\n");
+    if total > shown {
+        out.push_str(&format!("\n(+{} more error(s) suppressed)", total - shown));
+    }
+    Some(out)
+}
+
+/// Keep the first `max` chars (shaped output leads with the errors), marking the elision.
+fn head_chars(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}\n…[{} chars truncated]…", n - max)
 }
 
 /// Keep the last `max` chars, marking the elision (errors are at the tail).
@@ -230,6 +408,63 @@ mod tests {
         assert!(t.ends_with(&"B".repeat(30)));
         assert!(t.contains("truncated"));
         assert_eq!(tail_chars("short", 4000), "short");
+    }
+
+    #[test]
+    fn shapes_cargo_errors_deduped_and_capped() {
+        // 3 error blocks, one duplicated header, plus warnings — dedup + count, keep ≤5 lines each.
+        let raw = "\
+warning: unused variable: `x`
+error[E0308]: mismatched types
+ --> src/a.rs:10:5
+  = note: expected `u32`
+error[E0308]: mismatched types
+ --> src/a.rs:10:5
+error[E0425]: cannot find value `foo`
+ --> src/b.rs:2:1
+warning: dead code
+";
+        let s = shape_failure_output(raw);
+        assert_eq!(s.matches("error[E0308]").count(), 1, "duplicate header deduped: {s}");
+        assert!(s.contains("error[E0425]"), "{s}");
+        assert!(s.contains("--> src/a.rs:10:5"), "the location line survives: {s}");
+        assert!(s.contains("2 warning(s)") && s.contains("suppressed"), "{s}");
+    }
+
+    #[test]
+    fn shapes_tsc_error_rows() {
+        let raw = "\
+src/app.ts(10,5): error TS2322: Type 'string' is not assignable to type 'number'.
+src/app.ts(10,5): error TS2322: Type 'string' is not assignable to type 'number'.
+src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
+";
+        let s = shape_failure_output(raw);
+        assert_eq!(s.matches("TS2322").count(), 1, "duplicate row deduped: {s}");
+        assert!(s.contains("src/lib.ts 3:1"), "{s}");
+    }
+
+    #[test]
+    fn unknown_shape_falls_back_to_tail() {
+        let raw = format!("{}THE REAL FAILURE AT THE END", "noise\n".repeat(2000));
+        let s = shape_failure_output(&raw);
+        assert!(s.contains("THE REAL FAILURE AT THE END"), "tail preserved: …{}", &s[s.len().saturating_sub(80)..]);
+        assert!(s.contains("truncated"));
+    }
+
+    #[test]
+    fn custom_verify_requires_trust_gate() {
+        // An untrusted repo's verify.json must be INERT. Sandbox NEXTGEN_HOME so the developer's
+        // real trust store (which may trust THIS repo) can't leak into the assertion.
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = temp_dir("custom-untrusted-home");
+        std::env::set_var("NEXTGEN_HOME", &home);
+        let d = temp_dir("custom-untrusted");
+        std::fs::create_dir_all(d.join(".aizen")).unwrap();
+        std::fs::write(d.join(".aizen").join("verify.json"), r#"{"commands":["echo pwned"]}"#).unwrap();
+        std::fs::write(d.join("Cargo.toml"), "[package]").unwrap();
+        let cmds = detect_verify_commands(&d);
+        std::env::remove_var("NEXTGEN_HOME");
+        assert_eq!(cmds, vec![VerifyCommand::Cargo], "untrusted verify.json ignored: {cmds:?}");
     }
 
     #[test]

@@ -28,6 +28,12 @@ pub struct CostMeter {
     /// Prompt-cache input tokens read back this session (the prompt_cache breakpoint payoff). 0 ⇒
     /// caching off / unsupported by the provider — the `/cost` cache line only shows when > 0.
     cache_read_tokens: AtomicU64,
+    /// The MOST RECENT usage-carrying call (prompt / cached / completion) — the live cache-hit-rate
+    /// signal for the status line. Session totals above answer "what did this cost"; these answer
+    /// "is the prompt cache warm RIGHT NOW".
+    last_prompt_tokens: AtomicU64,
+    last_cached_tokens: AtomicU64,
+    last_completion_tokens: AtomicU64,
 }
 
 static COST_METER: CostMeter = CostMeter {
@@ -35,6 +41,9 @@ static COST_METER: CostMeter = CostMeter {
     completion_tokens: AtomicU64::new(0),
     calls_with_usage: AtomicU64::new(0),
     cache_read_tokens: AtomicU64::new(0),
+    last_prompt_tokens: AtomicU64::new(0),
+    last_cached_tokens: AtomicU64::new(0),
+    last_completion_tokens: AtomicU64::new(0),
 };
 
 /// The process-global cost meter (real provider-reported tokens this session).
@@ -60,7 +69,8 @@ pub fn is_anthropic_model(model: &str) -> bool {
 
 /// `haystack` contains `needle` delimited by non-alphanumeric boundaries (so `-`, `_`, `.`, space
 /// count as separators but an adjacent letter/digit does not). ASCII-only (model ids are ASCII).
-fn contains_word(haystack: &str, needle: &str) -> bool {
+/// Shared with `agent::prompt_tier_for` (the strict-tier model heuristic).
+pub(crate) fn contains_word(haystack: &str, needle: &str) -> bool {
     let bytes = haystack.as_bytes();
     let mut start = 0;
     while let Some(pos) = haystack[start..].find(needle) {
@@ -115,6 +125,21 @@ impl CostMeter {
         self.completion_tokens.fetch_add(u.completion_tokens.unwrap_or(0), Ordering::Relaxed);
         self.cache_read_tokens.fetch_add(u.cache_read(), Ordering::Relaxed);
         self.calls_with_usage.fetch_add(1, Ordering::Relaxed);
+        self.last_prompt_tokens.store(u.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
+        self.last_cached_tokens.store(u.cache_read(), Ordering::Relaxed);
+        self.last_completion_tokens.store(u.completion_tokens.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// `(prompt, cached, completion)` of the most recent usage-carrying call; `None` before any.
+    pub fn last_call(&self) -> Option<(u64, u64, u64)> {
+        if self.calls_with_usage.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        Some((
+            self.last_prompt_tokens.load(Ordering::Relaxed),
+            self.last_cached_tokens.load(Ordering::Relaxed),
+            self.last_completion_tokens.load(Ordering::Relaxed),
+        ))
     }
     /// `(prompt, completion, calls_with_usage)`. `calls == 0` ⇒ no real usage seen (use the estimate).
     pub fn snapshot(&self) -> (u64, u64, u64) {
@@ -134,6 +159,9 @@ impl CostMeter {
         self.completion_tokens.store(0, Ordering::Relaxed);
         self.calls_with_usage.store(0, Ordering::Relaxed);
         self.cache_read_tokens.store(0, Ordering::Relaxed);
+        self.last_prompt_tokens.store(0, Ordering::Relaxed);
+        self.last_cached_tokens.store(0, Ordering::Relaxed);
+        self.last_completion_tokens.store(0, Ordering::Relaxed);
     }
 }
 
@@ -285,7 +313,20 @@ pub struct ChatTurn {
     /// Advisory only — the loop classifies by `tool_calls`, not this. Kept for diagnostics.
     #[allow(dead_code)]
     pub finish_reason: Option<String>,
+    /// Provider-reported usage for THIS call, when sent (the final chunk in streaming). The loop's
+    /// context guards prefer this real number over the chars/4 estimate.
+    pub usage: Option<Usage>,
+    /// EAGERLY-STARTED tool executions from the streaming path: `(position in tool_calls, handle)`.
+    /// A read-only call whose arguments finished streaming may already be running before the
+    /// response ends — the executor ADOPTS these instead of re-spawning. Discarding a `ChatTurn`
+    /// (divergence, error) just detaches them; eager calls are read-only, so that is harmless.
+    pub eager: Vec<(usize, tokio::task::JoinHandle<String>)>,
 }
+
+/// Hook offered each tool call the moment its streamed arguments complete: return a running
+/// handle to START it early (read-only + prefix-safe only — the caller owns that policy), or
+/// `None` to let the executor run it normally after the stream ends.
+pub type EagerStartFn<'a> = &'a (dyn Fn(usize, &ToolCall) -> Option<tokio::task::JoinHandle<String>> + Send + Sync);
 
 /// Stream a chat completion. Prints content deltas to stdout as they arrive and
 /// returns the full concatenated assistant text. Returns a typed error on a non-2xx
@@ -308,6 +349,7 @@ pub async fn stream_chat(
         tool_choice: None,
         parallel_tool_calls: None,
         stream_options: None,
+        reasoning_effort: crate::core::cli_config::load().reasoning_effort,
     };
 
     let mut spin = Some(crate::ui::spinner::Spinner::start("thinking"));
@@ -405,6 +447,7 @@ pub async fn chat_with_tools(
         tool_choice: if tools.is_empty() { None } else { Some("auto".to_string()) },
         parallel_tool_calls: if tools.is_empty() { None } else { Some(true) },
         stream_options: None, // non-streaming responses carry `usage` natively
+        reasoning_effort: cfg.reasoning_effort.clone(),
     };
 
     let resp = send_with_retry(|| client.post(&url).bearer_auth(api_key).json(&body)).await?;
@@ -413,6 +456,7 @@ pub async fn chat_with_tools(
     if let Some(u) = &parsed.usage {
         cost_meter().record(u);
     }
+    let usage = parsed.usage;
     let choice = parsed
         .choices
         .into_iter()
@@ -422,6 +466,8 @@ pub async fn chat_with_tools(
         content: choice.message.content,
         tool_calls: choice.message.tool_calls,
         finish_reason: choice.finish_reason,
+        usage,
+        eager: Vec::new(),
     })
 }
 
@@ -440,6 +486,9 @@ pub struct ToolCallAccumulator {
     calls: BTreeMap<usize, AccCall>,
     /// Maps a seen tool-call `id` → the slot key it owns (for index-omitting providers).
     id_index: std::collections::HashMap<String, usize>,
+    /// The slot the CURRENT fragment stream is filling — a fragment landing on a different slot
+    /// means the previous call's arguments are complete (spec: one call streams contiguously).
+    active: Option<usize>,
 }
 
 #[derive(Default)]
@@ -450,7 +499,11 @@ struct AccCall {
 }
 
 impl ToolCallAccumulator {
-    pub fn ingest(&mut self, deltas: &[ToolCallDelta]) {
+    /// Merge a batch of fragments. Returns the calls whose arguments COMPLETED because a later
+    /// slot started (the eager-execution trigger). The FINAL call only completes at stream end —
+    /// `finish`/`finish_indexed` covers it.
+    pub fn ingest(&mut self, deltas: &[ToolCallDelta]) -> Vec<(usize, ToolCall)> {
+        let mut completed = Vec::new();
         for d in deltas {
             // Resolve which slot this fragment belongs to. Default: key by `index`. But a non-empty
             // `id` takes precedence — if we've seen the id, reuse its slot; if it's new and `d.index`
@@ -476,6 +529,14 @@ impl ToolCallAccumulator {
                 }
                 None => d.index,
             };
+            if let Some(prev) = self.active {
+                if prev != key {
+                    if let Some(tc) = self.snapshot(prev) {
+                        completed.push((prev, tc));
+                    }
+                }
+            }
+            self.active = Some(key);
             let e = self.calls.entry(key).or_default();
             if let Some(id) = &d.id {
                 if !id.is_empty() {
@@ -493,19 +554,48 @@ impl ToolCallAccumulator {
                 }
             }
         }
+        completed
     }
 
-    pub fn finish(self) -> Vec<ToolCall> {
+    /// A clone of slot `key`'s call as accumulated so far (None when it has no name yet). The id
+    /// may still be empty here — eager adoption keys by POSITION, not id, so that's fine.
+    fn snapshot(&self, key: usize) -> Option<ToolCall> {
+        let c = self.calls.get(&key)?;
+        if c.name.is_empty() {
+            return None;
+        }
+        Some(ToolCall {
+            id: c.id.clone(),
+            kind: "function".to_string(),
+            function: FunctionCall { name: c.name.clone(), arguments: c.args.clone() },
+        })
+    }
+
+    /// Finalize, keeping each call's SLOT KEY alongside — the eager path maps slot → final
+    /// position through this (positions are what the executor stitches by).
+    pub fn finish_indexed(self) -> Vec<(usize, ToolCall)> {
         self.calls
-            .into_values()
-            .filter(|c| !c.name.is_empty())
+            .into_iter()
+            .filter(|(_, c)| !c.name.is_empty())
             .enumerate()
-            .map(|(i, c)| ToolCall {
-                id: if c.id.is_empty() { format!("call_{i}") } else { c.id },
-                kind: "function".to_string(),
-                function: FunctionCall { name: c.name, arguments: c.args },
+            .map(|(i, (k, c))| {
+                (
+                    k,
+                    ToolCall {
+                        id: if c.id.is_empty() { format!("call_{i}") } else { c.id },
+                        kind: "function".to_string(),
+                        function: FunctionCall { name: c.name, arguments: c.args },
+                    },
+                )
             })
             .collect()
+    }
+
+    /// Slot-key-free finalize (the streaming path itself uses `finish_indexed` for eager-handle
+    /// position mapping; this stays as the plain API + test surface).
+    #[allow(dead_code)]
+    pub fn finish(self) -> Vec<ToolCall> {
+        self.finish_indexed().into_iter().map(|(_, tc)| tc).collect()
     }
 }
 
@@ -519,6 +609,23 @@ pub async fn stream_chat_with_tools(
     model: &str,
     messages: &[Message],
     tools: &[ToolDef],
+) -> Result<ChatTurn> {
+    stream_chat_with_tools_eager(client, base_url, api_key, model, messages, tools, None).await
+}
+
+/// [`stream_chat_with_tools`] plus EAGER tool execution: each tool call is offered to `eager_hook`
+/// the moment its streamed arguments complete, so read-only work overlaps the rest of the
+/// generation (first-tool latency hides inside stream time). Handles come back on
+/// `ChatTurn.eager` keyed by final POSITION; a mid-stream transport error drops them (detached —
+/// eager calls are read-only by policy, so discarding is safe).
+pub async fn stream_chat_with_tools_eager(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    eager_hook: Option<EagerStartFn<'_>>,
 ) -> Result<ChatTurn> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let cfg = crate::core::cli_config::load();
@@ -538,6 +645,7 @@ pub async fn stream_chat_with_tools(
         tool_choice: if tools.is_empty() { None } else { Some("auto".to_string()) },
         parallel_tool_calls: if tools.is_empty() { None } else { Some(true) },
         stream_options: Some(StreamOptions { include_usage: true }), // ask for a final usage chunk
+        reasoning_effort: cfg.reasoning_effort.clone(),
     };
 
     // Spinner during the "thinking" gap: from request send until the first token / tool delta
@@ -558,6 +666,10 @@ pub async fn stream_chat_with_tools(
     let mut full = String::new();
     let mut acc = ToolCallAccumulator::default();
     let mut finish_reason: Option<String> = None;
+    let mut final_usage: Option<Usage> = None; // the final-chunk usage report, threaded to the loop
+    // Eager starts, keyed by accumulator SLOT until the final position mapping exists.
+    let mut eager_by_slot: std::collections::HashMap<usize, tokio::task::JoinHandle<String>> =
+        std::collections::HashMap::new();
     let mut think = ThinkFilter::default(); // suppress `<think>…</think>` reasoning from the display
     // Render Markdown for the DISPLAY only (history keeps the raw text via `full`). Decorate when
     // we own an interactive terminal (sticky TUI or a TTY one-shot); pipes/CI pass through verbatim.
@@ -593,6 +705,7 @@ pub async fn stream_chat_with_tools(
                 if let Some(u) = &chunk.usage {
                     if chunk.choices.is_empty() {
                         cost_meter().record(u);
+                        final_usage = Some(u.clone());
                     }
                 }
                 if let Some(choice) = chunk.choices.first() {
@@ -607,6 +720,7 @@ pub async fn stream_chat_with_tools(
                         let shown = think.push(content);
                         if !shown.is_empty() {
                             full.push_str(&shown); // history keeps the RAW markdown
+                            crate::ui::tui::add_stream_chars(shown.chars().count() as u64); // live ↑tok pill
                             let rendered = md.push(&shown); // styled, complete lines (gutter, md, code)
                             if !rendered.is_empty() {
                                 crate::ui::tui::emit(&rendered); // sticky TUI funnel (plain print! when inactive)
@@ -615,7 +729,14 @@ pub async fn stream_chat_with_tools(
                     }
                     if !choice.delta.tool_calls.is_empty() {
                         spin.take(); // a tool-only turn: clear before the loop prints tool traces
-                        acc.ingest(&choice.delta.tool_calls);
+                        let completed = acc.ingest(&choice.delta.tool_calls);
+                        if let Some(hook) = eager_hook {
+                            for (slot, tc) in completed {
+                                if let Some(h) = hook(slot, &tc) {
+                                    eager_by_slot.insert(slot, h);
+                                }
+                            }
+                        }
                     }
                     if choice.finish_reason.is_some() {
                         finish_reason = choice.finish_reason.clone();
@@ -653,10 +774,19 @@ pub async fn stream_chat_with_tools(
         return Err(e);
     }
 
+    // Map eager handles from accumulator SLOT to final POSITION (what the executor stitches by).
+    let indexed = acc.finish_indexed();
+    let eager: Vec<(usize, tokio::task::JoinHandle<String>)> = indexed
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, (slot, _))| eager_by_slot.remove(slot).map(|h| (pos, h)))
+        .collect();
     Ok(ChatTurn {
         content: if full.is_empty() { None } else { Some(full) },
-        tool_calls: acc.finish(),
+        tool_calls: indexed.into_iter().map(|(_, tc)| tc).collect(),
         finish_reason,
+        usage: final_usage,
+        eager,
     })
 }
 
@@ -730,6 +860,23 @@ fn partial_suffix(s: &str, tag: &str) -> usize {
 mod tests {
     use super::*;
     use crate::core::types::FunctionDelta;
+
+    #[test]
+    fn cost_meter_last_call_tracks_most_recent() {
+        let m = CostMeter::default();
+        assert_eq!(m.last_call(), None, "no usage seen yet");
+        m.record(&Usage {
+            prompt_tokens: Some(1000),
+            completion_tokens: Some(50),
+            cache_read_input_tokens: Some(800),
+            ..Default::default()
+        });
+        assert_eq!(m.last_call(), Some((1000, 800, 50)));
+        m.record(&Usage { prompt_tokens: Some(2000), completion_tokens: Some(10), ..Default::default() });
+        assert_eq!(m.last_call(), Some((2000, 0, 10)), "most recent call wins; no cache → 0");
+        m.reset();
+        assert_eq!(m.last_call(), None, "reset clears the last-call signal");
+    }
 
     #[test]
     fn retry_classifier_only_retries_transient_statuses() {
@@ -848,6 +995,38 @@ mod tests {
             id: id.map(String::from),
             function: Some(FunctionDelta { name: name.map(String::from), arguments: args.map(String::from) }),
         }
+    }
+
+    #[test]
+    fn accumulator_emits_completion_when_next_slot_starts() {
+        let mut acc = ToolCallAccumulator::default();
+        // First call streams over two batches — nothing completes yet.
+        assert!(acc.ingest(&[delta(0, Some("a"), Some("file_read"), Some(r#"{"path":"#))]).is_empty());
+        assert!(acc.ingest(&[delta(0, None, None, Some(r#""x.rs"}"#))]).is_empty());
+        // Slot 1 starts → slot 0 completes with its FULL arguments.
+        let done = acc.ingest(&[delta(1, Some("b"), Some("file_glob"), Some("{}"))]);
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].0, 0, "completed slot key");
+        assert_eq!(done[0].1.function.name, "file_read");
+        assert_eq!(done[0].1.function.arguments, r#"{"path":"x.rs"}"#);
+        // The LAST call never emits mid-stream — finish_indexed covers it, slot keys intact.
+        let indexed = acc.finish_indexed();
+        assert_eq!(indexed.len(), 2);
+        assert_eq!((indexed[0].0, indexed[0].1.function.name.as_str()), (0, "file_read"));
+        assert_eq!((indexed[1].0, indexed[1].1.function.name.as_str()), (1, "file_glob"));
+    }
+
+    #[test]
+    fn accumulator_completion_survives_id_reroute() {
+        // Index-omitting provider: both calls claim index 0; the second id reroutes to a fresh
+        // slot — and that reroute must still emit the first call's completion.
+        let mut acc = ToolCallAccumulator::default();
+        assert!(acc.ingest(&[delta(0, Some("a"), Some("t_one"), Some("{}"))]).is_empty());
+        let done = acc.ingest(&[delta(0, Some("b"), Some("t_two"), Some("{}"))]);
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].1.function.name, "t_one");
+        let calls = acc.finish();
+        assert_eq!(calls.len(), 2, "both calls survive the collision");
     }
 
     #[test]

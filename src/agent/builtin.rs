@@ -98,6 +98,8 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
         r.register(Box::new(crate::agent::lsp::tools::LspDocumentSymbols::new(root.to_path_buf())));
         r.register(Box::new(crate::agent::lsp::tools::LspWorkspaceSymbol::new(root.to_path_buf())));
         r.register(Box::new(crate::agent::lsp::tools::LspDiagnostics::new(root.to_path_buf())));
+        // The ranked codebase skeleton rides the LSP gate too (its symbols come from the servers).
+        r.register(Box::new(crate::agent::repo_map::RepoMap::new(root.to_path_buf())));
     }
     // User-configurable MCP servers (`~/.nextgen/mcp.json`) — each remote tool wrapped as
     // `mcp_<server>_<tool>`. Empty (zero cost) when MCP is unconfigured. Top-level only, like
@@ -156,16 +158,44 @@ pub fn default_registry_with_task(
     api_key: String,
     model: String,
     auto_approve: bool,
+    context_window: usize,
 ) -> Result<ToolRegistry> {
     let root = resolve_root()?;
     let mut r = default_registry_in(&root);
     r.register(Box::new(PersonaCreate));
     r.register(Box::new(crate::agent::task_tool::TaskTool::new(
-        client, base_url, api_key, model, auto_approve, root, 0,
+        client.clone(),
+        base_url.clone(),
+        api_key.clone(),
+        model.clone(),
+        auto_approve,
+        root,
+        0,
+        context_window,
     )));
+    // The `workflow` fan-out tool is GATED: its schema costs ~350 tokens on every turn, so it
+    // registers only for the delegating population — ≥1 specialist ENABLED on the allowlist, or
+    // an explicit `workflow_tool: true` in config.
+    if should_register_workflow() {
+        r.register(Box::new(crate::agent::workflow_tool::WorkflowTool::new(
+            client, base_url, api_key, model, auto_approve, 0,
+        )));
+    }
     // Publish the live surface so the `<skills>` index can hide skills that `require:` an absent tool.
     publish_active_tools(&r);
     Ok(r)
+}
+
+/// Register the `workflow` tool? Config wins either way; default: only when ≥1 specialist agent is
+/// ENABLED on the allowlist (the population that actually fans out — the `<agents>` index already
+/// advertises exactly them). Deliberately NOT "any agent file exists": that over-triggered — a
+/// bulk `agents install` never enabled, or a cloned repo shipping `.claude/agents/`, would silently
+/// tax every turn with the ~350-token schema.
+fn should_register_workflow() -> bool {
+    match crate::core::cli_config::load().workflow_tool {
+        Some(v) => v,
+        None => crate::agents::any_enabled(),
+    }
 }
 
 /// The read-only tool base shared by EVERY sub-agent registry (role- or specialist-scoped): memory +
@@ -388,14 +418,16 @@ impl Tool for MemorySearch {
     }
     fn description(&self) -> &str {
         "Find a stored fact about the user or project by lexical/semantic match. Use to recall a \
-         specific past fact. Not for the user's overall preferences → use memory_profile. Read-only."
+         specific past fact. Not for the user's overall preferences → use memory_profile. \
+         Searches the current workspace + global facts by default. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "what to recall"},
-                "limit": {"type": "integer", "description": "max hits (default 5)"}
+                "limit": {"type": "integer", "description": "max hits (default 5)"},
+                "scope": {"type": "string", "enum": ["current", "all", "global"], "description": "zones to search: current project + global (default), all zones, or global-only"}
             },
             "required": ["query"],
             "additionalProperties": false
@@ -411,23 +443,48 @@ impl Tool for MemorySearch {
     fn execute(&self, args: &Value) -> Result<String> {
         let query = str_arg(args, "query")?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5).clamp(1, 20) as usize;
-        let hits = crate::memory::search(query, limit)?;
+        let sel = match args.get("scope").and_then(|v| v.as_str()).map(str::trim).unwrap_or("current") {
+            "" | "current" => crate::memory::ScopeSel::default_view(),
+            "all" => crate::memory::ScopeSel::All,
+            "global" => crate::memory::ScopeSel::Global,
+            other => return Ok(format!("error: unknown scope '{other}' (use current|all|global)")),
+        };
+        let hits = crate::memory::search_scoped(query, limit, &sel)?;
         if hits.is_empty() {
             return Ok(format!("(no memory matches '{query}')"));
         }
-        let mut s = String::new();
-        for h in &hits {
-            let body: String = h.entry.body.chars().take(200).collect();
-            s.push_str(&format!(
-                "[{:.2}] {} ({}) — {}\n",
-                h.score,
-                h.entry.name,
-                h.entry.mtype.as_str(),
-                body.replace('\n', " ")
-            ));
-        }
-        Ok(s.trim_end().to_string())
+        Ok(format_memory_hits(&hits, crate::memory::settings().search_max_tokens))
     }
+}
+
+/// Render search hits under a hard token budget (chars/4, same estimator as the frozen core):
+/// hits are already best-first, so trailing ones are cut and counted rather than blowing the turn.
+fn format_memory_hits(hits: &[crate::memory::Hit], max_tokens: usize) -> String {
+    let mut s = String::new();
+    let mut used = 0usize;
+    for (shown, h) in hits.iter().enumerate() {
+        let body: String = h.entry.body.chars().take(200).collect();
+        let zone = match h.entry.scope.as_deref() {
+            Some(z) => format!(" [p:{z}]"),
+            None => String::new(),
+        };
+        let line = format!(
+            "[{:.2}] {} ({}){} — {}\n",
+            h.score,
+            h.entry.name,
+            h.entry.mtype.as_str(),
+            zone,
+            body.replace('\n', " ")
+        );
+        let cost = crate::memory::render::est_tokens(&line);
+        if used + cost > max_tokens && shown > 0 {
+            s.push_str(&format!("(+{} more hit(s) over the token budget — narrow the query)\n", hits.len() - shown));
+            break;
+        }
+        used += cost;
+        s.push_str(&line);
+    }
+    s.trim_end().to_string()
 }
 
 // ── memory_profile (B2) ──────────────────────────────────────────────────────
@@ -735,72 +792,302 @@ impl Tool for FileEdit {
         let applied = apply_one_edit(&content, old, new, replace_all, path)?;
         std::fs::write(&target, &applied.content)
             .with_context(|| format!("writing {}", target.display()))?;
-        Ok(format!("edited {path} ({})\n{}", applied.summary(), diff_preview(&applied.before, &applied.after)))
+        let mut out =
+            format!("edited {path} ({})\n{}", applied.summary(), diff_preview(&applied.before, &applied.after));
+        // Post-edit LSP fold: NEW diagnostics land in THIS result (zero extra round-trips to
+        // discover breakage). Fail-soft + hard-capped inside; a no-op when LSP is off.
+        if let Some(fb) = crate::agent::lsp::LSP.edit_feedback(&target) {
+            out.push('\n');
+            out.push_str(&fb);
+        }
+        Ok(out)
     }
 }
 
-/// The outcome of ONE exact-or-indent-tolerant replacement (pure; computed in memory). `before`/
-/// `after` feed the diff preview; `count`/`tolerant` feed the human summary.
+/// The outcome of ONE replacement (pure; computed in memory). `before`/`after` feed the diff
+/// preview; `count`/`rung` feed the human summary (which rung matched is surfaced so a
+/// looser-than-exact match is always visible in the result).
+#[derive(Debug)]
 struct EditApplied {
     content: String,
     before: String,
     after: String,
     count: usize,
-    tolerant: bool,
+    /// Which ladder rung applied: "exact" | "indent" | "ws-norm" | "anchor-trim" | "unescape".
+    rung: &'static str,
 }
 impl EditApplied {
-    /// Human summary, byte-identical to the original `file_edit` wording (regression-gated).
+    /// Human summary. The "exact" and "indent" wordings are byte-identical to the original
+    /// `file_edit` strings (regression-gated by the existing tests).
     fn summary(&self) -> String {
-        if self.tolerant {
-            "1 replacement, indentation-tolerant match".to_string()
-        } else {
-            format!("{} replacement(s)", self.count)
+        match self.rung {
+            "indent" => "1 replacement, indentation-tolerant match".to_string(),
+            "ws-norm" => "1 replacement, whitespace-normalized match".to_string(),
+            "anchor-trim" => "1 replacement, shared-context-trimmed match".to_string(),
+            "unescape" => "1 replacement, escape-normalized match".to_string(),
+            _ => format!("{} replacement(s)", self.count),
         }
     }
 }
 
+/// Rungs R3–R5 skip oversized hunks (quadratic-ish scans buy nothing on giant blocks).
+const LADDER_MAX_LINES: usize = 200;
+const LADDER_MAX_BYTES: usize = 16 * 1024;
+/// The nearest-miss report is skipped on very large files (the scan is O(lines × hunk-lines)).
+const NEAREST_MISS_MAX_FILE_LINES: usize = 20_000;
+
 /// Apply ONE replacement to `content` — the shared matcher behind both `file_edit` and
-/// `multi_edit` (pure, no IO). Mirrors the original `file_edit` decision tree exactly:
-///   exact count 0  → indent_tolerant_blocks: 1 ⇒ apply, 0 ⇒ Err(not found), >1 ⇒ Err(ambiguous)
-///   exact count >1 → Err(not unique) unless replace_all
-///   exact count 1  → replacen / (replace_all ⇒ replace)
+/// `multi_edit` (pure, no IO). A LADDER of progressively looser strategies (the Aider lesson:
+/// every rescued edit is a saved round-trip — a ~9× edit-error reduction was measured for this
+/// class of matcher), with one invariant at every rung: EXACTLY one match applies; more than one
+/// is a hard "ambiguous" error that never falls through to a looser rung (a looser rung must not
+/// resolve an ambiguity a stricter one detected); zero falls through.
+///
+///   R1 exact           — `content.matches(old)` (`replace_all` lives here ONLY)
+///   R2 indent-tolerant — per-line trim (the #1 real failure: leading indentation)
+///   R3 ws-normalized   — per-line interior whitespace collapsed (`foo( a,  b )` ≡ `foo(a, b)`)
+///   R4 anchor-trim     — a first/last line byte-identical in old AND new (pure context) is
+///                        dropped from BOTH and R1–R3 retried: semantics-preserving by construction
+///   R5 escape-norm     — JSON-unescape old AND new (the double-escaped-arguments failure mode)
+///   R6 nearest-miss    — terminal failure with the best-scoring region quoted (line numbers +
+///                        "copy EXACTLY from this"), so the retry lands in ONE turn
+///
 /// `old` MUST be non-empty (create-new is the caller's concern). `label` names the target in
 /// errors (a path for file_edit; "edit #N (path)" for multi_edit).
 fn apply_one_edit(content: &str, old: &str, new: &str, replace_all: bool, label: &str) -> Result<EditApplied> {
     if old.is_empty() {
         bail!("empty old_string is only valid for creating a new file (file_edit), not mid-edit");
     }
+    // R1 exact.
     let count = content.matches(old).count();
-    if count == 0 {
-        // Exact miss → ONE whitespace/indentation-tolerant block match is safe to apply (the #1 real
-        // failure: the model gets leading indentation slightly wrong). >1 tolerant match is ambiguous
-        // and we refuse rather than risk corrupting the file.
-        let ranges = indent_tolerant_blocks(content, old);
-        match ranges.len() {
-            0 => bail!("old_string not found in {label} (even ignoring indentation) — re-read the file; it may have changed"),
-            1 => {
-                let (bs, be) = ranges[0];
-                let before = content[bs..be].to_string();
-                let updated = format!("{}{}{}", &content[..bs], new, &content[be..]);
-                Ok(EditApplied { content: updated, before, after: new.to_string(), count: 1, tolerant: true })
-            }
-            n => bail!("old_string (ignoring indentation) matches {n} blocks in {label}; add more surrounding context to disambiguate"),
-        }
-    } else {
+    if count > 0 {
         if count > 1 && !replace_all {
             bail!("old_string is not unique in {label} ({count} matches); add context or set replace_all");
         }
         let updated = if replace_all { content.replace(old, new) } else { content.replacen(old, new, 1) };
-        Ok(EditApplied { content: updated, before: old.to_string(), after: new.to_string(), count, tolerant: false })
+        return Ok(EditApplied { content: updated, before: old.to_string(), after: new.to_string(), count, rung: "exact" });
+    }
+    // R2 indent-tolerant (kept uncapped + byte-stable messages — the original fallback).
+    if let Some(a) = block_rung(content, old, new, trim_norm, "indent", label)? {
+        return Ok(a);
+    }
+    let within_caps = old.lines().count() <= LADDER_MAX_LINES && old.len() <= LADDER_MAX_BYTES;
+    if within_caps {
+        // R3 whitespace-run-normalized.
+        if let Some(a) = block_rung(content, old, new, ws_collapse, "ws-norm", label)? {
+            return Ok(a);
+        }
+        // R4 anchor-trim: drop a SHARED (old==new) first/last context line from both sides.
+        for (o2, n2) in anchor_trim_variants(old, new) {
+            if let Some(a) = try_pair(content, &o2, &n2, "anchor-trim", label)? {
+                return Ok(a);
+            }
+        }
+        // R5 escape-normalized (only when unescaping actually changes old).
+        if let Some(o2) = json_unescape(old) {
+            let n2 = json_unescape(new).unwrap_or_else(|| new.to_string());
+            if let Some(a) = try_pair(content, &o2, &n2, "unescape", label)? {
+                return Ok(a);
+            }
+        }
+    }
+    // R6 terminal: nearest-miss report so the model's retry can copy the real bytes.
+    if content.lines().count() <= NEAREST_MISS_MAX_FILE_LINES {
+        if let Some(hint) = nearest_miss(content, old) {
+            bail!(
+                "old_string not found in {label} (tried exact, indentation-tolerant, \
+                 whitespace-normalized, anchor-trimmed, and escape-normalized matching).\n{hint}"
+            );
+        }
+    }
+    bail!("old_string not found in {label} (even ignoring indentation) — re-read the file; it may have changed")
+}
+
+/// One full sub-ladder (R1 exact → R2 trim → R3 ws-collapse) over a DERIVED (old,new) pair —
+/// the driver for the R4/R5 variants. Same invariant: 1 ⇒ apply as `rung`, >1 ⇒ hard error,
+/// 0 ⇒ `None` (fall through).
+fn try_pair(content: &str, old: &str, new: &str, rung: &'static str, label: &str) -> Result<Option<EditApplied>> {
+    if old.trim().is_empty() {
+        return Ok(None); // a variant that trimmed away all signal proves nothing
+    }
+    let count = content.matches(old).count();
+    if count == 1 {
+        let updated = content.replacen(old, new, 1);
+        return Ok(Some(EditApplied {
+            content: updated,
+            before: old.to_string(),
+            after: new.to_string(),
+            count: 1,
+            rung,
+        }));
+    }
+    if count > 1 {
+        bail!("old_string ({rung} form) matches {count} places in {label}; add more surrounding context to disambiguate");
+    }
+    if let Some(a) = block_rung(content, old, new, trim_norm, rung, label)? {
+        return Ok(Some(a));
+    }
+    block_rung(content, old, new, ws_collapse, rung, label)
+}
+
+/// One block-matching rung over normalized lines: exactly 1 block ⇒ apply, >1 ⇒ hard ambiguous
+/// error, 0 ⇒ `None` (fall through). The "indent" wording stays byte-identical to the original.
+fn block_rung(
+    content: &str,
+    old: &str,
+    new: &str,
+    norm: fn(&str) -> String,
+    rung: &'static str,
+    label: &str,
+) -> Result<Option<EditApplied>> {
+    let ranges = normalized_blocks(content, old, norm);
+    match ranges.len() {
+        0 => Ok(None),
+        1 => {
+            let (bs, be) = ranges[0];
+            let before = content[bs..be].to_string();
+            let updated = format!("{}{}{}", &content[..bs], new, &content[be..]);
+            Ok(Some(EditApplied { content: updated, before, after: new.to_string(), count: 1, rung }))
+        }
+        n => {
+            if rung == "indent" {
+                bail!("old_string (ignoring indentation) matches {n} blocks in {label}; add more surrounding context to disambiguate");
+            }
+            bail!("old_string ({rung} form) matches {n} blocks in {label}; add more surrounding context to disambiguate");
+        }
     }
 }
 
-/// Find full-line blocks in `content` that match `old` IGNORING per-line leading/trailing
-/// whitespace. Returns the byte range [start, end) of each matching block (line-aligned: from the
-/// first matched line's start through the last matched line's end, excluding the trailing newline).
-/// Used only as a fallback when exact matching fails.
-fn indent_tolerant_blocks(content: &str, old: &str) -> Vec<(usize, usize)> {
-    let old_norm: Vec<&str> = old.lines().map(|l| l.trim()).collect();
+/// Per-line trim — the R2 normalization (leading indentation + trailing whitespace + CRLF).
+fn trim_norm(l: &str) -> String {
+    l.trim().to_string()
+}
+
+/// Per-line whitespace-INSENSITIVE comparison — the R3 normalization (`foo( a,  b )` ≡
+/// `foo(a, b)`). All whitespace is dropped for matching; the theoretical conflation (`let x` vs
+/// `letx`) is guarded by the exactly-1-match invariant, and the rung name in the result summary
+/// makes any loose match visible.
+fn ws_collapse(l: &str) -> String {
+    l.split_whitespace().collect::<Vec<_>>().concat()
+}
+
+/// R4 variants: when the first and/or last line of `old` is BYTE-IDENTICAL in `new` (pure
+/// unchanged context), dropping it from BOTH sides cannot change the result — but can rescue a
+/// match when that context line was mis-copied elsewhere. Order: drop-first, drop-last, drop-both.
+fn anchor_trim_variants(old: &str, new: &str) -> Vec<(String, String)> {
+    let ol: Vec<&str> = old.lines().collect();
+    let nl: Vec<&str> = new.lines().collect();
+    let mut out = Vec::new();
+    if ol.len() < 2 || nl.is_empty() {
+        return out;
+    }
+    let first_shared = ol.first() == nl.first();
+    let last_shared = ol.last() == nl.last();
+    if first_shared {
+        out.push((ol[1..].join("\n"), nl[1..].join("\n")));
+    }
+    if last_shared {
+        out.push((ol[..ol.len() - 1].join("\n"), nl[..nl.len() - 1].join("\n")));
+    }
+    if first_shared && last_shared && ol.len() >= 3 && nl.len() >= 2 {
+        out.push((ol[1..ol.len() - 1].join("\n"), nl[1..nl.len() - 1].join("\n")));
+    }
+    out
+}
+
+/// Undo one level of JSON string escaping (`\n` `\t` `\r` `\"` `\\`) — the double-escaped-arguments
+/// failure mode where the model ships literal `\n` sequences instead of newlines. `None` when
+/// nothing changed (the rung is then skipped). Unknown escapes pass through untouched.
+fn json_unescape(s: &str) -> Option<String> {
+    if !s.contains('\\') {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    let mut changed = false;
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => {
+                    out.push('\n');
+                    changed = true;
+                }
+                Some('t') => {
+                    out.push('\t');
+                    changed = true;
+                }
+                Some('r') => {
+                    out.push('\r');
+                    changed = true;
+                }
+                Some('"') => {
+                    out.push('"');
+                    changed = true;
+                }
+                Some('\\') => {
+                    out.push('\\');
+                    changed = true;
+                }
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    changed.then_some(out)
+}
+
+/// R6: the best-scoring window of the file vs `old` (mean per-line Jaro-Winkler on trimmed
+/// lines), quoted with line numbers so the model's retry copies REAL bytes. `None` below the 0.55
+/// similarity floor ("no similar region" is more honest than a random quote).
+fn nearest_miss(content: &str, old: &str) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let ol: Vec<&str> = old.lines().collect();
+    let k = ol.len().clamp(1, LADDER_MAX_LINES);
+    if lines.is_empty() || lines.len() < k {
+        return None;
+    }
+    let mut best_i = 0usize;
+    let mut best_score = 0.0f64;
+    for i in 0..=(lines.len() - k) {
+        let score: f64 = (0..k)
+            .map(|j| strsim::jaro_winkler(lines[i + j].trim(), ol.get(j).map_or("", |l| l.trim())))
+            .sum::<f64>()
+            / k as f64;
+        if score > best_score {
+            best_score = score;
+            best_i = i;
+        }
+    }
+    if best_score < 0.55 {
+        return None;
+    }
+    let ctx_start = best_i.saturating_sub(3);
+    let ctx_end = (best_i + k + 3).min(lines.len());
+    let mut excerpt = String::new();
+    for (n, line) in lines[ctx_start..ctx_end].iter().enumerate() {
+        excerpt.push_str(&format!("{:>5}| {line}\n", ctx_start + n + 1));
+        if excerpt.len() > 2_000 || n >= 40 {
+            excerpt.push_str("    …\n");
+            break;
+        }
+    }
+    Some(format!(
+        "Nearest match (similarity {best_score:.2}) at lines {}-{}:\n{excerpt}Copy old_string EXACTLY from the excerpt above (including whitespace) and retry.",
+        best_i + 1,
+        best_i + k
+    ))
+}
+
+/// Find full-line blocks in `content` that match `old` under a per-line normalization. Returns the
+/// byte range [start, end) of each matching block (line-aligned: from the first matched line's
+/// start through the last matched line's end, excluding the trailing newline).
+fn normalized_blocks(content: &str, old: &str, norm: fn(&str) -> String) -> Vec<(usize, usize)> {
+    let old_norm: Vec<String> = old.lines().map(norm).collect();
     let k = old_norm.len();
     if k == 0 {
         return Vec::new();
@@ -816,33 +1103,71 @@ fn indent_tolerant_blocks(content: &str, old: &str) -> Vec<(usize, usize)> {
     }
     spans.push((start, content.len()));
 
-    let norm: Vec<&str> = spans.iter().map(|&(a, b)| content[a..b].trim()).collect();
+    let cnorm: Vec<String> = spans.iter().map(|&(a, b)| norm(&content[a..b])).collect();
     let mut out = Vec::new();
-    if norm.len() < k {
+    if cnorm.len() < k {
         return out;
     }
-    for i in 0..=(norm.len() - k) {
-        if (0..k).all(|j| norm[i + j] == old_norm[j]) {
+    for i in 0..=(cnorm.len() - k) {
+        if (0..k).all(|j| cnorm[i + j] == old_norm[j]) {
             out.push((spans[i].0, spans[i + k - 1].1));
         }
     }
     out
 }
 
-/// A compact `before → after` preview of an edit (each side clipped so a big block can't flood
-/// the result). Gives the model cheap verifiability of what actually changed.
-fn diff_preview(before: &str, after: &str) -> String {
-    format!("--- before\n{}\n+++ after\n{}", clip_block(before), clip_block(after))
-}
 
-fn clip_block(s: &str) -> String {
-    let lines: Vec<&str> = s.lines().collect();
-    if lines.len() <= 12 {
-        return s.trim_end_matches('\n').to_string();
+/// A compact **unified diff** of an edit: common leading/trailing lines are trimmed away (so a big
+/// block collapses to just its changed window), the removed lines are prefixed `-`, the added lines
+/// `+`, and a couple of context lines (prefixed with a space) bracket the change. Gives the model
+/// cheap verifiability AND is what the TUI colourises (removed = salmon, added = green) — the lines
+/// are `^[-+]`-prefixed at column 0 so the display can pick them out unambiguously. Both sides are
+/// capped so a giant replacement can't flood the result.
+///
+/// Callers pass the SMALL changed region (file_edit: `applied.before`/`after`; multi_edit: each
+/// per-edit before/after), so the prefix/suffix trim is enough — no full LCS needed.
+fn diff_preview(before: &str, after: &str) -> String {
+    const CTX: usize = 2; // context lines kept on each side of the change
+    const MAX_SIDE: usize = 40; // cap removed / added lines shown per side
+
+    let b: Vec<&str> = before.lines().collect();
+    let a: Vec<&str> = after.lines().collect();
+
+    // Longest common prefix, then longest common suffix that doesn't overlap the prefix.
+    let mut p = 0;
+    while p < b.len() && p < a.len() && b[p] == a[p] {
+        p += 1;
     }
-    let head = lines[..6].join("\n");
-    let tail = lines[lines.len() - 4..].join("\n");
-    format!("{head}\n…[{} more lines]…\n{tail}", lines.len() - 10)
+    let mut s = 0;
+    while s < b.len().saturating_sub(p) && s < a.len().saturating_sub(p) && b[b.len() - 1 - s] == a[a.len() - 1 - s] {
+        s += 1;
+    }
+    let removed = &b[p..b.len() - s];
+    let added = &a[p..a.len() - s];
+
+    let mut out = String::new();
+    // leading context (from the shared prefix)
+    for line in &b[p.saturating_sub(CTX)..p] {
+        out.push_str(&format!(" {line}\n"));
+    }
+    for line in removed.iter().take(MAX_SIDE) {
+        out.push_str(&format!("-{line}\n"));
+    }
+    if removed.len() > MAX_SIDE {
+        out.push_str(&format!("…({} dòng bị bớt nữa)\n", removed.len() - MAX_SIDE));
+    }
+    for line in added.iter().take(MAX_SIDE) {
+        out.push_str(&format!("+{line}\n"));
+    }
+    if added.len() > MAX_SIDE {
+        out.push_str(&format!("…({} dòng thêm nữa)\n", added.len() - MAX_SIDE));
+    }
+    // trailing context (from the shared suffix)
+    let suf_start = b.len() - s;
+    for line in &b[suf_start..(suf_start + CTX).min(b.len())] {
+        out.push_str(&format!(" {line}\n"));
+    }
+    out.trim_end_matches('\n').to_string()
 }
 
 // ── multi_edit ───────────────────────────────────────────────────────────────
@@ -916,6 +1241,10 @@ impl Tool for MultiEdit {
         // byte offsets) and a later edit may target text an earlier one produced.
         let mut buf = original.clone();
         let mut summaries: Vec<String> = Vec::with_capacity(edits.len());
+        // Diff each edit's OWN before/after (the small changed region) rather than the whole file:
+        // precise per-hunk output, and it keeps `diff_preview`'s prefix/suffix trim on small inputs
+        // (a whole-file trim would merge far-apart edits into one giant spurious hunk).
+        let mut diffs: Vec<String> = Vec::with_capacity(edits.len());
         for (i, e) in edits.iter().enumerate() {
             let n = i + 1;
             let old = e
@@ -928,24 +1257,30 @@ impl Tool for MultiEdit {
                 .with_context(|| format!("edit #{n}: missing new_string"))?;
             let replace_all = e.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
             let applied = apply_one_edit(&buf, old, new, replace_all, &format!("edit #{n} ({path})"))?;
-            let detail = if applied.tolerant {
-                "1 replacement, indentation-tolerant".to_string()
-            } else if replace_all {
-                format!("{} replacement(s), replace_all", applied.count)
-            } else {
-                format!("{} replacement(s)", applied.count)
+            let detail = match applied.rung {
+                "indent" => "1 replacement, indentation-tolerant".to_string(),
+                "exact" if replace_all => format!("{} replacement(s), replace_all", applied.count),
+                "exact" => format!("{} replacement(s)", applied.count),
+                other => format!("1 replacement, {other} match"),
             };
             summaries.push(format!("  #{n}: {detail}"));
+            diffs.push(diff_preview(&applied.before, &applied.after));
             buf = applied.content;
         }
 
         std::fs::write(&target, &buf).with_context(|| format!("writing {}", target.display()))?;
-        Ok(format!(
+        let mut out = format!(
             "edited {path} ({} edits applied)\n{}\n{}",
             edits.len(),
             summaries.join("\n"),
-            diff_preview(&original, &buf)
-        ))
+            diffs.join("\n")
+        );
+        // One fold after the single atomic write (same as file_edit).
+        if let Some(fb) = crate::agent::lsp::LSP.edit_feedback(&target) {
+            out.push('\n');
+            out.push_str(&fb);
+        }
+        Ok(out)
     }
 }
 
@@ -1138,7 +1473,8 @@ impl Tool for SkillSave {
                 "name": {"type": "string"},
                 "description": {"type": "string", "description": "one-line summary"},
                 "when": {"type": "string", "description": "when this skill applies (trigger hint)"},
-                "body": {"type": "string", "description": "the steps / procedure (markdown)"}
+                "body": {"type": "string", "description": "the steps / procedure (markdown)"},
+                "scope": {"type": "string", "enum": ["global", "project"], "description": "global (default) = usable everywhere; project = only this workspace"}
             },
             "required": ["name", "body"],
             "additionalProperties": false
@@ -1155,7 +1491,8 @@ impl Tool for SkillSave {
         let body = str_arg(args, "body")?;
         let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
         let when = args.get("when").and_then(|v| v.as_str()).unwrap_or("");
-        let path = crate::skills::save(name, description, when, body)?;
+        let project_zone = matches!(args.get("scope").and_then(|v| v.as_str()).map(str::trim), Some("project"));
+        let path = crate::skills::save_scoped(name, description, when, body, project_zone)?;
         Ok(format!("saved skill '{name}' → {}", path.display()))
     }
 }
@@ -1232,6 +1569,34 @@ mod tests {
     }
 
     #[test]
+    fn format_memory_hits_respects_the_token_budget() {
+        use crate::memory::store::{MemoryEntry, MemoryType};
+        let hit = |id: &str, scope: Option<&str>| crate::memory::Hit {
+            entry: MemoryEntry {
+                id: id.into(),
+                name: id.into(),
+                mtype: MemoryType::Reference,
+                body: "word ".repeat(40),
+                scope: scope.map(str::to_string),
+                ..Default::default()
+            },
+            score: 1.0,
+        };
+        let hits: Vec<_> = (0..20).map(|i| hit(&format!("fact-{i}"), None)).collect();
+        // Each line ≈ 55 tokens; a 120-token budget fits ~2 lines then cuts with a counted tail.
+        let out = format_memory_hits(&hits, 120);
+        assert!(out.contains("fact-0"), "{out}");
+        assert!(out.contains("more hit(s) over the token budget"), "{out}");
+        assert!(crate::memory::render::est_tokens(&out) <= 160, "output stays near the budget: {out}");
+        // zone tag renders for project-scoped hits
+        let tagged = format_memory_hits(&[hit("zoned", Some("proj-00000001"))], 1200);
+        assert!(tagged.contains("[p:proj-00000001]"), "{tagged}");
+        // and the first hit always renders even when it alone exceeds the budget
+        let one = format_memory_hits(&[hit("big", None)], 1);
+        assert!(one.contains("big"));
+    }
+
+    #[test]
     fn glob_to_regex_matches_expected() {
         let re = regex::Regex::new(&glob_to_regex("src/**/*.rs")).unwrap();
         assert!(re.is_match("src/a.rs"));
@@ -1250,6 +1615,21 @@ mod tests {
         // a normal in-tree path resolves
         std::fs::write(root.join("ok.txt"), "hi").unwrap();
         assert!(confine(&root, "ok.txt", true).is_ok());
+    }
+
+    #[test]
+    fn diff_preview_is_a_trimmed_unified_diff() {
+        // A localized change in a longer block: the shared prefix/suffix collapse to ±2 context
+        // lines, and the change renders as column-0 `-`/`+` lines (what the TUI colourises).
+        let before = "1\n2\n3\n4\n5\nOLD\n7\n8\n9\n10";
+        let after = "1\n2\n3\n4\n5\nNEW\n7\n8\n9\n10";
+        let d = diff_preview(before, after);
+        assert!(d.lines().any(|l| l == "-OLD"), "removed line, column-0 '-': {d:?}");
+        assert!(d.lines().any(|l| l == "+NEW"), "added line, column-0 '+': {d:?}");
+        assert!(d.lines().any(|l| l == " 5"), "keeps a leading context line: {d:?}");
+        assert!(d.lines().any(|l| l == " 7"), "keeps a trailing context line: {d:?}");
+        assert!(!d.contains("--- before") && !d.contains("+++ after"), "no old block headers: {d:?}");
+        assert!(!d.contains('1'), "far prefix/suffix bulk is trimmed away: {d:?}");
     }
 
     #[test]
@@ -1367,6 +1747,77 @@ mod tests {
     }
 
     #[test]
+    fn ladder_ws_normalized_matches_interior_spacing() {
+        // Interior spacing differs (`foo( a,  b )` vs `foo(a, b)`) — R2 trim can't fix that, R3 can.
+        let content = "start\n    foo( a,  b );\nend\n";
+        let a = apply_one_edit(content, "foo(a, b);", "bar(a, b);", false, "t").unwrap();
+        assert_eq!(a.rung, "ws-norm");
+        assert!(a.content.contains("bar(a, b);"), "{}", a.content);
+        assert!(a.summary().contains("whitespace-normalized"));
+    }
+
+    #[test]
+    fn ladder_anchor_trim_only_when_context_shared() {
+        // First line of old == first line of new (pure context) but that line is WRONG in old
+        // ("fn mian" typo'd context) — dropping it from BOTH sides rescues the edit.
+        let content = "fn main() {\n    body();\n}\n";
+        let old = "fn mian() {\n    body();"; // first line mis-copied
+        let new = "fn mian() {\n    new_body();"; // …but identical in new → shared context
+        let a = apply_one_edit(content, old, new, false, "t").unwrap();
+        assert_eq!(a.rung, "anchor-trim");
+        assert!(a.content.contains("new_body();"), "{}", a.content);
+        assert!(a.content.contains("fn main() {"), "the real context line is untouched");
+        // NOT shared (the first line actually differs between old and new) → no R4, hard failure.
+        let old2 = "fn mian() {\n    body();";
+        let new2 = "fn other() {\n    new_body();";
+        assert!(apply_one_edit(content, old2, new2, false, "t").is_err(), "no anchor-trim without shared context");
+    }
+
+    #[test]
+    fn ladder_ambiguous_at_any_rung_refuses() {
+        // Two ws-normalized matches → hard error, must NOT fall through to a looser rung.
+        let content = "foo( a );\nfoo(  a );\n";
+        let err = apply_one_edit(content, "foo(a );", "bar();", false, "t").unwrap_err().to_string();
+        assert!(err.contains("2") && err.contains("t"), "ambiguity is a hard refusal: {err}");
+    }
+
+    #[test]
+    fn ladder_unescape_applies_pair() {
+        // The model shipped literal \n escapes in BOTH strings — R5 unescapes the pair together.
+        let content = "alpha\nbeta\ngamma\n";
+        let a = apply_one_edit(content, "alpha\\nbeta", "alpha\\nBETA", false, "t").unwrap();
+        assert_eq!(a.rung, "unescape");
+        assert!(a.content.contains("alpha\nBETA\ngamma"), "{}", a.content);
+    }
+
+    #[test]
+    fn ladder_nearest_miss_reports_line_numbers() {
+        let content = (1..=30).map(|i| format!("line number {i} content")).collect::<Vec<_>>().join("\n");
+        let err = apply_one_edit(&content, "line number 17 contnet", "x", false, "f.rs")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Nearest match"), "{err}");
+        assert!(err.contains("17| "), "the real line is quoted with its number: {err}");
+        assert!(err.contains("Copy old_string EXACTLY"), "{err}");
+    }
+
+    #[test]
+    fn ladder_no_similar_region_keeps_plain_error() {
+        let content = "completely different text\n";
+        let err = apply_one_edit(content, "zzz qqq www", "x", false, "f.rs").unwrap_err().to_string();
+        assert!(err.contains("not found"), "{err}");
+        assert!(!err.contains("Nearest match"), "below the similarity floor → no random quote: {err}");
+    }
+
+    #[test]
+    fn json_unescape_only_reports_real_changes() {
+        assert_eq!(json_unescape("a\\nb").as_deref(), Some("a\nb"));
+        assert_eq!(json_unescape("a\\\\b").as_deref(), Some("a\\b"));
+        assert_eq!(json_unescape("plain"), None, "no backslash → no rung");
+        assert_eq!(json_unescape("C:\\path\\dir"), None, "unknown escapes alone don't count as a change");
+    }
+
+    #[test]
     fn file_edit_indentation_tolerant_fallback() {
         let root = temp_root("edit-indent");
         // File uses 4-space indentation; the model's old_string uses 2 spaces (a real mismatch).
@@ -1380,7 +1831,9 @@ mod tests {
             }))
             .unwrap();
         assert!(r.contains("indentation-tolerant"), "got: {r}");
-        assert!(r.contains("before"), "should include a preview");
+        // the unified diff preview shows the removed/added lines (column-0 -/+ markers)
+        assert!(r.lines().any(|l| l.starts_with('-')), "diff shows a removed line: {r}");
+        assert!(r.lines().any(|l| l.starts_with('+')), "diff shows an added line: {r}");
         let after = std::fs::read_to_string(root.join("f.rs")).unwrap();
         assert_eq!(after, "fn main() {\n    let x = 2;\n    bar();\n}\n");
     }

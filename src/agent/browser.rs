@@ -161,10 +161,10 @@ async fn with_cdp<T>(
     res
 }
 
-/// Bridge the async CDP op to the sync `Tool::execute` (multi-thread runtime worker only — the same
-/// `block_in_place`+`block_on` invariant the web/telegram tools use → `is_concurrency_safe()=false`).
-fn block<F: Future>(f: F) -> F::Output {
-    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+/// Bridge the async CDP op to the sync `Tool::execute` — the shared cancel-aware bridge (valid on
+/// workers AND spawn_blocking threads; Esc aborts a hung CDP round-trip).
+fn block<T>(f: impl Future<Output = Result<T>>) -> Result<T> {
+    crate::agent::tools::block_for_tool(f)
 }
 
 /// Parse a `@ref` argument: accepts `3`, `"3"`, or `"@3"`.

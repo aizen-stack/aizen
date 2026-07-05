@@ -100,8 +100,9 @@ fn sanitize(s: &str) -> String {
         .replace("<agent_identity>", "<\\agent_identity>")
 }
 
-/// Truncate to ~`max_tokens` (chars/4) at a line boundary, keeping the head.
-fn cap_tokens(body: &str, max_tokens: usize) -> String {
+/// Truncate to ~`max_tokens` (chars/4) at a line boundary, keeping the head. Shared with the
+/// sibling `<persona>` render path (the same budget discipline for every identity block).
+pub(crate) fn cap_tokens(body: &str, max_tokens: usize) -> String {
     let max_chars = max_tokens * 4;
     if body.chars().count() <= max_chars {
         return body.to_string();

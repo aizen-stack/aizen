@@ -82,6 +82,13 @@ pub struct MemoryEntry {
     /// deny path). The fact stays searchable in the long tail but is excluded from `frozen_core::build`,
     /// so an explicit "no" is honored. Serialized as `noCore: true`; absent → false.
     pub core_denied: bool,
+    /// Workspace scope: `None` = global (applies everywhere — also the parse of a legacy file with
+    /// no `scope:` key, so the pre-scoping store keeps working untouched); `Some(slug)` = only the
+    /// project zone `config::project_slug()` names. Filters the frozen core + default search.
+    pub scope: Option<String>,
+    /// Optional region inside the project (`src/agent` style, `/`-normalized) — a soft ranking
+    /// boost when the user works under it, never a hard partition.
+    pub subpath: Option<String>,
     /// Topical dimension (B1) — DERIVED on load by `dimension::classify`, not stored.
     pub dimension: Dimension,
 }
@@ -108,6 +115,8 @@ impl Default for MemoryEntry {
             valid_to: None,
             superseded_by: None,
             core_denied: false,
+            scope: None,
+            subpath: None,
             dimension: Dimension::Other,
         }
     }
@@ -173,6 +182,12 @@ impl MemoryEntry {
             .filter(|s| !s.trim().is_empty());
         let core_denied =
             fm.get("noCore").map(|s| s.trim().eq_ignore_ascii_case("true")).unwrap_or(false);
+        let scope = parse_scope(fm.get("scope"));
+        let subpath = fm
+            .get("subpath")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.replace('\\', "/"));
         Ok(MemoryEntry {
             id,
             path: path.to_path_buf(),
@@ -193,8 +208,21 @@ impl MemoryEntry {
             valid_to,
             superseded_by,
             core_denied,
+            scope,
+            subpath,
             dimension,
         })
+    }
+}
+
+/// Frontmatter `scope:` → entry scope. Absent, empty, or the literal `global` all mean global
+/// (`None`) — a legacy pre-scoping file therefore loads as global with zero migration.
+fn parse_scope(raw: Option<&str>) -> Option<String> {
+    let s = raw?.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("global") {
+        None
+    } else {
+        Some(s.to_string())
     }
 }
 
@@ -264,6 +292,18 @@ pub fn add(
     mtype: MemoryType,
     body: &str,
 ) -> Result<String> {
+    add_scoped(name, description, mtype, body, None)
+}
+
+/// `add` with a workspace scope (`None` = global). Separate entry point so every existing caller
+/// keeps its signature; scoping callers (`#remember`, the learning router) opt in explicitly.
+pub fn add_scoped(
+    name: &str,
+    description: &str,
+    mtype: MemoryType,
+    body: &str,
+    scope: Option<&str>,
+) -> Result<String> {
     let dir = config::entries_dir();
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let id = slugify(name);
@@ -281,7 +321,11 @@ pub fn add(
     }
     fields.insert("type".to_string(), mtype.as_str().to_string());
     fields.insert("created".to_string(), today());
-    let content = frontmatter::serialize(&fields, body, &["name", "description", "type", "created"]);
+    if let Some(s) = scope.map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("global")) {
+        fields.insert("scope".to_string(), s.to_string());
+    }
+    let content =
+        frontmatter::serialize(&fields, body, &["name", "description", "type", "scope", "created"]);
     write_atomic(&path, &content)?;
     Ok(id)
 }
@@ -302,12 +346,18 @@ pub struct LearnedWrite<'a> {
     pub session_id: &'a str,
     /// Exclude this fact from the always-on frozen core (set on the CorePromote deny-downgrade).
     pub no_core: bool,
+    /// Workspace scope (`None` = global; `Some(slug)` = one project zone).
+    pub scope: Option<String>,
+    /// Optional region inside the project (soft ranking boost).
+    pub subpath: Option<String>,
 }
 
 const LEARNED_KEY_ORDER: &[&str] = &[
     "name",
     "description",
     "type",
+    "scope",
+    "subpath",
     "source",
     "confidence",
     "created",
@@ -354,6 +404,8 @@ struct LearnedRecord<'a> {
     valid_to: &'a str,
     superseded_by: &'a str,
     no_core: bool,
+    scope: &'a str,
+    subpath: &'a str,
 }
 
 fn render_learned(r: &LearnedRecord) -> String {
@@ -383,6 +435,12 @@ fn render_learned(r: &LearnedRecord) -> String {
     }
     if r.no_core {
         fields.insert("noCore".to_string(), "true".to_string());
+    }
+    if !r.scope.trim().is_empty() {
+        fields.insert("scope".to_string(), r.scope.trim().to_string());
+    }
+    if !r.subpath.trim().is_empty() {
+        fields.insert("subpath".to_string(), r.subpath.trim().to_string());
     }
     frontmatter::serialize(&fields, r.body, LEARNED_KEY_ORDER)
 }
@@ -415,6 +473,8 @@ pub fn add_learned_in(dir: &Path, w: &LearnedWrite) -> Result<String> {
         valid_to: "",
         superseded_by: "",
         no_core: w.no_core,
+        scope: w.scope.as_deref().unwrap_or(""),
+        subpath: w.subpath.as_deref().unwrap_or(""),
     });
     write_atomic(&path, &content)?;
     Ok(id)
@@ -457,6 +517,10 @@ pub fn reinforce(entry: &MemoryEntry, session_id: &str) -> Result<u32> {
     let superseded_by = fm.get("supersededBy").unwrap_or("").to_string();
     let last_retrieved = fm.get("lastRetrieved").unwrap_or("").to_string();
     let no_core = fm.get("noCore").map(|s| s.trim().eq_ignore_ascii_case("true")).unwrap_or(false);
+    // scope/subpath survive reinforcement verbatim — a reinforce that dropped them would silently
+    // promote a project fact to global.
+    let scope = fm.get("scope").unwrap_or("").to_string();
+    let subpath = fm.get("subpath").unwrap_or("").to_string();
     let content = render_learned(&LearnedRecord {
         name,
         description,
@@ -473,6 +537,8 @@ pub fn reinforce(entry: &MemoryEntry, session_id: &str) -> Result<u32> {
         valid_to: &valid_to,
         superseded_by: &superseded_by,
         no_core, // preserve an explicit deny across reinforcement
+        scope: &scope,
+        subpath: &subpath,
     });
     write_atomic(&entry.path, &content)?;
     Ok(reinforced)
@@ -499,6 +565,8 @@ pub fn mark_superseded(entry: &MemoryEntry, by_id: &str) -> Result<()> {
     let last_session = fm.get("lastSession").unwrap_or("").to_string();
     let last_retrieved = fm.get("lastRetrieved").unwrap_or("").to_string();
     let no_core = fm.get("noCore").map(|s| s.trim().eq_ignore_ascii_case("true")).unwrap_or(false);
+    let scope = fm.get("scope").unwrap_or("").to_string();
+    let subpath = fm.get("subpath").unwrap_or("").to_string();
     let content = render_learned(&LearnedRecord {
         name,
         description,
@@ -515,6 +583,8 @@ pub fn mark_superseded(entry: &MemoryEntry, by_id: &str) -> Result<()> {
         valid_to: &today(),
         superseded_by: by_id,
         no_core,
+        scope: &scope,
+        subpath: &subpath,
     });
     write_atomic(&entry.path, &content)?;
     Ok(())
@@ -585,6 +655,54 @@ mod tests {
         assert_eq!(MemoryType::parse("user"), MemoryType::User);
         assert_eq!(MemoryType::parse("nonsense"), MemoryType::Reference);
         assert_eq!(MemoryType::parse(""), MemoryType::Reference);
+    }
+
+    #[test]
+    fn scope_round_trips_and_survives_reinforce_and_supersede() {
+        let _g = config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ng-scope-rt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("NEXTGEN_HOME", &dir);
+
+        let w = LearnedWrite {
+            name: "zone fact",
+            description: "",
+            mtype: MemoryType::Project,
+            body: "the service deploys from ci",
+            source: crate::memory::provenance::ProvenanceKind::Inferred,
+            confidence: 0.8,
+            session_id: "s1",
+            no_core: false,
+            scope: Some("myproj-0a1b2c3d".into()),
+            subpath: Some("src/agent".into()),
+        };
+        let id = add_learned(&w).unwrap();
+        let reload = |id: &str| {
+            let id = id.to_string();
+            load_all().unwrap().into_iter().find(|e| e.id == id).unwrap()
+        };
+        let e = reload(&id);
+        assert_eq!(e.scope.as_deref(), Some("myproj-0a1b2c3d"));
+        assert_eq!(e.subpath.as_deref(), Some("src/agent"));
+
+        // reinforce must carry scope through verbatim (the easiest place to silently lose it)
+        reinforce(&e, "s2").unwrap();
+        let e2 = reload(&id);
+        assert_eq!(e2.scope.as_deref(), Some("myproj-0a1b2c3d"), "reinforce kept the zone");
+        assert_eq!(e2.subpath.as_deref(), Some("src/agent"));
+
+        // ...and so must supersession
+        mark_superseded(&e2, "replacement-id").unwrap();
+        assert_eq!(reload(&id).scope.as_deref(), Some("myproj-0a1b2c3d"), "supersede kept the zone");
+
+        // legacy + explicit-global both load as None
+        let legacy = add("legacy fact", "", MemoryType::User, "plain body").unwrap();
+        assert!(reload(&legacy).scope.is_none(), "no scope key → global");
+        let g = add_scoped("explicit global", "", MemoryType::User, "b", Some("global")).unwrap();
+        assert!(reload(&g).scope.is_none(), "literal 'global' → None");
+
+        std::env::remove_var("NEXTGEN_HOME");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

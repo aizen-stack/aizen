@@ -35,13 +35,48 @@ pub struct Hit {
     pub score: f64,
 }
 
+/// Which workspace zones a read (frozen core, search) should see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeSel {
+    /// The default working view: global facts + the current project's zone.
+    Current,
+    /// Everything, all zones (CLI inspection; the `NG_NO_SCOPE` kill-switch).
+    All,
+    /// Global facts only.
+    Global,
+    /// One specific zone by slug.
+    Project(String),
+}
+
+impl ScopeSel {
+    /// Does an entry carrying `scope` pass this selector? `current` = the resolved current slug.
+    pub fn admits(&self, scope: Option<&str>, current: &str) -> bool {
+        match self {
+            ScopeSel::All => true,
+            ScopeSel::Global => scope.is_none(),
+            ScopeSel::Current => scope.is_none() || scope == Some(current),
+            ScopeSel::Project(s) => scope == Some(s.as_str()),
+        }
+    }
+
+    /// The production default view: `Current`, or `All` when scoping is killed via `NG_NO_SCOPE`
+    /// (reads collapse back to the single pre-scoping pool; writes keep tagging either way).
+    pub fn default_view() -> ScopeSel {
+        if config::scope_disabled() {
+            ScopeSel::All
+        } else {
+            ScopeSel::Current
+        }
+    }
+}
+
 /// Live lazy search over the long-tail store for INJECTION INTO CONTEXT (the agent's
 /// `memory_search` tool). Same ranking as `search_filtered`, **plus** it records implicit-reuse
 /// reinforcement (the P8 evolution spine): every fact it returns into context is reinforced at
 /// most once/day. `cmd_search` (human inspection) and the bench deliberately use the read-only
 /// paths so only genuine context-injection grows the reuse signal.
-pub fn search(query: &str, k: usize) -> Result<Vec<Hit>> {
-    let hits = search_filtered(query, k, None)?;
+pub fn search_scoped(query: &str, k: usize, sel: &ScopeSel) -> Result<Vec<Hit>> {
+    let hits = search_filtered_scoped(query, k, None, sel)?;
     record_reuse(&hits); // best-effort; never fails the search
     Ok(hits)
 }
@@ -58,14 +93,24 @@ fn record_reuse(hits: &[Hit]) {
     }
 }
 
-/// Live search optionally restricted to one topical dimension (B1 scoped retrieval). Filtering
-/// happens before decay/sort so the dimension scope can't be diluted by off-topic noise.
-pub fn search_filtered(query: &str, k: usize, dim: Option<Dimension>) -> Result<Vec<Hit>> {
+/// The full retrieval pipeline with dimension + workspace-zone selection. The zone filter runs
+/// BEFORE the BM25 index is built (the index is corpus-relative — IDF/avgdl over exactly the
+/// candidate set), so scoping *improves* ranking statistics instead of just masking rows.
+pub fn search_filtered_scoped(
+    query: &str,
+    k: usize,
+    dim: Option<Dimension>,
+    sel: &ScopeSel,
+) -> Result<Vec<Hit>> {
     let all = store::load_all()?;
-    let active = bloat::supersede::active(&all);
+    let mut active = bloat::supersede::active(&all);
     let cfg = settings();
+    // The exclusion set mirrors what the served core actually holds (build() applies its own
+    // workspace view), so "long tail = whatever the always-on block doesn't carry" stays true.
     let core = frozen_core::build(&active, load_style().as_deref(), cfg.frozen_core_max_tokens);
     let exclude: HashSet<String> = core.source_ids.into_iter().collect();
+    let current = config::project_slug();
+    active.retain(|e| sel.admits(e.scope.as_deref(), &current));
 
     // Default path is the exact-BM25 lexical floor. `enable_dense` fuses a dense tier (RRF) with a
     // persistent per-fact embedding cache; `enable_fuzzy` adds the Jaro-Winkler bridge. Both OFF by
@@ -87,9 +132,19 @@ pub fn search_filtered(query: &str, k: usize, dim: Option<Dimension>) -> Result<
     }
     let today = bloat::decay::today();
     let half_life = cfg.recency_half_life_days;
+    let cur_sub = config::current_subpath();
     for h in &mut hits {
         // final = bm25 · decay · salience — facts rise/sink on reuse + reinforcement (P8).
         h.score = bloat::decay::evolved_score(h.score, &h.entry, &today, half_life);
+        // Soft region boost: a current-project fact tagged with the subpath the user is working
+        // under right now edges out its zone-mates (never a hard partition — see the plan).
+        if h.entry.scope.as_deref() == Some(current.as_str()) {
+            if let (Some(tag), Some(cur)) = (h.entry.subpath.as_deref(), cur_sub.as_deref()) {
+                if frozen_core::subpath_matches(tag, cur) {
+                    h.score *= 1.15;
+                }
+            }
+        }
     }
     hits.sort_by(|a, b| {
         b.score
@@ -255,14 +310,34 @@ impl embed::Embedder for CachingEmbedder<'_> {
 /// stating a fact to remember: the highest-confidence signal, so it's stored straight into the
 /// long-tail store as durable `feedback` (the agent's `memory_search` reads it next turn), bypassing
 /// the implicit free-extractor's confidence gate. Returns the new entry id.
+///
+/// Scope: a fact typed while standing in a project is usually ABOUT that project, so it lands in
+/// the current workspace zone by default; `#remember global: <text>` (or `g:`) pins it global.
+/// (Feedback never enters the frozen core, so scope only steers the default search visibility.)
 pub fn remember(text: &str) -> Result<String> {
+    let text = text.trim();
+    let (scope, text) = match strip_global_prefix(text) {
+        Some(rest) => (None, rest),
+        None => (Some(config::project_slug()), text),
+    };
     let text = text.trim();
     if text.is_empty() {
         anyhow::bail!("nothing to remember");
     }
     let slug = remember_slug(text);
     let desc: String = text.chars().take(80).collect();
-    store::add(&slug, &desc, MemoryType::Feedback, text)
+    store::add_scoped(&slug, &desc, MemoryType::Feedback, text, scope.as_deref())
+}
+
+/// `global: <text>` / `g: <text>` → the text with the marker stripped; `None` when unmarked.
+/// `.get` (not a raw slice) so a leading multi-byte char (`#gõ …`) can never panic mid-codepoint.
+fn strip_global_prefix(text: &str) -> Option<&str> {
+    for p in ["global:", "g:"] {
+        if text.get(..p.len()).is_some_and(|head| head.eq_ignore_ascii_case(p)) {
+            return Some(&text[p.len()..]);
+        }
+    }
+    None
 }
 
 /// A short kebab id from the first few words of a `#remember` capture (the store also disambiguates
@@ -297,13 +372,36 @@ pub fn cmd_add(name: &str, description: &str, mtype: &str, body: &str) -> Result
     Ok(())
 }
 
-pub fn cmd_list() -> Result<()> {
+/// Parse a CLI `--scope` value into a workspace view. `None` → All (human inspection sees
+/// everything); named views: all | global | current (global + this project) | project (this
+/// project's zone only) | any literal zone slug.
+pub fn parse_scope_sel(scope: Option<&str>) -> ScopeSel {
+    match scope.map(str::trim).map(str::to_lowercase).as_deref() {
+        None | Some("") | Some("all") => ScopeSel::All,
+        Some("global") => ScopeSel::Global,
+        Some("current") => ScopeSel::Current,
+        Some("project") => ScopeSel::Project(config::project_slug()),
+        Some(slug) => ScopeSel::Project(slug.to_string()),
+    }
+}
+
+/// `[p:slug]` display tag for a zoned entry; empty for global.
+fn zone_tag(e: &MemoryEntry) -> String {
+    match e.scope.as_deref() {
+        Some(z) => format!(" [p:{z}]"),
+        None => String::new(),
+    }
+}
+
+pub fn cmd_list(scope: Option<&str>) -> Result<()> {
+    let sel = parse_scope_sel(scope);
+    let current = config::project_slug();
     let mut entries = store::load_all()?;
     let superseded = entries.iter().filter(|e| !e.is_active()).count();
-    entries.retain(|e| e.is_active());
+    entries.retain(|e| e.is_active() && sel.admits(e.scope.as_deref(), &current));
     entries.sort_by(|a, b| a.id.cmp(&b.id));
     if entries.is_empty() {
-        println!("(no active memories yet — `aizen memory add ...`)");
+        println!("(no active memories in this view — `aizen memory add ...`, or `--scope all`)");
         return Ok(());
     }
     for e in &entries {
@@ -312,7 +410,7 @@ pub fn cmd_list() -> Result<()> {
         } else {
             format!(" — {}", e.description)
         };
-        println!("[{}] {}{}", e.mtype.as_str(), e.name, desc);
+        println!("[{}]{} {}{}", e.mtype.as_str(), zone_tag(e), e.name, desc);
     }
     println!("\n{} memories", entries.len());
     if superseded > 0 {
@@ -343,14 +441,15 @@ pub fn cmd_show(id_or_name: &str) -> Result<()> {
     }
 }
 
-pub fn cmd_search(query: &str, k: usize, dimension: Option<String>) -> Result<()> {
+pub fn cmd_search(query: &str, k: usize, dimension: Option<String>, scope: Option<&str>) -> Result<()> {
     let dim = match &dimension {
         Some(s) => Some(Dimension::parse(s).ok_or_else(|| {
             anyhow::anyhow!("unknown dimension '{s}' (style|tooling|workflow|stack|other)")
         })?),
         None => None,
     };
-    let hits = search_filtered(query, k, dim)?;
+    let sel = parse_scope_sel(scope);
+    let hits = search_filtered_scoped(query, k, dim, &sel)?;
     if hits.is_empty() {
         let scope = dim.map(|d| format!(" in dimension '{}'", d.as_str())).unwrap_or_default();
         println!("(no matches for '{query}'{scope})");
@@ -358,10 +457,11 @@ pub fn cmd_search(query: &str, k: usize, dimension: Option<String>) -> Result<()
     }
     for h in &hits {
         println!(
-            "{:.3}  [{}/{}] {}",
+            "{:.3}  [{}/{}]{} {}",
             h.score,
             h.entry.mtype.as_str(),
             h.entry.dimension.as_str(),
+            zone_tag(&h.entry),
             h.entry.name
         );
     }
@@ -555,6 +655,8 @@ pub fn cmd_review(promote: Option<String>, clear: bool) -> Result<()> {
             confidence: item.confidence,
             session_id: &learning::default_session_id(),
             no_core: false, // accepting a reviewed item → eligible for the core like any user fact
+            scope: item.scope.clone(),
+            subpath: item.subpath.clone(),
         };
         let id = store::add_learned(&w)?;
         let _ = std::fs::remove_file(&item.path);
@@ -674,6 +776,74 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn remember_defaults_to_project_zone_and_global_prefix_overrides() {
+        let _g = config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ng-remember-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("NG_PROJECT_ROOT", &dir);
+
+        let id = remember("the api base is internal dot example").unwrap();
+        let find = |id: &str| store::load_all().unwrap().into_iter().find(|e| e.id == id).unwrap();
+        assert_eq!(
+            find(&id).scope,
+            Some(config::project_slug()),
+            "a fact typed inside a project lands in its zone"
+        );
+
+        let gid = remember("GLOBAL: reply tersely everywhere").unwrap();
+        let g = find(&gid);
+        assert!(g.scope.is_none(), "global: prefix pins the fact global");
+        assert!(!g.body.to_lowercase().contains("global:"), "marker stripped from the body");
+
+        std::env::remove_var("NG_PROJECT_ROOT");
+        std::env::remove_var("NEXTGEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_global_prefix_matches_markers_only_and_is_utf8_safe() {
+        assert_eq!(strip_global_prefix("global: x").map(str::trim), Some("x"));
+        assert_eq!(strip_global_prefix("G: x").map(str::trim), Some("x"));
+        assert!(strip_global_prefix("globally speaking").is_none());
+        assert!(strip_global_prefix("gõ tiếng Việt nhanh").is_none(), "multi-byte head must not panic");
+    }
+
+    #[test]
+    fn search_scoped_current_hides_foreign_zones() {
+        let _g = config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ng-scope-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("NG_PROJECT_ROOT", &dir);
+        let cur = config::project_slug();
+
+        store::add_scoped("here fact", "", MemoryType::Reference, "the deploy pipeline uses fly", Some(&cur)).unwrap();
+        store::add_scoped("foreign fact", "", MemoryType::Reference, "the deploy pipeline uses render", Some("otherproj-11111111")).unwrap();
+        store::add("global fact", "", MemoryType::Feedback, "always deploy carefully").unwrap();
+
+        let current = search_scoped("deploy pipeline", 10, &ScopeSel::Current).unwrap();
+        assert!(current.iter().any(|h| h.entry.scope.as_deref() == Some(cur.as_str())), "current zone visible");
+        assert!(current.iter().any(|h| h.entry.scope.is_none()), "global visible");
+        assert!(
+            current.iter().all(|h| h.entry.scope.as_deref() != Some("otherproj-11111111")),
+            "another project's facts are invisible in the working view"
+        );
+
+        let all = search_filtered_scoped("deploy pipeline", 10, None, &ScopeSel::All).unwrap(); // human view
+        assert!(all.iter().any(|h| h.entry.scope.as_deref() == Some("otherproj-11111111")), "All sees every zone");
+
+        let global_only = search_scoped("deploy", 10, &ScopeSel::Global).unwrap();
+        assert!(!global_only.is_empty() && global_only.iter().all(|h| h.entry.scope.is_none()));
+
+        std::env::remove_var("NG_PROJECT_ROOT");
+        std::env::remove_var("NEXTGEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn remember_slug_is_kebab_and_bounded() {
         assert_eq!(remember_slug("Prefer pnpm over npm"), "prefer-pnpm-over-npm");
         let s = remember_slug("  the API base is https://x/v1  ");
@@ -783,14 +953,14 @@ mod tests {
         store::add("prefer pnpm", "", MemoryType::Feedback, "I prefer pnpm as my package manager").unwrap();
         store::add("project stack", "", MemoryType::Project, "the package is built with rust and tokio").unwrap();
 
-        let unscoped = search("package", 10).unwrap();
+        let unscoped = search_scoped("package", 10, &ScopeSel::All).unwrap();
         assert!(unscoped.len() >= 2, "both facts match 'package' unscoped");
 
-        let tooling = search_filtered("package", 10, Some(Dimension::Tooling)).unwrap();
+        let tooling = search_filtered_scoped("package", 10, Some(Dimension::Tooling), &ScopeSel::All).unwrap();
         assert!(!tooling.is_empty() && tooling.iter().all(|h| h.entry.dimension == Dimension::Tooling));
         assert!(tooling.iter().any(|h| h.entry.body.contains("pnpm")));
 
-        let stack = search_filtered("package", 10, Some(Dimension::Stack)).unwrap();
+        let stack = search_filtered_scoped("package", 10, Some(Dimension::Stack), &ScopeSel::All).unwrap();
         assert!(!stack.is_empty() && stack.iter().all(|h| h.entry.dimension == Dimension::Stack));
         assert!(stack.iter().all(|h| !h.entry.body.contains("pnpm")), "stack scope excludes the tooling fact");
 

@@ -117,13 +117,7 @@ pub async fn run_workflow(
     );
 
     // Fan out, bounded to MAX_PARALLEL via chunking.
-    let mut results: Vec<TaskOutcome> = Vec::with_capacity(spec.tasks.len());
-    for chunk in spec.tasks.chunks(MAX_PARALLEL) {
-        let futs = chunk.iter().map(|t| {
-            run_one_task(http, base_url, api_key, model, auto_approve, &root, &date, t)
-        });
-        results.extend(futures_util::future::join_all(futs).await);
-    }
+    let results = fan_out(http, base_url, api_key, model, auto_approve, &root, &date, &spec.tasks).await;
 
     for r in &results {
         eprintln!("  • {} ({}/{}) — {} [{} step(s)]", r.id, r.role, r.model, r.status, r.iters);
@@ -172,6 +166,94 @@ pub async fn run_workflow(
     Ok(())
 }
 
+/// Fan the tasks out, bounded to `MAX_PARALLEL` via chunking — shared by the CLI runner and the
+/// model-callable `workflow` tool (see `workflow_tool.rs`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fan_out(
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    auto_approve: bool,
+    root: &Path,
+    date: &str,
+    tasks: &[WorkflowTask],
+) -> Vec<TaskOutcome> {
+    let mut results: Vec<TaskOutcome> = Vec::with_capacity(tasks.len());
+    for chunk in tasks.chunks(MAX_PARALLEL) {
+        let futs =
+            chunk.iter().map(|t| run_one_task(http, base_url, api_key, model, auto_approve, root, date, t));
+        results.extend(futures_util::future::join_all(futs).await);
+    }
+    results
+}
+
+/// [`run_workflow`]'s COLLECTING sibling for the in-conversation `workflow` tool: same validation
+/// + fan-out, but a NON-streaming synthesis, everything returned as one result string (per-task
+/// status lines + the merged answer) instead of printed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_workflow_collect(
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    auto_approve: bool,
+    spec: &WorkflowSpec,
+    synthesize: bool,
+) -> Result<String> {
+    if spec.tasks.is_empty() {
+        bail!("workflow '{}' has no tasks", spec.name);
+    }
+    let mut seen = std::collections::HashSet::new();
+    for t in &spec.tasks {
+        if t.id.trim().is_empty() {
+            bail!("workflow '{}' has a blank task id", spec.name);
+        }
+        if !seen.insert(t.id.as_str()) {
+            bail!("workflow '{}' has a duplicate task id '{}'", spec.name, t.id);
+        }
+    }
+    let root = std::env::current_dir().context("resolving cwd")?.canonicalize().context("canonicalizing cwd")?;
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let results = fan_out(http, base_url, api_key, model, auto_approve, &root, &date, &spec.tasks).await;
+    if results.iter().all(|r| r.status == "error") {
+        bail!("workflow '{}': all {} task(s) failed — nothing to report", spec.name, results.len());
+    }
+
+    let mut out = format!("[workflow: {}, {} task(s)]\n", spec.name, results.len());
+    for r in &results {
+        out.push_str(&format!("  • {} ({}/{}) — {} [{} step(s)]\n", r.id, r.role, r.model, r.status, r.iters));
+    }
+    if !synthesize {
+        // Verify-style callers want the RAW per-task outputs, not a merged narrative.
+        for r in &results {
+            out.push_str(&format!("\n── {} ──\n{}\n", r.id, r.summary));
+        }
+        return Ok(out.trim_end().to_string());
+    }
+    let synth_model = spec.synthesis.as_ref().and_then(|s| s.model.as_deref()).unwrap_or(model);
+    let default_instruction = "Synthesize the sub-agent results below into ONE coherent, \
+        deduplicated answer. Resolve any conflicts explicitly and note which task each key point \
+        came from. Do not invent results that no task reported.";
+    let instruction = spec.synthesis.as_ref().and_then(|s| s.prompt.as_deref()).unwrap_or(default_instruction);
+    let synth_prompt = build_synthesis_prompt(&spec.name, instruction, &results);
+    let merged = crate::llm::client::chat_with_tools(
+        http,
+        base_url,
+        api_key,
+        synth_model,
+        &[Message::user(synth_prompt)],
+        &[],
+    )
+    .await
+    .context("workflow synthesis failed")?
+    .content
+    .unwrap_or_default();
+    out.push('\n');
+    out.push_str(merged.trim());
+    Ok(out)
+}
+
 /// Run one task as a role-scoped sub-agent (silent; non-streaming). Errors are captured into the
 /// outcome (a failed task never aborts the workflow — its siblings + the synthesis still run).
 #[allow(clippy::too_many_arguments)]
@@ -196,11 +278,11 @@ async fn run_one_task(
     let (label, task_model, registry, system) = match &spec {
         Some(def) => {
             let m = task.model.as_deref().or(def.model.as_deref()).unwrap_or(model);
-            (def.slug(), m, agent_registry(def, root), build_agent_subagent_prompt(def, root, m, date))
+            (def.slug(), m, agent_registry(def, root), build_agent_subagent_prompt(def, root, m, date, None))
         }
         None => {
             let m = task.model.as_deref().unwrap_or(model);
-            (task.role.clone(), m, role_registry(&task.role, root), build_subagent_prompt(&task.role, root, m, date))
+            (task.role.clone(), m, role_registry(&task.role, root), build_subagent_prompt(&task.role, root, m, date, None))
         }
     };
 

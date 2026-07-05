@@ -64,22 +64,32 @@ fn recency_key(e: &MemoryEntry) -> (String, String) {
     (d, e.id.clone())
 }
 
-/// Archive the oldest INFERRED active facts beyond `cap`. Curated facts are exempt and not
-/// counted against the cap. Returns the ids archived (LRU victims).
-pub fn enforce_caps(cap: usize) -> Result<Vec<String>> {
+/// Archive the oldest INFERRED active facts beyond the caps, PER WORKSPACE ZONE: the global pool
+/// gets `global_cap`, each project zone gets `project_cap` — one chatty project can no longer
+/// evict another project's (or the global pool's) facts. Curated facts are exempt and not counted.
+/// Returns the ids archived (LRU victims).
+pub fn enforce_caps(global_cap: usize, project_cap: usize) -> Result<Vec<String>> {
     let all = store::load_all()?;
-    let mut inferred: Vec<MemoryEntry> = all
-        .into_iter()
-        .filter(|e| e.source == ProvenanceKind::Inferred && e.is_active())
-        .collect();
-    if inferred.len() <= cap {
-        return Ok(Vec::new());
+    let mut by_zone: std::collections::HashMap<Option<String>, Vec<MemoryEntry>> =
+        std::collections::HashMap::new();
+    for e in all.into_iter().filter(|e| e.source == ProvenanceKind::Inferred && e.is_active()) {
+        by_zone.entry(e.scope.clone()).or_default().push(e);
     }
-    inferred.sort_by(|a, b| recency_key(a).cmp(&recency_key(b))); // oldest first
-    let victims = inferred.len() - cap;
     let mut archived = Vec::new();
-    for e in inferred.into_iter().take(victims) {
-        archived.push(archive_entry(&e)?);
+    // Deterministic zone order (global first, then slugs alphabetically) so test output is stable.
+    let mut zones: Vec<Option<String>> = by_zone.keys().cloned().collect();
+    zones.sort();
+    for zone in zones {
+        let mut inferred = by_zone.remove(&zone).unwrap_or_default();
+        let cap = if zone.is_none() { global_cap } else { project_cap };
+        if inferred.len() <= cap {
+            continue;
+        }
+        inferred.sort_by_key(recency_key); // oldest first
+        let victims = inferred.len() - cap;
+        for e in inferred.into_iter().take(victims) {
+            archived.push(archive_entry(&e)?);
+        }
     }
     Ok(archived)
 }
@@ -102,6 +112,10 @@ mod tests {
     }
 
     fn add_inferred(name: &str, created: &str) {
+        add_inferred_scoped(name, created, None)
+    }
+
+    fn add_inferred_scoped(name: &str, created: &str, scope: Option<&str>) {
         let w = LearnedWrite {
             name,
             description: "",
@@ -111,6 +125,8 @@ mod tests {
             confidence: 0.8,
             session_id: "s",
             no_core: false,
+            scope: scope.map(str::to_string),
+            subpath: None,
         };
         let id = store::add_learned(&w).unwrap();
         // back-date created/updated so the LRU order is deterministic in the test
@@ -138,7 +154,7 @@ mod tests {
             add_inferred("fact-old", "2026-01-01");
             add_inferred("fact-mid", "2026-03-01");
             add_inferred("fact-new", "2026-06-01");
-            let archived = enforce_caps(2).unwrap();
+            let archived = enforce_caps(2, 1).unwrap();
             assert_eq!(archived.len(), 1, "exactly one over-cap victim");
             assert_eq!(archived[0], "fact-old", "LRU victim is the oldest");
             // archive round-trips
@@ -157,10 +173,33 @@ mod tests {
             store::add("keepme", "", MemoryType::User, "a deliberate manual fact").unwrap();
             add_inferred("inf-old", "2026-01-01");
             add_inferred("inf-new", "2026-06-01");
-            let archived = enforce_caps(1).unwrap();
+            let archived = enforce_caps(1, 1).unwrap();
             assert_eq!(archived, vec!["inf-old".to_string()]);
             // manual fact untouched
             assert!(store::load_all().unwrap().iter().any(|e| e.id == "keepme"));
+        });
+    }
+
+    #[test]
+    fn caps_are_enforced_per_zone() {
+        with_temp_home("zonecap", || {
+            // global pool: 2 facts under a cap of 2 → untouched
+            add_inferred("glob-old", "2026-01-01");
+            add_inferred("glob-new", "2026-06-01");
+            // one chatty project zone: 3 facts under a per-zone cap of 1 → its own 2 oldest archived
+            add_inferred_scoped("za-old", "2026-01-01", Some("chatty-00000001"));
+            add_inferred_scoped("za-mid", "2026-03-01", Some("chatty-00000001"));
+            add_inferred_scoped("za-new", "2026-06-01", Some("chatty-00000001"));
+            // another zone stays within its cap
+            add_inferred_scoped("zb-only", "2026-01-01", Some("quiet-00000002"));
+
+            let archived = enforce_caps(2, 1).unwrap();
+            assert_eq!(archived, vec!["za-old".to_string(), "za-mid".to_string()],
+                "only the over-cap zone loses its own oldest facts");
+            let live: Vec<String> = store::load_all().unwrap().into_iter().map(|e| e.id).collect();
+            assert!(live.contains(&"glob-old".to_string()) && live.contains(&"glob-new".to_string()),
+                "a chatty project cannot evict the global pool");
+            assert!(live.contains(&"zb-only".to_string()), "…nor another project's zone");
         });
     }
 }

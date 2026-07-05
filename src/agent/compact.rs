@@ -23,6 +23,25 @@ const SUMMARIZE_SYS: &str = "You compress a coding-assistant conversation to con
     files/paths touched, commands run and their outcomes, important code/config, and any OPEN or \
     UNFINISHED tasks. Use terse bullet points. Do NOT invent anything not in the transcript.";
 
+/// The `/handoff` instruction: unlike compaction (preserve everything densely), a handoff is
+/// GOAL-CONDITIONED — extract only what the NEW objective needs and drop the rest. This is the
+/// fix for long-context drift that summarize-in-place preserves (the Amp lesson: a fresh thread
+/// seeded with relevant context beats an old thread summarized).
+const HANDOFF_SYS: &str = "You extract ONLY the context relevant to a NEW goal from a prior \
+    conversation: decisions, file paths, constraints, gotchas, and command outcomes that bear on \
+    that goal. Omit everything else — unrelated work, dead ends, pleasantries. Terse bullets. Do \
+    NOT invent anything not in the transcript.";
+
+/// Build the `/handoff` summarization prompt (goal-conditioned extraction over the transcript).
+pub fn handoff_prompt(history: &[Message], goal: &str) -> Vec<Message> {
+    // Skip [0] (the system prompt is not conversation) — same convention as compaction's cut.
+    let transcript = render_transcript(history.get(1..).unwrap_or_default());
+    vec![
+        Message::system(HANDOFF_SYS),
+        Message::user(format!("NEW GOAL:\n{goal}\n\nPrior conversation:\n\n{transcript}")),
+    ]
+}
+
 /// Truncate to `max` chars with a `…[+N chars]` marker (char-safe, never splits a codepoint).
 pub fn truncate_chars(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
@@ -93,9 +112,10 @@ pub fn splice_compacted(history: &mut Vec<Message>, cut: usize, summary: &str) {
     *history = rebuilt;
 }
 
-/// Rough size in tokens (chars/4, no tokenizer dep) — for the before/after trace only.
+/// Rough size in tokens — for the before/after trace only. Delegates to the shared estimator so
+/// compaction traces agree with the loop guards and the HUD.
 fn approx_tokens(history: &[Message]) -> usize {
-    history.iter().filter_map(|m| m.content.as_ref()).map(|c| c.chars().count()).sum::<usize>() / 4
+    history.iter().map(super::estimate_message_tokens).sum()
 }
 
 /// Summarize older turns to free context. `summarize` runs the model call on a `[system, user]`
@@ -136,6 +156,22 @@ where
 mod tests {
     use super::*;
     use crate::core::types::{FunctionCall, ToolCall};
+
+    #[test]
+    fn handoff_prompt_embeds_goal_and_skips_system() {
+        let history = vec![
+            Message::system("SYSTEM PROMPT — never in the transcript"),
+            Message::user("old task about the parser"),
+            Message::assistant("fixed it in src/parse.rs"),
+        ];
+        let p = handoff_prompt(&history, "now optimize the lexer");
+        assert_eq!(p.len(), 2);
+        assert!(p[0].content.as_deref().unwrap().contains("ONLY the context relevant"));
+        let usr = p[1].content.as_deref().unwrap();
+        assert!(usr.contains("NEW GOAL:\nnow optimize the lexer"), "{usr}");
+        assert!(usr.contains("src/parse.rs"), "transcript present");
+        assert!(!usr.contains("SYSTEM PROMPT"), "system prompt never leaks into the extraction");
+    }
 
     fn user(s: &str) -> Message {
         Message::user(s.to_string())

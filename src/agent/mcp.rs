@@ -18,10 +18,11 @@
 //! Static-binary posture: hand-rolled JSON-RPC over `serde_json` + the existing
 //! `reqwest`(rustls) / `tokio::process` — NO `*-sys` crate, NEVER the Python/TS MCP SDK.
 //!
-//! Async-from-sync: the `Tool` trait is sync; MCP I/O is async. We bridge with
-//! `block_in_place` + the current runtime's `block_on` (same invariant as `web_tools`), so every
-//! `McpTool` declares `is_concurrency_safe() = false` (it must stay on the serial runtime-worker
-//! path where the bridge is valid). Connections are process-global and reused across calls.
+//! Async-from-sync: the `Tool` trait is sync; MCP I/O is async. Calls bridge through the shared
+//! cancel-aware `tools::block_for_tool` (valid on runtime workers AND spawn_blocking threads), so
+//! read-only `McpTool`s declare `is_concurrency_safe() = true` and may run concurrently in a
+//! batch; same-server calls serialize on the connection's own `Arc<Mutex<Connection>>`.
+//! Connections are process-global and reused across calls.
 
 use crate::agent::cmd_guard;
 use crate::agent::tools::Tool;
@@ -1231,7 +1232,11 @@ impl Tool for McpTool {
         self.destructive
     }
     fn is_concurrency_safe(&self) -> bool {
-        false // block_in_place would panic on the parallel scoped-thread path (no runtime)
+        // The shared bridge is valid on spawn_blocking threads, so read-only MCP calls may run
+        // concurrently; same-server calls still serialize correctly on the connection's own
+        // Arc<Mutex<Connection>>. Destructive-annotated MCP tools stay serial anyway via the
+        // `!is_destructive` half of the executor's safety check.
+        true
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let conn = self.conn.clone();
@@ -1244,7 +1249,8 @@ impl Tool for McpTool {
             Value::Null => json!({}),
             _ => bail!("MCP tool '{server}/{name}' expects a JSON object for arguments, got {}", short_kind(args)),
         };
-        block(async move {
+        // The shared cancel-aware bridge: Esc aborts a slow MCP call instead of blocking the turn.
+        let out = crate::agent::tools::block_for_tool(async move {
             let mut c = conn.lock().await;
             match tokio::time::timeout(CALL_TIMEOUT, c.call_tool(&name, &args)).await {
                 Ok(r) => r,
@@ -1264,7 +1270,15 @@ impl Tool for McpTool {
                     ))
                 }
             }
-        })
+        });
+        // A cancel dropped the read mid-message — the same stdio-framing desync as a timeout, so
+        // the same medicine: reconnect from scratch on the next registry build.
+        if let Err(e) = &out {
+            if e.to_string().contains("cancelled by user") {
+                invalidate();
+            }
+        }
+        out
     }
 }
 

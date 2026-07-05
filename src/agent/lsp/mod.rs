@@ -80,6 +80,9 @@ impl LspStatus {
 
 pub struct LspManager {
     enabled: AtomicBool,
+    /// Fold NEW diagnostics into edit-tool results (see [`edit_feedback`](Self::edit_feedback)).
+    /// Default ON (only matters while `enabled`); `/lsp edits off` / config kill it.
+    edit_feedback: AtomicBool,
     /// Per-request wall-clock cap (seconds); set from `AgentConfig.lsp_request_timeout_secs`.
     request_timeout_secs: AtomicU64,
     /// The dedicated runtime the servers + requests run on. Built on [`enable`](Self::enable).
@@ -88,21 +91,36 @@ pub struct LspManager {
     servers: Mutex<HashMap<String, Arc<LspServer>>>,
     /// Respawns-after-death per server key; capped at [`MAX_RESPAWNS`] per session.
     restarts: Mutex<HashMap<String, u32>>,
+    /// Session baseline of diagnostic FINGERPRINTS per file (line-number-free — edits shift
+    /// lines), refreshed on every fetch. Post-edit feedback reports `now − baseline` only, so a
+    /// pre-existing warning wall never spams every edit result.
+    diag_baseline: Mutex<HashMap<PathBuf, std::collections::HashSet<String>>>,
 }
 
 impl LspManager {
     fn new() -> Self {
         Self {
             enabled: AtomicBool::new(false),
+            edit_feedback: AtomicBool::new(true),
             request_timeout_secs: AtomicU64::new(20),
             runtime: Mutex::new(None),
             servers: Mutex::new(HashMap::new()),
             restarts: Mutex::new(HashMap::new()),
+            diag_baseline: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Is the post-edit diagnostics fold on? (Only meaningful while LSP itself is enabled.)
+    pub fn edit_feedback_enabled(&self) -> bool {
+        self.edit_feedback.load(Ordering::Relaxed)
+    }
+
+    pub fn set_edit_feedback(&self, on: bool) {
+        self.edit_feedback.store(on, Ordering::Relaxed);
     }
 
     /// Set the per-request timeout (seconds, min 1). Called from config at startup / `/lsp on`.
@@ -211,6 +229,13 @@ impl LspManager {
         })
     }
 
+    /// [`document_symbols`](Self::document_symbols) returning the STRUCTS (for `repo_map`, which
+    /// renders its own compact skeleton instead of the tool's outline).
+    pub fn document_symbols_items(&self, file: &Path) -> Result<Vec<DocSym>> {
+        let f = file.to_path_buf();
+        self.run_query(file, "documentSymbol", move |s| async move { s.document_symbols(&f).await })
+    }
+
     /// Project-wide fuzzy symbol search by name (`max` caps the rendered hits).
     pub fn workspace_symbols(&self, anchor: &Path, query: &str, max: usize) -> Result<String> {
         let q = query.to_string();
@@ -223,10 +248,93 @@ impl LspManager {
     /// Current diagnostics for one file (pull-preferred, push-fallback — see `server::diagnostics`).
     pub fn diagnostics(&self, file: &Path) -> Result<String> {
         let f = file.to_path_buf();
-        self.run_query(file, "diagnostics", move |s| async move {
+        let out = self.run_query(file, "diagnostics", move |s| async move {
             let items = s.diagnostics(&f).await?;
-            Ok(format_diagnostics(&s.root, &f, &items))
-        })
+            Ok((format_diagnostics(&s.root, &f, &items), items))
+        });
+        match out {
+            Ok((rendered, items)) => {
+                self.update_baseline(file, &items);
+                Ok(rendered)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Post-edit diagnostics FOLD: NEW diagnostics for `file` (vs the session baseline), appended
+    /// to the edit tool's own result — the model learns of breakage in the same round-trip that
+    /// caused it, no separate diagnostics call, no failed-build round-trip later.
+    ///
+    /// Fail-soft and edit-latency-safe by construction: `None` on any miss (LSP off, fold off, no
+    /// project, server not RUNNING yet — never spawned from the edit path, only warmed in the
+    /// background for next time — or the 3s hard cap elapsing). An edit's success is never held
+    /// hostage by a slow analysis.
+    pub fn edit_feedback(&self, file: &Path) -> Option<String> {
+        if !self.is_enabled() || !self.edit_feedback_enabled() {
+            return None;
+        }
+        let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+        let (spec, root) = discovery::detect(&file)?;
+        let key = format!("{}\0{}", spec.lang, root.display());
+        let server = self.servers.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
+        let Some(server) = server else {
+            self.warm_spawn(spec, root); // folds activate from the NEXT edit onward
+            return None;
+        };
+        if !server.is_alive() {
+            return None;
+        }
+        let handle = self.handle().ok()?;
+        let f = file.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        handle.spawn(async move {
+            // Hard 3s wall-clock cap around re-open + re-analysis + (bounded) settle.
+            let out = tokio::time::timeout(
+                Duration::from_secs(3),
+                server.diagnostics_bounded(&f, Duration::from_millis(1500)),
+            )
+            .await;
+            let _ = tx.send(match out {
+                Ok(Ok(items)) => Some(items),
+                _ => None,
+            });
+        });
+        let items = rx.recv_timeout(Duration::from_millis(3_500)).ok().flatten()?;
+
+        let fingerprints: std::collections::HashSet<String> =
+            items.iter().map(diag_fingerprint).collect();
+        let had_baseline;
+        let new_items: Vec<&DiagItem> = {
+            let mut base = self.diag_baseline.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = base.get(&file);
+            had_baseline = prev.is_some();
+            let fresh: Vec<&DiagItem> = match prev {
+                Some(prev) => items.iter().filter(|d| !prev.contains(&diag_fingerprint(d))).collect(),
+                // First edit with no baseline: report only ERRORS (a pre-existing warning wall
+                // must not spam), labeled `current` not `new`.
+                None => items.iter().filter(|d| d.severity == "error").collect(),
+            };
+            base.insert(file.clone(), fingerprints);
+            fresh
+        };
+        Some(format_edit_feedback(&new_items, had_baseline))
+    }
+
+    /// Refresh the per-file fingerprint baseline (every fetch is the new truth).
+    fn update_baseline(&self, file: &Path, items: &[DiagItem]) {
+        let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+        let fp = items.iter().map(diag_fingerprint).collect();
+        self.diag_baseline.lock().unwrap_or_else(|e| e.into_inner()).insert(file, fp);
+    }
+
+    /// Fire-and-forget server spawn (a throwaway OS thread carries the blocking handshake) so the
+    /// NEXT edit's fold finds a live server. Never blocks the caller.
+    fn warm_spawn(&self, spec: &'static discovery::ServerSpec, root: PathBuf) {
+        let Ok(handle) = self.handle() else { return };
+        let timeout = self.request_timeout();
+        std::thread::spawn(move || {
+            let _ = LSP.get_or_spawn(spec, &root, &handle, timeout);
+        });
     }
 
     /// The shared async→sync bridge: detect the project for `anchor`, get/spawn its server, run
@@ -408,6 +516,33 @@ fn format_ws_symbols(root: &Path, query: &str, syms: &[WsSym], max: usize) -> St
 }
 
 /// Render diagnostics: severity counts header + `severity line:col  message [code]` rows.
+/// LINE-NUMBER-FREE identity of one diagnostic (`severity|code|first-120-chars-of-message`): an
+/// edit shifts every line below it, so a positional identity would mark every pre-existing
+/// diagnostic "new" after each edit.
+fn diag_fingerprint(d: &DiagItem) -> String {
+    let first: String = d.message.lines().next().unwrap_or("").chars().take(120).collect();
+    format!("{}|{}|{}", d.severity, d.code.as_deref().unwrap_or(""), first)
+}
+
+/// The post-edit fold block appended to an edit result. `had_baseline` picks the honest label:
+/// diffed against a prior snapshot ⇒ "new"; first sighting ⇒ "current" (errors only).
+fn format_edit_feedback(items: &[&DiagItem], had_baseline: bool) -> String {
+    if items.is_empty() {
+        return "[lsp] no new diagnostics".to_string();
+    }
+    let label = if had_baseline { "new" } else { "current" };
+    let mut s = format!("[lsp] {} {label} diagnostic(s) after edit:", items.len());
+    for d in items.iter().take(5) {
+        let first: String = d.message.lines().next().unwrap_or("").chars().take(140).collect();
+        let code = d.code.as_deref().map(|c| format!(" [{c}]")).unwrap_or_default();
+        s.push_str(&format!("\n  {} {}:{}  {first}{code}", d.severity, d.line, d.col));
+    }
+    if items.len() > 5 {
+        s.push_str(&format!("\n  (+{} more — run lsp_diagnostics for the full list)", items.len() - 5));
+    }
+    s
+}
+
 fn format_diagnostics(root: &Path, file: &Path, items: &[DiagItem]) -> String {
     let rel = rel_display(root, file);
     if items.is_empty() {
@@ -439,6 +574,38 @@ fn format_diagnostics(root: &Path, file: &Path, items: &[DiagItem]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn diag(sev: &'static str, line: usize, msg: &str, code: Option<&str>) -> DiagItem {
+        DiagItem { line, col: 1, severity: sev, message: msg.into(), code: code.map(String::from) }
+    }
+
+    #[test]
+    fn diag_fingerprint_ignores_line_numbers() {
+        let a = diag("error", 10, "cannot find value `x`", Some("E0425"));
+        let b = diag("error", 99, "cannot find value `x`", Some("E0425"));
+        assert_eq!(diag_fingerprint(&a), diag_fingerprint(&b), "same diagnostic, shifted lines");
+        let c = diag("warning", 10, "cannot find value `x`", Some("E0425"));
+        assert_ne!(diag_fingerprint(&a), diag_fingerprint(&c), "severity is identity");
+    }
+
+    #[test]
+    fn edit_feedback_formats_cap_and_labels() {
+        let items: Vec<DiagItem> =
+            (0..8).map(|i| diag("error", i, &format!("problem {i}"), None)).collect();
+        let refs: Vec<&DiagItem> = items.iter().collect();
+        let s = format_edit_feedback(&refs, true);
+        assert!(s.starts_with("[lsp] 8 new diagnostic(s) after edit:"), "{s}");
+        assert!(s.contains("(+3 more"), "capped at 5: {s}");
+        let s2 = format_edit_feedback(&refs[..1], false);
+        assert!(s2.contains("1 current diagnostic"), "no baseline → honest 'current' label: {s2}");
+        assert_eq!(format_edit_feedback(&[], true), "[lsp] no new diagnostics");
+    }
+
+    #[test]
+    fn edit_feedback_is_none_when_off() {
+        // LSP disabled (the default in tests) → the fold must be a hard no-op.
+        assert!(LSP.edit_feedback(Path::new("src/main.rs")).is_none());
+    }
 
     #[test]
     fn rel_display_handles_verbatim_and_drive_case() {

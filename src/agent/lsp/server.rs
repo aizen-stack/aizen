@@ -537,6 +537,13 @@ impl LspServer {
     /// advertises it; otherwise settle on push (`publishDiagnostics`) with a quiet window. Sorted
     /// by position.
     pub async fn diagnostics(&self, file: &Path) -> Result<Vec<DiagItem>> {
+        self.diagnostics_bounded(file, Duration::from_secs(8)).await
+    }
+
+    /// [`diagnostics`](Self::diagnostics) with a caller-chosen push-settle deadline: the tool path
+    /// keeps the patient 8s; the post-edit feedback fold uses a tight budget (its whole fold is
+    /// hard-capped) so an edit result is never held hostage by a slow re-analysis.
+    pub async fn diagnostics_bounded(&self, file: &Path, settle: Duration) -> Result<Vec<DiagItem>> {
         let (url, refreshed) = self.ensure_open(file).await?;
         let key = uri::normalize_uri(url.as_str());
 
@@ -564,7 +571,7 @@ impl LspServer {
         // the stored snapshot. `refreshed` ⇒ a didOpen/didChange just went out, so a fresh publish
         // is expected; otherwise the existing snapshot is current and a short quiet wait suffices.
         let start_seq = self.push_seq(&key);
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + settle;
         let mut last_seen = start_seq;
         let mut last_change = Instant::now();
         loop {

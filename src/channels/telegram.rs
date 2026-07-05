@@ -287,10 +287,11 @@ async fn self_poll_for_approval(client: &Client, id: &str) -> bool {
     false
 }
 
-/// Bridge an async future to the sync `Tool::execute` path (multi-thread runtime worker only;
-/// same invariant as the other async tools → `is_concurrency_safe()=false`).
-fn block<F: std::future::Future>(f: F) -> F::Output {
-    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+/// Bridge an async future to the sync `Tool::execute` path — the shared cancel-aware bridge
+/// (valid on workers AND spawn_blocking threads; Esc aborts an in-flight send or a pending
+/// 5-minute approval wait instead of blocking the turn on it).
+fn block<T>(f: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    crate::agent::tools::block_for_tool(f)
 }
 
 // ── agent tools ──────────────────────────────────────────────────────────────────
@@ -350,7 +351,7 @@ impl Tool for TelegramAsk {
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let q = args.get("question").and_then(|v| v.as_str()).context("missing required string arg 'question'")?;
-        match block(request_approval(q)) {
+        match block(async { anyhow::Ok(request_approval(q).await) })? {
             Some(true) => Ok("approved".to_string()),
             Some(false) => Ok("denied (or timed out)".to_string()),
             None => Ok("error: telegram not configured (run `aizen telegram setup`)".to_string()),

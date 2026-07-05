@@ -22,9 +22,11 @@ pub struct CompactReport {
     pub archived: Vec<String>,
 }
 
-/// Run a maintenance pass: enforce the inferred-fact LRU cap (archiving victims).
-/// Idempotent and safe to run often (the learning path calls it best-effort after writes).
+/// Run a maintenance pass: enforce the inferred-fact LRU caps (archiving victims). Per-zone:
+/// the global pool gets the full cap, each project zone half of it — bounded growth per project
+/// without one project starving the others. Idempotent and safe to run often (the learning path
+/// calls it best-effort after writes).
 pub fn compact() -> Result<CompactReport> {
     let cap = config::MemorySettings::default().learn_inferred_cap;
-    Ok(CompactReport { archived: caps::enforce_caps(cap)? })
+    Ok(CompactReport { archived: caps::enforce_caps(cap, (cap / 2).max(1))? })
 }

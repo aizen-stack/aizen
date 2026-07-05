@@ -27,6 +27,34 @@ pub struct CliConfig {
     /// when usage crosses it). `None` ⇒ default 80%. `Some(0)` ⇒ auto-compact disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_threshold_pct: Option<u8>,
+    /// System-prompt tier override: `"full"` or `"strict"` (the compact numbered-rules prompt for
+    /// small/local models). `None` ⇒ auto by model-id heuristic (`agent::prompt_tier_for`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tier: Option<String>,
+    /// Eager tool execution during streaming: read-only tool calls start the moment their streamed
+    /// arguments complete. `None` ⇒ ON. `Some(false)` ⇒ wait for the full response (also the
+    /// `NG_NO_EAGER` env kill-switch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eager_tools: Option<bool>,
+    /// Reasoning-effort passthrough for reasoning models ("low"/"medium"/"high"; provider
+    /// validates). `None` ⇒ field omitted from requests entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Fold NEW LSP diagnostics into edit-tool results (only meaningful while LSP is on).
+    /// `None` ⇒ ON. Toggle live with `/lsp edits on|off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_edit_diagnostics: Option<bool>,
+    /// One extra self-review turn before Done on runs that edited files (diff vs request; uses
+    /// `roles.oracle` when configured). `None` ⇒ OFF (costs a turn per editing task).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_review: Option<bool>,
+    /// Concurrent sub-agent cap for parallel read-only `task` dispatches. `None` ⇒ 3 (clamp 1..=5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel_subagents: Option<usize>,
+    /// Register the `workflow` fan-out tool. `None` ⇒ auto (only when specialist agents are
+    /// installed — the schema costs ~350 tok/turn). `Some(true/false)` forces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_tool: Option<bool>,
     /// Auto-learn skills: after a multi-step task the REPL distills a reusable procedure into a
     /// skill. `None` ⇒ default ON. `Some(false)` ⇒ disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,6 +129,98 @@ pub struct CliConfig {
     /// raise limits / unlock extras. See `agent::reach` and `/reach`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reach: Option<ReachConfig>,
+    /// Per-ROLE model routing: point harness chores (compaction summaries), sub-agents, and the
+    /// self-review oracle at different OpenAI-compatible endpoints/models than the main loop —
+    /// cheap-fast for chores, stronger for review. Every field optional; unset ⇒ the main model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles: Option<RolesConfig>,
+}
+
+/// One role's endpoint override. Any subset of fields; the rest inherit the main endpoint.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct RoleModelConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// `env:VAR` (preferred — the key never touches disk) or a literal key (masked in displays).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_ref: Option<String>,
+}
+
+/// The routable roles. `summarizer` = compaction/handoff summaries; `subagent_default` = the task
+/// tool's fallback model; `oracle` = the self-review reviewer (stronger model recommended);
+/// `apply` = reserved for a future fast-apply edit model (config-only today).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct RolesConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summarizer: Option<RoleModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_default: Option<RoleModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle: Option<RoleModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply: Option<RoleModelConfig>,
+}
+
+/// A fully-resolved (base_url, api_key, model) triple for one call.
+#[derive(Debug, Clone)]
+pub struct ResolvedEndpoint {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+/// Resolve a role's endpoint. Per-field precedence: `NG_<ROLE>_MODEL/BASE_URL/API_KEY` env >
+/// `roles.<role>.*` config > the main endpoint. `api_key_ref` supports `env:VAR` indirection.
+/// Unknown role name ⇒ the main endpoint unchanged.
+pub fn resolve_role(role: &str, main: &ResolvedEndpoint) -> ResolvedEndpoint {
+    let up = role.to_ascii_uppercase();
+    let cfg = load();
+    let rc = cfg.roles.as_ref().and_then(|r| match role {
+        "summarizer" => r.summarizer.clone(),
+        "subagent_default" => r.subagent_default.clone(),
+        "oracle" => r.oracle.clone(),
+        "apply" => r.apply.clone(),
+        _ => None,
+    });
+    let key_from_ref = |r: &RoleModelConfig| {
+        r.api_key_ref.as_ref().and_then(|k| match k.strip_prefix("env:") {
+            Some(var) => env_nonempty(var),
+            None => Some(k.clone()),
+        })
+    };
+    ResolvedEndpoint {
+        model: env_nonempty(&format!("NG_{up}_MODEL"))
+            .or_else(|| rc.as_ref().and_then(|r| r.model.clone()))
+            .unwrap_or_else(|| main.model.clone()),
+        base_url: env_nonempty(&format!("NG_{up}_BASE_URL"))
+            .or_else(|| rc.as_ref().and_then(|r| r.base_url.clone()))
+            .unwrap_or_else(|| main.base_url.clone()),
+        api_key: env_nonempty(&format!("NG_{up}_API_KEY"))
+            .or_else(|| rc.as_ref().and_then(key_from_ref))
+            .unwrap_or_else(|| main.api_key.clone()),
+    }
+}
+
+/// Is any override configured for `role` (config or env)? Consumers that should stay OFF without
+/// an explicit oracle (e.g. self-review's oracle mode) check this instead of comparing endpoints.
+pub fn role_configured(role: &str) -> bool {
+    let up = role.to_ascii_uppercase();
+    if env_nonempty(&format!("NG_{up}_MODEL")).is_some() {
+        return true;
+    }
+    let cfg = load();
+    cfg.roles
+        .as_ref()
+        .and_then(|r| match role {
+            "summarizer" => r.summarizer.as_ref(),
+            "subagent_default" => r.subagent_default.as_ref(),
+            "oracle" => r.oracle.as_ref(),
+            "apply" => r.apply.as_ref(),
+            _ => None,
+        })
+        .is_some_and(|r| r.model.is_some() || r.base_url.is_some() || r.api_key_ref.is_some())
 }
 
 /// Optional credentials for the reach layer. All channels have a keyless path; a key only upgrades:
@@ -251,6 +371,53 @@ pub fn mask(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn role_routing_resolves_with_fallback() {
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ng-roles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("NEXTGEN_HOME", &dir);
+        let main = ResolvedEndpoint {
+            base_url: "https://main/v1".into(),
+            api_key: "mk".into(),
+            model: "main-model".into(),
+        };
+        // No config → the main endpoint unchanged; role reads as unconfigured.
+        let r = resolve_role("summarizer", &main);
+        assert_eq!(
+            (r.model.as_str(), r.base_url.as_str(), r.api_key.as_str()),
+            ("main-model", "https://main/v1", "mk")
+        );
+        assert!(!role_configured("oracle"));
+        // Config: model-only summarizer (endpoint inherits) + env-indirected oracle key.
+        save(&CliConfig {
+            roles: Some(RolesConfig {
+                summarizer: Some(RoleModelConfig { model: Some("cheap".into()), ..Default::default() }),
+                oracle: Some(RoleModelConfig {
+                    api_key_ref: Some("env:NG_TEST_ORACLE_KEY".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let r = resolve_role("summarizer", &main);
+        assert_eq!(r.model, "cheap");
+        assert_eq!(r.base_url, "https://main/v1", "unset fields inherit the main endpoint");
+        assert!(role_configured("summarizer"));
+        assert!(role_configured("oracle"), "an api_key_ref alone counts as configured");
+        std::env::set_var("NG_TEST_ORACLE_KEY", "ok-secret");
+        assert_eq!(resolve_role("oracle", &main).api_key, "ok-secret", "env: indirection resolves");
+        std::env::remove_var("NG_TEST_ORACLE_KEY");
+        // Env beats config.
+        std::env::set_var("NG_SUMMARIZER_MODEL", "env-model");
+        assert_eq!(resolve_role("summarizer", &main).model, "env-model");
+        std::env::remove_var("NG_SUMMARIZER_MODEL");
+        std::env::remove_var("NEXTGEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn round_trips_through_disk() {

@@ -6,6 +6,12 @@
 //!
 //! Installed skills are THIRD-PARTY instructions the agent will then follow → `skill_install` is
 //! `is_destructive() = true` (approval-gated) and search surfaces the registry's `securityScore`.
+//!
+//! Network posture: every outbound URL (the registry base AND the GitHub raw URL built from the
+//! registry's response) passes the `net_guard` SSRF floor, and all fetches go through the shared
+//! `reach::http` guarded client — auto-redirects disabled, every redirect hop re-vetted, bodies
+//! bounded — so neither a poisoned `skill_registry` config nor a malicious registry response can
+//! steer a fetch at loopback/private/link-local targets (cloud metadata et al.).
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -100,43 +106,38 @@ pub fn registry_base() -> String {
         .unwrap_or_else(|| DEFAULT_REGISTRY.to_string())
 }
 
-fn http() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(concat!("aizen/", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .context("building registry HTTP client")
-}
-
-/// Search the registry by keyword. `limit` caps results.
+/// Search the registry by keyword. `limit` caps results. SSRF-guarded (see the module doc).
 pub async fn search(query: &str, limit: usize) -> Result<Vec<RegistrySkill>> {
     let base = registry_base();
-    let url = format!("{}/api/skills", base.trim_end_matches('/'));
-    let client = http()?;
-    let resp = client
-        .get(&url)
-        .query(&[("q", query), ("limit", &limit.to_string())])
-        .send()
+    let url = reqwest::Url::parse_with_params(
+        &format!("{}/api/skills", base.trim_end_matches('/')),
+        &[("q", query), ("limit", &limit.to_string())],
+    )
+    .with_context(|| format!("bad registry base '{base}'"))?;
+    crate::core::net_guard::guard_url_async(url.as_str()).await?;
+    let client = crate::agent::reach::http::client()?;
+    let f = crate::agent::reach::http::get(&client, url.as_str(), &[])
         .await
         .with_context(|| format!("searching {base}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        bail!("registry {base} returned HTTP {}", status.as_u16());
+    if !f.is_success() {
+        bail!("registry {base} returned HTTP {}", f.status);
     }
-    let parsed: SearchResponse = resp.json().await.context("parsing registry JSON")?;
+    let parsed: SearchResponse = serde_json::from_slice(&f.body).context("parsing registry JSON")?;
     let _ = parsed.total;
     Ok(parsed.data)
 }
 
-/// Fetch a registry skill's markdown body from its GitHub raw URL.
+/// Fetch a registry skill's markdown body from its GitHub raw URL. The URL is BUILT from the
+/// registry's response (untrusted input) → it passes the SSRF floor like any model-supplied URL.
 pub async fn fetch_body(sk: &RegistrySkill) -> Result<String> {
     let url = sk.raw_url().context("this skill has no GitHub source location")?;
-    let client = http()?;
-    let resp = client.get(&url).send().await.with_context(|| format!("GET {url}"))?;
-    if !resp.status().is_success() {
-        bail!("GitHub returned HTTP {} for {url}", resp.status().as_u16());
+    crate::core::net_guard::guard_url_async(&url).await?;
+    let client = crate::agent::reach::http::client()?;
+    let f = crate::agent::reach::http::get(&client, &url, &[]).await.with_context(|| format!("GET {url}"))?;
+    if !f.is_success() {
+        bail!("GitHub returned HTTP {} for {url}", f.status);
     }
-    resp.text().await.context("reading skill body")
+    Ok(f.text())
 }
 
 /// Search → pick the exact-slug match (else the first hit) → fetch + save locally. Returns the
@@ -159,10 +160,10 @@ pub async fn install(query: &str) -> Result<crate::skills::Skill> {
     Ok(crate::skills::Skill { name, ..parsed })
 }
 
-/// Bridge an async future to the sync `Tool::execute` path (multi-thread runtime worker only;
-/// same invariant as the other async tools → `is_concurrency_safe()=false`).
-fn block<F: std::future::Future>(f: F) -> F::Output {
-    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+/// Bridge an async future to the sync `Tool::execute` path — the shared cancel-aware bridge
+/// (valid on workers AND spawn_blocking threads; Esc aborts an in-flight marketplace call).
+fn block<T>(f: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    crate::agent::tools::block_for_tool(f)
 }
 
 // ── agent tools ────────────────────────────────────────────────────────────────
@@ -189,7 +190,7 @@ impl Tool for SkillSearch {
         })
     }
     fn is_concurrency_safe(&self) -> bool {
-        false
+        true // read-only marketplace query — the shared bridge is spawn_blocking-safe
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let query = args.get("query").and_then(|v| v.as_str()).context("missing required string arg 'query'")?;
@@ -296,11 +297,32 @@ mod tests {
         assert_eq!(sparse.data[0].name, "x");
     }
 
+    /// Offline SSRF wiring test: a loopback registry base must be refused by the net_guard floor
+    /// BEFORE any network I/O (literal private/loopback hosts reject synchronously, no DNS).
+    /// A plain #[test] + local block_on so the env lock is never held across an await point.
+    #[test]
+    fn search_refuses_a_private_registry_base() {
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ng-registry-ssrf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("NEXTGEN_HOME", &dir);
+        let mut cfg = crate::core::cli_config::load();
+        cfg.skill_registry = Some("http://127.0.0.1:9".to_string());
+        crate::core::cli_config::save(&cfg).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let res = rt.block_on(search("anything", 5));
+        std::env::remove_var("NEXTGEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = res.expect_err("a loopback registry base must be refused");
+        assert!(format!("{err:#}").contains("SSRF"), "refused by the SSRF floor: {err:#}");
+    }
+
     #[test]
     fn install_tool_is_destructive_search_is_not() {
         assert!(SkillInstall.is_destructive(), "installing third-party instructions must be approval-gated");
         assert!(!SkillSearch.is_destructive());
-        assert!(!SkillSearch.is_concurrency_safe());
-        assert!(!SkillInstall.is_concurrency_safe());
+        assert!(SkillSearch.is_concurrency_safe(), "read-only marketplace query parallelizes");
+        assert!(!SkillInstall.is_concurrency_safe(), "installs stay serial (writes to disk)");
     }
 }

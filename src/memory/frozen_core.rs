@@ -30,29 +30,86 @@ fn next_path() -> PathBuf {
     config::cli_memory_dir().join("core.next.md")
 }
 
-/// Core-eligible = the STYLE.md profile (if present) + `type=user` entries. Packing order is
-/// **salience-greedy (P8)**: STYLE.md is pinned first, then the rest by salience (reuse-earned
-/// rank, [`decay::salience_of`]) so the always-on prefix holds the facts that actually get used,
-/// newest-as-tiebreak. Build the rendered block capped at `max_tokens`; overflow spills to the
-/// retrieved tier. (Recomputed at session start into `core.next` — the live prefix stays
-/// byte-stable mid-session; a re-pack only takes effect next run.)
+/// Core-eligible = the STYLE.md profile (if present) + `type=user` entries that pass three gates:
+/// not `core_denied`, in-view for the CURRENT workspace (global or this project's zone — another
+/// repo's facts never spend this prefix budget), and **core-trusted**: curated provenance, or an
+/// inferred fact re-observed across ≥2 sessions. A single-session regex inference therefore can
+/// NEVER silently enter the always-on prompt (the learning module's stated invariant — it must
+/// earn residency by recurring; until then it stays search-only).
+///
+/// Packing order: STYLE.md pinned first, then GLOBAL facts, then the current project's facts
+/// (who-you-are outranks project trivia when the cap is tight); within each group salience-greedy
+/// (reuse-earned rank, [`decay::salience_of`]), with a ×1.3 boost for project facts tagged with a
+/// `subpath` the user is currently working under. Overflow spills to the retrieved tier.
+/// (Recomputed at session start into `core.next` — the live prefix stays byte-stable mid-session.)
 pub fn build(entries: &[MemoryEntry], style_body: Option<&str>, max_tokens: usize) -> FrozenCore {
+    build_scoped(
+        entries,
+        style_body,
+        max_tokens,
+        &crate::memory::ScopeSel::default_view(),
+        &config::project_slug(),
+        config::current_subpath().as_deref(),
+    )
+}
+
+/// Curated facts are always core-trusted; an inferred (regex-extracted) fact must recur across
+/// sessions before it may occupy the always-on prefix.
+fn core_trusted(e: &MemoryEntry) -> bool {
+    e.source != crate::memory::provenance::ProvenanceKind::Inferred || e.sessions >= 2
+}
+
+/// Does the user's current region (`current`) fall under an entry's `subpath` tag (segment-safe)?
+/// Shared with the search-path boost (`search_filtered_scoped`).
+pub(crate) fn subpath_matches(entry_subpath: &str, current: &str) -> bool {
+    current == entry_subpath
+        || current.strip_prefix(entry_subpath).is_some_and(|r| r.starts_with('/'))
+}
+
+/// [`build`] with the workspace view made explicit (pure — fully deterministic in tests).
+pub fn build_scoped(
+    entries: &[MemoryEntry],
+    style_body: Option<&str>,
+    max_tokens: usize,
+    sel: &crate::memory::ScopeSel,
+    current_slug: &str,
+    current_subpath: Option<&str>,
+) -> FrozenCore {
     let today = decay::today();
     let half_life = config::MemorySettings::default().recency_half_life_days;
 
-    // The rest (non-style user facts), salience-greedy then newest-first. `core_denied` facts are
-    // excluded: the user explicitly denied promoting them to the always-on prompt, so they stay
-    // searchable in the long tail but never enter this block (honoring that "no").
     let mut rest: Vec<MemoryEntry> = entries
         .iter()
-        .filter(|e| e.mtype == MemoryType::User && e.is_active() && !e.core_denied)
+        .filter(|e| {
+            e.mtype == MemoryType::User
+                && e.is_active()
+                && !e.core_denied
+                && sel.admits(e.scope.as_deref(), current_slug)
+                && core_trusted(e)
+        })
         .cloned()
         .collect();
+    // Global before project (group rank), salience-greedy within each, newest as tiebreak.
+    let boosted = |e: &MemoryEntry| {
+        let mut s = decay::salience_of(e, &today, half_life);
+        if e.scope.is_some() {
+            if let (Some(tag), Some(cur)) = (e.subpath.as_deref(), current_subpath) {
+                if subpath_matches(tag, cur) {
+                    s *= 1.3; // the region the user is standing in right now
+                }
+            }
+        }
+        s
+    };
     rest.sort_by(|a, b| {
-        let sa = decay::salience_of(a, &today, half_life);
-        let sb = decay::salience_of(b, &today, half_life);
-        sb.partial_cmp(&sa)
-            .unwrap_or(Ordering::Equal)
+        let ga = a.scope.is_some() as u8; // 0 = global, 1 = project
+        let gb = b.scope.is_some() as u8;
+        ga.cmp(&gb)
+            .then_with(|| {
+                boosted(b)
+                    .partial_cmp(&boosted(a))
+                    .unwrap_or(Ordering::Equal)
+            })
             .then(b.mtime_ms.cmp(&a.mtime_ms))
     });
 
@@ -211,6 +268,85 @@ mod tests {
             "salience must beat raw mtime: {:?}",
             fc.source_ids
         );
+    }
+
+    #[test]
+    fn core_is_workspace_scoped() {
+        use crate::memory::ScopeSel;
+        let mut here = user_entry("here", "fact about this project", 10);
+        here.scope = Some("proja-00000001".into());
+        let mut foreign = user_entry("foreign", "fact about another project", 20);
+        foreign.scope = Some("projb-00000002".into());
+        let global = user_entry("global", "the user prefers pnpm", 5);
+        let fc = build_scoped(
+            &[here, foreign, global],
+            None,
+            1500,
+            &ScopeSel::Current,
+            "proja-00000001",
+            None,
+        );
+        assert!(fc.source_ids.contains(&"here".to_string()), "current zone packs");
+        assert!(fc.source_ids.contains(&"global".to_string()), "global always packs");
+        assert!(
+            !fc.source_ids.contains(&"foreign".to_string()) && !fc.spilled_ids.contains(&"foreign".to_string()),
+            "another zone's fact never spends this prefix budget"
+        );
+    }
+
+    #[test]
+    fn single_session_inferred_is_barred_from_core_until_it_recurs() {
+        use crate::memory::provenance::ProvenanceKind;
+        use crate::memory::ScopeSel;
+        let mut one_shot = user_entry("one-shot", "a regex guess seen once", 10);
+        one_shot.source = ProvenanceKind::Inferred;
+        one_shot.sessions = 1;
+        let mut recurring = user_entry("recurring", "re-observed across sessions", 5);
+        recurring.source = ProvenanceKind::Inferred;
+        recurring.sessions = 2;
+        let curated = user_entry("curated", "hand-authored", 1); // Manual default
+        let fc = build_scoped(&[one_shot, recurring, curated], None, 1500, &ScopeSel::Current, "x", None);
+        assert!(!fc.source_ids.contains(&"one-shot".to_string()), "single-session inference stays search-only");
+        assert!(fc.source_ids.contains(&"recurring".to_string()), "recurrence earns core residency");
+        assert!(fc.source_ids.contains(&"curated".to_string()));
+    }
+
+    #[test]
+    fn global_packs_before_project_under_a_tight_cap() {
+        use crate::memory::ScopeSel;
+        let body = "word ".repeat(30);
+        let mut proj = user_entry("proj", &body, 999); // newer, but project-scoped
+        proj.scope = Some("z".into());
+        let glob = user_entry("glob", &body, 1);
+        let fc = build_scoped(&[proj, glob], None, 60, &ScopeSel::Current, "z", None);
+        assert_eq!(
+            fc.source_ids.first().map(String::as_str),
+            Some("glob"),
+            "who-you-are outranks project trivia when the cap is tight: {:?}",
+            fc.source_ids
+        );
+    }
+
+    #[test]
+    fn subpath_boost_prefers_the_region_you_are_in() {
+        use crate::memory::ScopeSel;
+        let body = "word ".repeat(30);
+        let mut tagged = user_entry("tagged", &body, 1); // older…
+        tagged.scope = Some("z".into());
+        tagged.subpath = Some("src/agent".into());
+        let mut untagged = user_entry("untagged", &body, 999); // …newer, would win without the boost
+        untagged.scope = Some("z".into());
+        let fc = build_scoped(&[untagged, tagged], None, 60, &ScopeSel::Current, "z", Some("src/agent/lsp"));
+        assert_eq!(
+            fc.source_ids.first().map(String::as_str),
+            Some("tagged"),
+            "working under src/agent boosts its facts: {:?}",
+            fc.source_ids
+        );
+        // segment-safe prefix rule
+        assert!(subpath_matches("src/agent", "src/agent"));
+        assert!(subpath_matches("src/agent", "src/agent/lsp"));
+        assert!(!subpath_matches("src/a", "src/agent"));
     }
 
     #[test]

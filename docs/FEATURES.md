@@ -71,7 +71,7 @@ A key cross-cutting fact for design: **output adapts to context** — rich ANSI/
 
 ### B. The agent's tools (its capabilities)
 
-Every tool is one clear capability. Tools are either **read-only** (run freely, often in parallel) or **destructive** (approval-gated). A live one-line trace (`⚙ tool_name <arg>`) is shown for each call unless quiet.
+Every tool is one clear capability. Tools are either **read-only** (run freely, often in parallel) or **destructive** (approval-gated). Each call renders as a `⏺ tool_name(arg)` event line with an informative `⎿ result` digest under it (lines read, matches found, `+adds −dels`, exit code) — edits also show a compact colour diff. The full output goes to the model; only the digest reaches the terminal.
 
 **Memory (read-only):**
 - `memory_search` — recall a specific fact (query + limit).
@@ -246,12 +246,12 @@ Branded **splash** (sun logo via sixel where supported, else braille; block-art 
 One line, e.g. `opus-4-8 · ~1.2K/200K tok · 5 turns · 42% ctx · ⚡ yolo` — model (gold) · tokens/context-window · turn count · % context used · mode badge (`⚡ yolo` auto-approve, `◆ smart` read-only-auto, or none).
 
 ### 4.4 Streaming output
-Live markdown rendering: syntax-highlighted code fences, gold headings/bullets, italic blockquotes with a faint bar, horizontal rules. A continuous **gold left gutter `▌`** marks assistant lines (vs `❯` user echoes and dim `⚙` tool traces). Pipes/CI get raw text.
+Live markdown rendering: syntax-highlighted code fences, gold headings/bullets, italic blockquotes with a faint bar, horizontal rules. A continuous **gold left gutter `▌`** marks assistant lines (vs `❯` user echoes and `⏺`/`⎿` tool call+result traces). Pipes/CI get raw text.
 
 ### 4.5 Input, images, keybindings
 - **Image attach:** `Ctrl-O` grabs a clipboard screenshot as a vision attachment; `Ctrl-X` drops the latest; a gold `[2img]` badge shows the count. Multi-line pastes collapse to a chip (`↵ 3 lines pasted · first line…`).
 - **Keys:** Enter submit · Esc cancel running turn / clear draft · Ctrl-C cancel · Ctrl-D quit-if-empty · Tab complete slash command · ↑/↓ palette nav or history · Home/End/←/→ edit.
-- **Working indicator:** gold braille spinner pill `⠋ working · 23s · Esc to stop` with a live elapsed counter.
+- **Working indicator:** a moonlight star-spinner pill with a cycling verb, live elapsed clock and output-token counter — `✻ Đang nghiền ngẫm… · 23s · ↑1.2K tok · Esc`.
 - **Approval modal:** inline `[y]es · [a]llow all this session · [n]o`.
 
 ---

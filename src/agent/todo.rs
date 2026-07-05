@@ -161,12 +161,17 @@ impl Tool for TodoWrite {
     }
 }
 
+/// Serializes tests that touch the process-global TODOS list (also used by `agent::tests` for the
+/// recitation-reminder loop test).
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // The list is a process-global, so the stateful tests must not run concurrently.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    use super::TEST_LOCK;
 
     #[test]
     fn set_and_summary_roundtrip() {

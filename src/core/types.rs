@@ -28,6 +28,12 @@ pub struct ChatRequest {
     /// it simply never send the chunk → the cost meter falls back to the chars/4 estimate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+    /// Reasoning-effort dial for reasoning models exposed via chat-completions (o-series/GPT-5
+    /// style: "low"/"medium"/"high"; free-form — the provider validates). Omitted from the wire
+    /// when `None`, so the request is byte-identical for current users; providers that don't know
+    /// the field ignore it (graceful degrade). Set from `CliConfig.reasoning_effort`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +68,11 @@ pub struct Usage {
     pub total_tokens: Option<u64>,
     #[serde(default)]
     pub cache_read_input_tokens: Option<u64>,
+    /// Anthropic-compatible gateways: cache WRITE tokens this call (the breakpoint-creation cost).
+    /// Deserialize-only for now — lets `/cost` grow a write-side line without a wire change.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
@@ -446,6 +457,7 @@ mod tests {
             tool_choice: None,
             parallel_tool_calls: None,
             stream_options: None,
+            reasoning_effort: None,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert!(v.get("tools").is_none(), "empty tools must be omitted");
@@ -472,6 +484,7 @@ mod tests {
             tool_choice: Some("auto".into()),
             parallel_tool_calls: Some(true),
             stream_options: None,
+            reasoning_effort: None,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["tools"][0]["type"], "function");

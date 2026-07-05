@@ -119,6 +119,10 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
             continue;
         }
 
+        // Workspace scope router: WHO the fact is about decides WHERE it applies. User/feedback
+        // facts travel with the user (global); project/reference facts belong to the workspace
+        // they were learned in (`p:<slug>` zone) so another repo's session never pays for them.
+        let (scope, subpath) = scope_for(&c.mtype);
         match route::route(&c, &s) {
             Route::Drop => report.dropped += 1,
             Route::Review => {
@@ -132,6 +136,8 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
                         confidence: c.confidence,
                         session_id: &opts.session_id,
                         no_core: false,
+                        scope,
+                        subpath,
                     };
                     let id = store::add_learned_in(&config::review_dir(), &w)?;
                     report.queued_review.push(id);
@@ -140,7 +146,7 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
                 }
             }
             Route::Store => {
-                apply_store(&clean, &c.mtype, provenance, c.confidence, false, opts, &mut existing, &s, &mut report)?;
+                apply_store(&clean, &c.mtype, provenance, c.confidence, false, scope, subpath, opts, &mut existing, &s, &mut report)?;
             }
             Route::CorePromote => {
                 let confirmed = confirm_core(&clean, opts);
@@ -154,7 +160,8 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
                     // Denied promotion → downgrade to a normal user-fact store, but mark it `no_core`
                     // so it stays searchable in the long tail yet NEVER re-enters the always-on frozen
                     // core (which packs all other type=user facts). This honors the explicit "no".
-                    apply_store(&clean, &MemoryType::User, provenance, c.confidence, true, opts, &mut existing, &s, &mut report)?;
+                    // Style facts are about the USER → always global.
+                    apply_store(&clean, &MemoryType::User, provenance, c.confidence, true, None, None, opts, &mut existing, &s, &mut report)?;
                 }
             }
         }
@@ -179,6 +186,18 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
     Ok(report)
 }
 
+/// Workspace-scope routing by fact type: user/feedback facts are global (the user is one person
+/// everywhere); project/reference facts stay in the zone they were learned in. `subpath` tags the
+/// region the user was working under, as a soft ranking boost.
+fn scope_for(mtype: &MemoryType) -> (Option<String>, Option<String>) {
+    match mtype {
+        MemoryType::User | MemoryType::Feedback => (None, None),
+        MemoryType::Project | MemoryType::Reference => {
+            (Some(config::project_slug()), config::current_subpath())
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_store(
     clean: &str,
@@ -186,6 +205,8 @@ fn apply_store(
     provenance: ProvenanceKind,
     confidence: f64,
     no_core: bool,
+    scope: Option<String>,
+    subpath: Option<String>,
     opts: &LearnOptions,
     existing: &mut Vec<MemoryEntry>,
     s: &MemorySettings,
@@ -229,6 +250,8 @@ fn apply_store(
                 confidence,
                 session_id: &opts.session_id,
                 no_core,
+                scope: scope.clone(),
+                subpath: subpath.clone(),
             };
             let id = store::add_learned(&w)?;
             // reflect the insert in-memory so the next candidate this run dedups against it
@@ -241,6 +264,8 @@ fn apply_store(
                 tokens: toks,
                 source: provenance,
                 confidence,
+                scope,
+                subpath,
                 ..Default::default()
             });
             report.added.push(id);
@@ -325,6 +350,24 @@ mod tests {
 
     fn opts() -> LearnOptions {
         LearnOptions { session_id: "test-sess".into(), auto_confirm_core: Some(false), dry_run: false }
+    }
+
+    #[test]
+    fn scope_router_sends_project_facts_to_the_zone_and_user_facts_global() {
+        let _g = config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ng-scope-route-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("NG_PROJECT_ROOT", &dir);
+
+        assert_eq!(scope_for(&MemoryType::User), (None, None), "user facts travel with the user");
+        assert_eq!(scope_for(&MemoryType::Feedback), (None, None));
+        let (proj, _sub) = scope_for(&MemoryType::Project);
+        assert_eq!(proj, Some(config::project_slug()), "project facts stay in the workspace zone");
+        let (rf, _) = scope_for(&MemoryType::Reference);
+        assert_eq!(rf, Some(config::project_slug()));
+
+        std::env::remove_var("NG_PROJECT_ROOT");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

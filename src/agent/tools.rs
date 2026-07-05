@@ -11,12 +11,12 @@ use serde_json::Value;
 
 /// A capability the model may invoke.
 ///
-/// `Send + Sync` is REQUIRED: the agent loop runs a batch of concurrency-safe tool calls in
-/// parallel via `std::thread::scope` (see `agent::execute_parallel`), which shares `&dyn Tool`
-/// across threads — that needs `Sync`, and moving the borrow into a scoped thread needs `Send`.
-/// All built-in tools hold only `PathBuf`/unit, so they satisfy this trivially. A future tool
-/// holding a non-`Sync` field (`Rc`, `RefCell`, …) will fail to compile here — which is the
-/// correct guardrail, not a false alarm: such a tool could not be run concurrently anyway.
+/// `Send + Sync` is REQUIRED: the agent loop runs each call of a concurrency-safe batch on a
+/// `tokio::task::spawn_blocking` thread (see `agent::execute_calls`), which needs the shared
+/// `Arc<dyn Tool>` to cross threads. All built-in tools hold only `PathBuf`/unit, so they satisfy
+/// this trivially. A future tool holding a non-`Sync` field (`Rc`, `RefCell`, …) will fail to
+/// compile here — which is the correct guardrail, not a false alarm: such a tool could not be run
+/// concurrently anyway.
 pub trait Tool: Send + Sync {
     /// `category_action`, unique in the registry (e.g. `memory_search`, `file_read`).
     fn name(&self) -> &str;
@@ -28,20 +28,49 @@ pub trait Tool: Send + Sync {
     fn is_destructive(&self) -> bool {
         false
     }
-    /// Read-only & side-effect-free → eligible for concurrent execution in a parallel batch
-    /// (`agent::execute_parallel`). Destructive tools also set this `false`.
+    /// Read-only & side-effect-free → eligible for concurrent execution in a parallel batch.
+    /// Destructive tools also set this `false`.
     fn is_concurrency_safe(&self) -> bool {
         true
+    }
+    /// Args-aware refinement of [`Tool::is_concurrency_safe`]: a tool whose safety depends on WHAT
+    /// it was asked to do overrides this (e.g. a `task` dispatch is safe iff the resolved sub-agent
+    /// registry is read-only). Default: the static flag.
+    fn is_concurrency_safe_for(&self, _args: &Value) -> bool {
+        self.is_concurrency_safe()
     }
     /// Run the tool. `args` is the parsed (object) arguments. Return the result text; return
     /// an `Err` for a real failure — the loop feeds the error back to the model to recover.
     fn execute(&self, args: &Value) -> Result<String>;
 }
 
+/// Drive an async future from the sync `Tool::execute` path, RACED against user cancellation
+/// (Esc while working) so a long network call aborts promptly instead of blocking the turn.
+///
+/// Validity invariant (the async execution core rests on this): the body is safe BOTH on a tokio
+/// multi-thread WORKER (where `block_in_place` parks the worker's queue — the classic bridge) AND
+/// on a `spawn_blocking` thread — verified against the vendored tokio source: `block_in_place`
+/// with a runtime context but off a worker is a no-op pass-through, and `Handle::block_on` off a
+/// worker is the documented sync bridge. Pinned by `bridge_works_inside_spawn_blocking` below so
+/// a future tokio upgrade that changes this fails loudly.
+pub(crate) fn block_for_tool<T>(f: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            tokio::select! {
+                r = f => r,
+                _ = crate::ui::tui::cancelled() => Err(anyhow::anyhow!("cancelled by user")),
+            }
+        })
+    })
+}
+
 /// The set of tools advertised to the model. Insertion order is the advertised order.
+/// Stored as `Arc<dyn Tool>` so a call can be moved onto a `spawn_blocking` thread (`'static`
+/// requirement) without cloning the tool itself; `register` keeps the `Box` signature so the ~40
+/// existing call sites compile unchanged.
 #[derive(Default)]
 pub struct ToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<std::sync::Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
@@ -50,12 +79,18 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
-        self.tools.push(tool);
+        self.tools.push(std::sync::Arc::from(tool));
     }
 
     /// Look up a tool by exact name.
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.iter().find(|t| t.name() == name).map(|b| b.as_ref())
+        self.tools.iter().find(|t| t.name() == name).map(|a| a.as_ref())
+    }
+
+    /// Look up a tool by exact name as an owned handle — for moving into a `spawn_blocking`
+    /// closure (which needs `'static`).
+    pub fn get_arc(&self, name: &str) -> Option<std::sync::Arc<dyn Tool>> {
+        self.tools.iter().find(|t| t.name() == name).cloned()
     }
 
     /// The `tools` array for the chat request.
@@ -70,5 +105,27 @@ impl ToolRegistry {
     /// skills index can hide skills whose `requires:` tool isn't present in this build/session.
     pub fn names(&self) -> Vec<String> {
         self.tools.iter().map(|t| t.name().to_string()).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PINS the tokio behavior `block_for_tool` depends on: `block_in_place` + `Handle::block_on`
+    /// must work unchanged INSIDE a `spawn_blocking` thread (context propagates; block_in_place is
+    /// a pass-through off a worker). If a tokio upgrade breaks this, the async execution core's
+    /// parallel path breaks with it — this test makes that loud and local.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bridge_works_inside_spawn_blocking() {
+        // On a spawn_blocking thread…
+        let via_blocking =
+            tokio::task::spawn_blocking(|| block_for_tool(async { Ok::<_, anyhow::Error>(41 + 1) }))
+                .await
+                .expect("spawn_blocking join");
+        assert_eq!(via_blocking.unwrap(), 42);
+        // …and on a worker thread (the classic serial path).
+        let on_worker = block_for_tool(async { Ok::<_, anyhow::Error>("ok") });
+        assert_eq!(on_worker.unwrap(), "ok");
     }
 }

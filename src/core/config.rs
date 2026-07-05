@@ -73,6 +73,113 @@ pub fn project_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// Workspace-scoping kill-switch: `NG_NO_SCOPE=1` collapses memory back to one global pool
+/// (every scope filter passes everything). Escape hatch, not a config field — scoping is the
+/// intended default and this exists only to debug/compare.
+pub fn scope_disabled() -> bool {
+    matches!(
+        std::env::var("NG_NO_SCOPE").ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// FNV-1a 64-bit — tiny local hash for the project-slug stable key (core must not depend on
+/// `memory::embed`; 8 lines beats a crate).
+fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// File/frontmatter-safe slug fragment: lowercase alnum, runs of the rest collapse to one `-`.
+fn slug_fragment(name: &str) -> String {
+    let mut s = String::new();
+    let mut prev_dash = false;
+    for c in name.trim().to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c);
+            prev_dash = false;
+        } else if !prev_dash && !s.is_empty() {
+            s.push('-');
+            prev_dash = true;
+        }
+    }
+    let s = s.trim_matches('-').to_string();
+    if s.is_empty() {
+        "project".to_string()
+    } else {
+        s.chars().take(24).collect()
+    }
+}
+
+/// The stable identity of the current workspace: `dirname-hex8`. The hash key prefers the git
+/// `remote.origin.url` (a re-clone / worktree / moved checkout keeps the SAME memory zone), falling
+/// back to the canonical root path (non-repo dirs still get a stable zone). Cached per
+/// (`NG_PROJECT_ROOT` env, cwd) so production pays the git shell-outs once and tests that repoint
+/// `NG_PROJECT_ROOT` are never served a stale slug.
+pub fn project_slug() -> String {
+    static CACHE: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+    let cache_key = format!(
+        "{}|{}",
+        std::env::var("NG_PROJECT_ROOT").unwrap_or_default(),
+        std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()
+    );
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((k, slug)) = guard.as_ref() {
+            if *k == cache_key {
+                return slug.clone();
+            }
+        }
+    }
+    let root = project_root();
+    let stable_key = git_remote_origin(&root).unwrap_or_else(|| {
+        std::fs::canonicalize(&root)
+            .unwrap_or_else(|_| root.clone())
+            .display()
+            .to_string()
+    });
+    let name = root.file_name().and_then(|s| s.to_str()).unwrap_or("project");
+    let slug = format!("{}-{:08x}", slug_fragment(name), fnv1a64(&stable_key) as u32);
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((cache_key, slug.clone()));
+    }
+    slug
+}
+
+/// `git config --get remote.origin.url` in `root` — `None` when not a repo / no remote / no git.
+fn git_remote_origin(root: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Where inside the project the user is working right now: cwd relative to the project root,
+/// `/`-normalized. `None` at the root (or outside it) — only a real subdir is a "region".
+pub fn current_subpath() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let rel = cwd.strip_prefix(project_root()).ok()?;
+    let s = rel.to_string_lossy().replace('\\', "/");
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// The project-local customization dir a cloned repo ships (skills / mcp.json / personas /
 /// commands), merged OVER the home dir by each resolver. Prefers `<root>/.aizen`; falls back to a
 /// legacy `<root>/.nextgen` when only that exists (so repos predating the rebrand still work).
@@ -167,7 +274,7 @@ pub struct MemorySettings {
     /// Lazy `search_memory` injection.
     #[allow(dead_code)]
     pub search_top_k: usize,
-    #[allow(dead_code)]
+    /// Hard output budget of one `memory_search` tool call (chars/4 estimate).
     pub search_max_tokens: usize,
     /// Lexical blend weights.
     #[allow(dead_code)]
@@ -231,5 +338,40 @@ impl Default for MemorySettings {
             enable_fuzzy: false,
             enable_dense: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slug_fragment_normalizes_and_bounds() {
+        assert_eq!(slug_fragment("My Project!"), "my-project");
+        assert_eq!(slug_fragment("***"), "project");
+        assert!(slug_fragment(&"a".repeat(100)).chars().count() <= 24);
+    }
+
+    #[test]
+    fn project_slug_is_stable_and_follows_ng_project_root() {
+        // NG_PROJECT_ROOT is process-global env → serialize with every other home-mutating test.
+        let _g = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ng-slug-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("NG_PROJECT_ROOT", &dir);
+        let a = project_slug();
+        let b = project_slug();
+        assert_eq!(a, b, "same workspace → same slug (cached)");
+        let hex = a.rsplit('-').next().unwrap();
+        assert_eq!(hex.len(), 8, "hex8 suffix: {a}");
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        // repointing the root env gives a DIFFERENT zone (the cache can't serve stale)
+        let dir2 = std::env::temp_dir().join(format!("ng-slug2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir2);
+        std::env::set_var("NG_PROJECT_ROOT", &dir2);
+        assert_ne!(project_slug(), a, "different root → different slug");
+        std::env::remove_var("NG_PROJECT_ROOT");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }
