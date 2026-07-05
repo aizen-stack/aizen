@@ -73,6 +73,7 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     r.register(Box::new(crate::features::timemachine::Checkpoint));
     r.register(Box::new(FileEdit::new(root.to_path_buf())));
     r.register(Box::new(MultiEdit::new(root.to_path_buf())));
+    r.register(Box::new(FileWrite::new(root.to_path_buf())));
     r.register(Box::new(ShellRun::new(root.to_path_buf())));
     r.register(Box::new(SkillSave));
     // Top-level only (NOT in role sub-agents) — the in-session list + process pool are shared, so a
@@ -229,6 +230,7 @@ pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
         "coder" => {
             r.register(Box::new(FileEdit::new(root.to_path_buf())));
             r.register(Box::new(MultiEdit::new(root.to_path_buf())));
+            r.register(Box::new(FileWrite::new(root.to_path_buf())));
             r.register(Box::new(ShellRun::new(root.to_path_buf())));
             r.register(Box::new(SkillSave));
         }
@@ -259,6 +261,7 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
         // Locked default: coder scope.
         r.register(Box::new(FileEdit::new(root.to_path_buf())));
         r.register(Box::new(MultiEdit::new(root.to_path_buf())));
+        r.register(Box::new(FileWrite::new(root.to_path_buf())));
         r.register(Box::new(ShellRun::new(root.to_path_buf())));
         r.register(Box::new(SkillSave));
         return r;
@@ -274,6 +277,7 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
         match canon {
             "file_edit" => r.register(Box::new(FileEdit::new(root.to_path_buf()))),
             "multi_edit" => r.register(Box::new(MultiEdit::new(root.to_path_buf()))),
+            "file_write" => r.register(Box::new(FileWrite::new(root.to_path_buf()))),
             "shell_run" => r.register(Box::new(ShellRun::new(root.to_path_buf()))),
             "skill_save" => r.register(Box::new(SkillSave)),
             _ => unreachable!("canonical_subagent_tool only yields grantable destructive tools"),
@@ -291,10 +295,14 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
 fn canonical_subagent_tool(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
         // editing
-        "edit" | "write" | "file_edit" | "fileedit" | "str_replace" | "str_replace_editor" => {
+        "edit" | "file_edit" | "fileedit" | "str_replace" | "str_replace_editor" => {
             Some("file_edit")
         }
         "multiedit" | "multi_edit" => Some("multi_edit"),
+        // whole-file create/overwrite (Claude-Code's "Write" maps here now that file_write exists)
+        "write" | "file_write" | "filewrite" | "write_file" | "writefile" | "create" | "create_file" => {
+            Some("file_write")
+        }
         // shell
         "bash" | "shell" | "shell_run" | "shellrun" | "run" | "run_command" | "terminal" => {
             Some("shell_run")
@@ -742,7 +750,8 @@ impl Tool for FileEdit {
         "Edit a file by exact string replacement (or create one when old_string is empty and the \
          file does not exist). old_string must be unique unless replace_all. If the exact text \
          isn't found, a whitespace/indentation-tolerant retry is attempted for a single matching \
-         block. Returns a before→after preview. Read the file first. Confined to the working directory."
+         block. To create OR fully rewrite a whole file, use file_write instead. Returns a \
+         before→after preview. Read the file first. Confined to the working directory."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -773,7 +782,7 @@ impl Tool for FileEdit {
             // create-new path
             let target = confine(&self.root, path, false)?;
             if target.exists() {
-                bail!("{path} exists; provide old_string to edit it");
+                bail!("{path} exists; provide old_string to edit it, or use file_write to overwrite the whole file");
             }
             std::fs::write(&target, new).with_context(|| format!("creating {}", target.display()))?;
             return Ok(format!("created {path}"));
@@ -789,6 +798,76 @@ impl Tool for FileEdit {
             format!("edited {path} ({})\n{}", applied.summary(), diff_preview(&applied.before, &applied.after));
         // Post-edit LSP fold: NEW diagnostics land in THIS result (zero extra round-trips to
         // discover breakage). Fail-soft + hard-capped inside; a no-op when LSP is off.
+        if let Some(fb) = crate::agent::lsp::LSP.edit_feedback(&target) {
+            out.push('\n');
+            out.push_str(&fb);
+        }
+        Ok(out)
+    }
+}
+
+// ── file_write ─────────────────────────────────────────────────────────────
+
+/// Create a new file OR completely overwrite an existing one in a single call. This is the tool a
+/// model reaches for when it wants to "write the file from scratch". WITHOUT it, models fall back to
+/// shelling out (`type NUL > f` to blank the file, then a heredoc to refill it) — which destroys the
+/// file and then fails, the exact thrash this tool removes. `file_edit` stays the right tool for a
+/// localized change; `file_write` is for whole-file create/replace.
+struct FileWrite {
+    root: PathBuf,
+}
+impl FileWrite {
+    fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+impl Tool for FileWrite {
+    fn name(&self) -> &str {
+        "file_write"
+    }
+    fn description(&self) -> &str {
+        "Create a file, or COMPLETELY overwrite an existing one, with the given content — the whole \
+         file in one call. Use this to write a new file, or to rewrite a file from scratch. NEVER \
+         blank or build files with shell (`type NUL > f`, `> f`, `echo >`, heredocs) — use this \
+         tool. For a small change to an existing file, prefer file_edit. The parent directory must \
+         already exist. Confined to the working directory."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string", "description": "the full file content to write"}
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false
+        })
+    }
+    fn is_destructive(&self) -> bool {
+        true
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
+    fn execute(&self, args: &Value) -> Result<String> {
+        let path = str_arg(args, "path")?;
+        let content = str_arg(args, "content")?;
+        // must_exist = false → create-or-overwrite; `confine` still keeps the target inside root and
+        // requires the PARENT dir to exist (a clear error the model can act on if it doesn't).
+        let target = confine(&self.root, path, false)?;
+        let existed = target.exists();
+        let before = if existed { std::fs::read_to_string(&target).unwrap_or_default() } else { String::new() };
+        std::fs::write(&target, content).with_context(|| format!("writing {}", target.display()))?;
+        let n = content.lines().count();
+        let verb = if existed { "overwrote" } else { "created" };
+        let mut out = format!("{verb} {path} ({n} line(s))");
+        // On an overwrite, show what changed so the human (and the model) sees the diff. Skipped for
+        // a brand-new file or a no-op rewrite.
+        if existed && before != content {
+            out.push('\n');
+            out.push_str(&diff_preview(&before, content));
+        }
+        // Same post-write LSP fold as file_edit — surface new diagnostics in this result.
         if let Some(fb) = crate::agent::lsp::LSP.edit_feedback(&target) {
             out.push('\n');
             out.push_str(&fb);
@@ -1909,6 +1988,31 @@ mod tests {
         assert!(FileEdit::new(PathBuf::from(".")).is_destructive());
         assert!(ShellRun::new(PathBuf::from(".")).is_destructive());
         assert!(!FileRead::new(PathBuf::from(".")).is_destructive());
+    }
+
+    #[test]
+    fn file_write_creates_and_overwrites() {
+        let root = temp_root("write");
+        let t = FileWrite::new(root.clone());
+        // create
+        let r = t.execute(&serde_json::json!({"path":"a.txt","content":"one\ntwo\n"})).unwrap();
+        assert!(r.starts_with("created a.txt"), "{r:?}");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "one\ntwo\n");
+        // overwrite an EXISTING non-empty file wholesale — the case that used to force `type NUL >`.
+        let r2 = t.execute(&serde_json::json!({"path":"a.txt","content":"brand new\n"})).unwrap();
+        assert!(r2.starts_with("overwrote a.txt"), "{r2:?}");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "brand new\n");
+        assert!(t.is_destructive() && !t.is_concurrency_safe());
+    }
+
+    #[test]
+    fn file_write_confined_and_needs_parent() {
+        let root = temp_root("write-guard");
+        let t = FileWrite::new(root.clone());
+        // escape attempt is refused by `confine`
+        assert!(t.execute(&serde_json::json!({"path":"../evil.txt","content":"x"})).is_err());
+        // writing into a non-existent subdir surfaces a clear error (parent must exist)
+        assert!(t.execute(&serde_json::json!({"path":"nope/deep.txt","content":"x"})).is_err());
     }
 
     #[test]

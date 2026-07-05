@@ -85,6 +85,25 @@ impl Tool for WebFetch {
 
 // ── web_search ─────────────────────────────────────────────────────────────────
 
+/// Pull the search text out of a `web_search` call, tolerating the aliases models commonly emit
+/// instead of `query` (`q`, `question`, `text`, `search`, or a `queries` list). This turns a
+/// slightly-malformed call into a working search rather than a hard "missing required string arg".
+fn extract_query(args: &Value) -> Option<String> {
+    for k in ["query", "q", "question", "text", "search", "queries"] {
+        match args.get(k) {
+            Some(Value::String(s)) if !s.trim().is_empty() => return Some(s.clone()),
+            Some(Value::Array(a)) => {
+                let joined = a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ");
+                if !joined.trim().is_empty() {
+                    return Some(joined);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub struct WebSearch;
 impl Tool for WebSearch {
     fn name(&self) -> &str {
@@ -116,12 +135,8 @@ impl Tool for WebSearch {
         true // read-only network fetch — the concurrent batch is the whole point (see module note)
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let query = args
-            .get("query")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-            .context("missing required string arg 'query'")?
-            .to_string();
+        let query = extract_query(args)
+            .context("missing required string arg 'query' (the text to search for)")?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5).clamp(1, 10) as usize;
         let site = args.get("site").and_then(|v| v.as_str()).map(str::to_string);
         block(crate::agent::reach::route::search(&query, limit, site.as_deref()))
