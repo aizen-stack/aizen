@@ -1,0 +1,58 @@
+name: release
+
+# Build optimized native binaries on each OS runner and attach them to the GitHub Release for the
+# tag. Cross-compiling to Linux/macOS from the (Windows) dev machine is impractical — the C dep
+# `ring` needs a native toolchain — so we let GitHub's own runners build natively per platform.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build binaries for (e.g. v0.1.0)'
+        required: true
+        default: v0.1.0
+
+permissions:
+  contents: write   # needed for `gh release upload`
+
+jobs:
+  build:
+    name: ${{ matrix.plat }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false   # one platform failing must not cancel the others
+      matrix:
+        include:
+          - { os: ubuntu-latest,  plat: linux-x86_64,   ext: '' }
+          - { os: macos-13,       plat: macos-x86_64,   ext: '' }   # Intel runner
+          - { os: macos-latest,   plat: macos-aarch64,  ext: '' }   # Apple Silicon runner
+          - { os: windows-latest, plat: windows-x86_64, ext: '.exe' }
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Show toolchain
+        run: rustc -V && cargo -V
+
+      - name: Build (release, default features)
+        run: cargo build --release --bin aizen
+
+      - name: Package binary
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          asset="aizen-${tag}-${{ matrix.plat }}${{ matrix.ext }}"
+          cp "target/release/aizen${{ matrix.ext }}" "$asset"
+          ls -lh "$asset"
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release upload "${{ github.event.inputs.tag || github.ref_name }}" \
+            "$ASSET" --clobber --repo "${{ github.repository }}"
