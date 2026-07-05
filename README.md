@@ -7,13 +7,42 @@ endpoint (OpenAI, OpenRouter, a local server, or an Anthropic-backed gateway).
 
 The command is **`aizen`**.
 
-## Build & install
+## Install
+
+**One line** — grabs the latest optimized binary for your OS and puts `aizen` on your PATH:
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/dawnofcd/Aizen_agent/main/install.ps1 | iex
+```
 
 ```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/dawnofcd/Aizen_agent/main/install.sh | sh
+```
+
+Then open a new terminal and run `aizen config`. (Override the install dir with `$env:AIZEN_INSTALL`
+on Windows or `$AIZEN_INSTALL` on Unix. The Windows `.exe` is unsigned — if SmartScreen warns, choose
+*More info → Run anyway*.)
+
+**Or download a binary by hand** from the [latest release](https://github.com/dawnofcd/Aizen_agent/releases/latest):
+
+| Platform | Asset |
+|---|---|
+| Windows x86-64 | `aizen-<ver>-windows-x86_64.exe` |
+| Linux x86-64 | `aizen-<ver>-linux-x86_64` |
+| macOS Apple Silicon | `aizen-<ver>-macos-aarch64` |
+| macOS Intel | `aizen-<ver>-macos-x86_64` |
+
+On Linux/macOS: `chmod +x aizen-* && ./aizen-…`.
+
+**Or build from source** (any platform with a Rust toolchain):
+
+```bash
+cargo install --git https://github.com/dawnofcd/Aizen_agent   # → aizen on your PATH
+# or, from a clone:
 cargo build --release      # → target/release/aizen (one static binary)
 cargo test                 # unit + harness tests (no network)
-
-cargo install --path .     # install `aizen` onto your PATH (~/.cargo/bin)
 ```
 
 The default build is a standalone binary with no native deps (pure-Rust, rustls-only TLS). Two
