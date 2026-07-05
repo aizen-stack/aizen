@@ -197,7 +197,7 @@ pub(crate) fn build_agent_subagent_prompt(
 /// (`<selfless>`, `Vec<String>`) — only a real structural tag opener is broken.
 static BREAKOUT_TAG_RE: Lazy<regex::Regex> = Lazy::new(|| {
     regex::Regex::new(
-        r"(?i)<\s*/?\s*(?:specialist|subagent|agent_identity|persona|self|role|environment|skills|user_memory|agents)\b",
+        r"(?i)<\s*/?\s*(?:specialist|subagent|agent_identity|persona|self|role|environment|project_context|skills|user_memory|agents)\b",
     )
     .expect("valid breakout-tag regex")
 });
@@ -428,11 +428,12 @@ impl Tool for TaskTool {
 
         // Bridge sync→async on the CURRENT runtime (same one the reqwest client was built on).
         // MUST run on a Tokio MULTI-THREAD worker thread — `block_in_place` panics on a
-        // current-thread runtime / with no runtime. The serial-path invariant guarantees this:
-        // `is_concurrency_safe()==false` keeps `task` off `execute_parallel`'s scoped threads
-        // (which have no runtime), so `execute` is only ever reached from `run_agent`'s async
-        // serial path under `#[tokio::main]` (multi-thread). Never call `execute` from a plain
-        // `#[test]` past the early-return guards.
+        // current-thread runtime / with no runtime. Both reach paths satisfy this: the async
+        // executor runs each tool body inside `spawn_blocking` (a multi-thread worker), and a
+        // read-only `task` dispatch is now partitioned onto that path via `is_concurrency_safe_for`
+        // (see the note at the top of this impl) — `block_in_place`+`block_on` is a verified
+        // pass-through there. Never call `execute` from a plain `#[test]` past the early-return
+        // guards (no runtime).
         let outcome = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(crate::agent::run_agent(chat, &cfg, &registry, &system, prompt))

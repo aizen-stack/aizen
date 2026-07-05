@@ -45,8 +45,10 @@ fn is_blocked_v4(ip: &Ipv4Addr) -> bool {
 }
 
 fn is_blocked_v6(ip: &Ipv6Addr) -> bool {
-    // IPv4-mapped (::ffff:a.b.c.d) → judge by the embedded v4 (e.g. ::ffff:169.254.169.254).
-    if let Some(v4) = ip.to_ipv4_mapped() {
+    // IPv4-mapped (::ffff:a.b.c.d) AND IPv4-compatible (::a.b.c.d, e.g. ::7f00:1 = ::127.0.0.1)
+    // → judge by the embedded v4. `to_ipv4()` covers both forms; `to_ipv4_mapped()` alone missed
+    // the compatible spelling, which resolves to the same private/loopback target at connect time.
+    if let Some(v4) = ip.to_ipv4() {
         return is_blocked_v4(&v4);
     }
     let seg0 = ip.segments()[0];

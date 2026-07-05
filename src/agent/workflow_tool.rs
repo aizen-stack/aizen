@@ -52,7 +52,26 @@ fn refuter_prompt(finding: &str) -> String {
     )
 }
 
-/// Build the spec for one call. Pure — unit-tested without the network.
+/// Does this task resolve to a WRITE-capable sub-agent? Mirrors the runner's resolution
+/// (`run_one_task`): a named `agent` supersedes `role`, and its capability is whether the resolved
+/// registry grants any workspace-write tool. The write tool NAMES present don't depend on the root
+/// the registry is built at, so a placeholder root is fine here. An unresolvable slug falls back to
+/// coder (write) scope at run time, so it counts as a writer. Without an agent, the write roles are
+/// `coder` and `tester` (tester runs `shell_run`).
+fn task_is_writer(role: &str, agent: Option<&str>) -> bool {
+    if let Some(slug) = agent.map(str::trim).filter(|s| !s.is_empty()) {
+        return match crate::agents::load(slug) {
+            Some(def) => !crate::agent::task_tool::dispatch_is_read_only(
+                &crate::agent::builtin::agent_registry(&def, std::path::Path::new(".")),
+            ),
+            None => true, // unresolvable slug → runner uses coder scope → treat as a writer
+        };
+    }
+    matches!(role, "coder" | "tester")
+}
+
+/// Build the spec for one call. Pure for role-only tasks; a task naming an `agent` resolves that
+/// specialist from disk to classify its write-capability (see [`task_is_writer`]).
 pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
     let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("fanout");
     match mode {
@@ -66,12 +85,8 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                 bail!("workflow caps at 5 tasks per call (got {})", tasks_in.len());
             }
             let mut tasks = Vec::new();
-            let mut coders = 0usize;
             for (i, t) in tasks_in.iter().enumerate() {
                 let role = t.get("role").and_then(|v| v.as_str()).unwrap_or("coder").to_string();
-                if role == "coder" {
-                    coders += 1;
-                }
                 tasks.push(WorkflowTask {
                     id: t.get("id").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("t{}", i + 1)),
                     role,
@@ -85,8 +100,15 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                     model: t.get("model").and_then(|v| v.as_str()).map(str::to_string),
                 });
             }
-            if coders > 1 {
-                bail!("at most ONE coder task per workflow call — parallel writers race edits; keep the write singular and fan out the reads");
+            // Singular-writer invariant: at most ONE write-capable task may fan out — parallel
+            // writers race file edits and the build lock. Capability is resolved the SAME way the
+            // runner (`run_one_task`) resolves it: a named specialist `agent` supersedes `role`, so
+            // a write-scoped agent counts as a writer even when its `role` label says "reviewer"
+            // (counting the label alone let that case race a real coder). Read-only roles and
+            // read-only specialists fan out freely.
+            let writers = tasks.iter().filter(|t| task_is_writer(&t.role, t.agent.as_deref())).count();
+            if writers > 1 {
+                bail!("at most ONE write-capable task per workflow call (a coder/tester role or a write-scoped agent) — parallel writers race edits; keep the write singular and fan out the reads");
             }
             let synthesis = args
                 .get("synthesis")
@@ -213,7 +235,7 @@ mod tests {
         }))
         .unwrap_err()
         .to_string();
-        assert!(err.contains("ONE coder"), "{err}");
+        assert!(err.contains("write-capable"), "{err}");
         // One coder + readers is fine.
         let (spec, synth) = build_spec(&serde_json::json!({
             "mode": "fanout",
@@ -235,6 +257,31 @@ mod tests {
         assert!(build_spec(&serde_json::json!({"mode": "dag"})).is_err(), "unknown mode");
         let six: Vec<_> = (0..6).map(|i| serde_json::json!({"prompt": format!("t{i}"), "role": "reviewer"})).collect();
         assert!(build_spec(&serde_json::json!({"mode": "fanout", "tasks": six})).is_err(), "cap 5");
+    }
+
+    #[test]
+    fn task_is_writer_classifies_by_capability() {
+        // Bare roles: coder and tester write (file_edit / shell_run); planner and reviewer read.
+        assert!(task_is_writer("coder", None));
+        assert!(task_is_writer("tester", None));
+        assert!(!task_is_writer("reviewer", None));
+        assert!(!task_is_writer("planner", None));
+        // An unresolvable agent slug falls back to coder (write) scope at run time → count as writer.
+        assert!(task_is_writer("reviewer", Some("__no_such_agent__")));
+    }
+
+    #[test]
+    fn fanout_allows_two_readers() {
+        // Two read-only tasks are NOT writers → they fan out freely (the invariant is one WRITER).
+        let (spec, _) = build_spec(&serde_json::json!({
+            "mode": "fanout",
+            "tasks": [
+                {"prompt": "review a", "role": "reviewer"},
+                {"prompt": "plan b", "role": "planner"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(spec.tasks.len(), 2);
     }
 
     #[test]

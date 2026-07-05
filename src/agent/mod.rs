@@ -325,9 +325,8 @@ pub enum StopReason {
 
 #[derive(Debug)]
 pub struct AgentOutcome {
-    /// The model's final answer (already streamed to stdout by `ng agent`; kept for callers
-    /// that consume the loop programmatically + the tests).
-    #[allow(dead_code)]
+    /// The model's final answer (already streamed to stdout by `ng agent`; consumed by the
+    /// programmatic callers — `main.rs` one-shot, workflow/task sub-agent collection).
     pub final_text: Option<String>,
     pub iters: usize,
     pub stop: StopReason,
@@ -488,7 +487,17 @@ where
         {
             let pct = est_now * 100 / cfg.context_window;
             if clearing_due(pct, iter, last_clear, cfg.clear_step_pct, cfg.clear_cooldown_iters) {
-                let target = cfg.context_window * cfg.clear_target_pct as usize / 100;
+                // The floor measures history in RAW estimate units (chars/4), but `est_now` — which
+                // armed this pass — is anchor-corrected. With an active anchor, effective = raw + K
+                // for a constant offset K (= real-minus-estimate at anchor time), so a target
+                // expressed in window units must be shifted into raw space by that same K; otherwise
+                // raw is already below the window target and the eviction loop no-ops every cadence
+                // step (common once the provider reports more tokens than chars/4 — code, Vietnamese).
+                // No anchor ⇒ est_now == raw ⇒ offset 0 ⇒ identical to the plain window target.
+                let raw_now = estimate_tokens(messages) + schema_overhead;
+                let anchor_offset = est_now.saturating_sub(raw_now);
+                let target = (cfg.context_window * cfg.clear_target_pct as usize / 100)
+                    .saturating_sub(anchor_offset);
                 let stats = clear_tool_results_to_floor(
                     messages,
                     cfg.keep_recent_tool_results,

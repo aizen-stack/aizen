@@ -52,13 +52,6 @@ fn resolve_root() -> Result<PathBuf> {
         .context("canonicalizing cwd")
 }
 
-/// Build the default tool registry rooted at the current working directory (no `task` tool —
-/// that needs creds; use `default_registry_with_task`). Kept for the existing tests.
-#[allow(dead_code)] // test-only convenience; the binary builds registries via default_registry_in
-pub fn default_registry() -> Result<ToolRegistry> {
-    Ok(default_registry_in(&resolve_root()?))
-}
-
 /// The 7 built-in tools rooted at `root`. Shared by the top-level registry and the `coder`
 /// sub-agent role.
 fn default_registry_in(root: &Path) -> ToolRegistry {
@@ -946,7 +939,8 @@ fn block_rung(
         1 => {
             let (bs, be) = ranges[0];
             let before = content[bs..be].to_string();
-            let updated = format!("{}{}{}", &content[..bs], new, &content[be..]);
+            let spliced = preserve_eol(new, &before, &content[be..]);
+            let updated = format!("{}{}{}", &content[..bs], spliced, &content[be..]);
             Ok(Some(EditApplied { content: updated, before, after: new.to_string(), count: 1, rung }))
         }
         n => {
@@ -956,6 +950,24 @@ fn block_rung(
             bail!("old_string ({rung} form) matches {n} blocks in {label}; add more surrounding context to disambiguate");
         }
     }
+}
+
+/// Preserve the file's line endings across a tolerant-rung splice. The matched span (`before`)
+/// includes the trailing `\r` of a CRLF line while the `\n` itself sits just past it — `after_be`
+/// (the tail from `be`) starts with that `\n`. A model-supplied `new` is typically bare-LF, so a
+/// naive splice drops the boundary `\r` and leaves a lone-LF line among CRLF neighbours (Windows
+/// mixed-ending corruption). When the replaced region was CRLF, convert `new`'s internal breaks to
+/// CRLF and restore the boundary `\r`. LF files are returned untouched (byte-identical to before).
+fn preserve_eol(new: &str, before: &str, after_be: &str) -> String {
+    let crlf = before.contains("\r\n") || before.ends_with('\r');
+    if !crlf {
+        return new.to_string();
+    }
+    let mut out = if new.contains('\n') && !new.contains("\r\n") { new.replace('\n', "\r\n") } else { new.to_string() };
+    if after_be.starts_with('\n') && !out.ends_with('\r') {
+        out.push('\r');
+    }
+    out
 }
 
 /// Per-line trim — the R2 normalization (leading indentation + trailing whitespace + CRLF).
@@ -1836,6 +1848,33 @@ mod tests {
         assert!(r.lines().any(|l| l.starts_with('+')), "diff shows an added line: {r}");
         let after = std::fs::read_to_string(root.join("f.rs")).unwrap();
         assert_eq!(after, "fn main() {\n    let x = 2;\n    bar();\n}\n");
+    }
+
+    #[test]
+    fn file_edit_preserves_crlf_via_tolerant_rung() {
+        let root = temp_root("edit-crlf");
+        // A Windows (CRLF) file; the model's old_string is bare-LF with the wrong indent — a real
+        // mismatch the indent-tolerant rung rescues. The replaced line MUST stay CRLF, not silently
+        // degrade to a lone-LF line among CRLF neighbours (Windows mixed-ending corruption).
+        std::fs::write(root.join("f.rs"), "a\r\n    b\r\nc\r\n").unwrap();
+        let t = FileEdit::new(root.clone());
+        t.execute(&serde_json::json!({"path":"f.rs","old_string":"  b","new_string":"X"})).unwrap();
+        let after = std::fs::read_to_string(root.join("f.rs")).unwrap();
+        // The invariant is line endings, not indentation (the indent rung reapplies leading space):
+        // the edited line is written with CRLF, and no lone-LF line survives anywhere.
+        assert!(after.contains("X\r\n"), "edited line written with CRLF: {after:?}");
+        assert!(!after.replace("\r\n", "").contains('\n'), "no lone-LF line survived the edit: {after:?}");
+    }
+
+    #[test]
+    fn preserve_eol_restores_boundary_and_internal_crlf() {
+        // CRLF block, bare-LF replacement, `\n` sits at the boundary → restore the trailing `\r`.
+        assert_eq!(preserve_eol("X", "b\r", "\nc"), "X\r");
+        // Multi-line bare-LF new against a CRLF region → every internal break becomes CRLF too.
+        assert_eq!(preserve_eol("X\nY", "b\r", "\nc"), "X\r\nY\r");
+        // LF file → untouched (byte-identical).
+        assert_eq!(preserve_eol("X", "b", "\nc"), "X");
+        assert_eq!(preserve_eol("X\nY", "b", "\nc"), "X\nY");
     }
 
     #[test]

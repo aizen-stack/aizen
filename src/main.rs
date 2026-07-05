@@ -1195,18 +1195,28 @@ SKIPPED unless you prefix with `/agent ` to run fully autonomously (no approval 
 Follow-ups keep context, so \"now fix it\" works. /new (or /reset) starts a fresh conversation · \
 /help shows this.";
 
-/// Split a string into <=`max`-char chunks (Telegram's message cap is 4096).
+/// Split a string so each chunk is `<= max` **UTF-16 code units** — the unit Telegram (4096) and
+/// Discord (2000) actually count their message caps in. Splitting by Unicode scalar undercounts:
+/// an astral char (emoji, math-bold) is 1 scalar but 2 UTF-16 units, so an emoji-heavy reply under
+/// the char cap can still exceed the platform limit → HTTP 400 → the reply is silently dropped.
 fn chunk_text(s: &str, max: usize) -> Vec<String> {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
+    if s.encode_utf16().count() <= max {
         return vec![s.to_string()];
     }
     let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let end = (i + max).min(chars.len());
-        out.push(chars[i..end].iter().collect());
-        i = end;
+    let mut cur = String::new();
+    let mut cur_units = 0usize;
+    for ch in s.chars() {
+        let u = ch.len_utf16();
+        if cur_units + u > max && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            cur_units = 0;
+        }
+        cur.push(ch);
+        cur_units += u;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
     }
     out
 }
@@ -4976,10 +4986,22 @@ fn print_config(cfg: &cli_config::CliConfig) {
     };
     let unset = || theme::faint("— not set").italic().to_string();
     let tok = |n: usize| if n >= 1000 { format!("{}K", n / 1000) } else { n.to_string() };
+    // A base URL shouldn't carry credentials, but if one embeds `user:pass@`, `config show` must
+    // not print it in the clear — redact the userinfo before display (host/path stay visible).
+    let redact_url = |u: &str| -> String {
+        match url::Url::parse(u) {
+            Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+                let _ = parsed.set_username("•••");
+                let _ = parsed.set_password(None);
+                parsed.to_string()
+            }
+            _ => u.to_string(),
+        }
+    };
 
     // ── Endpoint ──
     section("Endpoint");
-    row("url", cfg.base_url.clone().map(|v| theme::link(v).to_string()).unwrap_or_else(unset));
+    row("url", cfg.base_url.clone().map(|v| theme::link(redact_url(&v)).to_string()).unwrap_or_else(unset));
     row(
         "key",
         match cfg.api_key.as_deref() {
@@ -6058,12 +6080,15 @@ async fn agents_install(source: &str, yes: bool, enable_all: bool, as_name: Opti
                 println!("cancelled.");
                 return Ok(());
             }
-            let http = http_client()?;
-            let resp = http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
-            if !resp.status().is_success() {
-                anyhow::bail!("upstream returned HTTP {}", resp.status());
+            // Fetch through the shared guarded client (auto-redirects OFF, every hop re-vetted
+            // against the net_guard floor) — a plain reqwest client follows up to 10 redirects and
+            // would re-vet only the first hop, so a 302 → 169.254.169.254 / localhost slips through.
+            let http = crate::agent::reach::http::client()?;
+            let resp = crate::agent::reach::http::get(&http, &url, &[]).await.with_context(|| format!("GET {url}"))?;
+            if !resp.is_success() {
+                anyhow::bail!("upstream returned HTTP {}", resp.status);
             }
-            let text = resp.text().await.context("reading response body")?;
+            let text = resp.text();
             if !agents::looks_like_agent(&text) {
                 anyhow::bail!("that URL isn't an agent (needs frontmatter `name:` + a non-empty body)");
             }
@@ -6174,6 +6199,21 @@ mod tests {
 
     fn models() -> Vec<String> {
         vec!["opus-4-8".to_string(), "sonnet-4-6".to_string(), "minimax-m3".to_string()]
+    }
+
+    #[test]
+    fn chunk_text_splits_on_utf16_units_not_scalars() {
+        // 2100 emoji = 2100 scalars but 4200 UTF-16 units. Under a 3500-unit cap it MUST split —
+        // Telegram/Discord count length in UTF-16; naive char-splitting would wrongly keep it whole
+        // and the platform would 400 → the reply is silently dropped.
+        let s = "🚀".repeat(2100);
+        let chunks = chunk_text(&s, 3500);
+        assert!(chunks.len() >= 2, "over-the-UTF16-cap reply must split, got {}", chunks.len());
+        for c in &chunks {
+            assert!(c.encode_utf16().count() <= 3500, "each chunk within the UTF-16 budget");
+        }
+        assert_eq!(chunks.concat(), s, "reassembles losslessly");
+        assert_eq!(chunk_text("hello", 3500), vec!["hello".to_string()], "ASCII under cap stays whole");
     }
 
     #[test]

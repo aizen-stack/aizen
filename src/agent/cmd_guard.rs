@@ -43,7 +43,7 @@ static BLOCKLIST: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         // quotes before rm sees them) can't smuggle a root target past the floor. NON-root paths
         // (`/etc`, `/home/u/tmp`) have a non-slash/non-dot char after the leading slash, so the run
         // stops and the trailing `(\s|$)` fails → they correctly stay `Ask`.
-        (r"(?i)\brm\s+(-{1,2}[a-z-]+\s+)*(-[a-z]*[rf][a-z]*|--recursive|--force|--no-preserve-root)(\s+-{1,2}[a-z-]+)*\s+(/+(\.+/*)*|/\*|~|\$HOME)(\s|$)",
+        (r"(?i)\brm\s+(-{1,2}[a-z-]+\s+)*(-[a-z]*[rf][a-z]*|--recursive|--force|--no-preserve-root)(\s+-{1,2}[a-z-]+)*\s+(/+(\.+/*)*|/\*|~|\$HOME|\$\{HOME\})(\s|$)",
             "recursive delete of a filesystem root"),
         (r"(?i)\brm\b[^\n|;&]*\b--no-preserve-root\b", "rm --no-preserve-root"),
         // Filesystem creation over a whole device.

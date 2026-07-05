@@ -166,23 +166,30 @@ async fn gateway_once(token: &str, cfg: &DiscordConfig, tx: &mpsc::Sender<Incomi
     let (mut ws, _) =
         tokio_tungstenite::connect_async(GATEWAY_URL).await.context("connecting to discord gateway")?;
 
-    // 1) HELLO → heartbeat_interval (ms). Read frames until we get it.
+    // 1) HELLO → heartbeat_interval (ms). Read frames until we get it — under a hard timeout so a
+    // gateway that completes the WS upgrade but never sends HELLO (broken proxy / misbehaving edge)
+    // can't stall the daemon forever: on elapse we bail and `run_gateway`'s backoff reconnects.
     let mut interval_ms = 41_250u64;
-    loop {
-        let frame = ws.next().await.context("gateway closed before HELLO")?.context("gateway read")?;
-        if let WsMessage::Text(t) = frame {
-            if let Ok(v) = serde_json::from_str::<Value>(t.as_str()) {
-                if v.get("op").and_then(|o| o.as_u64()) == Some(OP_HELLO) {
-                    interval_ms = v
-                        .get("d")
-                        .and_then(|d| d.get("heartbeat_interval"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(interval_ms);
-                    break;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let frame = ws.next().await.context("gateway closed before HELLO")?.context("gateway read")?;
+            if let WsMessage::Text(t) = frame {
+                if let Ok(v) = serde_json::from_str::<Value>(t.as_str()) {
+                    if v.get("op").and_then(|o| o.as_u64()) == Some(OP_HELLO) {
+                        interval_ms = v
+                            .get("d")
+                            .and_then(|d| d.get("heartbeat_interval"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(interval_ms);
+                        break;
+                    }
                 }
             }
         }
-    }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("timed out waiting for gateway HELLO (20s)")??;
 
     // 2) IDENTIFY.
     let identify = json!({

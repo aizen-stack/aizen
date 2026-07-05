@@ -16,7 +16,6 @@
 
 use crate::core::config::nextgen_home;
 use crate::memory::learning::sanitize_facts::threat_scan;
-use crate::memory::render::sanitize_body;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
@@ -92,12 +91,13 @@ pub fn prompt_block() -> Option<String> {
     Some(cap_tokens(body, SOUL_MAX_TOKENS))
 }
 
-/// Structural sanitize: the shipped C0/`<memory>` cleaner PLUS neutralization of the block's OWN
-/// tag, so a SOUL body can't close `<agent_identity>` early and inject trailing instructions.
+/// Structural sanitize: the FULL breakout neutralizer shared with `<persona>`/`<skills>`/`<agents>`
+/// (`sanitize_agent_body`) — escapes the CLI's `<memory>` tags, strips C0/ANSI, and breaks EVERY
+/// structural tag opener (`agent_identity`, `persona`, `self`, `skills`, `user_memory`, `agents`,
+/// `project_context`…). Stronger than the old `agent_identity`-only cleaner, so a SOUL body can't
+/// close its own frame early NOR spoof a sibling frame to inject trailing instructions.
 fn sanitize(s: &str) -> String {
-    sanitize_body(s)
-        .replace("</agent_identity>", "<\\/agent_identity>")
-        .replace("<agent_identity>", "<\\agent_identity>")
+    crate::agent::task_tool::sanitize_agent_body(s)
 }
 
 /// Truncate to ~`max_tokens` (chars/4) at a line boundary, keeping the head. Shared with the

@@ -213,7 +213,13 @@ fn apply_store(
     report: &mut LearnReport,
 ) -> Result<()> {
     let toks = tokenize(clean);
-    match consolidate::decide(&toks, existing, s.learn_dedup_threshold) {
+    // Zone isolation for the write-path merge: only consolidate/dedup against entries in the SAME
+    // scope zone as this candidate. A project-A fact must never reinforce a project-B or global
+    // fact (cross-zone signal leak / scope drift), and a global fact must never fold into a zoned
+    // one. Reads (search, frozen_core, caps) are already zoned; this closes the merge gap. The
+    // reinforce still targets the real `existing` entry by id (the zone view holds clones).
+    let same_zone: Vec<MemoryEntry> = existing.iter().filter(|e| e.scope == scope).cloned().collect();
+    match consolidate::decide(&toks, &same_zone, s.learn_dedup_threshold) {
         MemOp::Reinforce { id } => {
             if let Some(e) = existing.iter().find(|e| e.id == id) {
                 if !opts.dry_run {
@@ -225,9 +231,10 @@ fn apply_store(
         MemOp::Add => {
             // Second-chance char-level dedup: catches typo/punctuation/reorder dups that the
             // token-blend consolidator missed. If found, reinforce instead of inserting a twin.
+            // Same-zone only, for the reason above.
             if let Some(dup) = existing
                 .iter()
-                .find(|e| bloat::dedup::is_near_duplicate(clean, &e.body, s.minhash_dup_threshold))
+                .find(|e| e.scope == scope && bloat::dedup::is_near_duplicate(clean, &e.body, s.minhash_dup_threshold))
             {
                 let id = dup.id.clone();
                 if !opts.dry_run {
