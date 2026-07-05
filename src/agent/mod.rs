@@ -463,8 +463,24 @@ where
     let schema_overhead = estimate_defs_tokens(&defs);
     let mut cap = cfg.max_iters;
     let mut extended = false;
-    let mut last_sig: Option<String> = None;
-    let mut recovery_used = false;
+    // W1/W6: ring of recent EXECUTED-turn signatures for A,A + A,B,A,B detection, plus per-
+    // signature nudge memory. nudged_sigs is cleared by any productive turn, so a legitimately
+    // repeated call AFTER real progress earns a fresh nudge instead of an instant hard-stop (the
+    // old run-global one-shot never reset). recent_sigs/nudged_sigs are plain trackers, never
+    // `messages`, so they can never orphan an assistant/tool pair.
+    let mut recent_sigs: std::collections::VecDeque<String> =
+        std::collections::VecDeque::with_capacity(SIG_RING);
+    let mut nudged_sigs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // W3/W4: hashes of every NON-failure tool-result body seen this run. Novel content = progress —
+    // the shared signal that resets the thrash streak, resets the divergence latch, and gates
+    // auto-extend. A stale re-read (already-seen bytes) is not novel, so it can't rescue a flail.
+    let mut seen_results: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // THRASH GUARD: consecutive UNPRODUCTIVE turns (no successful edit and no novel tool output).
+    // Catches a model flailing with distinct-but-fruitless calls that dodge the divergence check
+    // (which only fires on repeated/oscillating signatures). Nudges once, then stops, so a stuck
+    // run can't burn the whole step budget.
+    let mut unproductive_streak = 0usize;
+    let mut stuck_nudged = false;
     let mut verify_attempts = 0usize;
     let mut made_edits = false;
     // CUMULATIVE edit flag (never consumed, unlike `made_edits`) — arms the one-shot self-review.
@@ -532,6 +548,11 @@ where
                 if stats.cleared + stats.failures_trimmed > 0 {
                     // History shrank under the anchor's feet — the next real usage report re-anchors.
                     real_anchor = None;
+                    // Cleared result BODIES are gone from context, but their content hashes would
+                    // linger in seen_results and mark a legitimate RE-READ of that now-evicted content
+                    // as "not novel" → falsely unproductive → a spurious thrash stop. Drop the novelty
+                    // memory too, so re-reading evicted content counts as progress again.
+                    seen_results.clear();
                     est_now = estimate_tokens(messages) + schema_overhead;
                     if !cfg.quiet {
                         let line = format!(
@@ -566,6 +587,7 @@ where
                 {
                     context_warned = false; // history shrank — let the wrap-up nudge re-arm if it refills
                     real_anchor = None; // spliced history invalidates the anchor
+                    seen_results.clear(); // summarized-away results must not mark a re-read as stale
                     est_now = estimate_tokens(messages) + schema_overhead;
                     if !cfg.quiet {
                         let line = format!("→ context: auto-compacted ~{before} → ~{after} tok");
@@ -743,28 +765,39 @@ where
             });
         }
 
-        // DIVERGENCE: identical tool call(s) two turns in a row = no progress. Self-resolve
-        // first (the extension's R0/R1 lite): one corrective nudge before giving up. The
-        // repeated call is NOT executed/appended (so no dangling tool_calls in history).
+        // DIVERGENCE (W1): a turn whose canonical signature exactly repeats the previous turn
+        // (A,A) or completes a 2-cycle (A,B,A,B) is a SUSPECTED loop. On the FIRST flagged
+        // occurrence we nudge but still EXECUTE the call, so its result novelty is judged by the
+        // progress block below: a repeat that yields NEW content is productive and clears the latch
+        // (a legit poll/consume loop runs free — the false-positive fix), while a redundant repeat
+        // yields nothing new, keeps the latch, and the NEXT recurrence hard-stops WITHOUT executing.
+        // nudged_sigs is also cleared by any productive turn (W6), so a repeat after real progress
+        // earns a fresh nudge rather than an instant stop.
         let sig = turn_signature(&turn.tool_calls);
-        if last_sig.as_deref() == Some(sig.as_str()) {
-            if !recovery_used {
-                recovery_used = true;
-                push_nudge(
-                    messages,
-                    NUDGE_DIVERGENCE,
-                    "You repeated the same tool call(s) with no new information. Take a DIFFERENT approach, or stop and explain what is blocking you.",
-                );
-                iter += 1;
-                continue;
-            }
-            return Ok(AgentOutcome {
-                final_text: turn.content,
-                iters: iter + 1,
-                stop: StopReason::Divergence,
-            });
+        let repeated = recent_sigs.back() == Some(&sig) || is_two_cycle(&recent_sigs, &sig);
+        recent_sigs.push_back(sig.clone());
+        if recent_sigs.len() > SIG_RING {
+            recent_sigs.pop_front();
         }
-        last_sig = Some(sig);
+        if repeated {
+            if !nudged_sigs.insert(sig) {
+                // Already flagged this episode AND recurred with no productive turn clearing the
+                // latch → a genuine loop. Stop; the repeat is NOT executed/appended (return before
+                // pre-fill, so no dangling tool_calls can strand history).
+                return Ok(AgentOutcome {
+                    final_text: turn.content,
+                    iters: iter + 1,
+                    stop: StopReason::Divergence,
+                });
+            }
+            // First flag for this signature: nudge, then fall through to execute so the progress
+            // block can judge whether the repeat actually produced new information.
+            push_nudge(
+                messages,
+                NUDGE_DIVERGENCE,
+                "You repeated the same tool call(s). If this is not producing NEW information, take a DIFFERENT approach or stop and explain what is blocking you.",
+            );
+        }
 
         // PRE-FILL: append the assistant tool-call turn AND one placeholder result per call in a
         // single synchronous block (no await in between) — history is VALID from this instant, so
@@ -795,9 +828,62 @@ where
 
         // Arm the verify gate only if a destructive tool actually SUCCEEDED this turn — a
         // denied/errored edit changed nothing, so it must not make the gate blame the tree.
-        if turn_made_edits(registry, &calls, &results) {
+        let edited_this_turn = turn_made_edits(registry, &calls, &results);
+        if edited_this_turn {
             made_edits = true;
             made_any_edits = true;
+        }
+
+        // PROGRESS / THRASH GUARD (W3/W4): a turn is PRODUCTIVE iff a successful edit landed OR some
+        // NON-failure result carried content not seen before this run. Failures are never progress (a
+        // fresh error string can't rescue a flail — W3); a throwaway re-read of already-seen bytes is
+        // not novel (padding can't reset the streak — W3), and a same-content re-read loop climbs to a
+        // stop (W4). A re-read that surfaces NEW bytes, or is followed by a successful edit, IS
+        // productive and resets the streak — the system-prompt-sanctioned re-read→retry recovery is
+        // never punished. Productive turns also clear nudged_sigs, ending any open divergence episode.
+        let mut new_content = false;
+        for (_, r) in &results {
+            if is_failure_result(r) {
+                continue; // failures are never progress
+            }
+            if seen_results.insert(hash_str(r)) {
+                new_content = true;
+            }
+        }
+        let productive = edited_this_turn || new_content;
+        if productive {
+            unproductive_streak = 0;
+            stuck_nudged = false;
+        } else if !calls.is_empty() {
+            unproductive_streak += 1;
+        }
+        // Only GENUINELY NOVEL output ends a divergence episode. A successful destructive call sets
+        // edited_this_turn=true on EVERY turn (turn_made_edits is true for any non-error destructive
+        // result), so clearing the latch on `productive` would let a repeated IDENTICAL destructive
+        // call (same signature, same body — e.g. `git commit --allow-empty`, `>> log`, a no-op
+        // file_write) re-flag as "first seen" forever and never hard-stop. Gating the clear on
+        // new_content keeps a legit poll/consume loop free (each call is novel) while a redundant
+        // repeated edit keeps its latch → the next recurrence hits the insert()==false stop.
+        if new_content {
+            nudged_sigs.clear();
+        }
+        if unproductive_streak >= STUCK_STOP_STREAK {
+            return Ok(AgentOutcome {
+                final_text: turn.content,
+                iters: iter + 1,
+                stop: StopReason::Divergence,
+            });
+        }
+        if unproductive_streak >= STUCK_NUDGE_STREAK && !stuck_nudged {
+            stuck_nudged = true;
+            push_nudge(
+                messages,
+                NUDGE_STUCK,
+                "Several turns in a row made no progress (failing, or repeating calls that return \
+                 nothing new). STOP retrying variations. Re-read the file to copy exact text, use \
+                 file_write to create or fully overwrite a file (never blank a file with shell), \
+                 verify the real state, or explain what is blocking you.",
+            );
         }
 
         iter += 1;
@@ -846,8 +932,16 @@ where
             }
         }
 
-        // CONVERGENCE: near the cap, nudge once and grant the extended cap (pressure, not gate).
-        if iter >= cap && !extended && cfg.auto_extend_to > cap {
+        // CONVERGENCE (W10): near the cap, grant the extended cap ONLY when converging — the last
+        // turn made progress (streak below the stuck threshold) and no divergence episode is open. A
+        // wandering/diverging run falls through to the graceful MaxIters synthesis instead of being
+        // rewarded with a bigger budget.
+        if iter >= cap
+            && !extended
+            && cfg.auto_extend_to > cap
+            && unproductive_streak < STUCK_NUDGE_STREAK
+            && nudged_sigs.is_empty()
+        {
             extended = true;
             cap = cfg.auto_extend_to;
             push_nudge(
@@ -858,7 +952,26 @@ where
         }
     }
 
-    Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::MaxIters })
+    // MAXITERS (W9): don't abandon the task with no answer. Spend ONE tool-free call for a best-
+    // effort final answer, built on a THROWAWAY clone so the real `messages` is never mutated before
+    // the call (no rollback needed, TAIL invariant intact); empty tool defs push a prose answer.
+    // Degrades to None on any chat error — never worse than the old behavior.
+    let final_text = {
+        let mut synth = messages.clone();
+        synth.push(Message::user(
+            "You have reached the step limit and cannot call any more tools. Summarize what you \
+             accomplished and give your best final answer now from what you already have; \
+             explicitly flag anything you could not verify or finish.",
+        ));
+        match chat(synth, Vec::new()).await {
+            Ok(t) => t.content.filter(|s| !s.trim().is_empty()),
+            Err(_) => None,
+        }
+    };
+    if let Some(ref s) = final_text {
+        messages.push(Message::assistant(s.clone()));
+    }
+    Ok(AgentOutcome { final_text, iters: iter, stop: StopReason::MaxIters })
 }
 
 /// Hard cap on concurrent tool executions in a parallel run. Conservative for a single-binary
@@ -1189,7 +1302,7 @@ fn emit_tool_result(name: &str, out: &str) {
 }
 
 fn is_edit_tool(name: &str) -> bool {
-    matches!(name, "file_edit" | "multi_edit" | "edit_file" | "apply_patch")
+    matches!(name, "file_edit" | "multi_edit" | "edit_file" | "apply_patch" | "file_write" | "write_file")
 }
 
 /// Count added / removed lines in a unified-diff-bearing result: lines beginning `+` / `-` at
@@ -1288,7 +1401,12 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
             let (a, d) = count_diff(out);
             (true, format!("{} · +{a} −{d}", edit_target(first)))
         }
-        "file_write" | "write_file" => (true, "đã ghi".to_string()),
+        "file_write" | "write_file" => {
+            // out first line = "created <path> (N line(s))" | "overwrote <path> (N line(s))"
+            let verb = if first.starts_with("overwrote") { "ghi đè" } else { "tạo" };
+            let path = first.split_whitespace().nth(1).unwrap_or("");
+            (true, format!("{verb} {path}"))
+        }
         "memory_search" => {
             if trimmed.starts_with("(no memory") {
                 (true, "0 ghi nhớ".to_string())
@@ -1326,14 +1444,67 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
     }
 }
 
-/// Order-insensitive signature of a turn's tool calls, for divergence detection.
+/// Order-insensitive signature of a turn's tool calls, for divergence detection. Arguments are
+/// canonicalized (object keys sorted recursively, insignificant whitespace removed) so a
+/// reformatted-JSON or key-reordered repeat of the same call collapses to one signature (W2).
+/// Pagination fields (e.g. file_read's start/end) are DELIBERATELY kept: a different read window is
+/// different work; a re-read returning identical bytes is caught by the content-novelty thrash guard
+/// instead (stripping them would flag legit sequential paging as divergence).
 fn turn_signature(calls: &[ToolCall]) -> String {
     let mut sigs: Vec<String> = calls
         .iter()
-        .map(|c| format!("{}({})", c.function.name, c.function.arguments.trim()))
+        .map(|c| format!("{}({})", c.function.name, canonical_args(&c.function.arguments)))
         .collect();
     sigs.sort();
     sigs.join("|")
+}
+
+/// Whitespace/key-order-independent rendering of a JSON value (keys sorted recursively — does NOT
+/// depend on serde_json's `preserve_order` feature).
+fn canonical_json(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(m) => {
+            let mut e: Vec<(&String, &serde_json::Value)> = m.iter().collect();
+            e.sort_by(|a, b| a.0.cmp(b.0));
+            let body: Vec<String> =
+                e.iter().map(|(k, val)| format!("{k}:{}", canonical_json(val))).collect();
+            format!("{{{}}}", body.join(","))
+        }
+        serde_json::Value::Array(a) => {
+            format!("[{}]", a.iter().map(canonical_json).collect::<Vec<_>>().join(","))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Canonical, stable rendering of one call's raw argument string. Unparseable args fall back to the
+/// old trimmed form so nothing regresses for tools with odd argument encodings.
+fn canonical_args(raw: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v) => canonical_json(&v),
+        Err(_) => raw.trim().to_string(),
+    }
+}
+
+/// Does `s0` (the current turn signature) complete an A,B,A,B 2-cycle against the recent ring
+/// (newest at the back)? The two alternating signatures must differ, keeping this disjoint from the
+/// immediate-repeat (A,A) case.
+fn is_two_cycle(recent: &std::collections::VecDeque<String>, s0: &str) -> bool {
+    let n = recent.len();
+    if n < 3 {
+        return false;
+    }
+    let (s1, s2, s3) = (&recent[n - 1], &recent[n - 2], &recent[n - 3]);
+    s0 == s2.as_str() && s1 == s3 && s0 != s1.as_str()
+}
+
+/// Stable in-process hash of a string (std only). Values live only within one run, so
+/// DefaultHasher's lack of cross-version stability is irrelevant; storing u64 bounds memory.
+fn hash_str(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 /// Flat per-message envelope estimate (role name + JSON framing), in tokens.
@@ -1589,6 +1760,17 @@ const NUDGE_CONTEXT: &str = "Context is nearly full";
 const NUDGE_DIVERGENCE: &str = "You repeated the same tool call(s)";
 const NUDGE_STEP_LIMIT: &str = "You are nearing the step limit";
 const NUDGE_TODO: &str = "Current task list";
+const NUDGE_STUCK: &str = "Several turns in a row made no progress";
+
+/// Consecutive unproductive turns before the thrash guard nudges, then stops (see the loop).
+const STUCK_NUDGE_STREAK: usize = 3;
+const STUCK_STOP_STREAK: usize = 5;
+
+/// Recent executed-turn signatures retained for divergence detection. The detectors inspect only
+/// the last 1 (immediate repeat, A,A) and last 3 (2-cycle, A,B,A,B); a few extra slots are cheap
+/// headroom, nothing more. An INTERSPERSED cycle (A,B,X,A,B) is intentionally NOT treated as a loop
+/// here — if it makes no progress the thrash guard catches it. O(1) memory, cheap String compares.
+const SIG_RING: usize = 6;
 
 /// Append a system nudge, first removing any EARLIER system message of the same kind
 /// (`kind_prefix` must prefix `text`). Scans indices 1.. only — the system prompt at `[0]` is
@@ -1845,6 +2027,44 @@ mod tests {
         }
     }
 
+    /// Returns CONSTANT bytes regardless of args — models a tool called with distinct arguments
+    /// that nonetheless surfaces no new information (the successful-but-useless re-read, W4).
+    struct ConstTool;
+    impl Tool for ConstTool {
+        fn name(&self) -> &str {
+            "konst"
+        }
+        fn description(&self) -> &str {
+            "returns constant bytes"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{"i":{"type":"string"}}})
+        }
+        fn execute(&self, _args: &serde_json::Value) -> Result<String> {
+            Ok("CONST".into())
+        }
+    }
+
+    /// Stateful: returns an INCREMENTING value each call, so every invocation surfaces NEW content
+    /// regardless of args — models a legitimate poll/consume loop, used to prove a productive
+    /// repeated-signature loop is NOT hard-stopped as divergence.
+    struct TickTool(std::sync::atomic::AtomicUsize);
+    impl Tool for TickTool {
+        fn name(&self) -> &str {
+            "tick"
+        }
+        fn description(&self) -> &str {
+            "returns an incrementing counter"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{"s":{"type":"string"}}})
+        }
+        fn execute(&self, _args: &serde_json::Value) -> Result<String> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(format!("tick-{n}"))
+        }
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
     fn tool_turn(name: &str, args: &str) -> ChatTurn {
         ChatTurn {
@@ -1868,6 +2088,24 @@ mod tests {
             eager: Vec::new(),
         }
     }
+    /// A turn with SEVERAL tool calls (for testing turns that pad a failing call with a throwaway).
+    fn multi_tool_turn(calls: &[(&str, &str)]) -> ChatTurn {
+        ChatTurn {
+            content: None,
+            tool_calls: calls
+                .iter()
+                .enumerate()
+                .map(|(i, (name, args))| ToolCall {
+                    id: format!("call_{name}_{i}"),
+                    kind: "function".into(),
+                    function: FunctionCall { name: (*name).into(), arguments: (*args).into() },
+                })
+                .collect(),
+            finish_reason: Some("stop".into()),
+            usage: None,
+            eager: Vec::new(),
+        }
+    }
     fn call(id: &str, name: &str, args: &str) -> ToolCall {
         ToolCall { id: id.into(), kind: "function".into(), function: FunctionCall { name: name.into(), arguments: args.into() } }
     }
@@ -1877,6 +2115,8 @@ mod tests {
         r.register(Box::new(EchoTool));
         r.register(Box::new(FailTool));
         r.register(Box::new(DeleteTool));
+        r.register(Box::new(ConstTool));
+        r.register(Box::new(TickTool(std::sync::atomic::AtomicUsize::new(0))));
         r
     }
 
@@ -2124,6 +2364,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thrash_guard_stops_distinct_but_all_failing_turns() {
+        let r = registry();
+        // Every turn calls the always-failing `fail` tool with DIFFERENT args, so the identical-
+        // signature Divergence check never trips — the thrash guard (all-fail, no-edit streak) must
+        // still stop the flail well before the (raised) step cap.
+        let c = AgentConfig { max_iters: 20, auto_extend_to: 20, ..cfg() };
+        let turns = vec![
+            tool_turn("fail", r#"{"n":"1"}"#),
+            tool_turn("fail", r#"{"n":"2"}"#),
+            tool_turn("fail", r#"{"n":"3"}"#),
+            tool_turn("fail", r#"{"n":"4"}"#),
+            tool_turn("fail", r#"{"n":"5"}"#),
+            tool_turn("fail", r#"{"n":"6"}"#),
+            tool_turn("fail", r#"{"n":"7"}"#),
+            final_turn("should not reach"),
+        ];
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
+        assert_eq!(out.stop, StopReason::Divergence, "thrash guard must stop the all-failing flail");
+        // Stops on the STUCK_STOP_STREAK-th consecutive unproductive turn, not at the cap of 20.
+        assert_eq!(out.iters, STUCK_STOP_STREAK);
+    }
+
+    #[tokio::test]
     async fn auto_extend_grants_more_room() {
         let r = registry();
         let c = AgentConfig { max_iters: 2, auto_extend_to: 4, quiet: true, ..Default::default() };
@@ -2137,6 +2400,334 @@ mod tests {
         let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
         assert_eq!(out.stop, StopReason::Done);
         assert!(out.iters > 2, "auto-extend should let it run past the initial cap");
+    }
+
+    // ── P1 anti-loop overhaul (W1/W2/W3/W4/W6/W9/W10) ─────────────────────────
+
+    #[tokio::test]
+    async fn two_cycle_oscillation_stops() {
+        let r = registry();
+        // A,B,A,B,… never converging. The old single-slot last_sig ran to MaxIters (consecutive
+        // signatures always differ); the ring's 2-cycle detector must stop it within a few turns.
+        let c = AgentConfig { max_iters: 30, auto_extend_to: 30, ..cfg() };
+        let turns = vec![
+            tool_turn("echo", r#"{"text":"a"}"#),
+            tool_turn("echo", r#"{"text":"b"}"#),
+            tool_turn("echo", r#"{"text":"a"}"#),
+            tool_turn("echo", r#"{"text":"b"}"#),
+            tool_turn("echo", r#"{"text":"a"}"#),
+            tool_turn("echo", r#"{"text":"b"}"#),
+            tool_turn("echo", r#"{"text":"a"}"#),
+            final_turn("unreached"),
+        ];
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
+        assert_eq!(out.stop, StopReason::Divergence, "A,B,A,B oscillation must be caught");
+        // EXACTLY 6: the 2-cycle detector stops on the 6th turn. If is_two_cycle were broken, only the
+        // thrash guard would act and it would stop at 7 (streak 5) — so this pins the detector, not the
+        // fallback. (Complemented by the is_two_cycle unit test below.)
+        assert_eq!(out.iters, 6, "the 2-cycle detector must stop at 6, not fall through to thrash at 7");
+    }
+
+    #[test]
+    fn is_two_cycle_detects_abab_only() {
+        use std::collections::VecDeque;
+        let ring = |v: &[&str]| VecDeque::from(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        // Genuine A,B,A,B: ring tail [A,B,A], current B completes it.
+        assert!(is_two_cycle(&ring(&["a", "b", "a"]), "b"));
+        // Immediate repeat A,A,A is NOT a 2-cycle (the two alternating signatures must differ).
+        assert!(!is_two_cycle(&ring(&["a", "a", "a"]), "a"));
+        // Three distinct calls: no cycle.
+        assert!(!is_two_cycle(&ring(&["a", "b", "c"]), "d"));
+        // Too short to judge.
+        assert!(!is_two_cycle(&ring(&["a", "b"]), "a"));
+        // INTERSPERSED (…B,X,A + current B) is intentionally NOT caught — left to the thrash guard.
+        assert!(!is_two_cycle(&ring(&["b", "x", "a"]), "b"));
+        // ring tail [A,B,A] + current A is an immediate repeat, not a 2-cycle.
+        assert!(!is_two_cycle(&ring(&["a", "b", "a"]), "a"));
+    }
+
+    #[tokio::test]
+    async fn productive_poll_loop_not_stopped() {
+        let r = registry();
+        // A,B,A,B of two fixed-arg calls that each return NEW content every time (a legit poll/consume
+        // loop). The 2-cycle detector must NOT hard-stop it: the novel content clears the latch each
+        // time, so it runs to completion. (Regression test for the false-positive the review found.)
+        let c = AgentConfig { max_iters: 8, auto_extend_to: 8, ..cfg() };
+        let turns = vec![
+            tool_turn("tick", r#"{"s":"a"}"#),
+            tool_turn("tick", r#"{"s":"b"}"#),
+            tool_turn("tick", r#"{"s":"a"}"#),
+            tool_turn("tick", r#"{"s":"b"}"#),
+            tool_turn("tick", r#"{"s":"a"}"#),
+            tool_turn("tick", r#"{"s":"b"}"#),
+            final_turn("done polling"),
+        ];
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
+        assert_eq!(out.stop, StopReason::Done, "a productive poll loop must not be flagged as divergence");
+        assert_eq!(out.final_text.as_deref(), Some("done polling"));
+    }
+
+    #[test]
+    fn canonicalization_collapses_whitespace_and_key_order() {
+        // W2: reformatted-JSON whitespace and key reordering must NOT dodge the signature.
+        let a = vec![call("1", "echo", r#"{"text":"x"}"#)];
+        let b = vec![call("1", "echo", r#"{  "text" :   "x"  }"#)];
+        assert_eq!(turn_signature(&a), turn_signature(&b), "whitespace must not change the signature");
+        let c = vec![call("1", "t", r#"{"b":1,"a":2}"#)];
+        let d = vec![call("1", "t", r#"{"a":2,"b":1}"#)];
+        assert_eq!(turn_signature(&c), turn_signature(&d), "key order must not change the signature");
+    }
+
+    #[test]
+    fn pagination_window_kept_distinct_in_signature() {
+        // W2 guardrail: a DIFFERENT read window is different work and must stay a distinct signature —
+        // legit sequential paging must never be collapsed into a divergence.
+        let p1 = vec![call("1", "file_read", r#"{"path":"X","start":1,"end":50}"#)];
+        let p2 = vec![call("1", "file_read", r#"{"path":"X","start":51,"end":100}"#)];
+        assert_ne!(
+            turn_signature(&p1),
+            turn_signature(&p2),
+            "distinct read windows must stay distinct (the useless same-bytes re-read is caught by content novelty, not the signature)"
+        );
+    }
+
+    #[tokio::test]
+    async fn padded_flail_with_stale_read_still_stops() {
+        let r = registry();
+        // Every turn pads a failing call with a throwaway echo of CONSTANT bytes. The old guard reset
+        // on the one non-failure result and never stopped; now the stale echo is not novel, so the
+        // unproductive streak climbs to a stop.
+        let c = AgentConfig { max_iters: 20, auto_extend_to: 20, ..cfg() };
+        let turns = vec![
+            multi_tool_turn(&[("fail", r#"{"n":"1"}"#), ("echo", r#"{"text":"same"}"#)]),
+            multi_tool_turn(&[("fail", r#"{"n":"2"}"#), ("echo", r#"{"text":"same"}"#)]),
+            multi_tool_turn(&[("fail", r#"{"n":"3"}"#), ("echo", r#"{"text":"same"}"#)]),
+            multi_tool_turn(&[("fail", r#"{"n":"4"}"#), ("echo", r#"{"text":"same"}"#)]),
+            multi_tool_turn(&[("fail", r#"{"n":"5"}"#), ("echo", r#"{"text":"same"}"#)]),
+            multi_tool_turn(&[("fail", r#"{"n":"6"}"#), ("echo", r#"{"text":"same"}"#)]),
+            multi_tool_turn(&[("fail", r#"{"n":"7"}"#), ("echo", r#"{"text":"same"}"#)]),
+            final_turn("unreached"),
+        ];
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
+        assert_eq!(out.stop, StopReason::Divergence, "a padded flail must still stop");
+    }
+
+    #[tokio::test]
+    async fn useless_successful_reread_loop_stops() {
+        let r = registry();
+        // Distinct args (no divergence) but the tool returns CONSTANT bytes — novel only once, then
+        // the streak climbs to a stop. A successful-but-useless loop must terminate, not run to cap.
+        let c = AgentConfig { max_iters: 20, auto_extend_to: 20, ..cfg() };
+        let turns = vec![
+            tool_turn("konst", r#"{"i":"1"}"#),
+            tool_turn("konst", r#"{"i":"2"}"#),
+            tool_turn("konst", r#"{"i":"3"}"#),
+            tool_turn("konst", r#"{"i":"4"}"#),
+            tool_turn("konst", r#"{"i":"5"}"#),
+            tool_turn("konst", r#"{"i":"6"}"#),
+            tool_turn("konst", r#"{"i":"7"}"#),
+            final_turn("unreached"),
+        ];
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
+        assert_eq!(out.stop, StopReason::Divergence, "a useless successful re-read loop must stop");
+    }
+
+    #[tokio::test]
+    async fn legit_reread_after_failed_edit_recovers() {
+        let r = registry();
+        // THE hardest trap: the system-prompt-sanctioned recovery — a failed edit, then a re-read
+        // (stale bytes) to copy exact text, then a SUCCESSFUL edit. Peak streak 2 < STUCK_NUDGE_STREAK,
+        // so NO nudge and NO stop — the recovery must never be punished.
+        let c = AgentConfig { auto_approve: true, max_iters: 10, auto_extend_to: 10, ..cfg() };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let chat = scripted(vec![
+            tool_turn("echo", r#"{"text":"filecontent"}"#), // seed: read the file
+            tool_turn("fail", r#"{}"#),                      // failed edit
+            tool_turn("echo", r#"{"text":"filecontent"}"#),  // re-read to copy exact text (stale bytes)
+            tool_turn("delete", r#"{"x":"1"}"#),             // successful edit → resets everything
+            final_turn("recovered"),
+        ]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done, "legit re-read→retry recovery must not be punished");
+        assert_eq!(out.final_text.as_deref(), Some("recovered"));
+        // Peak streak is 2 (< STUCK_NUDGE_STREAK) and no signature repeats, so NO nudge of either
+        // kind must appear — the documented "not punished" property, now asserted.
+        assert!(
+            !messages.iter().any(|m| m.role == "system"
+                && m.content.as_deref().is_some_and(|c| {
+                    c.starts_with(NUDGE_STUCK) || c.starts_with(NUDGE_DIVERGENCE)
+                })),
+            "the recovery path must trigger no divergence/stuck nudge"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_destructive_call_stops() {
+        let r = registry();
+        // A repeated IDENTICAL successful destructive call (same signature, same body — models
+        // `git commit --allow-empty`, `>> log`, a no-op file_write) must hard-stop as Divergence, not
+        // run to the extended cap re-executing the side effect. Regression guard: a successful edit is
+        // "productive" for the thrash streak but must NOT clear the divergence latch (only novel
+        // content does), or the insert()==false hard-stop becomes unreachable.
+        let c = AgentConfig { auto_approve: true, max_iters: 4, auto_extend_to: 20, ..cfg() };
+        let turns = vec![
+            tool_turn("delete", r#"{}"#),
+            tool_turn("delete", r#"{}"#),
+            tool_turn("delete", r#"{}"#),
+            tool_turn("delete", r#"{}"#),
+            tool_turn("delete", r#"{}"#),
+            final_turn("unreached"),
+        ];
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
+        assert_eq!(out.stop, StopReason::Divergence, "a repeated identical destructive call must stop");
+        assert_eq!(out.iters, 3, "must hard-stop by the 3rd identical call, not run to the extended cap");
+    }
+
+    #[tokio::test]
+    async fn large_task_many_distinct_edits_no_false_positive() {
+        let r = registry();
+        // A big task that lands many DISTINCT successful edits must never be flagged: each edit is
+        // productive (streak pinned 0) and distinct args keep signatures distinct (no divergence).
+        let c = AgentConfig { auto_approve: true, max_iters: 30, auto_extend_to: 30, ..cfg() };
+        let turns = vec![
+            tool_turn("delete", r#"{"d":"1"}"#),
+            tool_turn("delete", r#"{"d":"2"}"#),
+            tool_turn("delete", r#"{"d":"3"}"#),
+            tool_turn("delete", r#"{"d":"4"}"#),
+            tool_turn("delete", r#"{"d":"5"}"#),
+            tool_turn("delete", r#"{"d":"6"}"#),
+            tool_turn("delete", r#"{"d":"7"}"#),
+            tool_turn("delete", r#"{"d":"8"}"#),
+            final_turn("all done"),
+        ];
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
+        assert_eq!(out.stop, StopReason::Done, "a legit many-edit task must complete");
+        assert_eq!(out.final_text.as_deref(), Some("all done"));
+    }
+
+    #[tokio::test]
+    async fn repeat_after_progress_gets_fresh_nudge() {
+        let r = registry();
+        // W6: a repeated call, then genuine progress (clears the nudge memory), then the SAME call
+        // repeats again — it must earn a FRESH nudge and recover. The old run-global latch would have
+        // hard-stopped Divergence at the later repeat.
+        let c = AgentConfig { max_iters: 12, auto_extend_to: 12, ..cfg() };
+        let turns = vec![
+            tool_turn("echo", r#"{"text":"x"}"#),
+            tool_turn("echo", r#"{"text":"x"}"#), // immediate repeat → nudge
+            tool_turn("echo", r#"{"text":"y"}"#), // progress → clears nudged_sigs
+            tool_turn("echo", r#"{"text":"x"}"#),
+            tool_turn("echo", r#"{"text":"x"}"#), // repeat again → FRESH nudge (not a hard stop)
+            final_turn("recovered"),
+        ];
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
+        assert_eq!(out.stop, StopReason::Done, "a repeat after real progress gets a fresh nudge, not a stop");
+        assert_eq!(out.final_text.as_deref(), Some("recovered"));
+    }
+
+    #[tokio::test]
+    async fn maxiters_synthesizes_final_answer() {
+        let r = registry();
+        // W9: 3 productive echoes exhaust the cap; the tool-free synthesis call then produces a final
+        // answer where the old code returned None.
+        let c = AgentConfig { max_iters: 3, auto_extend_to: 3, ..cfg() };
+        let turns = vec![
+            tool_turn("echo", r#"{"text":"1"}"#),
+            tool_turn("echo", r#"{"text":"2"}"#),
+            tool_turn("echo", r#"{"text":"3"}"#),
+            final_turn("synth-answer"), // consumed by the synthesis call
+        ];
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
+        assert_eq!(out.stop, StopReason::MaxIters);
+        assert_eq!(out.iters, 3);
+        assert_eq!(out.final_text.as_deref(), Some("synth-answer"), "MaxIters must synthesize an answer");
+    }
+
+    #[tokio::test]
+    async fn maxiters_synthesis_degrades_to_none_on_error() {
+        let r = registry();
+        // If the synthesis call itself errors, MaxIters degrades to final_text None without panicking.
+        let c = AgentConfig { max_iters: 3, auto_extend_to: 3, ..cfg() };
+        let calls = Mutex::new(0usize);
+        let chat = move |msgs: Vec<Message>, _defs: Vec<ToolDef>| {
+            let is_synth = msgs
+                .last()
+                .and_then(|m| m.content.as_deref())
+                .is_some_and(|c| c.contains("reached the step limit"));
+            let mut n = calls.lock().unwrap();
+            *n += 1;
+            let out: Result<ChatTurn> = if is_synth {
+                Err(anyhow::anyhow!("synthesis boom"))
+            } else {
+                Ok(tool_turn("echo", &format!(r#"{{"text":"{n}"}}"#)))
+            };
+            std::future::ready(out)
+        };
+        let out = run_agent(chat, &c, &r, "sys", "task").await.unwrap();
+        assert_eq!(out.stop, StopReason::MaxIters);
+        assert_eq!(out.final_text, None, "a failed synthesis degrades cleanly to None");
+    }
+
+    #[tokio::test]
+    async fn maxiters_synthesis_uses_throwaway_clone_and_empty_defs() {
+        let r = registry();
+        let c = AgentConfig { max_iters: 2, auto_extend_to: 2, ..cfg() };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let saw_synth = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let defs_empty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ss = saw_synth.clone();
+        let de = defs_empty.clone();
+        let calls = Mutex::new(0usize);
+        let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| {
+            use std::sync::atomic::Ordering::Relaxed;
+            let is_synth = msgs
+                .last()
+                .and_then(|m| m.content.as_deref())
+                .is_some_and(|c| c.contains("reached the step limit"));
+            let mut n = calls.lock().unwrap();
+            *n += 1;
+            let out: Result<ChatTurn> = if is_synth {
+                ss.store(true, Relaxed);
+                de.store(defs.is_empty(), Relaxed);
+                Ok(final_turn("final answer"))
+            } else {
+                Ok(tool_turn("echo", &format!(r#"{{"text":"{n}"}}"#)))
+            };
+            std::future::ready(out)
+        };
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(out.stop, StopReason::MaxIters);
+        assert!(saw_synth.load(Relaxed), "the synthesis call must fire on MaxIters");
+        assert!(defs_empty.load(Relaxed), "synthesis must pass EMPTY tool defs (tool-free)");
+        assert_eq!(out.final_text.as_deref(), Some("final answer"));
+        // Throwaway-clone invariant (#3): the synthesis PROMPT must not leak into real history…
+        assert!(
+            !messages.iter().any(|m| m.content.as_deref().is_some_and(|c| c.contains("reached the step limit"))),
+            "the synthesis prompt must live only on the throwaway clone, never real messages"
+        );
+        // …but the synthesized ANSWER is appended so multi-turn callers keep it.
+        assert!(
+            messages.iter().any(|m| m.role == "assistant" && m.content.as_deref() == Some("final answer")),
+            "the synthesized answer must be appended for the caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn wanderer_not_auto_extended() {
+        let r = registry();
+        // W10: a wandering run (unproductive at the cap) must NOT be granted the extension — it
+        // proceeds to the MaxIters synthesis at the base cap instead of getting a bigger budget.
+        let c = AgentConfig { max_iters: 3, auto_extend_to: 6, ..cfg() };
+        let turns = vec![
+            tool_turn("fail", r#"{"n":"1"}"#),
+            tool_turn("fail", r#"{"n":"2"}"#),
+            tool_turn("fail", r#"{"n":"3"}"#),
+            final_turn("final"),
+        ];
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
+        assert_eq!(out.stop, StopReason::MaxIters, "a wanderer must hit MaxIters, not get extended");
+        assert_eq!(out.iters, 3, "the extension to 6 must be denied");
     }
 
     #[tokio::test]

@@ -62,8 +62,44 @@ static BLOCKLIST: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         (r"(?i)\bformat\s+[a-z]:", "format a Windows drive"),
         (r"(?i)\b(del|erase)\s+(/[a-z]\s+)*[a-z]:\\?(\s|\*|$)", "force-delete a Windows drive root"),
         (r"(?i)\b(rd|rmdir)\s+(/[a-z]\s+)*[a-z]:\\?(\s|$)", "recursive remove of a Windows drive root"),
+        // PowerShell recursive force-delete of a drive/home root (`Remove-Item` + its `ri` alias). PS
+        // spells the flags separately, so require BOTH a recurse flag (`-r…`/`-Recurse`) AND a force flag
+        // (`-fo…`/`-Force`) — matched in EITHER order — plus a ROOT target (a bare drive `C:` / `C:\`, `~`,
+        // `$HOME`, `$env:USERPROFILE`, `$env:SystemDrive`). A specific subdir (`Remove-Item -Recurse -Force
+        // C:\Users\me\build`) has a non-terminal path after the drive → the trailing anchor fails → stays
+        // Ask. `[^;|&\n]*` keeps each run inside one segment so it can't span a chain. (`-fo…` starts at
+        // `-fo`, never `-f`, so `-Filter`/`-fi…` is not mistaken for `-Force`.)
+        (r"(?i)\b(remove-item|ri)\b[^;|&\n]*\s-r[a-z]*\b[^;|&\n]*\s-fo[a-z]*\b[^;|&\n]*\s([a-z]:\\?|~|\$home|\$env:userprofile|\$env:systemdrive)(\s|\*|$)",
+            "recursive force-delete of a drive/home root"),
+        (r"(?i)\b(remove-item|ri)\b[^;|&\n]*\s-fo[a-z]*\b[^;|&\n]*\s-r[a-z]*\b[^;|&\n]*\s([a-z]:\\?|~|\$home|\$env:userprofile|\$env:systemdrive)(\s|\*|$)",
+            "recursive force-delete of a drive/home root"),
+        // git-bash on Windows: `rm -rf C:\` / `rm -rf C:` wipes a whole drive — the POSIX-root pattern
+        // above only covers `/`. Bare drive or drive-root only; a subdir (`C:/Users/..`) stays Ask.
+        (r"(?i)\brm\s+(-{1,2}[a-z-]+\s+)*(-[a-z]*[rf][a-z]*|--recursive|--force)(\s+-{1,2}[a-z-]+)*\s+[a-z]:[\\/]?(\s|\*|$)",
+            "recursive delete of a Windows drive root"),
         // Overwrite the master boot record / wipe with zeros from /dev/zero onto a device.
         (r"(?i)\bdd\b[^\n]*\bif=\s*/dev/(zero|random|urandom)[^\n]*\bof=\s*/dev/", "wipe a raw device"),
+        // ── shell file-blanking (data-loss anti-pattern) ────────────────────────────────
+        // Blanking a file to "rewrite it from scratch" is the exact move that destroys a file and
+        // then fails: `type NUL > f`, `echo. > f`, `copy nul f`, `cp /dev/null f`, `truncate -s 0 f`.
+        // There is a first-class tool (`file_write`) for create/overwrite, so these have no
+        // legitimate use in a coding workspace — refuse and point at it. NOTE: `echo text > f`
+        // (real content) does NOT match; only the empty-source spellings do.
+        (r"(?i)\btype\s+nul\s*>", "shell file-blanking — use the file_write tool to create/overwrite files"),
+        (r"(?i)\bcopy\s+(/[a-z]+\s+)*nul\s+[^\s>]", "shell file-blanking — use the file_write tool to create/overwrite files"),
+        (r"(?i)\becho\s*\.?\s*>\s*[^>\s]", "shell file-blanking — use the file_write tool to create/overwrite files"),
+        (r"(?i)\bcat\s+/dev/null\s*>", "shell file-blanking — use the file_write tool to create/overwrite files"),
+        (r"(?i)\bcp\s+/dev/null\s+[^\s>]", "shell file-blanking — use the file_write tool to create/overwrite files"),
+        (r#"(?i)\bprintf\s+(''|"")\s*>"#, "shell file-blanking — use the file_write tool to create/overwrite files"),
+        (r"(?i)\btruncate\s+-s\s*0\b", "shell file-blanking — use the file_write tool to create/overwrite files"),
+        // PowerShell / bash blanking cousins. `Clear-Content f` and `Set-Content f $null` (or `… ''`/`""`)
+        // empty a file in place; a bare `> f` or `: > f` truncates with NO producing command. A real write
+        // (`Set-Content f 'text'`, `echo x > f`) keeps its content and is NOT matched: the bare-redirect
+        // pattern only fires when the `>` sits at a segment start (after `^` or `; | &`, optionally a no-op
+        // `:`), so a `>` that follows a real command is left alone. `>>` (append) never matches.
+        (r"(?i)\bclear-content\b", "shell file-blanking — use the file_write tool to create/overwrite files"),
+        (r#"(?i)\bset-content\b[^;|&\n]*\s(\$null|''|"")\s*($|[;|&])"#, "shell file-blanking — use the file_write tool to create/overwrite files"),
+        (r"(?i)(^|[;|&])\s*:?\s*>\s*[^>\s]", "shell file-blanking — use the file_write tool to create/overwrite files"),
     ];
     pats.iter().map(|(p, r)| (Regex::new(p).unwrap(), *r)).collect()
 });
@@ -222,6 +258,77 @@ mod tests {
         assert!(blocked("format C:"));
         assert!(blocked("del /f /s /q C:\\"));
         assert!(blocked("rd /s /q C:\\"));
+    }
+
+    #[test]
+    fn blocks_shell_file_blanking() {
+        // The exact data-loss move from the field report + its cousins.
+        assert!(blocked("type NUL > index.html"));
+        assert!(blocked("type nul>src/main.rs"));
+        assert!(blocked("echo. > file.txt"));
+        assert!(blocked("echo > file.txt"));
+        assert!(blocked("copy /y nul index.html"));
+        assert!(blocked("copy nul out.js"));
+        assert!(blocked("cat /dev/null > log.txt"));
+        assert!(blocked("cp /dev/null app.py"));
+        assert!(blocked("printf '' > f"));
+        assert!(blocked("truncate -s 0 big.log"));
+        // …even smuggled behind a chain.
+        assert!(blocked("cd src && type NUL > main.rs"));
+    }
+
+    #[test]
+    fn file_blanking_block_does_not_overreach() {
+        // Real content written to a file is NOT blanking → still just Ask (a normal write op).
+        assert!(!blocked("echo hello > out.txt"));
+        assert!(!blocked("echo \"x\" > cfg.json"));
+        assert!(!blocked("cat header.txt > combined.txt"));
+        assert!(!blocked("copy a.txt b.txt")); // nul not the source
+        assert!(!blocked("printf 'data' > f"));
+        assert_eq!(classify("echo hi > out.txt"), Verdict::Ask);
+    }
+
+    #[test]
+    fn blocks_powershell_destructive() {
+        // Remove-Item nuking a drive/home root — both flag orders, the `ri` alias, abbreviations.
+        assert!(blocked("Remove-Item -Recurse -Force C:\\"));
+        assert!(blocked("Remove-Item -Force -Recurse C:\\"));
+        assert!(blocked("Remove-Item -Recurse -Force C:"));
+        assert!(blocked("ri -r -fo ~"));
+        assert!(blocked("Remove-Item -Recurse -Force $HOME"));
+        assert!(blocked("Remove-Item -Recurse -Force $env:SystemDrive"));
+        assert!(blocked("remove-item -recurse -force C:\\*"));
+        // git-bash on Windows wiping a whole drive.
+        assert!(blocked("rm -rf C:\\"));
+        assert!(blocked("rm -rf C:"));
+        assert!(blocked("rm -rf C:/"));
+        // …smuggled behind a harmless prefix.
+        assert!(blocked("cd repo && Remove-Item -Recurse -Force C:\\"));
+        // PowerShell / bash file-blanking cousins.
+        assert!(blocked("Clear-Content important.txt"));
+        assert!(blocked("Set-Content app.js $null"));
+        assert!(blocked("Set-Content app.js ''"));
+        assert!(blocked("> wiped.txt"));
+        assert!(blocked(": > wiped.txt"));
+        assert!(blocked("cd src && > main.rs"));
+    }
+
+    #[test]
+    fn powershell_block_does_not_overreach() {
+        // A specific subdirectory is risky-but-legit → Ask, NOT Blocked.
+        assert!(!blocked("Remove-Item -Recurse -Force C:\\Users\\me\\build"));
+        assert!(!blocked("Remove-Item build -Recurse -Force"));
+        assert!(!blocked("Remove-Item old.txt"));
+        assert!(!blocked("rm -rf C:/Users/me/project")); // drive subdir, not the root
+        // Set-Content writing REAL content (incl. code that mentions $null / "") must not block.
+        assert!(!blocked("Set-Content app.js 'console.log(1)'"));
+        assert!(!blocked("Set-Content script.ps1 'if ($x -eq $null) {}'"));
+        assert!(!blocked("Set-Content s.ps1 'let a = \"\"'"));
+        // Not Clear-Content; a normal read; an append (>>) is not a blank.
+        assert!(!blocked("Clear-Host"));
+        assert!(!blocked("Get-Content app.js"));
+        assert!(!blocked("echo log >> app.log"));
+        assert_eq!(classify("Remove-Item old.txt"), Verdict::Ask);
     }
 
     #[test]
