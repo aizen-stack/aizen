@@ -261,7 +261,7 @@ async fn self_poll_for_approval(client: &Client, id: &str) -> bool {
                 if !warned_conflict && e.to_string().contains("409") {
                     warned_conflict = true;
                     eprintln!(
-                        "[telegram] getUpdates 409 Conflict — another process (likely `ng serve`) is \
+                        "[telegram] getUpdates 409 Conflict — another process (likely `aizen serve`) is \
                          already polling this bot token; this standalone approval may not receive the \
                          callback. Approve in that process, or stop it."
                     );

@@ -9,7 +9,7 @@
 
 ## 1. What Aizen is
 
-**Aizen** (binary `aizen`, short alias `ng` — both are the same binary) is a **single-binary, provider-agnostic agentic coding CLI**. It talks to any **OpenAI-compatible** endpoint (OpenAI, Anthropic via compatible gateway, local servers, etc.), and bundles an unusually deep set of capabilities into one fast, pure-Rust static executable — no Node, no Python, no external `rg`/browser engine required.
+**Aizen** (binary `aizen`) is a **single-binary, provider-agnostic agentic coding CLI**. It talks to any **OpenAI-compatible** endpoint (OpenAI, Anthropic via compatible gateway, local servers, etc.), and bundles an unusually deep set of capabilities into one fast, pure-Rust static executable — no Node, no Python, no external `rg`/browser engine required.
 
 The product's three-line pitch (from the splash): *"One fast binary: chat · tools · automation · a memory that learns you."*
 
@@ -31,11 +31,11 @@ Aizen is the same engine exposed through five distinct surfaces. Each needs its 
 
 | Surface | Entry | Character | Design implication |
 |---|---|---|---|
-| **Interactive TUI / REPL** | `ng agent` (or bare `ng` after setup) | Sticky-footer chat with live slash palette, HUD, streaming markdown | The flagship screen — most UI work lives here (§4) |
-| **Landing menu** | bare `ng` (first run / not configured) | Branded splash + arrow-key setup wizard | First impression; onboarding flow (§4.2) |
-| **One-shot commands** | `ng chat`, `ng memory …`, `ng crawl`, etc. | Plain stdin/stdout, pipe-safe, no chrome | Docs-driven; clean text output, scriptable |
-| **Always-on daemons (bots)** | `ng serve` (Telegram), `ng discord serve` | Headless; chat from your phone/Discord, approvals via inline buttons | Mobile/remote UX; setup wizards |
-| **Scheduled jobs** | `ng cron add …` (OS scheduler) | Unattended; logs to file | Config + log-viewing UX |
+| **Interactive TUI / REPL** | `aizen agent` (or bare `aizen` after setup) | Sticky-footer chat with live slash palette, HUD, streaming markdown | The flagship screen — most UI work lives here (§4) |
+| **Landing menu** | bare `aizen` (first run / not configured) | Branded splash + arrow-key setup wizard | First impression; onboarding flow (§4.2) |
+| **One-shot commands** | `aizen chat`, `aizen memory …`, `aizen crawl`, etc. | Plain stdin/stdout, pipe-safe, no chrome | Docs-driven; clean text output, scriptable |
+| **Always-on daemons (bots)** | `aizen serve` (Telegram), `aizen discord serve` | Headless; chat from your phone/Discord, approvals via inline buttons | Mobile/remote UX; setup wizards |
+| **Scheduled jobs** | `aizen cron add …` (OS scheduler) | Unattended; logs to file | Config + log-viewing UX |
 
 A key cross-cutting fact for design: **output adapts to context** — rich ANSI/markdown when attached to a TTY, plain raw text when piped/in CI. The UI must look great in a terminal *and* degrade cleanly.
 
@@ -45,12 +45,12 @@ A key cross-cutting fact for design: **output adapts to context** — rich ANSI/
 
 ### A. Chat & the agentic loop
 
-**One-shot chat — `ng chat`**
+**One-shot chat — `aizen chat`**
 - Streaming chat completion against an OpenAI-compatible endpoint. Prompt from `--prompt`/arg or stdin.
-- Resolution order for every connection field: **CLI flag → env var (`NG_BASE_URL` / `NG_API_KEY` / `NG_MODEL`) → saved config**.
+- Resolution order for every connection field: **CLI flag → env var (`AIZEN_BASE_URL` / `AIZEN_API_KEY` / `AIZEN_MODEL`) → saved config**.
 - Streams tokens live with a braille "thinking" spinner; renders markdown on a TTY, raw on a pipe.
 
-**The agent loop — `ng agent <task>`**
+**The agent loop — `aizen agent <task>`**
 - A lean 6-step state machine per turn: **call model (with tools) → classify (a non-empty `tool_calls[]` is the signal, *not* `finish_reason`) → execute each tool (validate → gate destructive ops → truncate result → feed errors back) → append results → check convergence → loop.**
 - **Iteration caps:** default 25 steps (`--max-iters`), with a **one-time auto-extend to ~50** when the model is near the cap and asked to wrap up. Hitting the wall ends with a clear `MaxIters` stop.
 - **Divergence guard:** if the model repeats the exact same tool calls two turns running, it gets one recovery nudge, then stops (`Divergence`).
@@ -62,7 +62,7 @@ A key cross-cutting fact for design: **output adapts to context** — rich ANSI/
 - The agent can dispatch a **focused sub-agent** with a fresh context and a role-scoped toolset for one self-contained sub-task; only the sub-agent's final text returns to the parent.
 - **Roles:** `coder` (read/edit/shell), `tester` (shell, no edits), `planner`/`reviewer` (read-only). Sub-agents can't recurse (no `task` tool inside a task) and inherit the parent's `--yes`.
 
-**Multi-agent workflow — `ng workflow <spec.json>`**
+**Multi-agent workflow — `aizen workflow <spec.json>`**
 - **Mixture-of-agents fan-out:** runs a set of role-scoped sub-agents concurrently (each with its own `role`, `prompt`, and optional per-task `model`), then a **synthesis pass** merges their outputs into one deliverable.
 - Per-task model diversity (cheap models scout, a strong model judges/synthesizes). Errors in one task don't abort siblings.
 - **Spec shape:** `{name, tasks:[{id,role,prompt,model?}], synthesis?:{model?,prompt?}}`. Flags: `--trace <file>` writes a JSON audit (per-task model + status + iters + summary), `--yes`, `--model`.
@@ -121,7 +121,7 @@ Every tool is one clear capability. Tools are either **read-only** (run freely, 
 
 ---
 
-### D. Memory brain — `ng memory …`
+### D. Memory brain — `aizen memory …`
 
 The headline differentiator. **One fact = one markdown file** under `~/.aizen/cli-memory/entries/<id>.md` with YAML frontmatter (name, description, `type`, created/updated, and learned-fact metadata: source, confidence, reinforced count, sessions, validTo, supersededBy).
 
@@ -148,13 +148,13 @@ The headline differentiator. **One fact = one markdown file** under `~/.aizen/cl
 **Key concepts to document:**
 - **Frozen core** — the `<memory>` block injected into *every* prompt prefix. Built fresh at **session start**, then **immutable mid-session** (keeps the prefix byte-stable so provider prompt-caching stays warm). STYLE.md pinned first, then top `user` facts by salience, capped (~2000 tokens); overflow spills to the searchable long tail.
 - **Passive auto-learning** (on by default): free regex extraction (zero token cost) → sanitize (neutralize tag-breakouts/control chars) → **threat-scan** (reject prompt-injection/secrets, fail-closed) → **consolidate** (near-duplicates *reinforce* an existing fact instead of duplicating) → **route by confidence** (drop / queue-for-review / store / promote-to-STYLE.md with confirmation).
-- **Retrieval & ranking:** a BM25 **lexical floor** (always on), an optional **fuzzy** Jaro-Winkler bridge (`NG_MEM_FUZZY=1`), and an optional **dense semantic** tier via RRF fusion (`NG_MEM_DENSE=1`, `--features dense` build). Final score = `BM25 × decay × salience` — **facts rise/sink on reuse and reinforcement, not age alone**.
+- **Retrieval & ranking:** a BM25 **lexical floor** (always on), an optional **fuzzy** Jaro-Winkler bridge (`AIZEN_MEM_FUZZY=1`), and an optional **dense semantic** tier via RRF fusion (`AIZEN_MEM_DENSE=1`, `--features dense` build). Final score = `BM25 × decay × salience` — **facts rise/sink on reuse and reinforcement, not age alone**.
 - **Anti-bloat:** LRU caps + archive (recoverable), recency decay (inferred facts only), dedup-on-write, supersede. Deliberate (manual) facts never auto-evict.
 - **Derived views are free/local** (no LLM): `profile` and `ask` compute deterministically and cite their basis; `ask` has a hard **abstain firewall** for unknowns.
 
 ---
 
-### E. Personas & self-memory — `ng persona …`
+### E. Personas & self-memory — `aizen persona …`
 
 A **persona** is a character the agent role-plays — a markdown "character card" (`~/.aizen/personas/<name>.md`, frontmatter: name/role/voice + body). The active persona is injected as a `<persona>` block.
 
@@ -164,7 +164,7 @@ A **persona** is a character the agent role-plays — a markdown "character card
 
 ---
 
-### F. Soul — `ng soul …`
+### F. Soul — `aizen soul …`
 
 The **durable operating identity** — values/policies that hold across **every** persona and project (e.g. "always run tests before claiming done," "reply in Vietnamese"). Stored at `~/.aizen/SOUL.md` (**HOME-only by design** — a project-local soul would let a cloned repo silently rewrite the agent's rules). Injected as `<agent_identity>`.
 
@@ -174,59 +174,59 @@ The **durable operating identity** — values/policies that hold across **every*
 
 ### G. Skills & custom commands
 
-**Skills — `ng skill …`** — reusable named **procedures** (markdown playbooks the *agent* loads on demand). Stored at `~/.aizen/skills/<name>.md` (project `./.aizen/skills/` overrides). Frontmatter: name/description/`when`, plus optional `requires:` (hidden unless those tools are present) and `platforms:` (hidden unless OS matches). A compact `<skills>` index (name → when) is injected into the prompt; the agent pulls the full body via `skill_load`.
+**Skills — `aizen skill …`** — reusable named **procedures** (markdown playbooks the *agent* loads on demand). Stored at `~/.aizen/skills/<name>.md` (project `./.aizen/skills/` overrides). Frontmatter: name/description/`when`, plus optional `requires:` (hidden unless those tools are present) and `platforms:` (hidden unless OS matches). A compact `<skills>` index (name → when) is injected into the prompt; the agent pulls the full body via `skill_load`.
 - Subcommands: `list`, `show`, `add [--description --when --body]`, `delete`, `fetch <url> [--name]`, `search <keywords> [--limit]` and `install <owner/name>` from the **agentskill.sh marketplace** (results show quality + security scores; install is approval-gated as third-party content).
 
 **Custom slash commands** (`./.aizen/commands/**.md` or `~/.aizen/commands/`) — user-defined **prompt-macros** the *user* fires by name (`/git:commit`). Subdirectories namespace them (`commands/git/commit.md` → `/git:commit`); project overrides global. Frontmatter: `description`, `argument-hint`. Template expansion at fire time: `$ARGUMENTS`, `$1..$9`, `@<path>` (inline a cwd-confined file), and `` !`cmd` `` (splice a **read-only** shell command's output, gated by the same `cmd_guard` floor — destructive commands are refused, never run).
 
 ---
 
-### H. Apps & MCP — `ng apps …` / `ng mcp …`
+### H. Apps & MCP — `aizen apps …` / `aizen mcp …`
 
 Connect third-party tools via the **Model Context Protocol** registry. Config lives in `~/.aizen/mcp.json` (project `./.aizen/mcp.json` loaded only after explicit **trust**).
 
 **Featured catalog:** GitHub, Notion, Slack, Linear, Spotify, Google/Gmail, … Three transports: **local (stdio)** (npx/uvx/docker on your machine, your keys), **static-token remote** (header auth), and **OAuth remote** (real OAuth 2.1 PKCE browser sign-in; tokens cached `0600` at `~/.aizen/mcp-tokens/`).
 
-**`ng apps` subcommands:** `list` (featured + custom, ✓/○ connection badges), `search <keywords>`, `add <name>` (interactive: pick a server with a ★-recommended local-first default, runtime-on-PATH check, explicit third-party/OAuth confirm gates, masked-secret review before writing), `info <key>` (config + **live probe** of the tools it exposes), `login <key>` (OAuth), `remove <key>`.
+**`aizen apps` subcommands:** `list` (featured + custom, ✓/○ connection badges), `search <keywords>`, `add <name>` (interactive: pick a server with a ★-recommended local-first default, runtime-on-PATH check, explicit third-party/OAuth confirm gates, masked-secret review before writing), `info <key>` (config + **live probe** of the tools it exposes), `login <key>` (OAuth), `remove <key>`.
 
-**`ng mcp` subcommands:** `list` (connected servers + tools), `login <name>`, `trust` / `untrust` (the supply-chain gate for project-local servers).
+**`aizen mcp` subcommands:** `list` (connected servers + tools), `login <name>`, `trust` / `untrust` (the supply-chain gate for project-local servers).
 
 ---
 
 ### I. Channels — bots & notifications
 
-**Telegram daemon — `ng serve`** — the long-lived bot: long-polls Telegram, runs the agent per message, keeps **persistent per-chat history** (follow-ups like "now fix it" keep context, capped ~40 msgs). In-chat commands: `/help`·`/start`, `/new`·`/reset`, `/resume`, and `/agent <task>` (autonomous mode). **Destructive-op approvals route to inline ✓/✗ buttons on your phone.** Replies chunked to ≤3500 chars.
-- Setup — `ng telegram setup` (paste BotFather token → message the bot to capture your chat id), `test`, `show`. Allowed-chat allowlist (empty = deny everyone).
+**Telegram daemon — `aizen serve`** — the long-lived bot: long-polls Telegram, runs the agent per message, keeps **persistent per-chat history** (follow-ups like "now fix it" keep context, capped ~40 msgs). In-chat commands: `/help`·`/start`, `/new`·`/reset`, `/resume`, and `/agent <task>` (autonomous mode). **Destructive-op approvals route to inline ✓/✗ buttons on your phone.** Replies chunked to ≤3500 chars.
+- Setup — `aizen telegram setup` (paste BotFather token → message the bot to capture your chat id), `test`, `show`. Allowed-chat allowlist (empty = deny everyone).
 
-**Discord bot — `ng discord …`** — two-way gateway bot (`setup`/`test`/`serve`/`show`/`disable`); needs the privileged MESSAGE_CONTENT intent; channel allowlist; same in-chat commands; replies chunked to ≤1900 chars. (Inline-button approvals not yet wired — use `/agent` for autonomous edits.)
+**Discord bot — `aizen discord …`** — two-way gateway bot (`setup`/`test`/`serve`/`show`/`disable`); needs the privileged MESSAGE_CONTENT intent; channel allowlist; same in-chat commands; replies chunked to ≤1900 chars. (Inline-button approvals not yet wired — use `/agent` for autonomous edits.)
 
-**Notifications (`notify` tool + config)** — one-way outbound to **Discord webhook / Slack / generic webhook**; `broadcast` posts to all configured channels. Useful for unattended runs ("report progress"). Env overrides: `NG_DISCORD_WEBHOOK`, `NG_SLACK_WEBHOOK`, `NG_WEBHOOK_URL`.
+**Notifications (`notify` tool + config)** — one-way outbound to **Discord webhook / Slack / generic webhook**; `broadcast` posts to all configured channels. Useful for unattended runs ("report progress"). Env overrides: `AIZEN_DISCORD_WEBHOOK`, `AIZEN_SLACK_WEBHOOK`, `AIZEN_WEBHOOK_URL`.
 
 ---
 
 ### J. Standalone capabilities
 
-**Web crawler — `ng crawl <url…>`** — katana-style BFS: extracts links from HTML and endpoints from JS. Flags: `--depth`, `--max-pages`, `--scope strict|subs`, `--concurrency`, `--timeout`, `--json`, `--show-source`. SSRF floor applies.
+**Web crawler — `aizen crawl <url…>`** — katana-style BFS: extracts links from HTML and endpoints from JS. Flags: `--depth`, `--max-pages`, `--scope strict|subs`, `--concurrency`, `--timeout`, `--json`, `--show-source`. SSRF floor applies.
 
-**Time machine — `ng time …`** — git-backed snapshots of the **whole working tree** (tracked + untracked, honoring `.gitignore`) stored on private refs — **never touches your real index/HEAD/branches**. `save [label]`, `list` (▸ marks the active point), `restore <id>` (auto-saves current state first), `undo`, `redo`, `prune [--keep N]`, `clear`. The agent can call `checkpoint` before risky edits. Retention cap `timemachine_keep` (default 50).
+**Time machine — `aizen time …`** — git-backed snapshots of the **whole working tree** (tracked + untracked, honoring `.gitignore`) stored on private refs — **never touches your real index/HEAD/branches**. `save [label]`, `list` (▸ marks the active point), `restore <id>` (auto-saves current state first), `undo`, `redo`, `prune [--keep N]`, `clear`. The agent can call `checkpoint` before risky edits. Retention cap `timemachine_keep` (default 50).
 
-**Scheduled jobs — `ng cron …`** — register agent tasks with the **OS scheduler** (Windows Task Scheduler / Unix crontab) — no daemon. `add <name> --schedule <daily@HH:MM|hourly|Nm|Nh> --task "…"`, `list`, `remove`. Runs unattended (`auto_approve`, hard floor still applies), pins the model at creation, logs each run to `~/.aizen/cron/<name>.log`.
+**Scheduled jobs — `aizen cron …`** — register agent tasks with the **OS scheduler** (Windows Task Scheduler / Unix crontab) — no daemon. `add <name> --schedule <daily@HH:MM|hourly|Nm|Nh> --task "…"`, `list`, `remove`. Runs unattended (`auto_approve`, hard floor still applies), pins the model at creation, logs each run to `~/.aizen/cron/<name>.log`.
 
 ---
 
 ### K. Config, models & provider
 
-**Config — `ng config`** — interactive setup wizard (base URL + key + pick a model from the live `/models` list) or `set` / `show` (key masked) / `path`. Saved at `~/.aizen/config.json`.
+**Config — `aizen config`** — interactive setup wizard (base URL + key + pick a model from the live `/models` list) or `set` / `show` (key masked) / `path`. Saved at `~/.aizen/config.json`.
 
 **Config fields:** `base_url`, `api_key`, `model`, `model_context_window` (override), `compact_threshold_pct` (auto-compact at %, default 80, 0=off), `auto_skill_learn`, `memory_auto_learn`, `persona_evolve`, `persona` (active), `timemachine_keep`, `price_in`/`price_out` (enable `/cost` USD estimate), `icons` (emoji/nerd/off), `onboarded`.
 
-**Models — `ng models`** — lists provider models (with context windows when advertised). Feeds the `/model` picker.
+**Models — `aizen models`** — lists provider models (with context windows when advertised). Feeds the `/model` picker.
 
 **Provider client** — OpenAI-compatible streaming + tool-calling. **Auto-detects Anthropic models** and inserts prompt-cache breakpoints (free, warms the cache). A **process-global cost meter** accumulates tokens across every call (real provider usage when reported, else chars/4 estimate), surfaced via `/cost`.
 
 ---
 
-### L. Benchmarks — `ng bench …`
+### L. Benchmarks — `aizen bench …`
 
 Internal quality gates (useful for a "trust/quality" docs section, not end-user UI): `memory` (anti-oracle recall, with `--split`, `--hybrid`, `--evolution`), `profile` (B2 golden set), `dialectic` (B3 Q&A incl. abstain-when-unknown).
 
@@ -239,7 +239,7 @@ A **sticky-footer REPL**: the input box is pinned to the bottom; the agent's wor
 ### 4.1 In-chat slash commands (live-filtered palette, ~7 rows, Tab/↑↓ to pick)
 `/help` · `/model` (pick model, shows context windows) · `/sessions` (save/restore/delete chats) · `/timeline` (`/tm`) and `/checkpoint` (`/cp`,`/snapshot`) — time machine · `/compact` (compress context) · `/memory` (`/mem`) · `/persona` (`/character`) · `/skills` · `/apps` · `/mcp` · `/commands` (custom) · `/telegram` (`/tg`) · `/serve` · `/config` (`/setup`) · `/yolo` (toggle auto-approve) · `/smart` (toggle smart approval) · `/cost` (`/usage`) · `/tokens` · `/clear` (`/new`,`/reset`) · `/quit` (`/exit`,`/q`). Plus any user **custom commands**.
 
-### 4.2 Landing & onboarding (bare `ng`)
+### 4.2 Landing & onboarding (bare `aizen`)
 Branded **splash** (sun logo via sixel where supported, else braille; block-art "AIZEN" wordmark, tagline "ARTIFICIAL INTELLIGENCE AGENT"), a one-time welcome ("about 30 seconds"), then the **setup wizard**: base URL → API key (hidden) → model picker (live list with context windows, or a custom-id option) → optional compact threshold → optional messaging-app connect. The full splash also renders a **capabilities panel** (tool groups + command list + "N tools · M commands").
 
 ### 4.3 HUD / status line
@@ -260,7 +260,7 @@ Live markdown rendering: syntax-highlighted code fences, gold headings/bullets, 
 
 - **One signature accent: warm gold-noir** (256-color `178`). Used for borders (`╭╮╰╯│─`), command/section/item names, the assistant gutter, spinners, badges. This single-accent restraint is the brand's visual signature — keep it.
 - **Semantic colors only where they carry meaning:** green = ok/`✓`/`● on`, red = error/`○ off`, blue = links/model names/URLs, amber = warnings, dim grey = secondary text.
-- **Three icon tiers** (user-selectable via `icons` config / `NG_NERD` / `NG_NO_ICONS`): **emoji** (default; 🧠 memory, 📘 skills, 📂 files, 💻 shell, 🌐 web, 🎭 persona, 🤝 delegate, 🔌 mcp, 🧩 apps…), **Nerd Font** (crisp PUA glyphs), or **off** (plain `•`).
+- **Three icon tiers** (user-selectable via `icons` config / `AIZEN_NERD` / `AIZEN_NO_ICONS`): **emoji** (default; 🧠 memory, 📘 skills, 📂 files, 💻 shell, 🌐 web, 🎭 persona, 🤝 delegate, 🔌 mcp, 🧩 apps…), **Nerd Font** (crisp PUA glyphs), or **off** (plain `•`).
 - **Layout:** monospace grid, content truncated to box width (never wraps), aligned columns, boxed panels with gold borders.
 - **Identity marks:** sun logo + "AIZEN" silver-gradient block wordmark on the splash.
 - **Adaptive chrome:** full ANSI on a TTY, plain text when piped — the visual system must have a clean no-color fallback.
@@ -287,21 +287,21 @@ This stack — *operating policy → character → lived experience → who the 
 
 | Command | Summary |
 |---|---|
-| `ng` | Landing menu / interactive REPL (after setup). |
-| `ng chat [--prompt]` | One-shot streaming chat. |
-| `ng agent <task> [--yes --max-iters -m]` | Run the agentic loop. |
-| `ng workflow <spec.json> [--trace --yes -m]` | Multi-agent fan-out + synthesis. |
-| `ng memory <add\|list\|show\|search\|frozen\|learn\|style\|profile\|ask\|review\|as-of\|supersede\|archive\|restore\|compact>` | The memory brain. |
-| `ng skill <list\|show\|add\|delete\|fetch\|search\|install>` | Reusable procedures. |
-| `ng persona <list\|show\|new\|use\|clear\|self\|remember\|block>` | Characters + self-memory. |
-| `ng soul <show\|set\|clear\|path>` | Durable operating identity. |
-| `ng config [set\|show\|path]` · `ng models` | Endpoint setup / list models. |
-| `ng apps <list\|search\|add\|info\|login\|remove>` · `ng mcp <list\|login\|trust\|untrust>` | Apps & MCP. |
-| `ng serve` · `ng telegram <setup\|test\|show>` · `ng discord <setup\|test\|serve\|show\|disable>` | Bots. |
-| `ng crawl <url…>` | Website crawler. |
-| `ng time <save\|list\|restore\|undo\|redo\|prune\|clear>` | Time machine. |
-| `ng cron <add\|list\|remove>` | OS-scheduled jobs. |
-| `ng bench <memory\|profile\|dialectic>` | Quality benchmarks. |
+| `aizen` | Landing menu / interactive REPL (after setup). |
+| `aizen chat [--prompt]` | One-shot streaming chat. |
+| `aizen agent <task> [--yes --max-iters -m]` | Run the agentic loop. |
+| `aizen workflow <spec.json> [--trace --yes -m]` | Multi-agent fan-out + synthesis. |
+| `aizen memory <add\|list\|show\|search\|frozen\|learn\|style\|profile\|ask\|review\|as-of\|supersede\|archive\|restore\|compact>` | The memory brain. |
+| `aizen skill <list\|show\|add\|delete\|fetch\|search\|install>` | Reusable procedures. |
+| `aizen persona <list\|show\|new\|use\|clear\|self\|remember\|block>` | Characters + self-memory. |
+| `aizen soul <show\|set\|clear\|path>` | Durable operating identity. |
+| `aizen config [set\|show\|path]` · `aizen models` | Endpoint setup / list models. |
+| `aizen apps <list\|search\|add\|info\|login\|remove>` · `aizen mcp <list\|login\|trust\|untrust>` | Apps & MCP. |
+| `aizen serve` · `aizen telegram <setup\|test\|show>` · `aizen discord <setup\|test\|serve\|show\|disable>` | Bots. |
+| `aizen crawl <url…>` | Website crawler. |
+| `aizen time <save\|list\|restore\|undo\|redo\|prune\|clear>` | Time machine. |
+| `aizen cron <add\|list\|remove>` | OS-scheduled jobs. |
+| `aizen bench <memory\|profile\|dialectic>` | Quality benchmarks. |
 
 ---
 
@@ -328,7 +328,7 @@ Home root: **`~/.aizen/`** (auto-migrated from legacy `~/.nextgen/`). Project-lo
 ## 9. Hand-off notes for the designer
 
 **Docs (information architecture suggestion):**
-1. *Getting started* — install (one binary), `ng config`, first chat.
+1. *Getting started* — install (one binary), `aizen config`, first chat.
 2. *The agent* — loop, tools, approval/safety, verify gate.
 3. *Memory brain* — the killer feature; lead with "it learns you," then the subcommand reference.
 4. *Identity* — Soul → Persona → Self-memory, with the layered-prompt diagram (§6).

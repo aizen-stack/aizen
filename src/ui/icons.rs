@@ -3,10 +3,10 @@
 //! A terminal can't render image icons — only text glyphs. We offer:
 //! - **emoji** (default): width-2 emoji that render on any modern terminal (Windows Terminal,
 //!   iTerm, …) WITHOUT a special font — no tofu on a default install.
-//! - **nerd** (`NG_NERD=1`): dev-style Nerd Font glyphs (Font Awesome codepoints in the Private
+//! - **nerd** (`AIZEN_NERD=1`): dev-style Nerd Font glyphs (Font Awesome codepoints in the Private
 //!   Use Area). Crisper/"premium", but ONLY render if the terminal uses a patched Nerd Font (e.g.
 //!   "Cascadia Code NF"); otherwise they show as boxes. Opt-in by design.
-//! - **none** (`NG_NO_ICONS=1`): plain text everywhere.
+//! - **none** (`AIZEN_NO_ICONS=1`): plain text everywhere.
 //!
 //! Nerd glyphs sit in U+E000–U+F8FF (PUA) → `unicode-width` measures them as 1 cell, matching how
 //! a Nerd Font renders them, so bordered panels stay aligned.
@@ -37,10 +37,10 @@ pub fn set_tier(cfg_value: Option<&str>) {
 
 /// Resolve the active tier: env wins (one-off override) > config > emoji default.
 fn tier() -> Tier {
-    if std::env::var_os("NG_NO_ICONS").is_some() {
+    if crate::core::cli_config::branded_flag("NO_ICONS") {
         return Tier::None;
     }
-    if std::env::var_os("NG_NERD").is_some() {
+    if crate::core::cli_config::branded_flag("NERD") {
         return Tier::Nerd;
     }
     match CONFIG_TIER.load(Ordering::Relaxed) {
@@ -55,7 +55,7 @@ pub fn on() -> bool {
     !matches!(tier(), Tier::None)
 }
 
-/// Pick the glyph for the active tier (emoji default, nerd when `NG_NERD`).
+/// Pick the glyph for the active tier (emoji default, nerd when `AIZEN_NERD`).
 fn pick(emoji: &'static str, nerd: &'static str) -> &'static str {
     if matches!(tier(), Tier::Nerd) {
         nerd

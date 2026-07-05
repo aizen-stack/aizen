@@ -5,14 +5,9 @@ edition = "2021"
 description = "Aizen first-party agentic coding CLI — OpenAI-compatible, hermes-style provider-agnostic API client"
 license = "MIT"
 
-# The product brand is Aizen → `aizen` is the command. `ng` stays as a short alias (same binary),
-# so existing muscle-memory / docs keep working. Both targets share `src/main.rs`.
+# The product brand is Aizen → `aizen` is the one and only command.
 [[bin]]
 name = "aizen"
-path = "src/main.rs"
-
-[[bin]]
-name = "ng"
 path = "src/main.rs"
 
 [dependencies]
@@ -38,7 +33,7 @@ strsim = "0.11"
 # pure-Rust single static binary (objdump-clean). Verified vs Cargo.lock 2026-06-25.
 icu_normalizer = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-# Interactive landing menu (`ng` with no args): arrow-key select + colors + hidden key entry.
+# Interactive landing menu (`aizen` with no args): arrow-key select + colors + hidden key entry.
 # Pure-Rust (console → windows-sys on Windows), keeps the single static binary. `password`
 # adds the hidden API-key prompt; default features dropped to stay lean.
 dialoguer = { version = "0.11", default-features = false, features = ["password"] }
@@ -53,7 +48,7 @@ url = "2"
 # with the `regex` crate already in the tree for line matching. This is the exact pure-Rust walker rg
 # is built on — no C/C++ → single static binary preserved. Removes the "rg must be on PATH" footgun.
 ignore = "0.4"
-# MCP remote-app OAuth 2.1 (PKCE S256) — lets `ng apps` sign into Linear/Notion/Slack/Gmail/Atlassian
+# MCP remote-app OAuth 2.1 (PKCE S256) — lets `aizen apps` sign into Linear/Notion/Slack/Gmail/Atlassian
 # the way Hermes does (the apps people actually want, all OAuth-only). `ring` (SHA-256 for the PKCE
 # challenge + a CSPRNG) and `getrandom` are BOTH already in the dependency tree via reqwest→rustls
 # (verified vs Cargo.lock 2026-06-27), so declaring them direct is ZERO marginal binary cost and adds
@@ -113,7 +108,7 @@ lto = "thin"
 # Image (vision) input — encode a pasted clipboard image into a data URL for OpenAI-compatible
 # vision models (paste a screenshot straight into the chat box with Ctrl-V). Clipboard access is
 # DESKTOP-ONLY: `arboard` needs X11/Wayland libraries on Linux at runtime, which would break the
-# headless single static binary that `ng serve` ships as — so the clipboard path (arboard + a
+# headless single static binary that `aizen serve` ships as — so the clipboard path (arboard + a
 # pure-Rust PNG encode of the raw RGBA pixels) is target-gated to Windows/macOS. Both crates are
 # pure-Rust there (clipboard-win links only system DLLs), so the single-static-binary posture holds
 # (objdump-verified). Linux/headless builds pull neither.

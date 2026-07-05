@@ -317,7 +317,7 @@ impl crate::agent::tools::Tool for Checkpoint {
     }
     fn description(&self) -> &str {
         "Save a time-machine checkpoint of the whole working tree (a restore point). Call this BEFORE \
-         a large or risky multi-file change so the user can rewind with `ng time restore`. Only works \
+         a large or risky multi-file change so the user can rewind with `aizen time restore`. Only works \
          inside a git repo. Safe / non-destructive."
     }
     fn parameters(&self) -> serde_json::Value {

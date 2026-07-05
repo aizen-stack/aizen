@@ -7,7 +7,7 @@
 //! roadmap): embedded engines (servo/CEF → C++), Playwright/Puppeteer (Node), the cloud/stealth half.
 //!
 //! Use it: launch a browser with remote debugging, then ask the agent to drive it —
-//!   `chrome --remote-debugging-port=9222`   (or `msedge` / `brave`), override host via `NG_BROWSER_CDP`.
+//!   `chrome --remote-debugging-port=9222`   (or `msedge` / `brave`), override host via `AIZEN_BROWSER_CDP`.
 //!
 //! Tools (top-level only): `browser_navigate`, `browser_snapshot` (a11y tree with `@ref` ids),
 //! `browser_click`/`browser_type` (by `@ref`), `browser_eval` (run JS — the "debug localhost:3000"
@@ -26,7 +26,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-/// Default CDP host:port; override with `NG_BROWSER_CDP` (e.g. `127.0.0.1:9333`).
+/// Default CDP host:port; override with `AIZEN_BROWSER_CDP` (e.g. `127.0.0.1:9333`).
 const CDP_DEFAULT: &str = "127.0.0.1:9222";
 /// Per-op wall-clock cap so a wedged page can't freeze the agent loop.
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -99,7 +99,7 @@ impl CdpClient {
 
 /// Discover a page target's websocket URL from the local CDP HTTP endpoint.
 async fn discover_ws_url() -> Result<String> {
-    let host = std::env::var("NG_BROWSER_CDP").unwrap_or_else(|_| CDP_DEFAULT.to_string());
+    let host = crate::core::cli_config::branded_env("BROWSER_CDP").unwrap_or_else(|| CDP_DEFAULT.to_string());
     let url = format!("http://{host}/json");
     let resp = reqwest::Client::new()
         .get(&url)
@@ -109,7 +109,7 @@ async fn discover_ws_url() -> Result<String> {
         .with_context(|| {
             format!(
                 "no Chrome DevTools endpoint at {host} — launch a browser with remote debugging, e.g. \
-                 `chrome --remote-debugging-port=9222` (or set NG_BROWSER_CDP)"
+                 `chrome --remote-debugging-port=9222` (or set AIZEN_BROWSER_CDP)"
             )
         })?;
     let targets: Value = resp.json().await.context("parsing the CDP /json target list")?;

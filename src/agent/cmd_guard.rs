@@ -2,7 +2,7 @@
 //!
 //! Two jobs, both deterministic + offline (pure `regex`, no model call):
 //! 1. **Hard blocklist** — a SHORT, high-confidence set of catastrophic commands that are refused
-//!    UNCONDITIONALLY, even under `/yolo`. `/yolo` (and `NG_YES`) bypass the *approval prompt*, never
+//!    UNCONDITIONALLY, even under `/yolo`. `/yolo` (and `AIZEN_YES`) bypass the *approval prompt*, never
 //!    this floor — so a confused model or an injected `rm -rf /` has something underneath it. The
 //!    list is intentionally tight: a true floor, not a fuzzy denylist (over-blocking erodes trust).
 //!    It scans the WHOLE command string so chaining (`foo && rm -rf /`) can't smuggle a blocked op in.

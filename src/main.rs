@@ -506,11 +506,11 @@ enum ConfigCmd {
 
 #[derive(Parser, Debug)]
 struct ModelsArgs {
-    /// OpenAI-compatible base URL (else NG_BASE_URL / saved config).
-    #[arg(long, env = "NG_BASE_URL")]
+    /// OpenAI-compatible base URL (else AIZEN_BASE_URL / saved config).
+    #[arg(long, env = "AIZEN_BASE_URL")]
     base_url: Option<String>,
-    /// Bearer API key (else NG_API_KEY / saved config).
-    #[arg(long, env = "NG_API_KEY")]
+    /// Bearer API key (else AIZEN_API_KEY / saved config).
+    #[arg(long, env = "AIZEN_API_KEY")]
     api_key: Option<String>,
 }
 
@@ -544,14 +544,14 @@ struct ChatArgs {
     /// One-shot prompt. If omitted, the prompt is read from stdin.
     #[arg(short, long)]
     prompt: Option<String>,
-    /// OpenAI-compatible base URL (else NG_BASE_URL / saved config).
-    #[arg(long, env = "NG_BASE_URL")]
+    /// OpenAI-compatible base URL (else AIZEN_BASE_URL / saved config).
+    #[arg(long, env = "AIZEN_BASE_URL")]
     base_url: Option<String>,
-    /// Bearer API key (else NG_API_KEY / saved config).
-    #[arg(long, env = "NG_API_KEY")]
+    /// Bearer API key (else AIZEN_API_KEY / saved config).
+    #[arg(long, env = "AIZEN_API_KEY")]
     api_key: Option<String>,
-    /// Model id (else NG_MODEL / saved config).
-    #[arg(short, long, env = "NG_MODEL")]
+    /// Model id (else AIZEN_MODEL / saved config).
+    #[arg(short, long, env = "AIZEN_MODEL")]
     model: Option<String>,
 }
 
@@ -559,14 +559,14 @@ struct ChatArgs {
 struct AgentArgs {
     /// The task for the agent to accomplish.
     task: String,
-    /// OpenAI-compatible base URL (else NG_BASE_URL / saved config).
-    #[arg(long, env = "NG_BASE_URL")]
+    /// OpenAI-compatible base URL (else AIZEN_BASE_URL / saved config).
+    #[arg(long, env = "AIZEN_BASE_URL")]
     base_url: Option<String>,
-    /// Bearer API key (else NG_API_KEY / saved config).
-    #[arg(long, env = "NG_API_KEY")]
+    /// Bearer API key (else AIZEN_API_KEY / saved config).
+    #[arg(long, env = "AIZEN_API_KEY")]
     api_key: Option<String>,
-    /// Model id (else NG_MODEL / saved config).
-    #[arg(short, long, env = "NG_MODEL")]
+    /// Model id (else AIZEN_MODEL / saved config).
+    #[arg(short, long, env = "AIZEN_MODEL")]
     model: Option<String>,
     /// Pre-authorize destructive tools (file edits / shell) without an interactive prompt.
     #[arg(short, long)]
@@ -580,15 +580,15 @@ struct AgentArgs {
 struct WorkflowArgs {
     /// Path to a workflow spec (JSON): {name, tasks:[{id,role,prompt,model?}], synthesis?:{model?,prompt?}}.
     spec: String,
-    /// OpenAI-compatible base URL (else NG_BASE_URL / saved config).
-    #[arg(long, env = "NG_BASE_URL")]
+    /// OpenAI-compatible base URL (else AIZEN_BASE_URL / saved config).
+    #[arg(long, env = "AIZEN_BASE_URL")]
     base_url: Option<String>,
-    /// Bearer API key (else NG_API_KEY / saved config).
-    #[arg(long, env = "NG_API_KEY")]
+    /// Bearer API key (else AIZEN_API_KEY / saved config).
+    #[arg(long, env = "AIZEN_API_KEY")]
     api_key: Option<String>,
     /// Default model id for the sub-agents + synthesis (a task's `model` field overrides it for
-    /// that task). Else NG_MODEL / saved config.
-    #[arg(short, long, env = "NG_MODEL")]
+    /// that task). Else AIZEN_MODEL / saved config.
+    #[arg(short, long, env = "AIZEN_MODEL")]
     model: Option<String>,
     /// Pre-authorize destructive tools (file edits / shell) for the sub-agents without prompts.
     #[arg(short, long)]
@@ -2894,12 +2894,12 @@ fn read_input_box(history: &[String]) -> Result<Option<(String, Vec<String>)>> {
     }
 }
 
-/// The interactive surface (bare `ng`). Dispatches to the **sticky TUI** (pinned bottom input box +
+/// The interactive surface (bare `aizen`). Dispatches to the **sticky TUI** (pinned bottom input box +
 /// continuous chat queue + Esc-to-cancel) on a real terminal, or the plain line-REPL fallback
-/// (non-TTY-forced, or `NG_NO_STICKY=1`). Needs a TTY; piped/CI prints a hint.
+/// (non-TTY-forced, or `AIZEN_NO_STICKY=1`). Needs a TTY; piped/CI prints a hint.
 async fn run_menu() -> Result<()> {
     use std::io::IsTerminal;
-    let forced = std::env::var_os("NG_MENU").is_some();
+    let forced = cli_config::branded_flag("MENU");
     if !forced && !std::io::stdin().is_terminal() {
         println!("aizen — Aizen agentic CLI");
         println!("Run `aizen --help` for commands, or `aizen config` to set up the endpoint + key.");
@@ -2915,7 +2915,7 @@ async fn run_menu() -> Result<()> {
     if let Some(n) = crate::agent::mcp::project_trust_prompt() {
         prompt_mcp_trust(n);
     }
-    let sticky = std::io::stdout().is_terminal() && std::env::var_os("NG_NO_STICKY").is_none();
+    let sticky = std::io::stdout().is_terminal() && !cli_config::branded_flag("NO_STICKY");
     if sticky {
         run_menu_sticky().await
     } else {
@@ -2949,22 +2949,21 @@ fn prompt_mcp_trust(server_count: usize) {
     }
 }
 
-/// Whether base URL + API key are already present (via the config file OR the `NG_*` env vars), so a
-/// user who arrives pre-configured (env-only / CI image) is never shown the first-run intro.
+/// Whether base URL + API key are already present (via the config file OR the `AIZEN_*`/`NG_*` env
+/// vars), so a user who arrives pre-configured (env-only / CI image) is never shown the first-run intro.
 fn endpoint_ready() -> bool {
     let cfg = cli_config::load();
-    let present = |file: Option<String>, env: &str| {
-        file.filter(|s| !s.trim().is_empty()).is_some()
-            || std::env::var(env).ok().filter(|s| !s.trim().is_empty()).is_some()
+    let present = |file: Option<String>, suffix: &str| {
+        file.filter(|s| !s.trim().is_empty()).is_some() || cli_config::branded_env(suffix).is_some()
     };
-    present(cfg.base_url, "NG_BASE_URL") && present(cfg.api_key, "NG_API_KEY")
+    present(cfg.base_url, "BASE_URL") && present(cfg.api_key, "API_KEY")
 }
 
 /// Show the first-run intro when: never onboarded AND no usable endpoint yet. (Either condition alone
 /// suppresses it — a returning user, or anyone already configured, skips straight to the menu.)
-/// `NG_ONBOARD=1` forces it, so an already-configured user can preview the intro.
+/// `AIZEN_ONBOARD=1` forces it, so an already-configured user can preview the intro.
 fn needs_onboarding() -> bool {
-    if std::env::var_os("NG_ONBOARD").is_some() {
+    if cli_config::branded_flag("ONBOARD") {
         return true;
     }
     cli_config::load().onboarded != Some(true) && !endpoint_ready()
@@ -3067,10 +3066,10 @@ fn summarizer_endpoint(base: &str, key: &str, model: &str) -> cli_config::Resolv
 }
 
 /// Eager tool execution during streaming: ON unless disabled by config (`eager_tools: false`) or
-/// the `NG_NO_EAGER` env kill-switch (per-machine escape hatch if a provider's stream framing
+/// the `AIZEN_NO_EAGER` env kill-switch (per-machine escape hatch if a provider's stream framing
 /// misbehaves).
 fn eager_enabled() -> bool {
-    if std::env::var_os("NG_NO_EAGER").is_some() {
+    if cli_config::branded_flag("NO_EAGER") {
         return false;
     }
     cli_config::load().eager_tools.unwrap_or(true)
@@ -3358,7 +3357,7 @@ async fn run_menu_sticky() -> Result<()> {
     Ok(())
 }
 
-/// The plain line-REPL fallback (no sticky footer): used when stdout isn't a TTY or `NG_NO_STICKY`
+/// The plain line-REPL fallback (no sticky footer): used when stdout isn't a TTY or `AIZEN_NO_STICKY`
 /// is set. You just type — a plain message is answered (chat), a task that needs tools uses them.
 async fn run_menu_plain() -> Result<()> {
     splash::print();
@@ -3458,7 +3457,7 @@ async fn run_menu_plain() -> Result<()> {
                 continue;
             }
         };
-        // auto_approve follows the `/yolo` toggle (or `NG_YES`): on → destructive ops run without
+        // auto_approve follows the `/yolo` toggle (or `AIZEN_YES`): on → destructive ops run without
         // a prompt; off (default) → each file edit / shell op asks first. `smart` (the `/smart`
         // toggle) auto-clears read-only shell commands when not in yolo.
         let cfg = AgentConfig {
@@ -4143,9 +4142,9 @@ fn auto_skill_learn_enabled() -> bool {
 }
 
 /// "Yolo" mode — auto-approve destructive tools (file edits / shell) without prompting. Off by
-/// default (safe). Forced on by the `NG_YES` env var, else read from the persisted `/yolo` toggle.
+/// default (safe). Forced on by the `AIZEN_YES` env var, else read from the persisted `/yolo` toggle.
 fn yolo_enabled() -> bool {
-    std::env::var_os("NG_YES").is_some() || cli_config::load().auto_approve.unwrap_or(false)
+    cli_config::branded_flag("YES") || cli_config::load().auto_approve.unwrap_or(false)
 }
 
 /// Whether the `smart` approval tier is on (auto-run read-only shell, ask for the rest). `None` ⇒ OFF.
@@ -4361,7 +4360,7 @@ Commands:
   /smart             toggle smart approval — auto-run read-only shell, ask for the rest
   /clear             start a fresh conversation
   /tokens            show session token usage (context-fill HUD)
-  /cost              session usage + $ estimate (real tokens when the provider reports them; set rates via `ng config set --price-in/--price-out`)
+  /cost              session usage + $ estimate (real tokens when the provider reports them; set rates via `aizen config set --price-in/--price-out`)
   /quit              exit
 
 Input shortcuts (in a normal message):
@@ -4531,8 +4530,8 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                 Ok(_) => tui::emit_line(&style("yolo OFF — destructive ops will ask for approval again.").dim().to_string()),
                 Err(e) => tui::emit_line(&format!("{} {e}", style("yolo:").red())),
             }
-            if std::env::var_os("NG_YES").is_some() {
-                tui::emit_line(&style("(note: NG_YES is set in your environment — it forces yolo ON regardless of this toggle)").dim().to_string());
+            if cli_config::branded_flag("YES") {
+                tui::emit_line(&style("(note: AIZEN_YES is set in your environment — it forces yolo ON regardless of this toggle)").dim().to_string());
             }
         }
         "smart" => {
@@ -4547,7 +4546,7 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                 Ok(_) => tui::emit_line(&style("smart OFF — every destructive op will ask for approval again.").dim().to_string()),
                 Err(e) => tui::emit_line(&format!("{} {e}", style("smart:").red())),
             }
-            if cfg.auto_approve.unwrap_or(false) || std::env::var_os("NG_YES").is_some() {
+            if cfg.auto_approve.unwrap_or(false) || cli_config::branded_flag("YES") {
                 tui::emit_line(&style("(note: yolo is ON — it approves everything, so smart has no extra effect until yolo is off)").dim().to_string());
             }
         }
@@ -4824,27 +4823,34 @@ fn resolve_endpoint(
     model: Option<String>,
 ) -> Result<(String, String, String)> {
     let cfg = cli_config::load();
+    // Precedence: explicit `--flag` (already folded into the args) > env (`AIZEN_*`) > saved config.
+    // Reading env here (not just via clap) means the bare REPL honors it too.
     let base_url = base_url
+        .or_else(|| cli_config::branded_env("BASE_URL"))
         .or(cfg.base_url)
-        .context("no base URL — run `aizen config` (interactive setup), or pass --base-url / set NG_BASE_URL")?;
+        .context("no base URL — run `aizen config` (interactive setup), or pass --base-url / set AIZEN_BASE_URL")?;
     let api_key = api_key
+        .or_else(|| cli_config::branded_env("API_KEY"))
         .or(cfg.api_key)
-        .context("no API key — run `aizen config` (interactive setup), or pass --api-key / set NG_API_KEY")?;
+        .context("no API key — run `aizen config` (interactive setup), or pass --api-key / set AIZEN_API_KEY")?;
     let model = model
+        .or_else(|| cli_config::branded_env("MODEL"))
         .or(cfg.model)
-        .context("no model — run `aizen config` (interactive setup) or `aizen models` to list, or pass --model / set NG_MODEL")?;
+        .context("no model — run `aizen config` (interactive setup) or `aizen models` to list, or pass --model / set AIZEN_MODEL")?;
     Ok((base_url, api_key, model))
 }
 
-/// Resolve just base URL + API key (for `ng models`, which has no model).
+/// Resolve just base URL + API key (for `aizen models`, which has no model).
 fn resolve_base_key(base_url: Option<String>, api_key: Option<String>) -> Result<(String, String)> {
     let cfg = cli_config::load();
     let base_url = base_url
+        .or_else(|| cli_config::branded_env("BASE_URL"))
         .or(cfg.base_url)
-        .context("no base URL — pass --base-url, set NG_BASE_URL, or run `aizen config set --base-url <url>`")?;
+        .context("no base URL — pass --base-url, set AIZEN_BASE_URL, or run `aizen config set --base-url <url>`")?;
     let api_key = api_key
+        .or_else(|| cli_config::branded_env("API_KEY"))
         .or(cfg.api_key)
-        .context("no API key — pass --api-key, set NG_API_KEY, or run `aizen config set --api-key <key>`")?;
+        .context("no API key — pass --api-key, set AIZEN_API_KEY, or run `aizen config set --api-key <key>`")?;
     Ok((base_url, api_key))
 }
 

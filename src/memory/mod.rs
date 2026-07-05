@@ -752,14 +752,14 @@ pub fn cmd_compact() -> Result<()> {
 
 /// Settings accessor (verified-good defaults). The retrieval-tier toggles are reachable via env so
 /// the fuzzy/dense moat can be turned on for a session without a config-schema change: set
-/// `NG_MEM_FUZZY=1` (Jaro-Winkler bridge) and/or `NG_MEM_DENSE=1` (dense⊕lexical RRF; pair with a
-/// `--features dense` build for a real semantic backend). Default OFF → the lexical floor ships.
+/// `AIZEN_MEM_FUZZY=1` (Jaro-Winkler bridge) and/or `AIZEN_MEM_DENSE=1` (dense⊕lexical RRF; pair with
+/// a `--features dense` build for a real semantic backend). Default OFF → the lexical floor ships.
 pub fn settings() -> MemorySettings {
     let mut s = MemorySettings::default();
-    if env_on("NG_MEM_FUZZY") {
+    if env_on("AIZEN_MEM_FUZZY") {
         s.enable_fuzzy = true;
     }
-    if env_on("NG_MEM_DENSE") {
+    if env_on("AIZEN_MEM_DENSE") {
         s.enable_dense = true;
     }
     s

@@ -63,12 +63,13 @@ impl Channel {
         }
     }
 
-    /// Env var that overrides the stored URL (one-off / CI).
-    pub fn env_var(&self) -> &'static str {
+    /// Env-var suffix that overrides the stored URL (one-off / CI); resolved via
+    /// [`cli_config::branded_env`] as `AIZEN_<suffix>`.
+    pub fn env_suffix(&self) -> &'static str {
         match self {
-            Channel::Discord => "NG_DISCORD_WEBHOOK",
-            Channel::Slack => "NG_SLACK_WEBHOOK",
-            Channel::Webhook => "NG_WEBHOOK_URL",
+            Channel::Discord => "DISCORD_WEBHOOK",
+            Channel::Slack => "SLACK_WEBHOOK",
+            Channel::Webhook => "WEBHOOK_URL",
         }
     }
 
@@ -104,11 +105,8 @@ fn truncate(text: &str, max: usize) -> String {
 
 /// Resolve a channel's URL: env override wins over the config file. Empty/whitespace → `None`.
 pub fn channel_url(ch: Channel, cfg: &CliConfig) -> Option<String> {
-    if let Ok(v) = std::env::var(ch.env_var()) {
-        let v = v.trim();
-        if !v.is_empty() {
-            return Some(v.to_string());
-        }
+    if let Some(v) = crate::core::cli_config::branded_env(ch.env_suffix()) {
+        return Some(v);
     }
     let n = cfg.notify.as_ref()?;
     let raw = match ch {

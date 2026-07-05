@@ -1,7 +1,7 @@
 //! Persistent CLI endpoint config (`ng config`) — base URL / API key / default model stored at
 //! `~/.aizen/cli-config.json`, so the network commands work without re-passing env vars.
 //!
-//! Resolution precedence for every network command: explicit `--flag` > `NG_*` env var > this
+//! Resolution precedence for every network command: explicit `--flag` > `AIZEN_*` env var > this
 //! file. (clap merges flag+env into the arg; we fall back to the file when that's still absent.)
 //! The key is stored in plaintext (standard for a CLI credential file, like `~/.aws/credentials`)
 //! but the file is tightened to owner-only (0600) on Unix at write time — see `save`.
@@ -33,7 +33,7 @@ pub struct CliConfig {
     pub prompt_tier: Option<String>,
     /// Eager tool execution during streaming: read-only tool calls start the moment their streamed
     /// arguments complete. `None` ⇒ ON. `Some(false)` ⇒ wait for the full response (also the
-    /// `NG_NO_EAGER` env kill-switch).
+    /// `AIZEN_NO_EAGER` env kill-switch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eager_tools: Option<bool>,
     /// Reasoning-effort passthrough for reasoning models ("low"/"medium"/"high"; provider
@@ -66,7 +66,7 @@ pub struct CliConfig {
     pub memory_auto_learn: Option<bool>,
     /// "Yolo" mode: auto-approve destructive tools (file edits / shell) in the TUI without prompting
     /// for each one. `None`/`Some(false)` ⇒ ask before every destructive op (safe default).
-    /// `Some(true)` ⇒ run them without asking. Toggle live with `/yolo`; `NG_YES` env also forces it on.
+    /// `Some(true)` ⇒ run them without asking. Toggle live with `/yolo`; `AIZEN_YES` env also forces it on.
     /// The hard command blocklist (`cmd_guard`) still applies underneath — yolo skips the prompt, never the floor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_approve: Option<bool>,
@@ -235,13 +235,13 @@ pub struct ReachConfig {
 }
 
 impl ReachConfig {
-    /// Effective Jina key: `NG_JINA_API_KEY` > `JINA_API_KEY` > config file.
+    /// Effective Jina key: `AIZEN_JINA_API_KEY` > `JINA_API_KEY` > config file.
     pub fn resolved_jina_key(&self) -> Option<String> {
-        env_nonempty("NG_JINA_API_KEY").or_else(|| env_nonempty("JINA_API_KEY")).or_else(|| self.jina_api_key.clone())
+        branded_env("JINA_API_KEY").or_else(|| env_nonempty("JINA_API_KEY")).or_else(|| self.jina_api_key.clone())
     }
-    /// Effective GitHub token: `NG_GITHUB_TOKEN` > the conventional `GITHUB_TOKEN` > config file.
+    /// Effective GitHub token: `AIZEN_GITHUB_TOKEN` > the conventional `GITHUB_TOKEN` > config file.
     pub fn resolved_github_token(&self) -> Option<String> {
-        env_nonempty("NG_GITHUB_TOKEN").or_else(|| env_nonempty("GITHUB_TOKEN")).or_else(|| self.github_token.clone())
+        branded_env("GITHUB_TOKEN").or_else(|| env_nonempty("GITHUB_TOKEN")).or_else(|| self.github_token.clone())
     }
 }
 
@@ -249,8 +249,18 @@ fn env_nonempty(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|s| !s.trim().is_empty())
 }
 
+/// Read a brand-prefixed user-facing setting env var: `AIZEN_<suffix>`. Empty/whitespace ⇒ `None`.
+pub fn branded_env(suffix: &str) -> Option<String> {
+    env_nonempty(&format!("AIZEN_{suffix}"))
+}
+
+/// Presence check for a brand-prefixed boolean toggle env var: `AIZEN_<suffix>` set (to anything) ⇒ true.
+pub fn branded_flag(suffix: &str) -> bool {
+    std::env::var_os(format!("AIZEN_{suffix}")).is_some()
+}
+
 /// Discord BOT (two-way) config — a bot token (from the Developer Portal) + an allowlist of channel
-/// and user ids. Empty `allowed_channel_ids` denies everyone (secure default). Env `NG_DISCORD_BOT_TOKEN`
+/// and user ids. Empty `allowed_channel_ids` denies everyone (secure default). Env `AIZEN_DISCORD_BOT_TOKEN`
 /// overrides the stored token.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DiscordConfig {
@@ -265,15 +275,15 @@ pub struct DiscordConfig {
 }
 
 impl DiscordConfig {
-    /// The effective bot token: `NG_DISCORD_BOT_TOKEN` env wins over the config file.
+    /// The effective bot token: `AIZEN_DISCORD_BOT_TOKEN` env wins over the config file.
     pub fn resolved_token(&self) -> Option<String> {
-        std::env::var("NG_DISCORD_BOT_TOKEN").ok().filter(|s| !s.trim().is_empty()).or_else(|| self.token.clone())
+        branded_env("DISCORD_BOT_TOKEN").or_else(|| self.token.clone())
     }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TelegramConfig {
-    /// Bot token from @BotFather. Prefer the `NG_TELEGRAM_TOKEN` env var over storing it here.
+    /// Bot token from @BotFather. Prefer the `AIZEN_TELEGRAM_TOKEN` env var over storing it here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     /// Chat ids allowed to talk to / approve the agent. Messages from any other chat are dropped.
@@ -282,14 +292,14 @@ pub struct TelegramConfig {
 }
 
 impl TelegramConfig {
-    /// The effective token: `NG_TELEGRAM_TOKEN` env wins over the config file.
+    /// The effective token: `AIZEN_TELEGRAM_TOKEN` env wins over the config file.
     pub fn resolved_token(&self) -> Option<String> {
-        std::env::var("NG_TELEGRAM_TOKEN").ok().filter(|s| !s.trim().is_empty()).or_else(|| self.token.clone())
+        branded_env("TELEGRAM_TOKEN").or_else(|| self.token.clone())
     }
 }
 
 /// Outbound notification channels — one-way HTTP POST sinks. Each URL can also be supplied via env
-/// (`NG_DISCORD_WEBHOOK`, `NG_SLACK_WEBHOOK`, `NG_WEBHOOK_URL`), which overrides the stored value.
+/// (`AIZEN_DISCORD_WEBHOOK`, `AIZEN_SLACK_WEBHOOK`, `AIZEN_WEBHOOK_URL`), which overrides the stored value.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct NotifyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -452,5 +462,32 @@ mod tests {
         assert!(m.starts_with("sk-f49"));
         assert!(!m.contains("0123456789"));
         assert!(m.contains("chars"));
+    }
+
+    #[test]
+    fn branded_env_reads_aizen_only() {
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A suffix nothing else in the process reads, so setting these can't disturb other tests.
+        let (brand, legacy) = ("AIZEN_BRANDED_UT", "NG_BRANDED_UT");
+        for v in [brand, legacy] {
+            std::env::remove_var(v);
+        }
+        // Neither set → None / false.
+        assert_eq!(branded_env("BRANDED_UT"), None);
+        assert!(!branded_flag("BRANDED_UT"));
+        // The pre-rebrand `NG_*` name is NOT read anymore (fully rebranded to Aizen).
+        std::env::set_var(legacy, "legacy");
+        assert_eq!(branded_env("BRANDED_UT"), None);
+        assert!(!branded_flag("BRANDED_UT"));
+        // `AIZEN_*` is honored.
+        std::env::set_var(brand, "brand");
+        assert_eq!(branded_env("BRANDED_UT").as_deref(), Some("brand"));
+        assert!(branded_flag("BRANDED_UT"));
+        // An empty/whitespace value is ignored.
+        std::env::set_var(brand, "   ");
+        assert_eq!(branded_env("BRANDED_UT"), None);
+        for v in [brand, legacy] {
+            std::env::remove_var(v);
+        }
     }
 }

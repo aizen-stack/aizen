@@ -1,20 +1,19 @@
-# `aizen` (alias `ng`) — Aizen agentic coding CLI
+# `aizen` — Aizen agentic coding CLI
 
 A single-binary, terminal-native coding agent: streaming chat, a tool-using agent loop, a
 self-learning **memory brain**, sub-agent dispatch, and lightweight multi-agent workflows.
 Pure Rust, rustls-only, OpenAI-compatible — point it at any OpenAI-style `/chat/completions`
 endpoint (OpenAI, OpenRouter, a local server, or an Anthropic-backed gateway).
 
-The command is **`aizen`**; **`ng`** is a built-in short alias for the same binary, so every
-`ng …` example below works identically as `aizen …`.
+The command is **`aizen`**.
 
 ## Build & install
 
 ```bash
-cargo build --release      # → target/release/aizen + target/release/ng (one static binary, two names)
+cargo build --release      # → target/release/aizen (one static binary)
 cargo test                 # unit + harness tests (no network)
 
-cargo install --path .     # install `aizen` (+ `ng`) onto your PATH (~/.cargo/bin)
+cargo install --path .     # install `aizen` onto your PATH (~/.cargo/bin)
 ```
 
 The default build is a standalone binary with no native deps (pure-Rust, rustls-only TLS). Two
@@ -42,10 +41,10 @@ jump, **↑/↓** recall past prompts, Enter sends. A braille spinner (`⠹ thin
 model is responding, clearing the moment the first token streams.
 
 **Attach an image** (vision) — two ways, because Ctrl-V can't be used (Windows Terminal intercepts
-it for its own paste, so the keystroke never reaches `ng`):
+it for its own paste, so the keystroke never reaches `aizen`):
 - **Ctrl-O** — grab a copied screenshot from the clipboard (Win+Shift+S, or "Copy image" in a
   browser). An `[1 img]` tag shows in the top border.
-- **Drag an image file onto the window** — the terminal pastes the file path; press Enter and `ng`
+- **Drag an image file onto the window** — the terminal pastes the file path; press Enter and `aizen`
   turns image-file paths on the line into attachments (you can also type/paste a path). Real image
   files only — prose like `nope.png` that isn't a file stays as text.
 
@@ -58,7 +57,7 @@ everywhere.
 The context window is **auto-detected** from the provider's `/models` when it reports one
 (OpenRouter/LiteLLM-style gateways do; the bare OpenAI schema doesn't). When it's absent the bar
 shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M · DeepSeek 64K · else
-128K). Override it explicitly with `ng config set --context-window <tokens>`.
+128K). Override it explicitly with `aizen config set --context-window <tokens>`.
 
 **Slash commands** (the meta layer):
 
@@ -78,7 +77,7 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | `/compact` | summarize older turns now to free context |
 | `/yolo` | toggle auto-approve (run file edits & shell without asking) — the hard safety floor still blocks catastrophic commands |
 | `/smart` | toggle smart approval (auto-run read-only shell like `git status`/`cargo check`; writes still ask) |
-| `/cost` | session token usage + a $ estimate (real provider usage when reported; set rates via `ng config set --price-in/--price-out`) |
+| `/cost` | session token usage + a $ estimate (real provider usage when reported; set rates via `aizen config set --price-in/--price-out`) |
 | `/clear` | fresh conversation · `/tokens` usage · `/quit` exit |
 
 **Input shortcuts** — on a normally typed message (not with an image):
@@ -96,34 +95,34 @@ estimated by model name, else whatever you type). Auto-compact (default **80%**,
 on the status line) summarizes older turns into one dense note when usage crosses the threshold,
 keeping the last few turns verbatim — the cut is always at a user-message boundary (no orphan tool
 results). `/compact` forces it now. Both also settable non-interactively:
-`ng config set --context-window <tokens> --compact-threshold <0–95>` (`0` = off).
+`aizen config set --context-window <tokens> --compact-threshold <0–95>` (`0` = off).
 
-The REPL needs a real terminal; piped/CI stdin prints a hint and exits (`NG_MENU=1` forces it).
+The REPL needs a real terminal; piped/CI stdin prints a hint and exits (`AIZEN_MENU=1` forces it).
 
-**Icons** — the TUI uses a curated glyph set. Pick the style in `/config` or `ng config set --icons
+**Icons** — the TUI uses a curated glyph set. Pick the style in `/config` or `aizen config set --icons
 <emoji|nerd|off>` (persisted): `emoji` (default — renders everywhere, no font install), `nerd`
 (dev-style Nerd Font glyphs — **only render if your terminal's font is a patched Nerd Font** like
-"Cascadia Code NF", else you'll see boxes), or `off` (plain text). One-off override: `NG_NERD=1` /
-`NG_NO_ICONS=1`. (A CLI can't bundle a font the terminal will use — `nerd` needs the font set in the
+"Cascadia Code NF", else you'll see boxes), or `off` (plain text). One-off override: `AIZEN_NERD=1` /
+`AIZEN_NO_ICONS=1`. (A CLI can't bundle a font the terminal will use — `nerd` needs the font set in the
 terminal itself.)
 
-## Telegram — control `ng` from your phone
+## Telegram — control `aizen` from your phone
 
-`ng serve` runs a long-lived daemon that listens on a Telegram bot (long-poll, no public URL): send
+`aizen serve` runs a long-lived daemon that listens on a Telegram bot (long-poll, no public URL): send
 it a message → it runs the agent and replies; **destructive ops (file edits / shell) ask you to
 approve from your phone** (inline ✓/✗). Pure-Rust (no teloxide), single binary.
 
 ```bash
-ng telegram setup     # paste the @BotFather token, message the bot to capture your chat id
-ng telegram test      # send a test message
-ng serve              # start listening (Ctrl-C to stop)
+aizen telegram setup     # paste the @BotFather token, message the bot to capture your chat id
+aizen telegram test      # send a test message
+aizen serve              # start listening (Ctrl-C to stop)
 ```
 In a chat: a plain message runs read-only-safe (destructive ops prompt you here); prefix `/agent `
 to run fully autonomously. **Follow-ups keep context** — "now fix it" works because each chat's
 conversation is carried across messages (memory + SOUL + persona seeded once per session). `/new`
 (or `/reset`) starts fresh; `/resume` reports how much context is kept. If the agent needs to
 disambiguate it asks (the `clarify` tool) and your next message is the answer. Token lives in
-`~/.aizen/cli-config.json` (or `NG_TELEGRAM_TOKEN`); only `allowed_chat_ids` may talk to it. The
+`~/.aizen/cli-config.json` (or `AIZEN_TELEGRAM_TOKEN`); only `allowed_chat_ids` may talk to it. The
 agent can also call `telegram_send` / `telegram_ask`.
 
 ## Configure
@@ -132,35 +131,35 @@ All network commands read three settings, as flags or env vars:
 
 | Env var | Flag | Meaning |
 | --- | --- | --- |
-| `NG_BASE_URL` | `--base-url` | OpenAI-compatible base, e.g. `https://api.openai.com/v1` |
-| `NG_API_KEY` | `--api-key` | Bearer token for the endpoint |
-| `NG_MODEL` | `-m, --model` | Model id, e.g. `gpt-4o-mini` |
+| `AIZEN_BASE_URL` | `--base-url` | OpenAI-compatible base, e.g. `https://api.openai.com/v1` |
+| `AIZEN_API_KEY` | `--api-key` | Bearer token for the endpoint |
+| `AIZEN_MODEL` | `-m, --model` | Model id, e.g. `gpt-4o-mini` |
 
-Resolution precedence per command: explicit `--flag` > `NG_*` env var > saved config (below).
+Resolution precedence per command: explicit `--flag` > `AIZEN_*` env var > saved config (below).
 
 ```bash
-export NG_BASE_URL=https://api.openai.com/v1
-export NG_API_KEY=sk-...
-export NG_MODEL=gpt-4o-mini
+export AIZEN_BASE_URL=https://api.openai.com/v1
+export AIZEN_API_KEY=sk-...
+export AIZEN_MODEL=gpt-4o-mini
 ```
 
-### `ng config` — interactive setup (recommended)
+### `aizen config` — interactive setup (recommended)
 Run it with no subcommand for a guided setup: it asks for the base URL + API key, **fetches the
 model list from the provider, and lets you pick one**, then saves to `~/.aizen/cli-config.json`.
 ```bash
-ng config            # interactive: base URL → key → pick a model → saved
+aizen config            # interactive: base URL → key → pick a model → saved
 ```
-After this, `ng chat`/`agent`/`workflow` work with **zero env vars**. Non-interactive equivalents:
+After this, `aizen chat`/`agent`/`workflow` work with **zero env vars**. Non-interactive equivalents:
 ```bash
-ng config set --base-url https://api.openai.com/v1 --api-key sk-... --model gpt-4o-mini
-ng config show       # API key masked
-ng config path
+aizen config set --base-url https://api.openai.com/v1 --api-key sk-... --model gpt-4o-mini
+aizen config show       # API key masked
+aizen config path
 ```
 
-### `ng models` — list the provider's models
+### `aizen models` — list the provider's models
 ```bash
-ng models                       # GET {base}/models, marks your default
-ng config set --model <id>      # pick one as the default
+aizen models                       # GET {base}/models, marks your default
+aizen config set --model <id>      # pick one as the default
 ```
 
 The memory brain lives under `~/.aizen/cli-memory/` (override the root with `AIZEN_HOME`; the legacy
@@ -171,7 +170,7 @@ Retrieval is **Unicode-aware**: the lexical tokenizer NFC-normalizes before lowe
 splits on `\p{L}\p{N}_`, so Vietnamese (and any accented script) is matched whole instead of
 being shredded to ASCII fragments. This is pure-Rust and adds no dependency to the static binary.
 Measured on the recall bench, Vietnamese paraphrase recall@5 went 0.00 → 1.00 with literal/English
-recall unchanged. Verify with `ng bench memory --split all`.
+recall unchanged. Verify with `aizen bench memory --split all`.
 
 Ranking is **BM25** (Okapi k1=1.2, b=0.75, floored IDF over the active corpus + length
 normalization) — term rarity and doc length now shape relevance, so concise on-point facts beat
@@ -183,24 +182,24 @@ The store **evolves from reuse** — no LLM, zero extra tokens. Every fact the a
 context is reinforced (at most once/day); ranking is `bm25 · decay · salience`, where reused facts
 decay slower (`half_life·(1+ln1p(reinforced))`) and gain salience (`0.5 + 0.3·reuse + 0.2·recency`,
 capped so BM25 stays dominant), and the always-on frozen core is packed salience-greedy so the
-prompt prefix holds the facts you actually use. This is provable, not marketing: `ng bench memory
+prompt prefix holds the facts you actually use. This is provable, not marketing: `aizen bench memory
 --evolution` runs a 6-session reuse simulation and **fails** unless recall@5 climbs ≥5%/session
 until it plateaus.
 
 ## Commands
 
-### `ng chat` — one-shot streaming chat
+### `aizen chat` — one-shot streaming chat
 ```bash
-ng chat -p "explain this error: ..."
-echo "summarize this" | ng chat        # prompt from stdin
+aizen chat -p "explain this error: ..."
+echo "summarize this" | aizen chat        # prompt from stdin
 ```
 
-### `ng agent` — the tool-using loop
+### `aizen agent` — the tool-using loop
 The model reads/edits files, runs shell, and uses memory to finish a task end-to-end.
 ```bash
-ng agent "add a --version flag and update the help text"
-ng agent --yes "fix the failing test in src/parse.rs"   # pre-approve file/shell ops
-ng agent --max-iters 40 "..."                            # raise the step cap
+aizen agent "add a --version flag and update the help text"
+aizen agent --yes "fix the failing test in src/parse.rs"   # pre-approve file/shell ops
+aizen agent --max-iters 40 "..."                            # raise the step cap
 ```
 Behavior worth knowing:
 - **Parallel reads** — when a turn only reads (file_read/glob/memory), the calls run
@@ -209,7 +208,7 @@ Behavior worth knowing:
   REPL each one shows an inline **`[y]es · [n]o · [a]llow all this session`** prompt (the `[a]`
   choice is a session-scoped soft `/yolo`, reset by `/clear`); `/yolo` still pre-approves everything,
   `/smart` auto-runs read-only-shaped shell. Non-TTY (CI/pipes) safely denies unless `--yes` is set;
-  under `ng serve` the prompt is routed to your phone. The hard `cmd_guard` floor blocks catastrophic
+  under `aizen serve` the prompt is routed to your phone. The hard `cmd_guard` floor blocks catastrophic
   commands underneath all of these.
 - **Verify gate** — after an editing run, a fast typecheck (`cargo check` / a `typecheck`
   npm script / `npx tsc --noEmit`) runs once before the agent reports done; on failure the
@@ -223,13 +222,13 @@ Behavior worth knowing:
   input box). For low-stakes choices it assumes and states rather than stalling.
 - **Web research** — `web_search` (no-key DuckDuckGo) finds pages; `web_fetch` GETs a URL and
   returns it as readable text (HTML reduced to prose, capped); `web_crawl` spiders a site from a
-  seed URL (see `ng crawl` below). Read-only; available to every role.
+  seed URL (see `aizen crawl` below). Read-only; available to every role.
 
-### `ng workflow <spec.json>` — fan-out + synthesis
+### `aizen workflow <spec.json>` — fan-out + synthesis
 Run several role-scoped sub-agents concurrently (bounded to 5), then merge their results into
 one answer (mixture-of-agents). See [examples/review.workflow.json](examples/review.workflow.json):
 ```bash
-ng workflow examples/review.workflow.json
+aizen workflow examples/review.workflow.json
 ```
 Spec shape:
 ```jsonc
@@ -241,20 +240,20 @@ Spec shape:
 ```
 Roles set each sub-agent's tools (coder = read/edit/shell, tester = shell no edit,
 planner/reviewer = read-only). A failed task never aborts the workflow — its result is captured
-and the synthesis still runs. The synthesis uses `NG_MODEL` unless `synthesis.model` overrides it.
+and the synthesis still runs. The synthesis uses `AIZEN_MODEL` unless `synthesis.model` overrides it.
 **Model diversity (mixture-of-agents):** each task may set its own `model` (e.g. a cheap model
 scouts, a strong one reviews) — else the workflow default. `--trace <path>` writes a JSON audit of
 the fan-out (per-task model + outcome + the synthesis model).
 
-### `ng crawl <url>` — katana-style web crawler
+### `aizen crawl <url>` — katana-style web crawler
 BFS over HTTP from a seed URL: extracts links from HTML (`href`/`src`/`action`) and endpoints
 from JS (regex over quoted paths/URLs), follows the in-scope, unseen ones up to a depth/page cap.
 Pure Rust — no headless browser, no passive sources (those would break the single binary).
 ```bash
-ng crawl https://example.com                       # depth 2, same host, ≤200 URLs
-ng crawl https://example.com --depth 1 --max-pages 50 --show-source
-ng crawl https://example.com --scope subs          # also follow *.example.com subdomains
-ng crawl https://example.com --json                # [{url, depth, via}]
+aizen crawl https://example.com                       # depth 2, same host, ≤200 URLs
+aizen crawl https://example.com --depth 1 --max-pages 50 --show-source
+aizen crawl https://example.com --scope subs          # also follow *.example.com subdomains
+aizen crawl https://example.com --json                # [{url, depth, via}]
 ```
 Only GET requests; scope defaults to the seed host (`--scope subs` for subdomains); `--max-pages`
 is a hard ceiling. Also exposed to the agent as the `web_crawl` tool.
@@ -288,20 +287,20 @@ from your **next message** (the switch happens at the turn boundary so the prefi
 
 `/persona` also has: **View self-memory** (insights + recent episodes), **Reset self-memory**, and an
 **Evolution ON/OFF** toggle. Off → a frozen character. Toggle persists via `persona_evolve`
-(`ng config set --persona-evolve false`). Honest framing: this is a *consistent, accumulating,
+(`aizen config set --persona-evolve false`). Honest framing: this is a *consistent, accumulating,
 self-reflecting character* — not raised model intelligence.
 
 Scriptable, fully offline (no creds) — handy for setup and for inspecting what the model sees:
 ```bash
-ng persona new Aria -r "a sharp mentor" -v "concise, warm" -b "You value clarity."  # body via -b or stdin
-ng persona use Aria / clear                         # set / clear the active persona
-ng persona list / show <name>                        # list (● active, with self-memory counts) / show a card
-ng persona self [name]                               # view accumulated insights + recent episodes
-ng persona remember "what I just lived through"      # record a free episode (auto-scored importance)
-ng persona block                                     # print the <persona> + <self> blocks the model sees
+aizen persona new Aria -r "a sharp mentor" -v "concise, warm" -b "You value clarity."  # body via -b or stdin
+aizen persona use Aria / clear                         # set / clear the active persona
+aizen persona list / show <name>                        # list (● active, with self-memory counts) / show a card
+aizen persona self [name]                               # view accumulated insights + recent episodes
+aizen persona remember "what I just lived through"      # record a free episode (auto-scored importance)
+aizen persona block                                     # print the <persona> + <self> blocks the model sees
 ```
 
-### `ng soul` — the agent's operating identity
+### `aizen soul` — the agent's operating identity
 Where a **persona** is a swappable costume, the **SOUL** is *who the agent is operationally* — durable
 values and policies that hold across EVERY persona and project (e.g. "always run tests before claiming
 done", "reply in Vietnamese", "never push without asking"). It lives at `~/.aizen/SOUL.md`
@@ -310,13 +309,13 @@ an `<agent_identity>` block **above** `<persona>` in the system prompt, reaching
 workflow alike. The body is sanitized + secret/injection-scanned before injection (fail-closed: a
 poisoned line drops the whole block).
 ```bash
-ng soul set -b "Always run tests before saying done. Never push without asking."  # body via -b or stdin
-ng soul show        # print the <agent_identity> the model actually sees
-ng soul path        # ~/.aizen/SOUL.md — edit directly in any editor
-ng soul clear
+aizen soul set -b "Always run tests before saying done. Never push without asking."  # body via -b or stdin
+aizen soul show        # print the <agent_identity> the model actually sees
+aizen soul path        # ~/.aizen/SOUL.md — edit directly in any editor
+aizen soul clear
 ```
 
-### `ng skill` — reusable procedures (skills)
+### `aizen skill` — reusable procedures (skills)
 A **skill** is a saved step-by-step playbook (deploy the VPS, cut a release, triage logs) — distinct
 from **memory** (facts/preferences). Skills live as human-editable markdown under `~/.aizen/skills/`.
 A compact index (`name: when`) is injected into the agent's system prompt (`<skills>`); the agent
@@ -324,9 +323,9 @@ pulls a skill's full steps on demand with the **`skill_load`** tool, and can per
 **`skill_save`** (approval-gated). Manage them from the REPL with **`/skills`** (list · view · new ·
 **fetch from URL** · delete), or the CLI:
 ```bash
-ng skill add deploy-vps -d "ship over SSH" -w "asked to deploy"   # body from --body or stdin
-ng skill fetch https://example.com/deploy-vps.md                  # pull a shared skill from a URL
-ng skill list / show <name> / delete <name>
+aizen skill add deploy-vps -d "ship over SSH" -w "asked to deploy"   # body from --body or stdin
+aizen skill fetch https://example.com/deploy-vps.md                  # pull a shared skill from a URL
+aizen skill list / show <name> / delete <name>
 ```
 
 Optional frontmatter narrows when a skill shows in the index: **`requires:`** (tool names — hidden
@@ -337,7 +336,7 @@ aren't built) and **`platforms:`** (`linux`/`macos`/`windows`, or `unix`/`posix`
 into a new skill automatically (conservative: skips one-offs and duplicates; prints `↯ learned skill
 '…'`). It fires when a turn did real work (**≥4 tool calls**) **or recovered from a dead end** (a tool
 errored, then a later call succeeded — that hard-won path is worth saving). It's like memory's
-self-learning, but for how-to. Toggle in `/config` (default on) or `ng config set --auto-skill-learn false`.
+self-learning, but for how-to. Toggle in `/config` (default on) or `aizen config set --auto-skill-learn false`.
 
 ### Custom slash commands — markdown macros you fire
 Where a **skill** is something the *agent* pulls when relevant, a **custom command** is a prompt-macro
@@ -365,7 +364,7 @@ memory apply):
   executed silently.
 
 ### MCP servers (`/mcp`) — bring your own tools
-`ng` can use tools from any [Model Context Protocol](https://modelcontextprotocol.io) server. Declare
+`aizen` can use tools from any [Model Context Protocol](https://modelcontextprotocol.io) server. Declare
 them in `~/.aizen/mcp.json` (the same `mcpServers` shape Claude Desktop uses) over **stdio** (a
 local child process) or **HTTP** (a remote endpoint):
 
@@ -379,15 +378,15 @@ local child process) or **HTTP** (a remote endpoint):
 }
 ```
 
-At startup `ng` connects each enabled server, lists its tools, and exposes each one to the agent as
+At startup `aizen` connects each enabled server, lists its tools, and exposes each one to the agent as
 **`mcp_<server>_<tool>`** (per-server `include`/`exclude` filters which). External tools are
 **approval-gated by default** (unless the server marks a tool read-only). A pure-Rust client — no
-Node/Python MCP SDK, no extra runtime; the single static binary is preserved. `ng mcp list` or
+Node/Python MCP SDK, no extra runtime; the single static binary is preserved. `aizen mcp list` or
 **`/mcp`** shows what's connected.
 
 **OAuth sign-in apps** — the marquee SaaS servers (Linear, Notion, Slack, Gmail/Google, Atlassian)
-are OAuth-only. `ng` speaks the full OAuth 2.1 (PKCE) flow: an entry with `"auth": "oauth"` triggers a
-browser sign-in (`ng apps login <key>`, or automatically when you `ng apps add` one), caches the token
+are OAuth-only. `aizen` speaks the full OAuth 2.1 (PKCE) flow: an entry with `"auth": "oauth"` triggers a
+browser sign-in (`aizen apps login <key>`, or automatically when you `aizen apps add` one), caches the token
 at `~/.aizen/mcp-tokens/<key>.json` (0600), and refreshes it transparently. No API key to paste — you
 authenticate with the real vendor; servers without dynamic client registration take an `"oauth": {
 "client_id": "…" }` block.
@@ -396,10 +395,10 @@ authenticate with the real vendor; servers without dynamic client registration t
 { "mcpServers": { "linear": { "url": "https://mcp.linear.app/mcp", "auth": "oauth" } } }
 ```
 
-**Connect apps without editing JSON** — `ng apps` is a curated catalog over the official MCP registry:
-`ng apps list` (featured + connected), `ng apps search <kw>`, `ng apps add <key|name>` (picks a server,
-prompts only for real secrets, signs you in if it's OAuth), `ng apps info <key>` (config with secrets
-masked + a live tool probe), `ng apps login <key>`, `ng apps remove <key>`. Also the `/apps` TUI hub.
+**Connect apps without editing JSON** — `aizen apps` is a curated catalog over the official MCP registry:
+`aizen apps list` (featured + connected), `aizen apps search <kw>`, `aizen apps add <key|name>` (picks a server,
+prompts only for real secrets, signs you in if it's OAuth), `aizen apps info <key>` (config with secrets
+masked + a live tool probe), `aizen apps login <key>`, `aizen apps remove <key>`. Also the `/apps` TUI hub.
 LOCAL-FIRST: a self-hostable package (runs on your machine with your keys) beats a hosted gateway.
 
 ### Browser automation (`--features browser`)
@@ -407,8 +406,8 @@ Build with `cargo build --release --features browser` to give the agent five CDP
 **existing** local Chrome/Edge/Brave (it never bundles a browser). Launch one with remote debugging,
 then just ask — "open localhost:3000 and tell me why the login button does nothing":
 ```bash
-chrome --remote-debugging-port=9222     # or msedge / brave; override host with NG_BROWSER_CDP
-ng --features… # (already built) → "go to http://localhost:3000 and debug the login form"
+chrome --remote-debugging-port=9222     # or msedge / brave; override host with AIZEN_BROWSER_CDP
+aizen --features… # (already built) → "go to http://localhost:3000 and debug the login form"
 ```
 Tools: **`browser_navigate`** (open a URL), **`browser_snapshot`** (the page's accessibility tree as
 `[@ref] role "name"` lines), **`browser_click`** / **`browser_type`** (act on a `@ref`), and
@@ -416,24 +415,24 @@ Tools: **`browser_navigate`** (open a URL), **`browser_snapshot`** (the page's a
 toolchain**: CDP's local endpoint is plain `ws://`, so the WebSocket client carries no TLS. An absent
 browser returns an actionable error, not a crash.
 
-### `ng memory` — the self-learning brain
+### `aizen memory` — the self-learning brain
 ```bash
-ng memory add "prefer-pnpm" -t feedback -b "I prefer pnpm over npm"
-ng memory list
-ng memory search "package manager" [--dimension tooling]
-ng memory profile [--json]      # derived preferences rollup (verbosity/tooling/stack/…)
-ng memory ask "which package manager should I use?"   # abstains rather than guessing
-ng memory learn "<a user turn>"  # free extraction → threat-scan → route → store
-ng memory frozen                 # the always-on prompt-prefix core
-ng memory style | review | as-of <date> | supersede <old> <new> | archive | restore <id> | compact
+aizen memory add "prefer-pnpm" -t feedback -b "I prefer pnpm over npm"
+aizen memory list
+aizen memory search "package manager" [--dimension tooling]
+aizen memory profile [--json]      # derived preferences rollup (verbosity/tooling/stack/…)
+aizen memory ask "which package manager should I use?"   # abstains rather than guessing
+aizen memory learn "<a user turn>"  # free extraction → threat-scan → route → store
+aizen memory frozen                 # the always-on prompt-prefix core
+aizen memory style | review | as-of <date> | supersede <old> <new> | archive | restore <id> | compact
 ```
 
-### `ng bench` — anti-oracle benches
+### `aizen bench` — anti-oracle benches
 ```bash
-ng bench memory [--split gate|tune|all] [--hybrid]   # retrieval recall vs a baseline
-ng bench memory --evolution                          # multi-session reuse gate (≥5%/session lift)
-ng bench profile                                     # golden set for the profile rollup
-ng bench dialectic                                   # golden set incl. abstain-when-unknown
+aizen bench memory [--split gate|tune|all] [--hybrid]   # retrieval recall vs a baseline
+aizen bench memory --evolution                          # multi-session reuse gate (≥5%/session lift)
+aizen bench profile                                     # golden set for the profile rollup
+aizen bench dialectic                                   # golden set incl. abstain-when-unknown
 ```
 
 ## Exit codes
@@ -447,7 +446,7 @@ applies transitively to sub-agents). Beneath approval sits a **hard safety floor
 blocklist (`rm -rf /` incl. GNU long flags like `rm --recursive --force /`, `mkfs`, `dd of=/dev/…`,
 fork bombs, `curl|sh`, `format C:`, …) that runs *before* the `/yolo` short-circuit, so catastrophic
 commands are refused **even under auto-approve** (and the same check applies to background `process
-start` + `` !`cmd` `` in custom commands). The web tools (`web_fetch`/`web_crawl`/`ng crawl`) carry an
+start` + `` !`cmd` `` in custom commands). The web tools (`web_fetch`/`web_crawl`/`aizen crawl`) carry an
 **SSRF floor**: a URL that resolves to a loopback/private/link-local address (incl. the cloud
 metadata endpoint `169.254.169.254`) is refused — set `AIZEN_ALLOW_PRIVATE_NET=1` to allow
 local/internal targets. Long-lived secret files (`cli-config.json`, OAuth/MCP token caches, saved
@@ -456,7 +455,7 @@ destructive-by-default. `shell_run` is wall-clock capped at 120s. Tool results a
 treated as data, never as instructions.
 
 ## Remote control & notifications
-`ng serve` / `ng discord serve` run long-lived daemons that drive the agent from Telegram or a
-Discord bot (pure-Rust gateways, no SDKs); destructive ops ask for approval from your phone. `ng
+`aizen serve` / `aizen discord serve` run long-lived daemons that drive the agent from Telegram or a
+Discord bot (pure-Rust gateways, no SDKs); destructive ops ask for approval from your phone. `aizen
 cron` schedules unattended runs (model pinned at create time). Outbound `notify` channels (Discord /
 Slack / generic webhook) and the two-way bots are all managed from the **`/apps`** hub.
