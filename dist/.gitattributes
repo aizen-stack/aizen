@@ -1,0 +1,4 @@
+# Shell scripts must stay LF so the shebang isn't broken by a `\r` on Unix,
+# even when committed from Windows.
+*.sh text eol=lf
+install.sh text eol=lf

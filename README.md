@@ -13,19 +13,19 @@ The command is **`aizen`**.
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/dawnofcd/Aizen_agent/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/dawnofcd/aizen/main/install.ps1 | iex
 ```
 
 ```bash
 # Linux / macOS
-curl -fsSL https://raw.githubusercontent.com/dawnofcd/Aizen_agent/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/dawnofcd/aizen/main/install.sh | sh
 ```
 
 Then open a new terminal and run `aizen config`. (Override the install dir with `$env:AIZEN_INSTALL`
 on Windows or `$AIZEN_INSTALL` on Unix. The Windows `.exe` is unsigned — if SmartScreen warns, choose
 *More info → Run anyway*.)
 
-**Or download a binary by hand** from the [latest release](https://github.com/dawnofcd/Aizen_agent/releases/latest):
+**Or download a binary by hand** from the [latest release](https://github.com/dawnofcd/aizen/releases/latest):
 
 | Platform | Asset |
 |---|---|

@@ -49,15 +49,30 @@ jobs:
           ls -lh "$asset"
           echo "ASSET=$asset" >> "$GITHUB_ENV"
 
-      - name: Publish to the release
+      - name: Publish binary (private record + public release)
         env:
           GH_TOKEN: ${{ github.token }}
+          PUBLIC_TOKEN: ${{ secrets.PUBLIC_SYNC_TOKEN }}
         shell: bash
         run: |
+          set -euo pipefail
           tag="${{ github.event.inputs.tag || github.ref_name }}"
-          repo="${{ github.repository }}"
-          # Create the release if it doesn't exist yet so a bare `git push --tags` is enough;
-          # the matrix jobs race here, so swallow the "already exists" error.
-          gh release create "$tag" --repo "$repo" --title "$tag" \
+
+          # 1) PRIVATE repo release — source-tag <-> binary record, and a fallback the owner can
+          #    hand-mirror if the public token ever lapses. Uses the built-in job token.
+          #    The matrix jobs race on `release create`, so swallow "already exists".
+          gh release create "$tag" --repo "${{ github.repository }}" --title "$tag" \
             --notes "Automated build for $tag." 2>/dev/null || true
-          gh release upload "$tag" "$ASSET" --clobber --repo "$repo"
+          gh release upload "$tag" "$ASSET" --clobber --repo "${{ github.repository }}"
+
+          # 2) PUBLIC repo release (dawnofcd/aizen) — the actual download channel the installers
+          #    pull from. Needs the fine-grained PAT secret; if it's absent we don't fail the
+          #    build — the private release still holds the asset for a manual mirror.
+          if [ -n "${PUBLIC_TOKEN:-}" ]; then
+            GH_TOKEN="$PUBLIC_TOKEN" gh release create "$tag" --repo dawnofcd/aizen --title "$tag" \
+              --notes "Aizen $tag — prebuilt binaries." 2>/dev/null || true
+            GH_TOKEN="$PUBLIC_TOKEN" gh release upload "$tag" "$ASSET" --clobber --repo dawnofcd/aizen
+            echo "mirrored $ASSET -> dawnofcd/aizen@$tag"
+          else
+            echo "PUBLIC_SYNC_TOKEN not set — skipped public mirror (private release still has $ASSET)."
+          fi

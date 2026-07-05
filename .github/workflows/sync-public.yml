@@ -1,0 +1,56 @@
+name: sync-public
+
+# Mirror the canonical public distribution files (dist/) from this PRIVATE source repo to the
+# PUBLIC download repo (dawnofcd/aizen) on every push that touches dist/. The public repo is a
+# GENERATED MIRROR — never edit it by hand; edit dist/ here and push, and this job pushes it over.
+#
+# Requires a repo secret PUBLIC_SYNC_TOKEN: a fine-grained PAT scoped to dawnofcd/aizen with
+# `Contents: Read and write`. See README / memory for the setup steps.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dist/**'
+      - '.github/workflows/sync-public.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize mirrors so two quick pushes can't race the public-repo push.
+concurrency:
+  group: sync-public
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+
+      - name: Push dist/ to the public repo
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PUBLIC_SYNC_TOKEN is not set — add a fine-grained PAT (Contents: R/W on dawnofcd/aizen)." >&2
+            exit 1
+          fi
+          # Token is embedded in the remote URL; GitHub Actions auto-masks the secret in logs.
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/dawnofcd/aizen.git" public
+          # Mirror dist/ -> public repo root: copy everything, delete files removed from dist/,
+          # but never touch the public repo's .git.
+          rsync -a --delete --exclude='.git' dist/ public/
+          cd public
+          git config user.name  "aizen-sync[bot]"
+          git config user.email "aizen-sync@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "public repo already in sync — nothing to push."
+          else
+            git commit -m "sync: dist from ${GITHUB_REPOSITORY}@${GITHUB_SHA:0:7}"
+            git push origin HEAD:main
+            echo "pushed dist -> dawnofcd/aizen"
+          fi
