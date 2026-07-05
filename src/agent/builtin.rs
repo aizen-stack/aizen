@@ -20,6 +20,12 @@ use std::time::{Duration, Instant};
 /// Hard wall-clock cap for `shell_run` (a hung command must never freeze the agent loop).
 const SHELL_TIMEOUT_SECS: u64 = 120;
 
+/// Prefix a write tool returns when the target already held byte-identical content — so nothing
+/// was written to disk. The agent loop keys off this exact prefix (`turn_made_edits`) to NOT arm
+/// the verify gate for a no-op (an unchanged tree can't have broken), and the thrash guard sees it
+/// as "not an edit" so a model re-writing the same bytes climbs to a stop instead of looping.
+pub(crate) const NOOP_WRITE_PREFIX: &str = "no change (identical content)";
+
 /// `file_read` budget: a WHOLE-file read over EITHER cap returns a head+tail preview with a loud
 /// marker (so the model knows it has a partial view). A range/numbered read is NEVER bounded. Small
 /// files (the common case) stay byte-exact so `old_string` round-trips. `0` disables a cap.
@@ -324,6 +330,11 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 
 /// Resolve `path` (relative → `base`) and ensure it stays within the `base` subtree.
 /// `must_exist`: canonicalize the full path; else canonicalize the parent + re-join the name.
+///
+/// Symlink hardening (both branches): the resolved path is checked against `base` AFTER symlink
+/// resolution. In the `must_exist=false` branch the target may itself be an existing symlink that
+/// points OUTSIDE `base` (canonicalizing only the parent would let a write follow it out of the
+/// workspace), so when the target already exists we canonicalize IT too and re-check containment.
 pub(crate) fn confine(base: &Path, path: &str, must_exist: bool) -> Result<PathBuf> {
     let raw = Path::new(path);
     let joined = if raw.is_absolute() { raw.to_path_buf() } else { base.join(raw) };
@@ -337,7 +348,15 @@ pub(crate) fn confine(base: &Path, path: &str, must_exist: bool) -> Result<PathB
             .canonicalize()
             .with_context(|| format!("resolving parent of {}", joined.display()))?;
         let fname = joined.file_name().context("path has no file name")?;
-        cparent.join(fname)
+        let candidate = cparent.join(fname);
+        // If the target ALREADY exists it may be a symlink escaping `base`; resolve and re-check the
+        // REAL path so a create-or-overwrite can't follow a planted symlink out of the workspace.
+        if let Ok(real) = candidate.canonicalize() {
+            if !real.starts_with(base) {
+                bail!("path escapes the working directory (symlink target): {path}");
+            }
+        }
+        candidate
     };
     if !resolved.starts_with(base) {
         bail!("path escapes the working directory: {path}");
@@ -792,6 +811,11 @@ impl Tool for FileEdit {
         let content = std::fs::read_to_string(&target)
             .with_context(|| format!("reading {}", target.display()))?;
         let applied = apply_one_edit(&content, old, new, replace_all, path)?;
+        // No-op guard: a match that produced byte-identical content (e.g. old_string == new_string)
+        // must not touch disk or arm the verify gate (W16).
+        if applied.content == content {
+            return Ok(format!("{NOOP_WRITE_PREFIX}: {path} unchanged (old_string == new_string)"));
+        }
         std::fs::write(&target, &applied.content)
             .with_context(|| format!("writing {}", target.display()))?;
         let mut out =
@@ -857,6 +881,12 @@ impl Tool for FileWrite {
         let target = confine(&self.root, path, false)?;
         let existed = target.exists();
         let before = if existed { std::fs::read_to_string(&target).unwrap_or_default() } else { String::new() };
+        // No-op guard: an overwrite that changes nothing must not touch disk (no mtime churn, no
+        // needless git-diff noise) and must not arm the verify gate (W16). A create with empty
+        // content is a real op (the file did not exist), so gate on `existed`.
+        if existed && before == content {
+            return Ok(format!("{NOOP_WRITE_PREFIX}: {path} already holds this exact content"));
+        }
         std::fs::write(&target, content).with_context(|| format!("writing {}", target.display()))?;
         let n = content.lines().count();
         let verb = if existed { "overwrote" } else { "created" };
@@ -1359,6 +1389,12 @@ impl Tool for MultiEdit {
             buf = applied.content;
         }
 
+        // No-op guard: every edit is individually valid (else apply_one_edit already bailed above),
+        // but a sequence that nets out to the original content (e.g. a change immediately undone by
+        // a later edit) must not touch disk or arm the verify gate (W16).
+        if buf == original {
+            return Ok(format!("{NOOP_WRITE_PREFIX}: {path} unchanged after {} edit(s) net to nothing", edits.len()));
+        }
         std::fs::write(&target, &buf).with_context(|| format!("writing {}", target.display()))?;
         let mut out = format!(
             "edited {path} ({} edits applied)\n{}\n{}",
@@ -1706,6 +1742,40 @@ mod tests {
         // a normal in-tree path resolves
         std::fs::write(root.join("ok.txt"), "hi").unwrap();
         assert!(confine(&root, "ok.txt", true).is_ok());
+    }
+
+    #[test]
+    fn confine_rejects_symlink_escape_on_create_or_overwrite() {
+        // A planted symlink inside the workspace whose TARGET is outside must not let a
+        // create-or-overwrite (must_exist=false) follow it out. Skip silently if the platform
+        // doesn't allow symlink creation (Windows without dev mode / privilege).
+        let root = temp_root("confine-symlink");
+        let outside = root.parent().unwrap().join("ng-confine-outside-secret");
+        let _ = std::fs::remove_file(&outside);
+        std::fs::write(&outside, "SECRET").unwrap();
+        let link = root.join("escape.txt");
+        let made = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&outside, &link).is_ok()
+            }
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_file(&outside, &link).is_ok()
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                false
+            }
+        };
+        if !made {
+            let _ = std::fs::remove_file(&outside);
+            return; // no symlink privilege on this runner — nothing to assert
+        }
+        let r = confine(&root, "escape.txt", false);
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&outside);
+        assert!(r.is_err(), "a create/overwrite that would follow a symlink out of the workspace must be rejected");
     }
 
     #[test]
@@ -2181,6 +2251,74 @@ mod tests {
         }));
         assert!(r.is_err(), "empty old_string mid-edit must error");
         assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "hi", "nothing written");
+    }
+
+    #[test]
+    fn file_write_noop_on_identical_content_does_not_touch_disk() {
+        // W16: overwriting a file with the bytes it already holds must not rewrite it (no mtime
+        // churn) and must return the no-op marker (so the loop won't arm the verify gate).
+        let root = temp_root("fw-noop");
+        let p = root.join("f.txt");
+        std::fs::write(&p, "same\n").unwrap();
+        let mtime_before = std::fs::metadata(&p).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let t = FileWrite::new(root.clone());
+        let r = t.execute(&serde_json::json!({"path": "f.txt", "content": "same\n"})).unwrap();
+        assert!(r.starts_with(NOOP_WRITE_PREFIX), "got: {r}");
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().modified().unwrap(),
+            mtime_before,
+            "no-op overwrite must not rewrite the file"
+        );
+    }
+
+    #[test]
+    fn file_write_empty_new_file_is_a_real_op() {
+        // A create with empty content is a genuine op (the file did not exist) — not a no-op.
+        let root = temp_root("fw-newempty");
+        let t = FileWrite::new(root.clone());
+        let r = t.execute(&serde_json::json!({"path": "new.txt", "content": ""})).unwrap();
+        assert!(!r.starts_with(NOOP_WRITE_PREFIX), "creating a new file is never a no-op: {r}");
+        assert!(root.join("new.txt").exists());
+    }
+
+    #[test]
+    fn file_edit_noop_when_old_equals_new() {
+        // W16: old_string == new_string produces byte-identical content → no write, no-op marker.
+        let root = temp_root("fe-noop");
+        let p = root.join("f.txt");
+        std::fs::write(&p, "alpha beta\n").unwrap();
+        let mtime_before = std::fs::metadata(&p).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let t = FileEdit::new(root.clone());
+        let r = t
+            .execute(&serde_json::json!({"path": "f.txt", "old_string": "beta", "new_string": "beta"}))
+            .unwrap();
+        assert!(r.starts_with(NOOP_WRITE_PREFIX), "got: {r}");
+        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), mtime_before);
+    }
+
+    #[test]
+    fn multi_edit_noop_when_edits_net_to_original() {
+        // W16: two edits that cancel out (X→Y then Y→X) net to the original → no write, no-op marker.
+        let root = temp_root("me-noop");
+        let p = root.join("f.txt");
+        std::fs::write(&p, "one two three\n").unwrap();
+        let mtime_before = std::fs::metadata(&p).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let t = MultiEdit::new(root.clone());
+        let r = t
+            .execute(&serde_json::json!({
+                "path": "f.txt",
+                "edits": [
+                    {"old_string": "two", "new_string": "TWO"},
+                    {"old_string": "TWO", "new_string": "two"}
+                ]
+            }))
+            .unwrap();
+        assert!(r.starts_with(NOOP_WRITE_PREFIX), "got: {r}");
+        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), mtime_before);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "one two three\n");
     }
 
     #[test]

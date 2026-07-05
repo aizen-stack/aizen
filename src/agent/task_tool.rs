@@ -406,10 +406,15 @@ impl Tool for TaskTool {
             }
         };
 
+        // A WRITE-CAPABLE sub-agent (coder/tester) must run its OWN verify gate (W14): its edits
+        // happen inside its own loop and reach the parent only as a result summary, so the parent's
+        // gate — which arms on the PARENT's own edit turns — never re-checks them. A read-only role
+        // (planner/reviewer) makes no edits, so the gate would only spawn a needless `cargo check`.
+        let sub_verify_gate = !dispatch_is_read_only(&registry);
         let cfg = AgentConfig {
             auto_approve: self.auto_approve, // inherit parent --yes (transitive autonomy)
             quiet: true,                     // suppress nested progress trace
-            enable_verify_gate: false,       // verify is a TOP-LEVEL concern (the parent run owns it)
+            enable_verify_gate: sub_verify_gate, // ON for write-capable roles; OFF for read-only (W14)
             // The dispatch step budget (default 15 ≪ the top level's 25/50 — a sub-task is
             // narrower by definition) with a bounded auto-extend.
             max_iters: max_steps,
@@ -706,6 +711,20 @@ mod tests {
         for (role, read_only) in [("planner", true), ("reviewer", true), ("coder", false), ("tester", false)] {
             let r = crate::agent::builtin::role_registry(role, &root);
             assert_eq!(dispatch_is_read_only(&r), read_only, "role {role}");
+        }
+    }
+
+    #[test]
+    fn subagent_verify_gate_follows_write_capability() {
+        // W14: the sub-agent verify-gate flag is exactly `!dispatch_is_read_only` — ON for a
+        // write-capable role (coder/tester, which make edits its own loop must verify), OFF for a
+        // read-only role (planner/reviewer, no edits → no needless `cargo check`). This mirrors the
+        // exact expression in `execute` so a drift in either direction fails here.
+        let root = std::env::temp_dir();
+        for (role, want_gate) in [("coder", true), ("tester", true), ("planner", false), ("reviewer", false)] {
+            let r = crate::agent::builtin::role_registry(role, &root);
+            let sub_verify_gate = !dispatch_is_read_only(&r);
+            assert_eq!(sub_verify_gate, want_gate, "verify-gate for role {role}");
         }
     }
 

@@ -42,6 +42,14 @@ pub trait Tool: Send + Sync {
     /// Run the tool. `args` is the parsed (object) arguments. Return the result text; return
     /// an `Err` for a real failure — the loop feeds the error back to the model to recover.
     fn execute(&self, args: &Value) -> Result<String>;
+    /// Does THIS tool consider `result` a failure? A tool that returns `Ok(...)` even on a logical
+    /// failure (so the model sees the detail) — e.g. `shell_run`'s `exit N`, or an MCP tool that
+    /// encodes `{"isError":true}` in its Ok body — overrides this so the loop's progress/thrash
+    /// guard doesn't count that "success" as real progress (W12). `None` (the default) ⇒ defer to
+    /// the loop's generic heuristic (`error:` prefix / non-zero `exit N`); `Some(b)` is definitive.
+    fn result_is_error(&self, _result: &str) -> Option<bool> {
+        None
+    }
 }
 
 /// Drive an async future from the sync `Tool::execute` path, RACED against user cancellation

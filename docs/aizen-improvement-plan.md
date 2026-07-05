@@ -492,15 +492,30 @@ dần trái→phải; làm tuần tự, mỗi phase build + test xanh trước k
 - [x] ~~Resolve `context_window`~~ — **W5 là báo động sai**: mọi caller production (REPL/one-shot,
   main.rs 5360/3214/3466/1244) đã truyền `resolve_ctx_window` (luôn >0) vào cả cfg lẫn registry;
   sub-agent kế thừa (`task_tool.rs:419`). Chỉ path nội bộ `main.rs:1246` để 0 (optional, không đụng).
-- [ ] **P2** Verify-gate re-fire tới pass/hết attempts bất kể edit mới (5.8, W8).
-- [ ] **P2** `truncate_result` → trích theo liên quan cho read/fetch (5.7, W11,W22).
-- [ ] **P2** `Tool::result_is_error` trait hook (5.3, W12).
+- [x] **P2** Verify-gate re-fire tới pass/hết attempts bất kể edit mới (5.8, W8). **Latch `verify_passed`
+  thay cho consume `made_edits`**: gate re-fire mỗi lần model tuyên bố "done" tới khi PASS hoặc hết
+  `max_verify_attempts`; edit mới clear latch (re-verify việc mới). Model không thể né gate bằng cách
+  tuyên bố "done" mà không sửa. (`mod.rs` gate block + edit-detect).
+- [x] **P2** `truncate_result` → trích theo liên quan cho read/fetch (5.7, W11,W22). `truncate_relevant`
+  (BM25-lite: chấm điểm block theo từ khoá, giữ head + cửa sổ điểm cao nhất), keyword lấy từ args của
+  tool (`relevance_query_from_args`), CHỈ áp cho `file_read`/`web_fetch`/`web_crawl`/`search_files`,
+  không-tín-hiệu → degrade y hệt head+tail cũ. (`mod.rs`, `run_tool_body`).
+- [x] **P2** `Tool::result_is_error` trait hook (5.3, W12). Trait method mặc định `None`→heuristic;
+  `result_is_failure(registry,name,content)` cho tool MCP/custom tự khai báo lỗi; thrash guard dùng nó.
 
 ### Tool / code-execution layer (`builtin.rs`, `task_tool.rs`, `timemachine.rs`)
-- [ ] **P2** No-op write/edit guard (không ghi khi `before==content`) (5.4, W16).
-- [ ] **P2** Auto-checkpoint trước thao tác phá huỷ đầu tiên; cấp `checkpoint` cho coder sub-agent (5.4, W15).
-- [ ] **P2** Bật `enable_verify_gate` cho coder sub-agent (`task_tool.rs:412`, W14).
-- [ ] **P2** `confine(must_exist=false)` canonical-hoá cả target (chặn symlink lách) (W: minor).
+- [x] **P2** No-op write/edit guard (không ghi khi `before==content`) (5.4, W16). `NOOP_WRITE_PREFIX`
+  cho cả 3 tool ghi (file_write identical, file_edit old==new, multi_edit net-to-original); không chạm
+  đĩa, `turn_made_edits` coi là không-edit → không arm verify gate.
+- [x] **P2** Auto-checkpoint trước thao tác phá huỷ đầu tiên (5.4, W15). One-shot latch trong loop trước
+  pre-fill khi turn có call destructive; `cfg.auto_checkpoint` (default true, test=false). `save` đã
+  dedup zero-diff tree → rẻ. Coder đã có `checkpoint` sẵn qua read-only base.
+- [x] **P2** Bật `enable_verify_gate` cho sub-agent WRITE-CAPABLE (`task_tool.rs`, W14).
+  `sub_verify_gate = !dispatch_is_read_only` — ON cho coder/tester (edit trong loop con phải tự verify),
+  OFF cho planner/reviewer (read-only, không phí `cargo check`).
+- [x] **P2** `confine(must_exist=false)` canonical-hoá cả target (chặn symlink lách) (W: minor). Khi
+  target đã tồn tại → canonicalize + re-check `starts_with(base)` (chặn create/overwrite theo symlink
+  trỏ ra ngoài workspace).
 
 ### Search layer (`reach/`, `web_tools.rs`)
 - [ ] **P3** Parse theo container + phân biệt vỡ-parser vs rỗng (W18,W19).

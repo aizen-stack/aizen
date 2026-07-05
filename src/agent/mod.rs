@@ -254,6 +254,10 @@ pub struct AgentConfig {
     pub enable_verify_gate: bool,
     /// Wall-clock cap (seconds) for the verify-gate subprocess.
     pub verify_gate_timeout_secs: u64,
+    /// Stamp a one-shot time-machine checkpoint before the FIRST destructive tool call of a run, so
+    /// the whole session's edits are rewindable (W15). Best-effort (no-op outside a git repo).
+    /// Default `true`; tests set it `false` (their cwd is a real repo — no checkpoint pollution).
+    pub auto_checkpoint: bool,
     /// The model's context window in tokens, for the mid-loop context guard. A single run-away
     /// loop (reading many large files) can blow past the window BEFORE control returns to the
     /// REPL's auto-compact; when the running history crosses ~90% of this, the loop injects a
@@ -315,6 +319,7 @@ impl Default for AgentConfig {
             quiet: false,
             enable_verify_gate: true,
             verify_gate_timeout_secs: 90,
+            auto_checkpoint: true,
             context_window: 0,
             keep_recent_tool_results: 8,
             clear_tool_result_min_chars: 1024,
@@ -482,9 +487,18 @@ where
     let mut unproductive_streak = 0usize;
     let mut stuck_nudged = false;
     let mut verify_attempts = 0usize;
-    let mut made_edits = false;
-    // CUMULATIVE edit flag (never consumed, unlike `made_edits`) — arms the one-shot self-review.
+    // The verify gate PASSED for the current tree state (W8). Set when a check comes back clean;
+    // CLEARED by a fresh successful edit (new work must be re-verified). While false and edits
+    // exist, the gate re-fires on every "done" claim until it passes or attempts exhaust — so a
+    // model can't finish by re-asserting "done" without fixing the breakage.
+    let mut verify_passed = false;
+    // CUMULATIVE edit flag — set once any successful edit lands; arms the one-shot self-review AND
+    // gates the verify gate (a run that never edited has nothing to verify).
     let mut made_any_edits = false;
+    // ONE-SHOT auto-checkpoint latch (W15): before the FIRST turn that will run a destructive tool,
+    // stamp a time-machine restore point so the user can rewind the whole session's edits. Set on
+    // the first attempt regardless of outcome (no repeated attempts if the repo/git is unusable).
+    let mut auto_checkpointed = false;
     let mut self_review_done = false;
     let mut context_warned = false;
     // Provider-reported prompt size at the last usage-carrying call (see `RealAnchor`) —
@@ -674,14 +688,20 @@ where
         // CLASSIFY: the structured tool_calls array is the source of truth (a gateway may
         // emit finish_reason="stop"/"end_turn" alongside tool calls — ignore it here).
         if turn.tool_calls.is_empty() {
-            // VERIFY/REPAIR GATE (F2): after an editing run, run a fast typecheck before Done. On
-            // failure, record the premature "done", inject the errors, and loop back for a fix — up
-            // to `max_verify_attempts` rounds (a bounded repair loop, not one-shot). `made_edits` is
-            // consumed here so the gate re-fires only after the model makes NEW edits; a model that
-            // re-asserts "done" without editing is allowed to finish. Best-effort: an unknown
-            // project / missing toolchain → no-op.
-            if cfg.enable_verify_gate && made_edits && verify_attempts < cfg.max_verify_attempts {
-                made_edits = false; // consume — re-arm only on fresh edits next round
+            // VERIFY/REPAIR GATE (F2 + W8): after an editing run, run a fast typecheck before Done.
+            // On failure, record the premature "done", inject the errors, and loop back for a fix.
+            // The gate RE-FIRES on EVERY "done" claim until it PASSES or the attempt budget
+            // (`max_verify_attempts`, a monotonic total-run cap that bounds the repair loop) is
+            // spent — it is NOT consumed by a single edit, so a model can no longer skip
+            // verification by simply re-asserting "done" without editing (W8). `verify_passed`
+            // latches a clean check; a FRESH successful edit clears it (see the edit block) so new
+            // work is always re-verified. Best-effort: an unknown project / missing toolchain → the
+            // gate returns None and this turn falls through to Done (never loops on absence).
+            if cfg.enable_verify_gate
+                && made_any_edits
+                && !verify_passed
+                && verify_attempts < cfg.max_verify_attempts
+            {
                 // Canonicalize to match the tool-registry root (`builtin::resolve_root`), so the
                 // gate typechecks the same tree the file tools were confined to.
                 let cwd = std::env::current_dir()
@@ -721,6 +741,9 @@ where
                         iter += 1;
                         continue;
                     }
+                    // PASSED: latch it so a subsequent no-edit "done" doesn't needlessly re-run the
+                    // gate (a fresh successful edit clears the latch → new work is re-verified).
+                    verify_passed = true;
                 }
             }
             // SELF-REVIEW (opt-in, once per run): after the verify gate is satisfied and before
@@ -799,6 +822,28 @@ where
             );
         }
 
+        // AUTO-CHECKPOINT (W15): the first time this run is about to execute a DESTRUCTIVE call,
+        // stamp a time-machine restore point so the whole session's edits are rewindable. Fires at
+        // most once per run; best-effort (a non-git tree / git absence returns Err and is ignored —
+        // `save` also dedups a zero-diff tree, so a checkpoint before a read-only-so-far session is
+        // free). Done BEFORE pre-fill so the snapshot captures the pre-edit tree.
+        if cfg.auto_checkpoint
+            && !auto_checkpointed
+            && turn.tool_calls.iter().any(|tc| {
+                registry.get(&tc.function.name).map(|t| t.is_destructive()).unwrap_or(false)
+            })
+        {
+            auto_checkpointed = true;
+            if let Ok(snap) = crate::features::timemachine::save("before agent edits", true) {
+                if !cfg.quiet {
+                    emit_trace(&format!(
+                        "→ checkpoint #{} saved (restore with `aizen time restore {}`)",
+                        snap.id, snap.id
+                    ));
+                }
+            }
+        }
+
         // PRE-FILL: append the assistant tool-call turn AND one placeholder result per call in a
         // single synchronous block (no await in between) — history is VALID from this instant, so
         // the REPL's `select!` dropping this future mid-batch (Esc) can never leave a dangling
@@ -830,8 +875,9 @@ where
         // denied/errored edit changed nothing, so it must not make the gate blame the tree.
         let edited_this_turn = turn_made_edits(registry, &calls, &results);
         if edited_this_turn {
-            made_edits = true;
             made_any_edits = true;
+            // Fresh work invalidates any prior clean check — the gate must re-verify (W8).
+            verify_passed = false;
         }
 
         // PROGRESS / THRASH GUARD (W3/W4): a turn is PRODUCTIVE iff a successful edit landed OR some
@@ -842,8 +888,10 @@ where
         // productive and resets the streak — the system-prompt-sanctioned re-read→retry recovery is
         // never punished. Productive turns also clear nudged_sigs, ending any open divergence episode.
         let mut new_content = false;
-        for (_, r) in &results {
-            if is_failure_result(r) {
+        for (tc, (_, r)) in calls.iter().zip(&results) {
+            // Registry-aware: a tool that self-declares failure (W12) is never progress, even if it
+            // returned Ok(...) without the `error:`/`exit N` shape the heuristic keys on.
+            if result_is_failure(registry, &tc.function.name, r) {
                 continue; // failures are never progress
             }
             if seen_results.insert(hash_str(r)) {
@@ -1140,6 +1188,11 @@ fn turn_made_edits(
         if !t.is_destructive() || result.starts_with("error:") {
             return false; // unknown tool, or a denied/errored op — changed nothing.
         }
+        // A write tool that no-op'd (target already held identical content) wrote nothing to disk,
+        // so it must not arm the verify gate (an unchanged tree can't have broken) — W16.
+        if result.starts_with(crate::agent::builtin::NOOP_WRITE_PREFIX) {
+            return false;
+        }
         // `shell_run` returns Ok("exit N\n…") even when the command FAILED (non-zero exit), so a
         // failed destructive shell op would otherwise arm the gate and let pre-existing breakage be
         // blamed on this turn. Only a clean `exit 0` counts as a real edit. (file_edit/file_write/
@@ -1259,7 +1312,37 @@ fn run_tool_body(tool: std::sync::Arc<dyn tools::Tool>, args: &serde_json::Value
     if !quiet {
         emit_tool_result(tool.name(), &out);
     }
+    // Relevance-aware truncation for the READ/FETCH tools whose output is a large document the model
+    // is scanning for specifics (W11/W22): keep the region matching the call's query keywords rather
+    // than a blind head+tail. Non-failure only (an error string must survive verbatim — the model's
+    // error trail is how it recovers) and only for these tools (an edit diff / shell log is
+    // positional, not keyword-scored). Everything else keeps the exact old head+tail behavior.
+    if !is_failure_result(&out) && is_relevance_truncatable(tool.name()) {
+        let keywords = relevance_keywords(&relevance_query_from_args(args));
+        return truncate_relevant(&out, max_chars, &keywords);
+    }
     truncate_result(&out, max_chars)
+}
+
+/// Tools whose large output is a document scanned for specifics — relevance-trimming keeps the
+/// matching region instead of a blind head+tail. Edit/shell/memory tools are excluded (their
+/// output is positional or already digested).
+fn is_relevance_truncatable(name: &str) -> bool {
+    matches!(name, "file_read" | "web_fetch" | "web_crawl" | "search_files")
+}
+
+/// Pull the relevance-signal string from a call's args: the query/pattern/topic fields these tools
+/// take. `web_fetch`/`web_crawl` carry a URL (its path segments are decent keywords); `search_files`
+/// a `query`/`pattern`; `file_read` a `path`. Joined so [`relevance_keywords`] can tokenize once.
+fn relevance_query_from_args(args: &serde_json::Value) -> String {
+    const KEYS: &[&str] = &["query", "pattern", "q", "search", "topic", "url", "path"];
+    let mut parts = Vec::new();
+    for k in KEYS {
+        if let Some(v) = args.get(*k).and_then(|v| v.as_str()) {
+            parts.push(v.to_string());
+        }
+    }
+    parts.join(" ")
 }
 
 /// The event-anchor line for a tool call — `⏺ name(salient-arg)`: a moonlight dot + tool name, the
@@ -1603,6 +1686,20 @@ pub struct ClearStats {
     pub failures_trimmed: usize,
 }
 
+/// Registry-aware failure check (W12): a tool may DEFINITIVELY classify its own result via
+/// [`tools::Tool::result_is_error`] (an MCP/custom tool that returns `Ok(...)` on a logical
+/// failure, so the model sees the detail). When the tool declines (`None`) — the common case —
+/// fall back to the generic [`is_failure_result`] heuristic. Used by the progress/thrash guard so
+/// a self-declared-failed result never counts as "new content" progress.
+fn result_is_failure(registry: &ToolRegistry, tool_name: &str, content: &str) -> bool {
+    if let Some(t) = registry.get(tool_name) {
+        if let Some(verdict) = t.result_is_error(content) {
+            return verdict;
+        }
+    }
+    is_failure_result(content)
+}
+
 /// A tool result that represents a FAILURE the model must keep seeing: an `error:`-prefixed
 /// feedback string (unknown tool / bad args / tool error / denied approval) or a `shell_run`
 /// result whose exit code is nonzero. Blanking failures teaches the model to repeat them —
@@ -1789,6 +1886,99 @@ fn push_nudge(messages: &mut Vec<Message>, kind_prefix: &str, text: &str) {
         }
     }
     messages.push(Message::system(text));
+}
+
+/// Generic tokens a URL/protocol source contributes that carry no topical signal (scheme, common
+/// TLDs, markup extensions) — filtered so a `web_fetch(url=...)` query doesn't dilute scoring with
+/// words that will spuriously "match" boilerplate (every page has "www"/"html" somewhere).
+const KEYWORD_STOPWORDS: &[&str] = &["http", "https", "www", "com", "org", "net", "html", "htm"];
+
+/// Split a query string into lowercased alphanumeric keyword tokens ≥3 chars, deduped, capped —
+/// the relevance signal for [`truncate_relevant`]. Short/stop-ish tokens add noise, not signal.
+fn relevance_keywords(query: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for tok in query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 3)
+    {
+        let low = tok.to_ascii_lowercase();
+        if KEYWORD_STOPWORDS.contains(&low.as_str()) {
+            continue;
+        }
+        if seen.insert(low.clone()) {
+            out.push(low);
+        }
+        if out.len() >= 24 {
+            break; // a huge query can't dominate the scan cost
+        }
+    }
+    out
+}
+
+/// RELEVANCE-AWARE truncation (W11/W22): keep the `max`-char window of `s` most relevant to
+/// `keywords` instead of a blind head+tail. Splits into line-blocks, scores each by keyword hits
+/// (BM25-lite: a keyword's contribution saturates so one repeated term can't dominate), then keeps
+/// the highest-scoring CONTIGUOUS run that fits `max`, always anchored to include the head (a
+/// file's imports / a page's title carry orientation signal). Falls back to [`truncate_result`]
+/// when there is no keyword signal or nothing scores — so a keyword-free result degrades exactly
+/// to the old behavior. Pure; no allocation beyond the kept window.
+pub fn truncate_relevant(s: &str, max: usize, keywords: &[String]) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    if keywords.is_empty() || max < 64 {
+        return truncate_result(s, max); // no signal (or too small a budget) → old head+tail
+    }
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() < 4 {
+        return truncate_result(s, max); // too few lines to window meaningfully
+    }
+    // Score each line: sum over keywords of a saturating hit count (min(hits,3)) — cheap, and it
+    // rewards a line matching MANY distinct keywords over one matching a single term many times.
+    let score_line = |line: &str| -> u32 {
+        let low = line.to_ascii_lowercase();
+        keywords.iter().map(|k| (low.matches(k.as_str()).count().min(3)) as u32).sum()
+    };
+    let scores: Vec<u32> = lines.iter().map(|l| score_line(l)).collect();
+    if scores.iter().all(|&x| x == 0) {
+        return truncate_result(s, max); // nothing matched → don't distort; keep head+tail
+    }
+    // Reserve ~1/4 of the budget for an always-included HEAD (orientation), the rest for the best
+    // window around the peak-scoring region.
+    let head_budget = (max / 4).min(n);
+    let head: String = s.chars().take(head_budget).collect();
+    let body_budget = max.saturating_sub(head.chars().count() + 48); // 48 ≈ two elision markers
+
+    // Find the contiguous line-run maximizing total score under body_budget chars (greedy window
+    // grown around the single best line — O(lines), good enough and stable).
+    let peak = scores.iter().enumerate().max_by_key(|(_, &sc)| sc).map(|(i, _)| i).unwrap_or(0);
+    let (mut lo, mut hi) = (peak, peak);
+    let mut win_chars = lines[peak].chars().count();
+    // Expand outward toward whichever neighbor has the higher score, staying under budget.
+    loop {
+        let up = lo.checked_sub(1);
+        let down = if hi + 1 < lines.len() { Some(hi + 1) } else { None };
+        let cand = match (up, down) {
+            (Some(u), Some(d)) => {
+                if scores[u] >= scores[d] { Some((u, true)) } else { Some((d, false)) }
+            }
+            (Some(u), None) => Some((u, true)),
+            (None, Some(d)) => Some((d, false)),
+            (None, None) => None,
+        };
+        let Some((idx, is_up)) = cand else { break };
+        let add = lines[idx].chars().count() + 1;
+        if win_chars + add > body_budget {
+            break;
+        }
+        win_chars += add;
+        if is_up { lo = idx } else { hi = idx }
+    }
+    let window: String = lines[lo..=hi].join("\n");
+    let omitted = n.saturating_sub(head.chars().count() + window.chars().count());
+    format!("{head}\n…[{omitted} chars elided — kept the region most relevant to the query]…\n{window}")
 }
 
 /// Truncate a tool result to `max` chars, head+tail, marking the elision.
@@ -2045,6 +2235,27 @@ mod tests {
         }
     }
 
+    /// Returns Ok(...) with a body that carries NO `error:`/`exit N` shape but self-declares failure
+    /// via `result_is_error` — models an MCP tool encoding `{"isError":true}` (W12).
+    struct SelfErrTool;
+    impl Tool for SelfErrTool {
+        fn name(&self) -> &str {
+            "selferr"
+        }
+        fn description(&self) -> &str {
+            "returns a body that self-declares failure"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{"i":{"type":"string"}}})
+        }
+        fn execute(&self, _args: &serde_json::Value) -> Result<String> {
+            Ok("{\"isError\":true,\"detail\":\"upstream 500\"}".into())
+        }
+        fn result_is_error(&self, result: &str) -> Option<bool> {
+            Some(result.contains("\"isError\":true"))
+        }
+    }
+
     /// Stateful: returns an INCREMENTING value each call, so every invocation surfaces NEW content
     /// regardless of args — models a legitimate poll/consume loop, used to prove a productive
     /// repeated-signature loop is NOT hard-stopped as divergence.
@@ -2116,6 +2327,7 @@ mod tests {
         r.register(Box::new(FailTool));
         r.register(Box::new(DeleteTool));
         r.register(Box::new(ConstTool));
+        r.register(Box::new(SelfErrTool));
         r.register(Box::new(TickTool(std::sync::atomic::AtomicUsize::new(0))));
         r
     }
@@ -2131,6 +2343,7 @@ mod tests {
             quiet: true,
             enable_verify_gate: false,
             verify_gate_timeout_secs: 90,
+            auto_checkpoint: false, // OFF in tests: cwd is a real repo — no checkpoint pollution
             context_window: 0, // guard off by default in tests; the guard test sets it explicitly
             keep_recent_tool_results: 8,
             clear_tool_result_min_chars: 1024,
@@ -2581,6 +2794,14 @@ mod tests {
         let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
         assert_eq!(out.stop, StopReason::Divergence, "a repeated identical destructive call must stop");
         assert_eq!(out.iters, 3, "must hard-stop by the 3rd identical call, not run to the extended cap");
+    }
+
+    #[test]
+    fn auto_checkpoint_defaults_on_and_off_in_tests() {
+        // W15: production defaults the auto-checkpoint latch ON, but the unit-test cfg() forces it
+        // OFF (the test cwd is a real git repo — a checkpoint per destructive test would pollute it).
+        assert!(AgentConfig::default().auto_checkpoint, "production default must be ON");
+        assert!(!cfg().auto_checkpoint, "test cfg must force it OFF to avoid repo pollution");
     }
 
     #[tokio::test]
@@ -3178,6 +3399,12 @@ mod tests {
         let calls = vec![call("1", "delete", "{}"), call("2", "delete", "{}")];
         let results = vec![("1".to_string(), "error: declined".to_string()), ("2".to_string(), "deleted".to_string())];
         assert!(turn_made_edits(&r, &calls, &results));
+        // W16: a write tool that no-op'd (identical content) wrote nothing → must not arm the gate.
+        let noop = format!("{}: f.txt already holds this exact content", crate::agent::builtin::NOOP_WRITE_PREFIX);
+        assert!(
+            !turn_made_edits(&r, &[call("1", "delete", "{}")], &res("1", &noop)),
+            "a no-op write must not arm the verify gate"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3203,7 +3430,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_run_does_not_invoke_verify_gate() {
-        // Gate ENABLED, but the run only reads → made_edits stays false → gate never fires (so
+        // Gate ENABLED, but the run only reads → made_any_edits stays false → gate never fires (so
         // no `cargo check` subprocess), and the loop reports Done normally.
         let r = registry();
         let c = AgentConfig { enable_verify_gate: true, quiet: true, ..cfg() };
@@ -3228,6 +3455,65 @@ mod tests {
         assert!(t.contains("truncated"));
         assert!(t.starts_with('a'));
         assert!(t.ends_with('b'));
+    }
+
+    #[test]
+    fn relevance_keywords_tokenizes_and_filters() {
+        let k = relevance_keywords("How does the RetryPolicy backoff work?");
+        assert!(k.contains(&"retrypolicy".to_string()));
+        assert!(k.contains(&"backoff".to_string()));
+        assert!(!k.iter().any(|t| t.chars().count() < 3), "short tokens dropped");
+        // URL stopwords are filtered so a url source doesn't dilute scoring.
+        let ku = relevance_keywords("https://docs.rs/tokio/latest/tokio/task");
+        assert!(!ku.contains(&"https".to_string()) && !ku.contains(&"www".to_string()));
+        assert!(ku.contains(&"tokio".to_string()) && ku.contains(&"task".to_string()));
+    }
+
+    #[test]
+    fn truncate_relevant_keeps_the_matching_region() {
+        // A long doc where the ONLY mention of the query term is in the MIDDLE — blind head+tail
+        // would drop it; relevance truncation must keep it.
+        let mut lines: Vec<String> = (0..200).map(|i| format!("filler line number {i} lorem ipsum")).collect();
+        lines[100] = "the CriticalSetting flag toggles the special behavior here".to_string();
+        let doc = lines.join("\n");
+        let kw = relevance_keywords("CriticalSetting");
+        let out = truncate_relevant(&doc, 400, &kw);
+        assert!(out.contains("CriticalSetting"), "the matching region must survive: {out}");
+        assert!(out.chars().count() <= 400 + 120, "stays near the budget (+markers)");
+    }
+
+    #[test]
+    fn truncate_relevant_degrades_to_head_tail_without_signal() {
+        // No keyword match anywhere → must behave EXACTLY like the old head+tail truncation.
+        let s = "a".repeat(300) + &"b".repeat(300);
+        let kw = relevance_keywords("nonexistentzzz");
+        let rel = truncate_relevant(&s, 120, &kw);
+        let plain = truncate_result(&s, 120);
+        assert_eq!(rel, plain, "no signal must degrade to the exact old behavior");
+    }
+
+    #[test]
+    fn truncate_relevant_passthrough_when_within_budget() {
+        let s = "short enough";
+        assert_eq!(truncate_relevant(s, 4096, &["short".to_string()]), s);
+    }
+
+    #[test]
+    fn relevance_query_from_args_pulls_known_keys() {
+        let a = serde_json::json!({"pattern": "RetryPolicy", "glob": "*.rs"});
+        assert_eq!(relevance_query_from_args(&a), "RetryPolicy");
+        let u = serde_json::json!({"url": "https://x.com/tokio"});
+        assert_eq!(relevance_query_from_args(&u), "https://x.com/tokio");
+        assert_eq!(relevance_query_from_args(&serde_json::json!({"other": 1})), "");
+    }
+
+    #[test]
+    fn is_relevance_truncatable_matches_read_fetch_only() {
+        assert!(is_relevance_truncatable("file_read"));
+        assert!(is_relevance_truncatable("web_fetch"));
+        assert!(is_relevance_truncatable("search_files"));
+        assert!(!is_relevance_truncatable("file_edit"), "edit output is positional");
+        assert!(!is_relevance_truncatable("shell_run"), "shell log is positional");
     }
 
     #[test]
@@ -3370,6 +3656,21 @@ mod tests {
         assert!(!is_failure_result("exit 0\nok"));
         assert!(!is_failure_result("plain file contents"));
         assert!(!is_failure_result("exit code unknown")); // unparsable code ≠ failure
+    }
+
+    #[test]
+    fn result_is_failure_consults_tool_then_heuristic() {
+        // W12: a tool that self-declares failure (SelfErrTool) overrides the generic heuristic even
+        // though its Ok body has no `error:`/`exit N` shape; a tool returning None defers to it.
+        let r = registry();
+        let err_body = "{\"isError\":true,\"detail\":\"x\"}";
+        assert!(result_is_failure(&r, "selferr", err_body), "self-declared failure must count");
+        assert!(!result_is_failure(&r, "selferr", "{\"isError\":false}"), "self-declared OK must not");
+        // A tool that doesn't override (echo → None) falls back to the heuristic.
+        assert!(result_is_failure(&r, "echo", "error: boom"), "None defers to heuristic (error:)");
+        assert!(!result_is_failure(&r, "echo", "plain contents"), "None defers to heuristic (ok)");
+        // Unknown tool → pure heuristic.
+        assert!(result_is_failure(&r, "ghost", "exit 3\n"));
     }
 
     #[test]
