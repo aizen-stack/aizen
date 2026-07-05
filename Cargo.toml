@@ -101,9 +101,16 @@ dense = ["dep:model2vec-rs"]
 # (`tokio-tungstenite` is now a base dep — the Discord bot needs it — so this just gates the tools.)
 browser = []
 
+# Release profile is tuned for a small, hard-to-reverse binary (the CI runners build this; the local
+# windows-gnu toolchain can't do an optimized build — see the repo notes). `panic` is deliberately
+# left at the default `unwind`: async-lsp's CatchUnwind middleware and per-task panic isolation rely
+# on unwinding, so `panic = "abort"` would let one LSP/tool panic tear down the whole process.
 [profile.release]
-strip = true
-lto = "thin"
+opt-level = 3
+lto = "fat"          # aggressive cross-crate inlining dissolves function boundaries (harder to trace)
+codegen-units = 1    # one unit → more inlining, smaller output (slower link; CI absorbs it)
+strip = true         # drop the symbol table + debug info (no function names for a disassembler)
+debug = false
 
 # Image (vision) input — encode a pasted clipboard image into a data URL for OpenAI-compatible
 # vision models (paste a screenshot straight into the chat box with Ctrl-V). Clipboard access is

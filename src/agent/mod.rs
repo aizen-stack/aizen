@@ -40,13 +40,37 @@ use console::style;
 use std::future::Future;
 use tools::ToolRegistry;
 
-/// The static (cached-prefix) base system prompt — see `system-prompt.md`.
-pub const SYSTEM_BASE: &str = include_str!("system_prompt.md");
+/// XOR-obfuscated system prompts (see `build.rs`): the plaintext is not present in the binary, so
+/// `strings aizen(.exe)` can't lift it. `decode` reverses the build-time XOR; the public accessors
+/// cache the result so the work happens once per process.
+mod obf {
+    include!(concat!(env!("OUT_DIR"), "/prompts_obf.rs"));
+
+    pub fn decode(cipher: &[u8]) -> String {
+        let key = PROMPT_KEY;
+        let bytes: Vec<u8> = cipher
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % key.len()])
+            .collect();
+        String::from_utf8(bytes).expect("obfuscated prompt is valid UTF-8")
+    }
+}
+
+/// The static (cached-prefix) base system prompt — see `system_prompt.md`. Stored obfuscated; decoded
+/// once into a cached `String` (was a plaintext `include_str!` const).
+pub fn system_base() -> &'static str {
+    static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| obf::decode(obf::SYSTEM_BASE_OBF)).as_str()
+}
 
 /// The STRICT-tier base prompt for small/local models (numbered imperative rules, explicit output
 /// contract, tool cheat sheet) — weak models follow commands, not essays. Selected by
-/// [`prompt_tier_for`]; ~half the tokens of the full prompt.
-pub const SYSTEM_BASE_STRICT: &str = include_str!("system_prompt_strict.md");
+/// [`prompt_tier_for`]; ~half the tokens of the full prompt. Obfuscated like [`system_base`].
+pub fn system_base_strict() -> &'static str {
+    static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| obf::decode(obf::SYSTEM_BASE_STRICT_OBF)).as_str()
+}
 
 /// Which base prompt a model gets. One prompt cannot serve both Claude and a 7B local model —
 /// the opencode precedent (`qwen.txt` fallback) applied to aizen's arbitrary-endpoint reality.
@@ -98,8 +122,8 @@ pub fn build_system_prompt(
     // Tier is a pure function of (model, config): fixed within a session, so the prefix stays
     // byte-stable; every model switch already rebuilds the system prompt.
     let base = match prompt_tier_for(model, crate::core::cli_config::load().prompt_tier.as_deref()) {
-        PromptTier::Strict => SYSTEM_BASE_STRICT,
-        PromptTier::Full => SYSTEM_BASE,
+        PromptTier::Strict => system_base_strict(),
+        PromptTier::Full => system_base(),
     };
     let mut s = String::from(base.trim_end());
     s.push_str("\n\n<environment>\n");
@@ -155,8 +179,8 @@ pub fn build_subagent_base_prompt(
     include_project_context: bool,
 ) -> String {
     let base = match prompt_tier_for(model, crate::core::cli_config::load().prompt_tier.as_deref()) {
-        PromptTier::Strict => SYSTEM_BASE_STRICT,
-        PromptTier::Full => SYSTEM_BASE,
+        PromptTier::Strict => system_base_strict(),
+        PromptTier::Full => system_base(),
     };
     let mut s = String::from(base.trim_end());
     s.push_str("\n\n<environment>\n");
@@ -2216,8 +2240,20 @@ mod tests {
         let s1 = build_system_prompt("/w", "linux", "2026-07-05", "qwen2.5-coder-7b", None);
         let s2 = build_system_prompt("/w", "linux", "2026-07-05", "qwen2.5-coder-7b", None);
         assert_eq!(s1, s2, "strict tier must be deterministic");
-        assert!(s1.starts_with(SYSTEM_BASE_STRICT.trim_end()), "strict base leads the strict prompt");
+        assert!(s1.starts_with(system_base_strict().trim_end()), "strict base leads the strict prompt");
         assert!(s1.contains("OUTPUT CONTRACT"));
+    }
+
+    #[test]
+    fn obfuscated_prompts_decode_correctly() {
+        // The build-time XOR must round-trip: a wrong key/decoder would corrupt UTF-8 (panic in
+        // decode) or drop the branding. Cheap guard so obfuscation can't silently break the prompt.
+        let base = system_base();
+        assert!(!base.is_empty(), "base prompt decoded empty");
+        assert!(base.to_lowercase().contains("aizen"), "decoded base prompt mentions aizen");
+        let strict = system_base_strict();
+        assert!(!strict.is_empty(), "strict prompt decoded empty");
+        assert!(strict.contains("OUTPUT CONTRACT"), "strict prompt keeps its contract section");
     }
 
     #[test]
@@ -2860,7 +2896,7 @@ mod tests {
     #[test]
     fn system_prompt_static_prefix_and_blocks() {
         let p1 = build_system_prompt("/a", "linux", "2026-06-20", "m", Some("- terse"));
-        assert!(p1.starts_with(SYSTEM_BASE.trim_end()), "static base must lead the prompt");
+        assert!(p1.starts_with(system_base().trim_end()), "static base must lead the prompt");
         assert!(p1.contains("cwd: /a"));
         // check the INJECTED block (the base prose also mentions <user_memory>).
         assert!(p1.contains("\n<user_memory>\n") && p1.contains("- terse"));
@@ -2869,7 +2905,7 @@ mod tests {
         assert!(!p2.contains("\n<user_memory>\n"));
         // static prefix byte-identical regardless of dynamic inputs (prefix-cache safety)
         let p3 = build_system_prompt("/b", "macos", "2026-01-01", "n", None);
-        assert!(p3.starts_with(SYSTEM_BASE.trim_end()));
+        assert!(p3.starts_with(system_base().trim_end()));
     }
 
     #[tokio::test]
@@ -2957,7 +2993,7 @@ mod tests {
             let top = build_top_level_system_prompt("/w", "linux", "2026-06-20", "m", None);
             assert!(top.contains("<agents>"), "installed agent ⇒ index present");
             assert!(top.contains("task(agent="), "tells the model how to dispatch");
-            assert!(top.starts_with(SYSTEM_BASE.trim_end()), "static base prefix is preserved");
+            assert!(top.starts_with(system_base().trim_end()), "static base prefix is preserved");
             // The block is a pure SUFFIX: stripping it yields exactly the base prompt.
             let base = build_system_prompt("/w", "linux", "2026-06-20", "m", None);
             assert!(top.starts_with(&base), "agents block is appended after the unchanged base");
