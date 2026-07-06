@@ -1,24 +1,16 @@
-//! The `search` channel — keyless web search with an automatic backend chain, plus per-platform
+//! The `search` channel — keyed web search with an automatic backend chain, plus per-platform
 //! search for the sites that expose real APIs (GitHub / Hacker News / Stack Overflow / Wikipedia).
 //!
-//! Web chain: `ddg-html` (POST https://html.duckduckgo.com/html/) → `ddg-lite`
-//! (https://lite.duckduckgo.com/lite/, lighter markup, same operator) → `marginalia`
-//! (api.marginalia.nu/public/search — keyless JSON, an INDEPENDENT index, so it both survives a DDG
-//! outage and gives a real second-source cross-check) → `jina-search` (s.jina.ai — needs a key;
-//! skipped keyless). DDG's anomaly wall answers HTTP 202 with an empty page instead of an error —
-//! that is treated as "blocked, fall through", and DDG calls are paced ≥2 s apart to stay under the
-//! wall. (Live-verified 2026-07-05: the aizen UA is accepted by DDG; only curl-shaped UAs are
-//! blocked.) Marginalia is deliberately placed AFTER both DDG endpoints, not before: it's a small
-//! volunteer-run service that is sometimes slow/504s under load (observed: sub-second on a good
-//! call, 60s+ timeout on a bad one) — fine as a third-choice fallback that never delays the common
-//! case, wrong as a primary. Paced ≥1 s as its own politeness floor.
+//! Web chain: `tavily` (POST https://api.tavily.com/search — a keyed JSON search API built for
+//! agents; the primary backend) → `jina-search` (s.jina.ai — also keyed; a secondary fallback).
+//! BOTH backends need a key. DuckDuckGo scraping (html + lite) and the keyless Marginalia floor
+//! were REMOVED: DDG's anomaly wall (HTTP 202, empty page) blocked keyless scraping too often to be
+//! a dependable primary, and Marginalia's volunteer index was too slow/flaky (60s+ timeouts) to
+//! stand alone. With NO key configured, `web_search` returns an actionable "add a Tavily key" error
+//! rather than silently degrading to an unreliable scrape.
 
 use super::http;
-use crate::agent::web_tools::{percent_decode, strip_tags};
-use anyhow::{bail, Result};
-use once_cell::sync::Lazy;
-use regex::Regex;
-use std::time::Duration;
+use anyhow::{bail, Context, Result};
 
 pub(crate) struct SearchResult {
     pub title: String,
@@ -58,14 +50,24 @@ pub(crate) async fn web_results(query: &str, limit: usize) -> Result<Vec<SearchR
     let c = http::client()?;
     let mut failures: Vec<String> = Vec::new();
     let mut any_answered_empty = false;
+    // Every search backend is now keyed. Track whether ANY backend even had a key to try, so a
+    // no-key config yields an actionable "add a key" message instead of an empty "all failed".
+    let mut any_attempted = false;
 
     for backend in super::ordered_backends("search") {
         let outcome = match backend {
-            "ddg-html" => ddg_html(&c, query, limit).await,
-            "ddg-lite" => ddg_lite(&c, query, limit).await,
-            "marginalia" => marginalia(&c, query, limit).await,
+            "tavily" => match super::tavily_key() {
+                Some(k) => {
+                    any_attempted = true;
+                    tavily(&c, query, limit, &k).await
+                }
+                None => continue, // keyed backend — silently absent when no key (chain-level error covers it)
+            },
             "jina-search" => match super::jina_key() {
-                Some(k) => jina_search(&c, query, limit, &k).await,
+                Some(k) => {
+                    any_attempted = true;
+                    jina_search(&c, query, limit, &k).await
+                }
                 None => continue, // optional keyed backend — silently absent keyless
             },
             _ => continue,
@@ -88,6 +90,16 @@ pub(crate) async fn web_results(query: &str, limit: usize) -> Result<Vec<SearchR
     }
     if any_answered_empty {
         return Ok(Vec::new());
+    }
+    if !any_attempted {
+        // No key was configured for ANY search backend, so nothing was even tried. Tell the user how
+        // to make search work rather than emitting a misleading "all backends failed".
+        bail!(
+            "web search needs an API key — none is configured. Set a Tavily key (get one free at \
+             https://app.tavily.com) via `AIZEN_TAVILY_API_KEY=<key>`, the `TAVILY_API_KEY` env var, \
+             or `reach.tavily_api_key` in the config. (A Jina key via `JINA_API_KEY` also works as a \
+             fallback search backend.)"
+        );
     }
     bail!("all search backends failed — {}", failures.join("; "))
 }
@@ -221,148 +233,32 @@ fn host_of(url: &str) -> String {
         .unwrap_or_default()
 }
 
-// ── DuckDuckGo (html + lite endpoints) ──────────────────────────────────────
+// ── Tavily (keyed JSON — the primary search backend) ──────────────────────────
 
-async fn ddg_html(c: &reqwest::Client, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-    super::pace("ddg", Duration::from_secs(2)).await;
-    let f = http::post_form(c, "https://html.duckduckgo.com/html/", &[], &[("q", query)]).await?;
-    if f.status == 202 {
-        bail!("DuckDuckGo anomaly wall (HTTP 202) — backing off");
+/// Tavily's search API — a keyed JSON search endpoint built for agents (get a free key at
+/// https://app.tavily.com). This is the primary backend: DuckDuckGo scraping was dropped because its
+/// anomaly wall (HTTP 202) blocked keyless requests too often to depend on. POST JSON to
+/// `https://api.tavily.com/search` with a bearer key; response shape:
+/// `{ "results": [ { "title", "url", "content", "score" }, … ] }`.
+async fn tavily(c: &reqwest::Client, query: &str, limit: usize, key: &str) -> Result<Vec<SearchResult>> {
+    let body = serde_json::json!({
+        "query": query,
+        "max_results": limit,
+        "search_depth": "basic",
+    });
+    let headers = [("Authorization", format!("Bearer {key}"))];
+    let f = http::post_json(c, "https://api.tavily.com/search", &headers, &body).await?;
+    if f.status == 401 || f.status == 403 {
+        bail!("Tavily rejected the key (HTTP {}) — check AIZEN_TAVILY_API_KEY / TAVILY_API_KEY", f.status);
+    }
+    if f.status == 429 {
+        bail!("Tavily rate limit (HTTP 429) — the free tier's monthly quota may be exhausted");
     }
     if !f.is_success() {
-        bail!("DuckDuckGo returned HTTP {}", f.status);
+        bail!("Tavily returned HTTP {}: {}", f.status, http::snippet(&f.text()));
     }
-    let body = f.text();
-    let results = parse_ddg(&body, limit);
-    if results.is_empty() && looks_like_broken_parse(&body, "result__a") {
-        bail!("DuckDuckGo returned result markup but 0 parsed (markup drift?) — falling through");
-    }
-    Ok(results)
-}
-
-async fn ddg_lite(c: &reqwest::Client, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-    super::pace("ddg", Duration::from_secs(2)).await;
-    let f = http::post_form(c, "https://lite.duckduckgo.com/lite/", &[], &[("q", query)]).await?;
-    if f.status == 202 {
-        bail!("DuckDuckGo lite anomaly wall (HTTP 202) — backing off");
-    }
-    if !f.is_success() {
-        bail!("DuckDuckGo lite returned HTTP {}", f.status);
-    }
-    let body = f.text();
-    let results = parse_ddg_lite(&body, limit);
-    if results.is_empty() && looks_like_broken_parse(&body, "result-link") {
-        bail!("DuckDuckGo lite returned result markup but 0 parsed (markup drift?) — falling through");
-    }
-    Ok(results)
-}
-
-/// Distinguish "the engine genuinely found nothing" (a real empty page → answer `(no results)`)
-/// from "our regex broke against a markup change" (the result-anchor CSS token is still all over
-/// the page, yet we extracted zero → the parser drifted, W19). Only the latter should fall through
-/// to the next backend; the former is a truthful empty. Heuristic: the class token appears at least
-/// twice in a body that parsed to nothing.
-fn looks_like_broken_parse(html: &str, result_class_token: &str) -> bool {
-    html.matches(result_class_token).count() >= 2
-}
-
-/// Pair each title anchor with the snippet that FOLLOWS it in document order — the snippet whose
-/// byte offset falls between this title and the next. Index-zipping title[i]↔snippet[i] (the old
-/// approach) silently mis-shifts every later row when one result lacks a snippet (W18); positional
-/// binding tolerates a missing snippet on any result and simply leaves that one blank.
-///
-/// `titles` and `snippets` are (byte_offset, text) pairs from separate regex sweeps; both are in
-/// ascending offset order (`captures_iter` yields left-to-right), so the pairing is a linear merge.
-fn bind_titles_to_snippets(
-    titles: Vec<(usize, String, String)>, // (offset, href, title)
-    snippets: Vec<(usize, String)>,       // (offset, snippet)
-    limit: usize,
-) -> Vec<SearchResult> {
-    let mut out = Vec::with_capacity(titles.len().min(limit));
-    for (i, (t_off, href, title)) in titles.iter().enumerate() {
-        if out.len() >= limit {
-            break;
-        }
-        // The next title's offset bounds this result's region (∞ for the last title).
-        let next_off = titles.get(i + 1).map(|(o, _, _)| *o).unwrap_or(usize::MAX);
-        let snippet = snippets
-            .iter()
-            .find(|(s_off, _)| *s_off > *t_off && *s_off < next_off)
-            .map(|(_, s)| s.clone())
-            .unwrap_or_default();
-        out.push(SearchResult { url: ddg_unwrap(href), title: title.clone(), snippet });
-    }
-    out
-}
-
-/// Parse DuckDuckGo's html-endpoint result list into (title, url, snippet) triples, binding each
-/// snippet to the title it follows (positional, not index-zipped — see [`bind_titles_to_snippets`]).
-pub(crate) fn parse_ddg(html: &str, limit: usize) -> Vec<SearchResult> {
-    static ANCHOR: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r#"(?is)<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>"#).unwrap()
-    });
-    static SNIPPET: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r#"(?is)<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>"#).unwrap()
-    });
-    let titles: Vec<(usize, String, String)> = ANCHOR
-        .captures_iter(html)
-        .map(|c| {
-            let m = c.get(0).unwrap();
-            (m.start(), c[1].to_string(), strip_tags(&c[2]))
-        })
-        .collect();
-    let snippets: Vec<(usize, String)> =
-        SNIPPET.captures_iter(html).map(|c| (c.get(0).unwrap().start(), strip_tags(&c[1]))).collect();
-    bind_titles_to_snippets(titles, snippets, limit)
-}
-
-/// Parse the lite endpoint (`result-link` anchors; snippets live in `result-snippet` table cells).
-/// Attribute ORDER is not fixed in this markup (`href` often precedes `class`), so the anchor tag
-/// is matched on the class token and the href extracted from the attribute blob separately.
-pub(crate) fn parse_ddg_lite(html: &str, limit: usize) -> Vec<SearchResult> {
-    static ANCHOR: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r#"(?is)<a\b([^>]*\bresult-link\b[^>]*)>(.*?)</a>"#).unwrap());
-    static HREF: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?is)href\s*=\s*["']([^"']+)["']"#).unwrap());
-    static SNIPPET: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r#"(?is)<td[^>]+class=["'][^"']*result-snippet[^"']*["'][^>]*>(.*?)</td>"#).unwrap()
-    });
-    let titles: Vec<(usize, String, String)> = ANCHOR
-        .captures_iter(html)
-        .filter_map(|c| {
-            let href = HREF.captures(&c[1]).map(|h| h[1].to_string())?;
-            Some((c.get(0).unwrap().start(), href, strip_tags(&c[2])))
-        })
-        .collect();
-    let snippets: Vec<(usize, String)> =
-        SNIPPET.captures_iter(html).map(|c| (c.get(0).unwrap().start(), strip_tags(&c[1]))).collect();
-    bind_titles_to_snippets(titles, snippets, limit)
-}
-
-/// DuckDuckGo wraps result links: `//duckduckgo.com/l/?uddg=<percent-encoded-url>&rut=…`.
-/// Pull out and decode the real target; pass through a direct/protocol-relative URL.
-pub(crate) fn ddg_unwrap(href: &str) -> String {
-    if let Some(idx) = href.find("uddg=") {
-        let rest = &href[idx + 5..];
-        let enc = rest.split('&').next().unwrap_or(rest);
-        return percent_decode(enc);
-    }
-    if let Some(stripped) = href.strip_prefix("//") {
-        format!("https://{stripped}")
-    } else {
-        href.to_string()
-    }
-}
-
-// ── Marginalia (keyless JSON, independent index) ──────────────────────────────
-
-/// Marginalia's public search API — keyless JSON, a small INDEPENDENT crawler/index (not a DDG/Bing
-/// reseller), so it doubles as a second-source cross-check and as a survivor when DDG's wall is up.
-/// Paced ≥1 s as a politeness floor (it's a volunteer-run service). Shape (live-verified 2026-07-05):
-/// `{ "results": [ { "url", "title", "description" }, … ] }`.
-async fn marginalia(c: &reqwest::Client, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-    super::pace("marginalia", Duration::from_secs(1)).await;
-    let url = format!("https://api.marginalia.nu/public/search/{}?count={limit}", urlencode(query));
-    let v = http::get_json(c, &url, &[]).await?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&f.body).context("parsing Tavily JSON response")?;
     let items = v["results"].as_array().cloned().unwrap_or_default();
     Ok(items
         .iter()
@@ -375,20 +271,23 @@ async fn marginalia(c: &reqwest::Client, query: &str, limit: usize) -> Result<Ve
             Some(SearchResult {
                 title: it["title"].as_str().unwrap_or("(untitled)").to_string(),
                 url,
-                snippet: it["description"].as_str().unwrap_or("").to_string(),
+                snippet: it["content"].as_str().unwrap_or("").to_string(),
             })
         })
         .collect())
 }
 
-pub(crate) async fn probe_marginalia() -> super::Probe {
+pub(crate) async fn probe_tavily() -> super::Probe {
+    let Some(key) = super::tavily_key() else {
+        return super::Probe::Off("needs a (free) Tavily key — set AIZEN_TAVILY_API_KEY or TAVILY_API_KEY".into());
+    };
     let c = match http::client() {
         Ok(c) => c,
         Err(e) => return super::Probe::Fail(e.to_string()),
     };
-    match marginalia(&c, "rust", 3).await {
-        Ok(r) if !r.is_empty() => super::Probe::Ok(format!("keyless independent index OK ({} results)", r.len())),
-        Ok(_) => super::Probe::Warn("responded but returned 0 results (index gap or drift?)".into()),
+    match tavily(&c, "rust", 1, &key).await {
+        Ok(r) if !r.is_empty() => super::Probe::Ok("keyed search OK".into()),
+        Ok(_) => super::Probe::Warn("responded but returned 0 results".into()),
         Err(e) => super::Probe::Fail(http::snippet(&e.to_string())),
     }
 }
@@ -428,31 +327,6 @@ pub(crate) fn urlencode(s: &str) -> String {
 }
 
 // ── doctor probes ───────────────────────────────────────────────────────────
-
-pub(crate) async fn probe_ddg_html() -> super::Probe {
-    match probe_ddg(false).await {
-        Ok(msg) => super::Probe::Ok(msg),
-        Err(e) if e.to_string().contains("202") => super::Probe::Warn(http::snippet(&e.to_string())),
-        Err(e) => super::Probe::Fail(http::snippet(&e.to_string())),
-    }
-}
-
-pub(crate) async fn probe_ddg_lite() -> super::Probe {
-    match probe_ddg(true).await {
-        Ok(msg) => super::Probe::Ok(msg),
-        Err(e) if e.to_string().contains("202") => super::Probe::Warn(http::snippet(&e.to_string())),
-        Err(e) => super::Probe::Fail(http::snippet(&e.to_string())),
-    }
-}
-
-async fn probe_ddg(lite: bool) -> Result<String> {
-    let c = http::client()?;
-    let results = if lite { ddg_lite(&c, "duckduckgo", 3).await? } else { ddg_html(&c, "duckduckgo", 3).await? };
-    if results.is_empty() {
-        bail!("responded but returned 0 parseable results (markup change?)");
-    }
-    Ok(format!("search OK ({} results for the probe query)", results.len()))
-}
 
 pub(crate) async fn probe_jina_search() -> super::Probe {
     let Some(key) = super::jina_key() else {
@@ -603,52 +477,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_ddg_extracts_results() {
-        let html = r#"
-            <div class="result">
-              <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org%2F">The <b>Rust</b> Language</a>
-              <a class="result__snippet">A language empowering everyone.</a>
-            </div>
-            <div class="result">
-              <a class="result__a" href="https://docs.rs/">docs.rs</a>
-              <a class="result__snippet">Docs for &amp; crates.</a>
-            </div>"#;
-        let r = parse_ddg(html, 5);
-        assert_eq!(r.len(), 2);
-        assert_eq!(r[0].url, "https://rust-lang.org/");
-        assert_eq!(r[0].title, "The Rust Language");
-        assert_eq!(r[0].snippet, "A language empowering everyone.");
-        assert_eq!(r[1].url, "https://docs.rs/");
-        assert_eq!(r[1].snippet, "Docs for & crates.");
-    }
-
-    #[test]
-    fn parse_ddg_respects_limit() {
-        let block = r#"<a class="result__a" href="https://a.com/">A</a>"#.repeat(10);
-        assert_eq!(parse_ddg(&block, 3).len(), 3);
-    }
-
-    #[test]
-    fn parse_ddg_lite_extracts_results() {
-        let html = r#"
-            <tr><td><a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftokio.rs%2F" class="result-link">Tokio - <b>async</b> runtime</a></td></tr>
-            <tr><td class="result-snippet">Build reliable network applications.</td></tr>
-            <tr><td><a href="https://docs.rs/tokio" class="result-link">tokio - Rust</a></td></tr>
-            <tr><td class="result-snippet">Docs.</td></tr>"#;
-        let r = parse_ddg_lite(html, 5);
-        assert_eq!(r.len(), 2);
-        assert_eq!(r[0].url, "https://tokio.rs/");
-        assert_eq!(r[0].title, "Tokio - async runtime");
-        assert_eq!(r[0].snippet, "Build reliable network applications.");
-        assert_eq!(r[1].url, "https://docs.rs/tokio");
-    }
-
-    #[test]
-    fn ddg_unwrap_extracts_real_url() {
-        let href = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust-lang.org%2Fstd%2F&rut=abc";
-        assert_eq!(ddg_unwrap(href), "https://doc.rust-lang.org/std/");
-        assert_eq!(ddg_unwrap("//example.com/x"), "https://example.com/x");
-        assert_eq!(ddg_unwrap("https://direct.com"), "https://direct.com");
+    fn tavily_json_shape_parses() {
+        // The primary backend's response shape: results[].{title,url,content}. Entries with an
+        // empty url are dropped; `content` maps to our snippet field.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"results":[{"title":"Tokio","url":"https://tokio.rs/","content":"An async runtime","score":0.9},
+                            {"title":"dropped (empty url)","url":"","content":"x"}]}"#,
+        )
+        .unwrap();
+        let items = v["results"].as_array().cloned().unwrap();
+        let parsed: Vec<SearchResult> = items
+            .iter()
+            .filter_map(|it| {
+                let url = it["url"].as_str().unwrap_or("").to_string();
+                if url.is_empty() {
+                    return None;
+                }
+                Some(SearchResult {
+                    title: it["title"].as_str().unwrap_or("(untitled)").to_string(),
+                    url,
+                    snippet: it["content"].as_str().unwrap_or("").to_string(),
+                })
+            })
+            .collect();
+        assert_eq!(parsed.len(), 1, "the empty-url entry must be dropped");
+        assert_eq!(parsed[0].url, "https://tokio.rs/");
+        assert_eq!(parsed[0].snippet, "An async runtime");
     }
 
     #[test]
@@ -668,92 +522,6 @@ mod tests {
         assert!(out.starts_with("1. T1"));
         assert!(out.contains("2. T2"));
         assert!(out.contains("   s1"));
-    }
-
-    // ── W18: positional (not index-zipped) title↔snippet binding ───────────────
-
-    #[test]
-    fn parse_ddg_missing_snippet_does_not_shift_later_rows() {
-        // Result 1 has NO snippet at all. Index-zipping (the old bug) would then assign result 2's
-        // snippet to result 1, and result 3 would end up with none — every row after the gap shifts.
-        // Positional binding must leave result 1 blank and keep 2/3 correctly paired.
-        let html = r#"
-            <div class="result">
-              <a class="result__a" href="https://a.com/">Result A (no snippet)</a>
-            </div>
-            <div class="result">
-              <a class="result__a" href="https://b.com/">Result B</a>
-              <a class="result__snippet">Snippet for B.</a>
-            </div>
-            <div class="result">
-              <a class="result__a" href="https://c.com/">Result C</a>
-              <a class="result__snippet">Snippet for C.</a>
-            </div>"#;
-        let r = parse_ddg(html, 5);
-        assert_eq!(r.len(), 3);
-        assert_eq!(r[0].url, "https://a.com/");
-        assert_eq!(r[0].snippet, "", "no snippet in this result's block");
-        assert_eq!(r[1].url, "https://b.com/");
-        assert_eq!(r[1].snippet, "Snippet for B.", "must not receive C's snippet nor stay empty");
-        assert_eq!(r[2].url, "https://c.com/");
-        assert_eq!(r[2].snippet, "Snippet for C.");
-    }
-
-    #[test]
-    fn parse_ddg_lite_missing_snippet_does_not_shift_later_rows() {
-        let html = r#"
-            <tr><td><a href="https://a.com/" class="result-link">Result A</a></td></tr>
-            <tr><td><a href="https://b.com/" class="result-link">Result B</a></td></tr>
-            <tr><td class="result-snippet">Snippet for B.</td></tr>"#;
-        let r = parse_ddg_lite(html, 5);
-        assert_eq!(r.len(), 2);
-        assert_eq!(r[0].snippet, "", "A has no snippet block");
-        assert_eq!(r[1].snippet, "Snippet for B.", "B's own snippet, not misattributed");
-    }
-
-    // ── W19: parser-break vs genuine-empty ──────────────────────────────────────
-
-    #[test]
-    fn broken_parse_detected_when_class_present_but_unparsed() {
-        // The class token is all over the page (so it's not a truly empty results page) yet our
-        // anchor regex (deliberately not matched here) extracts nothing — that's markup drift.
-        let drifted = r#"<span class="result__a-token">x</span><span class="result__a-token">y</span>"#;
-        assert!(looks_like_broken_parse(drifted, "result__a-token"));
-    }
-
-    #[test]
-    fn broken_parse_not_flagged_on_genuinely_empty_page() {
-        let empty = "<html><body>No results found for your search.</body></html>";
-        assert!(!looks_like_broken_parse(empty, "result__a"));
-    }
-
-    // ── Marginalia (keyless JSON backend) ───────────────────────────────────────
-
-    #[test]
-    fn marginalia_json_shape_parses() {
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"results":[{"url":"https://tokio.rs/","title":"Tokio","description":"An async runtime"},
-                            {"url":"","title":"dropped (empty url)","description":"x"}]}"#,
-        )
-        .unwrap();
-        let items = v["results"].as_array().cloned().unwrap();
-        let parsed: Vec<SearchResult> = items
-            .iter()
-            .filter_map(|it| {
-                let url = it["url"].as_str().unwrap_or("").to_string();
-                if url.is_empty() {
-                    return None;
-                }
-                Some(SearchResult {
-                    title: it["title"].as_str().unwrap_or("(untitled)").to_string(),
-                    url,
-                    snippet: it["description"].as_str().unwrap_or("").to_string(),
-                })
-            })
-            .collect();
-        assert_eq!(parsed.len(), 1, "the empty-url entry must be dropped");
-        assert_eq!(parsed[0].url, "https://tokio.rs/");
-        assert_eq!(parsed[0].snippet, "An async runtime");
     }
 
     // ── W20: fan-out interleave ──────────────────────────────────────────────────

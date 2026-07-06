@@ -228,6 +228,12 @@ pub fn role_configured(role: &str) -> bool {
 /// requests/h instead of 60. Env always wins (see `resolved_*`).
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ReachConfig {
+    /// Tavily search key. Web search is now KEYED-ONLY (DuckDuckGo scraping was dropped — it sat
+    /// behind an anomaly wall too often to be a reliable floor). Tavily is the primary web-search
+    /// backend; without it (and without a Jina key) `web_search` returns an actionable "add a key"
+    /// error rather than silently degrading. Get one free at tavily.com.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tavily_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jina_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -235,6 +241,10 @@ pub struct ReachConfig {
 }
 
 impl ReachConfig {
+    /// Effective Tavily key: `AIZEN_TAVILY_API_KEY` > `TAVILY_API_KEY` > config file.
+    pub fn resolved_tavily_key(&self) -> Option<String> {
+        branded_env("TAVILY_API_KEY").or_else(|| env_nonempty("TAVILY_API_KEY")).or_else(|| self.tavily_api_key.clone())
+    }
     /// Effective Jina key: `AIZEN_JINA_API_KEY` > `JINA_API_KEY` > config file.
     pub fn resolved_jina_key(&self) -> Option<String> {
         branded_env("JINA_API_KEY").or_else(|| env_nonempty("JINA_API_KEY")).or_else(|| self.jina_api_key.clone())

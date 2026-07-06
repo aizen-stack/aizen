@@ -37,10 +37,11 @@ impl Tool for SearchFiles {
         "search_files"
     }
     fn description(&self) -> &str {
-        "Search file CONTENT by regular expression across the working directory (respects \
-         .gitignore, skips hidden + binary files). Returns `path:line: matched text`. This is the \
-         canonical content search — do NOT shell out to grep/ripgrep, and do NOT use file_glob \
-         (that matches file NAMES, not content). Read-only."
+        "Search file CONTENT by regular expression. Defaults to the working directory but `path` may \
+         be a ../ or absolute directory elsewhere. By default respects .gitignore and skips hidden + \
+         binary files; set hidden:true to also search hidden files and ignored/build dirs. Returns \
+         `path:line: matched text`. This is the canonical content search — do NOT shell out to \
+         grep/ripgrep, and do NOT use file_glob (that matches file NAMES, not content). Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -48,9 +49,10 @@ impl Tool for SearchFiles {
             "additionalProperties": false,
             "properties": {
                 "pattern": {"type": "string", "description": "a regular expression to match against each line"},
-                "path": {"type": "string", "description": "optional subdir of the working dir to limit the search"},
+                "path": {"type": "string", "description": "optional directory to limit the search (a subdir, or a ../ or absolute path elsewhere)"},
                 "glob": {"type": "string", "description": "optional file glob to restrict which files are searched, e.g. *.rs or src/**/*.ts"},
                 "ignore_case": {"type": "boolean", "description": "case-insensitive match (default false)"},
+                "hidden": {"type": "boolean", "description": "also search hidden files and .gitignored paths (default false)"},
                 "max_results": {"type": "integer", "description": "cap on matches returned (default 200)"}
             },
             "required": ["pattern"]
@@ -71,8 +73,14 @@ impl Tool for SearchFiles {
             None => self.root.clone(),
         };
 
+        let show_hidden = args.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false);
         let mut wb = WalkBuilder::new(&search_root);
         wb.git_global(false); // honor the repo's .gitignore, not the dev's global one (reproducible)
+        if show_hidden {
+            // Opt-in "see everything": stop honoring .gitignore / hidden-file rules so the walk
+            // reaches dotfiles and ignored paths too (the user asked for nothing to be skipped).
+            wb.hidden(false).git_ignore(false).git_exclude(false).ignore(false).parents(false);
+        }
         if let Some(glob) = args.get("glob").and_then(|v| v.as_str()) {
             let mut ob = OverrideBuilder::new(&search_root);
             ob.add(glob).with_context(|| format!("invalid glob `{glob}`"))?;

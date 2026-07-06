@@ -2,10 +2,11 @@
 //! `memory_search` (the brain), `file_read`/`file_glob` (read-only), `file_edit`/`shell_run`
 //! (destructive → approval-gated by the loop).
 //!
-//! Safety: every file/shell op is CONFINED to the cwd subtree (`root`) — the path-traversal
-//! guard (`assertInsideWorkspace` equivalent the extension was found to be missing). The root
-//! is captured at registry-build time, so tools are testable against a temp dir without
-//! mutating the process-global cwd.
+//! Paths: `root` (captured at registry-build time) is the anchor for resolving RELATIVE paths, so
+//! tools stay testable against a temp dir without mutating the process-global cwd. The workspace
+//! CONFINEMENT boundary was removed by user request — file/shell ops may now reach paths anywhere
+//! on disk (a relative path still resolves under `root`; `../` and absolute paths escape freely).
+//! SECURITY trade-off: agent-read web/tool content can now steer a write to an arbitrary path.
 
 use crate::agent::tools::{Tool, ToolRegistry};
 use anyhow::{bail, Context, Result};
@@ -333,13 +334,16 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
         .with_context(|| format!("missing required string arg '{key}'"))
 }
 
-/// Resolve `path` (relative → `base`) and ensure it stays within the `base` subtree.
-/// `must_exist`: canonicalize the full path; else canonicalize the parent + re-join the name.
+/// Resolve `path` (relative → `base`) into an absolute, canonicalized path.
 ///
-/// Symlink hardening (both branches): the resolved path is checked against `base` AFTER symlink
-/// resolution. In the `must_exist=false` branch the target may itself be an existing symlink that
-/// points OUTSIDE `base` (canonicalizing only the parent would let a write follow it out of the
-/// workspace), so when the target already exists we canonicalize IT too and re-check containment.
+/// NOTE: the workspace confinement boundary was REMOVED by user request — file/shell tools may now
+/// touch paths ANYWHERE on disk, not just under `base`. `base` is retained only as the anchor for
+/// resolving RELATIVE paths (so `foo.rs` still means `<base>/foo.rs` and `../sibling/x` reaches the
+/// sibling project the user asked to work in). Absolute paths pass through unchanged. No escape or
+/// symlink-target check is performed. SECURITY: any web page / tool output the agent reads can now
+/// steer a write or delete to an arbitrary path — this is the accepted trade-off for the removal.
+/// `must_exist`: canonicalize the full path (errors if missing); else canonicalize the parent and
+/// re-join the file name (so a not-yet-existing target still resolves).
 pub(crate) fn confine(base: &Path, path: &str, must_exist: bool) -> Result<PathBuf> {
     let raw = Path::new(path);
     let joined = if raw.is_absolute() { raw.to_path_buf() } else { base.join(raw) };
@@ -353,19 +357,8 @@ pub(crate) fn confine(base: &Path, path: &str, must_exist: bool) -> Result<PathB
             .canonicalize()
             .with_context(|| format!("resolving parent of {}", joined.display()))?;
         let fname = joined.file_name().context("path has no file name")?;
-        let candidate = cparent.join(fname);
-        // If the target ALREADY exists it may be a symlink escaping `base`; resolve and re-check the
-        // REAL path so a create-or-overwrite can't follow a planted symlink out of the workspace.
-        if let Ok(real) = candidate.canonicalize() {
-            if !real.starts_with(base) {
-                bail!("path escapes the working directory (symlink target): {path}");
-            }
-        }
-        candidate
+        cparent.join(fname)
     };
-    if !resolved.starts_with(base) {
-        bail!("path escapes the working directory: {path}");
-    }
     Ok(resolved)
 }
 
@@ -403,7 +396,11 @@ fn glob_to_regex(glob: &str) -> String {
     re
 }
 
-fn walk(dir: &Path, base: &Path, re: &regex::Regex, out: &mut Vec<String>, cap: usize) {
+/// Recursively collect files under `dir` whose path RELATIVE to `anchor` (forward-slashed) matches
+/// `re`. Hidden files/dirs and heavy build dirs (`target`, `node_modules`, `.git`) are NO LONGER
+/// skipped — the user asked file_glob to see EVERYTHING (a `**/*` in a built repo will therefore
+/// walk `target/`; narrow the pattern to avoid the result cap filling with build output).
+fn walk(dir: &Path, anchor: &Path, re: &regex::Regex, out: &mut Vec<PathBuf>, cap: usize) {
     if out.len() >= cap {
         return;
     }
@@ -418,19 +415,83 @@ fn walk(dir: &Path, base: &Path, re: &regex::Regex, out: &mut Vec<String>, cap: 
             return;
         }
         let p = e.path();
-        let name = e.file_name().to_string_lossy().to_string();
-        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        if is_dir {
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
-                continue;
-            }
-            walk(&p, base, re, out, cap);
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            walk(&p, anchor, re, out, cap);
         } else {
-            let rel = p.strip_prefix(base).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+            let rel = p.strip_prefix(anchor).unwrap_or(&p).to_string_lossy().replace('\\', "/");
             if re.is_match(&rel) {
-                out.push(rel);
+                out.push(p);
             }
         }
+    }
+}
+
+/// Recursively gather every file path under `dir` (bounded by `cap`) — the candidate pool for the
+/// fuzzy name fallback. Same "skip nothing" policy as [`walk`].
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>, cap: usize) {
+    if out.len() >= cap {
+        return;
+    }
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        if out.len() >= cap {
+            return;
+        }
+        let p = e.path();
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            collect_files(&p, out, cap);
+        } else {
+            out.push(p);
+        }
+    }
+}
+
+/// Split a glob into (anchor_dir, sub_pattern): the leading run of segments with NO glob
+/// metacharacter (`*`/`?`) becomes a directory anchor, the rest is matched relative to it. This is
+/// what lets `file_glob` reach OUTSIDE the working dir — `../snakegame/**/*.js` anchors at the
+/// sibling project, an absolute `C:/x/**/*.rs` anchors at the drive path. A pure-literal pattern
+/// (no glob char) anchors at its parent and matches the final name. `..` and absolute paths pass
+/// through; a relative anchor is joined to `root`.
+fn glob_anchor(root: &Path, pattern: &str) -> (PathBuf, String) {
+    let norm = pattern.replace('\\', "/");
+    let segs: Vec<&str> = norm.split('/').collect();
+    let glob_idx = segs.iter().position(|s| s.contains('*') || s.contains('?'));
+    let (lit_segs, rest_segs): (&[&str], &[&str]) = match glob_idx {
+        Some(i) => (&segs[..i], &segs[i..]),
+        None if segs.is_empty() => (&[], &[]),
+        // Pure literal path: anchor at the parent, match the final segment as a name.
+        None => (&segs[..segs.len() - 1], &segs[segs.len() - 1..]),
+    };
+    let lit_str = lit_segs.join("/");
+    let anchor = if lit_str.is_empty() {
+        root.to_path_buf()
+    } else {
+        let lp = Path::new(&lit_str);
+        // Absolute (unix `/…`, Windows `C:/…`) → use as-is; otherwise resolve against root (`..` ok).
+        let is_abs = lp.is_absolute()
+            || lit_str.starts_with('/')
+            || (lit_str.len() >= 2 && lit_str.as_bytes()[1] == b':');
+        if is_abs {
+            lp.to_path_buf()
+        } else {
+            root.join(lp)
+        }
+    };
+    let anchor = anchor.canonicalize().unwrap_or(anchor);
+    (anchor, rest_segs.join("/"))
+}
+
+/// Display a matched path relative to `root` when it's under the working dir, else as a cleaned
+/// absolute path (so results outside the workspace are still copy-pasteable).
+fn display_path(root: &Path, p: &Path) -> String {
+    match p.strip_prefix(root) {
+        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+        Err(_) => p.to_string_lossy().replace('\\', "/"),
     }
 }
 
@@ -582,8 +643,9 @@ impl Tool for FileRead {
     fn description(&self) -> &str {
         "Read a file (optionally a 1-based line range). Use before editing. Set number:true to \
          prefix each line with its 1-based number (`N|line`) for orientation — leave it off (the \
-         default) when you'll feed the text back into file_edit's old_string. Confined to the \
-         working directory. Read-only."
+         default) when you'll feed the text back into file_edit's old_string. A relative path \
+         resolves under the working directory; an absolute path or `../` reads elsewhere too. \
+         Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -733,26 +795,62 @@ impl Tool for FileGlob {
         "file_glob"
     }
     fn description(&self) -> &str {
-        "List files matching a glob (*, **, ?) under the working directory. Use to locate files \
-         before reading. Not for searching file CONTENT → use search_files. Read-only."
+        "List files matching a glob (*, **, ?). Anchors under the working directory by default, but \
+         a leading `../` or an absolute path reaches OTHER directories too (e.g. \
+         `../snakegame/**/*.js`). Hidden files and build dirs (target, node_modules, .git) ARE \
+         included. If nothing matches the glob, falls back to a fuzzy match on the file NAME and \
+         suggests the closest paths. Not for searching file CONTENT → use search_files. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
-            "properties": {"pattern": {"type": "string", "description": "e.g. src/**/*.rs"}},
+            "properties": {"pattern": {"type": "string", "description": "e.g. src/**/*.rs, ../sibling/**/*.py, or a bare name like 'confg.toml' for a fuzzy lookup"}},
             "required": ["pattern"],
             "additionalProperties": false
         })
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let pattern = str_arg(args, "pattern")?;
-        let re = regex::Regex::new(&glob_to_regex(pattern)).context("invalid glob pattern")?;
-        let mut out = Vec::new();
-        walk(&self.root, &self.root, &re, &mut out, 200);
-        if out.is_empty() {
+        // Split into a literal directory anchor + the glob remainder, so `../x/**/*.rs` and
+        // `C:/abs/**/*.rs` reach outside the working dir instead of being trapped under root.
+        let (anchor, sub) = glob_anchor(&self.root, pattern);
+        // An empty remainder (the whole pattern was a literal path) means "match that exact name".
+        let sub_re = if sub.is_empty() { pattern.replace('\\', "/") } else { sub };
+        let re = regex::Regex::new(&glob_to_regex(&sub_re)).context("invalid glob pattern")?;
+        let mut hits: Vec<PathBuf> = Vec::new();
+        walk(&anchor, &anchor, &re, &mut hits, 200);
+        if !hits.is_empty() {
+            let lines: Vec<String> = hits.iter().map(|p| display_path(&self.root, p)).collect();
+            return Ok(lines.join("\n"));
+        }
+        // No glob match → fuzzy fallback on the final path segment (typo/near-name tolerance, #68).
+        // The needle is the last segment of the pattern (the intended file name).
+        let needle = pattern.replace('\\', "/");
+        let needle = needle.rsplit('/').next().unwrap_or(&needle).to_ascii_lowercase();
+        let needle = needle.trim_start_matches('*').trim_end_matches('*');
+        if needle.is_empty() {
             return Ok(format!("(no files match '{pattern}')"));
         }
-        Ok(out.join("\n"))
+        let mut pool: Vec<PathBuf> = Vec::new();
+        collect_files(&anchor, &mut pool, 5000);
+        let mut scored: Vec<(f64, &PathBuf)> = pool
+            .iter()
+            .filter_map(|p| {
+                let name = p.file_name()?.to_string_lossy().to_ascii_lowercase();
+                // Jaro-Winkler over the file name; a substring hit is treated as a strong match so
+                // `game` finds `snake_game.js`. Keep only reasonably-close candidates.
+                let sim = strsim::jaro_winkler(needle, &name);
+                let score = if name.contains(needle) { sim.max(0.92) } else { sim };
+                (score >= 0.72).then_some((score, p))
+            })
+            .collect();
+        if scored.is_empty() {
+            return Ok(format!("(no files match '{pattern}', and no similarly-named file nearby)"));
+        }
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(10);
+        let lines: Vec<String> = scored.iter().map(|(_, p)| display_path(&self.root, p)).collect();
+        Ok(format!("(no exact match for '{pattern}'; closest by name:)\n{}", lines.join("\n")))
     }
 }
 
@@ -775,7 +873,8 @@ impl Tool for FileEdit {
          file does not exist). old_string must be unique unless replace_all. If the exact text \
          isn't found, a whitespace/indentation-tolerant retry is attempted for a single matching \
          block. To create OR fully rewrite a whole file, use file_write instead. Returns a \
-         before→after preview. Read the file first. Confined to the working directory."
+         before→after preview. Read the file first. Relative paths resolve under the working \
+         directory; an absolute path or a leading `../` may write elsewhere on disk."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -859,7 +958,8 @@ impl Tool for FileWrite {
          file in one call. Use this to write a new file, or to rewrite a file from scratch. NEVER \
          blank or build files with shell (`type NUL > f`, `> f`, `echo >`, heredocs) — use this \
          tool. For a small change to an existing file, prefer file_edit. The parent directory must \
-         already exist. Confined to the working directory."
+         already exist. A relative path resolves under the working directory; an absolute path or \
+         a leading `../` may write ANYWHERE on disk."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -1441,7 +1541,7 @@ impl Tool for ShellRun {
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
-                "cwd": {"type": "string", "description": "optional subdir of the working dir"}
+                "cwd": {"type": "string", "description": "optional working dir for the command (a subdir, or a ../ or absolute path elsewhere)"}
             },
             "required": ["command"],
             "additionalProperties": false
@@ -1741,46 +1841,17 @@ mod tests {
     }
 
     #[test]
-    fn confine_rejects_escape() {
+    fn confine_resolves_relative_and_reaches_outside_root() {
+        // Confinement was removed by user request: `confine` is now a pure path resolver, no escape
+        // check. A relative in-tree path still resolves; a `..` path that leaves `root` now RESOLVES
+        // (used to be rejected) so the agent can work on sibling projects the user points it at.
         let root = temp_root("confine");
-        assert!(confine(&root, "../etc/passwd", false).is_err());
-        // a normal in-tree path resolves
         std::fs::write(root.join("ok.txt"), "hi").unwrap();
-        assert!(confine(&root, "ok.txt", true).is_ok());
-    }
-
-    #[test]
-    fn confine_rejects_symlink_escape_on_create_or_overwrite() {
-        // A planted symlink inside the workspace whose TARGET is outside must not let a
-        // create-or-overwrite (must_exist=false) follow it out. Skip silently if the platform
-        // doesn't allow symlink creation (Windows without dev mode / privilege).
-        let root = temp_root("confine-symlink");
-        let outside = root.parent().unwrap().join("ng-confine-outside-secret");
-        let _ = std::fs::remove_file(&outside);
-        std::fs::write(&outside, "SECRET").unwrap();
-        let link = root.join("escape.txt");
-        let made = {
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(&outside, &link).is_ok()
-            }
-            #[cfg(windows)]
-            {
-                std::os::windows::fs::symlink_file(&outside, &link).is_ok()
-            }
-            #[cfg(not(any(unix, windows)))]
-            {
-                false
-            }
-        };
-        if !made {
-            let _ = std::fs::remove_file(&outside);
-            return; // no symlink privilege on this runner — nothing to assert
-        }
-        let r = confine(&root, "escape.txt", false);
-        let _ = std::fs::remove_file(&link);
-        let _ = std::fs::remove_file(&outside);
-        assert!(r.is_err(), "a create/overwrite that would follow a symlink out of the workspace must be rejected");
+        assert!(confine(&root, "ok.txt", true).is_ok(), "in-tree path resolves");
+        // A create-target (must_exist=false) that escapes the root no longer errors — it resolves to
+        // a path OUTSIDE root. Its parent (root's parent) exists, so canonicalize+rejoin succeeds.
+        let escaped = confine(&root, "../ng-confine-escape.txt", false).expect("escape now resolves");
+        assert!(!escaped.starts_with(&root), "resolved target is outside the root: {}", escaped.display());
     }
 
     #[test]
@@ -1828,6 +1899,49 @@ mod tests {
         assert!(out.contains("src/a.rs"));
         assert!(out.contains("src/sub/b.rs"));
         assert!(!out.contains("c.ts"));
+    }
+
+    #[test]
+    fn file_glob_includes_hidden_and_build_dirs() {
+        // Hidden files and heavy build dirs (target, node_modules, .git) are NO LONGER skipped —
+        // the user asked file_glob to see everything.
+        let root = temp_root("glob-hidden");
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join("target/debug/app.rs"), "").unwrap();
+        std::fs::write(root.join(".hidden/secret.rs"), "").unwrap();
+        std::fs::write(root.join(".env.rs"), "").unwrap();
+        let t = FileGlob::new(root);
+        let out = t.execute(&serde_json::json!({"pattern":"**/*.rs"})).unwrap();
+        assert!(out.contains("target/debug/app.rs"), "build dir walked: {out}");
+        assert!(out.contains(".hidden/secret.rs"), "hidden dir walked: {out}");
+        assert!(out.contains(".env.rs"), "hidden file matched: {out}");
+    }
+
+    #[test]
+    fn file_glob_reaches_outside_the_root() {
+        // A `../sibling/...` pattern must escape the working dir (confinement removed, #67). Anchor
+        // the tool at a subdir and glob back up into a sibling.
+        let base = temp_root("glob-escape");
+        std::fs::create_dir_all(base.join("proj_a")).unwrap();
+        std::fs::create_dir_all(base.join("proj_b")).unwrap();
+        std::fs::write(base.join("proj_b/level.js"), "").unwrap();
+        let t = FileGlob::new(base.join("proj_a").canonicalize().unwrap());
+        let out = t.execute(&serde_json::json!({"pattern":"../proj_b/**/*.js"})).unwrap();
+        assert!(out.contains("level.js"), "should reach the sibling project: {out}");
+    }
+
+    #[test]
+    fn file_glob_fuzzy_fallback_suggests_near_names() {
+        // No glob match → fall back to a fuzzy match on the file NAME (#68). A typo'd needle should
+        // still surface the real file among the closest suggestions.
+        let root = temp_root("glob-fuzzy");
+        std::fs::write(root.join("snake_game.js"), "").unwrap();
+        std::fs::write(root.join("readme.md"), "").unwrap();
+        let t = FileGlob::new(root);
+        let out = t.execute(&serde_json::json!({"pattern":"snakegame.js"})).unwrap();
+        assert!(out.contains("closest by name"), "fuzzy header present: {out}");
+        assert!(out.contains("snake_game.js"), "near-name surfaced: {out}");
     }
 
     #[test]
@@ -2081,12 +2195,17 @@ mod tests {
     }
 
     #[test]
-    fn file_write_confined_and_needs_parent() {
+    fn file_write_reaches_outside_but_needs_parent() {
         let root = temp_root("write-guard");
         let t = FileWrite::new(root.clone());
-        // escape attempt is refused by `confine`
-        assert!(t.execute(&serde_json::json!({"path":"../evil.txt","content":"x"})).is_err());
-        // writing into a non-existent subdir surfaces a clear error (parent must exist)
+        // Confinement was REMOVED: a `../` path now writes to the sibling location (its parent, the
+        // temp dir, exists) instead of being refused. Clean up the file we create outside root.
+        let outside = root.parent().unwrap().join("evil.txt");
+        let _ = std::fs::remove_file(&outside);
+        assert!(t.execute(&serde_json::json!({"path":"../evil.txt","content":"x"})).is_ok());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "x");
+        let _ = std::fs::remove_file(&outside);
+        // The one remaining guard: writing into a non-existent subdir still errors (parent must exist).
         assert!(t.execute(&serde_json::json!({"path":"nope/deep.txt","content":"x"})).is_err());
     }
 

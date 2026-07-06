@@ -50,7 +50,11 @@ pub struct ChannelSpec {
 
 pub const CHANNELS: &[ChannelSpec] = &[
     ChannelSpec { name: "web", label: "any web page", tier: 0, backends: &["direct", "jina"] },
-    ChannelSpec { name: "search", label: "web search", tier: 0, backends: &["ddg-html", "ddg-lite", "marginalia", "jina-search"] },
+    // KEYED-ONLY (tier 1): DuckDuckGo scraping + the Marginalia floor were dropped — DDG's anomaly
+    // wall (HTTP 202) blocked keyless scraping too often to be a dependable primary. Tavily is the
+    // real backend; jina-search is a secondary keyed fallback. With NO key, `web_search` returns an
+    // actionable "add a Tavily key" error instead of degrading to an unreliable scrape.
+    ChannelSpec { name: "search", label: "web search (needs a key)", tier: 1, backends: &["tavily", "jina-search"] },
     ChannelSpec { name: "github", label: "GitHub repos, files, issues/PRs", tier: 0, backends: &["api", "raw", "html"] },
     ChannelSpec { name: "youtube", label: "YouTube metadata + transcripts", tier: 0, backends: &["innertube", "oembed"] },
     ChannelSpec { name: "twitter", label: "Twitter/X single tweets", tier: 0, backends: &["fxtwitter", "syndication"] },
@@ -187,6 +191,10 @@ pub(crate) fn cache_clear() {
 
 // ── optional keys (everything works without them) ────────────────────────────
 
+pub(crate) fn tavily_key() -> Option<String> {
+    crate::core::cli_config::load().reach.unwrap_or_default().resolved_tavily_key()
+}
+
 pub(crate) fn jina_key() -> Option<String> {
     crate::core::cli_config::load().reach.unwrap_or_default().resolved_jina_key()
 }
@@ -287,9 +295,7 @@ pub async fn doctor() -> Vec<ChannelReport> {
                 let p = match (spec.name, b) {
                     ("web", "direct") => Probe::Ok("direct fetch — always-available floor (not probed)".into()),
                     ("web", "jina") => run(web::probe_jina()).await,
-                    ("search", "ddg-html") => run(search::probe_ddg_html()).await,
-                    ("search", "ddg-lite") => run(search::probe_ddg_lite()).await,
-                    ("search", "marginalia") => run(search::probe_marginalia()).await,
+                    ("search", "tavily") => run(search::probe_tavily()).await,
                     ("search", "jina-search") => run(search::probe_jina_search()).await,
                     ("github", "api") => run(github::probe_api()).await,
                     ("github", "raw") => run(github::probe_raw()).await,
@@ -343,8 +349,10 @@ pub fn render_report(reports: &[ChannelReport]) -> String {
     }
     let avail = reports.iter().filter(|r| r.status == "ok" || r.status == "warn").count();
     s.push_str(&format!("  {avail}/{} channels available", reports.len()));
-    if jina_key().is_none() {
-        s.push_str("\n  tip: a free Jina key (JINA_API_KEY) raises the reader quota and unlocks jina-search; GITHUB_TOKEN raises GitHub to 5000 req/h");
+    if tavily_key().is_none() {
+        s.push_str("\n  tip: web search NEEDS a key — set TAVILY_API_KEY (https://tavily.com) to enable it; a Jina key (JINA_API_KEY) adds a search fallback + raises the reader quota; GITHUB_TOKEN raises GitHub to 5000 req/h");
+    } else if jina_key().is_none() {
+        s.push_str("\n  tip: a Jina key (JINA_API_KEY) adds a search fallback + raises the reader quota; GITHUB_TOKEN raises GitHub to 5000 req/h");
     }
     s
 }
@@ -478,14 +486,15 @@ mod tests {
     }
 
     #[test]
-    fn search_channel_chain_includes_marginalia() {
-        // Marginalia sits between the DDG endpoints and the keyed jina backend (independent index →
-        // survives a DDG outage AND gives a second-source cross-check).
+    fn search_channel_is_keyed_only_tavily_then_jina() {
+        // DuckDuckGo scraping + the Marginalia floor were dropped: the chain is now keyed-only,
+        // Tavily first (the real backend), jina-search as the secondary keyed fallback. No keyless
+        // scrape remains — with no key `web_search` returns an actionable error, it doesn't degrade.
         let order = ordered_backends("search");
-        assert!(order.contains(&"marginalia"), "chain: {order:?}");
-        let ddg = order.iter().position(|b| *b == "ddg-html").unwrap();
-        let marg = order.iter().position(|b| *b == "marginalia").unwrap();
-        assert!(marg > ddg, "marginalia should follow the DDG primaries");
+        assert_eq!(order, vec!["tavily", "jina-search"], "keyed-only chain");
+        assert!(!order.contains(&"ddg-html") && !order.contains(&"ddg-lite"), "DDG dropped");
+        assert!(!order.contains(&"marginalia"), "Marginalia floor dropped");
+        assert_eq!(channel("search").unwrap().tier, 1, "search is now a tier-1 (keyed) channel");
     }
 
     #[test]

@@ -90,7 +90,7 @@ Every tool is one clear capability. Tools are either **read-only** (run freely, 
 - `process` — background processes: `start`/`poll`/`wait`/`log`/`kill`/`write` (stdin); returns a `proc_<id>` handle; pool of 16. *start/kill gated.*
 
 **Web research (read-only):**
-- `web_search` — DuckDuckGo HTML search (no API key), capped results.
+- `web_search` — keyed web search (Tavily primary, Jina fallback; needs an API key), capped results.
 - `web_fetch` — fetch a URL → readable text (strips scripts/styles, 20K-char cap).
 - `web_crawl` — map a site from a seed (depth ≤3, scope strict/subs).
 - All three enforce an **SSRF floor** (loopback/private/link-local refused).

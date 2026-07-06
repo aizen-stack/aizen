@@ -261,7 +261,7 @@ impl Tool for Process {
             "properties": {
                 "action": {"type": "string", "enum": ["start", "list", "log", "status", "wait", "kill", "write"]},
                 "command": {"type": "string", "description": "the command (action=start)"},
-                "cwd": {"type": "string", "description": "optional subdir of the working dir (action=start)"},
+                "cwd": {"type": "string", "description": "optional working dir for the process (a subdir, or a ../ or absolute path elsewhere) (action=start)"},
                 "id": {"type": "string", "description": "a proc_<n> handle (all actions except start/list)"},
                 "timeout_secs": {"type": "integer", "description": "max seconds to block (action=wait; default 30)"},
                 "input": {"type": "string", "description": "text to send to the process stdin (action=write)"},

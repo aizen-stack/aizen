@@ -126,8 +126,8 @@ impl Tool for WebSearch {
         "web_search"
     }
     fn description(&self) -> &str {
-        "Search the web (keyless: DuckDuckGo → Marginalia independent index) and return the top \
-         results as title + URL + snippet, deduped and spread across domains. Use to FIND pages \
+        "Search the web (Tavily → Jina; an API key is required — set AIZEN_TAVILY_API_KEY) and \
+         return the top results as title + URL + snippet, deduped and spread across domains. Use to FIND pages \
          relevant to a query, then web_fetch a result URL to read it. Pass 'queries' (a list of \
          2–3 DIFFERENT-angle phrasings) to fan out in one call — the union is merged and deduped, \
          giving broader coverage than a single query. Optional 'site' searches one platform's own \
@@ -272,45 +272,6 @@ pub(crate) fn decode_entities(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// Minimal application/x-www-form-urlencoded percent-decoder (`%XX` + `+`→space).
-pub(crate) fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                (Some(a), Some(b)) => {
-                    out.push(a * 16 + b);
-                    i += 3;
-                }
-                _ => {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            },
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).to_string()
-}
-
-fn hex(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
 /// Truncate to `cap` characters (not bytes — never split a multibyte char), with a marker.
 pub(crate) fn truncate_chars(s: &str, cap: usize) -> String {
     if s.chars().count() <= cap {
@@ -334,13 +295,6 @@ mod tests {
         assert!(!text.contains("alert"), "script body removed");
         assert!(!text.contains("color:red"), "style body removed");
         assert!(!text.contains('<') || text.contains("<3"), "tags stripped (entity-decoded < kept)");
-    }
-
-    #[test]
-    fn percent_decode_basics() {
-        assert_eq!(percent_decode("https%3A%2F%2Fa.com%2Fx"), "https://a.com/x");
-        assert_eq!(percent_decode("a+b"), "a b");
-        assert_eq!(percent_decode("plain"), "plain");
     }
 
     #[test]

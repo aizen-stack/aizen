@@ -249,7 +249,7 @@ Behavior worth knowing:
   real work, the agent calls `clarify` to ask ONE question; the turn pauses and your next message
   is the answer (in the REPL, the plain prompt, or over Telegram — no stdin contention with the
   input box). For low-stakes choices it assumes and states rather than stalling.
-- **Web research** — `web_search` (no-key DuckDuckGo) finds pages; `web_fetch` GETs a URL and
+- **Web research** — `web_search` (needs a free Tavily key — set `TAVILY_API_KEY`) finds pages; `web_fetch` GETs a URL and
   returns it as readable text (HTML reduced to prose, capped); `web_crawl` spiders a site from a
   seed URL (see `aizen crawl` below). Read-only; available to every role.
 

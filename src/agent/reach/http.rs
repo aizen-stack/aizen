@@ -74,22 +74,6 @@ pub(crate) async fn get(c: &reqwest::Client, url: &str, headers: &[(&str, String
     bail!("too many redirects (> {MAX_REDIRECTS})")
 }
 
-/// POST a form (percent-encoded pairs). Redirects are NOT followed — no reach backend needs a
-/// redirected POST, and replaying a body across hops is where SSRF re-vet bugs live.
-pub(crate) async fn post_form(
-    c: &reqwest::Client,
-    url: &str,
-    headers: &[(&str, String)],
-    form: &[(&str, &str)],
-) -> Result<Fetched> {
-    let mut req = c.post(url).form(form);
-    for (k, v) in headers {
-        req = req.header(*k, v);
-    }
-    let resp = req.send().await.with_context(|| format!("POST {url} failed"))?;
-    read_body(resp).await
-}
-
 /// POST a JSON body (the InnerTube shape). Redirects are NOT followed (as above).
 pub(crate) async fn post_json(
     c: &reqwest::Client,

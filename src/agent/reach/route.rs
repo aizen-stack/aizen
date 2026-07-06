@@ -212,13 +212,14 @@ mod itest {
         // Plain web read still works (and search).
         let web = read_url("https://example.com").await.expect("web read");
         assert!(web.contains("Example Domain"), "{web}");
-        // DDG's anomaly wall (HTTP 202) is a transient, environment-dependent state — repeated
-        // probe/e2e runs from one IP within its window trip it. The chain handling it honestly IS
-        // correct behavior, so a 202-exhausted chain passes; anything else must produce results.
+        // Web search is now KEYED-ONLY (Tavily → Jina). With a key configured it must return
+        // results; with NO key the chain returns an actionable "needs an API key" error rather
+        // than degrading to an unreliable scrape — both are correct, so only an unexpected error
+        // fails the run.
         match search("rust tokio runtime", 5, None).await {
             Ok(s) => assert!(s.contains("1. "), "{s}"),
-            Err(e) if e.to_string().contains("202") => {
-                eprintln!("(web search skipped: DDG anomaly wall active — {e})");
+            Err(e) if e.to_string().contains("needs an API key") => {
+                eprintln!("(web search skipped: no Tavily/Jina key configured — {e})");
             }
             Err(e) => panic!("web search: {e}"),
         }
