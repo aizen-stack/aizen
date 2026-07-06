@@ -25,7 +25,6 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest,  plat: linux-x86_64,   ext: '' }
-          - { os: macos-13,       plat: macos-x86_64,   ext: '' }   # Intel runner
           - { os: macos-latest,   plat: macos-aarch64,  ext: '' }   # Apple Silicon runner
           - { os: windows-latest, plat: windows-x86_64, ext: '.exe' }
     steps:

@@ -43,7 +43,6 @@ Grab the asset for your platform from the [latest release](https://github.com/da
 | Windows x86-64 | `aizen-<ver>-windows-x86_64.exe` |
 | Linux x86-64 | `aizen-<ver>-linux-x86_64` |
 | macOS Apple Silicon | `aizen-<ver>-macos-aarch64` |
-| macOS Intel | `aizen-<ver>-macos-x86_64` |
 
 On Linux/macOS make it executable: `chmod +x aizen-* && ./aizen-…`.
 

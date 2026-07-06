@@ -32,7 +32,6 @@ on Windows or `$AIZEN_INSTALL` on Unix. The Windows `.exe` is unsigned — if Sm
 | Windows x86-64 | `aizen-<ver>-windows-x86_64.exe` |
 | Linux x86-64 | `aizen-<ver>-linux-x86_64` |
 | macOS Apple Silicon | `aizen-<ver>-macos-aarch64` |
-| macOS Intel | `aizen-<ver>-macos-x86_64` |
 
 On Linux/macOS: `chmod +x aizen-* && ./aizen-…`.
 
