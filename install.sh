@@ -17,7 +17,7 @@ case "$os" in
   Darwin)
     case "$arch" in
       arm64 | aarch64) plat="macos-aarch64" ;;
-      x86_64)          plat="macos-x86_64" ;;
+      x86_64) echo "aizen: Intel macs (x86_64) are no longer supported -- Apple Silicon (arm64) only." >&2; exit 1 ;;
       *) echo "aizen: unsupported macOS arch: $arch" >&2; exit 1 ;;
     esac ;;
   *) echo "aizen: unsupported OS: $os (use install.ps1 on Windows)" >&2; exit 1 ;;
