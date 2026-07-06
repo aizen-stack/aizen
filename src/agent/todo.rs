@@ -102,6 +102,40 @@ fn model_ack(items: &[Todo]) -> String {
     format!("todo list updated: {} item(s), {done} done, {doing} in progress", items.len())
 }
 
+/// Parse a `{"todos": [...]}` args object into a `Vec<Todo>` — shared by the top-level `todo_write`
+/// and the sub-agent-scoped `ScopedTodo`, so both accept exactly the same shape.
+fn parse_todos(args: &serde_json::Value) -> Result<Vec<Todo>> {
+    match args.get("todos") {
+        Some(v) => serde_json::from_value(v.clone())
+            .map_err(|e| anyhow::anyhow!("invalid `todos` (expect [{{content, status}}]): {e}")),
+        None => anyhow::bail!("missing `todos` array"),
+    }
+}
+
+/// The `todos` array JSON Schema — identical for `todo_write` and `ScopedTodo`.
+fn todos_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "todos": {
+                "type": "array",
+                "description": "The full task list (replaces the previous one).",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "content": {"type": "string", "description": "the task, imperative + concise"},
+                        "status": {"type": "string", "enum": ["pending", "in_progress", "done"]}
+                    },
+                    "required": ["content", "status"]
+                }
+            }
+        },
+        "required": ["todos"]
+    })
+}
+
 /// `todo_write` — the model sends its full current task list; we replace + show it.
 pub struct TodoWrite;
 
@@ -116,37 +150,14 @@ impl Tool for TodoWrite {
          one-step tasks. The list is shown to the user and resets on /clear."
     }
     fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "todos": {
-                    "type": "array",
-                    "description": "The full task list (replaces the previous one).",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {
-                            "content": {"type": "string", "description": "the task, imperative + concise"},
-                            "status": {"type": "string", "enum": ["pending", "in_progress", "done"]}
-                        },
-                        "required": ["content", "status"]
-                    }
-                }
-            },
-            "required": ["todos"]
-        })
+        todos_schema()
     }
     // Mutates shared session state → keep it on the serial path (not a parallel read-only batch).
     fn is_concurrency_safe(&self) -> bool {
         false
     }
     fn execute(&self, args: &serde_json::Value) -> Result<String> {
-        let items: Vec<Todo> = match args.get("todos") {
-            Some(v) => serde_json::from_value(v.clone())
-                .map_err(|e| anyhow::anyhow!("invalid `todos` (expect [{{content, status}}]): {e}"))?,
-            None => anyhow::bail!("missing `todos` array"),
-        };
+        let items = parse_todos(args)?;
         set(items.clone());
         // Show the checklist to the USER (scroll region above the pinned box, or stderr).
         let block = render_block(&items);
@@ -157,6 +168,57 @@ impl Tool for TodoWrite {
                 eprintln!("{block}");
             }
         }
+        Ok(model_ack(&items))
+    }
+}
+
+/// `todo_write` for a SUB-AGENT (W17). A sub-agent runs its own multi-step plan inside its own
+/// loop, but the top-level `TodoWrite` is unavailable to it (it writes the process-global `TODOS`
+/// and renders into the USER's scroll region — a sub-agent must not clobber either, and concurrent
+/// read-only sub-agents would race on one global list). This variant is fully SELF-CONTAINED: it
+/// holds its OWN list in a per-instance `Mutex` (fresh with each sub-agent registry), touches no
+/// global state, and prints nothing to the user's UI — the only effect is the ack returned to the
+/// sub-agent, which is exactly the recitation signal that keeps a long plan from drifting. The
+/// list dies with the sub-agent, which is correct: its plan is scratch work, not the user's.
+pub struct ScopedTodo {
+    items: Mutex<Vec<Todo>>,
+}
+
+impl ScopedTodo {
+    pub fn new() -> Self {
+        Self { items: Mutex::new(Vec::new()) }
+    }
+}
+
+impl Default for ScopedTodo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Tool for ScopedTodo {
+    fn name(&self) -> &str {
+        "todo_write"
+    }
+    fn description(&self) -> &str {
+        "Track your OWN multi-step plan as a checklist while you work. Send the COMPLETE current \
+         list every call (it REPLACES the previous one). Set ONE item to in_progress at a time and \
+         flip it to done before starting the next. Use it to keep a 3+ step task on track; skip it \
+         for trivial one- or two-step work. This is your private scratch plan — it is not shown to \
+         anyone and is discarded when you return your result."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        todos_schema()
+    }
+    // Mutates this tool's own list → keep it serial (a sub-agent runs single-threaded anyway).
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
+    fn execute(&self, args: &serde_json::Value) -> Result<String> {
+        let items = parse_todos(args)?;
+        *self.items.lock().unwrap_or_else(|e| e.into_inner()) = items.clone();
+        // No UI emission: a sub-agent's plan must not leak into the user's scroll region. The ack
+        // (the recitation signal) is the whole point.
         Ok(model_ack(&items))
     }
 }
@@ -220,5 +282,51 @@ mod tests {
         let t = TodoWrite;
         assert!(t.execute(&serde_json::json!({})).is_err());
         assert!(t.execute(&serde_json::json!({"todos": "nope"})).is_err());
+    }
+
+    #[test]
+    fn scoped_todo_keeps_its_own_list_and_never_touches_the_global() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Seed the process-global list (the user's top-level plan).
+        set(vec![Todo { content: "user-task".into(), status: Status::InProgress }]);
+
+        // A sub-agent's ScopedTodo writes its OWN plan.
+        let sub = ScopedTodo::new();
+        let ack = sub
+            .execute(&serde_json::json!({"todos":[
+                {"content":"sub-step-1","status":"in_progress"},
+                {"content":"sub-step-2","status":"pending"}
+            ]}))
+            .unwrap();
+        assert!(ack.contains("2 item"), "ack reflects the sub-agent's own list: {ack}");
+
+        // The global list is UNTOUCHED — no leak between the sub-agent and the user's plan.
+        let global = snapshot();
+        assert_eq!(global.len(), 1, "global list unchanged by the sub-agent");
+        assert_eq!(global[0].content, "user-task");
+
+        // Two independent sub-agents don't share state (per-instance, not global).
+        let other = ScopedTodo::new();
+        let other_ack = other.execute(&serde_json::json!({"todos":[{"content":"x","status":"done"}]})).unwrap();
+        assert!(other_ack.contains("1 item"), "second sub-agent has its own list");
+        // The first sub-agent's list is still its own 2 items.
+        assert_eq!(sub.items.lock().unwrap().len(), 2);
+
+        clear();
+    }
+
+    #[test]
+    fn scoped_todo_rejects_bad_args() {
+        let sub = ScopedTodo::new();
+        assert!(sub.execute(&serde_json::json!({})).is_err());
+        assert!(sub.execute(&serde_json::json!({"todos": 5})).is_err());
+    }
+
+    #[test]
+    fn scoped_todo_and_todo_write_share_a_schema() {
+        // Both accept the identical `{todos:[{content,status}]}` shape — a sub-agent that learned
+        // todo_write at top level uses it unchanged.
+        assert_eq!(TodoWrite.parameters(), ScopedTodo::new().parameters());
+        assert_eq!(TodoWrite.name(), ScopedTodo::new().name());
     }
 }

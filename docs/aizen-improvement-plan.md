@@ -545,12 +545,32 @@ dần trái→phải; làm tuần tự, mỗi phase build + test xanh trước k
   dedup trước khi build cache key, để giảm cache-miss dư thừa cho request tương đương).
 
 ### Memory layer (`memory/`, `config.rs`)
-- [ ] **P4** Cân nhắc bật fuzzy recall mặc định (rẻ, pure-Rust) (W24).
-- [ ] **P4** Cơ chế plan nhẹ cho sub-agent (todo cho `planner`/`coder`) (W17).
+- [x] **P4** Đo fuzzy recall trước khi bật mặc định (W24). `ng bench memory --split all --fuzzy`
+  (mới, song song `--hybrid`): `search_in_fuzzy` (public, wire trực tiếp `rank_lexical(fuzzy=true)`)
+  đo trên corpus bench hiện tại — recall@5 delta **+0.000** trên cả literal và paraphrase (corpus
+  không có query nào thực sự có lỗi chính tả để bridge), nhưng noise_rate TĂNG (gate 0.497→0.580)
+  và precision@5 GIẢM (0.503→0.420). Kết luận có số đo: **giữ `enable_fuzzy` default OFF** — không
+  phải phỏng đoán như trước, giờ là quyết định grounded. Doc comment `search_excluding` cập nhật số
+  liệu cụ thể. `--fuzzy` là công cụ đo lâu dài để tái đánh giá khi có fixture nhiều lỗi chính tả hơn.
+- [x] **P4** Cơ chế plan nhẹ cho sub-agent (W17). `ScopedTodo` (`agent/todo.rs`) — `todo_write` cho
+  MỌI sub-agent scope (`subagent_read_only_base`, nên cả role_registry và agent_registry đều có),
+  nhưng KHÔNG phải `TodoWrite` top-level: state riêng per-instance (`Mutex<Vec<Todo>>` trong chính
+  struct, không static/global), không render ra UI của user, không đè/bị đè bởi list của user hay
+  giữa các sub-agent song song. Cùng schema/tên tool nên model không cần học lại. Sửa kèm:
+  `task_tool.rs` đặt `todo_reminder_every: 0` cho sub-agent — recitation nudge cũ đọc
+  `todo::snapshot()` (global), để mặc định ON sẽ vô tình đọc plan của USER TOP-LEVEL vào context
+  sub-agent (context leak + sai ngữ cảnh). 6 test mới (todo.rs + builtin.rs).
 
 ### Evaluation / error-recovery layer
-- [ ] **P4** Eval harness: bộ ~15 kịch bản (edit-file, fix-test, research-fact, multi-file) đo
-  chỉ số Mục 10; chạy như test tích hợp (`shell_run` local, không CI nặng).
+- [x] **P4** Eval harness: bộ 15 kịch bản (`ng bench loop`, `bench/loop_eval.rs`) đo chỉ số Mục 10.
+  Chạy loop THẬT (`run_agent`) với model script (`scripted`, cùng pattern test trong `mod.rs`) qua
+  fixture tool offline (`Echo`/`Const`/`Fail`) — không network, không CI nặng, hoàn toàn xác định.
+  Phủ đủ 6 shape: answer(2)/edit(2)/multi(1)/fix-test(2)/research(3)/anti-loop(5) — anti-loop gồm cả
+  4 dạng lặp mục tiêu của P1 (identical-fail, A/B oscillation, useless-reread, padded-fail-vẫn-dừng)
+  + 1 MaxIters (tiến bộ liên tục nhưng không bao giờ Done). Kết quả trên HEAD: **15/15 PASS**,
+  verified-done 100% (10/10), mean 3.5 steps/task (healthy-Done), loop-stop-on-healthy-task 0%.
+  Không cần baseline riêng — gate là chính expectation từng scenario (đổi hành vi loop mà phá 1
+  scenario là regression bắt được ngay, không cần so lệch % như bench memory).
 - [ ] **P4** (Tuỳ chọn) bật `enable_self_review` cho task rủi ro cao.
 
 ---

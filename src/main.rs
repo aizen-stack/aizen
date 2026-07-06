@@ -528,6 +528,10 @@ enum BenchCmd {
         /// embedder unless built with the `dense` feature).
         #[arg(long)]
         hybrid: bool,
+        /// Also measure the fuzzy (Jaro-Winkler bridge) lexical pipeline (W24) — recall/noise
+        /// delta vs. the exact-BM25 floor, to decide whether `enable_fuzzy` should default on.
+        #[arg(long)]
+        fuzzy: bool,
         /// Run the EVOLUTION gate (P8): a multi-session reuse simulation proving recall@5 lifts
         /// ≥5%/session from implicit reinforcement until it plateaus. Standalone (ignores split).
         #[arg(long)]
@@ -537,6 +541,9 @@ enum BenchCmd {
     Profile,
     /// Golden-set bench for the DIALECTIC Q&A (B3), incl. abstain-when-unknown.
     Dialectic,
+    /// Offline loop-behavior eval (P4): drive the real agent loop with scripted models over ~15
+    /// scenarios and report the Section-10 metrics (steps/task, loop-stop rate, verified-done).
+    Loop,
 }
 
 #[derive(Parser, Debug)]
@@ -716,16 +723,18 @@ async fn main() -> Result<()> {
                 split,
                 update_baseline,
                 hybrid,
+                fuzzy,
                 evolution,
             } => {
                 if evolution {
                     bench::run_evolution()
                 } else {
-                    bench::run(&split, update_baseline, hybrid)
+                    bench::run(&split, update_baseline, hybrid, fuzzy)
                 }
             }
             BenchCmd::Profile => bench::brain::run_profile(),
             BenchCmd::Dialectic => bench::brain::run_dialectic(),
+            BenchCmd::Loop => bench::loop_eval::run().await,
         },
         Commands::Config { cmd } => run_config(cmd).await,
         Commands::Models(args) => run_models(args).await,

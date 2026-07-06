@@ -186,6 +186,13 @@ pub fn search_in(query: &str, k: usize, entries: Vec<MemoryEntry>) -> Vec<Hit> {
     search_excluding(query, k, entries, &HashSet::new())
 }
 
+/// Pure search over a supplied entry set WITH the Jaro-Winkler fuzzy bridge (the `enable_fuzzy`
+/// production path). Used by the bench's `--fuzzy` measurement to quantify the typo/morphology
+/// recall gain vs. the exact-BM25 floor before flipping the default (W24).
+pub fn search_in_fuzzy(query: &str, k: usize, entries: Vec<MemoryEntry>) -> Vec<Hit> {
+    rank_lexical(query, k, entries, &HashSet::new(), true)
+}
+
 /// Pure search excluding ids already served in the frozen core (the lazy long tail).
 /// Ranking is BM25 (P7) — IDF + length normalization computed over the candidate set.
 /// Lexical-only; the dense path is `search_hybrid_in`.
@@ -193,9 +200,11 @@ pub fn search_in(query: &str, k: usize, entries: Vec<MemoryEntry>) -> Vec<Hit> {
 /// Exact BM25 (`score`, not `score_fuzzy`) is the shipped floor: it returns the same nonzero
 /// candidate SET as a token-overlap scorer (so injected-noise is unchanged) while ranking it
 /// better via IDF + length normalization. The fuzzy bridge is implemented + unit-proven but
-/// default-OFF — on the current bench it adds candidate noise without a recall gain (the corpus
-/// is saturated), failing its "no English regression" gate; same posture as the dense tier, one
-/// flag from on once a typo-heavy fixture set proves net value.
+/// default-OFF — **measured** (W24, `ng bench memory --split all --fuzzy`) on the current bench
+/// corpus: recall@5 delta is +0.000 on both the literal and paraphrase tune slices (the corpus is
+/// already lexically saturated — no query in the fixture set actually has a typo to bridge), while
+/// noise_rate rises (gate 0.497→0.580) and precision@5 drops (0.503→0.420). Net loss, not a wash:
+/// stays OFF until a typo-heavy fixture proves a real recall gain. Same posture as the dense tier.
 pub fn search_excluding(
     query: &str,
     k: usize,
@@ -905,6 +914,22 @@ mod tests {
         let fuzzy = rank_lexical("postgers tuning", 5, entries, &ex, true);
         let score_of = |hits: &[Hit]| hits.iter().find(|h| h.entry.id == "a").map(|h| h.score).unwrap_or(0.0);
         assert!(score_of(&fuzzy) > score_of(&exact), "fuzzy bridges the typo → higher score on 'a'");
+    }
+
+    #[test]
+    fn search_in_fuzzy_is_the_public_bench_entry_for_the_bridge() {
+        // The bench's --fuzzy measurement (W24) calls this exact function; pin its wiring to
+        // rank_lexical(fuzzy=true) so the bench numbers can't silently drift from production.
+        let entries = vec![
+            entry("a", "postgres index tuning and query plans"),
+            entry("b", "react suspense and tanstack query"),
+        ];
+        let via_public = search_in_fuzzy("postgers tuning", 5, entries.clone());
+        let via_private = rank_lexical("postgers tuning", 5, entries, &HashSet::new(), true);
+        assert_eq!(
+            via_public.iter().map(|h| h.score).collect::<Vec<_>>(),
+            via_private.iter().map(|h| h.score).collect::<Vec<_>>()
+        );
     }
 
     #[test]

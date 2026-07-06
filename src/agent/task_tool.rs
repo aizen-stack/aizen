@@ -422,6 +422,11 @@ impl Tool for TaskTool {
             // Inherit the parent's window so TOOL-RESULT CLEARING is ON for deep investigations
             // (mid-loop compaction stays off by construction: one user turn can't be cut).
             context_window: self.context_window,
+            // Recitation reads the PROCESS-GLOBAL `todo::snapshot()` — the top-level user's list,
+            // not this sub-agent's own `ScopedTodo` (W17, a private per-instance list the loop has
+            // no handle to). Leaving this on would recite the PARENT's plan into a sub-agent's
+            // context, which is both wrong and a context leak. Off here, same as the test cfg().
+            todo_reminder_every: 0,
             ..AgentConfig::default()
         };
 

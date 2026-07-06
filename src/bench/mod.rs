@@ -6,10 +6,11 @@
 //! check (they exist precisely to measure the gap the dense tier (P5) will close).
 
 pub mod brain;
+pub mod loop_eval;
 pub mod metrics;
 
 use crate::memory::embed::{self, Embedder};
-use crate::memory::{search_hybrid_in, search_in};
+use crate::memory::{search_hybrid_in, search_in, search_in_fuzzy};
 use crate::memory::store::{MemoryEntry, MemoryType};
 use crate::memory::tokenize::tokenize;
 use anyhow::{Context, Result};
@@ -124,13 +125,25 @@ fn lint(corpus: &[MemoryEntry], queries: &[FixQuery]) -> Result<()> {
     }
 }
 
-fn eval(corpus: &[MemoryEntry], queries: &[FixQuery], embedder: Option<&dyn Embedder>) -> BenchMetrics {
+/// Which lexical ranking the bench scores. `Exact` is the shipped floor; `Fuzzy` adds the
+/// Jaro-Winkler bridge (W24 measurement); the dense embedder path is orthogonal (`--hybrid`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rank {
+    Exact,
+    Fuzzy,
+}
+
+fn eval(corpus: &[MemoryEntry], queries: &[FixQuery], embedder: Option<&dyn Embedder>, rank: Rank) -> BenchMetrics {
     let empty = HashSet::new();
     let evals: Vec<(Vec<String>, HashSet<String>)> = queries
         .iter()
         .map(|q| {
             let ranked: Vec<String> = match embedder {
                 Some(e) => search_hybrid_in(&q.query, 10, corpus.to_vec(), &empty, e)
+                    .into_iter()
+                    .map(|h| h.entry.id)
+                    .collect(),
+                None if rank == Rank::Fuzzy => search_in_fuzzy(&q.query, 10, corpus.to_vec())
                     .into_iter()
                     .map(|h| h.entry.id)
                     .collect(),
@@ -158,7 +171,7 @@ fn print_metrics(label: &str, m: &BenchMetrics) {
 }
 
 /// Entry point for `ng bench memory`.
-pub fn run(split: &str, update_baseline: bool, hybrid: bool) -> Result<()> {
+pub fn run(split: &str, update_baseline: bool, hybrid: bool, fuzzy: bool) -> Result<()> {
     let corpus = corpus()?;
     let gate: Vec<FixQuery> = parse_jsonl(Q_GATE, "queries.gate.jsonl")?;
     let tune: Vec<FixQuery> = parse_jsonl(Q_TUNE, "queries.tune.jsonl")?;
@@ -185,16 +198,16 @@ pub fn run(split: &str, update_baseline: bool, hybrid: bool) -> Result<()> {
         // Vietnamese-only paraphrase slice (P6 gate): the diacritic-shredding tokenizer bug hit
         // hardest here, so this is the number the NFC + Unicode-regex repair must move.
         let vn_para: Vec<FixQuery> = para.iter().filter(|q| q.is_vn()).map(clone_q).collect();
-        let lex_para = eval(&corpus, &para, None);
-        print_metrics("tune (literal)", &eval(&corpus, &lit, None));
+        let lex_para = eval(&corpus, &para, None, Rank::Exact);
+        print_metrics("tune (literal)", &eval(&corpus, &lit, None, Rank::Exact));
         print_metrics("tune (paraphrase)", &lex_para);
         if !vn_para.is_empty() {
-            print_metrics("tune (paraphrase, vn)", &eval(&corpus, &vn_para, None));
+            print_metrics("tune (paraphrase, vn)", &eval(&corpus, &vn_para, None, Rank::Exact));
         }
         println!("  ^ paraphrase recall is the lexical ceiling the dense tier must beat.");
         if let Some(e) = emb_ref {
-            let hyb_para = eval(&corpus, &para, Some(e));
-            print_metrics("tune (lit, hybrid)", &eval(&corpus, &lit, Some(e)));
+            let hyb_para = eval(&corpus, &para, Some(e), Rank::Exact);
+            print_metrics("tune (lit, hybrid)", &eval(&corpus, &lit, Some(e), Rank::Exact));
             print_metrics("tune (para, hybrid)", &hyb_para);
             let delta = hyb_para.recall_at_5 - lex_para.recall_at_5;
             println!("  embedder = {}", e.id());
@@ -210,15 +223,43 @@ pub fn run(split: &str, update_baseline: bool, hybrid: bool) -> Result<()> {
                 );
             }
         }
+        if fuzzy {
+            // W24 measurement: does the Jaro-Winkler bridge lift recall on literal/paraphrase
+            // queries WITHOUT adding noise (dropping precision/ndcg)? Both tiers matter — a fuzzy
+            // bridge that lifts recall by dragging in junk is a net loss, not a win.
+            let fz_lit = eval(&corpus, &lit, None, Rank::Fuzzy);
+            let fz_para = eval(&corpus, &para, None, Rank::Fuzzy);
+            print_metrics("tune (lit, fuzzy)", &fz_lit);
+            print_metrics("tune (para, fuzzy)", &fz_para);
+            let recall_delta = fz_para.recall_at_5 - lex_para.recall_at_5;
+            let noise_delta = fz_para.noise_rate - lex_para.noise_rate;
+            println!(
+                "  FUZZY: recall@5 {:+.3} ({:.3} → {:.3}), noise {:+.3} ({:.3} → {:.3})",
+                recall_delta, lex_para.recall_at_5, fz_para.recall_at_5,
+                noise_delta, lex_para.noise_rate, fz_para.noise_rate
+            );
+        }
     }
 
     if split == "gate" || split == "all" {
-        // The gate always tracks the LEXICAL floor (the shipping default); --hybrid is
-        // measurement-only and never rewrites the baseline.
-        let current = eval(&corpus, &gate, None);
+        // The gate always tracks the LEXICAL floor (the shipping default); --hybrid/--fuzzy are
+        // measurement-only and never rewrite the baseline.
+        let current = eval(&corpus, &gate, None, Rank::Exact);
         print_metrics("gate", &current);
         if hybrid {
-            print_metrics("gate (hybrid)", &eval(&corpus, &gate, emb_ref));
+            print_metrics("gate (hybrid)", &eval(&corpus, &gate, emb_ref, Rank::Exact));
+        }
+        if fuzzy {
+            let fz_gate = eval(&corpus, &gate, None, Rank::Fuzzy);
+            print_metrics("gate (fuzzy)", &fz_gate);
+            if fz_gate.recall_at_5 + 1e-9 < current.recall_at_5 || fz_gate.noise_rate > current.noise_rate + GATE_EPSILON {
+                println!(
+                    "  FUZZY GATE: would REGRESS the gate (recall {:.3}→{:.3}, noise {:.3}→{:.3}) — stay OFF by default.",
+                    current.recall_at_5, fz_gate.recall_at_5, current.noise_rate, fz_gate.noise_rate
+                );
+            } else {
+                println!("  FUZZY GATE: no regression on the gate split.");
+            }
         }
 
         if update_baseline {

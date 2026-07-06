@@ -220,6 +220,11 @@ fn subagent_read_only_base(root: &Path) -> ToolRegistry {
     register_telegram(&mut r);
     register_notify(&mut r);
     r.register(Box::new(crate::features::timemachine::Checkpoint));
+    // W17: a private, per-instance `todo_write` scratch plan (never the top-level TodoWrite — that
+    // one owns the process-global list + the user's scroll region, which no sub-agent may touch).
+    // Self-contained state means concurrent read-only sub-agents (planner/reviewer fan-out) never
+    // race on it either.
+    r.register(Box::new(crate::agent::todo::ScopedTodo::new()));
     r
 }
 
@@ -2380,5 +2385,41 @@ mod tests {
 
         std::env::remove_var("NEXTGEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_subagent_scope_gets_a_scratch_plan_but_never_the_top_level_todo() {
+        // W17: a sub-agent can track its own multi-step plan (todo_write present in every scope via
+        // the read-only base) — but it's the per-instance ScopedTodo, NOT the process-global
+        // TodoWrite (which is top-level only, sharing the user's list + scroll region).
+        let root = std::env::temp_dir();
+        for role in ["coder", "tester", "planner", "reviewer", "unknown-role"] {
+            let r = role_registry(role, &root);
+            assert!(r.get("todo_write").is_some(), "role {role} has a scratch plan");
+        }
+        // A specialist (empty tools = coder scope) also gets it.
+        let spec = agent_registry(
+            &crate::agents::AgentDef {
+                name: "S".into(),
+                description: String::new(),
+                color: String::new(),
+                emoji: String::new(),
+                vibe: String::new(),
+                tools: vec![],
+                model: None,
+                body: "b".into(),
+                division: None,
+                source: crate::agents::AgentSource::AizenHome,
+                source_path: std::path::PathBuf::new(),
+            },
+            &root,
+        );
+        assert!(spec.get("todo_write").is_some(), "specialist has a scratch plan");
+        // The scratch plan is a scratch plan — writing to it never touches the process-global list
+        // (proven per-instance in todo::tests; here we only assert presence + read-only classification).
+        assert!(
+            crate::agent::task_tool::dispatch_is_read_only(&role_registry("planner", &root)),
+            "todo_write does not make a read-only role a writer (it's not workspace mutation)"
+        );
     }
 }
