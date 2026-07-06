@@ -3915,12 +3915,14 @@ fn ctx_window_for(model: &str) -> usize {
     }
 }
 
-/// A 10-cell context-fill bar, coloured by pressure (green→yellow→red).
+/// A 10-cell context-fill bar, coloured by pressure using the semantic palette (P-ctx4): OK below
+/// 50%, WARN gold from 50%, ERR salmon from 80% — the same green/gold/salmon meanings the rest of
+/// the UI uses, instead of bespoke 256-colour indices.
 fn ctx_bar(pct: f64) -> String {
     const CELLS: usize = 10;
     let filled = ((pct / 100.0) * CELLS as f64).round().clamp(0.0, CELLS as f64) as usize;
     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(CELLS - filled));
-    let color: u8 = if pct >= 80.0 { 203 } else if pct >= 50.0 { 220 } else { 78 }; // red / yellow / green
+    let color: u8 = if pct >= 80.0 { theme::ERR } else if pct >= 50.0 { theme::WARN } else { theme::OK };
     style(bar).color256(color).to_string()
 }
 
@@ -4216,9 +4218,15 @@ fn print_status_line(history: &[Message], model: &str) {
     let winlabel = if window >= 1000 { format!("{}K", window / 1000) } else { window.to_string() };
     let tag = if auto { "ctx" } else { "ctx·est" }; // est = name-heuristic, provider didn't report it
     let ctx = format!("{} {}", ctx_bar(pct), style(format!("{pct:.0}% {tag}")).dim());
+    // Auto-compact trigger level, plus how many times this session has actually compacted so far
+    // (P-ctx3, read from the queryable boundary marker). `⊟ 80%` → `⊟ 80% ×2` after two compactions.
     let ac = match compact_threshold_pct() {
         0 => String::new(),
-        t => style(format!("  ·  ⊟ {t}%")).dim().to_string(), // auto-compact trigger level
+        t => {
+            let n = agent::compact::compaction_count(history);
+            let count = if n > 0 { format!(" ×{n}") } else { String::new() };
+            style(format!("  ·  ⊟ {t}%{count}")).dim().to_string()
+        }
     };
     let cache = cache_hit_label().map(|s| style(format!("  ·  {s}")).dim().to_string()).unwrap_or_default();
     let rest = style(format!(
@@ -6251,6 +6259,16 @@ mod tests {
         assert_eq!(ctx_window_for("deepseek-chat"), 64_000);
         assert_eq!(ctx_window_for("gpt-4o-mini"), 128_000); // default family
         assert_eq!(ctx_window_for("some-unknown-model"), 128_000); // fallback
+    }
+
+    #[test]
+    fn ctx_bar_uses_semantic_palette() {
+        // P-ctx4: colour comes from the semantic palette (OK/WARN/ERR) at the 50%/80% thresholds,
+        // not bespoke 256-indices. Force colour on so the ANSI code is actually emitted.
+        console::set_colors_enabled(true);
+        assert!(ctx_bar(30.0).contains(&theme::OK.to_string()), "green below 50%");
+        assert!(ctx_bar(60.0).contains(&theme::WARN.to_string()), "gold from 50%");
+        assert!(ctx_bar(90.0).contains(&theme::ERR.to_string()), "salmon from 80%");
     }
 
     #[test]

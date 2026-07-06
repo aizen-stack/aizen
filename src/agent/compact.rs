@@ -16,6 +16,14 @@ use std::future::Future;
 /// User turns kept verbatim at the tail; everything older is summarized.
 pub const KEEP_TURNS: usize = 3;
 
+/// Stable prefix identifying the compaction-boundary `system` note (P-ctx3). Analogous to Claude
+/// Code's `subtype:"compact_boundary"` marker: everything before this note in history is a lossy
+/// summary, everything after is verbatim. A stable prefix (not a bespoke `Message` field — the core
+/// stays pure) makes the boundary QUERYABLE: the HUD counts compactions from it, and each successive
+/// compaction reads the prior sequence number off it and increments, so the count survives even
+/// though the old boundary note itself is summarized away into the new one.
+pub const COMPACT_MARKER_PREFIX: &str = "[Earlier conversation auto-compacted";
+
 /// The summarization instruction. Centralized here so the REPL and the loop produce identical
 /// summaries. Mirrors the original `compact_history` prompt.
 const SUMMARIZE_SYS: &str = "You compress a coding-assistant conversation to conserve context. \
@@ -100,14 +108,44 @@ pub fn plan_compact_cut(history: &[Message], keep_turns: usize) -> Option<usize>
     }
 }
 
-/// Rebuild `history` in place as: the system prompt (`[0]`) + one summary `system` note + the
-/// verbatim tail from `cut`. The summary should already be trimmed.
+/// How many times `history` has been compacted, read from the boundary marker (P-ctx3). Zero if no
+/// boundary note is present. The count lives IN the marker text (`#N`) rather than a side counter,
+/// so it is correct after session save/restore (which only round-trips `messages`) and after a
+/// handoff — anywhere the boundary note travels, its count travels with it.
+pub fn compaction_count(history: &[Message]) -> usize {
+    history
+        .iter()
+        .find(|m| m.role == "system" && m.content.as_deref().is_some_and(|c| c.starts_with(COMPACT_MARKER_PREFIX)))
+        .and_then(|m| parse_marker_seq(m.content.as_deref().unwrap_or("")))
+        .unwrap_or(0)
+}
+
+/// Parse the `#N` sequence number out of a boundary marker's first line. `None` if absent/garbled.
+fn parse_marker_seq(marker: &str) -> Option<usize> {
+    let first = marker.lines().next().unwrap_or("");
+    let hash = first.rfind('#')?;
+    let digits: String = first[hash + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Build the boundary-note text for the `seq`-th compaction (1-based). Queryable via
+/// [`COMPACT_MARKER_PREFIX`] + [`parse_marker_seq`].
+fn marker_text(seq: usize, summary: &str) -> String {
+    format!("{COMPACT_MARKER_PREFIX} to conserve context · #{seq}]\n{summary}")
+}
+
+/// Rebuild `history` in place as: the system prompt (`[0]`) + one summary `system` boundary note +
+/// the verbatim tail from `cut`. The summary should already be trimmed. The boundary note carries a
+/// running compaction count: the number is read off any PRIOR boundary note (which is about to be
+/// summarized into this one) and incremented, so the count accumulates across successive
+/// compactions even though each old boundary note is folded into the next summary.
 pub fn splice_compacted(history: &mut Vec<Message>, cut: usize, summary: &str) {
+    let seq = compaction_count(history) + 1;
     let system_prompt = history[0].clone();
     let tail: Vec<Message> = history[cut..].to_vec();
     let mut rebuilt = Vec::with_capacity(2 + tail.len());
     rebuilt.push(system_prompt);
-    rebuilt.push(Message::system(format!("[Earlier conversation auto-compacted to conserve context]\n{summary}")));
+    rebuilt.push(Message::system(marker_text(seq, summary)));
     rebuilt.extend(tail);
     *history = rebuilt;
 }
@@ -251,6 +289,49 @@ mod tests {
         let mut h = vec![Message::system("SYS"), user("only one turn")];
         let r = compact_history(&mut h, |_m| async { Ok("x".to_string()) }, KEEP_TURNS).await;
         assert!(r.is_err(), "a single-turn conversation can't be compacted");
+    }
+
+    #[test]
+    fn boundary_marker_is_queryable_and_counts_accumulate() {
+        // P-ctx3: a fresh history has zero compactions; the marker is detectable by prefix; and the
+        // count accumulates across successive compactions even though each old boundary note is
+        // folded into the next summary.
+        let base = || vec![
+            Message::system("SYS"),
+            user("u1"), asst("a1"),
+            user("u2"), asst("a2"),
+            user("u3"), asst("a3"),
+        ];
+        let mut h = base();
+        assert_eq!(compaction_count(&h), 0, "no boundary yet");
+        splice_compacted(&mut h, 3, "SUMMARY_1");
+        assert_eq!(compaction_count(&h), 1, "first compaction → #1");
+        assert!(
+            h[1].content.as_deref().unwrap().starts_with(COMPACT_MARKER_PREFIX),
+            "boundary note detectable by prefix"
+        );
+        // Grow the tail and compact again: the prior #1 boundary sits before the new cut, so it is
+        // summarized away — but the sequence must still advance to #2 (read off the old marker).
+        h.push(user("u4"));
+        h.push(asst("a4"));
+        h.push(user("u5"));
+        h.push(asst("a5"));
+        let cut = plan_compact_cut(&h, 1).expect("compactable");
+        splice_compacted(&mut h, cut, "SUMMARY_2");
+        assert_eq!(compaction_count(&h), 2, "count accumulates to #2 across compactions");
+        // Exactly one boundary note survives (the newest); the old one was folded in.
+        let markers = h.iter().filter(|m| {
+            m.role == "system" && m.content.as_deref().is_some_and(|c| c.starts_with(COMPACT_MARKER_PREFIX))
+        }).count();
+        assert_eq!(markers, 1, "only the newest boundary note remains");
+    }
+
+    #[test]
+    fn parse_marker_seq_handles_missing_and_garbled() {
+        assert_eq!(parse_marker_seq("no hash here"), None);
+        assert_eq!(parse_marker_seq("[... · #7]\nsummary"), Some(7));
+        assert_eq!(parse_marker_seq("[... · #]\nx"), None); // hash with no digits
+        assert_eq!(parse_marker_seq("[... · #12] trailing"), Some(12));
     }
 
     #[tokio::test]

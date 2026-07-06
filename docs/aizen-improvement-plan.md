@@ -575,6 +575,67 @@ dần trái→phải; làm tuần tự, mỗi phase build + test xanh trước k
 
 ---
 
+## P-ctx. Nâng cấp Context / Compact (nghiên cứu grounded vs Claude Code)
+
+Xuất phát từ nhận xét người dùng ("kiểm tra context chưa có, compact sơ xài") + một deep-research
+đối chiếu Claude Code (CC) và docs Anthropic (17 claim verified 2-3/3). **Đính chính tiền đề:**
+Aizen KHÔNG thiếu — đã có statusline `%` realtime (`main.rs:4204`), bar 3 ngưỡng màu
+(`main.rs:3919`), hiệu chỉnh estimate theo token THẬT của provider `RealAnchor`
+(`mod.rs:1660,1667` — chính là "live from API response" của CC), compact cắt theo user-boundary giữ
+3 turn cuối verbatim + summary note (`compact.rs:87,105`, KHÔNG phải "xoá sạch"), giữ nguyên system
+prompt qua compact (CC **dính bug** #4517 làm CLAUDE.md bị nén mất — Aizen miễn nhiễm), tool-result
+clearing theo ngưỡng (`mod.rs:545` = `clear_tool_uses` của CC), và handoff goal-conditioned
+(`compact.rs:30`, CC không có). Vấn đề thật là **4 lỗ hổng cụ thể**, không phải "làm lại từ đầu":
+
+**Nguồn đã LOẠI (bác 0-3, không xây trên):** compact mặc định 15k token; "auto-compact chạy vô
+hạn"; "chỉ autoCompact ship trong npm". **Cảnh báo grounded:** ngưỡng 70% của CC bị đánh giá quá
+hung hăng gây thrashing (#61351) → Aizen giữ 80% là hợp lý, KHÔNG hạ.
+
+- [x] **P-ctx1** Bơm ngân sách context cho model theo từng lượt (khoảng cách A) — ĐÃ LÀM. CC bơm
+  `<budget:token_budget>200000</budget:token_budget>` + `<system_warning>Token usage: 35000/200000;
+  165000 remaining</system_warning>` sau MỖI tool call (server-side). Aizen là client-side nên
+  KHÔNG refresh mỗi turn (mỗi lần rewrite system-message giữa history bust prompt-cache từ byte đó
+  — đánh đổi chính context đang muốn tiết kiệm lấy churn). Giải pháp **band-gated** (`budget_band`,
+  `mod.rs`): chỉ inject/refresh 1 `system` nudge (`NUDGE_BUDGET`, collapse qua `push_nudge`) khi
+  usage vượt band decile mới ≥50% → cache-stable trong band, vẫn leo thang khi áp lực tăng. Dùng lại
+  `effective_tokens`/`RealAnchor`. Reset band khi clear/compact (history co lại). Guard 90% giữ làm
+  tầng cứng riêng, chạy SAU nên là tail-message (error-rollback `pop()` chỉ gỡ đúng n).
+  Sub-agent (`context_window==0`) không đụng. Test: `budget_band_floors…`, `budget_nudge_text…`,
+  `running_budget_nudge_appears_once_per_band…`.
+- [x] **P-ctx2** Cảnh báo "lưu trước khi xoá" (khoảng cách B — pain-point #1) — ĐÃ LÀM. CC: sắp chạm
+  ngưỡng clear thì model nhận warning để kịp ghi memory TRƯỚC khi tool-result bị xoá. Aizen xoá
+  thẳng body (`mod.rs`) → nguồn than phiền lớn nhất CC (#10232, #28721 "như bị cắt thuỳ não"). Giải
+  pháp one-shot (`save_before_clear_warned`): LẦN ĐẦU tới hạn clear → warn (ghi memory/`todo_write`)
+  + **hoãn** eviction sang turn sau (KHÔNG arm cadence → `clearing_due` vẫn true → turn kế mới xoá
+  thật), lúc đó nội dung quan trọng đã lưu. Chỉ bắn 1 lần/run. Test:
+  `save_before_clear_warns_first_then_evicts_next_turn` (assert warn xuất hiện + eviction VẪN xảy ra
+  ở turn sau + đúng 1 warn).
+- [x] **P-ctx3** Compact boundary thành marker query được (khoảng cách C) — ĐÃ LÀM. Thay system-note
+  chuỗi thường bằng marker có prefix ổn định `COMPACT_MARKER_PREFIX` + số thứ tự `#N`
+  (`compact.rs`). `compaction_count()` đọc N từ marker (KHÔNG đổi struct `Message` → giữ pure);
+  `splice_compacted` đọc N cũ +1 nên **đếm tích luỹ** dù mỗi boundary cũ bị nuốt vào summary mới; số
+  sống sót qua session save/restore + handoff (đi theo `messages`). HUD hiện `⊟ 80% ×N`
+  (`main.rs`). Test: `boundary_marker_is_queryable_and_counts_accumulate` (0→#1→#2, chỉ 1 marker sống
+  sót), `parse_marker_seq_handles_missing_and_garbled`.
+- [x] **P-ctx4** Dọn UI/config context (khoảng cách D) — ĐÃ LÀM. `ctx_bar` dùng
+  `theme::OK/WARN/ERR` (`main.rs`) thay hardcode 78/220/203 — cùng nghĩa green/gold/salmon với phần
+  UI còn lại. Ngưỡng guard đọc field mới `AgentConfig.context_guard_pct` (default 90, `0`=tắt) thay
+  90 hardcode. Test: `ctx_bar_uses_semantic_palette`, `context_guard_threshold_is_config_driven`.
+  **Grounded — KHÔNG hạ ngưỡng:** CC 70% bị đánh giá quá hung hăng gây thrashing (#61351), Aizen giữ
+  80% auto-compact + 90% guard.
+
+**Trạng thái:** 4/4 xong, build+clippy sạch (không warning mới), **706 test pass** (+8 so 698 của
+P4). Neo code sau khi áp dụng: `budget_band`/`budget_nudge_text`/`NUDGE_BUDGET`/`NUDGE_SAVE_BEFORE_
+CLEAR`/`context_guard_pct` trong `mod.rs`; `COMPACT_MARKER_PREFIX`/`compaction_count`/`splice_
+compacted` trong `compact.rs`; `ctx_bar`/HUD `⊟×N` trong `main.rs`.
+
+**Neo file:line:** guard/clear/compact loop `mod.rs:534-644`; nudge cơ chế `mod.rs:1896`; compact
+core `compact.rs:87,105`; HUD `main.rs:4204-4231`; bar `main.rs:3919`; config
+`cli_config.rs:22-29`. **How to apply:** mỗi mục build+test xanh trước khi sang mục sau; thuần Rust,
+không dep mới. Xem [[working-constraints]].
+
+---
+
 ## 10. Chỉ số đo chất lượng (trước → sau)
 
 Đo trên eval harness (P4) + log thực tế. Cột "Đo bằng" trỏ tới tín hiệu có sẵn trong loop.

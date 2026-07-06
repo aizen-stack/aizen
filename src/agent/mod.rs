@@ -296,6 +296,11 @@ pub struct AgentConfig {
     /// summarized in place. `0` disables compaction (the loop falls back to the one-shot wrap-up
     /// nudge). Requires `context_window > 0`.
     pub compact_at_pct: u8,
+    /// The one-shot "wrap up now" context guard fires when running history crosses this percent of
+    /// `context_window` (P-ctx4 — was a hardcoded 90). Kept above `compact_at_pct` so a summarizer-
+    /// equipped caller compacts first; the guard is the last-ditch nudge for callers WITHOUT one.
+    /// Requires `context_window > 0`; `0` disables the guard.
+    pub context_guard_pct: u8,
     /// Max gate-triggered fix rounds in the verify/repair loop: after an editing run, a failing
     /// typecheck injects the errors and loops back for a fix, up to this many times (then the model
     /// is allowed to finish). `1` = the old one-shot behavior; `0` disables looping entirely (the
@@ -337,6 +342,7 @@ impl Default for AgentConfig {
             clear_cooldown_iters: 6,
             todo_reminder_every: 8,
             compact_at_pct: 80,
+            context_guard_pct: 90,
             max_verify_attempts: 2,
             enable_self_review: false,
             enable_lsp: false,
@@ -509,6 +515,14 @@ where
     let mut auto_checkpointed = false;
     let mut self_review_done = false;
     let mut context_warned = false;
+    // P-ctx1: the last budget band we surfaced to the model (see `budget_band`). Injected only on a
+    // band change so the running budget `system` nudge stays cache-stable within a band. Reset when
+    // history shrinks (clear/compact) so the signal re-arms honestly against the new, smaller size.
+    let mut budget_band_shown: Option<u8> = None;
+    // P-ctx2: one-shot latch — the FIRST time history reaches the clearing threshold we warn the
+    // model to persist anything durable and SKIP that pass, so the eviction happens a turn later
+    // with the important content already saved. Never fires again (subsequent clears are silent).
+    let mut save_before_clear_warned = false;
     // Provider-reported prompt size at the last usage-carrying call (see `RealAnchor`) —
     // invalidated whenever history is mutated (clearing/compaction shrink what we'd send next).
     let mut real_anchor: Option<RealAnchor> = None;
@@ -549,6 +563,28 @@ where
         {
             let pct = est_now * 100 / cfg.context_window;
             if clearing_due(pct, iter, last_clear, cfg.clear_step_pct, cfg.clear_cooldown_iters) {
+                // SAVE-BEFORE-CLEAR (P-ctx2): the first eviction of a run is the moment stale
+                // tool-result bodies leave context for good — the single biggest source of "it
+                // forgot the workaround we found" complaints. So the FIRST time we're due to clear,
+                // don't: warn the model to persist anything durable (memory files, todo_write) while
+                // the results are still here, then let THIS turn run with the warning + full context.
+                // The eviction happens next turn (latch set, cadence NOT armed → clearing_due stays
+                // true), by which point the important content is saved. One-shot; later clears are
+                // silent (the model has been told the rule once).
+                if !save_before_clear_warned {
+                    save_before_clear_warned = true;
+                    push_nudge(
+                        messages,
+                        NUDGE_SAVE_BEFORE_CLEAR,
+                        "Context is filling up, so older tool results will start being dropped from \
+                         history to make room. BEFORE that happens: if any earlier command output, \
+                         file content, fix, or workaround still matters for this task, save it now — \
+                         write it to a memory file or record it with todo_write. Details you don't \
+                         persist will be gone from context after this.",
+                    );
+                    // Skip the eviction this pass; do NOT arm the cadence, so the next iteration is
+                    // still "due" and actually clears — now that the model has had a turn to save.
+                } else {
                 // The floor measures history in RAW estimate units (chars/4), but `est_now` — which
                 // armed this pass — is anchor-corrected. With an active anchor, effective = raw + K
                 // for a constant offset K (= real-minus-estimate at anchor time), so a target
@@ -576,6 +612,7 @@ where
                     // memory too, so re-reading evicted content counts as progress again.
                     seen_results.clear();
                     est_now = estimate_tokens(messages) + schema_overhead;
+                    budget_band_shown = None; // history shrank — re-arm the running budget signal (P-ctx1)
                     if !cfg.quiet {
                         let line = format!(
                             "→ context: cleared ~{} chars ({} result(s), {} failure(s) trimmed)",
@@ -591,6 +628,7 @@ where
                 // Arm the cadence even when nothing was clearable — re-scanning the same
                 // un-clearable history every iteration buys nothing.
                 last_clear = Some((est_now * 100 / cfg.context_window, iter));
+                }
             }
         }
 
@@ -608,6 +646,7 @@ where
                     compact::compact_history(messages, summarize, compact::KEEP_TURNS).await
                 {
                     context_warned = false; // history shrank — let the wrap-up nudge re-arm if it refills
+                    budget_band_shown = None; // …and the running budget signal (P-ctx1)
                     real_anchor = None; // spliced history invalidates the anchor
                     seen_results.clear(); // summarized-away results must not mark a re-read as stale
                     est_now = estimate_tokens(messages) + schema_overhead;
@@ -623,25 +662,50 @@ where
             }
         }
 
+        // RUNNING CONTEXT BUDGET (P-ctx1): give the model an explicit token budget it can plan
+        // against — the way context-aware Claude models get a server-side `<budget>` tag plus a
+        // running `<system_warning>` after each tool call. We can't touch the system prompt
+        // server-side, so we inject one collapsible `system` nudge instead — but only when usage
+        // crosses a NEW band (≥50%, per decile). Refreshing every turn would rewrite a mid-history
+        // message each iteration and bust the prompt cache from that byte onward — trading the very
+        // context we're conserving for churn. Band-gated, it stays cache-stable within a band while
+        // still escalating as pressure climbs. Off when `context_window == 0` (sub-agents).
+        if cfg.context_window > 0 {
+            if let Some(band) = budget_band(est_now, cfg.context_window) {
+                if budget_band_shown != Some(band) {
+                    budget_band_shown = Some(band);
+                    push_nudge(messages, NUDGE_BUDGET, &budget_nudge_text(est_now, cfg.context_window));
+                }
+            }
+        }
+
         // MID-LOOP CONTEXT GUARD: a single run-away loop (e.g. reading many large files) can blow
         // past the window BEFORE control returns to the REPL's auto-compact (which only runs
         // between turns). When the running history crosses ~90% of the window, inject a ONE-TIME
         // "wrap up" nudge so the model acts on what it has rather than overflowing. Pure arithmetic
         // (chars/4 + the real-usage anchor) — NOT a mid-loop summarization model call, and no
-        // tokenizer dep. Disabled when `context_window == 0` (sub-agents / unconfigured).
-        let nudge_pushed =
-            if cfg.context_window > 0 && !context_warned && est_now * 100 >= cfg.context_window * 90 {
-                context_warned = true;
-                push_nudge(
-                    messages,
-                    NUDGE_CONTEXT,
-                    "Context is nearly full (~90% of the window). Wrap up now: stop gathering more, act \
+        // tokenizer dep. Disabled when `context_window == 0` (sub-agents / unconfigured). This runs
+        // AFTER the budget nudge so the wrap-up is the tail message — the error-rollback `pop()`
+        // below removes exactly it, leaving the persistent budget signal intact.
+        let nudge_pushed = if cfg.context_window > 0
+            && cfg.context_guard_pct > 0
+            && !context_warned
+            && est_now * 100 >= cfg.context_window * cfg.context_guard_pct as usize
+        {
+            context_warned = true;
+            push_nudge(
+                messages,
+                NUDGE_CONTEXT,
+                &format!(
+                    "Context is nearly full (~{}% of the window). Wrap up now: stop gathering more, act \
                      on what you already have, and give your final answer — or state what is blocking you.",
-                );
-                true
-            } else {
-                false
-            };
+                    cfg.context_guard_pct
+                ),
+            );
+            true
+        } else {
+            false
+        };
 
         // Roll back the just-appended nudge if the model call fails, so a network/gateway error
         // doesn't strand an unanswered system message at the tail of history (the REPL's error path
@@ -1877,6 +1941,49 @@ const NUDGE_DIVERGENCE: &str = "You repeated the same tool call(s)";
 const NUDGE_STEP_LIMIT: &str = "You are nearing the step limit";
 const NUDGE_TODO: &str = "Current task list";
 const NUDGE_STUCK: &str = "Several turns in a row made no progress";
+/// Save-before-clear warning (P-ctx2). Mirrors Claude's server-side "preserve important information"
+/// warning: fired ONCE, the turn BEFORE the first tool-result eviction, so the model can persist
+/// anything durable (memory files, todo_write) while the old results are still in context.
+const NUDGE_SAVE_BEFORE_CLEAR: &str = "Context is filling up";
+/// Running context-budget signal (P-ctx1). Like Claude's server-side `<budget>`/`<system_warning>`
+/// pair, but client-side and CACHE-AWARE: refreshed only when usage crosses a new band (see
+/// `budget_band`), never every turn — every mid-history system-message rewrite busts the provider
+/// prompt cache from that byte onward, so a per-turn refresh would trade the very context it reports
+/// on for churn. One `system` nudge, collapsed in place by `push_nudge`.
+const NUDGE_BUDGET: &str = "Context budget:";
+
+/// The coarse band a usage fraction falls in, for the running budget signal. Returns `None` below
+/// the floor (no point nagging about budget when the window is nearly empty), else a decile
+/// `5..=10` (50%, 60%, …, 100%). Refreshing only on a band CHANGE keeps the injected `system`
+/// message stable across turns within a band, so the prompt cache survives; the model still gets an
+/// escalating signal as pressure climbs. Disabled-window (`window == 0`) is handled by the caller.
+fn budget_band(est: usize, window: usize) -> Option<u8> {
+    if window == 0 {
+        return None;
+    }
+    let pct = (est.saturating_mul(100) / window).min(100);
+    if pct < 50 {
+        None
+    } else {
+        Some((pct / 10) as u8) // 50→5, 63→6, …, 100→10
+    }
+}
+
+/// The running budget nudge text: `Context budget: ~123.4K/200K tokens used (~76.6K remaining, 38%
+/// left). Spend it deliberately — do not re-read files you already have; wrap up before it runs
+/// out.` Kept terse; the leading `NUDGE_BUDGET` prefix lets `push_nudge` collapse the prior one.
+fn budget_nudge_text(est: usize, window: usize) -> String {
+    let remaining = window.saturating_sub(est);
+    let pct_left = if window > 0 { remaining * 100 / window } else { 0 };
+    format!(
+        "{NUDGE_BUDGET} ~{}/{} tokens used (~{} remaining, {}% left). Spend it deliberately — do \
+         not re-read files you already have, and wrap up before it runs out.",
+        fmt_tok(est as u64),
+        fmt_tok(window as u64),
+        fmt_tok(remaining as u64),
+        pct_left,
+    )
+}
 
 /// Consecutive unproductive turns before the thrash guard nudges, then stops (see the loop).
 const STUCK_NUDGE_STREAK: usize = 3;
@@ -2391,6 +2498,7 @@ mod tests {
             clear_cooldown_iters: 6,
             todo_reminder_every: 0, // recitation OFF in unit tests (todo state is process-global)
             compact_at_pct: 80,
+            context_guard_pct: 90,
             max_verify_attempts: 2,
             enable_self_review: false,
             enable_lsp: false,
@@ -3022,6 +3130,30 @@ mod tests {
             !messages.iter().any(|m| m.content.as_deref().is_some_and(|c| c.contains("Context is nearly full"))),
             "guard must stay silent when context_window is 0"
         );
+    }
+
+    #[tokio::test]
+    async fn context_guard_threshold_is_config_driven() {
+        // P-ctx4: the wrap-up guard reads context_guard_pct, not a hardcoded 90. Set it to 50 and a
+        // half-full window must trip it; set it to 0 and even a full window must not.
+        let r = registry();
+        let mk = |pct: u8| AgentConfig {
+            max_iters: 5, auto_extend_to: 5, quiet: true, context_window: 100,
+            context_guard_pct: pct, clear_at_pct: 0, compact_at_pct: 0, ..Default::default()
+        };
+        // ~260 chars ≈ 65 tok → past 50% but under 90% of the 100-tok window.
+        let hist = || vec![Message::system("sys"), Message::user("x".repeat(260))];
+        let fired = |msgs: &[Message]| {
+            msgs.iter().any(|m| m.content.as_deref().is_some_and(|c| c.contains("Context is nearly full")))
+        };
+
+        let mut m50 = hist();
+        run_agent_loop(scripted(vec![tool_turn("echo", r#"{"text":"a"}"#), final_turn("done")]), &mk(50), &r, &mut m50).await.unwrap();
+        assert!(fired(&m50), "guard at 50% must trip on a ~65% window");
+
+        let mut m0 = hist();
+        run_agent_loop(scripted(vec![tool_turn("echo", r#"{"text":"a"}"#), final_turn("done")]), &mk(0), &r, &mut m0).await.unwrap();
+        assert!(!fired(&m0), "context_guard_pct=0 disables the wrap-up guard");
     }
 
     #[test]
@@ -3759,6 +3891,95 @@ mod tests {
         push_nudge(&mut msgs, NUDGE_CONTEXT, "Context is nearly full (~90%) — wrap up");
         assert_eq!(msgs.len(), 2);
         assert!(msgs[0].content.as_deref().unwrap().contains("SYSTEM PROMPT"));
+    }
+
+    #[test]
+    fn budget_band_floors_below_50_and_deciles_above() {
+        // P-ctx1: no band below 50% (don't nag on an empty window), then one band per decile.
+        assert_eq!(budget_band(0, 200_000), None);
+        assert_eq!(budget_band(99_000, 200_000), None); // 49% → still quiet
+        assert_eq!(budget_band(100_000, 200_000), Some(5)); // 50%
+        assert_eq!(budget_band(126_000, 200_000), Some(6)); // 63% → decile 6
+        assert_eq!(budget_band(199_999, 200_000), Some(9)); // 99%
+        assert_eq!(budget_band(200_000, 200_000), Some(10)); // full
+        assert_eq!(budget_band(999_999, 200_000), Some(10)); // clamps at 100%, never overflows
+        assert_eq!(budget_band(500, 0), None); // disabled window is never a band
+    }
+
+    #[test]
+    fn budget_nudge_text_is_prefixed_and_reports_remaining() {
+        // Must start with NUDGE_BUDGET so push_nudge collapses the prior one, and carry the honest
+        // remaining figure the model plans against.
+        let t = budget_nudge_text(150_000, 200_000);
+        assert!(t.starts_with(NUDGE_BUDGET), "prefix drives push_nudge collapse: {t}");
+        assert!(t.contains("50.0K remaining"), "remaining = window - est: {t}");
+        assert!(t.contains("25% left"), "pct left: {t}");
+        // Over-budget never underflows the remaining figure.
+        let over = budget_nudge_text(210_000, 200_000);
+        assert!(over.contains("0 remaining") && over.contains("0% left"), "saturating: {over}");
+    }
+
+    #[tokio::test]
+    async fn running_budget_nudge_appears_once_per_band_and_survives_wrapup() {
+        // With a small window, a few large results push usage across bands; the budget nudge must
+        // appear (collapsed to ONE, newest wins) and NOT be popped when the 90% wrap-up nudge lands
+        // on top of it (the wrap-up is the tail; error-rollback pops only that).
+        let r = registry();
+        let mut c = cfg();
+        c.context_window = 1000; // tiny window so a couple of turns cross 50%/90%
+        c.clear_at_pct = 0; // disable clearing so history only grows (isolate the budget signal)
+        let big = "X".repeat(3000); // ~750 tok result → crosses bands fast
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let chat = scripted(vec![
+            tool_turn("echo", &format!(r#"{{"text":"{big}"}}"#)),
+            tool_turn("echo", &format!(r#"{{"text":"{big}"}}"#)),
+            final_turn("done"),
+        ]);
+        let _ = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        let budget_msgs = messages
+            .iter()
+            .filter(|m| m.role == "system" && m.content.as_deref().is_some_and(|c| c.starts_with(NUDGE_BUDGET)))
+            .count();
+        assert_eq!(budget_msgs, 1, "the running budget nudge collapses to a single message");
+    }
+
+    #[tokio::test]
+    async fn save_before_clear_warns_first_then_evicts_next_turn() {
+        // P-ctx2: the FIRST time clearing is due, the loop must WARN (so the model can persist) and
+        // NOT evict yet — the old result bodies are still in context that turn. The eviction happens
+        // on a LATER turn. Assert both: the warning appears, and at least one bulky result gets
+        // blanked to the placeholder by the end (proving the deferral didn't disable clearing).
+        let r = registry();
+        let mut c = cfg();
+        c.max_iters = 10;
+        c.auto_extend_to = 10;
+        c.context_window = 1200; // tiny window
+        c.clear_at_pct = 40; // arm early
+        c.clear_target_pct = 20;
+        c.clear_step_pct = 1; // cadence trivially satisfied so the deferred pass re-fires next turn
+        c.clear_cooldown_iters = 0;
+        c.keep_recent_tool_results = 1; // keep only the newest → older bulky ones are clearable
+        c.clear_tool_result_min_chars = 100;
+        let big = "Y".repeat(2400); // ~600 tok each → a couple crosses the 40% arm
+        let turns: Vec<ChatTurn> = (0..6)
+            .map(|_| tool_turn("echo", &format!(r#"{{"text":"{big}"}}"#)))
+            .collect();
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let _ = run_agent_loop(scripted(turns), &c, &r, &mut messages).await.unwrap();
+        let warned = messages.iter().any(|m| {
+            m.role == "system" && m.content.as_deref().is_some_and(|c| c.starts_with(NUDGE_SAVE_BEFORE_CLEAR))
+        });
+        assert!(warned, "the save-before-clear warning must be injected before eviction");
+        let evicted = messages
+            .iter()
+            .any(|m| m.role == "tool" && m.content.as_deref() == Some(CLEARED_TOOL_PLACEHOLDER));
+        assert!(evicted, "clearing must still happen (a later turn) — the warning only defers, not disables");
+        // And the warning is one-shot: exactly one such system message.
+        let warn_count = messages
+            .iter()
+            .filter(|m| m.role == "system" && m.content.as_deref().is_some_and(|c| c.starts_with(NUDGE_SAVE_BEFORE_CLEAR)))
+            .count();
+        assert_eq!(warn_count, 1, "the save-before-clear warning fires at most once per run");
     }
 
     #[tokio::test]
