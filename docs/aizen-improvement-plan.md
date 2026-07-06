@@ -518,10 +518,31 @@ dần trái→phải; làm tuần tự, mỗi phase build + test xanh trước k
   trỏ ra ngoài workspace).
 
 ### Search layer (`reach/`, `web_tools.rs`)
-- [ ] **P3** Parse theo container + phân biệt vỡ-parser vs rỗng (W18,W19).
-- [ ] **P3** Fan-out đa truy vấn + dedup theo host + đa dạng domain (W20,W21).
-- [ ] **P3** Backend keyless thứ 2 để cross-check (W19,W21).
-- [ ] **P3** Tách `FETCH_CAP` khỏi `max_tool_result_chars`; cache TTL trong tiến trình (W22,W23).
+- [x] **P3** Parse theo container + phân biệt vỡ-parser vs rỗng (W18,W19). `bind_titles_to_snippets`
+  (`search.rs`) ghép title↔snippet theo BYTE OFFSET (title[i]'s window = `[t_off, next_title_off)`)
+  thay vì index-zip — 1 kết quả thiếu snippet không còn làm lệch mọi dòng sau. `looks_like_broken_parse`
+  (đếm token class thô ≥2 khi parse ra 0) phân biệt "markup vỡ → bail, rơi sang backend kế" với
+  "trang thật sự rỗng → trả '(no results)'".
+- [x] **P3** Fan-out đa truy vấn + dedup theo host + đa dạng domain (W20,W21). `web_search` nhận
+  `queries: []` (2–3 góc khác nhau) → `route::search_multi` → `search::web_multi` chạy CONCURRENT qua
+  `web_results`, `interleave` round-robin theo rank, `dedup_and_diversify` khử trùng theo
+  `canonical_url` (bỏ www/trailing-slash/query) + cap per-host `(limit/2).max(1)` với pass nới cap
+  nếu thiếu kết quả. Schema `queries` không ép `query` phải có (tránh kẹt ở provider strict-schema).
+- [x] **P3** Backend keyless thứ 2 để cross-check (W19,W21). `marginalia` (api.marginalia.nu/public/search,
+  JSON keyless, index ĐỘC LẬP — không xào Bing/Google) chèn SAU ddg-html/ddg-lite trong chain (nó là
+  dịch vụ nhỏ, đo được lúc <1s lúc timeout 60s/504 — hợp làm fallback thứ 3, không hợp làm primary).
+  Mojeek bị loại (captcha-walled, đã live-test). Doctor probe `probe_marginalia` + đăng ký channel.
+- [x] **P3** Tách `FETCH_CAP` khỏi `max_tool_result_chars`; cache TTL trong tiến trình (W22,W23).
+  `AgentConfig.max_fetch_result_chars` (default 12_000) riêng cho tool relevance-truncatable
+  (file_read/web_fetch/web_crawl/search_files), dùng làm FLOOR (`max_fetch_chars.max(max_chars)`) nên
+  không bao giờ bị cắt sát hơn tool thường — hết cắt-2-lần 20k→4k trước khi trích liên quan. Cache
+  TTL 600s/128 entry (`reach/mod.rs`, giống mẫu `PACE`/`OUTCOMES`) khoá theo `site|limit|query`
+  (site alias gộp qua `canonical_site` để `gh`≡`github` share 1 entry); chỉ cache câu trả lời thật,
+  không cache "(no results…)". 17 test mới (689 tổng, +17), clippy sạch trên mọi file đụng.
+  **Adversarial review** (2 reviewer độc lập, xhigh): 0 bug correctness ở parsing/fan-out/dedup;
+  1 medium fixed (schema `required:["query"]` mâu thuẫn với description khuyên dùng `queries` — đã
+  bỏ `required`, `execute()` tự validate "có ít nhất 1 trong 2") + 2 low fixed (site alias + query-list
+  dedup trước khi build cache key, để giảm cache-miss dư thừa cho request tương đương).
 
 ### Memory layer (`memory/`, `config.rs`)
 - [ ] **P4** Cân nhắc bật fuzzy recall mặc định (rẻ, pure-Rust) (W24).

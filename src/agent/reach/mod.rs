@@ -50,7 +50,7 @@ pub struct ChannelSpec {
 
 pub const CHANNELS: &[ChannelSpec] = &[
     ChannelSpec { name: "web", label: "any web page", tier: 0, backends: &["direct", "jina"] },
-    ChannelSpec { name: "search", label: "web search", tier: 0, backends: &["ddg-html", "ddg-lite", "jina-search"] },
+    ChannelSpec { name: "search", label: "web search", tier: 0, backends: &["ddg-html", "ddg-lite", "marginalia", "jina-search"] },
     ChannelSpec { name: "github", label: "GitHub repos, files, issues/PRs", tier: 0, backends: &["api", "raw", "html"] },
     ChannelSpec { name: "youtube", label: "YouTube metadata + transcripts", tier: 0, backends: &["innertube", "oembed"] },
     ChannelSpec { name: "twitter", label: "Twitter/X single tweets", tier: 0, backends: &["fxtwitter", "syndication"] },
@@ -139,6 +139,50 @@ pub(crate) async fn pace(key: &'static str, min: Duration) {
         };
         tokio::time::sleep(wait).await;
     }
+}
+
+// ── in-process TTL cache (search results) ────────────────────────────────────
+//
+// A session that searches the same thing twice — a retry, a fan-out angle that overlaps a prior
+// call, a sub-agent repeating the parent's query — should not re-hit the network or pay the `pace`
+// politeness floor again (W23). Keyed by an opaque caller-built string; values expire after `TTL`.
+// Bounded (LRU-ish by insertion time) so a long session can't grow it without limit.
+
+struct Cached {
+    value: String,
+    at: Instant,
+}
+
+static SEARCH_CACHE: Lazy<Mutex<HashMap<String, Cached>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+const CACHE_TTL: Duration = Duration::from_secs(600); // 10 min — fresh enough for a work session
+const CACHE_MAX: usize = 128;
+
+/// Return a cached value for `key` if present and younger than [`CACHE_TTL`]; expired entries are
+/// treated as absent (and dropped opportunistically on the next insert).
+pub(crate) fn cache_get(key: &str) -> Option<String> {
+    let c = SEARCH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    match c.get(key) {
+        Some(e) if e.at.elapsed() < CACHE_TTL => Some(e.value.clone()),
+        _ => None,
+    }
+}
+
+/// Store `value` under `key`. Evicts expired entries first, then — if still at the cap — the single
+/// oldest entry, so the map stays bounded without a full LRU structure.
+pub(crate) fn cache_put(key: String, value: String) {
+    let mut c = SEARCH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    c.retain(|_, e| e.at.elapsed() < CACHE_TTL);
+    if c.len() >= CACHE_MAX {
+        if let Some(oldest) = c.iter().min_by_key(|(_, e)| e.at).map(|(k, _)| k.clone()) {
+            c.remove(&oldest);
+        }
+    }
+    c.insert(key, Cached { value, at: Instant::now() });
+}
+
+#[cfg(test)]
+pub(crate) fn cache_clear() {
+    SEARCH_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 // ── optional keys (everything works without them) ────────────────────────────
@@ -245,6 +289,7 @@ pub async fn doctor() -> Vec<ChannelReport> {
                     ("web", "jina") => run(web::probe_jina()).await,
                     ("search", "ddg-html") => run(search::probe_ddg_html()).await,
                     ("search", "ddg-lite") => run(search::probe_ddg_lite()).await,
+                    ("search", "marginalia") => run(search::probe_marginalia()).await,
                     ("search", "jina-search") => run(search::probe_jina_search()).await,
                     ("github", "api") => run(github::probe_api()).await,
                     ("github", "raw") => run(github::probe_raw()).await,
@@ -430,5 +475,31 @@ mod tests {
         note_err("twitter", "fxtwitter", "HTTP 500");
         note_ok("twitter", "syndication");
         assert_eq!(last_active("twitter"), Some("syndication"));
+    }
+
+    #[test]
+    fn search_channel_chain_includes_marginalia() {
+        // Marginalia sits between the DDG endpoints and the keyed jina backend (independent index →
+        // survives a DDG outage AND gives a second-source cross-check).
+        let order = ordered_backends("search");
+        assert!(order.contains(&"marginalia"), "chain: {order:?}");
+        let ddg = order.iter().position(|b| *b == "ddg-html").unwrap();
+        let marg = order.iter().position(|b| *b == "marginalia").unwrap();
+        assert!(marg > ddg, "marginalia should follow the DDG primaries");
+    }
+
+    #[test]
+    fn ttl_cache_stores_and_evicts() {
+        cache_clear();
+        assert_eq!(cache_get("k1"), None, "empty on miss");
+        cache_put("k1".into(), "v1".into());
+        assert_eq!(cache_get("k1"), Some("v1".into()), "hit within TTL");
+        // Bound enforcement: fill past CACHE_MAX and confirm the map never exceeds the cap.
+        for i in 0..(CACHE_MAX + 20) {
+            cache_put(format!("bulk-{i}"), "x".into());
+        }
+        let len = SEARCH_CACHE.lock().unwrap().len();
+        assert!(len <= CACHE_MAX, "cache must stay bounded, got {len}");
+        cache_clear();
     }
 }

@@ -85,23 +85,39 @@ impl Tool for WebFetch {
 
 // ── web_search ─────────────────────────────────────────────────────────────────
 
-/// Pull the search text out of a `web_search` call, tolerating the aliases models commonly emit
-/// instead of `query` (`q`, `question`, `text`, `search`, or a `queries` list). This turns a
-/// slightly-malformed call into a working search rather than a hard "missing required string arg".
-fn extract_query(args: &Value) -> Option<String> {
-    for k in ["query", "q", "question", "text", "search", "queries"] {
+/// Pull the search queries out of a `web_search` call as a LIST (fan-out, W20), tolerating the
+/// aliases models commonly emit instead of `query` (`q`, `question`, `text`, `search`, or a
+/// `queries` array). A `queries` array becomes 2–3 distinct fan-out angles; a bare string is a
+/// single-element list. This turns a slightly-malformed call into a working search rather than a
+/// hard "missing required string arg". Empty when nothing usable was supplied.
+fn extract_queries(args: &Value) -> Vec<String> {
+    // Prefer an explicit list (`queries`) — that's the fan-out signal.
+    if let Some(Value::Array(a)) = args.get("queries") {
+        let list: Vec<String> = a
+            .iter()
+            .filter_map(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !list.is_empty() {
+            return list;
+        }
+    }
+    for k in ["query", "q", "question", "text", "search"] {
         match args.get(k) {
-            Some(Value::String(s)) if !s.trim().is_empty() => return Some(s.clone()),
+            Some(Value::String(s)) if !s.trim().is_empty() => return vec![s.trim().to_string()],
             Some(Value::Array(a)) => {
-                let joined = a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ");
-                if !joined.trim().is_empty() {
-                    return Some(joined);
+                let list: Vec<String> =
+                    a.iter().filter_map(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
+                if !list.is_empty() {
+                    return list;
                 }
             }
             _ => {}
         }
     }
-    None
+    Vec::new()
 }
 
 pub struct WebSearch;
@@ -110,24 +126,34 @@ impl Tool for WebSearch {
         "web_search"
     }
     fn description(&self) -> &str {
-        "Search the web (DuckDuckGo chain, keyless) and return the top results as title + URL + \
-         snippet. Use to FIND pages relevant to a query, then web_fetch a result URL to read it. \
-         Optional 'site' searches one platform's own index instead: github (repositories), \
-         hackernews, stackoverflow, wikipedia. Read-only."
+        "Search the web (keyless: DuckDuckGo → Marginalia independent index) and return the top \
+         results as title + URL + snippet, deduped and spread across domains. Use to FIND pages \
+         relevant to a query, then web_fetch a result URL to read it. Pass 'queries' (a list of \
+         2–3 DIFFERENT-angle phrasings) to fan out in one call — the union is merged and deduped, \
+         giving broader coverage than a single query. Optional 'site' searches one platform's own \
+         index instead: github (repositories), hackernews, stackoverflow, wikipedia. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "query": {"type": "string"},
+                "query": {"type": "string", "description": "a single search query"},
+                "queries": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "2–3 different-angle queries to fan out and merge (use instead of 'query' for research breadth)"
+                },
                 "limit": {"type": "integer", "description": "max results (default 5, max 10)"},
                 "site": {
                     "type": "string",
                     "enum": ["web", "github", "hackernews", "stackoverflow", "wikipedia"],
-                    "description": "where to search (default web)"
+                    "description": "where to search (default web); fan-out applies to web only"
                 }
             },
-            "required": ["query"],
+            // Neither `query` nor `queries` is individually required — a fan-out-only call
+            // (`{"queries": [...]}`, the description's PREFERRED shape for research) must stay
+            // schema-valid under a strict-mode tool-calling provider. `execute()` enforces "at
+            // least one of them, non-empty" at runtime via `extract_queries`.
             "additionalProperties": false
         })
     }
@@ -135,11 +161,17 @@ impl Tool for WebSearch {
         true // read-only network fetch — the concurrent batch is the whole point (see module note)
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let query = extract_query(args)
-            .context("missing required string arg 'query' (the text to search for)")?;
+        let queries = extract_queries(args);
+        if queries.is_empty() {
+            anyhow::bail!("missing required string arg 'query' (the text to search for)");
+        }
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5).clamp(1, 10) as usize;
         let site = args.get("site").and_then(|v| v.as_str()).map(str::to_string);
-        block(crate::agent::reach::route::search(&query, limit, site.as_deref()))
+        if queries.len() == 1 {
+            block(crate::agent::reach::route::search(&queries[0], limit, site.as_deref()))
+        } else {
+            block(crate::agent::reach::route::search_multi(&queries, limit, site.as_deref()))
+        }
     }
 }
 
@@ -338,5 +370,48 @@ mod tests {
         for want in ["web", "github", "hackernews", "stackoverflow", "wikipedia"] {
             assert!(sites.iter().any(|s| s == want), "missing site {want}");
         }
+    }
+
+    #[test]
+    fn web_search_schema_offers_fan_out_queries() {
+        let p = WebSearch.parameters();
+        assert_eq!(p["properties"]["queries"]["type"], "array", "fan-out param present");
+    }
+
+    #[test]
+    fn web_search_schema_does_not_hard_require_query() {
+        // A fan-out-only call (`{"queries": [...]}`, no `query` key) is the description's PREFERRED
+        // shape — the schema must not mark `query` as required, or a strict-mode tool-calling
+        // provider would reject exactly the documented call shape before execute() ever runs.
+        let p = WebSearch.parameters();
+        let required = p.get("required").and_then(|r| r.as_array());
+        match required {
+            None => {} // no required list at all — fine
+            Some(list) => assert!(!list.iter().any(|v| v == "query"), "'query' must not be schema-required: {list:?}"),
+        }
+        // execute() must still reject a call with neither field.
+        assert!(WebSearch.execute(&serde_json::json!({"limit": 3})).is_err());
+    }
+
+    #[test]
+    fn extract_queries_handles_single_list_and_aliases() {
+        // Single string.
+        assert_eq!(extract_queries(&serde_json::json!({"query": "rust async"})), vec!["rust async"]);
+        // Fan-out list (the W20 path).
+        assert_eq!(
+            extract_queries(&serde_json::json!({"queries": ["tokio runtime", "async-std", "  "]})),
+            vec!["tokio runtime", "async-std"],
+            "blank entries dropped, order preserved"
+        );
+        // `queries` takes precedence over a lone `query` when both appear.
+        assert_eq!(
+            extract_queries(&serde_json::json!({"query": "ignored", "queries": ["a", "b"]})),
+            vec!["a", "b"]
+        );
+        // Aliases still work.
+        assert_eq!(extract_queries(&serde_json::json!({"q": "x"})), vec!["x"]);
+        // Nothing usable.
+        assert!(extract_queries(&serde_json::json!({"limit": 5})).is_empty());
+        assert!(extract_queries(&serde_json::json!({"queries": ["   ", ""]})).is_empty());
     }
 }

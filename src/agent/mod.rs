@@ -240,6 +240,13 @@ pub struct AgentConfig {
     pub auto_extend_to: usize,
     /// Per-tool result truncation (chars). Bounds history growth cheaply.
     pub max_tool_result_chars: usize,
+    /// Larger budget for the READ/FETCH tools whose output is a document scanned for specifics
+    /// (`file_read`/`web_fetch`/`web_crawl`/`search_files`). The reach layer already caps a fetched
+    /// page at `FETCH_CAP` (20k); cutting that again to `max_tool_result_chars` (4k) here would drop
+    /// the very region relevance-truncation is meant to keep (W22). Used as a FLOOR
+    /// (`max_fetch_chars.max(max_tool_result_chars)`) so these tools are never trimmed *tighter* than
+    /// a plain tool — the kept window stays meaningful. Other tools stay at `max_tool_result_chars`.
+    pub max_fetch_result_chars: usize,
     /// Pre-authorize destructive ops (the `--yes` escape hatch / `/yolo`). The hard blocklist in
     /// `cmd_guard` still applies underneath — `auto_approve` skips the *prompt*, never the floor.
     pub auto_approve: bool,
@@ -314,6 +321,7 @@ impl Default for AgentConfig {
             max_iters: 25,
             auto_extend_to: 50,
             max_tool_result_chars: 4096,
+            max_fetch_result_chars: 12_000,
             auto_approve: false,
             smart_approve: false,
             quiet: false,
@@ -1114,7 +1122,8 @@ async fn execute_calls(
                         let args = parsed[k].clone().expect("safe ⇒ parsed");
                         let quiet = cfg.quiet;
                         let max = cfg.max_tool_result_chars;
-                        (k, tokio::task::spawn_blocking(move || run_tool_body(tool, &args, quiet, max)))
+                        let max_fetch = cfg.max_fetch_result_chars;
+                        (k, tokio::task::spawn_blocking(move || run_tool_body(tool, &args, quiet, max, max_fetch)))
                     })
                     .collect();
                 for (k, h) in handles {
@@ -1155,7 +1164,8 @@ async fn execute_calls(
                             let args = args.clone();
                             let quiet = cfg.quiet;
                             let max = cfg.max_tool_result_chars;
-                            tokio::task::spawn_blocking(move || run_tool_body(tool, &args, quiet, max))
+                            let max_fetch = cfg.max_fetch_result_chars;
+                            tokio::task::spawn_blocking(move || run_tool_body(tool, &args, quiet, max, max_fetch))
                                 .await
                                 .unwrap_or_else(|_| "error: tool thread panicked".to_string())
                         }
@@ -1217,6 +1227,7 @@ pub fn eager_starter<'a>(
     let barrier_hit = std::sync::atomic::AtomicBool::new(false);
     let started = std::sync::atomic::AtomicUsize::new(0);
     let max_chars = cfg.max_tool_result_chars;
+    let max_fetch_chars = cfg.max_fetch_result_chars;
     move |_slot, tc| {
         use std::sync::atomic::Ordering::Relaxed;
         if barrier_hit.load(Relaxed) {
@@ -1234,7 +1245,7 @@ pub fn eager_starter<'a>(
         if started.fetch_add(1, Relaxed) >= MAX_PARALLEL {
             return None; // over the cap: run normally at execution time
         }
-        Some(tokio::task::spawn_blocking(move || run_tool_body(tool, &args, true, max_chars)))
+        Some(tokio::task::spawn_blocking(move || run_tool_body(tool, &args, true, max_chars, max_fetch_chars)))
     }
 }
 
@@ -1299,7 +1310,13 @@ fn gate_and_approve(tool: &dyn tools::Tool, args: &serde_json::Value, cfg: &Agen
 /// (failures become feedback strings). This is the `spawn_blocking` payload — the existing tool
 /// bridges (`block_in_place` + `Handle::block_on`) work unchanged on blocking threads (pinned by
 /// `tools::tests::bridge_works_inside_spawn_blocking`).
-fn run_tool_body(tool: std::sync::Arc<dyn tools::Tool>, args: &serde_json::Value, quiet: bool, max_chars: usize) -> String {
+fn run_tool_body(
+    tool: std::sync::Arc<dyn tools::Tool>,
+    args: &serde_json::Value,
+    quiet: bool,
+    max_chars: usize,
+    max_fetch_chars: usize,
+) -> String {
     if !quiet {
         // The Claude-Code-style event anchor: a moonlight dot `⏺`, the tool name, then the salient
         // argument parenthesised (unescaped, 1st line, clipped) — `⏺ file_edit(src/foo.rs)`.
@@ -1314,12 +1331,14 @@ fn run_tool_body(tool: std::sync::Arc<dyn tools::Tool>, args: &serde_json::Value
     }
     // Relevance-aware truncation for the READ/FETCH tools whose output is a large document the model
     // is scanning for specifics (W11/W22): keep the region matching the call's query keywords rather
-    // than a blind head+tail. Non-failure only (an error string must survive verbatim — the model's
-    // error trail is how it recovers) and only for these tools (an edit diff / shell log is
-    // positional, not keyword-scored). Everything else keeps the exact old head+tail behavior.
+    // than a blind head+tail, and give it the LARGER `max_fetch_chars` budget so the reach layer's
+    // 20k fetch isn't halved to 4k before the relevant window is even chosen (the W22 double-cut).
+    // Non-failure only (an error string must survive verbatim — the model's error trail is how it
+    // recovers) and only for these tools (an edit diff / shell log is positional, not keyword-scored).
+    // Everything else keeps the exact old head+tail behavior at the standard budget.
     if !is_failure_result(&out) && is_relevance_truncatable(tool.name()) {
         let keywords = relevance_keywords(&relevance_query_from_args(args));
-        return truncate_relevant(&out, max_chars, &keywords);
+        return truncate_relevant(&out, max_fetch_chars.max(max_chars), &keywords);
     }
     truncate_result(&out, max_chars)
 }
@@ -2256,6 +2275,24 @@ mod tests {
         }
     }
 
+    /// Named "file_read" (a relevance-truncatable tool per `is_relevance_truncatable`) so tests can
+    /// exercise the W22 fetch-budget split without a real file. Returns a long fixed document.
+    struct LongReadTool;
+    impl Tool for LongReadTool {
+        fn name(&self) -> &str {
+            "file_read"
+        }
+        fn description(&self) -> &str {
+            "test stand-in for file_read"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{}})
+        }
+        fn execute(&self, _args: &serde_json::Value) -> Result<String> {
+            Ok((0..500).map(|i| format!("line {i} of filler text")).collect::<Vec<_>>().join("\n"))
+        }
+    }
+
     /// Stateful: returns an INCREMENTING value each call, so every invocation surfaces NEW content
     /// regardless of args — models a legitimate poll/consume loop, used to prove a productive
     /// repeated-signature loop is NOT hard-stopped as divergence.
@@ -2338,6 +2375,7 @@ mod tests {
             max_iters: 5,
             auto_extend_to: 5,
             max_tool_result_chars: 4096,
+            max_fetch_result_chars: 12_000,
             auto_approve: false,
             smart_approve: false,
             quiet: true,
@@ -2382,7 +2420,7 @@ mod tests {
         if let Some(denied) = gate_and_approve(tool.as_ref(), &args, cfg) {
             return denied;
         }
-        run_tool_body(tool, &args, cfg.quiet, cfg.max_tool_result_chars)
+        run_tool_body(tool, &args, cfg.quiet, cfg.max_tool_result_chars, cfg.max_fetch_result_chars)
     }
 
     /// Drive the async executor the way the loop does: pre-filled placeholder sink, results out.
@@ -3496,6 +3534,28 @@ mod tests {
     fn truncate_relevant_passthrough_when_within_budget() {
         let s = "short enough";
         assert_eq!(truncate_relevant(s, 4096, &["short".to_string()]), s);
+    }
+
+    #[test]
+    fn run_tool_body_gives_relevance_truncatable_tools_the_larger_fetch_budget() {
+        // W22: a read/fetch tool's output must be measured against `max_fetch_chars`, NOT the
+        // smaller `max_chars` — otherwise the reach layer's 20k fetch gets halved to 4k before
+        // relevance-truncation ever sees the full document (the double-cut the plan calls out).
+        let long_tool = std::sync::Arc::new(LongReadTool) as std::sync::Arc<dyn Tool>;
+        let small_budget = 200usize;
+        let large_budget = 6000usize;
+        let out = run_tool_body(long_tool, &serde_json::json!({}), true, small_budget, large_budget);
+        assert!(
+            out.chars().count() > small_budget,
+            "file_read output should use the larger fetch budget, not the small default: got {} chars",
+            out.chars().count()
+        );
+        assert!(out.chars().count() <= large_budget + 200, "still bounded by the larger budget");
+
+        // A non-truncatable tool (positional output) stays at the SMALL budget regardless.
+        let konst_out = "x".repeat(1000);
+        let plain = truncate_result(&konst_out, small_budget);
+        assert!(plain.chars().count() <= small_budget + 40, "non-fetch tools keep the small budget");
     }
 
     #[test]

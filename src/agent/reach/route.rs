@@ -89,15 +89,79 @@ pub async fn read_url(raw: &str) -> Result<String> {
     }
 }
 
-/// Search the web or a specific platform. This is `web_search`'s engine.
+/// Fold a `site` alias to its canonical form (`gh`→`github`, `hn`→`hackernews`, …), so two calls
+/// that hit the SAME handler share one cache entry instead of caching separately per spelling.
+/// Unknown/empty stays as-is (the caller's match falls through to its error/default arm).
+fn canonical_site(site_key: &str) -> &'static str {
+    match site_key {
+        "" | "web" => "web",
+        "github" | "gh" => "github",
+        "hackernews" | "hn" => "hackernews",
+        "stackoverflow" | "so" => "stackoverflow",
+        "wikipedia" | "wiki" => "wikipedia",
+        _ => "unknown",
+    }
+}
+
+/// Search the web or a specific platform. This is `web_search`'s engine. Successful results are
+/// cached in-process for a short TTL (W23) so a repeated query — a retry, a sub-agent re-asking —
+/// skips both the network and the `pace` politeness floor.
 pub async fn search(query: &str, limit: usize, site: Option<&str>) -> Result<String> {
+    let site_key = site.map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    // Canonicalize aliases (`gh`→`github`, …) BEFORE the cache key so `site="github"` and
+    // `site="gh"` — which hit the exact same handler — share one cache entry instead of two.
+    let canon_site = canonical_site(&site_key);
+    let cache_key = format!("s|{canon_site}|{limit}|{}", query.trim().to_ascii_lowercase());
+    if let Some(hit) = super::cache_get(&cache_key) {
+        return Ok(hit);
+    }
+    let out = match canon_site {
+        "web" => super::search::web(query, limit).await,
+        "github" => super::search::github(query, limit).await,
+        "hackernews" => super::search::hackernews(query, limit).await,
+        "stackoverflow" => super::search::stackoverflow(query, limit).await,
+        "wikipedia" => super::search::wikipedia(query, limit).await,
+        _ => bail!("unknown search site '{site_key}' (use web, github, hackernews, stackoverflow, or wikipedia)"),
+    }?;
+    // Cache real answers only — never a "(no results)" placeholder (it might be a transient block
+    // that a later retry should get a fresh shot at).
+    if !out.starts_with("(no results") && !out.starts_with("(no ") {
+        super::cache_put(cache_key, out.clone());
+    }
+    Ok(out)
+}
+
+/// Fan-out search over 2–3 different-angle queries (W20). Only the generic web channel fans out —
+/// the per-platform indexes (github/hn/…) are single-index and cheap to call directly, so a
+/// multi-query against them degrades to the first query. Merges + dedups + diversifies the union.
+pub async fn search_multi(queries: &[String], limit: usize, site: Option<&str>) -> Result<String> {
     match site.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-        None | Some("") | Some("web") => super::search::web(query, limit).await,
-        Some("github") | Some("gh") => super::search::github(query, limit).await,
-        Some("hackernews") | Some("hn") => super::search::hackernews(query, limit).await,
-        Some("stackoverflow") | Some("so") => super::search::stackoverflow(query, limit).await,
-        Some("wikipedia") | Some("wiki") => super::search::wikipedia(query, limit).await,
-        Some(other) => bail!("unknown search site '{other}' (use web, github, hackernews, stackoverflow, or wikipedia)"),
+        None | Some("") | Some("web") => {
+            // Cache the whole fan-out under the ordered, normalized query set (its own dedup happens
+            // inside web_multi; the key just needs to be stable for identical fan-out calls).
+            let mut norm: Vec<String> = queries.iter().map(|q| q.trim().to_ascii_lowercase()).filter(|q| !q.is_empty()).collect();
+            norm.sort();
+            norm.dedup(); // identical queries collapse — web_multi dedups them anyway, so the
+                          // cache key should too (["rust","rust"] and ["rust"] → one entry).
+            let cache_key = format!("m||{limit}|{}", norm.join("\u{1f}"));
+            if let Some(hit) = super::cache_get(&cache_key) {
+                return Ok(hit);
+            }
+            let out = super::search::web_multi(queries, limit).await?;
+            if !out.starts_with("(no results") {
+                super::cache_put(cache_key, out.clone());
+            }
+            Ok(out)
+        }
+        // A platform index has one query surface; fan-out there is just the first query (which
+        // `search` caches on its own).
+        _ => {
+            let first = queries.iter().find(|q| !q.trim().is_empty());
+            match first {
+                Some(q) => search(q, limit, site).await,
+                None => bail!("no non-empty query provided"),
+            }
+        }
     }
 }
 
@@ -169,6 +233,16 @@ mod tests {
 
     fn t(s: &str) -> Target {
         classify(&reqwest::Url::parse(s).unwrap())
+    }
+
+    #[test]
+    fn canonical_site_folds_aliases() {
+        assert_eq!(canonical_site("gh"), canonical_site("github"));
+        assert_eq!(canonical_site("hn"), canonical_site("hackernews"));
+        assert_eq!(canonical_site("so"), canonical_site("stackoverflow"));
+        assert_eq!(canonical_site("wiki"), canonical_site("wikipedia"));
+        assert_eq!(canonical_site(""), "web");
+        assert_eq!(canonical_site("bogus"), "unknown");
     }
 
     #[test]
