@@ -5073,6 +5073,16 @@ fn print_config(cfg: &cli_config::CliConfig) {
         },
     );
 
+    // ── Web search ──
+    section("Web search");
+    row(
+        "tavily key",
+        match cfg.reach.as_ref().and_then(|r| r.resolved_tavily_key()) {
+            Some(k) => format!("{}  {}", cli_config::mask(&k), theme::ok("✓")),
+            None => format!("{}  {}", unset(), theme::warn("web_search needs a key · run config")),
+        },
+    );
+
     // ── Cost ──
     section("Cost");
     row(
@@ -5218,6 +5228,26 @@ async fn config_wizard() -> Result<()> {
         Ok(n) if n >= 1000 => Some(n),
         _ => None, // "auto"/blank/garbage → detect-or-heuristic
     };
+
+    // Web search key (Tavily) — web_search is KEYED-ONLY now, so without a key it can't search.
+    // Hidden as you type; blank keeps the current one; a lone `-` clears it back to unset.
+    step("Web search");
+    let cur_tavily = cfg.reach.as_ref().and_then(|r| r.tavily_api_key.clone());
+    let tavily_prompt = match cur_tavily.as_deref() {
+        Some(k) => format!("Tavily key (current {} — Enter keeps, `-` clears)", cli_config::mask(k)),
+        None => "Tavily API key for web_search (free at tavily.com; Enter to skip)".to_string(),
+    };
+    println!("{}", style("web_search needs a Tavily key — env AIZEN_TAVILY_API_KEY overrides this.").dim());
+    let tavily_in = Password::with_theme(&theme)
+        .with_prompt(tavily_prompt)
+        .allow_empty_password(true)
+        .interact()
+        .context("reading Tavily key")?;
+    let tavily_in = tavily_in.trim();
+    if !tavily_in.is_empty() {
+        let reach = cfg.reach.get_or_insert_with(Default::default);
+        reach.tavily_api_key = if tavily_in == "-" { None } else { Some(tavily_in.to_string()) };
+    }
 
     step("Behavior");
     // 5) auto-compact threshold — % of the window at which older turns get summarized (`off` = 0).

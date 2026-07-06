@@ -396,10 +396,12 @@ fn glob_to_regex(glob: &str) -> String {
     re
 }
 
-/// Recursively collect files under `dir` whose path RELATIVE to `anchor` (forward-slashed) matches
-/// `re`. Hidden files/dirs and heavy build dirs (`target`, `node_modules`, `.git`) are NO LONGER
-/// skipped — the user asked file_glob to see EVERYTHING (a `**/*` in a built repo will therefore
-/// walk `target/`; narrow the pattern to avoid the result cap filling with build output).
+/// Recursively collect paths under `dir` whose path RELATIVE to `anchor` (forward-slashed) matches
+/// `re`. Matches BOTH files AND directories — a coding agent asked to "find the X folder" must be
+/// able to return the directory itself, not just files under it. Hidden files/dirs and heavy build
+/// dirs (`target`, `node_modules`, `.git`) are NO LONGER skipped — the user asked file_glob to see
+/// EVERYTHING (a `**/*` in a built repo will therefore walk `target/`; narrow the pattern to avoid
+/// the result cap filling with build output).
 fn walk(dir: &Path, anchor: &Path, re: &regex::Regex, out: &mut Vec<PathBuf>, cap: usize) {
     if out.len() >= cap {
         return;
@@ -415,20 +417,22 @@ fn walk(dir: &Path, anchor: &Path, re: &regex::Regex, out: &mut Vec<PathBuf>, ca
             return;
         }
         let p = e.path();
-        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // Test the entry itself (file OR directory) against the pattern, then still recurse into
+        // directories so nested matches are found too.
+        let rel = p.strip_prefix(anchor).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+        if re.is_match(&rel) {
+            out.push(p.clone());
+        }
+        if is_dir {
             walk(&p, anchor, re, out, cap);
-        } else {
-            let rel = p.strip_prefix(anchor).unwrap_or(&p).to_string_lossy().replace('\\', "/");
-            if re.is_match(&rel) {
-                out.push(p);
-            }
         }
     }
 }
 
-/// Recursively gather every file path under `dir` (bounded by `cap`) — the candidate pool for the
-/// fuzzy name fallback. Same "skip nothing" policy as [`walk`].
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>, cap: usize) {
+/// Recursively gather every path (files AND directories) under `dir` (bounded by `cap`) — the
+/// candidate pool for the fuzzy name fallback. Same "skip nothing" policy as [`walk`].
+fn collect_paths(dir: &Path, out: &mut Vec<PathBuf>, cap: usize) {
     if out.len() >= cap {
         return;
     }
@@ -443,10 +447,10 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>, cap: usize) {
             return;
         }
         let p = e.path();
-        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            collect_files(&p, out, cap);
-        } else {
-            out.push(p);
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        out.push(p.clone());
+        if is_dir {
+            collect_paths(&p, out, cap);
         }
     }
 }
@@ -795,11 +799,14 @@ impl Tool for FileGlob {
         "file_glob"
     }
     fn description(&self) -> &str {
-        "List files matching a glob (*, **, ?). Anchors under the working directory by default, but \
-         a leading `../` or an absolute path reaches OTHER directories too (e.g. \
-         `../snakegame/**/*.js`). Hidden files and build dirs (target, node_modules, .git) ARE \
-         included. If nothing matches the glob, falls back to a fuzzy match on the file NAME and \
-         suggests the closest paths. Not for searching file CONTENT → use search_files. Read-only."
+        "List files AND directories matching a glob (*, **, ?) — use it to locate a folder (e.g. \
+         `**/mini_project`) as well as files. Anchors under the working directory by default, but a \
+         leading `../` or an absolute path reaches OTHER directories too (e.g. `../snakegame/**/*.js`). \
+         Hidden files and build dirs (target, node_modules, .git) ARE included. If nothing matches \
+         the glob, falls back to a fuzzy match on the NAME (tolerates typos and `_`/`-`/space \
+         differences, and looks at parent + sibling folders too, so `miniproject` finds a \
+         `mini_project` folder one level up) and suggests the closest paths, tagging folders. Not \
+         for searching file CONTENT → use search_files. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -824,32 +831,74 @@ impl Tool for FileGlob {
             return Ok(lines.join("\n"));
         }
         // No glob match → fuzzy fallback on the final path segment (typo/near-name tolerance, #68).
-        // The needle is the last segment of the pattern (the intended file name).
+        // The needle is the last segment of the pattern (the intended file OR directory name).
         let needle = pattern.replace('\\', "/");
         let needle = needle.rsplit('/').next().unwrap_or(&needle).to_ascii_lowercase();
         let needle = needle.trim_start_matches('*').trim_end_matches('*');
         if needle.is_empty() {
-            return Ok(format!("(no files match '{pattern}')"));
+            return Ok(format!("(no match for '{pattern}')"));
         }
+        // Candidate pool: everything under the anchor, PLUS everything under a couple of ancestor
+        // directories. The workspace is often a subdir (e.g. .../mini_project/aizen), so the folder
+        // the user means ("mini_project") can be a PARENT or a SIBLING — a downward-only walk never
+        // reaches it. Climb up to 2 levels and scan each, so sibling/parent names are matchable.
         let mut pool: Vec<PathBuf> = Vec::new();
-        collect_files(&anchor, &mut pool, 5000);
+        collect_paths(&anchor, &mut pool, 5000);
+        let mut climb = anchor.clone();
+        for _ in 0..2 {
+            match climb.parent() {
+                Some(parent) => {
+                    let parent = parent.to_path_buf();
+                    // The ancestor itself is a candidate (matching a parent folder by name).
+                    pool.push(parent.clone());
+                    // …and its immediate children (siblings of what we came from), shallowly.
+                    if let Ok(rd) = std::fs::read_dir(&parent) {
+                        for e in rd.flatten() {
+                            pool.push(e.path());
+                        }
+                    }
+                    climb = parent;
+                }
+                None => break,
+            }
+        }
+        pool.sort();
+        pool.dedup();
         let mut scored: Vec<(f64, &PathBuf)> = pool
             .iter()
             .filter_map(|p| {
                 let name = p.file_name()?.to_string_lossy().to_ascii_lowercase();
-                // Jaro-Winkler over the file name; a substring hit is treated as a strong match so
-                // `game` finds `snake_game.js`. Keep only reasonably-close candidates.
-                let sim = strsim::jaro_winkler(needle, &name);
-                let score = if name.contains(needle) { sim.max(0.92) } else { sim };
+                // Jaro-Winkler over the file/dir name; a substring hit is treated as a strong match
+                // so `game` finds `snake_game.js` and `miniproject` finds `mini_project`. To bridge
+                // separators, also compare with `_`/`-`/space stripped from both sides.
+                let strip = |s: &str| s.chars().filter(|c| !matches!(c, '_' | '-' | ' ')).collect::<String>();
+                let sim = strsim::jaro_winkler(needle, &name)
+                    .max(strsim::jaro_winkler(&strip(needle), &strip(&name)));
+                let score = if name.contains(needle) || strip(&name).contains(&strip(needle)) {
+                    sim.max(0.92)
+                } else {
+                    sim
+                };
                 (score >= 0.72).then_some((score, p))
             })
             .collect();
         if scored.is_empty() {
-            return Ok(format!("(no files match '{pattern}', and no similarly-named file nearby)"));
+            return Ok(format!("(no match for '{pattern}', and no similarly-named file or folder nearby)"));
         }
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(10);
-        let lines: Vec<String> = scored.iter().map(|(_, p)| display_path(&self.root, p)).collect();
+        // Tag directories so the agent knows which suggestions are folders (relevant for "cd into X").
+        let lines: Vec<String> = scored
+            .iter()
+            .map(|(_, p)| {
+                let shown = display_path(&self.root, p);
+                if p.is_dir() {
+                    format!("{shown}/  (folder)")
+                } else {
+                    shown
+                }
+            })
+            .collect();
         Ok(format!("(no exact match for '{pattern}'; closest by name:)\n{}", lines.join("\n")))
     }
 }
@@ -1942,6 +1991,31 @@ mod tests {
         let out = t.execute(&serde_json::json!({"pattern":"snakegame.js"})).unwrap();
         assert!(out.contains("closest by name"), "fuzzy header present: {out}");
         assert!(out.contains("snake_game.js"), "near-name surfaced: {out}");
+    }
+
+    #[test]
+    fn file_glob_matches_directories_not_just_files() {
+        // "Find the X folder" must return the DIRECTORY itself, not only files under it.
+        let root = temp_root("glob-dirs");
+        std::fs::create_dir_all(root.join("src/mini_project")).unwrap();
+        std::fs::write(root.join("src/mini_project/main.rs"), "").unwrap();
+        let t = FileGlob::new(root);
+        let out = t.execute(&serde_json::json!({"pattern":"**/mini_project"})).unwrap();
+        assert!(out.contains("src/mini_project"), "the folder itself is listed: {out}");
+    }
+
+    #[test]
+    fn file_glob_fuzzy_finds_parent_folder_by_near_name() {
+        // The workspace is often a subdir (e.g. .../mini_project/aizen). Asking for the parent
+        // folder by a separator-insensitive near name ("miniproject") must surface "mini_project"
+        // even though it lives ABOVE the anchor — a downward-only walk never reaches it.
+        let base = temp_root("glob-parent");
+        let ws = base.join("mini_project").join("aizen");
+        std::fs::create_dir_all(&ws).unwrap();
+        let t = FileGlob::new(ws.canonicalize().unwrap());
+        let out = t.execute(&serde_json::json!({"pattern":"miniproject"})).unwrap();
+        assert!(out.contains("mini_project"), "parent folder surfaced by fuzzy: {out}");
+        assert!(out.contains("(folder)"), "it's tagged as a folder: {out}");
     }
 
     #[test]
