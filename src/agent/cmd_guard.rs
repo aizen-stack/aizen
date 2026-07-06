@@ -356,6 +356,22 @@ mod tests {
     }
 
     #[test]
+    fn does_not_block_opening_files_or_urls() {
+        // Opening a file/URL in the default app is a normal, allowed action — the agent used to
+        // (falsely) tell users "start is blocked" and refuse. The hard floor must NOT block it.
+        // (These are not read-only-SHAPED either, so they land at Ask — the model runs them once
+        // approval clears; the point here is they are never Blocked.)
+        assert!(!blocked("start index.html"));
+        assert!(!blocked("start https://example.com"));
+        assert!(!blocked("cmd /C start index.html"));
+        assert!(!blocked("open index.html"));           // macOS
+        assert!(!blocked("xdg-open index.html"));        // Linux
+        assert!(!blocked("explorer.exe index.html"));    // Windows file explorer
+        // …and they are not misread as a redirect/blank either.
+        assert_eq!(classify("start index.html"), Verdict::Ask);
+    }
+
+    #[test]
     fn recognizes_readonly_commands() {
         assert_eq!(classify("ls -la"), Verdict::Allow);
         assert_eq!(classify("cat src/main.rs"), Verdict::Allow);
