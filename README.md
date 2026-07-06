@@ -7,7 +7,8 @@ a self-learning memory brain, sub-agent dispatch, and lightweight multi-agent wo
 static executable with no Node, no Python, and no external tools to install.
 
 This repository distributes the **prebuilt `aizen` binaries** and the install scripts. The command
-is **`aizen`**.
+is **`aizen`**. (The source code lives in a separate private repository — this repo is the download
+channel only.)
 
 ## Install
 
