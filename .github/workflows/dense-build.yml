@@ -1,0 +1,51 @@
+name: dense-build
+
+# P6 — prove the `--features dense` build LINKS cleanly on every release platform. The release
+# workflow now ships `--features dense`, and the dense tier drags in `tokenizers`/`getrandom 0.3`,
+# whose raw-dylib linking broke the windows-GNU dev box (missing `as.exe`). The release runners are
+# different toolchains (Windows = MSVC, macOS = Apple clang, Linux = gcc), so we verify the dense
+# build here BEFORE a tag build depends on it — a green run means `release.yml`'s dense build is safe.
+#
+# This is a link check, not the bench: no model weights are downloaded (loading needs weights, but
+# BUILDING does not). Runs on every push/PR that touches the build so a dependency bump that
+# reintroduces a raw-dylib linker can't slip into a release unnoticed.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - '.github/workflows/dense-build.yml'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: dense build (${{ matrix.plat }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false   # one platform's link failure must not hide the others' status
+      matrix:
+        include:
+          - { os: ubuntu-latest,  plat: linux-x86_64 }
+          - { os: macos-latest,   plat: macos-aarch64 }
+          - { os: windows-latest, plat: windows-x86_64 }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustc -V && cargo -V
+
+      # A real BUILD (not just `cargo check`) — the raw-dylib wall is a LINK-time failure, so only an
+      # actual link proves the release dense build will succeed on this platform.
+      - name: Build --features dense (link check)
+        run: cargo build --features dense --bin aizen
