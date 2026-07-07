@@ -1,0 +1,76 @@
+name: dense-bench
+
+# P6 — measure whether the dense (model2vec) semantic tier actually beats the lexical BM25 floor
+# on the bench fixtures, for EACH candidate model. This runs on Linux where the `--features dense`
+# build links cleanly: the Windows-gnu dev box can't link it (tokenizers → getrandom 0.3 uses
+# raw-dylib linking, which needs a `dlltool.exe`/`as.exe` pair the slim self-contained MinGW lacks
+# — the same wall that blocks local optimized/release builds). So the dense bench lives in CI.
+#
+# Manual-only (`workflow_dispatch`): this downloads model weights (potion-multilingual-128M is
+# ~530MB) and is a measurement, not a per-push gate. Read the job log's "DENSE GATE" lines to
+# decide whether dense earns being enabled by default — the whole P6 discipline is bench-first.
+on:
+  workflow_dispatch:
+    inputs:
+      split:
+        description: 'Query split to score: tune | gate | all'
+        required: false
+        default: tune
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: dense bench (${{ matrix.model }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # one model failing must not hide the other's numbers
+      matrix:
+        # The two candidates from the P6 research: the small English-only static model vs the
+        # multilingual one distilled from bge-m3. We bench BOTH on the same bilingual fixtures and
+        # let recall@5 decide — the multilingual model is ~18x larger, so it must earn that cost.
+        model:
+          - potion-base-8M
+          - potion-multilingual-128M
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustc -V && cargo -V
+
+      - name: Cache the model weights
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.aizen/models/${{ matrix.model }}
+          key: model2vec-${{ matrix.model }}-v1
+
+      - name: Download the model weights (on cache miss)
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          dir="$HOME/.aizen/models/${{ matrix.model }}"
+          mkdir -p "$dir"
+          base="https://huggingface.co/minishlab/${{ matrix.model }}/resolve/main"
+          # The three files model2vec-rs::from_pretrained reads from a local folder.
+          for f in config.json tokenizer.json model.safetensors; do
+            echo "downloading $f ..."
+            curl -fSL --retry 3 "$base/$f?download=true" -o "$dir/$f"
+          done
+          ls -lh "$dir"
+
+      - name: Build (dense feature)
+        run: cargo build --features dense --bin aizen
+
+      - name: Bench — lexical floor vs dense hybrid
+        env:
+          # Pin the home so the model dir resolves to the one we just populated, and pick the model.
+          AIZEN_HOME: /home/runner/.aizen
+          NG_EMBED_MODEL: ${{ matrix.model }}
+        run: |
+          set -euo pipefail
+          echo "=== ${{ matrix.model }} — split=${{ github.event.inputs.split }} ==="
+          cargo run --features dense --bin aizen -- \
+            bench memory --split "${{ github.event.inputs.split }}" --hybrid

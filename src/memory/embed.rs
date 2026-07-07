@@ -6,14 +6,19 @@
 //! once. A real semantic backend (model2vec-rs / Candle bge-small) plugs in behind a cargo
 //! feature — see the dependency note below — WITHOUT changing any caller.
 //!
-//! ## Backend status (owner decision, plan risk #1)
-//! The default build stays a **pure-Rust single static binary** and ships the lexical floor.
-//! The real semantic backends both pull a tokenizer that drags in C/C++ deps (`onig` by
-//! default, `esaxx-rs` via `tokenizers`), so dense is kept OUT of the default build and
-//! lands behind an opt-in `dense` feature once the backend is chosen. `HashEmbedder` below
-//! is a deterministic, dependency-free embedder that exercises the full hybrid pipeline
-//! (fusion, cache, bench, graceful fallback) in tests — it is NOT semantic and will not
-//! beat the lexical floor on paraphrase; that's what the real backend is for.
+//! ## Backend status (owner decision, plan risk #1 — RESOLVED P6)
+//! The default build stays a **pure-Rust single static binary** and ships the lexical floor;
+//! the real model2vec backend lands behind the opt-in `dense` feature. The no-C-dep risk is
+//! resolved: `tokenizers` has a `compile_error!` requiring `onig` OR `fancy-regex`, and
+//! model2vec-rs's own `fancy-regex`/`onig` features BOTH hard-wire `tokenizers/esaxx_fast`
+//! (→ `esaxx-rs/cpp` → a C++ `cc` build step). We sidestep that by depending on `tokenizers`
+//! DIRECTLY with only its pure-Rust `fancy-regex` backend (no `esaxx_fast`); Cargo feature
+//! unification then satisfies the compile-gate WITHOUT the C++ step. `cargo tree` confirms
+//! `esaxx-rs/cpp` is off and the only `cc` build-dep left is `ring` (already in the default
+//! build via rustls) — so `--features dense` adds NO new C/C++ toolchain requirement.
+//! `HashEmbedder` below is a deterministic, dependency-free embedder that exercises the full
+//! hybrid pipeline (fusion, cache, bench, graceful fallback) in tests — it is NOT semantic and
+//! will not beat the lexical floor on paraphrase; that's what the real backend is for.
 
 use crate::core::config;
 use crate::memory::tokenize::tokenize;

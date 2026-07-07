@@ -58,10 +58,14 @@ ring = "0.17"
 getrandom = "0.2"
 
 # Dense semantic tier (P5) — OPT-IN only. The default build stays pure-Rust (lexical floor).
-# `fancy-regex` (not the default `onig`) keeps the regex backend pure-Rust; `local-only`
-# drops hf-hub/TLS so models load from a local dir we manage. NOTE: `tokenizers` still pulls
-# `esaxx-rs` (C++), so `--features dense` needs a C/C++ toolchain at build time.
-model2vec-rs = { version = "0.2", optional = true, default-features = false, features = ["fancy-regex", "local-only"] }
+# `local-only` drops hf-hub/TLS so models load from a local dir we manage. We do NOT enable
+# model2vec-rs's own `fancy-regex`/`onig` features: BOTH hard-wire `tokenizers/esaxx_fast`,
+# which pulls `esaxx-rs/cpp` → a C++ `cc` build step (breaks no-C-dep). Instead we satisfy
+# `tokenizers`' "need onig OR fancy-regex" compile-gate by depending on `tokenizers` DIRECTLY
+# with only its pure-Rust `fancy-regex` backend (NOT esaxx_fast). Cargo feature unification
+# then gives the shared `tokenizers` `fancy-regex` WITHOUT esaxx_fast → no C++ toolchain.
+model2vec-rs = { version = "0.2", optional = true, default-features = false, features = ["local-only"] }
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["fancy-regex"] }
 
 # WebSocket client — used by (a) the Discord two-way bot gateway (`wss://`, needs TLS) and (b) the
 # opt-in CDP browser tools (`ws://localhost`, no TLS). `rustls-tls-webpki-roots` reuses the
@@ -96,7 +100,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 
 [features]
 # Enable the model2vec semantic embedder. Build: `cargo build --features dense`.
-dense = ["dep:model2vec-rs"]
+dense = ["dep:model2vec-rs", "dep:tokenizers"]
 # Enable the CDP browser tools (browser_navigate/snapshot/click/type/eval). Build: `cargo build --features browser`.
 # (`tokio-tungstenite` is now a base dep — the Discord bot needs it — so this just gates the tools.)
 browser = []
