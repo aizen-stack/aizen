@@ -982,19 +982,38 @@ pub fn cmd_compact() -> Result<()> {
     Ok(())
 }
 
-/// Settings accessor (verified-good defaults). The retrieval-tier toggles are reachable via env so
-/// the fuzzy/dense moat can be turned on for a session without a config-schema change: set
-/// `AIZEN_MEM_FUZZY=1` (Jaro-Winkler bridge) and/or `AIZEN_MEM_DENSE=1` (dense⊕lexical RRF; pair with
-/// a `--features dense` build for a real semantic backend). Default OFF → the lexical floor ships.
+/// Settings accessor (verified-good defaults). `AIZEN_MEM_FUZZY=1` opts the Jaro-Winkler bridge in
+/// (default OFF). The dense tier (P6) is ON by default on a `--features dense` build (the one with a
+/// real semantic backend, where the bench proved gated fusion wins) and OFF on a default build (only
+/// the non-semantic `HashEmbedder` → enabling it there is pure overhead). `AIZEN_MEM_DENSE` overrides
+/// either way (`=0/off` disables, `=1/on` forces on).
 pub fn settings() -> MemorySettings {
     let mut s = MemorySettings::default();
     if env_on("AIZEN_MEM_FUZZY") {
         s.enable_fuzzy = true;
     }
-    if env_on("AIZEN_MEM_DENSE") {
-        s.enable_dense = true;
+    // Dense tier (P6): ON by default ONLY on a `--features dense` build — that's the one carrying a
+    // real semantic backend, and the bench proved gated fusion earns its keep there (paraphrase
+    // recall +0.231 with negligible literal-slice noise). A default build has only the non-semantic
+    // `HashEmbedder`, so enabling dense there is pure overhead for no gain → it stays OFF. Either
+    // way `AIZEN_MEM_DENSE` overrides: `=0/off` kills it on a dense build, `=1` forces the plumbing
+    // path on a default build (integration tests). The gate itself (`dense_gate_coverage`) still
+    // means a confident literal query never pays the dense cost.
+    s.enable_dense = cfg!(feature = "dense");
+    if let Some(v) = env_flag("AIZEN_MEM_DENSE") {
+        s.enable_dense = v;
     }
     s
+}
+
+/// Parse a truthy/falsy env toggle. `Some(true)` for `1/true/yes/on`, `Some(false)` for
+/// `0/false/no/off`, `None` when unset/empty/unrecognized (caller keeps its default).
+fn env_flag(key: &str) -> Option<bool> {
+    match std::env::var(key).ok().as_deref().map(str::trim) {
+        Some("1") | Some("true") | Some("yes") | Some("on") => Some(true),
+        Some("0") | Some("false") | Some("no") | Some("off") => Some(false),
+        _ => None,
+    }
 }
 
 fn env_on(key: &str) -> bool {
@@ -1006,6 +1025,24 @@ mod tests {
     use super::*;
     use crate::memory::store::{MemoryEntry, MemoryType};
     use std::path::PathBuf;
+
+    #[test]
+    fn settings_dense_defaults_to_the_feature_and_env_overrides_both_ways() {
+        // P6: `settings().enable_dense` tracks the `dense` cargo feature by default (ON only where a
+        // real semantic backend exists), and `AIZEN_MEM_DENSE` overrides in EITHER direction. Guard
+        // the process-global env with the home lock so we don't race other env-touching tests.
+        let _g = config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("AIZEN_MEM_DENSE");
+        // unset → mirrors the build: ON with `--features dense`, OFF otherwise.
+        assert_eq!(settings().enable_dense, cfg!(feature = "dense"));
+        // explicit ON forces the plumbing path even on a default build.
+        std::env::set_var("AIZEN_MEM_DENSE", "1");
+        assert!(settings().enable_dense);
+        // explicit OFF kills it even on a `--features dense` build.
+        std::env::set_var("AIZEN_MEM_DENSE", "off");
+        assert!(!settings().enable_dense);
+        std::env::remove_var("AIZEN_MEM_DENSE");
+    }
 
     #[test]
     fn remember_defaults_to_project_zone_and_global_prefix_overrides() {
