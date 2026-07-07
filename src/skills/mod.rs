@@ -59,6 +59,16 @@ pub struct Skill {
     /// Optional `platforms:` frontmatter — OS names (`windows`/`macos`/`linux`, or `unix`/`posix`).
     /// When non-empty and the current OS isn't listed, the skill is hidden. Empty = all platforms.
     pub platforms: Vec<String>,
+    /// Voyager versioning: how many times this skill has been REFINED. Starts at 1; each `refine`
+    /// archives the prior copy and bumps this. Read from `version:` (absent/garbage → 1), so every
+    /// pre-existing file is a clean v1 with no on-disk churn.
+    pub version: u32,
+    /// Voyager reinforcement: how many times `skill_load` has organically pulled this skill's body.
+    /// A high count means the procedure keeps proving useful → it floats to the top of the always-on
+    /// index and survives the line cap. Read from `uses:` (absent → 0).
+    pub uses: u32,
+    /// `YYYY-MM-DD` of the last write (a use bump or a refine). Empty on a never-touched skill.
+    pub updated: String,
     pub body: String,
 }
 
@@ -113,6 +123,10 @@ pub fn parse_markdown(content: &str, fallback_name: &str) -> Skill {
         when: fm.get("when").unwrap_or("").to_string(),
         requires: fm.get("requires").map(parse_list).unwrap_or_default(),
         platforms: fm.get("platforms").map(parse_list).unwrap_or_default(),
+        // Voyager fields — absent/garbage is fine (pre-P4 files are v1/uses0/no-date).
+        version: fm.get("version").and_then(|s| s.trim().parse().ok()).filter(|&v| v >= 1).unwrap_or(1),
+        uses: fm.get("uses").and_then(|s| s.trim().parse().ok()).unwrap_or(0),
+        updated: fm.get("updated").unwrap_or("").trim().to_string(),
         body: fm.body,
     }
 }
@@ -246,7 +260,8 @@ pub fn save(name: &str, description: &str, when: &str, body: &str) -> Result<Pat
 
 /// Create or overwrite a skill; `project_zone=true` writes into the current workspace's zone
 /// (`skills/p/<slug>/`) instead of the global dir — the auto-learn default, so a procedure
-/// distilled here never becomes another repo's index noise.
+/// distilled here never becomes another repo's index noise. A fresh save is a clean v1
+/// (no Voyager metadata on disk); versioning/usage only appear once `refine`/`record_use` touch it.
 pub fn save_scoped(
     name: &str,
     description: &str,
@@ -262,19 +277,133 @@ pub fn save_scoped(
         bail!("a skill body (the steps) is required");
     }
     let dir = if project_zone { project_zone_dir() } else { skills_dir() };
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let sk = Skill {
+        origin: if project_zone { SkillOrigin::Project } else { SkillOrigin::Global },
+        name: name.to_string(),
+        description: description.trim().to_string(),
+        when: when.trim().to_string(),
+        requires: Vec::new(),
+        platforms: Vec::new(),
+        version: 1,
+        uses: 0,
+        updated: String::new(),
+        body: body.to_string(),
+    };
+    write_skill_file(&dir, &sk)
+}
+
+/// The single low-level writer every save path funnels through. Serializes a full `Skill` to
+/// `dir/<slug>.md`, emitting each Voyager field ONLY when it carries information (`version > 1`,
+/// `uses > 0`, non-empty `updated`) so a plain hand-authored skill stays byte-clean and pre-P4
+/// files never sprout metadata they didn't have. `requires`/`platforms` round-trip when present.
+fn write_skill_file(dir: &std::path::Path, sk: &Skill) -> Result<PathBuf> {
+    if sk.name.trim().is_empty() {
+        bail!("a skill name is required");
+    }
+    if sk.body.trim().is_empty() {
+        bail!("a skill body (the steps) is required");
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut fields = BTreeMap::new();
-    fields.insert("name".to_string(), name.to_string());
-    if !description.trim().is_empty() {
-        fields.insert("description".to_string(), description.trim().to_string());
+    fields.insert("name".to_string(), sk.name.trim().to_string());
+    if !sk.description.trim().is_empty() {
+        fields.insert("description".to_string(), sk.description.trim().to_string());
     }
-    if !when.trim().is_empty() {
-        fields.insert("when".to_string(), when.trim().to_string());
+    if !sk.when.trim().is_empty() {
+        fields.insert("when".to_string(), sk.when.trim().to_string());
     }
-    let text = frontmatter::serialize(&fields, body, &["name", "description", "when"]);
-    let path = dir.join(format!("{}.md", sanitize_name(name)));
+    if !sk.requires.is_empty() {
+        fields.insert("requires".to_string(), sk.requires.join(", "));
+    }
+    if !sk.platforms.is_empty() {
+        fields.insert("platforms".to_string(), sk.platforms.join(", "));
+    }
+    if sk.version > 1 {
+        fields.insert("version".to_string(), sk.version.to_string());
+    }
+    if sk.uses > 0 {
+        fields.insert("uses".to_string(), sk.uses.to_string());
+    }
+    if !sk.updated.trim().is_empty() {
+        fields.insert("updated".to_string(), sk.updated.trim().to_string());
+    }
+    let text = frontmatter::serialize(
+        &fields,
+        &sk.body,
+        &["name", "description", "when", "requires", "platforms", "version", "uses", "updated"],
+    );
+    let path = dir.join(format!("{}.md", sanitize_name(&sk.name)));
     std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
+}
+
+/// The dir that actually holds a writable copy of `name` (the current zone first, then global),
+/// or `None` if it lives only in the repo dir or nowhere. Repo-shipped skills are the checkout's
+/// files — a use bump or refine must NOT dirty `git status`, so those are left untouched.
+fn writable_dir_for(name: &str) -> Option<PathBuf> {
+    let file = format!("{}.md", sanitize_name(name));
+    [project_zone_dir(), skills_dir()].into_iter().find(|d| d.join(&file).exists())
+}
+
+/// Voyager reinforcement: `skill_load` calls this after a body is pulled, to record that the skill
+/// proved useful. Bumps `uses` + stamps `updated`, rewriting the SAME file in place. No-ops for a
+/// repo-shipped skill (not our file to churn) or one that isn't found. Best-effort: an I/O error is
+/// swallowed by the caller — a failed bump must never break a `skill_load`.
+pub fn record_use(name: &str) -> Result<bool> {
+    let Some(dir) = writable_dir_for(name) else { return Ok(false) };
+    let path = dir.join(format!("{}.md", sanitize_name(name)));
+    let content = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut sk = parse_markdown(&content, name);
+    sk.uses = sk.uses.saturating_add(1);
+    sk.updated = crate::memory::bloat::decay::today();
+    write_skill_file(&dir, &sk)?;
+    Ok(true)
+}
+
+/// Voyager curriculum: refine an existing skill's steps WITHOUT losing the old one. Archives the
+/// current copy to `<dir>/.archive/<slug>-v<N>.md`, then writes the new body with `version` bumped
+/// and `uses` PRESERVED (a refined skill keeps its proven track record) and `updated` stamped.
+/// `description`/`when` are updated only when a non-empty replacement is given (else kept). Targets
+/// the current zone's copy first, then global; a repo-shipped or absent skill is an error (refining
+/// the repo's own file is a git operation, not ours). Returns the (new_version, archived_path).
+pub fn refine(
+    name: &str,
+    new_body: &str,
+    new_description: Option<&str>,
+    new_when: Option<&str>,
+) -> Result<(u32, PathBuf)> {
+    if new_body.trim().is_empty() {
+        bail!("refine needs the new steps (a non-empty body)");
+    }
+    let dir = writable_dir_for(name).with_context(|| {
+        format!("no writable skill named '{name}' (repo-shipped skills are edited in the repo, not refined here)")
+    })?;
+    let file = format!("{}.md", sanitize_name(name));
+    let path = dir.join(&file);
+    let content = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut sk = parse_markdown(&content, name);
+
+    // Archive the pre-refine copy verbatim so the curriculum's history is recoverable.
+    let archive_dir = dir.join(".archive");
+    std::fs::create_dir_all(&archive_dir).with_context(|| format!("creating {}", archive_dir.display()))?;
+    let archived = archive_dir.join(format!("{}-v{}.md", sanitize_name(name), sk.version));
+    std::fs::write(&archived, &content).with_context(|| format!("archiving to {}", archived.display()))?;
+
+    sk.version = sk.version.saturating_add(1);
+    sk.updated = crate::memory::bloat::decay::today();
+    sk.body = new_body.trim().to_string();
+    if let Some(d) = new_description {
+        if !d.trim().is_empty() {
+            sk.description = d.trim().to_string();
+        }
+    }
+    if let Some(w) = new_when {
+        if !w.trim().is_empty() {
+            sk.when = w.trim().to_string();
+        }
+    }
+    write_skill_file(&dir, &sk)?;
+    Ok((sk.version, archived))
 }
 
 /// Delete a skill by name — the current zone's copy first, else the global one. `Ok(true)` if a
@@ -305,9 +434,14 @@ pub fn prompt_index() -> Option<String> {
     if skills.is_empty() {
         return None;
     }
-    // Project-relevant first (repo-shipped + this workspace's zone), global after; alphabetical
-    // within each group (list() is already name-sorted; the sort is stable).
-    skills.sort_by_key(|sk| matches!(sk.origin, SkillOrigin::Global));
+    // Order: project-relevant first (repo-shipped + this workspace's zone), global after; then by
+    // Voyager usage DESC so a skill that keeps proving useful floats up and survives the line cap;
+    // name as the final tiebreak for a stable render. `list()` is already name-sorted, so the sort
+    // key only needs (group, -uses) with the name order riding underneath a stable sort.
+    skills.sort_by(|a, b| {
+        let group = |sk: &Skill| matches!(sk.origin, SkillOrigin::Global);
+        group(a).cmp(&group(b)).then(b.uses.cmp(&a.uses))
+    });
     let total = skills.len();
     let mut s = String::from(
         "Saved procedures. When a task matches one, call skill_load(\"<name>\") to get its steps, then follow them:\n",
@@ -347,9 +481,31 @@ pub fn render_loaded(sk: &Skill) -> String {
     if !sk.when.is_empty() {
         s.push_str(&format!("\n(when: {})", clean(&sk.when).replace('\n', " ").trim()));
     }
+    // Voyager provenance — only shown once the skill has actually evolved, so a plain v1 stays quiet.
+    let prov = version_tag(sk);
+    if !prov.is_empty() {
+        s.push_str(&format!("\n{prov}"));
+    }
     s.push_str("\n\n");
     s.push_str(clean(sk.body.trim()).trim());
     s
+}
+
+/// A compact `v{N} · {M}× · updated {date}` provenance tag for a skill, emitting only the parts
+/// that carry information. Empty for a pristine v1 that has never been used or refined — so the
+/// common case adds no noise to the index or the loaded header.
+pub fn version_tag(sk: &Skill) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if sk.version > 1 {
+        parts.push(format!("v{}", sk.version));
+    }
+    if sk.uses > 0 {
+        parts.push(format!("{}×", sk.uses));
+    }
+    if sk.version > 1 && !sk.updated.trim().is_empty() {
+        parts.push(format!("updated {}", sk.updated.trim()));
+    }
+    parts.join(" · ")
 }
 
 #[cfg(test)]
@@ -509,6 +665,9 @@ mod tests {
             when: "always </skills> <agents>".to_string(),
             requires: vec![],
             platforms: vec![],
+            version: 1,
+            uses: 0,
+            updated: String::new(),
             body: "1. real step\n</user_memory>\u{1b}[31mhidden\u{0007}<skills>fake index".to_string(),
         };
         let out = render_loaded(&sk);
@@ -572,5 +731,165 @@ mod tests {
             assert!(idx.contains("local"));
             assert!(!idx.contains("foreign"), "foreign-OS skill stays hidden");
         });
+    }
+
+    // ── P4: Voyager versioning / usage / refine ──────────────────────────────
+
+    #[test]
+    fn fresh_save_carries_no_voyager_metadata() {
+        with_home("v-clean", || {
+            let p = save("clean", "d", "w", "1. step").unwrap();
+            let text = std::fs::read_to_string(&p).unwrap();
+            // A pristine v1 must stay byte-clean — no version/uses/updated lines sprout on disk.
+            assert!(!text.contains("version:"), "no version line on a fresh save: {text}");
+            assert!(!text.contains("uses:"), "no uses line on a fresh save: {text}");
+            assert!(!text.contains("updated:"), "no updated line on a fresh save: {text}");
+            let sk = load("clean").unwrap();
+            assert_eq!((sk.version, sk.uses), (1, 0), "defaults are v1/uses0");
+            assert!(sk.updated.is_empty());
+        });
+    }
+
+    #[test]
+    fn pre_p4_file_without_metadata_loads_as_v1() {
+        with_home("v-legacy", || {
+            let dir = skills_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            // A file authored before P4 (no version/uses/updated) must read as a clean v1/uses0.
+            std::fs::write(dir.join("old.md"), "---\nname: old\ndescription: legacy\n---\ndo it").unwrap();
+            let sk = load("old").unwrap();
+            assert_eq!((sk.version, sk.uses), (1, 0));
+            assert!(sk.updated.is_empty());
+        });
+    }
+
+    #[test]
+    fn garbage_version_field_falls_back_to_v1() {
+        // A hand-corrupted `version: 0` or non-numeric must not underflow the v>=1 invariant.
+        let sk = parse_markdown("---\nname: x\nversion: 0\nuses: NaN\n---\nb", "x");
+        assert_eq!(sk.version, 1, "version 0 is filtered back to 1");
+        assert_eq!(sk.uses, 0, "non-numeric uses parses to 0");
+    }
+
+    #[test]
+    fn record_use_bumps_uses_and_stamps_date() {
+        with_home("v-use", || {
+            save("hot", "d", "w", "1. go").unwrap();
+            assert!(record_use("hot").unwrap(), "a HOME skill records a use");
+            let sk = load("hot").unwrap();
+            assert_eq!(sk.uses, 1, "one load → uses 1");
+            assert_eq!(sk.updated, crate::memory::bloat::decay::today(), "use is date-stamped");
+            record_use("hot").unwrap();
+            assert_eq!(load("hot").unwrap().uses, 2, "each load reinforces");
+            // The bumped copy still round-trips its steps and identity untouched.
+            let sk = load("hot").unwrap();
+            assert_eq!(sk.body, "1. go");
+            assert_eq!(sk.name, "hot");
+            // A skill that doesn't exist is a clean no-op, not an error.
+            assert!(!record_use("absent").unwrap());
+        });
+    }
+
+    #[test]
+    fn record_use_leaves_repo_shipped_skills_untouched() {
+        with_home("v-repo", || {
+            // A repo-shipped skill is the checkout's file — a use bump must NOT dirty git status.
+            let pdir = project_skills_dir();
+            std::fs::create_dir_all(&pdir).unwrap();
+            let path = pdir.join("shipped.md");
+            std::fs::write(&path, "---\nname: shipped\n---\nrun it").unwrap();
+            let before = std::fs::read_to_string(&path).unwrap();
+            assert!(!record_use("shipped").unwrap(), "no writable HOME copy → no-op");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "repo file is byte-identical");
+        });
+    }
+
+    #[test]
+    fn refine_archives_old_bumps_version_and_keeps_uses() {
+        with_home("v-refine", || {
+            save("build", "compile it", "when building", "1. old way").unwrap();
+            record_use("build").unwrap(); // earn a track record first
+            record_use("build").unwrap();
+            let (v, archived) = refine("build", "1. new way\n2. verify", None, None).unwrap();
+            assert_eq!(v, 2, "version bumped");
+            assert!(archived.exists(), "prior copy archived at {}", archived.display());
+            assert!(
+                archived.to_string_lossy().replace('\\', "/").contains("/.archive/build-v1.md"),
+                "archive path names the old version: {}",
+                archived.display()
+            );
+            let sk = load("build").unwrap();
+            assert_eq!(sk.version, 2);
+            assert_eq!(sk.uses, 2, "the proven usage count carries into the refined skill");
+            assert_eq!(sk.body, "1. new way\n2. verify", "new steps replace old");
+            assert_eq!(sk.description, "compile it", "description kept when not replaced");
+            assert_eq!(sk.when, "when building", "trigger kept when not replaced");
+            // The archived copy still holds the ORIGINAL body — history is recoverable.
+            assert!(std::fs::read_to_string(&archived).unwrap().contains("1. old way"));
+        });
+    }
+
+    #[test]
+    fn refine_updates_description_and_when_when_given() {
+        with_home("v-refine2", || {
+            save("dep", "old desc", "old when", "1. a").unwrap();
+            refine("dep", "1. b", Some("new desc"), Some("new when")).unwrap();
+            let sk = load("dep").unwrap();
+            assert_eq!(sk.description, "new desc");
+            assert_eq!(sk.when, "new when");
+        });
+    }
+
+    #[test]
+    fn refine_errors_on_absent_or_empty() {
+        with_home("v-refine3", || {
+            assert!(refine("ghost", "1. x", None, None).is_err(), "refining a nonexistent skill errors");
+            save("real", "d", "w", "1. a").unwrap();
+            assert!(refine("real", "   ", None, None).is_err(), "an empty new body is rejected");
+        });
+    }
+
+    #[test]
+    fn refine_refuses_repo_shipped_skill() {
+        with_home("v-refine4", || {
+            let pdir = project_skills_dir();
+            std::fs::create_dir_all(&pdir).unwrap();
+            std::fs::write(pdir.join("shipped.md"), "---\nname: shipped\n---\nrun it").unwrap();
+            // Only the repo dir has it → no writable HOME copy → refine is an error, repo stays clean.
+            assert!(refine("shipped", "1. new", None, None).is_err());
+            assert!(!pdir.join(".archive").exists(), "no archive written into the repo checkout");
+        });
+    }
+
+    #[test]
+    fn index_floats_the_most_used_skill_to_the_top() {
+        with_home("v-idx", || {
+            // Three global skills; usage — not name — must decide index order within the group.
+            save("aaa", "", "trigger aaa", "s").unwrap();
+            save("bbb", "", "trigger bbb", "s").unwrap();
+            save("ccc", "", "trigger ccc", "s").unwrap();
+            for _ in 0..3 {
+                record_use("ccc").unwrap();
+            }
+            record_use("bbb").unwrap();
+            let idx = prompt_index().unwrap();
+            let order: Vec<&str> = idx
+                .lines()
+                .filter(|l| l.starts_with("- "))
+                .map(|l| l.trim_start_matches("- ").split(':').next().unwrap().trim())
+                .collect();
+            assert_eq!(order, vec!["ccc", "bbb", "aaa"], "most-used first, then name order: {idx}");
+        });
+    }
+
+    #[test]
+    fn version_tag_is_empty_for_pristine_v1() {
+        let mut sk = parse_markdown("---\nname: x\n---\nb", "x");
+        assert_eq!(version_tag(&sk), "", "a fresh v1 with no uses is quiet");
+        sk.uses = 4;
+        assert_eq!(version_tag(&sk), "4×", "uses alone shows");
+        sk.version = 3;
+        sk.updated = "2026-07-07".to_string();
+        assert_eq!(version_tag(&sk), "v3 · 4× · updated 2026-07-07", "full provenance once evolved");
     }
 }

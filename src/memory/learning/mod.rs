@@ -48,6 +48,32 @@ pub fn default_session_id() -> String {
     chrono::Local::now().format("%Y%m%dT%H%M%S").to_string()
 }
 
+/// The tool whose firing means "this turn AUTHORED a fictional character", not "the user stated a
+/// preference". Kept as one constant so the tool name and the leak-guard can never drift apart.
+pub const PERSONA_AUTHORING_TOOL: &str = "persona_create";
+
+/// True when the LAST turn authored a character (the [`PERSONA_AUTHORING_TOOL`] fired). When it did,
+/// the user's message was describing a FICTIONAL persona's traits (role, voice, the language it
+/// speaks), NOT the user's own preferences — mining it would leak a `persona-…` "fact" into user
+/// memory (the verbosity-profile pollution bug).
+///
+/// This is the STRONG, fact-based half of the two-layer persona-leak defense: it keys off what the
+/// turn ACTUALLY did, so it catches phrasings the [`signals::looks_like_persona_intent`] regex gate
+/// (the first, heuristic layer inside [`ingest`]) misses — e.g. a pasted character card with no
+/// trigger keyword. Callers that have the turn's tool-call history (the REPL) must consult this
+/// before feeding the user's message to [`ingest`]; extracting it here keeps it unit-tested so a
+/// future refactor of the REPL loop cannot silently drop the guard and resurrect the leak.
+///
+/// Scoped to the LAST turn: from the final user message to the end of `history`.
+pub fn turn_authored_persona(history: &[crate::core::types::Message]) -> bool {
+    let start = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
+    history[start..]
+        .iter()
+        .filter(|m| m.role == "assistant")
+        .flat_map(|m| m.tool_calls.iter())
+        .any(|tc| tc.function.name == PERSONA_AUTHORING_TOOL)
+}
+
 #[derive(Default, Debug)]
 pub struct LearnReport {
     pub added: Vec<String>,
@@ -76,6 +102,16 @@ impl LearnReport {
 pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
     let s = MemorySettings::default();
     let mut report = LearnReport::default();
+
+    // A turn about authoring / becoming a role-play CHARACTER describes a FICTIONAL persona's
+    // traits (role, voice, the language it speaks), NOT the user's own preferences. Mining it
+    // would leak a `persona-…` "fact" into user memory (it did — polluting the verbosity profile).
+    // Persona content lives only in `~/.aizen/personas` via the `persona_create` tool, so skip
+    // learning entirely here. Treated as passive (a no-op, free turn).
+    if signals::looks_like_persona_intent(user_text) {
+        report.skipped_passive = true;
+        return Ok(report);
+    }
 
     let signal = signals::detect(user_text);
     let mut candidates = extract_free::extract(user_text);
@@ -387,6 +423,20 @@ mod tests {
     }
 
     #[test]
+    fn persona_authoring_turn_learns_nothing() {
+        with_temp_home("persona-intent", || {
+            // Creating / role-playing a CHARACTER must not mine the character's traits as USER
+            // facts (the leak that put a `persona-…` entry into the verbosity profile).
+            let r = ingest("tạo cho tôi một nhân vật là kiến trúc sư phần mềm, nói ngắn gọn", &opts()).unwrap();
+            assert!(!r.changed(), "a persona-authoring turn must write nothing, got {r:?}");
+            assert!(r.skipped_passive);
+            let r2 = ingest("create a persona: a terse noir detective who speaks english", &opts()).unwrap();
+            assert!(!r2.changed(), "persona intent (EN) must write nothing, got {r2:?}");
+            assert!(store::load_all().unwrap().is_empty(), "no persona trait leaked into user memory");
+        });
+    }
+
+    #[test]
     fn preference_is_stored() {
         with_temp_home("pref", || {
             let r = ingest("I prefer pnpm over npm", &opts()).unwrap();
@@ -459,5 +509,102 @@ mod tests {
             assert!(r.changed(), "dry-run still reports what it WOULD do");
             assert!(store::load_all().unwrap().is_empty(), "dry-run must not write");
         });
+    }
+
+    // ── P2 workspace-scope invariants (write path) ───────────────────────────
+    // The read path (search / frozen_core) is scope-tested elsewhere; these pin the two write-path
+    // guarantees that keep zones from bleeding: (1) the merge/dedup step in `apply_store` only ever
+    // touches same-zone entries, and (2) `ingest` actually stamps the resolved zone onto what it
+    // learns. Both are the load-bearing half of scoping — a leak here silently poisons every zone.
+
+    /// A near-identical fact in a DIFFERENT zone must NOT be reinforced/deduped against: the
+    /// candidate is added fresh in its own zone (no cross-zone signal leak / scope drift).
+    #[test]
+    fn apply_store_never_merges_across_zones() {
+        with_temp_home("zone-merge", || {
+            let s = crate::core::config::MemorySettings::default();
+            // A project-A fact already in the store, lexically identical to what we're about to learn.
+            let existing_id = store::add_scoped(
+                "deploy note",
+                "",
+                MemoryType::Project,
+                "the deploy pipeline uses fly",
+                Some("proja-00000001"),
+            )
+            .unwrap();
+            let mut existing = store::load_all().unwrap();
+
+            // Learn the SAME sentence but scoped to project-B → must ADD, never reinforce A.
+            let mut report = LearnReport::default();
+            apply_store(
+                "the deploy pipeline uses fly",
+                &MemoryType::Project,
+                ProvenanceKind::Inferred,
+                0.9,
+                false,
+                Some("projb-00000002".to_string()),
+                None,
+                &opts(),
+                &mut existing,
+                &s,
+                &mut report,
+            )
+            .unwrap();
+            assert!(report.reinforced.is_empty(), "a same-text fact in ANOTHER zone must not reinforce");
+            assert_eq!(report.added.len(), 1, "it is added fresh in its own zone, got {report:?}");
+
+            // Now learn it AGAIN in project-A's zone → this time it MUST reinforce the existing A row.
+            let mut existing = store::load_all().unwrap();
+            let mut report2 = LearnReport::default();
+            apply_store(
+                "the deploy pipeline uses fly",
+                &MemoryType::Project,
+                ProvenanceKind::Inferred,
+                0.9,
+                false,
+                Some("proja-00000001".to_string()),
+                None,
+                &opts(),
+                &mut existing,
+                &s,
+                &mut report2,
+            )
+            .unwrap();
+            assert!(report2.added.is_empty(), "same zone + same text → no duplicate, got {report2:?}");
+            assert_eq!(report2.reinforced, vec![existing_id], "it reinforces the SAME-zone row");
+        });
+    }
+
+    /// End-to-end: a fact `ingest` classifies as project-scoped lands tagged with the current zone,
+    /// while a user/feedback fact stays global — so the read-side scope filter has something true to
+    /// filter on. Complements the `scope_for` unit test by proving the tag survives the full pipeline.
+    #[test]
+    fn ingested_project_fact_is_zone_tagged_end_to_end() {
+        let _g = config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ng-ingest-zone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("NG_PROJECT_ROOT", &dir); // a stable, isolated zone for this test
+
+        // A stated preference is about the USER → global (no scope), searchable from any project.
+        let r = ingest("I prefer pnpm over npm", &opts()).unwrap();
+        assert!(!r.added.is_empty(), "a preference is learned, got {r:?}");
+        let entries = store::load_all().unwrap();
+        let pref = entries
+            .iter()
+            .find(|e| e.body.to_lowercase().contains("pnpm"))
+            .expect("the preference is stored");
+        assert!(pref.scope.is_none(), "a user/feedback fact is global, not zoned: {:?}", pref.scope);
+        // Whatever type it resolved to, the router's contract holds: only project/reference get a zone.
+        assert_eq!(
+            scope_for(&pref.mtype).0,
+            pref.scope,
+            "the stored scope matches what scope_for() dictates for its type"
+        );
+
+        std::env::remove_var("NG_PROJECT_ROOT");
+        std::env::remove_var("NEXTGEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

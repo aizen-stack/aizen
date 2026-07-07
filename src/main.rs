@@ -283,6 +283,21 @@ enum SkillCmd {
         /// Skill name.
         name: String,
     },
+    /// Refine an existing skill's steps in place: archives the prior version, bumps the version,
+    /// keeps the usage count. The new body comes from `--body` or stdin.
+    Refine {
+        /// The existing skill's name.
+        name: String,
+        /// New one-line summary (kept unchanged if omitted).
+        #[arg(short, long)]
+        description: Option<String>,
+        /// New trigger hint (kept unchanged if omitted).
+        #[arg(short, long)]
+        when: Option<String>,
+        /// The improved steps/procedure (else read from stdin).
+        #[arg(short, long)]
+        body: Option<String>,
+    },
     /// Fetch a skill (markdown, optional frontmatter) from a URL and save it.
     Fetch {
         /// Absolute http(s) URL to a markdown skill file (e.g. a gist/raw GitHub link).
@@ -637,6 +652,9 @@ enum MemoryCmd {
         /// Restrict to one topical dimension: style|tooling|workflow|stack|other.
         #[arg(long)]
         dimension: Option<String>,
+        /// Restrict to one content category: bug-history|failed-attempt|success-pattern|arch-decision|command|security-rule|deploy-note|codebase.
+        #[arg(long)]
+        category: Option<String>,
         /// Workspace view: all (default) | global | current | project | a zone slug.
         #[arg(long)]
         scope: Option<String>,
@@ -700,6 +718,14 @@ enum MemoryCmd {
     },
     /// Run anti-bloat maintenance (enforce the inferred-fact LRU cap → archive victims).
     Compact,
+    /// Show a fact's strongest co-retrieval associations (the Hebbian graph, P5).
+    Neighbors {
+        /// The memory (id or name) whose neighbors to list.
+        id: String,
+        /// Max neighbors to show.
+        #[arg(short, long, default_value_t = 10)]
+        k: usize,
+    },
 }
 
 #[tokio::main]
@@ -3726,6 +3752,14 @@ fn maybe_learn_memory(history: &[Message]) {
     if user_text.trim().is_empty() {
         return;
     }
+    // If THIS turn authored a character (the `persona_create` tool fired), the user's message was
+    // describing a FICTIONAL persona, not stating their own preferences — mining it would leak a
+    // `persona-…` "fact" into user memory. Skip learning for the whole turn. (The regex intent-gate
+    // inside `ingest` is the first, heuristic line of defense; this fact-based gate catches phrasings
+    // it misses. Lives as a unit-tested helper so this loop can't silently drop it in a refactor.)
+    if learning::turn_authored_persona(history) {
+        return;
+    }
     let opts = LearnOptions {
         session_id: repl_session_id().to_string(),
         auto_confirm_core: Some(false), // never auto-mutate the frozen core; downgrade to store
@@ -4583,7 +4617,7 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             rebuild_system(history, model_label);
         }
         "memory" | "mem" => {
-            let r = if arg.is_empty() { memory::cmd_profile(false) } else { memory::cmd_search(arg, 5, None, None) };
+            let r = if arg.is_empty() { memory::cmd_profile(false) } else { memory::cmd_search(arg, 5, None, None, None) };
             if let Err(e) = r {
                 eprintln!("{} {e}", style("memory:").red());
             }
@@ -5486,8 +5520,8 @@ fn run_memory(cmd: MemoryCmd) -> Result<()> {
         }
         MemoryCmd::List { scope } => memory::cmd_list(scope.as_deref()),
         MemoryCmd::Show { id } => memory::cmd_show(&id),
-        MemoryCmd::Search { query, k, dimension, scope } => {
-            memory::cmd_search(&query, k, dimension, scope.as_deref())
+        MemoryCmd::Search { query, k, dimension, category, scope } => {
+            memory::cmd_search(&query, k, dimension, category, scope.as_deref())
         }
         MemoryCmd::Frozen { rebuild } => memory::cmd_frozen(rebuild),
         MemoryCmd::Learn { text, yes, dry_run } => {
@@ -5509,6 +5543,7 @@ fn run_memory(cmd: MemoryCmd) -> Result<()> {
         MemoryCmd::Archive => memory::cmd_archive_list(),
         MemoryCmd::Restore { id } => memory::cmd_restore(&id),
         MemoryCmd::Compact => memory::cmd_compact(),
+        MemoryCmd::Neighbors { id, k } => memory::cmd_neighbors(&id, k),
     }
 }
 
@@ -5674,7 +5709,10 @@ async fn run_skill(cmd: SkillCmd) -> Result<()> {
                     skill::SkillOrigin::Project => " [project]",
                     skill::SkillOrigin::Repo => " [repo]",
                 };
-                println!("{}{tag}  —  {}", s.name, d);
+                // Voyager provenance (v{N} · {M}× · updated …) — empty for a pristine, never-used v1.
+                let prov = skill::version_tag(s);
+                let prov = if prov.is_empty() { String::new() } else { format!("  ({prov})") };
+                println!("{}{tag}{prov}  —  {}", s.name, d);
             }
             if all_zones {
                 let others = skill::list_other_zones();
@@ -5714,6 +5752,20 @@ async fn run_skill(cmd: SkillCmd) -> Result<()> {
             } else {
                 println!("(no skill named '{name}')");
             }
+            Ok(())
+        }
+        SkillCmd::Refine { name, description, when, body } => {
+            let body = match body {
+                Some(b) => b,
+                None => read_stdin("reading the refined skill body from stdin")?,
+            };
+            let (version, archived) =
+                skill::refine(&name, &body, description.as_deref(), when.as_deref())?;
+            println!(
+                "{} '{name}' → v{version} (prior version archived at {})",
+                style("refined").color256(splash::ACCENT),
+                archived.display()
+            );
             Ok(())
         }
         SkillCmd::Fetch { url, name } => run_skill_fetch(&url, name.as_deref()).await,

@@ -83,6 +83,30 @@ pub fn scope_disabled() -> bool {
     )
 }
 
+/// True when an env var is set to a truthy token (`1`/`true`/`yes`/`on`). Shared by the
+/// memory kill-switches so they parse identically.
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// Hebbian co-retrieval graph kill-switch. `NG_NO_GRAPH=1` turns OFF both edge *recording*
+/// (retrieval writes nothing to `graph.tsv`) and edge *reading* (neighbor expansion is skipped),
+/// collapsing retrieval to the pre-P5 lexical/salience path. Escape hatch for debugging/benching.
+pub fn graph_disabled() -> bool {
+    env_flag("NG_NO_GRAPH")
+}
+
+/// Opt-IN switch for graph neighbor-expansion in PRODUCTION retrieval. `NG_GRAPH_EXPAND=1` lets a
+/// strong lexical hit pull in its most-associated neighbors (spreading activation). Default OFF —
+/// same posture as the dense/fuzzy moat tiers: the edge graph is always *recorded* (cheap, builds
+/// the corpus), but *reading* it into results waits until the bench proves net recall value.
+pub fn graph_expand_enabled() -> bool {
+    !graph_disabled() && env_flag("NG_GRAPH_EXPAND")
+}
+
 /// FNV-1a 64-bit — tiny local hash for the project-slug stable key (core must not depend on
 /// `memory::embed`; 8 lines beats a crate).
 fn fnv1a64(s: &str) -> u64 {
@@ -244,6 +268,13 @@ pub fn archive_dir() -> PathBuf {
 /// Cached embeddings (P5), keyed by content hash.
 pub fn embed_cache_dir() -> PathBuf {
     cli_memory_dir().join("embed-cache")
+}
+
+/// The Hebbian co-retrieval graph (P5 — neuron-link associations between facts). A single
+/// plain-text edge file next to the entry store; the ONE piece of memory state that is not
+/// derivable from fact content (which facts get recalled together over time).
+pub fn graph_path() -> PathBuf {
+    cli_memory_dir().join("graph.tsv")
 }
 
 /// Local model store (P5 dense backend). Shared `~/.aizen/models/` (NOT under cli-memory)

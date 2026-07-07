@@ -4,12 +4,14 @@
 //! learning (P3), anti-bloat (P4), dense semantic tier (P5).
 
 pub mod bloat;
+pub mod category;
 pub mod dialectic;
 pub mod dimension;
 pub mod embed;
 pub mod frontmatter;
 pub mod frozen_core;
 pub mod fuse;
+pub mod graph;
 pub mod learning;
 pub mod profile;
 pub mod provenance;
@@ -76,13 +78,21 @@ impl ScopeSel {
 /// most once/day. `cmd_search` (human inspection) and the bench deliberately use the read-only
 /// paths so only genuine context-injection grows the reuse signal.
 pub fn search_scoped(query: &str, k: usize, sel: &ScopeSel) -> Result<Vec<Hit>> {
-    let hits = search_filtered_scoped(query, k, None, sel)?;
+    let mut hits = search_filtered_scoped(query, k, None, sel)?;
+    // Graph EXPANSION (P5, bench-gated): pull in strong co-retrieval neighbors this lexical/dense
+    // query missed, before the reuse signal is recorded — so an expanded neighbor also counts as
+    // co-fired. Default-OFF (`NG_GRAPH_EXPAND`); the recording spine below always runs.
+    if graph::expansion_enabled() {
+        expand_with_graph(&mut hits, query, k, sel);
+    }
     record_reuse(&hits); // best-effort; never fails the search
     Ok(hits)
 }
 
-/// Reinforce every returned fact (per-day deduped) — implicit-reuse signal. Best-effort: a
-/// read-only store just means no signal this turn, never a failed retrieval.
+/// Reinforce every returned fact (per-day deduped) — implicit-reuse signal — AND record the
+/// co-retrieval event into the Hebbian graph (P5): the set of facts recalled together this turn
+/// gets its pairwise associations strengthened. Both are best-effort: a read-only store just means
+/// no signal this turn, never a failed retrieval.
 fn record_reuse(hits: &[Hit]) {
     if hits.is_empty() {
         return;
@@ -91,7 +101,67 @@ fn record_reuse(hits: &[Hit]) {
     for h in hits {
         let _ = store::record_retrieval(&h.entry, &today);
     }
+    // "Neurons that fire together wire together": one search that surfaced ≥2 facts is one co-fire
+    // event. Per-day-deduped per pair inside `record_coretrieval`, so a chatty session can't inflate
+    // a link. Best-effort — a graph write failure never breaks the search. Skipped when the
+    // `NG_NO_GRAPH` kill-switch is set (collapse to the pre-P5 path).
+    if hits.len() >= 2 && graph::recording_enabled() {
+        let ids: Vec<&str> = hits.iter().map(|h| h.entry.id.as_str()).collect();
+        let _ = graph::record_coretrieval(&ids, &today);
+    }
 }
+
+/// Widen `hits` with the strongest co-retrieval neighbors of the facts already retrieved (P5
+/// expansion). A neighbor is appended only if it isn't already present, is admitted by the scope
+/// selector, and is still an active fact; its score is the seed hit's score scaled by the (decayed)
+/// edge weight, so a graph-surfaced fact never outranks a genuine lexical/dense match. The list is
+/// re-truncated to `k`. Best-effort and cheap: skips entirely when the graph is empty.
+fn expand_with_graph(hits: &mut Vec<Hit>, _query: &str, k: usize, sel: &ScopeSel) {
+    if hits.is_empty() {
+        return;
+    }
+    let today = bloat::decay::today();
+    let present: HashSet<String> = hits.iter().map(|h| h.entry.id.clone()).collect();
+    // Gather candidate neighbor ids (id → best incoming edge weight) from every seed hit.
+    let mut cand: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for h in hits.iter() {
+        for (nid, w) in graph::neighbors(&h.entry.id, &today, k, GRAPH_EDGE_FLOOR) {
+            if present.contains(&nid) {
+                continue;
+            }
+            // Weight the neighbor by the seed's own score so it slots in below real matches.
+            let contributed = h.score * w;
+            cand.entry(nid).and_modify(|e| *e = e.max(contributed)).or_insert(contributed);
+        }
+    }
+    if cand.is_empty() {
+        return;
+    }
+    // Resolve candidate ids to active, scope-admitted entries.
+    let all = match store::load_all() {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+    let active = bloat::supersede::active(&all);
+    let current = config::project_slug();
+    for e in active {
+        if let Some(&score) = cand.get(&e.id) {
+            if sel.admits(e.scope.as_deref(), &current) {
+                hits.push(Hit { entry: e, score });
+            }
+        }
+    }
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then(b.entry.mtime_ms.cmp(&a.entry.mtime_ms))
+    });
+    hits.truncate(k);
+}
+
+/// Minimum decayed edge weight for a neighbor to be considered live (below this a link has faded).
+const GRAPH_EDGE_FLOOR: f64 = 0.35;
 
 /// The full retrieval pipeline with dimension + workspace-zone selection. The zone filter runs
 /// BEFORE the BM25 index is built (the index is corpus-relative — IDF/avgdl over exactly the
@@ -100,6 +170,19 @@ pub fn search_filtered_scoped(
     query: &str,
     k: usize,
     dim: Option<Dimension>,
+    sel: &ScopeSel,
+) -> Result<Vec<Hit>> {
+    search_filtered_scoped_cat(query, k, dim, None, sel)
+}
+
+/// As [`search_filtered_scoped`], plus an optional content-category filter (P3 CoALA typing) —
+/// e.g. show only `bug-history` or `security-rule` facts. Category is derived on load, orthogonal
+/// to the dimension filter, so the two compose (a `tooling` fact that is also a `command`).
+pub fn search_filtered_scoped_cat(
+    query: &str,
+    k: usize,
+    dim: Option<Dimension>,
+    cat: Option<crate::memory::category::Category>,
     sel: &ScopeSel,
 ) -> Result<Vec<Hit>> {
     let all = store::load_all()?;
@@ -129,6 +212,9 @@ pub fn search_filtered_scoped(
     };
     if let Some(d) = dim {
         hits.retain(|h| h.entry.dimension == d);
+    }
+    if let Some(c) = cat {
+        hits.retain(|h| h.entry.category == c);
     }
     let today = bloat::decay::today();
     let half_life = cfg.recency_half_life_days;
@@ -450,31 +536,55 @@ pub fn cmd_show(id_or_name: &str) -> Result<()> {
     }
 }
 
-pub fn cmd_search(query: &str, k: usize, dimension: Option<String>, scope: Option<&str>) -> Result<()> {
+pub fn cmd_search(
+    query: &str,
+    k: usize,
+    dimension: Option<String>,
+    category: Option<String>,
+    scope: Option<&str>,
+) -> Result<()> {
     let dim = match &dimension {
         Some(s) => Some(Dimension::parse(s).ok_or_else(|| {
             anyhow::anyhow!("unknown dimension '{s}' (style|tooling|workflow|stack|other)")
         })?),
         None => None,
     };
+    let cat = match &category {
+        Some(s) => Some(crate::memory::category::Category::parse(s).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown category '{s}' (bug-history|failed-attempt|success-pattern|arch-decision|command|security-rule|deploy-note|codebase|none)"
+            )
+        })?),
+        None => None,
+    };
     let sel = parse_scope_sel(scope);
-    let hits = search_filtered_scoped(query, k, dim, &sel)?;
+    let hits = search_filtered_scoped_cat(query, k, dim, cat, &sel)?;
     if hits.is_empty() {
-        let scope = dim.map(|d| format!(" in dimension '{}'", d.as_str())).unwrap_or_default();
-        println!("(no matches for '{query}'{scope})");
+        let d = dim.map(|d| format!(" in dimension '{}'", d.as_str())).unwrap_or_default();
+        let c = cat.map(|c| format!(" in category '{}'", c.as_str())).unwrap_or_default();
+        println!("(no matches for '{query}'{d}{c})");
         return Ok(());
     }
     for h in &hits {
         println!(
-            "{:.3}  [{}/{}]{} {}",
+            "{:.3}  [{}/{}]{}{} {}",
             h.score,
             h.entry.mtype.as_str(),
             h.entry.dimension.as_str(),
             zone_tag(&h.entry),
+            cat_tag(&h.entry),
             h.entry.name
         );
     }
     Ok(())
+}
+
+/// `[c:bug-history]` display tag for a categorized entry; empty for the `None` (uncategorized) case.
+fn cat_tag(e: &MemoryEntry) -> String {
+    match e.category {
+        crate::memory::category::Category::None => String::new(),
+        c => format!(" [c:{}]", c.as_str()),
+    }
 }
 
 /// Show the derived user profile (B2): a deterministic, free/local rollup of the user's
@@ -722,6 +832,36 @@ pub fn cmd_supersede(old: &str, new: &str) -> Result<()> {
     Ok(())
 }
 
+/// Show the Hebbian co-retrieval neighbors of a fact (P5): the other facts most often recalled
+/// together with it, ranked by decayed edge weight. Matches `id` by id or name. Inspection-only —
+/// reads the graph, never records a co-fire (so `ng memory neighbors` can't pollute its own signal).
+pub fn cmd_neighbors(id_or_name: &str, k: usize) -> Result<()> {
+    let all = store::load_all()?;
+    let key = id_or_name.to_lowercase();
+    let seed = all
+        .iter()
+        .find(|e| e.id == key || e.name.to_lowercase() == key)
+        .ok_or_else(|| anyhow::anyhow!("no memory matching '{id_or_name}'"))?;
+    let today = bloat::decay::today();
+    let neigh = graph::neighbors(&seed.id, &today, k, 0.0);
+    if neigh.is_empty() {
+        println!("({} has no co-retrieval associations yet)", seed.id);
+        return Ok(());
+    }
+    // Resolve neighbor ids to names/bodies for a legible listing (a dangling id is shown raw).
+    println!("neighbors of '{}' (co-recalled together, strongest first):\n", seed.id);
+    for (nid, w) in &neigh {
+        match all.iter().find(|e| &e.id == nid) {
+            Some(e) => {
+                let body: String = e.body.chars().take(70).collect();
+                println!("  {w:.3}  {}{} — {}", e.id, cat_tag(e), body.replace('\n', " "));
+            }
+            None => println!("  {w:.3}  {nid} (fact no longer present)"),
+        }
+    }
+    Ok(())
+}
+
 /// Restore an archived memory back into the live store.
 pub fn cmd_restore(id: &str) -> Result<()> {
     let restored = bloat::caps::restore(id)?;
@@ -755,6 +895,10 @@ pub fn cmd_compact() -> Result<()> {
         for id in &report.archived {
             println!("  ⌁ {id}");
         }
+    }
+    // P5: the same pass prunes co-retrieval edges to facts that no longer exist.
+    if report.edges_pruned > 0 {
+        println!("pruned {} dangling graph edge(s).", report.edges_pruned);
     }
     Ok(())
 }
@@ -959,6 +1103,36 @@ mod tests {
             config::embed_cache_dir().join(format!("{}.json", inner.id())).exists(),
             "embedding cache persisted to disk"
         );
+
+        std::env::remove_var("NEXTGEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn category_filter_separates_bug_from_decision_end_to_end() {
+        // P3: content-category is derived on load, so a search filtered to one category must return
+        // only facts whose text classifies there — proven through the real store, not just classify().
+        let _g = config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ng-cat-filter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("NEXTGEN_HOME", &dir);
+
+        use crate::memory::category::Category;
+        // non-user types so neither lands in the always-on frozen core (which search excludes).
+        store::add("parser crash", "", MemoryType::Project, "the parser hit a null pointer panic on empty input").unwrap();
+        store::add("store design", "", MemoryType::Project, "we decided the architecture uses one store per zone by convention").unwrap();
+
+        let unfiltered = search_filtered_scoped_cat("parser store", 10, None, None, &ScopeSel::All).unwrap();
+        assert!(unfiltered.len() >= 2, "both facts match unfiltered");
+
+        let bugs = search_filtered_scoped_cat("parser store", 10, None, Some(Category::BugHistory), &ScopeSel::All).unwrap();
+        assert!(!bugs.is_empty() && bugs.iter().all(|h| h.entry.category == Category::BugHistory), "bug filter returns only bug-history");
+        assert!(bugs.iter().any(|h| h.entry.body.contains("panic")));
+
+        let decisions = search_filtered_scoped_cat("parser store", 10, None, Some(Category::ArchDecision), &ScopeSel::All).unwrap();
+        assert!(!decisions.is_empty() && decisions.iter().all(|h| h.entry.category == Category::ArchDecision), "decision filter returns only arch-decision");
+        assert!(decisions.iter().all(|h| !h.entry.body.contains("panic")), "the bug is excluded from the decision view");
 
         std::env::remove_var("NEXTGEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);

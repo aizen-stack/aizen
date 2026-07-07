@@ -83,6 +83,7 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     r.register(Box::new(FileWrite::new(root.to_path_buf())));
     r.register(Box::new(ShellRun::new(root.to_path_buf())));
     r.register(Box::new(SkillSave));
+    register_skill_refine(&mut r);
     // Top-level only (NOT in role sub-agents) — the in-session list + process pool are shared, so a
     // sub-agent must not clobber them. `role_registry` builds its own list and never gets these.
     r.register(Box::new(crate::agent::todo::TodoWrite));
@@ -121,6 +122,15 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
 fn register_skill_load(r: &mut ToolRegistry) {
     if crate::skills::has_any() {
         r.register(Box::new(SkillLoad));
+    }
+}
+
+/// Advertise `skill_refine` only when at least one skill exists — you can't refine what isn't there,
+/// so it'd be pure schema-token cost on a fresh install. Destructive (rewrites + archives a skill),
+/// so it rides only the AUTHORING scopes (top-level + coder/specialist), never the read-only base.
+fn register_skill_refine(r: &mut ToolRegistry) {
+    if crate::skills::has_any() {
+        r.register(Box::new(SkillRefine));
     }
 }
 
@@ -245,6 +255,7 @@ pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
             r.register(Box::new(FileWrite::new(root.to_path_buf())));
             r.register(Box::new(ShellRun::new(root.to_path_buf())));
             r.register(Box::new(SkillSave));
+            register_skill_refine(&mut r);
         }
         "tester" => {
             r.register(Box::new(ShellRun::new(root.to_path_buf())));
@@ -276,6 +287,7 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
         r.register(Box::new(FileWrite::new(root.to_path_buf())));
         r.register(Box::new(ShellRun::new(root.to_path_buf())));
         r.register(Box::new(SkillSave));
+        register_skill_refine(&mut r);
         return r;
     }
     let mut granted: HashSet<&'static str> = HashSet::new();
@@ -291,7 +303,12 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
             "multi_edit" => r.register(Box::new(MultiEdit::new(root.to_path_buf()))),
             "file_write" => r.register(Box::new(FileWrite::new(root.to_path_buf()))),
             "shell_run" => r.register(Box::new(ShellRun::new(root.to_path_buf()))),
-            "skill_save" => r.register(Box::new(SkillSave)),
+            "skill_save" => {
+                // A persona granted skill authoring gets the refine companion too (gated on any
+                // skill existing — see register_skill_refine), so it can evolve, not just mint.
+                r.register(Box::new(SkillSave));
+                register_skill_refine(&mut r);
+            }
             _ => unreachable!("canonical_subagent_tool only yields grantable destructive tools"),
         }
     }
@@ -517,7 +534,8 @@ impl Tool for MemorySearch {
             "properties": {
                 "query": {"type": "string", "description": "what to recall"},
                 "limit": {"type": "integer", "description": "max hits (default 5)"},
-                "scope": {"type": "string", "enum": ["current", "all", "global"], "description": "zones to search: current project + global (default), all zones, or global-only"}
+                "scope": {"type": "string", "enum": ["current", "all", "global"], "description": "zones to search: current project + global (default), all zones, or global-only"},
+                "category": {"type": "string", "enum": ["bug-history", "failed-attempt", "success-pattern", "arch-decision", "command", "security-rule", "deploy-note", "codebase"], "description": "restrict to one KIND of project knowledge (optional) — e.g. only past bugs, or only what previously FAILED so you don't retry a dead end"}
             },
             "required": ["query"],
             "additionalProperties": false
@@ -539,7 +557,20 @@ impl Tool for MemorySearch {
             "global" => crate::memory::ScopeSel::Global,
             other => return Ok(format!("error: unknown scope '{other}' (use current|all|global)")),
         };
-        let hits = crate::memory::search_scoped(query, limit, &sel)?;
+        let cat = match args.get("category").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+            None => None,
+            Some(s) => match crate::memory::category::Category::parse(s) {
+                Some(c) => Some(c),
+                None => return Ok(format!("error: unknown category '{s}'")),
+            },
+        };
+        // record_reuse (the reinforcement write side-effect) is intentionally kept on the unfiltered
+        // `search_scoped` path; a category-filtered recall is an inspection, not organic reuse.
+        let hits = if cat.is_some() {
+            crate::memory::search_filtered_scoped_cat(query, limit, None, cat, &sel)?
+        } else {
+            crate::memory::search_scoped(query, limit, &sel)?
+        };
         if hits.is_empty() {
             return Ok(format!("(no memory matches '{query}')"));
         }
@@ -558,12 +589,19 @@ fn format_memory_hits(hits: &[crate::memory::Hit], max_tokens: usize) -> String 
             Some(z) => format!(" [p:{z}]"),
             None => String::new(),
         };
+        // Surface the CoALA content type when the fact HAS one, tagged with its neural bucket
+        // (episodic/semantic/procedural) so the agent can weight a past bug vs a durable decision.
+        let cat = match h.entry.category {
+            crate::memory::category::Category::None => String::new(),
+            c => format!(" [{}/{}]", c.kind().as_str(), c.as_str()),
+        };
         let line = format!(
-            "[{:.2}] {} ({}){} — {}\n",
+            "[{:.2}] {} ({}){}{} — {}\n",
             h.score,
             h.entry.name,
             h.entry.mtype.as_str(),
             zone,
+            cat,
             body.replace('\n', " ")
         );
         let cost = crate::memory::render::est_tokens(&line);
@@ -1726,7 +1764,13 @@ impl Tool for SkillLoad {
     fn execute(&self, args: &Value) -> Result<String> {
         let name = str_arg(args, "name")?;
         match crate::skills::load(name) {
-            Some(sk) => Ok(crate::skills::render_loaded(&sk)),
+            Some(sk) => {
+                // Voyager reinforcement: a real load is organic reuse — bump `uses` so a repeatedly
+                // useful skill floats to the top of the always-on index and survives its line cap.
+                // Best-effort: a bump failure (repo-shipped skill, or I/O) must never break the load.
+                let _ = crate::skills::record_use(name);
+                Ok(crate::skills::render_loaded(&sk))
+            }
             None => {
                 let avail: Vec<String> = crate::skills::list().into_iter().map(|s| s.name).collect();
                 Ok(format!("(no skill named '{name}'; available: {})", avail.join(", ")))
@@ -1775,6 +1819,52 @@ impl Tool for SkillSave {
         let project_zone = matches!(args.get("scope").and_then(|v| v.as_str()).map(str::trim), Some("project"));
         let path = crate::skills::save_scoped(name, description, when, body, project_zone)?;
         Ok(format!("saved skill '{name}' → {}", path.display()))
+    }
+}
+
+// ── skill_refine ─────────────────────────────────────────────────────────────
+
+/// Voyager curriculum: improve an EXISTING skill's steps in place, archiving the prior version so
+/// nothing learned is lost and the usage track record carries forward. This is the "skills get
+/// better with experience" tool — distinct from `skill_save` (which mints a NEW skill and refuses
+/// to touch an existing one).
+struct SkillRefine;
+impl Tool for SkillRefine {
+    fn name(&self) -> &str {
+        "skill_refine"
+    }
+    fn description(&self) -> &str {
+        "Improve an EXISTING skill's steps after you found a better way — e.g. a step failed and a \
+         corrected sequence worked. Rewrites the skill's body, bumps its version, archives the old \
+         copy (nothing is lost), and preserves its usage count. Use this instead of skill_save when \
+         the skill already exists. The new steps replace the old ones, so include the whole procedure."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "the existing skill's name (from <skills>)"},
+                "body": {"type": "string", "description": "the improved full steps / procedure (replaces the old body)"},
+                "description": {"type": "string", "description": "optional new one-line summary (kept if omitted)"},
+                "when": {"type": "string", "description": "optional new trigger hint (kept if omitted)"}
+            },
+            "required": ["name", "body"],
+            "additionalProperties": false
+        })
+    }
+    fn is_destructive(&self) -> bool {
+        true
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
+    fn execute(&self, args: &Value) -> Result<String> {
+        let name = str_arg(args, "name")?;
+        let body = str_arg(args, "body")?;
+        let description = args.get("description").and_then(|v| v.as_str());
+        let when = args.get("when").and_then(|v| v.as_str());
+        let (version, archived) = crate::skills::refine(name, body, description, when)?;
+        Ok(format!("refined skill '{name}' → v{version} (prior version archived at {})", archived.display()))
     }
 }
 

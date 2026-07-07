@@ -91,6 +91,9 @@ pub struct MemoryEntry {
     pub subpath: Option<String>,
     /// Topical dimension (B1) — DERIVED on load by `dimension::classify`, not stored.
     pub dimension: Dimension,
+    /// Content category (P3 CoALA typing) — DERIVED on load by `category::classify`, not stored.
+    /// Orthogonal to `mtype` (scope) and `dimension` (user-profile facet).
+    pub category: crate::memory::category::Category,
 }
 
 impl Default for MemoryEntry {
@@ -118,6 +121,7 @@ impl Default for MemoryEntry {
             scope: None,
             subpath: None,
             dimension: Dimension::Other,
+            category: crate::memory::category::Category::None,
         }
     }
 }
@@ -147,7 +151,9 @@ impl MemoryEntry {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let tokens = tokenize(&format!("{name}\n{description}\n{}", fm.body));
-        let dimension = crate::memory::dimension::classify(&format!("{name} {description} {}", fm.body));
+        let classify_text = format!("{name} {description} {}", fm.body);
+        let dimension = crate::memory::dimension::classify(&classify_text);
+        let category = crate::memory::category::classify(&classify_text);
         // learned-fact meta (absent on hand-authored files → trust-as-manual defaults)
         let source = match fm.get("source") {
             Some(s) => ProvenanceKind::parse(s),
@@ -211,6 +217,7 @@ impl MemoryEntry {
             scope,
             subpath,
             dimension,
+            category,
         })
     }
 }
