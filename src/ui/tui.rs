@@ -147,23 +147,56 @@ const STAR: [&str; 6] = ["✶", "✷", "✸", "✹", "✺", "✻"];
 /// thinking" flavour, Claude-Code style. Purely cosmetic: the elapsed clock + the `↑N tok` counter
 /// are the real liveness signal.
 const VERBS: &[&str] = &[
-    "Đang nghiền ngẫm",
-    "Đang suy tư",
-    "Đang dệt chữ",
-    "Đang mài giũa",
-    "Đang lục lọi",
-    "Đang xâu chuỗi",
-    "Đang chưng cất",
-    "Đang thai nghén",
-    "Đang gọt giũa",
-    "Đang mường tượng",
-    "Đang cân não",
-    "Đang hì hục",
-    "Đang xoay xở",
-    "Đang tính toán",
-    "Đang liên kết ý",
-    "Đang gói ghém",
+    "Pondering",
+    "Contemplating",
+    "Weaving words",
+    "Honing",
+    "Rummaging",
+    "Threading ideas",
+    "Distilling",
+    "Incubating",
+    "Refining",
+    "Envisioning",
+    "Racking my brain",
+    "Toiling",
+    "Figuring it out",
+    "Calculating",
+    "Linking ideas",
+    "Wrapping up",
 ];
+/// Rotating one-line tips shown under each submitted message (Claude-Code style) — a quiet
+/// discoverability nudge for a feature the user may not know. Each turn advances by one (seeded off
+/// `TIP_SEED`), so a session slowly surfaces the whole set instead of repeating one. Kept short so
+/// they fit one line; silenced with `AIZEN_NO_TIPS`.
+const TIPS: &[&str] = &[
+    "type `/` to browse commands, or `@` to attach a file",
+    "press Esc to cancel the current turn without quitting",
+    "`#remember <fact>` teaches the memory brain a durable fact",
+    "start a line with `!` to run a shell command inline",
+    "`/model` switches models mid-session; `/config` opens setup",
+    "`/persona` role-plays a character with its own evolving memory",
+    "`/compact` summarizes old turns to free up context",
+    "`/time` saves & restores code checkpoints (git-backed)",
+    "`/skills` loads reusable step-by-step procedures on demand",
+    "delegate a sub-task with the `task` tool for parallel work",
+    "`/cost` and `/tokens` show this session's usage",
+    "set a Tavily key (`/config`) to unlock `web_search`",
+    "`/apps` connects GitHub, Notion, Slack & more via MCP",
+    "`/yolo` auto-approves tool calls; `/smart` approves read-only",
+];
+/// Per-session tip cursor — advanced once per submitted turn so tips rotate rather than repeat.
+static TIP_SEED: AtomicUsize = AtomicUsize::new(0);
+
+/// The next rotating tip line (`""` when tips are off via `AIZEN_NO_TIPS`, or on a pipe/CI). Advances
+/// the cursor each call, so successive turns show successive tips.
+pub fn next_tip() -> &'static str {
+    if crate::core::cli_config::branded_flag("NO_TIPS") || !std::io::stdout().is_terminal() {
+        return "";
+    }
+    let i = TIP_SEED.fetch_add(1, Ordering::Relaxed);
+    TIPS[i % TIPS.len()]
+}
+
 /// Current spinner frame index (advanced by the ticker thread; read by `paint_box`).
 static WORK_FRAME: AtomicUsize = AtomicUsize::new(0);
 /// Rough count of streamed OUTPUT characters this turn (÷4 ≈ tokens) — drives the live "↑N tok"
@@ -1211,6 +1244,23 @@ mod tests {
         for f in STAR {
             assert_eq!(measure_text_width(f), 1, "{f:?} must be a single cell");
         }
+    }
+
+    #[test]
+    fn tips_are_nonempty_one_line_and_rotate() {
+        // Every tip must be a single non-empty line (they render on one dim row under the message).
+        assert!(!TIPS.is_empty(), "there must be at least one tip");
+        for t in TIPS {
+            assert!(!t.trim().is_empty(), "a tip must not be blank");
+            assert!(!t.contains('\n'), "a tip must be a single line: {t:?}");
+        }
+        // The rotation cursor advances by one per pull, wrapping the set — consecutive pulls index
+        // consecutive tips (modulo the seed's current value, which sibling tests may have bumped).
+        let base = TIP_SEED.load(Ordering::Relaxed);
+        let a = TIPS[base % TIPS.len()];
+        let b = TIPS[(base + 1) % TIPS.len()];
+        assert_eq!(TIPS[TIP_SEED.fetch_add(1, Ordering::Relaxed) % TIPS.len()], a);
+        assert_eq!(TIPS[TIP_SEED.fetch_add(1, Ordering::Relaxed) % TIPS.len()], b);
     }
 
     #[test]

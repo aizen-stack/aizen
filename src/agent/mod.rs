@@ -265,6 +265,12 @@ pub struct AgentConfig {
     /// the whole session's edits are rewindable (W15). Best-effort (no-op outside a git repo).
     /// Default `true`; tests set it `false` (their cwd is a real repo — no checkpoint pollution).
     pub auto_checkpoint: bool,
+    /// Stamp a time-machine checkpoint AFTER every turn that successfully edited files (Cline-style
+    /// per-step snapshots), so each editing step is an independent restore point — not just the one
+    /// pre-run snapshot from `auto_checkpoint`. Best-effort + dedup'd (a zero-diff tree reuses the
+    /// last snapshot), so quiet turns cost nothing. Requires `auto_checkpoint`; default `true`,
+    /// forced `false` in tests (their cwd is a real repo).
+    pub checkpoint_each_edit: bool,
     /// The model's context window in tokens, for the mid-loop context guard. A single run-away
     /// loop (reading many large files) can blow past the window BEFORE control returns to the
     /// REPL's auto-compact; when the running history crosses ~90% of this, the loop injects a
@@ -333,6 +339,7 @@ impl Default for AgentConfig {
             enable_verify_gate: true,
             verify_gate_timeout_secs: 90,
             auto_checkpoint: true,
+            checkpoint_each_edit: true,
             context_window: 0,
             keep_recent_tool_results: 8,
             clear_tool_result_min_chars: 1024,
@@ -825,26 +832,53 @@ where
             // extra. Nudge mode makes THIS model re-read its own diff.
             if cfg.enable_self_review && made_any_edits && !self_review_done {
                 self_review_done = true;
-                let injected = match &oracle {
-                    Some(o) => oracle_review(o, messages).await.map(|findings| {
-                        format!(
-                            "[self-review]\n{findings}\n\nFix anything valid above, or state briefly why a point does not apply — then give your final answer."
-                        )
-                    }),
-                    None => Some(SELF_REVIEW_NUDGE.to_string()),
-                };
-                if let Some(text) = injected {
-                    // Record the premature "done" so the review turn reads coherently.
-                    if let Some(t) = &turn.content {
-                        if !t.trim().is_empty() {
-                            messages.push(Message::assistant(t.clone()));
+                match &oracle {
+                    // ORACLE MODE: the verify step gates Done. A review with a [BLOCKING] finding
+                    // costs one fix-or-rebut turn; an all-[ADVISORY] review is surfaced ONCE as a
+                    // note (so the user sees the cleanup suggestions) but does NOT hold Done — the
+                    // model isn't forced to churn on style. LGTM / no-diff falls straight through.
+                    Some(o) => {
+                        if let Some(review) = oracle_review(o, messages).await {
+                            if review.blocking {
+                                // Record the premature "done" so the review turn reads coherently,
+                                // then hand back a fix-or-rebut turn (the verify step gates Done).
+                                if let Some(t) = &turn.content {
+                                    if !t.trim().is_empty() {
+                                        messages.push(Message::assistant(t.clone()));
+                                    }
+                                }
+                                messages.push(Message::user(format!(
+                                    "[self-review]\n{}\n\nFix each [BLOCKING] item above, or state briefly why it does not apply — then give your final answer. [ADVISORY] items are optional.",
+                                    review.findings
+                                )));
+                                iter += 1;
+                                continue;
+                            }
+                            // Advisory-only: surface the notes ONCE as a trace (they don't gate
+                            // Done — the model isn't forced to churn on style), then finish this
+                            // turn. Falls through to the shared Done return below, which records the
+                            // final assistant text exactly once (no duplicate).
+                            if !cfg.quiet {
+                                emit_trace(&format!(
+                                    "  ⎿ self-review: advisory only (no blocking issue)\n{}",
+                                    review.findings
+                                ));
+                            }
                         }
+                        // else: LGTM / no diff → fall through to Done, no extra turn.
                     }
-                    messages.push(Message::user(text));
-                    iter += 1;
-                    continue;
+                    // NUDGE MODE (no oracle): the model re-reads its own diff. One turn, always.
+                    None => {
+                        if let Some(t) = &turn.content {
+                            if !t.trim().is_empty() {
+                                messages.push(Message::assistant(t.clone()));
+                            }
+                        }
+                        messages.push(Message::user(SELF_REVIEW_NUDGE.to_string()));
+                        iter += 1;
+                        continue;
+                    }
                 }
-                // Oracle said LGTM (or no diff to review) → fall through to Done, no extra turn.
             }
 
             // Push the final assistant text so a multi-turn caller (REPL) keeps context.
@@ -950,6 +984,21 @@ where
             made_any_edits = true;
             // Fresh work invalidates any prior clean check — the gate must re-verify (W8).
             verify_passed = false;
+            // PER-STEP CHECKPOINT (Cline-style): after each turn whose edits SUCCEEDED, stamp a
+            // restore point so every editing step is independently rewindable — not just the whole
+            // run from the single pre-edit snapshot. Best-effort; `save` dedups a zero-diff tree, so
+            // a turn that only ran (say) a shell build with no file change costs nothing. Runs AFTER
+            // the pre-fill/execute so the snapshot captures the POST-edit tree.
+            if cfg.checkpoint_each_edit {
+                if let Ok(snap) = crate::features::timemachine::save("after agent edit", true) {
+                    if !cfg.quiet {
+                        emit_trace(&format!(
+                            "  ⎿ checkpoint #{} (restore with `aizen time restore {}`)",
+                            snap.id, snap.id
+                        ));
+                    }
+                }
+            }
         }
 
         // PROGRESS / THRASH GUARD (W3/W4): a turn is PRODUCTIVE iff a successful edit landed OR some
@@ -1360,6 +1409,21 @@ fn gate_and_approve(tool: &dyn tools::Tool, args: &serde_json::Value, cfg: &Agen
                 ));
             }
             cmd_guard::Verdict::Allow => smart_allow = cfg.smart_approve,
+            cmd_guard::Verdict::Caution(reason) => {
+                // A risky-but-legit git op (force-push, reset --hard, push to main, …). Surface the
+                // specific reason, then ALWAYS fall through to the approval prompt — `smart` must not
+                // auto-clear it (leave smart_allow false), so this can never be silently auto-run.
+                let line = format!(
+                    "{} {}",
+                    style("⚠ caution").color256(crate::ui::theme::WARN).bold(),
+                    style(&reason).dim()
+                );
+                if crate::ui::tui::active() {
+                    crate::ui::tui::emit_line(&line);
+                } else if !cfg.quiet {
+                    eprintln!("{line}");
+                }
+            }
             cmd_guard::Verdict::Ask => {}
         }
     }
@@ -1472,7 +1536,7 @@ fn is_edit_tool(name: &str) -> bool {
 }
 
 /// Count added / removed lines in a unified-diff-bearing result: lines beginning `+` / `-` at
-/// column 0. The `…(N dòng …)` cap notes begin with `…` and context lines with a space, so neither
+/// column 0. The `…(N more lines …)` cap notes begin with `…` and context lines with a space, so neither
 /// is miscounted.
 fn count_diff(out: &str) -> (usize, usize) {
     let (mut add, mut del) = (0usize, 0usize);
@@ -1486,13 +1550,13 @@ fn count_diff(out: &str) -> (usize, usize) {
     (add, del)
 }
 
-/// `edited src/foo.rs (2 replacement(s))` → `sửa src/foo.rs`; `created src/foo.rs` → `tạo src/foo.rs`.
+/// `edited src/foo.rs (2 replacement(s))` → `edited src/foo.rs`; `created src/foo.rs` → `created src/foo.rs`.
 fn edit_target(head: &str) -> String {
     let mut it = head.split_whitespace();
     match (it.next(), it.next()) {
-        (Some("created"), Some(path)) => format!("tạo {path}"),
-        (Some(_), Some(path)) => format!("sửa {path}"),
-        _ => "sửa".to_string(),
+        (Some("created"), Some(path)) => format!("created {path}"),
+        (Some(_), Some(path)) => format!("edited {path}"),
+        _ => "edited".to_string(),
     }
 }
 
@@ -1510,7 +1574,7 @@ fn emit_edit_diff(out: &str) {
             _ => continue,
         };
         if shown == MAX_SHOWN {
-            emit_trace(&format!("    {}", crate::ui::theme::faint("… (diff rút gọn)")));
+            emit_trace(&format!("    {}", crate::ui::theme::faint("… (diff trimmed)")));
             break;
         }
         let clipped: String = content.chars().take(budget).collect();
@@ -1526,13 +1590,13 @@ fn emit_edit_diff(out: &str) {
 
 /// Build the `⎿` summary for a tool result, returning `(ok, text)` (`ok=false` → coloured as a
 /// failure). Parses the tool's OWN returned string — no `Tool` trait change — minting a concise
-/// Vietnamese label for the high-traffic tools and reusing the tool's own one-line header where it
+/// label for the high-traffic tools and reusing the tool's own one-line header where it
 /// already reads well (LSP `N reference(s)`, `search_files` `N match(es) in M file(s)`, `web_crawl`,
 /// `todo_write`).
 fn summarize_result(name: &str, out: &str) -> (bool, String) {
     let trimmed = out.trim_start();
     if let Some(reason) = trimmed.strip_prefix("error:") {
-        return (false, format!("lỗi: {}", first_line_clip(reason.trim(), 60)));
+        return (false, format!("error: {}", first_line_clip(reason.trim(), 60)));
     }
     let first = out.lines().next().unwrap_or("");
     match name {
@@ -1544,15 +1608,15 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
             match code {
                 Some(0) => (true, "exit 0".to_string()),
                 Some(n) => (false, format!("exit {n}")),
-                None => (true, "xong".to_string()),
+                None => (true, "done".to_string()),
             }
         }
-        "file_read" | "read_file" => (true, format!("đọc {} dòng", out.lines().count())),
+        "file_read" | "read_file" => (true, format!("read {} lines", out.lines().count())),
         "file_glob" => {
             if trimmed.starts_with("(no files") {
-                (true, "0 tệp".to_string())
+                (true, "0 files".to_string())
             } else {
-                (true, format!("{} tệp", out.lines().count()))
+                (true, format!("{} files", out.lines().count()))
             }
         }
         "file_edit" | "edit_file" | "apply_patch" => {
@@ -1569,31 +1633,31 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
         }
         "file_write" | "write_file" => {
             // out first line = "created <path> (N line(s))" | "overwrote <path> (N line(s))"
-            let verb = if first.starts_with("overwrote") { "ghi đè" } else { "tạo" };
+            let verb = if first.starts_with("overwrote") { "overwrote" } else { "created" };
             let path = first.split_whitespace().nth(1).unwrap_or("");
             (true, format!("{verb} {path}"))
         }
         "memory_search" => {
             if trimmed.starts_with("(no memory") {
-                (true, "0 ghi nhớ".to_string())
+                (true, "0 memories".to_string())
             } else {
-                (true, format!("{} ghi nhớ", out.lines().filter(|l| l.starts_with('[')).count()))
+                (true, format!("{} memories", out.lines().filter(|l| l.starts_with('[')).count()))
             }
         }
         "web_search" => {
             if trimmed.starts_with("(no results") {
-                (true, "0 kết quả".to_string())
+                (true, "0 results".to_string())
             } else {
                 let n = out.lines().filter(|l| l.trim_start().starts_with(|c: char| c.is_ascii_digit())).count();
-                (true, format!("{n} kết quả"))
+                (true, format!("{n} results"))
             }
         }
         "web_fetch" => {
             let kb = out.len() as f64 / 1024.0;
             if kb >= 1.0 {
-                (true, format!("tải {kb:.0} KB"))
+                (true, format!("fetched {kb:.0} KB"))
             } else {
-                (true, format!("{} ký tự", out.chars().count()))
+                (true, format!("{} chars", out.chars().count()))
             }
         }
         // Everything else already returns a good one-line header (`N reference(s)`,
@@ -1602,7 +1666,7 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
         _ => {
             let f = out.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
             if f.is_empty() {
-                (true, "xong".to_string())
+                (true, "done".to_string())
             } else {
                 (true, first_line_clip(f.trim_end_matches(':'), 60))
             }
@@ -1885,10 +1949,33 @@ const SELF_REVIEW_NUDGE: &str =
      every requirement is met and nothing unrelated changed. Fix or flag anything off, then give \
      your final answer.";
 
+/// The outcome of one oracle self-review pass.
+struct ReviewOutcome {
+    /// The findings text to inject (already formatted, most-severe first).
+    findings: String,
+    /// `true` if at least one finding is a VERIFIED correctness problem (a bug or missed
+    /// requirement) — those gate Done (the model MUST fix or rebut). `false` when every finding is
+    /// ADVISORY (cleanup/style): surfaced once, but Done is NOT held hostage to it.
+    blocking: bool,
+}
+
+/// Does a review verdict carry at least one VERIFIED correctness problem? Keyed on the `[BLOCKING]`
+/// tag (case-insensitive) the oracle is instructed to prefix such lines with. Pure so it's unit-
+/// testable without a live model or a git tree.
+fn review_is_blocking(review: &str) -> bool {
+    review.to_ascii_uppercase().contains("[BLOCKING]")
+}
+
 /// Ask the oracle (a usually-stronger model) to review the working-tree diff against the original
 /// request. `None` ⇒ nothing actionable (no git / empty diff / LGTM / call failed) — the loop
 /// falls through to Done without burning a turn.
-async fn oracle_review<O, OFut>(oracle: &O, messages: &[Message]) -> Option<String>
+///
+/// The oracle is asked to VERIFY each candidate finding against how the code actually behaves and
+/// tag it `[BLOCKING]` (a real bug / missed requirement, evidenced) or `[ADVISORY]` (cleanup, style,
+/// nice-to-have). This mirrors the SOTA pattern (Claude Code's `/code-review`): the verify step —
+/// not the raw candidate list — is what gates Done, so a pile of style nits can't force a fix turn
+/// while a genuine bug always does.
+async fn oracle_review<O, OFut>(oracle: &O, messages: &[Message]) -> Option<ReviewOutcome>
 where
     O: Fn(Vec<Message>) -> OFut,
     OFut: Future<Output = Result<String>>,
@@ -1903,15 +1990,24 @@ where
         .take(2_000)
         .collect();
     let sys = Message::system(
-        "You are a rigorous senior code reviewer. Review the DIFF against the ORIGINAL REQUEST. \
-         List only REAL problems (bugs, missed requirements, unintended changes) with file:line \
-         evidence, most severe first. If the diff is sound, reply with exactly: LGTM",
+        "You are a rigorous senior code reviewer. Review the DIFF against the ORIGINAL REQUEST in \
+         two steps. STEP 1 — find candidate problems. STEP 2 — VERIFY each against how the code \
+         actually behaves and KEEP only the ones you can stand behind. For each surviving finding \
+         emit ONE line, most severe first, prefixed with a tag:\n\
+         [BLOCKING] a real bug, a broken build, or a missed/incorrect requirement — with file:line evidence.\n\
+         [ADVISORY] cleanup, style, or a nice-to-have that does NOT affect correctness.\n\
+         If the diff is correct and complete, reply with exactly: LGTM",
     );
     let usr = Message::user(format!("ORIGINAL REQUEST:\n{task}\n\nDIFF:\n{diff}"));
     match oracle(vec![sys, usr]).await {
         Ok(s) => {
-            let t = s.trim().to_string();
-            (!t.is_empty() && !t.eq_ignore_ascii_case("lgtm")).then_some(t)
+            let t = s.trim();
+            if t.is_empty() || t.eq_ignore_ascii_case("lgtm") {
+                return None;
+            }
+            // A finding is BLOCKING iff any line is tagged [BLOCKING] (case-insensitive). An
+            // all-advisory review is surfaced but must not gate Done.
+            Some(ReviewOutcome { findings: t.to_string(), blocking: review_is_blocking(t) })
         }
         Err(_) => None, // best-effort: a failing oracle never blocks Done
     }
@@ -2238,16 +2334,16 @@ mod tests {
 
     #[test]
     fn summarize_result_reads_signal_from_each_tool() {
-        assert_eq!(summarize_result("file_read", "l1\nl2\nl3"), (true, "đọc 3 dòng".to_string()));
+        assert_eq!(summarize_result("file_read", "l1\nl2\nl3"), (true, "read 3 lines".to_string()));
         assert_eq!(summarize_result("shell_run", "exit 0\nok"), (true, "exit 0".to_string()));
         assert_eq!(summarize_result("shell_run", "exit 2\nboom"), (false, "exit 2".to_string()));
-        assert_eq!(summarize_result("file_glob", "a.rs\nb.rs"), (true, "2 tệp".to_string()));
-        assert_eq!(summarize_result("file_glob", "(no files match 'x')"), (true, "0 tệp".to_string()));
+        assert_eq!(summarize_result("file_glob", "a.rs\nb.rs"), (true, "2 files".to_string()));
+        assert_eq!(summarize_result("file_glob", "(no files match 'x')"), (true, "0 files".to_string()));
         // an edit result → target + counts derived from the embedded unified diff
         let edit = "edited src/x.rs (1 replacement(s))\n a\n-old\n+new\n b";
         let (ok, s) = summarize_result("file_edit", edit);
-        assert!(ok && s.starts_with("sửa src/x.rs") && s.contains("+1"), "{s:?}");
-        assert_eq!(summarize_result("file_edit", "created src/n.rs"), (true, "tạo src/n.rs".to_string()));
+        assert!(ok && s.starts_with("edited src/x.rs") && s.contains("+1"), "{s:?}");
+        assert_eq!(summarize_result("file_edit", "created src/n.rs"), (true, "created src/n.rs".to_string()));
         // a tool with no special arm reuses its own header (sans a trailing ':')
         assert_eq!(
             summarize_result("search_files", "7 match(es) in 2 file(s):\nsrc/a.rs:3: hit"),
@@ -2255,19 +2351,19 @@ mod tests {
         );
         // an error is coloured as a failure
         let (ok, s) = summarize_result("file_edit", "error: old_string not found");
-        assert!(!ok && s.starts_with("lỗi:"), "{s:?}");
+        assert!(!ok && s.starts_with("error:"), "{s:?}");
     }
 
     #[test]
     fn count_diff_counts_only_column0_markers() {
-        let out = "edited x (1)\n a\n-gone\n+added\n+also\n…(3 dòng thêm nữa)\n b";
+        let out = "edited x (1)\n a\n-gone\n+added\n+also\n…(3 more lines added)\n b";
         assert_eq!(count_diff(out), (2, 1), "two '+' lines, one '-'; '…' and ' ' ignored");
     }
 
     #[test]
     fn edit_target_labels_create_vs_edit() {
-        assert_eq!(edit_target("edited src/x.rs (1 replacement(s))"), "sửa src/x.rs");
-        assert_eq!(edit_target("created src/n.rs"), "tạo src/n.rs");
+        assert_eq!(edit_target("edited src/x.rs (1 replacement(s))"), "edited src/x.rs");
+        assert_eq!(edit_target("created src/n.rs"), "created src/n.rs");
     }
 
     // ── test tools ──────────────────────────────────────────────────────────
@@ -2489,6 +2585,7 @@ mod tests {
             enable_verify_gate: false,
             verify_gate_timeout_secs: 90,
             auto_checkpoint: false, // OFF in tests: cwd is a real repo — no checkpoint pollution
+            checkpoint_each_edit: false, // OFF in tests for the same reason
             context_window: 0, // guard off by default in tests; the guard test sets it explicitly
             keep_recent_tool_results: 8,
             clear_tool_result_min_chars: 1024,
@@ -2948,6 +3045,11 @@ mod tests {
         // OFF (the test cwd is a real git repo — a checkpoint per destructive test would pollute it).
         assert!(AgentConfig::default().auto_checkpoint, "production default must be ON");
         assert!(!cfg().auto_checkpoint, "test cfg must force it OFF to avoid repo pollution");
+        // The per-edit-turn checkpoint (Cline-style: a restore point after EACH editing turn, not
+        // just once before the first) is gated behind the SAME latch, so it also defaults ON in
+        // production and OFF in tests — a per-edit checkpoint would pollute the real test repo.
+        assert!(AgentConfig::default().checkpoint_each_edit, "per-edit checkpoint default must be ON");
+        assert!(!cfg().checkpoint_each_edit, "test cfg must force per-edit checkpoint OFF");
     }
 
     #[tokio::test]
@@ -3389,6 +3491,18 @@ mod tests {
             .count();
         assert_eq!(reviews, 1, "exactly one review turn, never a loop");
         assert_valid_history(&messages);
+    }
+
+    #[test]
+    fn review_blocking_classification() {
+        // A [BLOCKING] tag anywhere → gates Done; an all-[ADVISORY] review does not.
+        assert!(review_is_blocking("[BLOCKING] src/a.rs:10 off-by-one in the loop bound"));
+        assert!(review_is_blocking(
+            "[ADVISORY] rename foo\n[BLOCKING] src/b.rs:3 missed the null check"
+        ), "one blocking line among advisories still gates");
+        assert!(review_is_blocking("[blocking] lowercase tag still counts"));
+        assert!(!review_is_blocking("[ADVISORY] tidy the imports\n[ADVISORY] add a doc comment"));
+        assert!(!review_is_blocking("looks fine, just nits"));
     }
 
     #[tokio::test]

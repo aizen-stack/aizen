@@ -1517,6 +1517,10 @@ fn run_time(cmd: TimeCmd) -> Result<()> {
             let snap = timemachine::restore(id)?;
             let label = if snap.label.is_empty() { "(no label)".to_string() } else { snap.label.clone() };
             println!("{} #{} — {label}", style("⏪ restored to").color256(splash::ACCENT), snap.id);
+            // Say WHAT changed and that it's undoable: aizen only rewinds the working tree (files),
+            // never your chat/history — and because the pre-restore state was auto-snapshotted, you
+            // can always go forward again (`aizen time redo`, or restore the newest checkpoint).
+            println!("{}", style("  files only — your conversation is untouched · reversible with `aizen time redo`").dim());
             Ok(())
         }
         TimeCmd::Undo => {
@@ -1567,7 +1571,16 @@ fn print_timeline() -> Result<()> {
 }
 
 /// `/timeline` — interactive time machine: pick a checkpoint to restore, or save a new one.
-async fn timeline_menu() -> Result<()> {
+///
+/// Restore offers up to three tiers (Cline-style), depending on whether the checkpoint captured the
+/// conversation too:
+///   • Restore Files — rewind only the working tree; the chat stays (always available).
+///   • Restore Task Only — rewind only the conversation to where it was then; files stay.
+///   • Restore Files & Task — rewind both.
+/// A checkpoint saved through `/timeline` / `/checkpoint` carries a chat sidecar (all three tiers);
+/// an auto/agent checkpoint is Files-only. Every restore is reversible — the pre-restore tree is
+/// auto-snapshotted, and the current chat is saved to the `last` session before a task rewind.
+async fn timeline_menu(history: &mut Vec<Message>, model_label: &mut String) -> Result<()> {
     let theme = ui_theme();
     loop {
         let (snaps, cursor) = match timemachine::timeline() {
@@ -1585,32 +1598,101 @@ async fn timeline_menu() -> Result<()> {
                 let here = if Some(i) == cursor { "▸ " } else { "  " };
                 let label = if s.label.is_empty() { "(no label)".to_string() } else { s.label.clone() };
                 let tag = if s.auto { " · auto" } else { "" };
-                format!("{here}#{} {}  {label}{tag}", s.id, style(&s.created).dim())
+                let chat = if s.has_chat { " · +chat" } else { "" };
+                format!("{here}#{} {}  {label}{tag}{chat}", s.id, style(&s.created).dim())
             })
             .collect();
-        items.push("✚ Save a checkpoint now".to_string());
+        items.push("✚ Save a checkpoint now (code + chat)".to_string());
         items.push("Back".to_string());
-        let prompt = format!("Time machine — {n} checkpoint(s); pick one to restore (Esc to go back)");
+        let prompt = format!(
+            "Time machine — {n} checkpoint(s); pick one to restore (reversible). Esc to go back"
+        );
         let pick = match Select::with_theme(&theme).with_prompt(prompt).items(&items).default(cursor.unwrap_or(0)).interact_opt()? {
             Some(i) => i,
             None => return Ok(()),
         };
         if pick < n {
-            match timemachine::restore(snaps[pick].id) {
-                Ok(s) => println!("{} #{}", style("⏪ restored to").color256(splash::ACCENT), s.id),
-                Err(e) => println!("{}", style(format!("restore failed: {e}")).red()),
-            }
+            restore_menu(&snaps[pick], history, model_label, &theme)?;
         } else if pick == n {
             let label: String =
                 Input::with_theme(&theme).with_prompt("Label (optional)").allow_empty(true).interact_text()?;
-            match timemachine::save(label.trim(), false) {
-                Ok(s) => println!("{} #{}", style("✓ checkpoint").color256(splash::ACCENT), s.id),
+            // Capture the conversation alongside the tree so this checkpoint supports task restore.
+            match timemachine::save_with_chat(label.trim(), false, history) {
+                Ok(s) => println!("{} #{} (code + chat)", style("✓ checkpoint").color256(splash::ACCENT), s.id),
                 Err(e) => println!("{}", style(format!("save failed: {e}")).red()),
             }
         } else {
             return Ok(());
         }
     }
+}
+
+/// The per-checkpoint restore sub-menu: Files / Task / Both, gated on whether a chat sidecar exists.
+fn restore_menu(
+    snap: &timemachine::Snapshot,
+    history: &mut Vec<Message>,
+    model_label: &mut String,
+    theme: &dialoguer::theme::ColorfulTheme,
+) -> Result<()> {
+    // Files-only checkpoints (auto/agent) can't restore the chat — do the files rewind directly.
+    if !snap.has_chat {
+        return files_restore(snap.id);
+    }
+    let opts = [
+        "Restore Files (code only — chat stays)",
+        "Restore Task Only (chat only — files stay)",
+        "Restore Files & Task (both)",
+        "Cancel",
+    ];
+    let pick = match Select::with_theme(theme)
+        .with_prompt(format!("Restore checkpoint #{} — what to rewind?", snap.id))
+        .items(&opts)
+        .default(0)
+        .interact_opt()?
+    {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+    match pick {
+        0 => files_restore(snap.id)?,
+        1 => task_restore(snap.id, history, model_label)?,
+        2 => {
+            files_restore(snap.id)?;
+            task_restore(snap.id, history, model_label)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Rewind only the working tree to checkpoint `id` (reversible — pre-restore tree auto-saved).
+fn files_restore(id: u32) -> Result<()> {
+    match timemachine::restore(id) {
+        Ok(s) => {
+            println!("{} #{} — files rewound; your chat is untouched", style("⏪ restored").color256(splash::ACCENT), s.id);
+            println!("{}", style("  (reversible — the pre-restore tree was auto-saved; pick it to go back)").dim());
+        }
+        Err(e) => println!("{}", style(format!("restore failed: {e}")).red()),
+    }
+    Ok(())
+}
+
+/// Rewind only the conversation to the sidecar captured with checkpoint `id`; files stay as they are.
+/// Before overwriting, the CURRENT chat is saved to the `last` session so it's never lost.
+fn task_restore(id: u32, history: &mut Vec<Message>, model_label: &mut String) -> Result<()> {
+    match timemachine::load_chat(id) {
+        Some(chat) if !chat.is_empty() => {
+            let _ = save_session(history, "last"); // don't lose the current chat — it's recoverable via /sessions
+            *history = chat;
+            // The restored transcript carries its own system prompt at [0]; refresh the model label
+            // line so the HUD matches, without rebuilding (which would wipe the restored history).
+            let _ = model_label; // label is display-only; the restored chat already holds its system prompt
+            println!("{} #{} — conversation rewound; files untouched", style("⏪ restored task").color256(splash::ACCENT), id);
+            println!("{}", style("  (your previous chat was saved as `last` — /sessions to get it back)").dim());
+        }
+        _ => println!("{}", style(format!("checkpoint #{id} has no saved conversation to restore")).color256(crate::ui::theme::WARN).to_string()),
+    }
+    Ok(())
 }
 
 // ───────────────────────────── discord bot daemon + setup ─────────────────────────────
@@ -3226,6 +3308,13 @@ async fn run_menu_sticky() -> Result<()> {
                         continue;
                     }
                 };
+                // A quiet rotating tip under the message (Claude-Code style) — a discoverability
+                // nudge that advances per turn. Empty when tips are off (`AIZEN_NO_TIPS`) or off-TTY.
+                // Placed after the endpoint check so an unconfigured REPL doesn't burn a tip.
+                let tip = tui::next_tip();
+                if !tip.is_empty() {
+                    tui::emit_line(&style(format!("  {}{}", icons::g(icons::tip()), tip)).dim().to_string());
+                }
                 model_label = model.clone();
                 if images.is_empty() {
                     history.push(Message::user(line));
@@ -4665,12 +4754,15 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
         }
         // ── time machine (git snapshots) ──
         "timeline" | "tm" => {
-            if let Err(e) = timeline_menu().await {
+            if let Err(e) = timeline_menu(history, model_label).await {
                 eprintln!("{} {e}", style("time:").red());
             }
         }
-        "checkpoint" | "snapshot" | "cp" => match timemachine::save(arg, false) {
-            Ok(s) => tui::emit_line(&format!("{} #{} saved", style("✓ checkpoint").color256(splash::ACCENT), s.id)),
+        // Capture the conversation alongside the tree so this checkpoint supports the 3-way restore
+        // (Files / Task / Both) later — a `/checkpoint` is a deliberate save point where the chat is
+        // worth keeping, unlike the loop's per-edit auto-snapshots.
+        "checkpoint" | "snapshot" | "cp" => match timemachine::save_with_chat(arg, false, history) {
+            Ok(s) => tui::emit_line(&format!("{} #{} saved (code + chat)", style("✓ checkpoint").color256(splash::ACCENT), s.id)),
             Err(e) => tui::emit_line(&style(format!("checkpoint: {e}")).color256(crate::ui::theme::WARN).to_string()),
         },
         "undo" => match timemachine::undo() {
@@ -5142,7 +5234,7 @@ fn print_config(cfg: &cli_config::CliConfig) {
 
     // ── Display ──
     section("Display");
-    row("icons", theme::accent(cfg.icons.as_deref().unwrap_or("emoji")).to_string());
+    row("icons", theme::accent(cfg.icons.as_deref().unwrap_or("nerd")).to_string());
     println!();
 }
 
@@ -5352,10 +5444,12 @@ async fn config_wizard() -> Result<()> {
     };
 
     step("Display");
-    // 8) icon style — emoji (works everywhere) / nerd (needs a Nerd Font in the terminal) / off.
-    let cur_ic = cfg.icons.clone().unwrap_or_else(|| "emoji".to_string());
+    // 8) icon style — nerd (default; crisp monochrome glyphs, needs a Nerd Font) / emoji (colour,
+    //    works on any font) / off. Nerd is the default so the TUI reads as one calm accent palette;
+    //    a plain font shows tofu → pick emoji.
+    let cur_ic = cfg.icons.clone().unwrap_or_else(|| "nerd".to_string());
     let ic_in = Input::<String>::with_theme(&theme)
-        .with_prompt("Icons: emoji / nerd (needs a Nerd Font) / off")
+        .with_prompt("Icons: nerd (needs a Nerd Font) / emoji (any font) / off")
         .default(cur_ic.clone())
         .allow_empty(true)
         .interact_text()?;

@@ -24,6 +24,12 @@ pub enum Verdict {
     Blocked(String),
     /// Read-only shape → safe to auto-run under the `smart` tier (still asks under `manual`).
     Allow,
+    /// A risky-but-legitimate git op that rewrites history, discards work, or publishes to a shared
+    /// branch (`push --force`, `reset --hard`, `clean -fd`, `branch -D`, push to `main`/`master`,
+    /// `checkout --`). Not catastrophic enough for the hard floor, but the user must SEE what it does
+    /// before approving — so it carries a specific reason and is NEVER auto-cleared by the `smart`
+    /// tier (it always prompts, with the reason surfaced). This is the pre-execution git gate.
+    Caution(String),
     /// The uncertain middle (writes / network / installs / deletes / anything chained) → prompt.
     Ask,
 }
@@ -128,6 +134,55 @@ static READONLY_SUBCMDS: &[(&str, &[&str])] = &[
 /// read-only set). Backtick / `$(` command-substitution and `>`/`>>` redirects disqualify `Allow`.
 static RE_REDIRECT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(>|<|\$\(|`)").unwrap());
 
+// ── git caution list (risky-but-legit → always prompt WITH a reason) ─────────────
+// History-rewriting, work-discarding, or shared-branch-publishing git ops. Each is legitimate in
+// the right moment but destroys or publishes work in a way the user should see spelled out before
+// approving — the exact ops the standing rules call out (`no force-push / reset --hard / clean -f /
+// branch -D without explicit permission`; `never push to main directly`). Matched case-insensitively
+// against the whitespace-normalized command; each entry carries the human reason shown at the prompt.
+static GIT_CAUTION: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
+    let pats: &[(&str, &str)] = &[
+        // Force-push (short `-f`, long `--force`, and the safer-but-still-rewriting `--force-with-lease`)
+        // — rewrites a published branch's history, can clobber a teammate's commits.
+        (r"(?i)\bgit\s+push\b[^\n]*\s(--force\b|--force-with-lease\b|-f\b)", "git push --force rewrites published history (can clobber remote commits)"),
+        // Push straight to main/master (by branch name or the `HEAD:main` refspec) — bypasses the
+        // branch-first workflow. `origin main`, `origin HEAD:main`, `origin master` all match.
+        (r"(?i)\bgit\s+push\b[^\n]*\s(main|master)\b", "git push to main/master — push to a feature branch first unless you meant this"),
+        (r"(?i)\bgit\s+push\b[^\n]*\bHEAD:(main|master)\b", "git push to main/master — push to a feature branch first unless you meant this"),
+        // Hard reset — discards ALL uncommitted work in the tree AND moves the branch pointer.
+        (r"(?i)\bgit\s+reset\b[^\n]*\s--hard\b", "git reset --hard discards all uncommitted changes in the working tree"),
+        // clean -f/-d/-x — permanently deletes untracked (and with -x, ignored) files; no undo.
+        (r"(?i)\bgit\s+clean\b[^\n]*\s-[a-z]*[fdx]", "git clean deletes untracked files permanently (no recycle bin)"),
+        // Force-delete a branch (may drop unmerged commits). The `-D` is case-SENSITIVE (scoped
+        // `(?-i:…)`): uppercase `-D` force-deletes, lowercase `-d` is a safe delete that refuses on
+        // unmerged commits — only the former is a caution. `git branch --delete --force` also matches.
+        (r"(?i)\bgit\s+branch\b[^\n]*\s(?-i:-D)\b", "git branch -D force-deletes a branch (may drop unmerged commits)"),
+        (r"(?i)\bgit\s+branch\b[^\n]*\s--delete\b[^\n]*\s--force\b", "git branch --delete --force force-deletes a branch"),
+        // checkout/restore that overwrites working-tree files from the index/HEAD, discarding edits.
+        (r"(?i)\bgit\s+checkout\b[^\n]*\s--\s", "git checkout -- discards uncommitted changes to those files"),
+        // `git restore <path>` / `restore .` / `restore --source …` overwrites the working tree,
+        // discarding edits. The Rust `regex` crate has no lookahead, so the `--staged` exclusion (a
+        // no-data-loss unstage) is handled in `git_caution` rather than inline here.
+        (r"(?i)\bgit\s+restore\b[^\n]*\s(\.|--\s|-s\b|--source)", "git restore discards uncommitted changes to those files"),
+    ];
+    pats.iter().map(|(p, r)| (Regex::new(p).unwrap(), *r)).collect()
+});
+
+/// Scan for a git caution op; returns the reason for the first match. `None` if the command is not a
+/// cautioned git op.
+fn git_caution(norm: &str) -> Option<&'static str> {
+    // `git restore --staged <path>` only unstages (no working-tree data loss), so it must NOT be a
+    // caution — but the restore pattern can't express that exclusion (no lookahead in `regex`). Skip
+    // it here. A `--staged --worktree` combo DOES touch the tree, so only exclude the staged-only form.
+    let restore_staged_only = norm.contains("git restore")
+        && norm.contains("--staged")
+        && !norm.contains("--worktree");
+    GIT_CAUTION
+        .iter()
+        .find(|(re, r)| re.is_match(norm) && !(restore_staged_only && r.starts_with("git restore")))
+        .map(|(_, r)| *r)
+}
+
 /// Classify a raw shell command (the user/model's `command` arg, before any platform wrapping).
 pub fn classify(command: &str) -> Verdict {
     let cmd = command.trim();
@@ -149,7 +204,15 @@ pub fn classify(command: &str) -> Verdict {
         }
     }
 
-    // 2) Read-only? Be conservative: no redirection, and every chained segment is read-only.
+    // 2) Git caution — a risky-but-legit git op (force-push, reset --hard, clean -f, branch -D,
+    // push to main). Sits ABOVE the read-only path so a cautioned op is never auto-cleared by
+    // `smart`, and carries a specific reason the approval layer surfaces. Not part of the hard
+    // floor: the user CAN approve it, they just have to see what it does first.
+    if let Some(reason) = git_caution(&norm) {
+        return Verdict::Caution(reason.to_string());
+    }
+
+    // 3) Read-only? Be conservative: no redirection, and every chained segment is read-only.
     if RE_REDIRECT.is_match(&norm) {
         return Verdict::Ask;
     }
@@ -382,6 +445,48 @@ mod tests {
         assert_eq!(classify("rg foo | head -20"), Verdict::Allow); // read-only pipe
         assert_eq!(classify("ls && pwd"), Verdict::Allow);
         assert_eq!(classify("git.exe log --oneline"), Verdict::Allow); // .exe + path stripped
+    }
+
+    fn cautioned(cmd: &str) -> bool {
+        matches!(classify(cmd), Verdict::Caution(_))
+    }
+
+    #[test]
+    fn cautions_dangerous_git_ops() {
+        // History-rewriting / work-discarding / shared-branch ops → Caution (prompt WITH a reason),
+        // never silently auto-run.
+        assert!(cautioned("git push --force origin feature"));
+        assert!(cautioned("git push -f origin feature"));
+        assert!(cautioned("git push --force-with-lease"));
+        assert!(cautioned("git push origin main"));
+        assert!(cautioned("git push origin master"));
+        assert!(cautioned("git push origin HEAD:main"));
+        assert!(cautioned("git reset --hard HEAD"));
+        assert!(cautioned("git reset --hard origin/main"));
+        assert!(cautioned("git clean -fd"));
+        assert!(cautioned("git clean -fdx"));
+        assert!(cautioned("git branch -D feature"));
+        assert!(cautioned("git checkout -- src/main.rs"));
+        assert!(cautioned("git restore ."));
+        assert!(cautioned("git restore --source HEAD~1 file.rs"));
+        // …even smuggled behind a harmless prefix (whole-string scan).
+        assert!(cautioned("cd repo && git push --force"));
+    }
+
+    #[test]
+    fn caution_does_not_overreach() {
+        // Ordinary git that neither rewrites nor discards nor targets a shared branch → plain Ask.
+        assert_eq!(classify("git push origin feature-x"), Verdict::Ask);
+        assert_eq!(classify("git push -u origin my-branch"), Verdict::Ask);
+        assert_eq!(classify("git reset HEAD~1"), Verdict::Ask); // soft/mixed reset keeps the tree
+        assert_eq!(classify("git reset file.rs"), Verdict::Ask);
+        assert!(!cautioned("git branch -d merged")); // safe delete (lowercase -d) is NOT a caution
+        assert_eq!(classify("git checkout feature-branch"), Verdict::Ask); // switch branches, no `--`
+        assert_eq!(classify("git restore --staged file.rs"), Verdict::Ask); // unstage only, no data loss
+        assert_eq!(classify("git commit -m x"), Verdict::Ask);
+        // A branch NAMED after main (e.g. `mainline`) must not trip the main/master matcher.
+        assert_eq!(classify("git push origin mainline"), Verdict::Ask);
+        assert_eq!(classify("git push origin feature/master-fix"), Verdict::Ask);
     }
 
     #[test]

@@ -1,12 +1,14 @@
 //! A curated glyph set for a lively-but-tasteful TUI, in three tiers.
 //!
 //! A terminal can't render image icons — only text glyphs. We offer:
-//! - **emoji** (default): width-2 emoji that render on any modern terminal (Windows Terminal,
-//!   iTerm, …) WITHOUT a special font — no tofu on a default install.
-//! - **nerd** (`AIZEN_NERD=1`): dev-style Nerd Font glyphs (Font Awesome codepoints in the Private
-//!   Use Area). Crisper/"premium", but ONLY render if the terminal uses a patched Nerd Font (e.g.
-//!   "Cascadia Code NF"); otherwise they show as boxes. Opt-in by design.
-//! - **none** (`AIZEN_NO_ICONS=1`): plain text everywhere.
+//! - **nerd** (default): dev-style Nerd Font glyphs (Font Awesome codepoints in the Private Use
+//!   Area). Crisp, monochrome, single-cell — they inherit the moonlight accent instead of a
+//!   clashing multi-colour emoji, so the whole TUI reads as one calm palette (the "clean like a
+//!   pro CLI" look). They ONLY render on a patched Nerd Font (e.g. "Cascadia Code NF", the common
+//!   dev default); on a plain font they show as boxes (tofu) → set `AIZEN_EMOJI=1` or `icons=emoji`.
+//! - **emoji** (`AIZEN_EMOJI=1` / `icons=emoji`): width-2 colour emoji that render on any modern
+//!   terminal WITHOUT a special font — the safe fallback when Nerd Font tofu shows up.
+//! - **none** (`AIZEN_NO_ICONS=1` / `icons=off`): plain text everywhere.
 //!
 //! Nerd glyphs sit in U+E000–U+F8FF (PUA) → `unicode-width` measures them as 1 cell, matching how
 //! a Nerd Font renders them, so bordered panels stay aligned.
@@ -20,11 +22,11 @@ enum Tier {
 }
 
 /// The config-chosen tier, set once at startup (and after `/config`) so glyph lookups don't read
-/// the config file on every call. 0 = unset (→ emoji default), 1 = off, 2 = emoji, 3 = nerd.
+/// the config file on every call. 0 = unset (→ nerd default), 1 = off, 2 = emoji, 3 = nerd.
 static CONFIG_TIER: AtomicU8 = AtomicU8::new(0);
 
 /// Persist the icon tier chosen in config into the fast in-process slot. Call at startup + after
-/// the config wizard. Accepts `"off"`/`"none"`, `"emoji"`, `"nerd"`; anything else → emoji default.
+/// the config wizard. Accepts `"off"`/`"none"`, `"emoji"`, `"nerd"`; anything else → nerd default.
 pub fn set_tier(cfg_value: Option<&str>) {
     let v = match cfg_value.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
         Some("off") | Some("none") => 1,
@@ -35,18 +37,24 @@ pub fn set_tier(cfg_value: Option<&str>) {
     CONFIG_TIER.store(v, Ordering::Relaxed);
 }
 
-/// Resolve the active tier: env wins (one-off override) > config > emoji default.
+/// Resolve the active tier: env wins (one-off override) > config > nerd default. The default is
+/// nerd so the icon set is monochrome + single-cell + accent-tinted (one calm palette). A plain
+/// (non-Nerd) font shows tofu → `AIZEN_EMOJI=1` forces the colour-emoji tier, `AIZEN_NO_ICONS=1`
+/// forces plain text.
 fn tier() -> Tier {
     if crate::core::cli_config::branded_flag("NO_ICONS") {
         return Tier::None;
+    }
+    if crate::core::cli_config::branded_flag("EMOJI") {
+        return Tier::Emoji;
     }
     if crate::core::cli_config::branded_flag("NERD") {
         return Tier::Nerd;
     }
     match CONFIG_TIER.load(Ordering::Relaxed) {
         1 => Tier::None,
-        3 => Tier::Nerd,
-        _ => Tier::Emoji,
+        2 => Tier::Emoji,
+        _ => Tier::Nerd,
     }
 }
 
@@ -55,12 +63,13 @@ pub fn on() -> bool {
     !matches!(tier(), Tier::None)
 }
 
-/// Pick the glyph for the active tier (emoji default, nerd when `AIZEN_NERD`).
+/// Pick the glyph for the active tier — the nerd glyph by default, the colour emoji only when the
+/// emoji tier is forced (`AIZEN_EMOJI=1` / `icons=emoji`).
 fn pick(emoji: &'static str, nerd: &'static str) -> &'static str {
-    if matches!(tier(), Tier::Nerd) {
-        nerd
-    } else {
+    if matches!(tier(), Tier::Emoji) {
         emoji
+    } else {
+        nerd
     }
 }
 
@@ -79,6 +88,9 @@ pub fn spark() -> &'static str {
 }
 pub fn learned() -> &'static str {
     pick("🌱", "\u{f06c}") // nf-fa-leaf
+}
+pub fn tip() -> &'static str {
+    pick("💡", "\u{f0eb}") // nf-fa-lightbulb-o
 }
 
 /// Icon for an agent tool group (splash panel).
@@ -137,12 +149,14 @@ mod tests {
 
     #[test]
     fn known_labels_map_else_bullet() {
-        // default (emoji) tier — no NG_NERD / NG_NO_ICONS in the test env.
-        assert_eq!(tool_group("skills"), "📘");
-        assert_eq!(tool_group("memory"), "🧠");
+        // default (nerd) tier — no AIZEN_EMOJI / AIZEN_NO_ICONS in the test env, so `pick` returns
+        // the nerd glyph. The `•` fallback is tier-independent (returned directly, not via `pick`),
+        // so an unknown label is a bullet regardless of tier.
+        assert_eq!(tool_group("skills"), "\u{f02d}"); // book
+        assert_eq!(tool_group("memory"), "\u{f1c0}"); // database
         assert_eq!(tool_group("nope"), "•");
-        assert_eq!(slash("telegram"), "📱");
-        assert_eq!(slash("quit"), "🚪");
+        assert_eq!(slash("telegram"), "\u{f2c6}");
+        assert_eq!(slash("quit"), "\u{f08b}");
         assert_eq!(slash("nope"), "•");
     }
 
@@ -156,6 +170,7 @@ mod tests {
             "\u{f544}",
             "\u{f2c6}",
             "\u{f08b}",
+            "\u{f0eb}", // tip / lightbulb
         ];
         for g in nerd {
             let c = g.chars().next().unwrap();

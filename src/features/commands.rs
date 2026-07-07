@@ -199,6 +199,12 @@ fn expand_shell(s: &str) -> Result<String> {
             crate::agent::cmd_guard::Verdict::Blocked(reason) => {
                 bail!("custom command: refusing to run `!{command}` — blocked by the safety floor: {reason}");
             }
+            crate::agent::cmd_guard::Verdict::Caution(reason) => {
+                bail!(
+                    "custom command: refusing to auto-run `!{command}` — {reason}. This risky git op \
+                     needs explicit approval; run it yourself and `@`-attach the output."
+                );
+            }
             crate::agent::cmd_guard::Verdict::Ask => {
                 bail!(
                     "custom command: `!`{command}`` is not auto-runnable (only read-only commands like \

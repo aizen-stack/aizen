@@ -12,6 +12,7 @@
 //! working tree, removing files not in the snapshot). `.gitignore`d paths (node_modules/target) are
 //! never staged, so they're never touched.
 
+use crate::core::types::Message;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -37,6 +38,11 @@ pub struct Snapshot {
     pub created: String,
     /// `true` if auto-created (e.g. just before a restore) vs an explicit user/agent checkpoint.
     pub auto: bool,
+    /// `true` if a conversation sidecar (`.git/ng_tm_chat_<id>.json`) was captured alongside this
+    /// snapshot, so a restore can offer to rewind the CHAT too (the 3-way Files/Task/Both restore).
+    /// Defaults `false` (serde) so snapshots saved before this field degrade to Files-only cleanly.
+    #[serde(default)]
+    pub has_chat: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -80,6 +86,40 @@ fn ledger_path(root: &Path) -> Result<PathBuf> {
     let git_dir = git_at(root, None, &["rev-parse", "--git-dir"])?;
     let gd = root.join(git_dir);
     Ok(gd.join("ng_timemachine.json"))
+}
+
+/// The conversation-sidecar path for checkpoint `id` (`.git/ng_tm_chat_<id>.json`). Lives in the
+/// git dir alongside the ledger — never in the working tree, so a snapshot restore can't clobber it,
+/// and it's naturally private (git dir is not published). Holds the REPL conversation as it was when
+/// the checkpoint was taken, enabling the "Restore Task" / "Restore Both" tiers.
+fn chat_path(root: &Path, id: u32) -> Result<PathBuf> {
+    let git_dir = git_at(root, None, &["rev-parse", "--git-dir"])?;
+    Ok(root.join(git_dir).join(format!("ng_tm_chat_{id}.json")))
+}
+
+/// Write the conversation sidecar for checkpoint `id`. Best-effort caller decides; here a write
+/// failure is an error the caller can ignore (the snapshot itself still stands, just Files-only).
+fn write_chat(root: &Path, id: u32, chat: &[Message]) -> Result<()> {
+    let p = chat_path(root, id)?;
+    std::fs::write(&p, serde_json::to_string(chat)?).with_context(|| format!("writing {}", p.display()))?;
+    crate::core::config::harden_file(&p); // the transcript may hold pasted secrets → owner-only
+    Ok(())
+}
+
+/// Load the conversation captured with checkpoint `id`. `None` when the checkpoint has no sidecar
+/// (an older Files-only snapshot, or the file was pruned) or can't be parsed.
+pub fn load_chat(id: u32) -> Option<Vec<Message>> {
+    let root = repo_root().ok()?;
+    let p = chat_path(&root, id).ok()?;
+    let s = std::fs::read_to_string(p).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+/// Remove a checkpoint's conversation sidecar (best-effort; missing file is fine).
+fn delete_chat(root: &Path, id: u32) {
+    if let Ok(p) = chat_path(root, id) {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 fn load_ledger(root: &Path) -> Ledger {
@@ -128,19 +168,34 @@ fn current_tree(root: &Path) -> Result<String> {
 /// Capture the current working tree as a checkpoint. `auto` marks system-created points.
 pub fn save(label: &str, auto: bool) -> Result<Snapshot> {
     let root = repo_root()?;
-    save_in(&root, label, auto)
+    save_in(&root, label, auto, None)
 }
 
-fn save_in(root: &Path, label: &str, auto: bool) -> Result<Snapshot> {
+/// Capture the working tree AND the current REPL conversation as a checkpoint, so the checkpoint can
+/// later restore code, chat, or both (the 3-way restore). `chat` is the live history at save time.
+pub fn save_with_chat(label: &str, auto: bool, chat: &[Message]) -> Result<Snapshot> {
+    let root = repo_root()?;
+    save_in(&root, label, auto, Some(chat))
+}
+
+fn save_in(root: &Path, label: &str, auto: bool, chat: Option<&[Message]>) -> Result<Snapshot> {
     let tree = current_tree(root)?;
     let mut ledger = load_ledger(root);
 
     // Dedup: if the newest checkpoint already captures this exact tree, reuse it instead of piling on
-    // a zero-diff snapshot (the main source of checkpoint spam).
+    // a zero-diff snapshot (the main source of checkpoint spam). Still refresh its chat sidecar — the
+    // code is identical but the conversation has moved on, so "restore task" should land on NOW.
     if let Some(last) = ledger.snapshots.last() {
         if last.tree == tree {
-            let last = last.clone();
-            ledger.cursor = Some(ledger.snapshots.len() - 1);
+            let mut last = last.clone();
+            let idx = ledger.snapshots.len() - 1;
+            if let Some(c) = chat {
+                if write_chat(root, last.id, c).is_ok() {
+                    last.has_chat = true;
+                    ledger.snapshots[idx].has_chat = true;
+                }
+            }
+            ledger.cursor = Some(idx);
             save_ledger(root, &ledger)?;
             return Ok(last);
         }
@@ -159,6 +214,12 @@ fn save_in(root: &Path, label: &str, auto: bool) -> Result<Snapshot> {
     let id = ledger.next_id.max(1);
     ledger.next_id = id + 1;
     git_at(root, None, &["update-ref", &format!("refs/ng/tm/{id}"), &commit])?;
+    // Persist the conversation sidecar BEFORE recording the flag, so `has_chat` is only ever `true`
+    // when the file actually landed (a write failure degrades cleanly to a Files-only checkpoint).
+    let has_chat = match chat {
+        Some(c) => write_chat(root, id, c).is_ok(),
+        None => false,
+    };
     let snap = Snapshot {
         id,
         commit,
@@ -166,6 +227,7 @@ fn save_in(root: &Path, label: &str, auto: bool) -> Result<Snapshot> {
         label: label.to_string(),
         created: now_string(),
         auto,
+        has_chat,
     };
     ledger.snapshots.push(snap.clone());
     ledger.cursor = Some(ledger.snapshots.len() - 1);
@@ -176,9 +238,11 @@ fn save_in(root: &Path, label: &str, auto: bool) -> Result<Snapshot> {
     Ok(snap)
 }
 
-/// Delete a checkpoint's ref so its git objects become unreachable (reclaimed by `git gc`).
+/// Delete a checkpoint's ref so its git objects become unreachable (reclaimed by `git gc`), and drop
+/// its conversation sidecar so a pruned checkpoint leaves nothing behind.
 fn delete_ref(root: &Path, id: u32) {
     let _ = git_at(root, None, &["update-ref", "-d", &format!("refs/ng/tm/{id}")]);
+    delete_chat(root, id);
 }
 
 /// Drop oldest checkpoints (deleting their refs) until at most `keep` remain — but NEVER drop the
@@ -249,7 +313,7 @@ fn restore_in(root: &Path, id: u32) -> Result<Snapshot> {
     // lost — then you can come back to "now" via the timeline.
     let cur = current_tree(root)?;
     if !ledger.snapshots.iter().any(|s| s.tree == cur) {
-        save_in(root, "before time-travel", true)?;
+        save_in(root, "before time-travel", true, None)?;
     }
 
     // Exact rewind: stage the current state into a temp index, then reset index+worktree to the
@@ -367,11 +431,11 @@ mod tests {
         let file = dir.join("a.txt");
 
         std::fs::write(&file, "v1").unwrap();
-        let s1 = save_in(&dir, "v1", false).unwrap();
+        let s1 = save_in(&dir, "v1", false, None).unwrap();
         assert_eq!(s1.id, 1);
 
         std::fs::write(&file, "v2").unwrap();
-        let s2 = save_in(&dir, "v2", false).unwrap();
+        let s2 = save_in(&dir, "v2", false, None).unwrap();
         assert_eq!(s2.id, 2);
 
         // a brand-new untracked file exists at v2…
@@ -397,6 +461,7 @@ mod tests {
             label: String::new(),
             created: "now".into(),
             auto: false,
+            has_chat: false,
         }
     }
 
@@ -426,8 +491,8 @@ mod tests {
         git_at(&dir, None, &["config", "user.email", "t@t"]).unwrap();
         git_at(&dir, None, &["config", "user.name", "t"]).unwrap();
         std::fs::write(dir.join("a.txt"), "same").unwrap();
-        let a = save_in(&dir, "first", false).unwrap();
-        let b = save_in(&dir, "again", false).unwrap(); // no change → must reuse, not append
+        let a = save_in(&dir, "first", false, None).unwrap();
+        let b = save_in(&dir, "again", false, None).unwrap(); // no change → must reuse, not append
         assert_eq!(a.id, b.id, "an unchanged working tree reuses the last checkpoint");
         assert_eq!(timeline_len(&dir), 1, "no duplicate snapshot created");
         let _ = std::fs::remove_dir_all(&dir);
@@ -435,6 +500,47 @@ mod tests {
 
     fn timeline_len(root: &Path) -> usize {
         load_ledger(root).snapshots.len()
+    }
+
+    #[test]
+    fn chat_sidecar_round_trips_and_flags_has_chat() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ng-tm-chat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_at(&dir, None, &["init", "-q"]).unwrap();
+        git_at(&dir, None, &["config", "user.email", "t@t"]).unwrap();
+        git_at(&dir, None, &["config", "user.name", "t"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "v1").unwrap();
+
+        // A checkpoint WITH chat flags has_chat and its sidecar round-trips verbatim.
+        let chat = vec![Message::system("sys"), Message::user("do the thing")];
+        let snap = save_in(&dir, "with chat", false, Some(&chat)).unwrap();
+        assert!(snap.has_chat, "a checkpoint saved with a conversation is flagged has_chat");
+        let back = read_chat_in(&dir, snap.id).expect("sidecar present");
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[1].content.as_deref(), Some("do the thing"));
+
+        // A Files-only checkpoint has no sidecar and is not flagged.
+        std::fs::write(dir.join("a.txt"), "v2").unwrap();
+        let plain = save_in(&dir, "no chat", false, None).unwrap();
+        assert!(!plain.has_chat, "a Files-only checkpoint is not flagged");
+        assert!(read_chat_in(&dir, plain.id).is_none(), "no sidecar written");
+
+        // Clearing a checkpoint removes its sidecar too (no orphaned transcript on disk).
+        delete_chat(&dir, snap.id);
+        assert!(read_chat_in(&dir, snap.id).is_none(), "sidecar removed with the checkpoint");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Root-scoped sidecar reader for tests (the public `load_chat` resolves the repo from cwd).
+    fn read_chat_in(root: &Path, id: u32) -> Option<Vec<Message>> {
+        let p = chat_path(root, id).ok()?;
+        let s = std::fs::read_to_string(p).ok()?;
+        serde_json::from_str(&s).ok()
     }
 
     #[test]
@@ -448,6 +554,7 @@ mod tests {
             label: "x".into(),
             created: "now".into(),
             auto: false,
+            has_chat: false,
         });
         l.cursor = Some(0);
         let s = serde_json::to_string(&l).unwrap();

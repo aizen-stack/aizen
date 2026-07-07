@@ -1467,13 +1467,13 @@ fn diff_preview(before: &str, after: &str) -> String {
         out.push_str(&format!("-{line}\n"));
     }
     if removed.len() > MAX_SIDE {
-        out.push_str(&format!("…({} dòng bị bớt nữa)\n", removed.len() - MAX_SIDE));
+        out.push_str(&format!("…({} more lines removed)\n", removed.len() - MAX_SIDE));
     }
     for line in added.iter().take(MAX_SIDE) {
         out.push_str(&format!("+{line}\n"));
     }
     if added.len() > MAX_SIDE {
-        out.push_str(&format!("…({} dòng thêm nữa)\n", added.len() - MAX_SIDE));
+        out.push_str(&format!("…({} more lines added)\n", added.len() - MAX_SIDE));
     }
     // trailing context (from the shared suffix)
     let suf_start = b.len() - s;

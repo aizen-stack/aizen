@@ -29,7 +29,9 @@ pub const COMPACT_MARKER_PREFIX: &str = "[Earlier conversation auto-compacted";
 const SUMMARIZE_SYS: &str = "You compress a coding-assistant conversation to conserve context. \
     Write a DENSE summary that preserves: the user's goals and explicit requests, decisions made, \
     files/paths touched, commands run and their outcomes, important code/config, and any OPEN or \
-    UNFINISHED tasks. Use terse bullet points. Do NOT invent anything not in the transcript.";
+    UNFINISHED tasks. Also preserve a REFLECTION section: approaches that were TRIED and FAILED and \
+    WHY (errors hit, dead ends, things that did not work) — so the continuation does not repeat \
+    them. Use terse bullet points. Do NOT invent anything not in the transcript.";
 
 /// The `/handoff` instruction: unlike compaction (preserve everything densely), a handoff is
 /// GOAL-CONDITIONED — extract only what the NEW objective needs and drop the rest. This is the
@@ -282,6 +284,34 @@ mod tests {
         assert_eq!(h[0].content.as_deref(), Some("SYS"));
         assert!(h[1].content.as_deref().unwrap().contains("SUMMARY_OK"));
         assert!(b > 0 && a > 0);
+    }
+
+    #[tokio::test]
+    async fn compact_prompt_asks_to_preserve_a_reflection_section() {
+        // Reflexion (arXiv:2303.11366) ported to compaction: the summary must carry a REFLECTION
+        // section — approaches tried-and-failed and why — so a compacted continuation doesn't repeat
+        // the same dead ends. Capture the prompt the summarizer receives and assert the instruction.
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let cap = captured.clone();
+        let mut h = vec![
+            Message::system("SYS"),
+            user("u1"), asst("a1"),
+            user("u2"), asst("a2"),
+        ];
+        compact_history(
+            &mut h,
+            move |msgs| {
+                *cap.lock().unwrap() = msgs[0].content.clone().unwrap_or_default();
+                async { Ok("S".to_string()) }
+            },
+            1,
+        )
+        .await
+        .expect("compaction should succeed");
+        let sys = captured.lock().unwrap().to_ascii_uppercase();
+        assert!(sys.contains("REFLECTION"), "summarizer instruction must request a reflection section: {sys}");
+        assert!(sys.contains("FAILED"), "…and specifically failed approaches: {sys}");
     }
 
     #[tokio::test]
