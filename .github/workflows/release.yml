@@ -36,8 +36,13 @@ jobs:
       - name: Show toolchain
         run: rustc -V && cargo -V
 
-      - name: Build (release, default features)
-        run: cargo build --release --bin aizen
+      - name: Build (release, dense tier on)
+        # `--features dense` ships the model2vec semantic backend so the dense retrieval tier is
+        # live in the released binary (gated ON by default; see `memory::settings`). The model
+        # weights are NOT bundled — a user runs `aizen memory model-download` once to cache
+        # potion-base-8M (~30 MB) into ~/.aizen/models/. The Windows runner is MSVC (not the
+        # windows-gnu dev box), so the getrandom-0.3 raw-dylib link wall doesn't apply here.
+        run: cargo build --release --features dense --bin aizen
 
       - name: Package binary
         shell: bash

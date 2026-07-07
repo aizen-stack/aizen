@@ -13,6 +13,7 @@ pub mod frozen_core;
 pub mod fuse;
 pub mod graph;
 pub mod learning;
+pub mod model_dl;
 pub mod profile;
 pub mod provenance;
 pub mod render;

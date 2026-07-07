@@ -726,6 +726,14 @@ enum MemoryCmd {
         #[arg(short, long, default_value_t = 10)]
         k: usize,
     },
+    /// Download the dense-tier embedding model into `~/.aizen/models/<name>/` (one-time, P6).
+    /// Fetches the three files the dense backend loads locally; pair with a `--features dense`
+    /// build to actually use them. Re-running only fetches files not already present.
+    ModelDownload {
+        /// Model name (a HF `minishlab/<name>` repo). Defaults to the configured embed model.
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -740,7 +748,7 @@ async fn main() -> Result<()> {
         Commands::Chat(args) => run_chat(args).await,
         Commands::Agent(args) => run_agent_cmd(args).await,
         Commands::Workflow(args) => run_workflow_cmd(args).await,
-        Commands::Memory { cmd } => run_memory(cmd),
+        Commands::Memory { cmd } => run_memory(cmd).await,
         Commands::Skill { cmd } => run_skill(cmd).await,
         Commands::Persona { cmd } => run_persona(cmd),
         Commands::Soul { cmd } => run_soul(cmd),
@@ -5501,7 +5509,7 @@ async fn run_workflow_cmd(args: WorkflowArgs) -> Result<()> {
     agent::workflow::run_workflow(&http, &base_url, &api_key, &model, args.yes, &spec, trace).await
 }
 
-fn run_memory(cmd: MemoryCmd) -> Result<()> {
+async fn run_memory(cmd: MemoryCmd) -> Result<()> {
     match cmd {
         MemoryCmd::Add {
             name,
@@ -5544,6 +5552,9 @@ fn run_memory(cmd: MemoryCmd) -> Result<()> {
         MemoryCmd::Restore { id } => memory::cmd_restore(&id),
         MemoryCmd::Compact => memory::cmd_compact(),
         MemoryCmd::Neighbors { id, k } => memory::cmd_neighbors(&id, k),
+        MemoryCmd::ModelDownload { name } => {
+            memory::model_dl::download(name.as_deref()).await.map(|_| ())
+        }
     }
 }
 
