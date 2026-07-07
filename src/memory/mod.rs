@@ -204,7 +204,16 @@ pub fn search_filtered_scoped_cat(
             inner: inner.as_ref(),
             cache: std::cell::RefCell::new(embed::EmbeddingCache::load(&inner.id())),
         };
-        let h = search_hybrid_in(query, usize::MAX, active, &exclude, &caching);
+        // Query-level gated fusion: dense joins only when BM25 is ambiguous (low query coverage),
+        // so a confident literal match keeps its lexical precision (see the bench in P6).
+        let h = search_hybrid_gated_in(
+            query,
+            usize::MAX,
+            active,
+            &exclude,
+            &caching,
+            cfg.dense_gate_coverage,
+        );
         caching.cache.borrow().save();
         h
     } else {
@@ -366,6 +375,76 @@ pub fn search_hybrid_in(
         b.1.partial_cmp(&a.1)
             .unwrap_or(Ordering::Equal)
             .then(a.0.cmp(&b.0))
+    });
+    let dense_ids: Vec<String> = dense.into_iter().map(|(id, _)| id).collect();
+
+    let fused = fuse::rrf(&[lexical, dense_ids], settings().rrf_k);
+    let by_id: std::collections::HashMap<String, MemoryEntry> =
+        candidates.into_iter().map(|e| (e.id.clone(), e)).collect();
+    fused
+        .into_iter()
+        .filter_map(|(id, score)| by_id.get(&id).map(|e| Hit { entry: e.clone(), score }))
+        .take(k)
+        .collect()
+}
+
+/// Fraction of the query's DISTINCT tokens that appear in `hit_tokens` — a cheap proxy for "how
+/// confidently did BM25 match this?". A literal query fully covered by its top hit → 1.0; a
+/// paraphrase / cross-lingual query whose wording barely overlaps the stored fact → low. Empty
+/// query → 0.0 (nothing to cover, so the gate opens and lets dense try).
+fn lexical_coverage(query_tokens: &HashSet<String>, hit_tokens: &[String]) -> f64 {
+    if query_tokens.is_empty() {
+        return 0.0;
+    }
+    let hit: HashSet<&String> = hit_tokens.iter().collect();
+    let covered = query_tokens.iter().filter(|t| hit.contains(t)).count();
+    covered as f64 / query_tokens.len() as f64
+}
+
+/// Hybrid search with a QUERY-LEVEL GATE (P6). Runs the lexical floor first; the dense tier is
+/// fused in **only when BM25 is ambiguous** — i.e. the best lexical hit covers fewer than
+/// `gate_coverage` of the query's tokens (paraphrase / cross-lingual), OR the query returned no
+/// lexical hit at all. A confident, high-coverage literal match returns the pure lexical order,
+/// preserving its precision (the bench showed always-on fusion lifts paraphrase recall but wrecks
+/// literal-slice precision/noise). `gate_coverage >= 1.0` ⇒ always fuse (the always-on ceiling);
+/// `<= 0.0` ⇒ never fuse. Pure over a supplied entry set (used by the bench + tests).
+pub fn search_hybrid_gated_in(
+    query: &str,
+    k: usize,
+    entries: Vec<MemoryEntry>,
+    exclude: &HashSet<String>,
+    embedder: &dyn embed::Embedder,
+    gate_coverage: f64,
+) -> Vec<Hit> {
+    let candidates: Vec<MemoryEntry> =
+        entries.into_iter().filter(|e| !exclude.contains(&e.id)).collect();
+
+    // Lexical ranking first — it is always the floor.
+    let lex_hits = search_in(query, usize::MAX, candidates.clone());
+
+    // Gate decision: fuse dense unless the top lexical hit already covers the query confidently.
+    let qtoks: HashSet<String> = tokenize(query).into_iter().collect();
+    let top_coverage = lex_hits
+        .first()
+        .map(|h| lexical_coverage(&qtoks, &h.entry.tokens))
+        .unwrap_or(0.0);
+    let gate_open = top_coverage < gate_coverage;
+
+    if !gate_open {
+        // BM25 is confident (high-coverage literal match) → skip dense, keep lexical precision.
+        return lex_hits.into_iter().take(k).collect();
+    }
+
+    // Gate open → fuse the dense ranking in via RRF (the paraphrase / cross-lingual path).
+    let lexical: Vec<String> = lex_hits.into_iter().map(|h| h.entry.id).collect();
+    let qv = embedder.embed(query);
+    let mut dense: Vec<(String, f32)> = candidates
+        .iter()
+        .map(|e| (e.id.clone(), embed::cosine(&qv, &embedder.embed(&e.body))))
+        .filter(|(_, s)| *s > 0.0)
+        .collect();
+    dense.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0))
     });
     let dense_ids: Vec<String> = dense.into_iter().map(|(id, _)| id).collect();
 
@@ -1106,6 +1185,74 @@ mod tests {
 
         std::env::remove_var("NEXTGEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lexical_coverage_is_full_for_a_literal_match_and_low_for_paraphrase() {
+        // A query whose every token is present in the hit → coverage 1.0; a query sharing only
+        // one of three tokens → ~0.33; an empty query → 0.0 (gate opens, lets dense try).
+        let hit = tokenize("auth login oauth jwt session refresh");
+        let full: HashSet<String> = tokenize("oauth login").into_iter().collect();
+        assert!((lexical_coverage(&full, &hit) - 1.0).abs() < 1e-9);
+        let partial: HashSet<String> = tokenize("oauth deploy pipeline").into_iter().collect();
+        assert!(lexical_coverage(&partial, &hit) < 0.5, "only 1/3 tokens covered");
+        assert_eq!(lexical_coverage(&HashSet::new(), &hit), 0.0);
+    }
+
+    #[test]
+    fn gate_closed_on_a_confident_literal_match_skips_dense() {
+        // When the top lexical hit fully covers the query, the gate stays CLOSED: the result is the
+        // pure lexical order and the (adversarial) embedder is never allowed to reorder it. Uses an
+        // embedder that would rank the WRONG doc first if consulted, so a closed gate is observable.
+        struct AdversarialEmbedder;
+        impl embed::Embedder for AdversarialEmbedder {
+            fn id(&self) -> String { "adversarial".into() }
+            fn dim(&self) -> usize { 4 }
+            // Constant vector → cosine identical for every doc, so dense contributes a stable but
+            // meaningless ranking; if it were fused it would inject the non-matching doc as noise.
+            fn embed(&self, _t: &str) -> Vec<f32> { vec![1.0, 0.0, 0.0, 0.0] }
+        }
+        let entries = vec![
+            entry("hit", "auth login oauth jwt session refresh"),
+            entry("noise", "postgres index tuning and query plans"),
+        ];
+        // "oauth login" is fully covered by "hit" → coverage 1.0 ≥ gate 0.6 → gate CLOSED.
+        let gated = search_hybrid_gated_in(
+            "oauth login", usize::MAX, entries.clone(), &HashSet::new(), &AdversarialEmbedder, 0.6,
+        );
+        assert_eq!(gated[0].entry.id, "hit", "confident literal match keeps lexical order");
+        assert_eq!(gated.len(), 1, "only the lexically-matching doc is returned (dense not fused)");
+    }
+
+    #[test]
+    fn gate_open_on_low_coverage_fuses_the_dense_neighbor() {
+        // A query the lexical floor barely covers opens the gate, so a dense-only hit surfaces.
+        // The embedder returns the SAME vector for the query and the target doc (cosine 1.0) and an
+        // orthogonal vector otherwise, so dense uniquely favors the intended doc.
+        struct TargetedEmbedder;
+        impl embed::Embedder for TargetedEmbedder {
+            fn id(&self) -> String { "targeted".into() }
+            fn dim(&self) -> usize { 2 }
+            fn embed(&self, t: &str) -> Vec<f32> {
+                // "paraphrase" query and the deploy doc share the semantic axis; others are orthogonal.
+                if t.contains("ship") || t.contains("release") || t.contains("deploy") {
+                    vec![1.0, 0.0]
+                } else {
+                    vec![0.0, 1.0]
+                }
+            }
+        }
+        let entries = vec![
+            entry("deploy", "deploy release to production on fridays"),
+            entry("other", "postgres index tuning notes"),
+        ];
+        // "ship" shares no token with any doc → lexical coverage 0.0 < gate → gate OPEN → dense fuses
+        // and surfaces the deploy doc (its vector matches the query's).
+        let gated = search_hybrid_gated_in(
+            "ship", usize::MAX, entries, &HashSet::new(), &TargetedEmbedder, 0.6,
+        );
+        assert!(!gated.is_empty(), "gate open → dense surfaces a semantic neighbor lexical missed");
+        assert_eq!(gated[0].entry.id, "deploy", "the dense-favored doc wins when the gate is open");
     }
 
     #[test]

@@ -291,7 +291,10 @@ pub fn embed_model_name() -> String {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "potion-multilingual-128M".to_string())
+        // potion-base-8M (English static, ~30MB) — the P6 CI bench (dense-bench.yml) measured it
+        // LIFTING paraphrase recall@5 more than the ~18x-larger multilingual model (+0.231 vs
+        // +0.154) on the bilingual En-Vi fixtures, so it's the default. `NG_EMBED_MODEL` overrides.
+        .unwrap_or_else(|| "potion-base-8M".to_string())
 }
 
 /// Verified-good defaults adopted from the retrieval/anti-bloat research.
@@ -345,8 +348,14 @@ pub struct MemorySettings {
     /// Enable the dense (embedding) tier fused with lexical via RRF in PRODUCTION retrieval.
     /// Default OFF; the real semantic backend needs `--features dense` (else the pure-Rust hashing
     /// embedder, which exercises the path but isn't semantic). When on, `search_filtered` routes
-    /// through `search_hybrid_in` with a persistent per-fact embedding cache.
+    /// through `search_hybrid_gated_in` with a persistent per-fact embedding cache.
     pub enable_dense: bool,
+    /// Dense query-level GATE (P6): fuse the dense tier only when the best lexical hit covers FEWER
+    /// than this fraction of the query's tokens — i.e. BM25 is ambiguous (paraphrase / cross-lingual).
+    /// A confident, high-coverage literal match skips dense entirely, preserving its precision (the
+    /// bench showed always-on fusion lifts paraphrase recall but wrecks literal precision/noise).
+    /// `0.0` ⇒ never gate open (dense off in practice); `≥1.0` ⇒ always fuse (the always-on ceiling).
+    pub dense_gate_coverage: f64,
 }
 
 impl Default for MemorySettings {
@@ -368,6 +377,12 @@ impl Default for MemorySettings {
             embed_dim: 256,
             enable_fuzzy: false,
             enable_dense: false,
+            // Gate open when the best lexical hit covers <60% of the query tokens. Tuned so a
+            // clean literal match (full coverage) skips dense while a paraphrase/cross-lingual
+            // query (low lexical overlap) opens it. The bench (`--split tune --hybrid`) is what
+            // re-tunes this: it must keep the paraphrase recall lift without the literal-slice
+            // precision/noise hit that always-on fusion showed.
+            dense_gate_coverage: 0.60,
         }
     }
 }

@@ -10,7 +10,7 @@ pub mod loop_eval;
 pub mod metrics;
 
 use crate::memory::embed::{self, Embedder};
-use crate::memory::{search_hybrid_in, search_in, search_in_fuzzy};
+use crate::memory::{search_hybrid_gated_in, search_hybrid_in, search_in, search_in_fuzzy};
 use crate::memory::store::{MemoryEntry, MemoryType};
 use crate::memory::tokenize::tokenize;
 use anyhow::{Context, Result};
@@ -133,16 +133,39 @@ enum Rank {
     Fuzzy,
 }
 
-fn eval(corpus: &[MemoryEntry], queries: &[FixQuery], embedder: Option<&dyn Embedder>, rank: Rank) -> BenchMetrics {
+/// How the dense tier (when an embedder is supplied) is fused. `AlwaysOn` fuses dense on every
+/// query (the ceiling the first P6 bench measured); `Gated(c)` fuses only when the top lexical hit
+/// covers < `c` of the query tokens (the production `dense_gate_coverage` path), so a confident
+/// literal match keeps its lexical precision.
+#[derive(Clone, Copy)]
+enum DenseMode {
+    AlwaysOn,
+    Gated(f64),
+}
+
+fn eval(
+    corpus: &[MemoryEntry],
+    queries: &[FixQuery],
+    embedder: Option<&dyn Embedder>,
+    rank: Rank,
+    dense_mode: DenseMode,
+) -> BenchMetrics {
     let empty = HashSet::new();
     let evals: Vec<(Vec<String>, HashSet<String>)> = queries
         .iter()
         .map(|q| {
             let ranked: Vec<String> = match embedder {
-                Some(e) => search_hybrid_in(&q.query, 10, corpus.to_vec(), &empty, e)
-                    .into_iter()
-                    .map(|h| h.entry.id)
-                    .collect(),
+                Some(e) => {
+                    let hits = match dense_mode {
+                        DenseMode::AlwaysOn => {
+                            search_hybrid_in(&q.query, 10, corpus.to_vec(), &empty, e)
+                        }
+                        DenseMode::Gated(c) => {
+                            search_hybrid_gated_in(&q.query, 10, corpus.to_vec(), &empty, e, c)
+                        }
+                    };
+                    hits.into_iter().map(|h| h.entry.id).collect()
+                }
                 None if rank == Rank::Fuzzy => search_in_fuzzy(&q.query, 10, corpus.to_vec())
                     .into_iter()
                     .map(|h| h.entry.id)
@@ -198,37 +221,62 @@ pub fn run(split: &str, update_baseline: bool, hybrid: bool, fuzzy: bool) -> Res
         // Vietnamese-only paraphrase slice (P6 gate): the diacritic-shredding tokenizer bug hit
         // hardest here, so this is the number the NFC + Unicode-regex repair must move.
         let vn_para: Vec<FixQuery> = para.iter().filter(|q| q.is_vn()).map(clone_q).collect();
-        let lex_para = eval(&corpus, &para, None, Rank::Exact);
-        print_metrics("tune (literal)", &eval(&corpus, &lit, None, Rank::Exact));
+        let lex_para = eval(&corpus, &para, None, Rank::Exact, DenseMode::AlwaysOn);
+        let lex_lit = eval(&corpus, &lit, None, Rank::Exact, DenseMode::AlwaysOn);
+        print_metrics("tune (literal)", &lex_lit);
         print_metrics("tune (paraphrase)", &lex_para);
         if !vn_para.is_empty() {
-            print_metrics("tune (paraphrase, vn)", &eval(&corpus, &vn_para, None, Rank::Exact));
+            print_metrics("tune (paraphrase, vn)", &eval(&corpus, &vn_para, None, Rank::Exact, DenseMode::AlwaysOn));
         }
         println!("  ^ paraphrase recall is the lexical ceiling the dense tier must beat.");
         if let Some(e) = emb_ref {
-            let hyb_para = eval(&corpus, &para, Some(e), Rank::Exact);
-            print_metrics("tune (lit, hybrid)", &eval(&corpus, &lit, Some(e), Rank::Exact));
-            print_metrics("tune (para, hybrid)", &hyb_para);
-            let delta = hyb_para.recall_at_5 - lex_para.recall_at_5;
-            println!("  embedder = {}", e.id());
-            if delta > 1e-9 {
+            // Two dense regimes side by side (P6): ALWAYS-ON fuses dense on every query (the recall
+            // ceiling, but it wrecks literal precision); GATED fuses only when BM25 is ambiguous
+            // (low query coverage) — the production `dense_gate_coverage` path. The win we want:
+            // gated keeps the always-on paraphrase recall lift WITHOUT the literal-slice noise.
+            let gate_c = crate::core::config::MemorySettings::default().dense_gate_coverage;
+            println!("  embedder = {}  (gate coverage < {:.2})", e.id(), gate_c);
+
+            let on_para = eval(&corpus, &para, Some(e), Rank::Exact, DenseMode::AlwaysOn);
+            let on_lit = eval(&corpus, &lit, Some(e), Rank::Exact, DenseMode::AlwaysOn);
+            print_metrics("tune (lit, always-on)", &on_lit);
+            print_metrics("tune (para, always-on)", &on_para);
+
+            let gt_para = eval(&corpus, &para, Some(e), Rank::Exact, DenseMode::Gated(gate_c));
+            let gt_lit = eval(&corpus, &lit, Some(e), Rank::Exact, DenseMode::Gated(gate_c));
+            print_metrics("tune (lit, gated)", &gt_lit);
+            print_metrics("tune (para, gated)", &gt_para);
+
+            let on_recall = on_para.recall_at_5 - lex_para.recall_at_5;
+            let gt_recall = gt_para.recall_at_5 - lex_para.recall_at_5;
+            // Literal-slice noise cost of each regime vs the pure lexical floor.
+            let on_lit_noise = on_lit.noise_rate - lex_lit.noise_rate;
+            let gt_lit_noise = gt_lit.noise_rate - lex_lit.noise_rate;
+            println!(
+                "  DENSE (always-on): para recall@5 {:+.3}, literal noise {:+.3} (prec {:.3}→{:.3})",
+                on_recall, on_lit_noise, lex_lit.precision_at_5, on_lit.precision_at_5
+            );
+            println!(
+                "  DENSE (gated)    : para recall@5 {:+.3}, literal noise {:+.3} (prec {:.3}→{:.3})",
+                gt_recall, gt_lit_noise, lex_lit.precision_at_5, gt_lit.precision_at_5
+            );
+            if gt_recall > 1e-9 && gt_lit_noise + 1e-9 < on_lit_noise {
                 println!(
-                    "  DENSE GATE: PASS — dense lifts paraphrase recall@5 by +{:.3} ({:.3} → {:.3}); it earns its keep.",
-                    delta, lex_para.recall_at_5, hyb_para.recall_at_5
+                    "  GATE WIN: gating keeps a paraphrase recall lift (+{:.3}) while cutting the literal-slice noise the always-on path added ({:+.3} → {:+.3}).",
+                    gt_recall, on_lit_noise, gt_lit_noise
                 );
+            } else if gt_recall > 1e-9 {
+                println!("  GATE: keeps a paraphrase recall lift (+{:.3}); literal-slice noise not improved over always-on.", gt_recall);
             } else {
-                println!(
-                    "  DENSE GATE: no lift ({:.3} → {:.3}) — dense does NOT beat lexical on this corpus; lexical stays the default.",
-                    lex_para.recall_at_5, hyb_para.recall_at_5
-                );
+                println!("  GATE: no paraphrase recall lift on this corpus — lexical stays the default.");
             }
         }
         if fuzzy {
             // W24 measurement: does the Jaro-Winkler bridge lift recall on literal/paraphrase
             // queries WITHOUT adding noise (dropping precision/ndcg)? Both tiers matter — a fuzzy
             // bridge that lifts recall by dragging in junk is a net loss, not a win.
-            let fz_lit = eval(&corpus, &lit, None, Rank::Fuzzy);
-            let fz_para = eval(&corpus, &para, None, Rank::Fuzzy);
+            let fz_lit = eval(&corpus, &lit, None, Rank::Fuzzy, DenseMode::AlwaysOn);
+            let fz_para = eval(&corpus, &para, None, Rank::Fuzzy, DenseMode::AlwaysOn);
             print_metrics("tune (lit, fuzzy)", &fz_lit);
             print_metrics("tune (para, fuzzy)", &fz_para);
             let recall_delta = fz_para.recall_at_5 - lex_para.recall_at_5;
@@ -244,13 +292,15 @@ pub fn run(split: &str, update_baseline: bool, hybrid: bool, fuzzy: bool) -> Res
     if split == "gate" || split == "all" {
         // The gate always tracks the LEXICAL floor (the shipping default); --hybrid/--fuzzy are
         // measurement-only and never rewrite the baseline.
-        let current = eval(&corpus, &gate, None, Rank::Exact);
+        let current = eval(&corpus, &gate, None, Rank::Exact, DenseMode::AlwaysOn);
         print_metrics("gate", &current);
         if hybrid {
-            print_metrics("gate (hybrid)", &eval(&corpus, &gate, emb_ref, Rank::Exact));
+            let gc = crate::core::config::MemorySettings::default().dense_gate_coverage;
+            print_metrics("gate (hybrid, always-on)", &eval(&corpus, &gate, emb_ref, Rank::Exact, DenseMode::AlwaysOn));
+            print_metrics("gate (hybrid, gated)", &eval(&corpus, &gate, emb_ref, Rank::Exact, DenseMode::Gated(gc)));
         }
         if fuzzy {
-            let fz_gate = eval(&corpus, &gate, None, Rank::Fuzzy);
+            let fz_gate = eval(&corpus, &gate, None, Rank::Fuzzy, DenseMode::AlwaysOn);
             print_metrics("gate (fuzzy)", &fz_gate);
             if fz_gate.recall_at_5 + 1e-9 < current.recall_at_5 || fz_gate.noise_rate > current.noise_rate + GATE_EPSILON {
                 println!(
