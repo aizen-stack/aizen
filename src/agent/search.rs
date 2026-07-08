@@ -9,10 +9,13 @@ use crate::agent::builtin::confine;
 use crate::agent::tools::Tool;
 use anyhow::{Context, Result};
 use ignore::overrides::OverrideBuilder;
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 use regex::RegexBuilder;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Cap on emitted matches (the loop also bounds history growth at the agent layer).
 const DEFAULT_MAX_RESULTS: usize = 200;
@@ -22,6 +25,48 @@ const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const BINARY_SNIFF: usize = 8192;
 /// Clip a very long matched line so one minified line can't blow the result.
 const MAX_LINE_CHARS: usize = 240;
+/// Hard wall-clock cap so a search over a giant tree can't freeze the agent loop (the parallel walk
+/// checks this per file and quits every thread once it trips).
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Decode a file's bytes to searchable text, detecting UTF-16 (P2.2). A UTF-16-encoded source file
+/// (common on Windows — PowerShell `>` redirection, some editors, .NET logs) is `byte,0,byte,0…`,
+/// so the plain NUL sniff would wrongly write it off as binary and the search would silently miss
+/// it. We detect UTF-16 by BOM first (unambiguous), then by a strong alternating-NUL heuristic on
+/// the head. Returns `None` for genuine binary (so the caller skips it).
+fn decode_text(bytes: &[u8]) -> Option<String> {
+    // BOM-based detection (unambiguous).
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        let u16s: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        return Some(String::from_utf16_lossy(&u16s));
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        let u16s: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        return Some(String::from_utf16_lossy(&u16s));
+    }
+    let head = &bytes[..bytes.len().min(BINARY_SNIFF)];
+    if !head.contains(&0) {
+        return Some(String::from_utf8_lossy(bytes).into_owned()); // ordinary UTF-8 / ASCII
+    }
+    // NULs present without a BOM: could be BOM-less UTF-16, or genuine binary. UTF-16LE ASCII text
+    // has NULs on the ODD byte offsets (high byte of each code unit); UTF-16BE on the EVEN offsets.
+    // If ~80% of one parity is NUL, treat it as UTF-16 text of that endianness.
+    let half = head.len() / 2;
+    if half == 0 {
+        return None;
+    }
+    let odd_nul = head.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
+    let even_nul = head.iter().step_by(2).filter(|&&b| b == 0).count();
+    if odd_nul * 10 >= half * 8 {
+        let u16s: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        return Some(String::from_utf16_lossy(&u16s));
+    }
+    if even_nul * 10 >= half * 8 {
+        let u16s: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        return Some(String::from_utf16_lossy(&u16s));
+    }
+    None // genuine binary
+}
 
 pub struct SearchFiles {
     root: PathBuf,
@@ -87,63 +132,111 @@ impl Tool for SearchFiles {
             wb.overrides(ob.build().context("building glob filter")?);
         }
 
-        let mut results: Vec<String> = Vec::new();
-        let mut files_hit = 0usize;
-        let mut truncated = false;
-        'walk: for dent in wb.build() {
-            let dent = match dent {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                continue;
-            }
-            if dent.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE_BYTES {
-                continue;
-            }
-            let bytes = match std::fs::read(dent.path()) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            if bytes.iter().take(BINARY_SNIFF).any(|&b| b == 0) {
-                continue; // binary
-            }
-            let text = String::from_utf8_lossy(&bytes);
-            let rel = dent.path().strip_prefix(&self.root).unwrap_or(dent.path());
-            let mut this_file = false;
-            for (i, line) in text.lines().enumerate() {
-                if re.is_match(line) {
-                    this_file = true;
-                    let trimmed = line.trim_end();
-                    let shown: String = if trimmed.chars().count() > MAX_LINE_CHARS {
-                        trimmed.chars().take(MAX_LINE_CHARS).collect::<String>() + "…"
-                    } else {
-                        trimmed.to_string()
-                    };
-                    results.push(format!("{}:{}: {}", rel.display(), i + 1, shown));
-                    if results.len() >= max_results {
-                        truncated = true;
-                        if this_file {
-                            files_hit += 1;
+        // A PARALLEL walk (ripgrep's own engine) with a SHARED wall-clock budget: every worker
+        // checks the deadline before opening a file and returns `Quit` once it trips, so a search
+        // over a huge tree can't freeze the agent loop. Results, the match counter, and the
+        // skipped-large-file counter are shared behind a `Mutex`/atomics. Per-file work (read →
+        // binary/UTF-16 classify → line-scan) happens on the worker thread.
+        let results: Mutex<Vec<(PathBuf, usize, String)>> = Mutex::new(Vec::new());
+        let files_hit = AtomicUsize::new(0);
+        let match_count = AtomicUsize::new(0);
+        let skipped_large = AtomicUsize::new(0);
+        let truncated = AtomicBool::new(false);
+        let deadline = Instant::now() + SEARCH_TIMEOUT;
+        let budget_hit = AtomicBool::new(false);
+        let re = &re;
+        wb.build_parallel().run(|| {
+            Box::new(|dent| {
+                // Stop the whole walk once the match cap or the wall-clock budget is reached.
+                if match_count.load(Ordering::Relaxed) >= max_results {
+                    truncated.store(true, Ordering::Relaxed);
+                    return WalkState::Quit;
+                }
+                if Instant::now() >= deadline {
+                    budget_hit.store(true, Ordering::Relaxed);
+                    return WalkState::Quit;
+                }
+                let dent = match dent {
+                    Ok(d) => d,
+                    Err(_) => return WalkState::Continue,
+                };
+                if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    return WalkState::Continue;
+                }
+                if dent.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE_BYTES {
+                    skipped_large.fetch_add(1, Ordering::Relaxed); // P2.3: count, then report
+                    return WalkState::Continue;
+                }
+                let bytes = match std::fs::read(dent.path()) {
+                    Ok(b) => b,
+                    Err(_) => return WalkState::Continue,
+                };
+                let text = match decode_text(&bytes) {
+                    Some(t) => t,
+                    None => return WalkState::Continue, // binary
+                };
+                let rel = dent.path().strip_prefix(&self.root).unwrap_or(dent.path()).to_path_buf();
+                let mut this_file = false;
+                for (i, line) in text.lines().enumerate() {
+                    if re.is_match(line) {
+                        this_file = true;
+                        let trimmed = line.trim_end();
+                        let shown: String = if trimmed.chars().count() > MAX_LINE_CHARS {
+                            trimmed.chars().take(MAX_LINE_CHARS).collect::<String>() + "…"
+                        } else {
+                            trimmed.to_string()
+                        };
+                        let n = match_count.fetch_add(1, Ordering::Relaxed);
+                        if n >= max_results {
+                            truncated.store(true, Ordering::Relaxed);
+                            break;
                         }
-                        break 'walk;
+                        results.lock().unwrap().push((rel.clone(), i + 1, shown));
                     }
                 }
-            }
-            if this_file {
-                files_hit += 1;
-            }
-        }
+                if this_file {
+                    files_hit.fetch_add(1, Ordering::Relaxed);
+                }
+                WalkState::Continue
+            })
+        });
+
+        let mut results = results.into_inner().unwrap();
+        // The parallel walk collects in nondeterministic order; sort so output is stable/readable.
+        results.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        results.truncate(max_results);
+        let files_hit = files_hit.load(Ordering::Relaxed);
+        let skipped_large = skipped_large.load(Ordering::Relaxed);
 
         if results.is_empty() {
-            return Ok(format!("no matches for /{pattern}/"));
+            let mut msg = format!("no matches for /{pattern}/");
+            if skipped_large > 0 {
+                msg.push_str(&format!(
+                    "\n(skipped {skipped_large} file(s) larger than {} MB — search a specific path if the match is in one)",
+                    MAX_FILE_BYTES / (1024 * 1024)
+                ));
+            }
+            if budget_hit.load(Ordering::Relaxed) {
+                msg.push_str("\n(search budget reached before the whole tree was scanned — narrow with path/glob)");
+            }
+            return Ok(msg);
         }
-        let header = format!("{} match(es) in {files_hit} file(s):", results.len());
-        let mut out = header;
+        let lines: Vec<String> =
+            results.iter().map(|(rel, n, shown)| format!("{}:{}: {}", rel.display(), n, shown)).collect();
+        let mut out = format!("{} match(es) in {files_hit} file(s):", lines.len());
         out.push('\n');
-        out.push_str(&results.join("\n"));
-        if truncated {
+        out.push_str(&lines.join("\n"));
+        if truncated.load(Ordering::Relaxed) {
             out.push_str(&format!("\n…[capped at {max_results} matches — narrow the pattern or set path/glob]"));
+        }
+        if budget_hit.load(Ordering::Relaxed) {
+            out.push_str("\n…[search budget reached before the whole tree was scanned — narrow with path/glob]");
+        }
+        if skipped_large > 0 {
+            out.push_str(&format!(
+                "\n…[skipped {skipped_large} file(s) larger than {} MB]",
+                MAX_FILE_BYTES / (1024 * 1024)
+            ));
         }
         Ok(out)
     }
@@ -183,5 +276,81 @@ mod tests {
         let t = SearchFiles::new(root());
         assert!(t.execute(&serde_json::json!({"pattern": "("})).is_err());
         assert!(t.execute(&serde_json::json!({})).is_err()); // missing pattern
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ng-search-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn decode_text_handles_utf16_bom_le_and_be() {
+        // P2.2: a UTF-16 file (BOM'd) must decode to searchable text, not be dropped as binary.
+        let le = {
+            let mut b = vec![0xFF, 0xFE];
+            for u in "hello".encode_utf16() {
+                b.extend_from_slice(&u.to_le_bytes());
+            }
+            b
+        };
+        assert_eq!(decode_text(&le).as_deref(), Some("hello"));
+        let be = {
+            let mut b = vec![0xFE, 0xFF];
+            for u in "hello".encode_utf16() {
+                b.extend_from_slice(&u.to_be_bytes());
+            }
+            b
+        };
+        assert_eq!(decode_text(&be).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn decode_text_handles_bomless_utf16le() {
+        // BOM-less UTF-16LE ASCII: NUL on every odd byte. The alternating-NUL heuristic must catch it
+        // instead of the plain NUL sniff writing it off as binary.
+        let mut b = Vec::new();
+        for u in "function main".encode_utf16() {
+            b.extend_from_slice(&u.to_le_bytes());
+        }
+        let decoded = decode_text(&b).expect("bom-less utf16le should decode as text");
+        assert!(decoded.contains("function main"), "got: {decoded:?}");
+    }
+
+    #[test]
+    fn decode_text_rejects_real_binary() {
+        // Genuine binary: NULs present but scattered across BOTH parities (neither the odd nor the
+        // even offsets are dominated by NUL), so neither the BOM check nor the alternating-NUL
+        // UTF-16 heuristic fires — it stays classified as binary and is skipped.
+        let b = vec![0x00, 0x01, 0x02, 0x03, 0x04, 0xFF, 0x89, 0x13, 0x37, 0x00];
+        assert_eq!(decode_text(&b), None);
+    }
+
+    #[test]
+    fn utf16_file_is_searched_end_to_end() {
+        // A UTF-16LE-BOM file on disk must be found by a content search (regression for the old NUL
+        // sniff that skipped it).
+        let root = tmp("utf16");
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in "let secret = 42;".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(root.join("cfg.ts"), &bytes).unwrap();
+        let t = SearchFiles::new(root);
+        let out = t.execute(&serde_json::json!({"pattern": "secret"})).unwrap();
+        assert!(out.contains("cfg.ts"), "utf-16 file searched: {out}");
+    }
+
+    #[test]
+    fn reports_skipped_oversized_files() {
+        // P2.3: a file over the size cap is skipped but REPORTED so the model knows to target it.
+        let root = tmp("skip-large");
+        let big = "x".repeat((MAX_FILE_BYTES + 1024) as usize);
+        std::fs::write(root.join("huge.log"), &big).unwrap();
+        std::fs::write(root.join("small.txt"), "nothing here").unwrap();
+        let t = SearchFiles::new(root);
+        let out = t.execute(&serde_json::json!({"pattern": "xxxxx"})).unwrap();
+        assert!(out.contains("skipped 1 file"), "skip reported: {out}");
     }
 }

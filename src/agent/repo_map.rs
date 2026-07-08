@@ -88,20 +88,27 @@ impl Tool for RepoMap {
         }
         let total = files.len();
 
-        // 2) Rank: git churn primary, mtime recency as tiebreak/fallback.
+        // 2) Rank: git churn primary, mtime recency as tiebreak/fallback. STAT SHORT-CIRCUIT (P2.4):
+        // the per-file `metadata()`/`modified()` call is only needed when there is NO churn data (no
+        // repo) — with churn present it's a minor tiebreak among equal-churn files, not worth 2000
+        // `stat` syscalls (slow on Windows). So we read mtime ONLY on the no-repo path.
         let churn = git_churn(&self.root);
+        let use_mtime = churn.is_none();
         let mut ranked: Vec<(PathBuf, u32, u64)> = files
             .into_iter()
             .map(|p| {
                 let rel = p.strip_prefix(&self.root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
                 let c = churn.as_ref().and_then(|m| m.get(rel.as_str())).copied().unwrap_or(0);
-                let mtime = p
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let mtime = if use_mtime {
+                    p.metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                } else {
+                    0 // churn dominates; equal-churn ties fall back to deterministic path order
+                };
                 (p, c, mtime)
             })
             .collect();
@@ -154,9 +161,14 @@ fn source_files(root: &Path) -> Vec<PathBuf> {
 
 /// Per-file change counts over the last [`CHURN_COMMITS`] commits (`git log --name-only`) — the
 /// same shell-out pattern as timemachine. `None` when not a repo / git missing.
+///
+/// `-c core.quotePath=false` (P2.4): by default git OCTAL-ESCAPES non-ASCII bytes in path output
+/// (e.g. a Vietnamese filename `hồ_sơ.rs` prints as `"h\341\273\223_s\306\241.rs"`), which would
+/// never match the real UTF-8 path the walker produced — so those files silently rank churn:0. With
+/// quotePath off, git prints the raw UTF-8 path and the map keys line up.
 fn git_churn(root: &Path) -> Option<HashMap<String, u32>> {
     let out = std::process::Command::new("git")
-        .args(["log", "--name-only", "--pretty=format:", "-n", CHURN_COMMITS])
+        .args(["-c", "core.quotePath=false", "log", "--name-only", "--pretty=format:", "-n", CHURN_COMMITS])
         .current_dir(root)
         .output()
         .ok()?;

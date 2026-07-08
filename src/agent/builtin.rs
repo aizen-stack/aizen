@@ -10,12 +10,14 @@
 
 use crate::agent::tools::{Tool, ToolRegistry};
 use anyhow::{bail, Context, Result};
+use ignore::{WalkBuilder, WalkState};
 use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Hard wall-clock cap for `shell_run` (a hung command must never freeze the agent loop).
@@ -413,63 +415,306 @@ fn glob_to_regex(glob: &str) -> String {
     re
 }
 
-/// Recursively collect paths under `dir` whose path RELATIVE to `anchor` (forward-slashed) matches
-/// `re`. Matches BOTH files AND directories — a coding agent asked to "find the X folder" must be
-/// able to return the directory itself, not just files under it. Hidden files/dirs and heavy build
-/// dirs (`target`, `node_modules`, `.git`) are NO LONGER skipped — the user asked file_glob to see
-/// EVERYTHING (a `**/*` in a built repo will therefore walk `target/`; narrow the pattern to avoid
-/// the result cap filling with build output).
-fn walk(dir: &Path, anchor: &Path, re: &regex::Regex, out: &mut Vec<PathBuf>, cap: usize) {
-    if out.len() >= cap {
-        return;
+/// Compile a glob into a `Regex`, honoring smart-case (`ci` prepends the `(?i)` inline flag). The
+/// body from [`glob_to_regex`] is already `^…$`-anchored, so `(?i)^…$` is valid.
+fn compile_glob(glob: &str, ci: bool) -> Result<regex::Regex> {
+    let body = glob_to_regex(glob);
+    let full = if ci { format!("(?i){body}") } else { body };
+    regex::Regex::new(&full).context("invalid glob pattern")
+}
+
+/// The intended NAME behind a pattern: its last `/`-separated segment with glob metacharacters
+/// stripped, lower-cased. `src/**/*.rs` → `.rs`… no — we want the meaningful name, so we take the
+/// last segment that still carries literal characters. `**/mini_project` → `mini_project`,
+/// `src/**/*.rs` → `.rs` is useless, so fall back to the last segment that ISN'T pure glob. Used to
+/// rank hits and to seed the fuzzy fallback.
+fn last_literal_segment(pattern: &str) -> String {
+    let norm = pattern.replace('\\', "/");
+    let strip = |s: &str| s.trim_matches(|c| c == '*' || c == '?').to_string();
+    // Walk segments right-to-left; the first one that has a literal (non-glob) character wins.
+    for seg in norm.rsplit('/') {
+        let lit = strip(seg);
+        if !lit.is_empty() {
+            return lit.to_ascii_lowercase();
+        }
     }
-    let rd = match std::fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-    let mut entries: Vec<_> = rd.flatten().collect();
-    entries.sort_by_key(|e| e.file_name());
-    for e in entries {
-        if out.len() >= cap {
-            return;
+    String::new()
+}
+
+// ── file_glob walk engine ────────────────────────────────────────────────────
+// A BOUNDED, PARALLEL directory walk (ripgrep's `ignore` crate, same engine as `search_files`)
+// replaces the old single-threaded recursive DFS. The old walk had three fatal bugs on a real
+// Windows tree: (1) it counted MATCHES not NODES, so a rare-match glob scanned the WHOLE drive
+// before returning; (2) no wall-clock or node ceiling, so it could hang for minutes (the model then
+// gave up and shelled out to `where`); (3) it followed junctions/symlinks and swallowed errors, so
+// a reparse-point loop under `C:\Users` could spin forever. The engine below fixes all three:
+// node-count + wall-clock BUDGET (checked per entry), `follow_links(false)` +
+// `same_file_system(true)` (no junction loops, no crossing into other volumes), a bounded depth, and
+// optional subtree pruning of heavy/system dirs for BROAD (home/drive-wide) searches.
+
+/// Result of a bounded walk: the collected paths and WHY it stopped (so the tool can tell the model
+/// the list may be incomplete and it should narrow, instead of trusting a silently-truncated list).
+struct WalkOutcome {
+    paths: Vec<PathBuf>,
+    /// The node or wall-clock budget was exhausted before the tree was fully scanned.
+    budget_hit: bool,
+    /// The per-walk match cap was reached (more matches almost certainly exist).
+    capped: bool,
+}
+
+/// Node-count + wall-clock ceiling shared across the parallel walk threads. `tick()` is called once
+/// per visited entry; when either limit trips it flips an atomic flag and every thread quits.
+struct WalkBudget {
+    nodes: AtomicUsize,
+    max_nodes: usize,
+    deadline: Instant,
+    tripped: std::sync::atomic::AtomicBool,
+}
+impl WalkBudget {
+    fn new(max_nodes: usize, max_wall: Duration) -> Self {
+        Self {
+            nodes: AtomicUsize::new(0),
+            max_nodes,
+            deadline: Instant::now() + max_wall,
+            tripped: std::sync::atomic::AtomicBool::new(false),
         }
-        let p = e.path();
-        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        // Test the entry itself (file OR directory) against the pattern, then still recurse into
-        // directories so nested matches are found too.
-        let rel = p.strip_prefix(anchor).unwrap_or(&p).to_string_lossy().replace('\\', "/");
-        if re.is_match(&rel) {
-            out.push(p.clone());
+    }
+    /// Returns `true` while there is budget left; flips `tripped` and returns `false` once spent.
+    /// The wall-clock is only polled every 512 nodes (per thread) so `Instant::now()` isn't on the
+    /// hot path of every single entry.
+    fn alive(&self) -> bool {
+        if self.tripped.load(Ordering::Relaxed) {
+            return false;
         }
-        if is_dir {
-            walk(&p, anchor, re, out, cap);
+        let n = self.nodes.fetch_add(1, Ordering::Relaxed);
+        if n >= self.max_nodes || (n.is_multiple_of(512) && Instant::now() >= self.deadline) {
+            self.tripped.store(true, Ordering::Relaxed);
+            return false;
         }
+        true
+    }
+    fn is_tripped(&self) -> bool {
+        self.tripped.load(Ordering::Relaxed)
     }
 }
 
-/// Recursively gather every path (files AND directories) under `dir` (bounded by `cap`) — the
-/// candidate pool for the fuzzy name fallback. Same "skip nothing" policy as [`walk`].
-fn collect_paths(dir: &Path, out: &mut Vec<PathBuf>, cap: usize) {
-    if out.len() >= cap {
-        return;
+/// Directory names whose ENTIRE subtree is pruned during a BROAD (home-/drive-wide) walk — package
+/// caches, VCS internals, build output, and OS/system folders that never hold user source and would
+/// otherwise burn the whole budget. NOT applied to a NARROW anchored walk (there the user pointed at
+/// a specific dir and asked to see everything, build output included).
+static BROAD_PRUNE: &[&str] = &[
+    "node_modules", "target", ".git", ".hg", ".svn", "vendor", "dist", "build", "out",
+    ".cache", ".cargo", ".rustup", ".npm", ".gradle", ".m2", ".nuget", ".venv", "venv",
+    "__pycache__", ".next", ".nuxt", ".terraform", ".tox", ".idea", ".vscode",
+    "AppData", "$Recycle.Bin", "System Volume Information", "Windows", "WinSxS",
+    "Program Files", "Program Files (x86)", "ProgramData", "$WinREAgent", ".Trash",
+];
+
+/// Run a bounded, parallel walk over `roots`, keeping every entry (file OR directory) for which
+/// `keep(&full_path, rel_slashed)` returns `true`. `rel_slashed` is the path relative to the walk
+/// root that produced it, forward-slashed (what a glob regex matches against). Each root carries its
+/// OWN max depth — the cwd is walked deep, ancestors shallow (so a name-find sees siblings and the
+/// ancestor dir itself without re-scanning the whole tree). `prune` toggles the [`BROAD_PRUNE`]
+/// subtree skipping (on for a broad name-find, off for a structured anchored glob). `match_cap`
+/// bounds how many kept paths we retain (ranking later trims to a display count). All roots SHARE one
+/// budget, so the global node/wall-clock ceiling bounds the total work across every root.
+fn bounded_walk<F>(roots: &[(PathBuf, usize)], prune: bool, match_cap: usize, budget: &WalkBudget, keep: F) -> WalkOutcome
+where
+    F: Fn(&Path, &str) -> bool + Sync,
+{
+    let (tx, rx) = mpsc::channel::<PathBuf>();
+    let kept = AtomicUsize::new(0);
+    for (root, depth) in roots.iter() {
+        if budget.is_tripped() {
+            break;
+        }
+        let mut wb = WalkBuilder::new(root);
+        wb.follow_links(false) // never chase junctions/symlinks → no reparse-point loops
+            .same_file_system(true) // don't cross into other drives/mounts mid-walk
+            .hidden(false) // SEE hidden files/dirs (dotfiles, .env) — the user asked for everything
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .ignore(false)
+            .parents(false)
+            .max_depth(Some(*depth));
+        let tx = tx.clone();
+        let keep = &keep;
+        let kept = &kept;
+        wb.build_parallel().run(|| {
+            let tx = tx.clone();
+            let root = root.clone();
+            Box::new(move |res| {
+                if !budget.alive() {
+                    return WalkState::Quit;
+                }
+                let dent = match res {
+                    Ok(d) => d,
+                    Err(_) => return WalkState::Continue, // swallow permission/loop errors, keep going
+                };
+                let path = dent.path();
+                let is_dir = dent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                // Prune heavy/system subtrees on a broad walk (depth>0 so we don't prune a root the
+                // caller explicitly pointed at). This is the single highest-leverage speed-up.
+                if prune && is_dir && dent.depth() > 0 {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if BROAD_PRUNE.iter().any(|b| b.eq_ignore_ascii_case(name)) {
+                            return WalkState::Skip;
+                        }
+                    }
+                }
+                if kept.load(Ordering::Relaxed) >= match_cap {
+                    return WalkState::Quit;
+                }
+                let rel = path.strip_prefix(&root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+                if keep(path, &rel) {
+                    if kept.fetch_add(1, Ordering::Relaxed) >= match_cap {
+                        return WalkState::Quit;
+                    }
+                    let _ = tx.send(path.to_path_buf());
+                }
+                WalkState::Continue
+            })
+        });
     }
-    let rd = match std::fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return,
+    drop(tx);
+    let mut paths: Vec<PathBuf> = rx.into_iter().collect();
+    paths.sort();
+    paths.dedup();
+    let capped = kept.load(Ordering::Relaxed) >= match_cap;
+    WalkOutcome { paths, budget_hit: budget.is_tripped(), capped }
+}
+
+/// Read the user's home directory from the environment WITHOUT pulling the `dirs` crate (its
+/// `winsafe`-adjacent deps break our windows-gnu single-static-binary posture). `USERPROFILE` on
+/// Windows, `HOME` elsewhere; falls back to the other if the primary is unset.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+}
+
+/// Depth the WORKING DIR is walked to on a name-find — deep enough to reach a file buried in a
+/// project, bounded so it can't run away.
+const SEED_DEPTH_CWD: usize = 40;
+/// Depth ANCESTORS + well-known folders are walked to — shallow, so we surface siblings, the ancestor
+/// dir itself, and top-of-project files without re-scanning an entire home tree.
+const SEED_DEPTH_WIDE: usize = 6;
+
+/// The FAMILIAR-LOCATION seed list for a bare-name find (P1.1), each paired with its OWN walk depth:
+/// the working dir (deep), its ancestors (shallow, up to but NOT past home — we never seed a bare
+/// drive root, that's the pathology we're killing), and the well-known user folders
+/// (Desktop/Documents/Downloads/Projects, incl. the OneDrive-redirected ones Windows creates —
+/// shallow). Reduced to a MINIMAL set — any seed that lives inside another is dropped, so we never
+/// walk the same subtree twice. This is why a model can ask for a bare name and we find it on the
+/// Desktop or one folder up without scanning the entire drive.
+fn seed_dirs(root: &Path) -> Vec<(PathBuf, usize)> {
+    let home = home_dir();
+    let mut seeds: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), SEED_DEPTH_CWD)];
+    // Climb ancestors, but STOP before home and before a drive/filesystem root — we must never seed a
+    // bare drive root (`C:\`) or home itself, because pruning would then skip AppData/Windows/etc. and
+    // the walk would still be enormous. The well-known user folders below (Desktop/Documents/…) are
+    // the widen targets instead. Capped at a handful of levels so a deeply-nested cwd doesn't seed a
+    // huge ancestor. Each ancestor is walked SHALLOW.
+    let mut cur = root.to_path_buf();
+    for _ in 0..6 {
+        let Some(parent) = cur.parent().map(|p| p.to_path_buf()) else { break };
+        // Don't seed home or a root: parent-of-parent None means `parent` is a drive/fs root.
+        if home.as_deref() == Some(parent.as_path()) || parent.parent().is_none() {
+            break;
+        }
+        seeds.push((parent.clone(), SEED_DEPTH_WIDE));
+        cur = parent;
+    }
+    if let Some(home) = home {
+        for sub in ["Desktop", "Documents", "Downloads", "Projects", "Code", "src", "dev", "repos"] {
+            let p = home.join(sub);
+            if p.is_dir() {
+                seeds.push((p, SEED_DEPTH_WIDE));
+            }
+        }
+        // OneDrive-redirected known folders (Windows silently moves Desktop/Documents there).
+        let onedrive = home.join("OneDrive");
+        if onedrive.is_dir() {
+            for sub in ["Desktop", "Documents"] {
+                let p = onedrive.join(sub);
+                if p.is_dir() {
+                    seeds.push((p, SEED_DEPTH_WIDE));
+                }
+            }
+        }
+    }
+    minimal_roots(seeds)
+}
+
+/// Reduce a seed list to non-overlapping roots. FIRST-SEEN WINS: seeds are proximity-ordered (the cwd
+/// is first and is walked DEEP), so we never drop an earlier root in favor of a later one — a later
+/// seed is dropped only when it is EQUAL TO or a DESCENDANT OF an already-kept root (already covered
+/// downward). A later seed that is an ANCESTOR of a kept root is retained (walked shallow): it surfaces
+/// parent/sibling names the deep cwd walk can't reach upward, and the small subtree overlap is bounded
+/// by that seed's shallow depth + the shared budget. The old logic dropped the deep cwd whenever an
+/// ancestor (e.g. the temp/AppData dir the cwd sits under) came along, so the cwd's own files were
+/// walked shallow-and-late and lost to the budget — the exact bug this ordering fixes.
+fn minimal_roots(seeds: Vec<(PathBuf, usize)>) -> Vec<(PathBuf, usize)> {
+    let seeds: Vec<(PathBuf, usize)> = seeds.into_iter().filter(|(p, _)| p.is_dir()).collect();
+    let mut out: Vec<(PathBuf, usize)> = Vec::new();
+    for (s, d) in seeds {
+        // Drop only if already covered downward by an earlier (higher-proximity) root.
+        let covered = out.iter().any(|(o, _)| s == *o || s.starts_with(o));
+        if covered {
+            continue;
+        }
+        out.push((s, d));
+    }
+    out
+}
+
+/// Score a candidate path for ranking (P1.3). Higher is better. Combines: filename fuzzy similarity
+/// to the needle (Jaro-Winkler, separator-insensitive) · an EXACT-name bonus · proximity to the
+/// working dir (shared path-prefix depth) · a small recency nudge from mtime. Used both to order
+/// glob hits and to pick the fuzzy-fallback suggestions, so the BEST answer is always line one.
+fn score_path(p: &Path, needle: &str, root: &Path, now: std::time::SystemTime) -> f64 {
+    let name = p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let strip = |s: &str| s.chars().filter(|c| !matches!(c, '_' | '-' | ' ' | '.')).collect::<String>();
+    let mut score = if needle.is_empty() {
+        0.5
+    } else {
+        let sim = strsim::jaro_winkler(needle, &name).max(strsim::jaro_winkler(&strip(needle), &strip(&name)));
+        if name == needle {
+            1.5 // exact filename — unbeatable
+        } else if name.contains(needle) || strip(&name).contains(&strip(needle)) {
+            sim.max(0.95)
+        } else {
+            sim
+        }
     };
-    let mut entries: Vec<_> = rd.flatten().collect();
-    entries.sort_by_key(|e| e.file_name());
-    for e in entries {
-        if out.len() >= cap {
-            return;
-        }
-        let p = e.path();
-        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        out.push(p.clone());
-        if is_dir {
-            collect_paths(&p, out, cap);
+    // Proximity: how many leading path components the candidate shares with the working dir. A file
+    // right next to the cwd beats an identically-named one three folders away.
+    let shared = root
+        .components()
+        .zip(p.components())
+        .take_while(|(a, b)| a == b)
+        .count();
+    score += (shared as f64) * 0.02;
+    // Recency: files touched in the last week get a tiny nudge (breaks ties toward live work).
+    if let Ok(meta) = p.metadata() {
+        if let Ok(mtime) = meta.modified() {
+            if let Ok(age) = now.duration_since(mtime) {
+                if age < Duration::from_secs(7 * 24 * 3600) {
+                    score += 0.03;
+                }
+            }
         }
     }
+    score
+}
+
+/// Smart-case: a glob with NO uppercase letter matches case-INSENSITIVELY (the common intent — a
+/// model types `readme.md` and means `README.md`); any uppercase makes the whole match
+/// case-sensitive. Mirrors ripgrep/`search_files` ergonomics.
+fn smart_case_insensitive(pattern: &str) -> bool {
+    !pattern.chars().any(|c| c.is_uppercase())
 }
 
 /// Split a glob into (anchor_dir, sub_pattern): the leading run of segments with NO glob
@@ -507,12 +752,32 @@ fn glob_anchor(root: &Path, pattern: &str) -> (PathBuf, String) {
     (anchor, rest_segs.join("/"))
 }
 
+/// Strip a Windows verbatim/extended-length prefix (`\\?\` or `\\?\UNC\`) so a canonicalized path
+/// displays as a normal `C:\…` path instead of the `//?/C:/…` a naive `\`→`/` replace would produce.
+/// No-op on non-Windows paths. Kept as a plain string transform so it works on the `Cow` we already
+/// have without another allocation-path branch.
+fn strip_verbatim(s: &str) -> &str {
+    s.strip_prefix(r"\\?\UNC\")
+        .map(|_| s) // UNC verbatim is rare; leave it (rewriting it to `\\server` is lossy to reason about)
+        .unwrap_or_else(|| s.strip_prefix(r"\\?\").unwrap_or(s))
+}
+
 /// Display a matched path relative to `root` when it's under the working dir, else as a cleaned
-/// absolute path (so results outside the workspace are still copy-pasteable).
+/// absolute path (so results outside the workspace are still copy-pasteable). Windows verbatim
+/// prefixes (`\\?\`, left behind by `canonicalize`) are stripped so the model sees `C:/…`, not `//?/C:/…`.
 fn display_path(root: &Path, p: &Path) -> String {
-    match p.strip_prefix(root) {
-        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
-        Err(_) => p.to_string_lossy().replace('\\', "/"),
+    // Compare on the verbatim-stripped forms so a canonicalized `p` still strips against a plain `root`.
+    let ps = p.to_string_lossy();
+    let ps = strip_verbatim(&ps);
+    let rs = root.to_string_lossy();
+    let rs = strip_verbatim(&rs);
+    let rel = ps
+        .strip_prefix(rs)
+        .map(|r| r.trim_start_matches(['\\', '/']))
+        .filter(|r| !r.is_empty() && ps.len() != rs.len());
+    match rel {
+        Some(r) => r.replace('\\', "/"),
+        None => ps.replace('\\', "/"),
     }
 }
 
@@ -837,14 +1102,19 @@ impl Tool for FileGlob {
         "file_glob"
     }
     fn description(&self) -> &str {
-        "List files AND directories matching a glob (*, **, ?) — use it to locate a folder (e.g. \
-         `**/mini_project`) as well as files. Anchors under the working directory by default, but a \
-         leading `../` or an absolute path reaches OTHER directories too (e.g. `../snakegame/**/*.js`). \
-         Hidden files and build dirs (target, node_modules, .git) ARE included. If nothing matches \
-         the glob, falls back to a fuzzy match on the NAME (tolerates typos and `_`/`-`/space \
-         differences, and looks at parent + sibling folders too, so `miniproject` finds a \
-         `mini_project` folder one level up) and suggests the closest paths, tagging folders. Not \
-         for searching file CONTENT → use search_files. Read-only."
+        "Find files AND directories by NAME or glob (*, **, ?). This is the RIGHT tool for locating \
+         a file or folder — do NOT shell out to `where`, `dir /s`, `Get-ChildItem -Recurse`, `find`, \
+         or `fd` (they hang on large trees and aren't installed everywhere; this is faster and always \
+         present). Give a bare name (`Cargo.toml`, `snake_game.js`) or a glob (`src/**/*.rs`, \
+         `**/mini_project`); matching is case-insensitive unless your pattern has an uppercase \
+         letter. It automatically searches the working dir, its parent folders, and your \
+         Desktop/Documents/Downloads/home — so a bare name is found even when it lives above the cwd \
+         or on the Desktop, without you naming the path. A leading `../` or an absolute path \
+         (`C:/…`) targets a specific place. Results are RANKED best-first (line 1 is the most likely \
+         answer). If nothing matches exactly it falls back to the closest names (typo- and \
+         `_`/`-`/space-tolerant). Hidden files are included; heavy/system dirs (node_modules, target, \
+         .git, Windows, AppData…) are skipped on a broad search. Not for file CONTENT → use \
+         search_files. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -856,88 +1126,123 @@ impl Tool for FileGlob {
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let pattern = str_arg(args, "pattern")?;
+        let now = std::time::SystemTime::now();
         // Split into a literal directory anchor + the glob remainder, so `../x/**/*.rs` and
-        // `C:/abs/**/*.rs` reach outside the working dir instead of being trapped under root.
+        // `C:/abs/**/*.rs` reach a SPECIFIC place. A bare-name / bare-`**/name` pattern (no explicit
+        // directory the user pointed at) is a BROAD search: we walk the familiar-location seeds
+        // (cwd → ancestors → Desktop/Documents/Downloads/home) so the file is found even when it
+        // lives above the cwd — the whole reason a model no longer needs to shell out to `where`.
         let (anchor, sub) = glob_anchor(&self.root, pattern);
-        // An empty remainder (the whole pattern was a literal path) means "match that exact name".
-        let sub_re = if sub.is_empty() { pattern.replace('\\', "/") } else { sub };
-        let re = regex::Regex::new(&glob_to_regex(&sub_re)).context("invalid glob pattern")?;
-        let mut hits: Vec<PathBuf> = Vec::new();
-        walk(&anchor, &anchor, &re, &mut hits, 200);
-        if !hits.is_empty() {
-            let lines: Vec<String> = hits.iter().map(|p| display_path(&self.root, p)).collect();
+        let sub_re = if sub.is_empty() { pattern.replace('\\', "/") } else { sub.clone() };
+        // STRUCTURED vs BARE-NAME. A pattern with a path SEPARATOR, a glob metacharacter (`*`/`?`), a
+        // `..`, or an absolute prefix is a deliberate STRUCTURED query → walk just its anchor DEEP with
+        // NO pruning (the caller pointed somewhere specific and wants everything under it, build output
+        // included — this is what `**/*.rs`, `src/**/*.ts`, `../sib/**/*.js` need). A pattern that is a
+        // BARE NAME (`Cargo.toml`, `miniproject`) is a "find this by name" → walk the familiar-location
+        // seeds (cwd deep, ancestors + Desktop/Documents/… shallow) WITH heavy/system-dir pruning and
+        // ranking, so it's found even above the cwd without scanning the whole drive.
+        let norm = pattern.replace('\\', "/");
+        let structured = norm.contains('/')
+            || norm.contains('*')
+            || norm.contains('?')
+            || anchor != self.root;
+        let narrow = structured;
+        let ci = smart_case_insensitive(&sub_re);
+        let re = compile_glob(&sub_re, ci)?;
+
+        // ── exact glob pass ──────────────────────────────────────────────────
+        // NARROW: walk just the anchor deep (no pruning). BROAD: walk the seed roots (cwd deep,
+        // ancestors + familiar folders shallow) with subtree pruning of heavy/system dirs. Match the
+        // entry's path RELATIVE to the walk root against the glob; for a broad walk we also test the
+        // BASENAME so a bare `**/*.rs`-style regex matches by name regardless of how deep the seed sits.
+        let roots: Vec<(PathBuf, usize)> =
+            if narrow { vec![(anchor.clone(), SEED_DEPTH_CWD)] } else { seed_dirs(&self.root) };
+        let budget = WalkBudget::new(if narrow { 400_000 } else { 250_000 }, Duration::from_millis(if narrow { 4000 } else { 2500 }));
+        let re_ref = &re;
+        let outcome = bounded_walk(&roots, !narrow, 2000, &budget, |p, rel| {
+            if re_ref.is_match(rel) {
+                return true;
+            }
+            // On a broad seed walk the glob is usually name-only; also match the basename so
+            // `**/foo` and `foo*` hit regardless of how deep the seed root sits.
+            if !narrow {
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    return re_ref.is_match(name);
+                }
+            }
+            false
+        });
+        if !outcome.paths.is_empty() {
+            // Rank best-first so line 1 is the most likely answer (P1.3). The needle for scoring is
+            // the last literal segment of the pattern (the intended name).
+            let needle = last_literal_segment(pattern);
+            let mut ranked = outcome.paths;
+            ranked.sort_by(|a, b| {
+                score_path(b, &needle, &self.root, now)
+                    .partial_cmp(&score_path(a, &needle, &self.root, now))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let shown = 50.min(ranked.len());
+            let mut lines: Vec<String> = ranked[..shown]
+                .iter()
+                .map(|p| {
+                    let s = display_path(&self.root, p);
+                    if p.is_dir() { format!("{s}/") } else { s }
+                })
+                .collect();
+            // Truncation / budget flags TEACH the model to narrow instead of trusting a partial list.
+            if ranked.len() > shown {
+                lines.push(format!("…[{} more — showing the {shown} best; narrow the pattern to see the rest]", ranked.len() - shown));
+            } else if outcome.capped {
+                lines.push("…[result cap reached — more matches exist; narrow the pattern]".to_string());
+            } else if outcome.budget_hit {
+                lines.push("…[search budget reached before the whole tree was scanned — narrow the pattern or pass a ../ or absolute path to search a specific place]".to_string());
+            }
             return Ok(lines.join("\n"));
         }
-        // No glob match → fuzzy fallback on the final path segment (typo/near-name tolerance, #68).
-        // The needle is the last segment of the pattern (the intended file OR directory name).
-        let needle = pattern.replace('\\', "/");
-        let needle = needle.rsplit('/').next().unwrap_or(&needle).to_ascii_lowercase();
-        let needle = needle.trim_start_matches('*').trim_end_matches('*');
+
+        // ── fuzzy fallback on the NAME ───────────────────────────────────────
+        // No exact glob hit → find the closest names (typo / separator tolerance). Reuse the SAME
+        // bounded walk over the same roots (P1.4) — no second bespoke recursive scan.
+        let needle = last_literal_segment(pattern);
+        let needle = needle.trim_matches(|c| c == '*' || c == '?').to_ascii_lowercase();
         if needle.is_empty() {
-            return Ok(format!("(no match for '{pattern}')"));
+            return Ok(format!("no files matched '{pattern}' (give a name or a glob like src/**/*.rs)"));
         }
-        // Candidate pool: everything under the anchor, PLUS everything under a couple of ancestor
-        // directories. The workspace is often a subdir (e.g. .../mini_project/aizen), so the folder
-        // the user means ("mini_project") can be a PARENT or a SIBLING — a downward-only walk never
-        // reaches it. Climb up to 2 levels and scan each, so sibling/parent names are matchable.
-        let mut pool: Vec<PathBuf> = Vec::new();
-        collect_paths(&anchor, &mut pool, 5000);
-        let mut climb = anchor.clone();
-        for _ in 0..2 {
-            match climb.parent() {
-                Some(parent) => {
-                    let parent = parent.to_path_buf();
-                    // The ancestor itself is a candidate (matching a parent folder by name).
-                    pool.push(parent.clone());
-                    // …and its immediate children (siblings of what we came from), shallowly.
-                    if let Ok(rd) = std::fs::read_dir(&parent) {
-                        for e in rd.flatten() {
-                            pool.push(e.path());
-                        }
-                    }
-                    climb = parent;
+        let strip = |s: &str| s.chars().filter(|c| !matches!(c, '_' | '-' | ' ' | '.')).collect::<String>();
+        let needle_ref = &needle;
+        let fuzzy_budget = WalkBudget::new(if narrow { 400_000 } else { 250_000 }, Duration::from_millis(if narrow { 4000 } else { 2500 }));
+        let pool = bounded_walk(&roots, !narrow, 6000, &fuzzy_budget, |p, _rel| {
+            match p.file_name().and_then(|n| n.to_str()) {
+                Some(name) => {
+                    let name = name.to_ascii_lowercase();
+                    name.contains(needle_ref)
+                        || strip(&name).contains(&strip(needle_ref))
+                        || strsim::jaro_winkler(needle_ref, &name) >= 0.82
                 }
-                None => break,
+                None => false,
             }
-        }
-        pool.sort();
-        pool.dedup();
-        let mut scored: Vec<(f64, &PathBuf)> = pool
-            .iter()
-            .filter_map(|p| {
-                let name = p.file_name()?.to_string_lossy().to_ascii_lowercase();
-                // Jaro-Winkler over the file/dir name; a substring hit is treated as a strong match
-                // so `game` finds `snake_game.js` and `miniproject` finds `mini_project`. To bridge
-                // separators, also compare with `_`/`-`/space stripped from both sides.
-                let strip = |s: &str| s.chars().filter(|c| !matches!(c, '_' | '-' | ' ')).collect::<String>();
-                let sim = strsim::jaro_winkler(needle, &name)
-                    .max(strsim::jaro_winkler(&strip(needle), &strip(&name)));
-                let score = if name.contains(needle) || strip(&name).contains(&strip(needle)) {
-                    sim.max(0.92)
-                } else {
-                    sim
-                };
-                (score >= 0.72).then_some((score, p))
-            })
+        });
+        let mut scored: Vec<(f64, PathBuf)> = pool
+            .paths
+            .into_iter()
+            .map(|p| (score_path(&p, &needle, &self.root, now), p))
+            .filter(|(s, _)| *s >= 0.72)
             .collect();
         if scored.is_empty() {
-            return Ok(format!("(no match for '{pattern}', and no similarly-named file or folder nearby)"));
+            return Ok(format!("no file or folder named like '{pattern}' found nearby (searched the working dir, its parents, and your Desktop/Documents/Downloads). Pass a ../ or absolute path to search a specific place."));
         }
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(10);
-        // Tag directories so the agent knows which suggestions are folders (relevant for "cd into X").
+        scored.truncate(15);
+        // Lead with a NEUTRAL header (never negative prose that reads like a failure) and tag folders.
         let lines: Vec<String> = scored
             .iter()
             .map(|(_, p)| {
-                let shown = display_path(&self.root, p);
-                if p.is_dir() {
-                    format!("{shown}/  (folder)")
-                } else {
-                    shown
-                }
+                let s = display_path(&self.root, p);
+                if p.is_dir() { format!("{s}/  (folder)") } else { s }
             })
             .collect();
-        Ok(format!("(no exact match for '{pattern}'; closest by name:)\n{}", lines.join("\n")))
+        Ok(format!("closest matches for '{pattern}' (ranked):\n{}", lines.join("\n")))
     }
 }
 
@@ -2079,7 +2384,7 @@ mod tests {
         std::fs::write(root.join("readme.md"), "").unwrap();
         let t = FileGlob::new(root);
         let out = t.execute(&serde_json::json!({"pattern":"snakegame.js"})).unwrap();
-        assert!(out.contains("closest by name"), "fuzzy header present: {out}");
+        assert!(out.contains("closest matches"), "fuzzy header present: {out}");
         assert!(out.contains("snake_game.js"), "near-name surfaced: {out}");
     }
 
@@ -2106,6 +2411,44 @@ mod tests {
         let out = t.execute(&serde_json::json!({"pattern":"miniproject"})).unwrap();
         assert!(out.contains("mini_project"), "parent folder surfaced by fuzzy: {out}");
         assert!(out.contains("(folder)"), "it's tagged as a folder: {out}");
+    }
+
+    #[test]
+    fn file_glob_smart_case_insensitive_by_default() {
+        // A lowercase pattern matches case-insensitively (a model types `readme.md`, means
+        // `README.md`); an uppercase letter in the pattern makes the match case-sensitive.
+        let root = temp_root("glob-case");
+        std::fs::write(root.join("README.md"), "").unwrap();
+        let t = FileGlob::new(root);
+        let out = t.execute(&serde_json::json!({"pattern":"readme.md"})).unwrap();
+        assert!(out.contains("README.md"), "lowercase pattern is case-insensitive: {out}");
+    }
+
+    #[test]
+    fn file_glob_ranks_exact_name_first() {
+        // With several matches, the EXACT-name file must sort to line 1 (best-first ranking, P1.3),
+        // so a model that reads only the first line still gets the right answer.
+        let root = temp_root("glob-rank");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("a/config.toml.bak"), "").unwrap();
+        std::fs::write(root.join("b/config.toml"), "").unwrap();
+        let t = FileGlob::new(root);
+        let out = t.execute(&serde_json::json!({"pattern":"**/config.toml"})).unwrap();
+        let first = out.lines().next().unwrap_or("");
+        assert!(first.ends_with("b/config.toml"), "exact name ranked first: {out}");
+    }
+
+    #[test]
+    fn file_glob_no_match_message_is_not_negative_prose() {
+        // A true no-match must NOT open with parenthetical negative prose (the old "(no exact
+        // match…)" that made models distrust the tool and shell out). It names where it looked.
+        let root = temp_root("glob-nomatch");
+        std::fs::write(root.join("alpha.rs"), "").unwrap();
+        let t = FileGlob::new(root);
+        let out = t.execute(&serde_json::json!({"pattern":"zzqwx_nonexistent_qq"})).unwrap();
+        assert!(!out.starts_with('('), "no leading negative parenthetical: {out}");
+        assert!(out.contains("searched"), "says where it looked: {out}");
     }
 
     #[test]
