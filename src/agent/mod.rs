@@ -228,6 +228,20 @@ pub fn build_top_level_system_prompt(
         s.push_str(&idx);
         s.push_str("\n</agents>\n");
     }
+    // Ultimate mode (aizen's `ultracode`): a pure SUFFIX telling the model to reason at max depth and
+    // orchestrate by default. Absent when off, so the prefix stays byte-identical (zero cache bust).
+    // Top-level only — sub-agents call `build_system_prompt` directly and never see this (they can't
+    // fan out further anyway; the workflow tool is depth-capped at 1).
+    if crate::core::cli_config::ultimate_enabled() {
+        s.push_str(
+            "\n<ultimate_mode>\n\
+             You are in ULTIMATE mode. Reason at maximum depth. For any task that decomposes into \
+             independent sub-tasks (multi-file investigation, multi-angle review, broad search), \
+             PREFER launching the `workflow` fan-out tool over doing it serially yourself. Verify \
+             findings adversarially before committing to conclusions.\n\
+             </ultimate_mode>\n",
+        );
+    }
     s
 }
 
@@ -1637,6 +1651,11 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
             let path = first.split_whitespace().nth(1).unwrap_or("");
             (true, format!("{verb} {path}"))
         }
+        "file_move" | "move_file" | "rename_file" | "file_rename" => {
+            // out first line = "moved <kind> <from> → <to>"; surface it verbatim (it's already a
+            // tidy one-liner), sans any trailing detail.
+            (true, first.trim_start_matches("moved ").to_string())
+        }
         "memory_search" => {
             if trimmed.starts_with("(no memory") {
                 (true, "0 memories".to_string())
@@ -2288,6 +2307,7 @@ fn tool_trace(name: &str, args: &serde_json::Value) -> String {
         "file_edit" | "multi_edit" | "edit_file" | "file_write" | "write_file" | "apply_patch" => {
             field("path").or_else(|| field("file"))
         }
+        "file_move" | "move_file" | "rename_file" | "file_rename" => field("from"),
         "file_read" | "read_file" => field("path").or_else(|| field("file")),
         "find_symbols" | "lsp_query" => field("query").or_else(|| field("name")),
         "clarify" | "memory_ask" | "telegram_ask" => field("question"),

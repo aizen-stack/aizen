@@ -53,7 +53,9 @@ pub fn active_tool_names() -> Option<HashSet<String>> {
     ACTIVE_TOOL_NAMES.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Resolve + canonicalize the working-directory root (the confinement boundary for file/shell).
+/// Resolve + canonicalize the working-directory root — the base that relative file/shell paths
+/// resolve against (NOT a hard boundary: `confine` no longer rejects paths that escape it, so an
+/// absolute or `../` path may reach elsewhere on disk — see [`confine`]).
 fn resolve_root() -> Result<PathBuf> {
     std::env::current_dir()
         .context("resolving cwd")?
@@ -61,7 +63,7 @@ fn resolve_root() -> Result<PathBuf> {
         .context("canonicalizing cwd")
 }
 
-/// The 7 built-in tools rooted at `root`. Shared by the top-level registry and the `coder`
+/// The built-in tools rooted at `root`. Shared by the top-level registry and the `coder`
 /// sub-agent role.
 fn default_registry_in(root: &Path) -> ToolRegistry {
     use crate::agent::web_tools::{WebCrawl, WebFetch, WebSearch};
@@ -83,6 +85,7 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     r.register(Box::new(FileEdit::new(root.to_path_buf())));
     r.register(Box::new(MultiEdit::new(root.to_path_buf())));
     r.register(Box::new(FileWrite::new(root.to_path_buf())));
+    r.register(Box::new(FileMove::new(root.to_path_buf())));
     r.register(Box::new(ShellRun::new(root.to_path_buf())));
     r.register(Box::new(SkillSave));
     register_skill_refine(&mut r);
@@ -207,7 +210,9 @@ pub fn default_registry_with_task(
 fn should_register_workflow() -> bool {
     match crate::core::cli_config::load().workflow_tool {
         Some(v) => v,
-        None => crate::agents::any_enabled(),
+        // Ultimate mode orchestrates by default, so the fan-out tool must be present even when no
+        // specialist agent is enabled (the model is told to prefer it in the system prompt).
+        None => crate::agents::any_enabled() || crate::core::cli_config::ultimate_enabled(),
     }
 }
 
@@ -255,6 +260,7 @@ pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
             r.register(Box::new(FileEdit::new(root.to_path_buf())));
             r.register(Box::new(MultiEdit::new(root.to_path_buf())));
             r.register(Box::new(FileWrite::new(root.to_path_buf())));
+            r.register(Box::new(FileMove::new(root.to_path_buf())));
             r.register(Box::new(ShellRun::new(root.to_path_buf())));
             r.register(Box::new(SkillSave));
             register_skill_refine(&mut r);
@@ -270,9 +276,9 @@ pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
 
 /// Build a tool registry for a dispatched SPECIALIST agent (see [`crate::agents`]). Same read-only
 /// base as [`role_registry`], plus a destructive scope derived from the persona's `tools:` frontmatter:
-/// - EMPTY `tools:` → **coder scope** (file_edit + multi_edit + shell_run + skill_save) — the locked
-///   default; no wider than the trusted `coder` sub-agent (the `cmd_guard` floor + per-op approval
-///   still apply underneath).
+/// - EMPTY `tools:` → **coder scope** (file_edit + multi_edit + file_write + file_move + shell_run +
+///   skill_save) — the locked default; no wider than the trusted `coder` sub-agent (the `cmd_guard`
+///   floor + per-op approval still apply underneath).
 /// - non-empty `tools:` → exactly those, mapped by name (Claude-Code casing accepted via the alias
 ///   map in [`canonical_subagent_tool`]; duplicates collapsed).
 ///
@@ -287,6 +293,7 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
         r.register(Box::new(FileEdit::new(root.to_path_buf())));
         r.register(Box::new(MultiEdit::new(root.to_path_buf())));
         r.register(Box::new(FileWrite::new(root.to_path_buf())));
+        r.register(Box::new(FileMove::new(root.to_path_buf())));
         r.register(Box::new(ShellRun::new(root.to_path_buf())));
         r.register(Box::new(SkillSave));
         register_skill_refine(&mut r);
@@ -304,6 +311,7 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
             "file_edit" => r.register(Box::new(FileEdit::new(root.to_path_buf()))),
             "multi_edit" => r.register(Box::new(MultiEdit::new(root.to_path_buf()))),
             "file_write" => r.register(Box::new(FileWrite::new(root.to_path_buf()))),
+            "file_move" => r.register(Box::new(FileMove::new(root.to_path_buf()))),
             "shell_run" => r.register(Box::new(ShellRun::new(root.to_path_buf()))),
             "skill_save" => {
                 // A persona granted skill authoring gets the refine companion too (gated on any
@@ -321,7 +329,8 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
 /// canonical name of a GRANTABLE destructive tool, or `None`. `None` covers three cases, all meaning
 /// "don't add it": read-only tools (already in the base — `Read`/`Grep`/`Glob`/…), forbidden tools
 /// (`task`/`todo`/`process`/`clarify`/`persona_create`/`mcp_*`), and unknown names. This is the single
-/// structural choke-point for the capability invariant: only these four strings can ever be returned,
+/// structural choke-point for the capability invariant: only the grantable destructive tool names
+/// (`file_edit`/`multi_edit`/`file_write`/`file_move`/`shell_run`/`skill_save`) can ever be returned,
 /// so nothing else can be granted to a specialist.
 fn canonical_subagent_tool(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -334,6 +343,9 @@ fn canonical_subagent_tool(raw: &str) -> Option<&'static str> {
         "write" | "file_write" | "filewrite" | "write_file" | "writefile" | "create" | "create_file" => {
             Some("file_write")
         }
+        // rename / move
+        "file_move" | "filemove" | "move_file" | "movefile" | "mv_file" | "mv" | "file_rename"
+        | "filerename" | "rename_file" | "renamefile" | "rename" => Some("file_move"),
         // shell
         "bash" | "shell" | "shell_run" | "shellrun" | "run" | "run_command" | "terminal" => {
             Some("shell_run")
@@ -1403,6 +1415,141 @@ impl Tool for FileWrite {
     }
 }
 
+// ── file_move ──────────────────────────────────────────────────────────────
+
+/// Rename or move a file or directory in one call — the tool a model reaches for instead of shelling
+/// out to `mv`/`move`/`Rename-Item` (which vary by OS and silently clobber). Uses `std::fs::rename`
+/// (an atomic same-filesystem rename that PRESERVES the inode + metadata), falling back to a
+/// copy-then-remove only across filesystems. Guards against accidental clobber: an existing
+/// destination is a hard error unless `overwrite:true`.
+struct FileMove {
+    root: PathBuf,
+}
+impl FileMove {
+    fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+impl Tool for FileMove {
+    fn name(&self) -> &str {
+        "file_move"
+    }
+    fn description(&self) -> &str {
+        "Rename or move a file or directory (from → to) in a single call. Use this instead of \
+         shelling out to mv / move / Rename-Item. An existing destination is a hard error unless \
+         `overwrite` is true (so you never clobber a file by accident). Set `create_dirs` true to \
+         create missing parent directories of the destination. Preserves file metadata (it is an \
+         OS-level rename on the same drive). Relative paths resolve under the working directory; an \
+         absolute path or a leading `../` may move ANYWHERE on disk."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "from": {"type": "string", "description": "existing source path (file or directory)"},
+                "to": {"type": "string", "description": "destination path"},
+                "overwrite": {"type": "boolean", "description": "replace the destination if it already exists (default false)"},
+                "create_dirs": {"type": "boolean", "description": "create missing parent directories of the destination (default false)"}
+            },
+            "required": ["from", "to"],
+            "additionalProperties": false
+        })
+    }
+    fn is_destructive(&self) -> bool {
+        true
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
+    fn execute(&self, args: &Value) -> Result<String> {
+        let from = str_arg(args, "from")?;
+        let to = str_arg(args, "to")?;
+        let overwrite = args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false);
+        let create_dirs = args.get("create_dirs").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // Source MUST exist (must_exist=true canonicalizes the whole path → clear error if missing).
+        let src = confine(&self.root, from, true)
+            .with_context(|| format!("source {from} not found"))?;
+        // Destination need only have an existing parent (must_exist=false), unless create_dirs asks
+        // us to make it. Resolve the parent ourselves so we can create it BEFORE confine() tries to
+        // canonicalize it (confine requires the parent to already exist).
+        let raw_to = Path::new(to);
+        let joined_to = if raw_to.is_absolute() { raw_to.to_path_buf() } else { self.root.join(raw_to) };
+        if create_dirs {
+            if let Some(parent) = joined_to.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating parent directories of {to}"))?;
+            }
+        }
+        let dst = confine(&self.root, to, false)
+            .with_context(|| format!("resolving destination {to} (its parent directory must exist — pass create_dirs:true to create it)"))?;
+
+        // Moving a path onto itself is a no-op (don't churn the FS or arm the verify gate).
+        if src == dst {
+            return Ok(format!("{NOOP_WRITE_PREFIX}: {from} and {to} are the same path"));
+        }
+        if dst.exists() {
+            if !overwrite {
+                bail!("destination {to} already exists; pass overwrite:true to replace it");
+            }
+            // Overwrite: remove the existing destination first so rename can't fail on a non-empty
+            // dir (and cross-fs semantics stay uniform). A file or an (empty/non-empty) dir both go.
+            if dst.is_dir() {
+                std::fs::remove_dir_all(&dst).with_context(|| format!("removing existing {to}"))?;
+            } else {
+                std::fs::remove_file(&dst).with_context(|| format!("removing existing {to}"))?;
+            }
+        }
+        move_path(&src, &dst).with_context(|| format!("moving {from} → {to}"))?;
+        let kind = if dst.is_dir() { "directory" } else { "file" };
+        Ok(format!("moved {kind} {from} → {to}"))
+    }
+}
+
+/// Rename `src` → `dst`, falling back to copy-then-delete when they live on different filesystems
+/// (`fs::rename` returns `ErrorKind::CrossesDevices`, or a raw OS error on older toolchains). The
+/// happy path is a single atomic `rename` that preserves the inode + metadata.
+fn move_path(src: &Path, dst: &Path) -> std::io::Result<()> {
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if is_cross_device(&e) => {
+            // Cross-device: recursively copy then remove the source. Directories are walked; files
+            // are a straight copy (which carries permissions via std on both Windows and Unix).
+            copy_recursive(src, dst)?;
+            if src.is_dir() {
+                std::fs::remove_dir_all(src)
+            } else {
+                std::fs::remove_file(src)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a rename error is "these paths are on different filesystems" (the only case worth a
+/// copy-then-delete fallback). `CrossesDevices` is unstable-named but stable-valued; also match the
+/// raw OS codes (Windows ERROR_NOT_SAME_DEVICE=17, Unix EXDEV=18) so we don't depend on the name.
+fn is_cross_device(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(17) | Some(18))
+}
+
+/// Recursively copy `src` → `dst` (file or directory). Used only on the cross-filesystem move path.
+fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst).map(|_| ())
+    }
+}
+
 /// The outcome of ONE replacement (pure; computed in memory). `before`/`after` feed the diff
 /// preview; `count`/`rung` feed the human summary (which rung matched is surfaced so a
 /// looser-than-exact match is always visible in the result).
@@ -1412,7 +1559,8 @@ struct EditApplied {
     before: String,
     after: String,
     count: usize,
-    /// Which ladder rung applied: "exact" | "indent" | "ws-norm" | "anchor-trim" | "unescape".
+    /// Which ladder rung applied: "exact" | "indent" | "ws-norm" | "anchor-trim" | "unescape" |
+    /// "blank-norm".
     rung: &'static str,
 }
 impl EditApplied {
@@ -1424,6 +1572,7 @@ impl EditApplied {
             "ws-norm" => "1 replacement, whitespace-normalized match".to_string(),
             "anchor-trim" => "1 replacement, shared-context-trimmed match".to_string(),
             "unescape" => "1 replacement, escape-normalized match".to_string(),
+            "blank-norm" => "1 replacement, blank-line-insensitive match".to_string(),
             _ => format!("{} replacement(s)", self.count),
         }
     }
@@ -1448,6 +1597,8 @@ const NEAREST_MISS_MAX_FILE_LINES: usize = 20_000;
 ///   R4 anchor-trim     — a first/last line byte-identical in old AND new (pure context) is
 ///                        dropped from BOTH and R1–R3 retried: semantics-preserving by construction
 ///   R5 escape-norm     — JSON-unescape old AND new (the double-escaped-arguments failure mode)
+///   R5.5 blank-norm    — match ignoring blank lines (the model added/dropped an empty line inside
+///                        the block, so its fixed line count no longer aligns with the file)
 ///   R6 nearest-miss    — terminal failure with the best-scoring region quoted (line numbers +
 ///                        "copy EXACTLY from this"), so the retry lands in ONE turn
 ///
@@ -1489,13 +1640,40 @@ fn apply_one_edit(content: &str, old: &str, new: &str, replace_all: bool, label:
                 return Ok(a);
             }
         }
+        // R5.5 blank-line-insensitive: the model added or dropped a blank line INSIDE the block, so
+        // its line count no longer lines up with the file and the fixed-`k` rungs above all miss.
+        // Match on the non-blank trimmed lines only; splice the whole spanned region (interior blanks
+        // included) so `new` fully redefines it. Same 1-match invariant as every other rung.
+        {
+            let ranges = blank_insensitive_blocks(content, old);
+            match ranges.len() {
+                0 => {}
+                1 => {
+                    let (bs, be) = ranges[0];
+                    let before = content[bs..be].to_string();
+                    let spliced = preserve_eol(new, &before, &content[be..]);
+                    let updated = format!("{}{}{}", &content[..bs], spliced, &content[be..]);
+                    return Ok(EditApplied {
+                        content: updated,
+                        before,
+                        after: new.to_string(),
+                        count: 1,
+                        rung: "blank-norm",
+                    });
+                }
+                n => bail!(
+                    "old_string (ignoring blank lines) matches {n} blocks in {label}; add more surrounding context to disambiguate"
+                ),
+            }
+        }
     }
     // R6 terminal: nearest-miss report so the model's retry can copy the real bytes.
     if content.lines().count() <= NEAREST_MISS_MAX_FILE_LINES {
         if let Some(hint) = nearest_miss(content, old) {
             bail!(
                 "old_string not found in {label} (tried exact, indentation-tolerant, \
-                 whitespace-normalized, anchor-trimmed, and escape-normalized matching).\n{hint}"
+                 whitespace-normalized, anchor-trimmed, escape-normalized, and \
+                 blank-line-insensitive matching).\n{hint}"
             );
         }
     }
@@ -1734,6 +1912,57 @@ fn normalized_blocks(content: &str, old: &str, norm: fn(&str) -> String) -> Vec<
     out
 }
 
+/// R5.5: find blocks matching `old` when blank lines are IGNORED on both sides — the model added or
+/// dropped an empty line inside the block, so its fixed line count no longer aligns and every rung
+/// above (which needs exactly `k` consecutive lines) misses. The comparison is over the trimmed,
+/// NON-blank lines only; the returned byte range still covers the WHOLE spanned region in the file
+/// (interior blank lines included), so splicing `new` in redefines it wholesale. Returns each
+/// matching block's `[start, end)` (line-aligned, excluding the trailing newline). A block whose
+/// non-blank content is empty proves nothing → no ranges (the caller then falls through to R6).
+fn blank_insensitive_blocks(content: &str, old: &str) -> Vec<(usize, usize)> {
+    // The signature we match: `old`'s non-blank lines, trimmed.
+    let want: Vec<String> = old
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let k = want.len();
+    if k == 0 {
+        return Vec::new();
+    }
+    // Byte spans of every line in content (line content excludes the '\n').
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    for (idx, ch) in content.char_indices() {
+        if ch == '\n' {
+            spans.push((start, idx));
+            start = idx + 1;
+        }
+    }
+    spans.push((start, content.len()));
+
+    // Index the NON-blank lines (trimmed text + which content-line they came from), so a matched run
+    // of `k` non-blank lines can be mapped back to the first/last physical line for the byte span.
+    let nonblank: Vec<(usize, String)> = spans
+        .iter()
+        .enumerate()
+        .map(|(li, &(a, b))| (li, content[a..b].trim().to_string()))
+        .filter(|(_, t)| !t.is_empty())
+        .collect();
+    if nonblank.len() < k {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for i in 0..=(nonblank.len() - k) {
+        if (0..k).all(|j| nonblank[i + j].1 == want[j]) {
+            let first_line = nonblank[i].0;
+            let last_line = nonblank[i + k - 1].0;
+            out.push((spans[first_line].0, spans[last_line].1));
+        }
+    }
+    out
+}
+
 
 /// A compact **unified diff** of an edit: common leading/trailing lines are trimmed away (so a big
 /// block collapses to just its changed window), the removed lines are prefixed `-`, the added lines
@@ -1808,8 +2037,9 @@ impl Tool for MultiEdit {
         "Apply an ORDERED list of exact-string edits to ONE file in a single atomic write — all \
          succeed or the file is left untouched. Each edit is {old_string, new_string, replace_all?} \
          and applies to the result of the previous one (same matching as file_edit, incl. the \
-         indentation-tolerant retry). For a SINGLE edit use file_edit. Read the file first. Confined \
-         to the working directory."
+         indentation-tolerant retry). For a SINGLE edit use file_edit. Read the file first. A relative \
+         path resolves under the working directory; an absolute path or a leading `../` may write \
+         elsewhere on disk."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -2325,10 +2555,14 @@ mod tests {
     }
 
     #[test]
-    fn file_read_rejects_escape() {
-        let root = temp_root("read-escape");
+    fn file_read_errors_on_missing_path() {
+        // NOTE: confinement was removed — a `../` path is NOT rejected for escaping the root. This
+        // errors only because the target doesn't exist (canonicalize fails). A `../` path that DOES
+        // exist is read successfully by design (see `confine`'s doc). This test guards the
+        // missing-file error, not a boundary that no longer exists.
+        let root = temp_root("read-missing");
         let t = FileRead::new(root);
-        assert!(t.execute(&serde_json::json!({"path":"../../secret"})).is_err());
+        assert!(t.execute(&serde_json::json!({"path":"../../nonexistent-xyzzy-secret"})).is_err());
     }
 
     #[test]
@@ -2575,6 +2809,33 @@ mod tests {
         let a = apply_one_edit(content, "alpha\\nbeta", "alpha\\nBETA", false, "t").unwrap();
         assert_eq!(a.rung, "unescape");
         assert!(a.content.contains("alpha\nBETA\ngamma"), "{}", a.content);
+    }
+
+    #[test]
+    fn ladder_blank_line_insensitive_match() {
+        // The file has a blank line INSIDE the block that the model's old_string omitted — every
+        // fixed-`k` rung misses (line counts differ), but R5.5 matches on the non-blank lines and
+        // splices the whole spanned region (blank included) so `new` redefines it.
+        let content = "fn f() {\n    let a = 1;\n\n    let b = 2;\n}\n";
+        let old = "let a = 1;\n    let b = 2;"; // no blank between — 2 lines vs the file's 3
+        let new = "let a = 10;\n    let b = 20;";
+        let a = apply_one_edit(content, old, new, false, "t").unwrap();
+        assert_eq!(a.rung, "blank-norm");
+        assert!(a.content.contains("let a = 10;"), "{}", a.content);
+        assert!(a.content.contains("let b = 20;"), "{}", a.content);
+        assert!(!a.content.contains("let a = 1;"), "old first line replaced: {}", a.content);
+        assert!(a.summary().contains("blank-line-insensitive"));
+    }
+
+    #[test]
+    fn ladder_blank_norm_ambiguous_refuses() {
+        // Both occurrences have a blank INSIDE them, so old (no blank) misses every fixed-`k` rung
+        // and only R5.5 matches — twice → hard error, never a silent wrong splice.
+        let content = "a = 1;\n\nb = 2;\nMID\na = 1;\n\nb = 2;\n";
+        let err = apply_one_edit(content, "a = 1;\nb = 2;", "z = 9;", false, "t")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("blank lines") && err.contains('2'), "ambiguity is a hard refusal: {err}");
     }
 
     #[test]
@@ -2950,6 +3211,99 @@ mod tests {
         assert!(r.starts_with(NOOP_WRITE_PREFIX), "got: {r}");
         assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), mtime_before);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "one two three\n");
+    }
+
+    #[test]
+    fn file_move_renames_a_file() {
+        let root = temp_root("fmv-rename");
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        let t = FileMove::new(root.clone());
+        let r = t.execute(&serde_json::json!({"from": "a.txt", "to": "b.txt"})).unwrap();
+        assert!(r.starts_with("moved file"), "got: {r}");
+        assert!(!root.join("a.txt").exists(), "source is gone after a move");
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "hello\n");
+    }
+
+    #[test]
+    fn file_move_errors_on_missing_source() {
+        let root = temp_root("fmv-missing");
+        let t = FileMove::new(root.clone());
+        let err = t.execute(&serde_json::json!({"from": "nope.txt", "to": "x.txt"})).unwrap_err();
+        assert!(format!("{err:#}").contains("nope.txt"), "error names the source: {err:#}");
+    }
+
+    #[test]
+    fn file_move_wont_clobber_without_overwrite() {
+        let root = temp_root("fmv-clobber");
+        std::fs::write(root.join("a.txt"), "A\n").unwrap();
+        std::fs::write(root.join("b.txt"), "B\n").unwrap();
+        let t = FileMove::new(root.clone());
+        // Default: refuse to overwrite an existing destination.
+        let err = t.execute(&serde_json::json!({"from": "a.txt", "to": "b.txt"})).unwrap_err();
+        assert!(format!("{err:#}").contains("already exists"), "got: {err:#}");
+        // Both files must be untouched after the refusal.
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "A\n");
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "B\n");
+    }
+
+    #[test]
+    fn file_move_overwrite_replaces_destination() {
+        let root = temp_root("fmv-overwrite");
+        std::fs::write(root.join("a.txt"), "A\n").unwrap();
+        std::fs::write(root.join("b.txt"), "B\n").unwrap();
+        let t = FileMove::new(root.clone());
+        let r = t
+            .execute(&serde_json::json!({"from": "a.txt", "to": "b.txt", "overwrite": true}))
+            .unwrap();
+        assert!(r.starts_with("moved file"), "got: {r}");
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "A\n", "dest now holds source content");
+    }
+
+    #[test]
+    fn file_move_create_dirs_makes_parents() {
+        let root = temp_root("fmv-mkdirs");
+        std::fs::write(root.join("a.txt"), "hi\n").unwrap();
+        let t = FileMove::new(root.clone());
+        // Destination parent (`nested/deep/`) does not exist yet.
+        let no_parent = t.execute(&serde_json::json!({"from": "a.txt", "to": "nested/deep/b.txt"}));
+        assert!(no_parent.is_err(), "missing parent errors without create_dirs");
+        // With create_dirs it makes the parents and moves.
+        let r = t
+            .execute(&serde_json::json!({"from": "a.txt", "to": "nested/deep/b.txt", "create_dirs": true}))
+            .unwrap();
+        assert!(r.starts_with("moved file"), "got: {r}");
+        assert_eq!(std::fs::read_to_string(root.join("nested/deep/b.txt")).unwrap(), "hi\n");
+    }
+
+    #[test]
+    fn file_move_moves_a_directory() {
+        let root = temp_root("fmv-dir");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/f.txt"), "x\n").unwrap();
+        let t = FileMove::new(root.clone());
+        let r = t.execute(&serde_json::json!({"from": "src", "to": "dst"})).unwrap();
+        assert!(r.starts_with("moved directory"), "got: {r}");
+        assert!(!root.join("src").exists());
+        assert_eq!(std::fs::read_to_string(root.join("dst/f.txt")).unwrap(), "x\n");
+    }
+
+    #[test]
+    fn file_move_same_path_is_a_noop() {
+        let root = temp_root("fmv-noop");
+        std::fs::write(root.join("a.txt"), "keep\n").unwrap();
+        let t = FileMove::new(root.clone());
+        let r = t.execute(&serde_json::json!({"from": "a.txt", "to": "a.txt"})).unwrap();
+        assert!(r.starts_with(NOOP_WRITE_PREFIX), "got: {r}");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "keep\n");
+    }
+
+    #[test]
+    fn file_move_is_destructive_and_arms_verify_gate() {
+        // The verify gate arms on is_destructive() (not a tool-name list), so file_move must report
+        // destructive to be verified like file_edit/file_write.
+        assert!(FileMove::new(PathBuf::from(".")).is_destructive());
+        assert!(!FileMove::new(PathBuf::from(".")).is_concurrency_safe());
     }
 
     #[test]

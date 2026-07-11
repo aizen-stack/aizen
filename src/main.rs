@@ -512,6 +512,21 @@ enum ConfigCmd {
         /// Time-machine checkpoints to keep (oldest auto-pruned past this; `0` = unlimited). Default 50.
         #[arg(long)]
         timemachine_keep: Option<usize>,
+        /// Auto-detect reasoning effort per turn from your wording (default on). `false` pins the
+        /// fixed --reasoning-effort (or omits it if unset).
+        #[arg(long)]
+        auto_effort: Option<bool>,
+        /// Fixed reasoning effort passed to the provider: `low`, `medium`, `high`, `xhigh`, or `max`.
+        /// Setting it turns auto-detect off.
+        #[arg(long)]
+        reasoning_effort: Option<String>,
+        /// Ultimate mode: pin max reasoning effort + prefer launching workflows (orchestrate-by-default).
+        #[arg(long)]
+        ultimate: Option<bool>,
+        /// Adaptive difficulty→effort routing: let the per-turn heuristic climb to `xhigh` on the
+        /// hardest turns (opt-in; default off).
+        #[arg(long)]
+        adaptive_effort: Option<bool>,
     },
     /// Show the saved config (API key masked).
     Show,
@@ -1512,7 +1527,10 @@ fn run_time(cmd: TimeCmd) -> Result<()> {
             println!("{} #{}  {}", style("✓ checkpoint").color256(splash::ACCENT), snap.id, style(&snap.created).dim());
             Ok(())
         }
-        TimeCmd::List => print_timeline(),
+        TimeCmd::List => {
+            print_timeline();
+            Ok(())
+        }
         TimeCmd::Restore { id } => {
             let snap = timemachine::restore(id)?;
             let label = if snap.label.is_empty() { "(no label)".to_string() } else { snap.label.clone() };
@@ -1547,30 +1565,114 @@ fn run_time(cmd: TimeCmd) -> Result<()> {
     }
 }
 
-/// Print the snapshot timeline (▸ = the active point).
-fn print_timeline() -> Result<()> {
-    let (snaps, cursor) = timemachine::timeline()?;
-    if snaps.is_empty() {
-        println!("(no checkpoints yet — `aizen time save [label]`, or /checkpoint in the REPL)");
-        return Ok(());
+/// Human "2m ago" from a snapshot's stored LOCAL timestamp. Pure core (`rel_time_from`) takes `now`
+/// so the bucketing is unit-testable; a malformed timestamp degrades to the raw string.
+fn rel_time(created: &str) -> String {
+    rel_time_from(created, chrono::Local::now().naive_local())
+}
+fn rel_time_from(created: &str, now: chrono::NaiveDateTime) -> String {
+    match chrono::NaiveDateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S") {
+        Ok(t) => {
+            let secs = (now - t).num_seconds();
+            if secs < 0 {
+                "just now".to_string()
+            } else if secs < 60 {
+                format!("{secs}s ago")
+            } else if secs < 3600 {
+                format!("{}m ago", secs / 60)
+            } else if secs < 86_400 {
+                format!("{}h ago", secs / 3600)
+            } else {
+                format!("{}d ago", secs / 86_400)
+            }
+        }
+        Err(_) => created.to_string(),
     }
-    for (i, s) in snaps.iter().enumerate() {
-        let here = if Some(i) == cursor {
-            style("▸").color256(splash::ACCENT).bold().to_string()
-        } else {
-            " ".to_string()
-        };
-        let label = if s.label.is_empty() { "(no label)".to_string() } else { s.label.clone() };
-        let tag = if s.auto { style(" · auto").dim().to_string() } else { String::new() };
-        println!("{here} #{:<3} {}  {label}{tag}", s.id, style(&s.created).dim());
-    }
-    let keep = cli_config::load().timemachine_keep.unwrap_or(50);
-    let limit = if keep == 0 { "unlimited".to_string() } else { format!("auto-prune oldest past {keep}") };
-    println!("{}", style(format!("{} checkpoint(s) · {limit} · `aizen time prune`/`clear` to tidy", snaps.len())).dim());
-    Ok(())
 }
 
-/// `/timeline` — interactive time machine: pick a checkpoint to restore, or save a new one.
+#[cfg(test)]
+mod rel_time_tests {
+    use super::*;
+
+    fn at(s: &str) -> chrono::NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn buckets_seconds_minutes_hours_days() {
+        let now = at("2026-07-08 12:00:00");
+        assert_eq!(rel_time_from("2026-07-08 11:59:30", now), "30s ago");
+        assert_eq!(rel_time_from("2026-07-08 11:58:00", now), "2m ago");
+        assert_eq!(rel_time_from("2026-07-08 09:00:00", now), "3h ago");
+        assert_eq!(rel_time_from("2026-07-05 12:00:00", now), "3d ago");
+    }
+
+    #[test]
+    fn future_and_now_and_malformed() {
+        let now = at("2026-07-08 12:00:00");
+        // A clock-skewed future timestamp degrades to "just now", not a negative age.
+        assert_eq!(rel_time_from("2026-07-08 12:00:30", now), "just now");
+        assert_eq!(rel_time_from("2026-07-08 12:00:00", now), "0s ago");
+        // Unparseable input falls back to the raw string.
+        assert_eq!(rel_time_from("not-a-date", now), "not-a-date");
+    }
+}
+
+/// `/timeline` — a static, glanceable print of the checkpoint timeline (newest first), with the
+/// active point marked `▸`, relative times, labels, and `auto`/`+chat` tags. Read-only: restoring
+/// stays behind `/timeline pick` (the interactive menu) so a rewind is always a deliberate choice.
+fn print_timeline() {
+    let (snaps, cursor) = match timemachine::timeline() {
+        Ok(t) => t,
+        Err(e) => {
+            tui::emit_line(&style(format!("{e}")).color256(crate::ui::theme::WARN).to_string());
+            return;
+        }
+    };
+    if snaps.is_empty() {
+        tui::emit_line(
+            &style("⎇ timeline — no checkpoints yet · /checkpoint to save one").dim().to_string(),
+        );
+        return;
+    }
+    let n = snaps.len();
+    tui::emit_line(&format!(
+        "{}  {n} checkpoint(s)",
+        style("⎇ timeline").color256(splash::ACCENT).bold(),
+    ));
+    // Align the `#id` column to the widest id present (+1 for the leading `#`).
+    let id_w = snaps.iter().map(|s| s.id.to_string().len()).max().unwrap_or(1) + 1;
+    // Newest first (the ledger stores oldest → newest).
+    for (i, s) in snaps.iter().enumerate().rev() {
+        let is_cur = Some(i) == cursor;
+        let id = format!("#{}", s.id);
+        let rel = rel_time(&s.created);
+        let label = if s.label.is_empty() { "(no label)".to_string() } else { s.label.clone() };
+        let mut tags = String::new();
+        if s.auto {
+            tags.push_str(" · auto");
+        }
+        if s.has_chat {
+            tags.push_str(" · +chat");
+        }
+        let head = format!("{id:<id_w$}  {rel:<9}  {label}");
+        let mark = if is_cur { "▸" } else { " " };
+        // Current point accented; tags always dim. Style the marker+head as one segment, then append
+        // the dim tags separately so no ANSI code nests inside another.
+        let body = if is_cur {
+            format!("{} {}", style(mark).color256(splash::ACCENT).bold(), style(head).color256(splash::ACCENT))
+        } else {
+            format!("{mark} {head}")
+        };
+        let tag_str = if tags.is_empty() { String::new() } else { style(tags).dim().to_string() };
+        tui::emit_line(&format!("{body}{tag_str}"));
+    }
+    tui::emit_line(
+        &style("▸ = current · restore: /timeline pick   (or /undo · /redo to step)").dim().to_string(),
+    );
+}
+
+/// `/timeline pick` — interactive time machine: pick a checkpoint to restore, or save a new one.
 ///
 /// Restore offers up to three tiers (Cline-style), depending on whether the checkpoint captured the
 /// conversation too:
@@ -3155,25 +3257,34 @@ async fn first_run_onboarding() {
     );
 }
 
-/// One-line status string (model · tokens · turns · ctx% · yolo) for the sticky TUI footer. Plain
-/// text — `paint_box` dims it as a whole.
+/// The minimal HUD line: `model  ·  ✦ mode`, with an optional TODO summary. Everything numeric
+/// (token counts, turns, cache%) moved OFF this row — the context fill is now the graphical meter
+/// bar painted on the right of the HUD (fed via `tui::set_ctx_permille`), and the raw numbers live
+/// behind `/tokens` · `/cost`. Keeping the left side to just model + mode is the whole point: the
+/// row reads at a glance instead of being a wall of stats.
 fn status_text(history: &[Message], model: &str) -> String {
     let toks = session_tokens(history);
-    let turns = history.iter().filter(|m| m.role == "user").count();
     let (window, _) = resolve_ctx_window(model);
-    let pct = (toks as f64 / window as f64 * 100.0).min(100.0);
-    let toklabel = if toks >= 1000 { format!("~{:.1}K", toks as f64 / 1000.0) } else { format!("~{toks}") };
-    let winlabel = if window >= 1000 { format!("{}K", window / 1000) } else { window.to_string() };
-    let mode = if yolo_enabled() {
+    // Feed the graphical context meter (per-mille for sub-1% resolution); paint_box draws the bar.
+    let permille = (toks as f64 / window as f64 * 1000.0).round().clamp(0.0, 1000.0) as u16;
+    tui::set_ctx_permille(permille);
+    let mode = if cli_config::ultimate_enabled() {
+        "  ·  ✦ ultimate"
+    } else if yolo_enabled() {
         "  ·  ⚡ yolo"
     } else if smart_approve_enabled() {
         "  ·  ◆ smart"
     } else {
         ""
     };
+    // Active persona chip — so it's always visible WHICH character aizen is role-playing (not just a
+    // one-off "now playing" line that scrolls away). `🎭 Name`, styled by paint_box's chip pass.
+    let persona = cli_config::load()
+        .persona
+        .map(|p| format!("  ·  🎭 {p}"))
+        .unwrap_or_default();
     let todos = crate::agent::todo::status_summary().map(|s| format!("  ·  {s}")).unwrap_or_default();
-    let cache = cache_hit_label().map(|s| format!("  ·  {s}")).unwrap_or_default();
-    format!("{model}  ·  {toklabel}/{winlabel} tok  ·  {turns} turns  ·  {pct:.0}% ctx{cache}{todos}{mode}")
+    format!("{model}{persona}{mode}{todos}")
 }
 
 /// The summarizer endpoint: `roles.summarizer` routing (env > config > main endpoint). Chore
@@ -3316,6 +3427,11 @@ async fn run_menu_sticky() -> Result<()> {
                     tui::emit_line(&style(format!("  {}{}", icons::g(icons::tip()), tip)).dim().to_string());
                 }
                 model_label = model.clone();
+                // Per-turn reasoning-effort auto-detect: classify the finalized user text, arm the
+                // override the client reads this turn, and show the chosen tier (always, incl. defer).
+                let eff = resolve_turn_effort(&line);
+                cli_config::set_effort_override(eff.clone());
+                tui::emit_line(&effort_turn_line(eff.as_deref()));
                 if images.is_empty() {
                     history.push(Message::user(line));
                 } else {
@@ -3358,6 +3474,17 @@ async fn run_menu_sticky() -> Result<()> {
 
                 tui::clear_cancel(); // fresh turn → forget any Esc from a previous one
                 while input.cancel.try_recv().is_ok() {} // drain any stale cancel
+                // A quiet "here we go" line: the whimsical working verb ("✦ Pondering…") prints ONCE
+                // into the scrolling transcript at turn start, so each run opens on a fresh word —
+                // instead of the verb cycling in the cramped HUD pill. This path only runs under the
+                // sticky TUI (already a TTY); silenced with tips off (`AIZEN_NO_TIPS`).
+                if !cli_config::branded_flag("NO_TIPS") {
+                    tui::emit_line(
+                        &style(format!("✦ {}…", tui::next_work_verb()))
+                            .color256(splash::ACCENT)
+                            .to_string(),
+                    );
+                }
                 // Arm LAST: the keyboard thread only queues a cancel once WORKING is true, so flipping
                 // it after the clear+drain guarantees no Esc meant for THIS turn gets swallowed in the
                 // arming window.
@@ -3430,6 +3557,10 @@ async fn run_menu_sticky() -> Result<()> {
                     }
                 };
                 tui::set_working(false);
+                // Disarm the per-turn effort override the moment the turn ends — every branch below
+                // (ok / clarify / interrupt / error) flows through here, so effort never leaks into
+                // the next turn regardless of how this one finished.
+                cli_config::clear_effort_override();
 
                 match result {
                     None => {
@@ -3454,7 +3585,19 @@ async fn run_menu_sticky() -> Result<()> {
                     Some(Ok(AgentOutcome { stop: StopReason::AwaitingInput(q), .. })) => {
                         show_clarify(&q);
                     }
-                    Some(Ok(_)) => {
+                    Some(Ok(outcome)) => {
+                        // An EMPTY answer from a SINGLE model call (no tool work, no streamed text)
+                        // used to vanish silently — a blank turn (a rate-limit swallowed into an empty
+                        // 200, a content filter, a dead endpoint that streams `[DONE]` with no deltas)
+                        // looked identical to "still idle". Surface it so a failed/empty call never
+                        // passes for success. Gated on `iters <= 1` so a turn that DID do tool work and
+                        // simply ended without a closing sentence isn't wrongly flagged.
+                        let empty = outcome.final_text.as_deref().map(str::trim).unwrap_or("").is_empty();
+                        if empty && outcome.iters <= 1 {
+                            tui::emit_line(
+                                &theme::muted("· no response — the model returned nothing (try again, or /model to switch)").to_string(),
+                            );
+                        }
                         let persona_after = cli_config::load().persona;
                         if persona_after != persona_before {
                             update_system_prompt(&mut history, &model);
@@ -3561,6 +3704,11 @@ async fn run_menu_plain() -> Result<()> {
             }
         };
         model_label = model.clone();
+        // Per-turn reasoning-effort auto-detect (mirrors the sticky REPL): classify the finalized
+        // user text, arm the override the client reads this turn, and show the chosen tier.
+        let eff = resolve_turn_effort(&line);
+        cli_config::set_effort_override(eff.clone());
+        println!("{}", effort_turn_line(eff.as_deref()));
         if images.is_empty() {
             history.push(Message::user(line));
         } else {
@@ -3681,6 +3829,9 @@ async fn run_menu_plain() -> Result<()> {
                 }
             }
         }
+        // Disarm the per-turn effort override so it never leaks into the next turn (mirror of the
+        // sticky REPL's reset). Covers every branch above, incl. clarify/error.
+        cli_config::clear_effort_override();
     }
     crate::agent::process::kill_all(); // reap any background dev servers/watchers we started
     println!("{}", style("bye.").dim());
@@ -3828,6 +3979,119 @@ fn repl_session_id() -> &'static str {
 
 fn memory_auto_learn_enabled() -> bool {
     cli_config::load().memory_auto_learn.unwrap_or(true)
+}
+
+/// Decide THIS turn's reasoning effort. When auto-detect is ON (default), classify the user's
+/// fully-expanded message (keyword ladder → complexity heuristic); a hit forces that tier, else we
+/// fall back to the configured `reasoning_effort` (which may itself be `None` ⇒ omit the field).
+/// PURE-ish wrapper (loads config) around the pure `core::effort::classify_effort`. The result is
+/// armed into the per-turn override cell read by the LLM client, and cleared at turn end.
+fn resolve_turn_effort(line: &str) -> Option<String> {
+    // Ultimate mode pins max effort every turn (auto-detect is bypassed) — the aizen `ultracode`.
+    if cli_config::ultimate_enabled() {
+        return Some("max".to_string());
+    }
+    if cli_config::auto_effort_enabled() {
+        // P3: adaptive routing lets the complexity heuristic climb to `xhigh` on the hardest turns.
+        let adaptive = cli_config::adaptive_effort_enabled();
+        if let Some(e) = crate::core::effort::classify_effort_with(line, adaptive) {
+            return Some(e.as_str().to_string());
+        }
+    }
+    cli_config::load().reasoning_effort.clone()
+}
+
+/// The per-turn "effort: <tier>" status line, tinted to match the slider's tier colours (auto =
+/// moonlight · low = green · medium = dim silver · high = gold) so the whole effort feature reads as
+/// one system. `None` ⇒ the field is omitted this turn → shown as a faint "default".
+fn effort_turn_line(eff: Option<&str>) -> String {
+    // low = green, medium = dim silver; the three "hot" rungs escalate high → xhigh → max
+    // (gold → bold gold → salmon) so the eye can tell them apart at a glance.
+    let styled = match eff {
+        Some("low") => console::style("low".to_string()).color256(theme::OK),
+        Some("medium") => console::style("medium".to_string()).color256(theme::ACCENT_DIM),
+        Some("high") => console::style("high".to_string()).color256(theme::WARN),
+        Some("xhigh") => console::style("xhigh".to_string()).color256(theme::WARN).bold(),
+        Some("max") => console::style("max".to_string()).color256(theme::ERR).bold(),
+        Some(other) => console::style(other.to_string()).color256(theme::ACCENT),
+        None => console::style("default".to_string()).color256(theme::FAINT),
+    };
+    format!("{} {}", theme::faint("  effort:"), styled)
+}
+
+/// The current effort setting as a slider index: 0 = auto (auto-detect ON, no pinned tier), else the
+/// pinned tier (1=low · 2=medium · 3=high). A pinned-but-unknown effort string, or auto-off with no
+/// pin, both fall back to `auto` so the slider always opens on a valid stop.
+fn effort_slider_start() -> usize {
+    let cfg = cli_config::load();
+    if cli_config::auto_effort_enabled() {
+        return 0; // auto ON ⇒ the "auto" stop, regardless of any stale pinned value
+    }
+    match cfg.reasoning_effort.as_deref() {
+        Some("low") => 1,
+        Some("medium") => 2,
+        Some("high") => 3,
+        Some("xhigh") => 4,
+        Some("max") => 5,
+        _ => 0,
+    }
+}
+
+/// Apply a slider choice to the config and persist it. `0` ⇒ auto (auto_effort=None, clear the pin);
+/// `1..=5` ⇒ pin low/medium/high/xhigh/max and turn auto off — the exact same writes as `/effort auto`
+/// and `/effort low|medium|high|xhigh|max`, so the slider and the text commands stay in lockstep.
+fn apply_effort_choice(idx: usize) {
+    let mut cfg = cli_config::load();
+    let msg = match idx {
+        1..=5 => {
+            let tier = ["", "low", "medium", "high", "xhigh", "max"][idx];
+            cfg.reasoning_effort = Some(tier.to_string());
+            cfg.auto_effort = Some(false);
+            format!("effort pinned to {tier} (auto off) — every turn now sends reasoning_effort={tier}.")
+        }
+        _ => {
+            cfg.auto_effort = None; // None ⇒ auto ON (the default)
+            cfg.reasoning_effort = None; // clear any stale pin so auto isn't shadowed
+            "effort auto ON — each turn's effort is detected from your message (keyword + complexity).".to_string()
+        }
+    };
+    match cli_config::save(&cfg) {
+        Ok(_) => tui::emit_line(&style(msg).color256(splash::ACCENT).to_string()),
+        Err(e) => tui::emit_line(&format!("{} {e}", style("effort:").red())),
+    }
+}
+
+/// The plain text status report for `/effort status` (and the off-TTY fallback of the bare `/effort`).
+fn effort_status_report() {
+    let cfg = cli_config::load();
+    let auto = if cli_config::auto_effort_enabled() { "on" } else { "off" };
+    let fixed = cfg.reasoning_effort.as_deref().unwrap_or("(none — omitted)");
+    tui::emit_line(
+        &style(format!(
+            "effort: auto-detect {auto} · fixed reasoning_effort {fixed}\n\
+             /effort auto|off · /effort low|medium|high (pins it, turns auto off) · /effort none (clear)"
+        ))
+        .dim()
+        .to_string(),
+    );
+    if std::env::var("AIZEN_AUTO_EFFORT").is_ok() {
+        tui::emit_line(&style("(note: AIZEN_AUTO_EFFORT is set — it overrides the auto toggle)").dim().to_string());
+    }
+}
+
+/// Bare `/effort` → the animated drag slider. Opens on the current setting; a commit persists the
+/// choice, Esc keeps things as-is. Off-TTY the slider returns `None` immediately, so we fall back to
+/// the text report instead of leaving the user with no output.
+fn effort_slider_flow() {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        effort_status_report();
+        return;
+    }
+    match tui::effort_slider(effort_slider_start()) {
+        Some(idx) => apply_effort_choice(idx),
+        None => tui::emit_line(&style("(effort unchanged)").dim().to_string()),
+    }
 }
 
 /// After a completed turn: passively learn durable user/project facts from the user's last message.
@@ -4144,6 +4408,171 @@ fn print_cost(history: &[Message], model: &str) {
     }
 }
 
+/// Decompose the live system prompt into its named blocks by XML tag, returning (label, char count)
+/// for the leftover base instructions plus every block actually present. Pure (byte-index scan over
+/// ASCII tags) so it's unit-testable; char counts ÷4 ≈ tokens, the same basis the HUD estimator uses.
+fn system_block_chars(system: &str) -> Vec<(&'static str, usize)> {
+    // (display label, tag) in build order — an absent block contributes nothing.
+    const BLOCKS: &[(&str, &str)] = &[
+        ("environment", "environment"),
+        ("agent identity", "agent_identity"),
+        ("persona", "persona"),
+        ("persona memory", "self"),
+        ("user memory", "user_memory"),
+        ("skills index", "skills"),
+        ("project context", "project_context"),
+        ("agents index", "agents"),
+    ];
+    let mut rows = Vec::new();
+    let mut tagged = 0usize;
+    for (label, tag) in BLOCKS {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        if let (Some(s), Some(e)) = (system.find(&open), system.find(&close)) {
+            if e >= s {
+                // Tags are ASCII, so byte slicing lands on char boundaries.
+                let c = system[s..e + close.len()].chars().count();
+                tagged += c;
+                rows.push((*label, c));
+            }
+        }
+    }
+    let base = system.chars().count().saturating_sub(tagged);
+    let mut out = vec![("base instructions", base)];
+    out.extend(rows);
+    out
+}
+
+/// Render the `/compact` result as a small tree: a headline with the token delta, then one `└` leaf
+/// per file the collapsed turns had referenced and one for the skills they had loaded. The leaves are
+/// what makes compaction feel non-lossy — the dense summary note is invisible, but this shows at a
+/// glance the concrete context (which files, which skills) those turns carried, harvested by
+/// [`agent::compact::context_touchpoints`] BEFORE the collapse.
+fn print_compact_summary(before: usize, after: usize, tp: &agent::compact::Touchpoints) {
+    let saved = before.saturating_sub(after);
+    tui::emit_line(&format!(
+        "{}  {} → {} tok{}",
+        style("✳ Compacted").color256(splash::ACCENT).bold(),
+        style(format!("~{}", fmt_k(before))).dim(),
+        style(format!("~{}", fmt_k(after))).color256(splash::ACCENT),
+        if saved > 0 {
+            style(format!("  · freed ~{}", fmt_k(saved))).dim().to_string()
+        } else {
+            String::new()
+        },
+    ));
+    let leaf = style("  └").color256(theme::FAINT).to_string();
+    for f in &tp.files {
+        tui::emit_line(&format!("{leaf} {} {}", style("Referenced file").dim(), style(f).color256(theme::ACCENT_DIM)));
+    }
+    if !tp.skills.is_empty() {
+        tui::emit_line(&format!(
+            "{leaf} {} ({})",
+            style("Skills restored").dim(),
+            style(tp.skills.join(", ")).color256(theme::ACCENT_DIM),
+        ));
+    }
+    if tp.files.is_empty() && tp.skills.is_empty() {
+        tui::emit_line(&format!("{leaf} {}", style("no files or skills to carry forward").dim()));
+    }
+}
+
+/// `/context` — where the tokens are going right now: the system prompt split into its blocks, the
+/// tool-schema overhead (rides every request, lives in no message), and the conversation split by
+/// role. Estimated (chars/4) — the same honest basis the HUD + auto-compact use; `/cost` shows the
+/// provider's REAL billed count when the endpoint reports usage.
+fn print_context(history: &[Message], model: &str) {
+    let (window, auto) = resolve_ctx_window(model);
+    let total = session_tokens(history);
+    let pct = (total as f64 / window as f64 * 100.0).min(100.0);
+
+    let system = history
+        .first()
+        .filter(|m| m.role == "system")
+        .and_then(|m| m.content.as_deref())
+        .unwrap_or("");
+    let sys_blocks = system_block_chars(system);
+    let sys_tok: usize = sys_blocks.iter().map(|(_, c)| c / 4).sum();
+    let schemas = agent::schema_overhead_tokens();
+
+    // Everything after the system message, bucketed by role.
+    let (mut user_tok, mut asst_tok, mut tool_tok) = (0usize, 0usize, 0usize);
+    for m in history.iter().skip(1) {
+        let t = agent::estimate_message_tokens(m);
+        match m.role.as_str() {
+            "assistant" => asst_tok += t,
+            "tool" => tool_tok += t,
+            _ => user_tok += t, // user turns + any stray system nudges
+        }
+    }
+    let convo = user_tok + asst_tok + tool_tok;
+
+    // One aligned row: label left-padded to a column, "~X.XK tok" right; sub-rows dimmed + indented.
+    fn line(label: &str, tok: usize, depth: usize, dim: bool) -> String {
+        let name = format!("{}{}", "  ".repeat(depth), label);
+        let s = format!("{name:<26} {:>10}", format!("~{} tok", fmt_k(tok)));
+        if dim { style(s).dim().to_string() } else { s }
+    }
+
+    tui::emit_line(&format!(
+        "{}  {model} · window {}{}",
+        style("📊 context breakdown").color256(splash::ACCENT).bold(),
+        fmt_k(window),
+        if auto { "" } else { " (est)" },
+    ));
+    tui::emit_line(&line("system prompt", sys_tok, 0, false));
+    for (label, c) in &sys_blocks {
+        if c / 4 > 0 {
+            tui::emit_line(&line(label, c / 4, 1, true));
+        }
+    }
+    tui::emit_line(&line("tool schemas", schemas, 0, false));
+    tui::emit_line(&line("conversation", convo, 0, false));
+    if convo > 0 {
+        tui::emit_line(&line("user turns", user_tok, 1, true));
+        tui::emit_line(&line("assistant turns", asst_tok, 1, true));
+        tui::emit_line(&line("tool results", tool_tok, 1, true));
+    }
+    let bar = format!("{} {}", ctx_bar(pct), style(format!("{pct:.0}%")).dim());
+    tui::emit_line(&format!(
+        "{}  {} {bar}",
+        style(format!("{:<26}", "total")).color256(splash::ACCENT).bold(),
+        style(format!("~{} / {} tok", fmt_k(total), fmt_k(window))).color256(splash::ACCENT),
+    ));
+}
+
+#[cfg(test)]
+mod context_breakdown_tests {
+    use super::*;
+
+    #[test]
+    fn splits_system_prompt_into_blocks() {
+        let sys = "BASE RULES HERE\n\n<environment>\ncwd: /x\n</environment>\n\
+                   <user_memory>\n- terse\n</user_memory>\n<skills>\nidx\n</skills>\n";
+        let rows = system_block_chars(sys);
+        // base instructions is always first.
+        assert_eq!(rows[0].0, "base instructions");
+        let labels: Vec<&str> = rows.iter().map(|(l, _)| *l).collect();
+        assert!(labels.contains(&"environment"));
+        assert!(labels.contains(&"user memory"));
+        assert!(labels.contains(&"skills index"));
+        // absent blocks aren't reported.
+        assert!(!labels.contains(&"persona"));
+        assert!(!labels.contains(&"agents index"));
+        // block char counts + base sum to the whole prompt (nothing double-counted or dropped).
+        let sum: usize = rows.iter().map(|(_, c)| *c).sum();
+        assert_eq!(sum, sys.chars().count());
+    }
+
+    #[test]
+    fn base_only_prompt_reports_just_base() {
+        let sys = "just the base, no tagged blocks";
+        let rows = system_block_chars(sys);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], ("base instructions", sys.chars().count()));
+    }
+}
+
 /// Render a `clarify` question prominently and yield to the input box. `display` is the tool's
 /// stored text: the question on the first line, any numbered options on the following lines.
 /// Routes through `tui::emit_line` under the sticky TUI, else plain stdout — so the user just types
@@ -4338,7 +4767,9 @@ fn print_status_line(history: &[Message], model: &str) {
     let toks = session_tokens(history);
     let turns = history.iter().filter(|m| m.role == "user").count();
     let tg = if telegram::is_configured() { "  ·  📱 telegram" } else { "" };
-    let yolo = if yolo_enabled() {
+    let yolo = if cli_config::ultimate_enabled() {
+        format!("  ·  {}", style("✦ ultimate").color256(theme::WARN).bold()) // top of the ladder — runs hottest
+    } else if yolo_enabled() {
         format!("  ·  {}", style("⚡ yolo").color256(theme::WARN)) // reserved gold — runs hot
     } else {
         String::new()
@@ -4453,15 +4884,18 @@ const SLASH_CMDS: &[(&str, &str)] = &[
     ("mcp", "MCP servers from ~/.aizen/mcp.json (+ a trusted repo's ./.aizen/mcp.json) — list connected tools"),
     ("telegram", "Telegram integration menu (setup · test · status · daemon)"),
     ("sessions", "saved conversations — restore · save · delete (auto-saves as you go)"),
-    ("timeline", "time machine — rewind / re-apply code states (git snapshots)"),
+    ("timeline", "show the checkpoint timeline; /timeline pick to restore (git snapshots)"),
     ("checkpoint", "save a restore point of the code now"),
     ("compact", "summarize older turns to free context now"),
     ("lsp", "type-aware code navigation (references · definition · symbols · diagnostics) — on/off/status/restart"),
     ("reach", "web-access health check: which backend serves each platform (youtube · twitter · github · hn · wikipedia · feeds · stackexchange · search)"),
     ("yolo", "toggle auto-approve: run file edits & shell WITHOUT asking each time"),
     ("smart", "toggle smart approval: auto-run read-only shell, ask for the rest"),
+    ("ultimate", "toggle ultimate mode: max reasoning effort + prefer launching workflows (aizen's ultracode)"),
+    ("effort", "reasoning effort — drag the slider (auto · low · medium · high · xhigh · max), or /effort <level>"),
     ("clear", "start a fresh conversation"),
     ("tokens", "show session token usage"),
+    ("context", "break down what fills the context window (prompt · tools · history)"),
     ("cost", "session token usage + $ estimate (real usage when the provider reports it)"),
     ("quit", "exit"),
 ];
@@ -4499,15 +4933,18 @@ Commands:
   /mcp               MCP servers from ~/.aizen/mcp.json — list connected tools
   /telegram          Telegram integration menu (setup · test · status · start daemon · disable)
   /sessions          saved conversations — restore · save · delete (auto-saves as you go)
-  /timeline          time machine — rewind / re-apply code states (git snapshots); also /undo · /redo
+  /timeline          show the checkpoint timeline (▸ = current); /timeline pick to restore · also /undo · /redo
   /checkpoint [note] save a restore point of the working tree now
   /compact           summarize older turns to free context now
   /lsp [on|off|status|restart]  type-aware navigation + diagnostics via a language server (rust-analyzer · pyright · typescript-language-server); default OFF, servers start lazily
   /reach [doctor|status]  web-access channels: live-probe every backend (doctor) or show what served this session (status); web_fetch/web_search route through these
   /yolo              toggle auto-approve — run file edits & shell WITHOUT asking each time
   /smart             toggle smart approval — auto-run read-only shell, ask for the rest
+  /ultimate          toggle ultimate mode — max reasoning effort + prefer launching workflows (aizen's ultracode)
+  /effort            drag an animated slider (auto · low · medium · high · xhigh · max); or /effort auto|off|low|medium|high|xhigh|max|clear to set it directly
   /clear             start a fresh conversation
   /tokens            show session token usage (context-fill HUD)
+  /context           break down what fills the context window (system prompt · tool schemas · conversation by role)
   /cost              session usage + $ estimate (real tokens when the provider reports them; set rates via `aizen config set --price-in/--price-out`)
   /quit              exit
 
@@ -4543,6 +4980,7 @@ fn slash_is_interactive(name: &str) -> bool {
             | "mem"
             | "timeline"
             | "tm"
+            | "effort" // no-arg → the interactive drag slider owns stdin
     )
 }
 
@@ -4561,6 +4999,7 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             tui::emit_line(&style("(new conversation)").dim().to_string());
         }
         "tokens" => print_status_line(history, model_label),
+        "context" | "ctx" => print_context(history, model_label),
         "cost" | "usage" => print_cost(history, model_label),
         // /save + /load folded into /sessions (the current chat also auto-saves as "last").
         "save" | "load" => {
@@ -4572,11 +5011,12 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             }
         }
         "compact" => {
+            // Harvest what the older turns touched BEFORE they collapse — once summarized their tool
+            // calls are gone, so the tree must read the history while it's still whole.
+            let tp = agent::compact::context_touchpoints(history);
             tui::emit_line(&style("compacting…").dim().to_string());
             match compact_now(history).await {
-                Ok((b, a)) => tui::emit_line(
-                    &style(format!("compacted: ~{} → ~{} tok", fmt_k(b), fmt_k(a))).color256(splash::ACCENT).to_string(),
-                ),
+                Ok((b, a)) => print_compact_summary(b, a, &tp),
                 Err(e) => tui::emit_line(&format!("{} {e}", style("compact:").red())),
             }
         }
@@ -4698,6 +5138,89 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                 tui::emit_line(&style("(note: yolo is ON — it approves everything, so smart has no extra effect until yolo is off)").dim().to_string());
             }
         }
+        "ultimate" | "ultra" => {
+            let mut cfg = cli_config::load();
+            let now = !cfg.ultimate.unwrap_or(false);
+            cfg.ultimate = Some(now);
+            if now {
+                // ultracode = max effort + orchestrate-by-default: pin max, bypass auto-detect.
+                cfg.reasoning_effort = Some("max".to_string());
+                cfg.auto_effort = Some(false);
+            } else {
+                // back to the default: auto-detect ON, no pinned tier.
+                cfg.reasoning_effort = None;
+                cfg.auto_effort = None;
+            }
+            match cli_config::save(&cfg) {
+                Ok(_) if now => tui::emit_line(
+                    &style("✦ ultimate ON — max reasoning effort every turn + prefers launching workflows for fan-out-able tasks. /ultimate again to turn it off.")
+                        .color256(splash::ACCENT).to_string(),
+                ),
+                Ok(_) => tui::emit_line(&style("ultimate OFF — effort back to auto-detect, no orchestration nudge.").dim().to_string()),
+                Err(e) => tui::emit_line(&format!("{} {e}", style("ultimate:").red())),
+            }
+            if std::env::var("AIZEN_ULTIMATE").is_ok() {
+                tui::emit_line(&style("(note: AIZEN_ULTIMATE is set in your environment — it forces ultimate ON regardless of this toggle)").dim().to_string());
+            }
+        }
+        "effort" => {
+            let sub = arg.trim().to_ascii_lowercase();
+            match sub.as_str() {
+                // No arg → the interactive drag slider (falls back to a text report off-TTY).
+                "" => effort_slider_flow(),
+                // `status`/`st` → the plain text report (no slider).
+                "status" | "st" => effort_status_report(),
+                "auto" | "on" => {
+                    let mut cfg = cli_config::load();
+                    cfg.auto_effort = None; // None ⇒ ON (the default); clears any explicit off.
+                    match cli_config::save(&cfg) {
+                        Ok(_) => tui::emit_line(
+                            &style("effort auto ON — each turn's effort is detected from your message (keyword + complexity).")
+                                .color256(splash::ACCENT).to_string(),
+                        ),
+                        Err(e) => tui::emit_line(&format!("{} {e}", style("effort:").red())),
+                    }
+                }
+                "off" => {
+                    let mut cfg = cli_config::load();
+                    cfg.auto_effort = Some(false);
+                    match cli_config::save(&cfg) {
+                        Ok(_) => tui::emit_line(
+                            &style("effort auto OFF — every turn uses the fixed reasoning_effort (or omits it if unset).")
+                                .dim().to_string(),
+                        ),
+                        Err(e) => tui::emit_line(&format!("{} {e}", style("effort:").red())),
+                    }
+                }
+                "low" | "medium" | "high" | "xhigh" | "max" => {
+                    let mut cfg = cli_config::load();
+                    cfg.reasoning_effort = Some(sub.clone());
+                    cfg.auto_effort = Some(false); // pinning a fixed tier turns auto off.
+                    match cli_config::save(&cfg) {
+                        Ok(_) => tui::emit_line(
+                            &style(format!("effort pinned to {sub} (auto off) — every turn now sends reasoning_effort={sub}."))
+                                .color256(splash::ACCENT).to_string(),
+                        ),
+                        Err(e) => tui::emit_line(&format!("{} {e}", style("effort:").red())),
+                    }
+                }
+                "none" | "clear" => {
+                    let mut cfg = cli_config::load();
+                    cfg.reasoning_effort = None;
+                    cfg.auto_effort = None; // back to the default (auto ON, no fixed tier).
+                    match cli_config::save(&cfg) {
+                        Ok(_) => tui::emit_line(
+                            &style("effort cleared — auto ON, no fixed tier (requests omit reasoning_effort unless auto detects one).")
+                                .dim().to_string(),
+                        ),
+                        Err(e) => tui::emit_line(&format!("{} {e}", style("effort:").red())),
+                    }
+                }
+                other => tui::emit_line(
+                    &style(format!("usage: /effort [auto|off|low|medium|high|xhigh|max|none]  (unknown '{other}')")).dim().to_string(),
+                ),
+            }
+        }
         "model" | "models" => {
             // Merged: `/model` lists the provider's models (with context windows) AND picks one.
             if let Err(e) = slash_model(model_label).await {
@@ -4753,9 +5276,15 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             }
         }
         // ── time machine (git snapshots) ──
+        // Bare `/timeline` prints the static, glanceable timeline (read-only). `pick`/`restore`/`menu`
+        // opens the interactive restore menu, so rewinding stays a deliberate second step.
         "timeline" | "tm" => {
-            if let Err(e) = timeline_menu(history, model_label).await {
-                eprintln!("{} {e}", style("time:").red());
+            if matches!(arg, "pick" | "restore" | "menu" | "open") {
+                if let Err(e) = timeline_menu(history, model_label).await {
+                    eprintln!("{} {e}", style("time:").red());
+                }
+            } else {
+                print_timeline();
             }
         }
         // Capture the conversation alongside the tree so this checkpoint supports the 3-way restore
@@ -5025,7 +5554,7 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
         None => return config_wizard().await, // bare `ng config` → interactive setup
     };
     match cmd {
-        ConfigCmd::Set { base_url, api_key, model, context_window, compact_threshold, auto_skill_learn, memory_auto_learn, persona_evolve, price_in, price_out, icons, timemachine_keep } => {
+        ConfigCmd::Set { base_url, api_key, model, context_window, compact_threshold, auto_skill_learn, memory_auto_learn, persona_evolve, price_in, price_out, icons, timemachine_keep, auto_effort, reasoning_effort, ultimate, adaptive_effort } => {
             if base_url.is_none()
                 && api_key.is_none()
                 && model.is_none()
@@ -5038,8 +5567,12 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                 && price_out.is_none()
                 && icons.is_none()
                 && timemachine_keep.is_none()
+                && auto_effort.is_none()
+                && reasoning_effort.is_none()
+                && ultimate.is_none()
+                && adaptive_effort.is_none()
             {
-                anyhow::bail!("nothing to set — pass at least one of --base-url / --api-key / --model / --context-window / --compact-threshold / --auto-skill-learn / --memory-auto-learn / --persona-evolve / --price-in / --price-out / --icons / --timemachine-keep");
+                anyhow::bail!("nothing to set — pass at least one of --base-url / --api-key / --model / --context-window / --compact-threshold / --auto-skill-learn / --memory-auto-learn / --persona-evolve / --price-in / --price-out / --icons / --timemachine-keep / --auto-effort / --reasoning-effort / --ultimate / --adaptive-effort");
             }
             let mut cfg = cli_config::load();
             if let Some(v) = base_url {
@@ -5092,6 +5625,22 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             }
             if let Some(k) = timemachine_keep {
                 cfg.timemachine_keep = Some(k); // 0 = unlimited
+            }
+            if let Some(b) = auto_effort {
+                cfg.auto_effort = Some(b);
+            }
+            if let Some(v) = reasoning_effort {
+                let v = v.trim().to_ascii_lowercase();
+                if !["low", "medium", "high", "xhigh", "max"].contains(&v.as_str()) {
+                    anyhow::bail!("--reasoning-effort must be one of: low, medium, high, xhigh, max");
+                }
+                cfg.reasoning_effort = Some(v);
+            }
+            if let Some(b) = ultimate {
+                cfg.ultimate = Some(b);
+            }
+            if let Some(b) = adaptive_effort {
+                cfg.adaptive_effort = Some(b);
             }
             cli_config::save(&cfg)?;
             println!("{} {}", crate::ui::theme::ok("✓"), style("saved").color256(splash::ACCENT));
@@ -5247,11 +5796,318 @@ fn model_default_index(models: &[String], current: Option<&str>) -> usize {
 
 const CUSTOM_MODEL_ITEM: &str = "‹ type a custom id ›";
 
-/// Interactive setup (`ng config` with no subcommand, or menu → Setup): asks for base URL + a
-/// hidden API key, fetches the model list, and lets you pick one with arrow keys. Enter keeps the
-/// shown default at each step.
+/// `aizen config` / `/config` / menu → Setup. A fresh install (no endpoint yet) gets the guided
+/// linear setup once so nothing required is missed; an already-configured user gets the HUB menu —
+/// jump to the one section you want, edit just it, it saves on the spot, you're back at the menu. No
+/// more Enter-through-every-prompt to change a single field.
 async fn config_wizard() -> Result<()> {
-    let mut cfg = cli_config::load();
+    let cfg = cli_config::load();
+    let fresh = cfg.base_url.is_none() || cfg.api_key.is_none() || cfg.model.is_none();
+    if fresh {
+        let mut cfg = cfg;
+        return config_setup_full(&mut cfg).await;
+    }
+    config_menu(cfg).await
+}
+
+/// A yes/no toggle with the shared gold theme (used by the section editors below).
+fn yn(theme: &ColorfulTheme, prompt: &str, default: bool) -> Result<bool> {
+    Ok(Confirm::with_theme(theme).with_prompt(prompt).default(default).interact()?)
+}
+
+/// The config HUB: a `Select` of sections, each row showing its current value so the panel reads as a
+/// live dashboard. Pick a section → edit just that → it saves immediately → back to the menu. Esc or
+/// "Done" exits. Every field here is also scriptable via `aizen config set`, so nothing depends on it.
+async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    loop {
+        // Glanceable current-value hints, one per row.
+        let key_h = if cfg.api_key.is_some() { "set" } else { "missing" };
+        let model_h = cfg.model.clone().unwrap_or_else(|| "not set".into());
+        let tavily_h = if cfg.reach.as_ref().and_then(|r| r.resolved_tavily_key()).is_some() { "set" } else { "none" };
+        let compact_h = match cfg.compact_threshold_pct.unwrap_or(80) {
+            0 => "off".to_string(),
+            t => format!("{t}%"),
+        };
+        let effort_h = if cfg.ultimate.unwrap_or(false) {
+            "ultimate".to_string()
+        } else if cfg.auto_effort == Some(false) {
+            cfg.reasoning_effort.clone().unwrap_or_else(|| "fixed".into())
+        } else {
+            "auto".to_string()
+        };
+        let icons_h = cfg.icons.clone().unwrap_or_else(|| "nerd".into());
+
+        let items = vec![
+            format!("Connection      · api key {key_h}"),
+            format!("Model & context · {model_h}"),
+            format!("Web search      · tavily {tavily_h}"),
+            format!("Session         · compact {compact_h}"),
+            format!("Reasoning       · {effort_h}"),
+            format!("Display         · icons {icons_h}"),
+            "Show full config".to_string(),
+            "Done".to_string(),
+        ];
+        let pick = match Select::with_theme(&theme)
+            .with_prompt("Config — pick a section (Esc when done)")
+            .items(&items)
+            .default(0)
+            .interact_opt()?
+        {
+            Some(i) => i,
+            None => break,
+        };
+        // Sections 0..=5 edit + save; 6 shows the panel; 7 (or Esc) exits.
+        let edited = match pick {
+            0 => config_edit_connection(&mut cfg),
+            1 => config_edit_model(&mut cfg).await,
+            2 => config_edit_websearch(&mut cfg),
+            3 => config_edit_session(&mut cfg),
+            4 => config_edit_reasoning(&mut cfg),
+            5 => config_edit_display(&mut cfg),
+            6 => {
+                print_config(&cfg);
+                continue;
+            }
+            _ => break,
+        };
+        match edited {
+            Ok(()) => match cli_config::save(&cfg) {
+                Ok(_) => println!("  {} {}", crate::ui::theme::ok("✓"), style("saved").color256(splash::ACCENT)),
+                Err(e) => eprintln!("  {} {e}", style("save:").red()),
+            },
+            Err(e) => eprintln!("  {} {e}", style("config:").red()),
+        }
+    }
+    Ok(())
+}
+
+/// Section editor: base URL + API key. Empty base keeps the current one; empty key keeps the current.
+fn config_edit_connection(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    let mut base_in = Input::<String>::with_theme(&theme)
+        .with_prompt("Base URL (OpenAI-compatible)")
+        .allow_empty(true);
+    if let Some(cur) = cfg.base_url.clone() {
+        base_in = base_in.default(cur);
+    }
+    let base = base_in.interact_text()?;
+    let base = base.trim().trim_end_matches('/').to_string();
+    if !base.is_empty() {
+        cfg.base_url = Some(base);
+    }
+    let key_prompt = match cfg.api_key.as_deref() {
+        Some(k) => format!("API key (current {} — Enter to keep)", cli_config::mask(k)),
+        None => "API key".to_string(),
+    };
+    let entered = Password::with_theme(&theme)
+        .with_prompt(key_prompt)
+        .allow_empty_password(true)
+        .interact()?;
+    if !entered.trim().is_empty() {
+        cfg.api_key = Some(entered.trim().to_string());
+    }
+    Ok(())
+}
+
+/// Section editor: fetch the model list, pick one (Esc keeps current), then the context window.
+async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    let (base, key) = match (cfg.base_url.clone(), cfg.api_key.clone()) {
+        (Some(b), Some(k)) => (b, k),
+        _ => {
+            println!("  {}", style("set the Connection (base URL + key) first").color256(crate::ui::theme::WARN));
+            return Ok(());
+        }
+    };
+    let http = http_client()?;
+    print!("{} {base} … ", style("Fetching models from").dim());
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+    match client::fetch_models_info(&http, &base, &key).await {
+        Ok(infos) if !infos.is_empty() => {
+            println!("{}", style(format!("ok ({} found)", infos.len())).dim());
+            let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
+            let mut items: Vec<String> = ids.clone();
+            items.push(CUSTOM_MODEL_ITEM.to_string());
+            let pick = match Select::with_theme(&theme)
+                .with_prompt("Pick a model (Esc keeps current)")
+                .items(&items)
+                .default(model_default_index(&ids, cfg.model.as_deref()))
+                .interact_opt()?
+            {
+                Some(i) => i,
+                None => return Ok(()),
+            };
+            if pick < infos.len() {
+                cfg.model = Some(infos[pick].id.clone());
+                cfg.model_context_window = infos[pick].context_length; // auto when reported, else heuristic
+            } else {
+                let m: String = Input::with_theme(&theme).with_prompt("Model id").interact_text()?;
+                if !m.trim().is_empty() {
+                    cfg.model = Some(m.trim().to_string());
+                    cfg.model_context_window = None;
+                }
+            }
+        }
+        other => {
+            match other {
+                Ok(_) => println!("{}", style("no models returned.").dim()),
+                Err(e) => println!("{}", style(format!("failed: {e}")).red()),
+            }
+            let mut mi = Input::<String>::with_theme(&theme).with_prompt("Enter a model id manually");
+            if let Some(cur) = cfg.model.clone() {
+                mi = mi.default(cur);
+            }
+            let m = mi.allow_empty(true).interact_text()?;
+            if !m.trim().is_empty() {
+                cfg.model = Some(m.trim().to_string());
+                cfg.model_context_window = None;
+            }
+        }
+    }
+    // context window — drives the `% context` HUD + auto-compact trigger.
+    if let Some(model) = cfg.model.clone() {
+        let (shown, was_cfg) = effective_ctx_window(&model, cfg.model_context_window);
+        let ctx_default = cfg.model_context_window.map(|w| w.to_string()).unwrap_or_else(|| "auto".to_string());
+        let note = if was_cfg { "auto-detected from the provider" } else { "estimated from the model name" };
+        println!("{}", style(format!("Context window — currently {shown} tokens ({note}).")).dim());
+        let ctx_in = Input::<String>::with_theme(&theme)
+            .with_prompt("Context window (tokens, e.g. 200000 / 128k, or `auto`)")
+            .default(ctx_default)
+            .allow_empty(true)
+            .interact_text()?;
+        cfg.model_context_window = match ctx_in.trim().to_ascii_lowercase().replace('_', "").replace('k', "000").parse::<usize>() {
+            Ok(n) if n >= 1000 => Some(n),
+            _ => None, // "auto"/blank/garbage → detect-or-heuristic
+        };
+    }
+    Ok(())
+}
+
+/// Section editor: the Tavily web-search key (`-` clears, Enter keeps).
+fn config_edit_websearch(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    let cur_tavily = cfg.reach.as_ref().and_then(|r| r.tavily_api_key.clone());
+    let tavily_prompt = match cur_tavily.as_deref() {
+        Some(k) => format!("Tavily key (current {} — Enter keeps, `-` clears)", cli_config::mask(k)),
+        None => "Tavily API key for web_search (free at tavily.com; Enter to skip)".to_string(),
+    };
+    println!("{}", style("web_search needs a Tavily key — env AIZEN_TAVILY_API_KEY overrides this.").dim());
+    let tavily_in = Password::with_theme(&theme)
+        .with_prompt(tavily_prompt)
+        .allow_empty_password(true)
+        .interact()?;
+    let tavily_in = tavily_in.trim();
+    if !tavily_in.is_empty() {
+        let reach = cfg.reach.get_or_insert_with(Default::default);
+        reach.tavily_api_key = if tavily_in == "-" { None } else { Some(tavily_in.to_string()) };
+    }
+    Ok(())
+}
+
+/// Section editor: session behavior — auto-compact %, skill/memory/persona learning, checkpoints.
+fn config_edit_session(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    let cur_ac = cfg.compact_threshold_pct.unwrap_or(80);
+    let ac_default = if cur_ac == 0 { "off".to_string() } else { cur_ac.to_string() };
+    let ac_in = Input::<String>::with_theme(&theme)
+        .with_prompt("Auto-compact at what % of context? (10–95, or `off`)")
+        .default(ac_default)
+        .allow_empty(true)
+        .interact_text()?;
+    cfg.compact_threshold_pct = match ac_in.trim().to_ascii_lowercase().as_str() {
+        "off" | "false" | "0" => Some(0),
+        s => match s.trim_end_matches('%').parse::<u8>() {
+            Ok(p) if (10..=95).contains(&p) => Some(p),
+            _ => Some(cur_ac),
+        },
+    };
+    cfg.auto_skill_learn = Some(yn(&theme, "Auto-learn skills from completed tasks?", cfg.auto_skill_learn.unwrap_or(true))?);
+    cfg.memory_auto_learn = Some(yn(&theme, "Auto-learn memory (durable facts) from each turn?", cfg.memory_auto_learn.unwrap_or(true))?);
+    cfg.persona_evolve = Some(yn(&theme, "Persona evolution (learn a voice over time)?", cfg.persona_evolve.unwrap_or(true))?);
+    let cur_tm = cfg.timemachine_keep.unwrap_or(50);
+    let tm_in = Input::<String>::with_theme(&theme)
+        .with_prompt("Time-machine checkpoints to keep? (a number, or `unlimited`)")
+        .default(if cur_tm == 0 { "unlimited".to_string() } else { cur_tm.to_string() })
+        .allow_empty(true)
+        .interact_text()?;
+    cfg.timemachine_keep = match tm_in.trim().to_ascii_lowercase().as_str() {
+        "unlimited" | "all" | "0" => Some(0),
+        s => match s.parse::<usize>() {
+            Ok(n) => Some(n),
+            _ => Some(cur_tm),
+        },
+    };
+    Ok(())
+}
+
+/// Section editor: reasoning effort tier (arrow-key Select) + the ultimate / adaptive toggles.
+fn config_edit_reasoning(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    let tiers = ["auto (detect per turn)", "low", "medium", "high", "xhigh", "max"];
+    let cur_idx = if cfg.auto_effort == Some(false) {
+        match cfg.reasoning_effort.as_deref() {
+            Some("low") => 1,
+            Some("medium") => 2,
+            Some("high") => 3,
+            Some("xhigh") => 4,
+            Some("max") => 5,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    let pick = match Select::with_theme(&theme)
+        .with_prompt("Reasoning effort (Esc keeps current)")
+        .items(&tiers)
+        .default(cur_idx)
+        .interact_opt()?
+    {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+    if pick == 0 {
+        cfg.reasoning_effort = None;
+        cfg.auto_effort = None; // back to auto-detect
+    } else {
+        cfg.reasoning_effort = Some(tiers[pick].to_string());
+        cfg.auto_effort = Some(false); // a fixed tier turns auto off
+    }
+    cfg.ultimate = Some(yn(&theme, "Ultimate mode (max effort + prefer workflows)?", cfg.ultimate.unwrap_or(false))?);
+    cfg.adaptive_effort = Some(yn(&theme, "Adaptive effort (let hard turns climb to xhigh)?", cfg.adaptive_effort.unwrap_or(false))?);
+    Ok(())
+}
+
+/// Section editor: icon style (nerd / emoji / off), applied immediately.
+fn config_edit_display(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    let opts = ["nerd (needs a Nerd Font)", "emoji (any font)", "off"];
+    let cur_idx = match cfg.icons.as_deref().unwrap_or("nerd") {
+        "emoji" => 1,
+        "off" | "none" => 2,
+        _ => 0,
+    };
+    let pick = match Select::with_theme(&theme)
+        .with_prompt("Icons (Esc keeps current)")
+        .items(&opts)
+        .default(cur_idx)
+        .interact_opt()?
+    {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+    cfg.icons = Some(match pick {
+        1 => "emoji",
+        2 => "off",
+        _ => "nerd",
+    }.to_string());
+    icons::set_tier(cfg.icons.as_deref()); // apply immediately
+    Ok(())
+}
+
+/// Guided first-time setup (fresh install): walks Connection → Model → Web search → Behavior →
+/// Display in order and saves at the end. `config_wizard` calls this only when no endpoint exists yet.
+async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let theme = ui_theme();
     let width = tui::width().clamp(46, 72);
     println!();
@@ -5461,9 +6317,9 @@ async fn config_wizard() -> Result<()> {
     };
     icons::set_tier(cfg.icons.as_deref()); // apply immediately for the "Saved" preview below
 
-    cli_config::save(&cfg)?;
+    cli_config::save(cfg)?;
     println!("\n{} {}", crate::ui::theme::ok("✓"), style("Saved.").color256(splash::ACCENT).bold());
-    print_config(&cfg);
+    print_config(cfg);
     println!("{}", style("Ready — type a message, or run:  aizen chat -p \"hello\"").color256(crate::ui::theme::FAINT));
     Ok(())
 }
@@ -6409,6 +7265,30 @@ mod tests {
 
     fn models() -> Vec<String> {
         vec!["opus-4-8".to_string(), "sonnet-4-6".to_string(), "minimax-m3".to_string()]
+    }
+
+    #[test]
+    fn effort_turn_line_names_the_tier_or_default() {
+        // The per-turn status line must contain the tier name (or "default" when the field is
+        // omitted), regardless of colour stripping under the test harness.
+        assert!(effort_turn_line(Some("high")).contains("high"));
+        assert!(effort_turn_line(Some("low")).contains("low"));
+        assert!(effort_turn_line(Some("xhigh")).contains("xhigh"), "xhigh rung named");
+        assert!(effort_turn_line(Some("max")).contains("max"), "max rung named");
+        assert!(effort_turn_line(None).contains("default"), "None ⇒ default");
+        assert!(effort_turn_line(Some("high")).contains("effort:"), "always prefixed");
+    }
+
+    #[test]
+    fn apply_effort_choice_index_mapping_is_total() {
+        // Guard the index→tier table the slider feeds apply_effort_choice: 0=auto, 1..=5 pin a tier.
+        // (We assert the mapping shape, not the persisted config — save() touches the real config.)
+        let tier = |i: usize| ["", "low", "medium", "high", "xhigh", "max"][i];
+        assert_eq!(tier(1), "low");
+        assert_eq!(tier(2), "medium");
+        assert_eq!(tier(3), "high");
+        assert_eq!(tier(4), "xhigh");
+        assert_eq!(tier(5), "max");
     }
 
     #[test]

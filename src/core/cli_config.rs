@@ -8,8 +8,10 @@
 
 use crate::core::config::nextgen_home;
 use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::RwLock;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CliConfig {
@@ -40,6 +42,22 @@ pub struct CliConfig {
     /// validates). `None` ⇒ field omitted from requests entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Auto-detect reasoning effort per-turn (keyword + complexity — see `core::effort`). `None` ⇒
+    /// ON (default). `Some(true)` forces ON, `Some(false)` disables it (then only the fixed
+    /// `reasoning_effort` above, if any, is used). The per-turn effort is NEVER persisted here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_effort: Option<bool>,
+    /// "Ultimate mode": pin max reasoning effort + prefer launching workflows (orchestrate-by-default).
+    /// The aizen analogue of Claude Code's `ultracode` (xhigh + standing orchestration permission).
+    /// `None`/`Some(false)` ⇒ off; `Some(true)` ⇒ on. Toggle live with `/ultimate`, or force via
+    /// `AIZEN_ULTIMATE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ultimate: Option<bool>,
+    /// Adaptive difficulty→effort routing (P3, opt-in): when on, the per-turn complexity heuristic may
+    /// climb past `high` to `xhigh` for the very hardest turns. `None`/`Some(false)` ⇒ off (the
+    /// heuristic caps at `high`, unchanged default). Force via `AIZEN_ADAPTIVE_EFFORT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive_effort: Option<bool>,
     /// Fold NEW LSP diagnostics into edit-tool results (only meaningful while LSP is on).
     /// `None` ⇒ ON. Toggle live with `/lsp edits on|off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -267,6 +285,66 @@ pub fn branded_env(suffix: &str) -> Option<String> {
 /// Presence check for a brand-prefixed boolean toggle env var: `AIZEN_<suffix>` set (to anything) ⇒ true.
 pub fn branded_flag(suffix: &str) -> bool {
     std::env::var_os(format!("AIZEN_{suffix}")).is_some()
+}
+
+/// Per-turn reasoning-effort override, set by the REPL for one user turn and read by the LLM client
+/// when it builds a request. Kept OUT of `CliConfig` on purpose — effort is a per-turn decision, not
+/// a persisted setting. The nesting distinguishes three states:
+/// - outer `None`  ⇒ NO override active this turn (subagents/summarizer/oracle ⇒ client uses `cfg.reasoning_effort`).
+/// - `Some(None)`  ⇒ override active, but "omit" (send no `reasoning_effort` on the wire).
+/// - `Some(Some(e))` ⇒ override active, send effort `e`.
+static EFFORT_OVERRIDE: Lazy<RwLock<Option<Option<String>>>> = Lazy::new(|| RwLock::new(None));
+
+/// Arm the per-turn effort override (called once per turn from the REPL, before the turn runs).
+pub fn set_effort_override(v: Option<String>) {
+    *EFFORT_OVERRIDE.write().unwrap_or_else(|e| e.into_inner()) = Some(v);
+}
+
+/// Disarm the per-turn override (called at turn end, so effort never leaks into the next turn).
+pub fn clear_effort_override() {
+    *EFFORT_OVERRIDE.write().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Read the current per-turn override. Outer `None` ⇒ no override armed (use the config default).
+pub fn effort_override() -> Option<Option<String>> {
+    EFFORT_OVERRIDE.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Resolve the `reasoning_effort` to stamp on an outgoing request: the per-turn override when one
+/// is armed (main REPL turns), else the caller-supplied config default (subagents / summarizer /
+/// oracle, which never arm an override). `None` ⇒ omit the field (request stays byte-identical).
+pub fn resolved_reasoning_effort(config_default: Option<String>) -> Option<String> {
+    match effort_override() {
+        Some(inner) => inner,
+        None => config_default,
+    }
+}
+
+/// Is per-turn effort auto-detection ON? `AIZEN_AUTO_EFFORT` env wins (`1`/`true`/`on`/`yes` ⇒ on,
+/// anything else ⇒ off); otherwise the `auto_effort` config field, defaulting to ON when unset.
+pub fn auto_effort_enabled() -> bool {
+    if let Ok(v) = std::env::var("AIZEN_AUTO_EFFORT") {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
+    }
+    load().auto_effort.unwrap_or(true)
+}
+
+/// Is "ultimate mode" ON? `AIZEN_ULTIMATE` env wins (`1`/`true`/`on`/`yes` ⇒ on); otherwise the
+/// `ultimate` config field, defaulting to OFF. Mirrors `auto_effort_enabled` (env-forced, else config).
+pub fn ultimate_enabled() -> bool {
+    if let Ok(v) = std::env::var("AIZEN_ULTIMATE") {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
+    }
+    load().ultimate.unwrap_or(false)
+}
+
+/// Is adaptive difficulty→effort routing ON (P3)? `AIZEN_ADAPTIVE_EFFORT` env wins; otherwise the
+/// `adaptive_effort` config field, defaulting to OFF (so the heuristic caps at `high` by default).
+pub fn adaptive_effort_enabled() -> bool {
+    if let Ok(v) = std::env::var("AIZEN_ADAPTIVE_EFFORT") {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
+    }
+    load().adaptive_effort.unwrap_or(false)
 }
 
 /// Discord BOT (two-way) config — a bot token (from the Developer Portal) + an allowlist of channel

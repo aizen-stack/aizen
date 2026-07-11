@@ -349,7 +349,9 @@ pub async fn stream_chat(
         tool_choice: None,
         parallel_tool_calls: None,
         stream_options: None,
-        reasoning_effort: crate::core::cli_config::load().reasoning_effort,
+        reasoning_effort: crate::core::cli_config::resolved_reasoning_effort(
+            crate::core::cli_config::load().reasoning_effort,
+        ),
     };
 
     let mut spin = Some(crate::ui::spinner::Spinner::start("thinking"));
@@ -447,7 +449,7 @@ pub async fn chat_with_tools(
         tool_choice: if tools.is_empty() { None } else { Some("auto".to_string()) },
         parallel_tool_calls: if tools.is_empty() { None } else { Some(true) },
         stream_options: None, // non-streaming responses carry `usage` natively
-        reasoning_effort: cfg.reasoning_effort.clone(),
+        reasoning_effort: crate::core::cli_config::resolved_reasoning_effort(cfg.reasoning_effort.clone()),
     };
 
     let resp = send_with_retry(|| client.post(&url).bearer_auth(api_key).json(&body)).await?;
@@ -645,7 +647,7 @@ pub async fn stream_chat_with_tools_eager(
         tool_choice: if tools.is_empty() { None } else { Some("auto".to_string()) },
         parallel_tool_calls: if tools.is_empty() { None } else { Some(true) },
         stream_options: Some(StreamOptions { include_usage: true }), // ask for a final usage chunk
-        reasoning_effort: cfg.reasoning_effort.clone(),
+        reasoning_effort: crate::core::cli_config::resolved_reasoning_effort(cfg.reasoning_effort.clone()),
     };
 
     // Spinner during the "thinking" gap: from request send until the first token / tool delta

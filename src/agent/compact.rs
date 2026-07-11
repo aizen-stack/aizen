@@ -90,6 +90,52 @@ pub fn render_transcript(msgs: &[Message]) -> String {
     out
 }
 
+/// What the conversation touched, harvested from the tool-call history: files read/edited and
+/// skills loaded. Powers the `/compact` summary tree — after the older turns collapse into one
+/// dense note, this shows AT A GLANCE the concrete context those turns carried (which files, which
+/// skills), the part most worth not losing track of.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Touchpoints {
+    /// Distinct file paths that appeared as a `path` argument to a file tool, in first-seen order.
+    pub files: Vec<String>,
+    /// Distinct skill names loaded via `skill_load`, in first-seen order.
+    pub skills: Vec<String>,
+}
+
+/// Extract [`Touchpoints`] from `history` (files referenced by file tools + skills loaded). Pure
+/// over the message list so it's unit-testable, and order-preserving + de-duplicated so the tree
+/// reads like a short memory of the turn. Call this BEFORE compaction — once the older turns are
+/// summarized their tool calls are gone, so the harvest must happen while they're still present.
+pub fn context_touchpoints(history: &[Message]) -> Touchpoints {
+    let mut tp = Touchpoints::default();
+    let push = |v: &mut Vec<String>, s: &str| {
+        let s = s.trim();
+        if !s.is_empty() && !v.iter().any(|e| e == s) {
+            v.push(s.to_string());
+        }
+    };
+    for m in history {
+        for call in &m.tool_calls {
+            let args: serde_json::Value =
+                serde_json::from_str(&call.function.arguments).unwrap_or(serde_json::Value::Null);
+            match call.function.name.as_str() {
+                "file_read" | "file_edit" | "file_write" | "multi_edit" => {
+                    if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+                        push(&mut tp.files, p);
+                    }
+                }
+                "skill_load" => {
+                    if let Some(n) = args.get("name").and_then(|v| v.as_str()) {
+                        push(&mut tp.skills, n);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    tp
+}
+
 /// Compute the compaction cut index: the kept tail starts here. It's always a `user` message, so the
 /// summarized block never ends mid-turn and the tail never begins with an orphan `tool` result.
 /// Keeps the last `keep_turns` user turns verbatim. `None` when the conversation is too short to be
@@ -362,6 +408,42 @@ mod tests {
         assert_eq!(parse_marker_seq("[... · #7]\nsummary"), Some(7));
         assert_eq!(parse_marker_seq("[... · #]\nx"), None); // hash with no digits
         assert_eq!(parse_marker_seq("[... · #12] trailing"), Some(12));
+    }
+
+    fn tool_call(name: &str, args: &str) -> Message {
+        Message::assistant_tool_calls(vec![ToolCall {
+            id: "x".into(),
+            kind: "function".into(),
+            function: FunctionCall { name: name.into(), arguments: args.into() },
+        }])
+    }
+
+    #[test]
+    fn touchpoints_harvest_files_and_skills_ordered_and_deduped() {
+        let h = vec![
+            Message::system("SYS"),
+            user("do the thing"),
+            tool_call("file_read", r#"{"path":"src/main.rs"}"#),
+            tool_call("skill_load", r#"{"name":"deep-research"}"#),
+            tool_call("file_edit", r#"{"path":"src/main.rs","old_string":"a","new_string":"b"}"#),
+            tool_call("file_write", r#"{"path":"src/new.rs","content":"x"}"#),
+            tool_call("multi_edit", r#"{"path":"src/ui/tui.rs","edits":[]}"#),
+            tool_call("skill_load", r#"{"name":"deep-research"}"#),
+            tool_call("shell_run", r#"{"command":"ls"}"#),
+        ];
+        let tp = context_touchpoints(&h);
+        // First-seen order, de-duplicated (main.rs appears twice → once), non-file tools ignored.
+        assert_eq!(tp.files, vec!["src/main.rs", "src/new.rs", "src/ui/tui.rs"]);
+        assert_eq!(tp.skills, vec!["deep-research"]);
+    }
+
+    #[test]
+    fn touchpoints_empty_when_no_tool_calls_and_survives_garbled_args() {
+        let clean = vec![Message::system("SYS"), user("hi"), asst("hello")];
+        assert_eq!(context_touchpoints(&clean), Touchpoints::default());
+        // Malformed JSON arguments must not panic — they just yield nothing.
+        let garbled = vec![tool_call("file_read", "not json{")];
+        assert_eq!(context_touchpoints(&garbled), Touchpoints::default());
     }
 
     #[tokio::test]

@@ -520,7 +520,7 @@ impl TaskTool {
 /// effects, approval-gated inside the child, and benign under parallelism — deliberately NOT
 /// counted as writes: what must serialize is workspace mutation.
 pub(crate) fn dispatch_is_read_only(r: &crate::agent::tools::ToolRegistry) -> bool {
-    const WRITERS: &[&str] = &["file_edit", "multi_edit", "file_write", "shell_run", "skill_save"];
+    const WRITERS: &[&str] = &["file_edit", "multi_edit", "file_write", "file_move", "shell_run", "skill_save"];
     WRITERS.iter().all(|w| r.get(w).is_none())
 }
 
@@ -545,6 +545,15 @@ impl SubagentSlot {
             return None;
         }
         Some(Self)
+    }
+
+    /// Greedily reserve UP TO `want` slots (used by the `workflow` fan-out, which runs several
+    /// children under one call — reserving one slot per concurrent child keeps the global cap
+    /// honest, instead of a whole fan-out spending a single slot). Returns however many the gate
+    /// had free (0..=want); an empty Vec means the caller should degrade to a soft "gate full"
+    /// error. Each slot releases on drop, so the whole batch frees when the returned Vec drops.
+    pub(crate) fn acquire_up_to(want: usize) -> Vec<Self> {
+        (0..want).map_while(|_| Self::try_acquire()).collect()
     }
 }
 
@@ -734,8 +743,12 @@ mod tests {
     }
 
     #[test]
-    fn subagent_gate_caps_and_releases() {
-        // Default cap is 3: three slots acquire, the fourth refuses, a drop frees one.
+    fn subagent_gate_caps_reserves_and_releases() {
+        // ONE test for the whole gate: both `try_acquire` and `acquire_up_to` mutate the same
+        // process-global counter, so they must be exercised in a single test (cargo runs #[test]
+        // fns concurrently — two tests asserting exact counts on a shared atomic would race).
+
+        // try_acquire: default cap is 3 — three slots acquire, the fourth refuses, a drop frees one.
         let a = SubagentSlot::try_acquire().expect("slot 1");
         let b = SubagentSlot::try_acquire().expect("slot 2");
         let c = SubagentSlot::try_acquire().expect("slot 3");
@@ -745,6 +758,19 @@ mod tests {
         drop(a);
         drop(c);
         drop(d);
+
+        // acquire_up_to: reserves ONE slot per child, capped by the gate — asking for 5 on a cap of
+        // 3 yields exactly 3 (the workflow fan-out's honest accounting: N children cost N slots, not
+        // one slot for the whole call), the gate is then full, and dropping frees them all.
+        let batch = SubagentSlot::acquire_up_to(5);
+        assert_eq!(batch.len(), 3, "capped at the default cap of 3");
+        assert!(SubagentSlot::try_acquire().is_none(), "gate is full after a maxed reservation");
+        drop(batch);
+        let again = SubagentSlot::acquire_up_to(2);
+        assert_eq!(again.len(), 2, "all freed → a fresh reservation succeeds");
+        drop(again);
+        let one = SubagentSlot::acquire_up_to(1);
+        assert_eq!(one.len(), 1, "asking for fewer than the cap yields exactly that many");
     }
 
     #[test]
@@ -898,6 +924,19 @@ mod tests {
         assert!(r.get("multi_edit").is_none(), "multi_edit not listed → not granted");
         assert!(r.get("skill_save").is_none(), "skill_save not listed → not granted");
         assert!(r.get("file_read").is_some(), "read-only base still present");
+    }
+
+    #[test]
+    fn agent_registry_maps_file_move_aliases() {
+        let root = std::env::temp_dir();
+        // Each common rename/move alias must resolve to the one file_move tool.
+        for alias in ["file_move", "move_file", "rename_file", "mv_file", "Rename"] {
+            let r = crate::agent::builtin::agent_registry(
+                &agent_def("S", &["Read", alias], None, "b"),
+                &root,
+            );
+            assert!(r.get("file_move").is_some(), "{alias} alias → file_move");
+        }
     }
 
     #[test]

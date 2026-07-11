@@ -188,10 +188,9 @@ impl Tool for WorkflowTool {
             bail!("workflow is depth-capped at 1 — a sub-agent cannot orchestrate further fan-outs");
         }
         let (spec, synthesize) = build_spec(args)?;
-        // Children draw from the same global gate as `task` — over-limit degrades to a soft error.
-        let Some(_slot) = crate::agent::task_tool::SubagentSlot::try_acquire() else {
-            return Ok("error: sub-agent concurrency limit reached — retry when running tasks finish".to_string());
-        };
+        // Sub-agent gate is acquired INSIDE run_workflow_collect — one slot per concurrent child
+        // (see SubagentSlot::acquire_up_to), so the fan-out is counted against the global cap at its
+        // real width rather than as a single slot for the whole call. Over-limit → soft error there.
         let client = self.client.clone();
         let base = self.base_url.clone();
         let key = self.api_key.clone();

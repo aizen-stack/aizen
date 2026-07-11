@@ -116,8 +116,9 @@ pub async fn run_workflow(
         MAX_PARALLEL.min(spec.tasks.len())
     );
 
-    // Fan out, bounded to MAX_PARALLEL via chunking.
-    let results = fan_out(http, base_url, api_key, model, auto_approve, &root, &date, &spec.tasks).await;
+    // Fan out, bounded to MAX_PARALLEL via chunking. The standalone CLI runner is not under the
+    // process-global sub-agent gate (no interleaving `task` calls), so it uses the full width.
+    let results = fan_out(http, base_url, api_key, model, auto_approve, &root, &date, &spec.tasks, MAX_PARALLEL).await;
 
     for r in &results {
         eprintln!("  • {} ({}/{}) — {} [{} step(s)]", r.id, r.role, r.model, r.status, r.iters);
@@ -168,6 +169,12 @@ pub async fn run_workflow(
 
 /// Fan the tasks out, bounded to `MAX_PARALLEL` via chunking — shared by the CLI runner and the
 /// model-callable `workflow` tool (see `workflow_tool.rs`).
+///
+/// `max_parallel` bounds the chunk size: the CLI runner passes [`MAX_PARALLEL`] (standalone, no
+/// global gate), while the model-callable tool passes the number of sub-agent slots it actually
+/// reserved (`SubagentSlot::acquire_up_to`), so a fan-out never runs more concurrent children than
+/// the process-global cap allows. Clamped to `1..=MAX_PARALLEL` so a bad caller can't serialize to
+/// death or oversubscribe.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fan_out(
     http: &reqwest::Client,
@@ -178,9 +185,11 @@ pub(crate) async fn fan_out(
     root: &Path,
     date: &str,
     tasks: &[WorkflowTask],
+    max_parallel: usize,
 ) -> Vec<TaskOutcome> {
+    let width = max_parallel.clamp(1, MAX_PARALLEL);
     let mut results: Vec<TaskOutcome> = Vec::with_capacity(tasks.len());
-    for chunk in tasks.chunks(MAX_PARALLEL) {
+    for chunk in tasks.chunks(width) {
         let futs =
             chunk.iter().map(|t| run_one_task(http, base_url, api_key, model, auto_approve, root, date, t));
         results.extend(futures_util::future::join_all(futs).await);
@@ -215,7 +224,22 @@ pub(crate) async fn run_workflow_collect(
     }
     let root = std::env::current_dir().context("resolving cwd")?.canonicalize().context("canonicalizing cwd")?;
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let results = fan_out(http, base_url, api_key, model, auto_approve, &root, &date, &spec.tasks).await;
+    // Reserve ONE global sub-agent slot per concurrent child (bounded by both the workflow's own
+    // MAX_PARALLEL and the number of tasks), so a fan-out is accounted against the process-global
+    // cap at its real width — not as a single slot for the whole call. The reserved slots are held
+    // in `_slots` for the duration of the fan-out and released on drop; the fan-out chunks at
+    // exactly the width we secured. An empty reservation (gate already full) is a soft error.
+    let want = MAX_PARALLEL.min(spec.tasks.len());
+    let slots = crate::agent::task_tool::SubagentSlot::acquire_up_to(want);
+    if slots.is_empty() {
+        bail!("sub-agent concurrency limit reached — retry when running tasks finish");
+    }
+    let width = slots.len();
+    // Header line into the transcript so the user sees the fan-out begin (TUI path only; no-op on
+    // the CLI runner, which prints its own eprintln banner).
+    wf_header(&format!("workflow: {} · {} task(s)", spec.name, spec.tasks.len()));
+    let results = fan_out(http, base_url, api_key, model, auto_approve, &root, &date, &spec.tasks, width).await;
+    drop(slots); // explicit: hold the reservation across the whole fan-out, free it here
     if results.iter().all(|r| r.status == "error") {
         bail!("workflow '{}': all {} task(s) failed — nothing to report", spec.name, results.len());
     }
@@ -237,6 +261,7 @@ pub(crate) async fn run_workflow_collect(
         came from. Do not invent results that no task reported.";
     let instruction = spec.synthesis.as_ref().and_then(|s| s.prompt.as_deref()).unwrap_or(default_instruction);
     let synth_prompt = build_synthesis_prompt(&spec.name, instruction, &results);
+    wf_trace(&format!("⋯ synthesizing ({synth_model})…"));
     let merged = crate::llm::client::chat_with_tools(
         http,
         base_url,
@@ -306,6 +331,12 @@ async fn run_one_task(
         ..AgentConfig::default()
     };
 
+    // Live progress: workflow children run `quiet` (no nested trace) and only their MERGED result
+    // reaches the parent at the end, so without this the user stares at a blank screen while ≤5
+    // agents run. Emit a start + finish line per task into the transcript (only under the sticky
+    // TUI — the CLI path prints its own eprintln status and isn't TUI-active, so no double lines).
+    wf_trace(&format!("⋯ {} ({label}) running…", task.id));
+
     match run_agent(chat, &cfg, &registry, &system, &task.prompt).await {
         Ok(o) => {
             let status = match o.stop {
@@ -315,6 +346,8 @@ async fn run_one_task(
                 // Unreachable: workflow sub-agents have no `clarify` tool (nobody to answer).
                 StopReason::AwaitingInput(_) => "awaiting-input",
             };
+            let ok = status == "done";
+            wf_trace_done(ok, &format!("{} ({label}) — {status} [{} step(s)]", task.id, o.iters));
             TaskOutcome {
                 id: task.id.clone(),
                 role: label.clone(),
@@ -324,15 +357,47 @@ async fn run_one_task(
                 iters: o.iters,
             }
         }
-        Err(e) => TaskOutcome {
-            id: task.id.clone(),
-            role: label.clone(),
-            model: task_model.to_string(),
-            status: "error".to_string(),
-            summary: format!("error: {e}"),
-            iters: 0,
-        },
+        Err(e) => {
+            wf_trace_done(false, &format!("{} ({label}) — error", task.id));
+            TaskOutcome {
+                id: task.id.clone(),
+                role: label.clone(),
+                model: task_model.to_string(),
+                status: "error".to_string(),
+                summary: format!("error: {e}"),
+                iters: 0,
+            }
+        }
     }
+}
+
+/// Emit the workflow header line (the fan-out banner) into the sticky-TUI transcript — a moonlight
+/// `✦` + label, matching the turn-start whimsy line's accent so it reads as a section opener.
+fn wf_header(line: &str) {
+    if crate::ui::tui::active() {
+        let star = console::style("✦").color256(crate::ui::splash::ACCENT).bold();
+        crate::ui::tui::emit_line(&format!("{star} {}", crate::ui::theme::accent(line)));
+    }
+}
+
+/// Emit one workflow progress line into the sticky-TUI transcript (a quiet `⎿`-prefixed trace,
+/// same shape as the agent loop's tool trace). A no-op when the TUI isn't active — the standalone
+/// CLI runner prints its own `eprintln!` status and isn't TUI-active, so this never double-prints.
+fn wf_trace(line: &str) {
+    if crate::ui::tui::active() {
+        crate::ui::tui::emit_line(&format!("  {} {}", crate::ui::theme::faint("⎿"), crate::ui::theme::faint(line)));
+    }
+}
+
+/// Emit a workflow task's FINISH line — the corner + text turn salmon on failure so a diverged /
+/// errored task reads at a glance, matching the agent loop's `emit_tool_result` styling.
+fn wf_trace_done(ok: bool, line: &str) {
+    if !crate::ui::tui::active() {
+        return;
+    }
+    let corner = if ok { crate::ui::theme::faint("⎿") } else { crate::ui::theme::err("⎿") };
+    let body = if ok { crate::ui::theme::faint(line).to_string() } else { crate::ui::theme::err(line).to_string() };
+    crate::ui::tui::emit_line(&format!("  {corner} {body}"));
 }
 
 /// Write a JSON audit trace of the fan-out (best-effort; caller logs any error).
@@ -379,6 +444,20 @@ fn build_synthesis_prompt(name: &str, instruction: &str, results: &[TaskOutcome]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_trace_helpers_are_noop_off_tui() {
+        // Off the sticky TUI (the test harness), the progress helpers must be silent no-ops — the
+        // CLI runner prints its own eprintln status, so these emitting there would double-print.
+        // We can't assert "nothing printed" cheaply, but we CAN assert they don't panic / gate
+        // correctly on `tui::active()` (false under tests). A regression to an unconditional emit
+        // would still run here without a live TUI and is caught by the smoke path.
+        assert!(!crate::ui::tui::active(), "test harness is never TUI-active");
+        wf_header("workflow: t · 2 task(s)");
+        wf_trace("⋯ a (reviewer) running…");
+        wf_trace_done(true, "a (reviewer) — done [3 step(s)]");
+        wf_trace_done(false, "b (coder) — error");
+    }
 
     #[test]
     fn parses_spec_with_defaults() {

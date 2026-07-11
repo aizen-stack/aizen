@@ -47,7 +47,7 @@ pub const SLASH: &[(&str, &str)] = &[
     ("help", "commands & tips"),
     ("model", "list + pick the model"),
     ("sessions", "saved chats — restore / save / delete"),
-    ("timeline", "time machine — rewind / re-apply code"),
+    ("timeline", "checkpoint timeline (glance) · pick to restore"),
     ("checkpoint", "save a code restore point"),
     ("compact", "compress context to free tokens"),
     ("memory", "your memory profile / search"),
@@ -197,15 +197,48 @@ pub fn next_tip() -> &'static str {
     TIPS[i % TIPS.len()]
 }
 
+/// Rotating cursor for the per-turn working verb (advanced once per turn, so each run opens on a
+/// fresh word). Distinct from the footer's old in-place cycling: the verb now prints ONCE into the
+/// transcript at turn start (a quiet "here we go" line) AND drives the animated thinking line in the
+/// footer breather row (see [`thinking_line`]).
+static VERB_CURSOR: AtomicUsize = AtomicUsize::new(0);
+/// Index (into `VERBS`) of the verb chosen for the CURRENT turn — set by [`next_work_verb`] at turn
+/// start and read every frame by [`paint_box`] so the footer shimmer keeps showing the same word for
+/// the whole turn (rather than re-rolling on each ~9×/s repaint).
+static CURRENT_VERB: AtomicUsize = AtomicUsize::new(0);
+
+/// The next working verb (e.g. "Pondering"), advancing the rotation AND pinning it as the current
+/// turn's verb (so the animated footer line shows the same word). Emitted once per turn into the
+/// scrolling transcript by the REPL — see the turn-start line in `run_menu_sticky`.
+pub fn next_work_verb() -> &'static str {
+    let i = VERB_CURSOR.fetch_add(1, Ordering::Relaxed) % VERBS.len();
+    CURRENT_VERB.store(i, Ordering::Relaxed);
+    VERBS[i]
+}
+
+/// The verb pinned for the current turn (the one [`next_work_verb`] last returned) — read by the
+/// footer's animated thinking line so it stays stable across repaints.
+fn current_verb() -> &'static str {
+    VERBS[CURRENT_VERB.load(Ordering::Relaxed) % VERBS.len()]
+}
+
+/// Context-window fill, in per-mille (0..=1000), for the HUD meter bar. Set by `status_text` each
+/// time the status is refreshed; read by `paint_box` to draw the coloured bar. Per-mille (not
+/// percent) so the bar has sub-1% resolution without a float in the hot paint path.
+static CTX_PERMILLE: AtomicU16 = AtomicU16::new(0);
+
+/// Update the context-meter fill (per-mille, clamped 0..=1000). Called from `status_text` alongside
+/// each status refresh; harmless when the TUI is inactive.
+pub fn set_ctx_permille(v: u16) {
+    CTX_PERMILLE.store(v.min(1000), Ordering::Relaxed);
+}
+
 /// Current spinner frame index (advanced by the ticker thread; read by `paint_box`).
 static WORK_FRAME: AtomicUsize = AtomicUsize::new(0);
 /// Rough count of streamed OUTPUT characters this turn (÷4 ≈ tokens) — drives the live "↑N tok"
 /// counter in the working pill. Bumped by the streaming client via [`add_stream_chars`]; zeroed at
 /// each turn start (`set_working(true)`).
 static STREAM_CHARS: AtomicU64 = AtomicU64::new(0);
-/// Per-turn seed so the cycling verb doesn't start on the same word every turn — bumped on each
-/// `set_working(true)`. No RNG (keeps the loop deterministic; `Math.random`-free by design).
-static WORK_VERB_SEED: AtomicUsize = AtomicUsize::new(0);
 /// When the current task started — drives the "· Ns" elapsed counter in the working pill. Set on
 /// `set_working(true)`, cleared on `set_working(false)`.
 static WORK_START: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
@@ -449,15 +482,107 @@ fn truncate_to_width(s: &str, max: usize) -> String {
 /// the colour itself signals "this mode runs hot" vs "this mode is careful". Operates on the
 /// already-truncated PLAIN string, so it never splits an ANSI escape.
 fn style_hud(s: &str) -> String {
-    if let Some(i) = s.find('⚡') {
-        let (head, tail) = s.split_at(i);
-        return format!("{}{}", theme::muted(head), theme::warn(tail)); // yolo → gold
+    // The HUD is `model  ·  🎭 Persona  ·  ✦ mode  ·  todos` — chips are separated by "  ·  ".
+    // Colour each SEGMENT on its own so persona + mode can both pop at once (the old single-split
+    // version only lit the first chip and left the rest muted). A segment's leading glyph picks its
+    // colour; everything else stays neutral moonlight-grey.
+    const SEP: &str = "  ·  ";
+    s.split(SEP)
+        .map(|seg| {
+            if seg.starts_with('⚡') {
+                theme::warn(seg).to_string() // yolo → gold (runs hot)
+            } else if seg.starts_with('✦') {
+                theme::warn(seg).bold().to_string() // ultimate → gold bold (runs hottest)
+            } else if seg.starts_with('◆') || seg.starts_with('🎭') {
+                // smart mode + persona chip → calm moonlight (careful mode / which character is live)
+                theme::accent(seg).to_string()
+            } else {
+                theme::muted(seg).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(&theme::faint(SEP).to_string())
+}
+
+/// Number of filled cells the context meter uses (excludes the enclosing brackets). Kept small so
+/// the whole `⟦▓▓▓░░░⟧ 42%` widget is a compact right-hand gauge, not a full-width progress bar.
+const CTX_BAR_CELLS: usize = 10;
+
+/// Render the context-window meter: a bracketed 10-cell bar that fills as the session grows, plus a
+/// trailing `NN%`. The fill colour tracks headroom — calm moonlight while there's plenty of room,
+/// warm gold as it tightens, salmon when nearly full — so a glance reads "how much context is left"
+/// without parsing a number. `permille` is 0..=1000 (see [`set_ctx_permille`]). Returns a styled
+/// string sized to exactly `CTX_BAR_CELLS + 2` bracket cells + " NN%" (≤ 4) so callers can budget it.
+fn ctx_meter(permille: u16) -> String {
+    let pm = permille.min(1000);
+    let filled = (pm as usize * CTX_BAR_CELLS).div_ceil(1000).min(CTX_BAR_CELLS);
+    // A partial cell for the boundary so low fills still show a sliver of progress (▏..█ eighths).
+    let bar_color = if pm >= 900 {
+        theme::ERR // nearly full — reclaim room soon (/compact)
+    } else if pm >= 700 {
+        theme::WARN // getting tight
+    } else {
+        theme::ACCENT_DIM // plenty of headroom — quiet moonlight
+    };
+    let mut bar = String::new();
+    for i in 0..CTX_BAR_CELLS {
+        bar.push(if i < filled { '▓' } else { '░' });
     }
-    if let Some(i) = s.find('◆') {
-        let (head, tail) = s.split_at(i);
-        return format!("{}{}", theme::muted(head), theme::accent(tail)); // smart → moonlight
+    let pct = (pm as f64 / 10.0).round() as u16; // per-mille → percent
+    format!(
+        "{}{}{} {}",
+        theme::faint("⟦"),
+        style(bar).color256(bar_color),
+        theme::faint("⟧"),
+        theme::muted(format!("{pct}%")),
+    )
+}
+
+/// Render the animated "thinking" line for the footer breather row while the agent works: the
+/// current turn's verb (e.g. `Pondering`) with a bright moonlight band that sweeps left→right across
+/// its letters (a shimmer), a leading star frame, and trailing dots that grow `.`→`..`→`···`. Driven
+/// entirely by `WORK_FRAME` (advanced ~9×/s by the ticker) so it animates smoothly even when no token
+/// is streaming. Returns `""` when the verb is empty so the caller can leave the row blank when idle.
+///
+/// The shimmer is a moving 3-cell-wide window: letters inside it render bright `ACCENT` (bold at the
+/// crest), the rest a quiet `MUTED`, so a soft highlight glides across the word like moonlight on
+/// water — matching the palette's "holds the moon" identity without adding a new colour.
+fn thinking_line(frame: usize) -> String {
+    let verb = current_verb();
+    let chars: Vec<char> = verb.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return String::new();
     }
-    theme::muted(s).to_string()
+    // The shimmer crest sweeps across [0, n + tail) so it enters, crosses, and exits the word before
+    // wrapping — a slow, continuous glide (one cell every ~2 frames ≈ 5 cells/s).
+    let span = n + 6;
+    let crest = (frame / 2) % span;
+    let mut out = String::from("  "); // indent so it sits under the transcript column, not the rule
+    for (i, &c) in chars.iter().enumerate() {
+        // Distance from the crest, wrapping so the band re-enters cleanly at the left edge.
+        let d = (i as isize - crest as isize).unsigned_abs();
+        let styled = if d == 0 {
+            style(c.to_string()).color256(ACCENT).bold() // crest — brightest
+        } else if d == 1 {
+            style(c.to_string()).color256(theme::ACCENT_DIM) // shoulder — soft glow
+        } else {
+            style(c.to_string()).color256(theme::MUTED) // trough — quiet
+        };
+        out.push_str(&styled.to_string());
+    }
+    // Trailing dots grow 0→3 then repeat, on a slower clock than the shimmer so they read as a pulse.
+    let dots = (frame / 4) % 4;
+    out.push_str(&theme::faint(".".repeat(dots)).to_string());
+    out
+}
+
+/// Visible (de-styled) width of the context meter for a given fill — brackets + bar + " NN%".
+/// `paint_box` uses this to reserve the meter's right-hand slot before truncating the status text.
+fn ctx_meter_width(permille: u16) -> usize {
+    let pct = (permille.min(1000) as f64 / 10.0).round() as u16;
+    // ⟦ + bar + ⟧ + space + digits + %
+    1 + CTX_BAR_CELLS + 1 + 1 + pct.to_string().len() + 1
 }
 
 // ── ANSI helpers (written into a String, flushed under the lock) ──────────────────────────────
@@ -553,14 +678,17 @@ fn paint_box(buf: &mut String, r: &Render) {
     clear_line(buf);
     buf.push_str(&theme::faint("─".repeat(w)).to_string());
 
-    // row 2: HUD — muted "model · tokens · …" on the left, a state pill on the right edge of meaning.
+    // row 2: HUD — muted "model · ✦ mode" on the LEFT; a compact state pill + the always-on context
+    // meter on the RIGHT. The verb ("Pondering…") no longer animates here — it prints once into the
+    // transcript at turn start — so this row stays quiet: state, liveness numbers, and the ctx gauge.
     goto(buf, top_row + 1, 1);
     clear_line(buf);
-    let work = if WORKING.load(Ordering::Relaxed) {
+    let pm = CTX_PERMILLE.load(Ordering::Relaxed);
+    let meter = ctx_meter(pm);
+    let meter_w = ctx_meter_width(pm);
+    let state = if WORKING.load(Ordering::Relaxed) {
         let frame = STAR[WORK_FRAME.load(Ordering::Relaxed) % STAR.len()];
         let secs = work_elapsed_secs();
-        // Cycle the verb every ~3s, offset per turn so it doesn't always open on the same word.
-        let verb = VERBS[(WORK_VERB_SEED.load(Ordering::Relaxed) + (secs / 3) as usize) % VERBS.len()];
         let tok = stream_tokens();
         let toktail = if tok >= 1000 {
             format!(" · ↑{:.1}K tok", tok as f64 / 1000.0)
@@ -570,23 +698,36 @@ fn paint_box(buf: &mut String, r: &Render) {
             String::new()
         };
         format!(
-            "{} {} {}",
+            "{} {}",
             style(frame).color256(ACCENT).bold(),
-            theme::muted(format!("{verb}…")),
-            theme::faint(format!("· {secs}s{toktail} · Esc"))
+            theme::faint(format!("{secs}s{toktail} · Esc"))
         )
     } else {
         format!("{} {}", theme::ok("●"), theme::faint("ready"))
     };
-    // Bound the status so the right-side pill always fits and the line can never wrap onto a second
+    // Right cluster = state pill + a gap + the context meter, right-aligned to the window edge.
+    let right = format!("{state}   {meter}");
+    let right_w = measure_text_width(&state) + 3 + meter_w;
+    // Bound the status so the right cluster always fits and the line can never wrap onto a second
     // row (a wrapped HUD is how the footer visually "doubles").
-    let avail = w.saturating_sub(measure_text_width(&work) + 3);
+    let avail = w.saturating_sub(right_w + 3);
     let status = truncate_to_width(&r.status, avail);
-    buf.push_str(&format!("{}   {work}", style_hud(&status)));
+    let status_styled = style_hud(&status);
+    // Pad between the (plain-width) status and the right cluster so the meter hugs the right edge.
+    let pad = w
+        .saturating_sub(measure_text_width(&status) + right_w)
+        .max(1);
+    buf.push_str(&format!("{status_styled}{}{right}", " ".repeat(pad)));
 
-    // row 3: a blank breather between the HUD and the prompt (matches the airy mockup spacing).
+    // row 3: while the agent works this is the animated "thinking" line — the turn's verb with a
+    // moonlight shimmer sweeping across its letters (driven by WORK_FRAME, repainted ~9×/s by the
+    // ticker). Idle → a blank breather between the HUD and the prompt (the airy mockup spacing).
     goto(buf, top_row + 2, 1);
     clear_line(buf);
+    if WORKING.load(Ordering::Relaxed) {
+        let line = thinking_line(WORK_FRAME.load(Ordering::Relaxed));
+        buf.push_str(&line);
+    }
 
     // row 4: the moonlit `❯` prompt — scroll so the cursor is visible.
     let imgtag = if r.images > 0 {
@@ -810,7 +951,6 @@ pub fn set_working(working: bool) {
         *work_start_slot().lock().unwrap() = Some(Instant::now());
         WORK_FRAME.store(0, Ordering::Relaxed);
         STREAM_CHARS.store(0, Ordering::Relaxed); // fresh token counter for this turn
-        WORK_VERB_SEED.fetch_add(1, Ordering::Relaxed); // vary the starting verb per turn
         start_ticker();
     } else {
         *work_start_slot().lock().unwrap() = None;
@@ -1215,6 +1355,192 @@ fn take_pending_images() -> Vec<String> {
     std::mem::take(&mut *pending_images().lock().unwrap())
 }
 
+// ── the animated `/effort` slider ─────────────────────────────────────────────
+// A keyboard-dragged horizontal slider for the per-turn reasoning-effort tier. Four discrete stops
+// (`auto` · `low` · `medium` · `high`) sit on a rail; a moonlit knob slides between them with an
+// ease-out glide (the "kéo"/drag feel), and a small pulse plays on commit. Colour keys the mood —
+// auto is calm moonlight, low goes green (light & cheap), medium dim-silver, high burns the reserved
+// gold (runs hot). Runs while the sticky box is SUSPENDED (or in the plain REPL), so it owns stdin;
+// degrades to a no-op (returns `None`) off-TTY. The caller maps the returned index to config writes.
+
+/// Rail inner width in cells (index range `0..=RAIL`).
+const RAIL: usize = 39;
+/// Cell position of each tier's notch on the rail — evenly spaced across `0..=RAIL`.
+const NOTCHES: [usize; 6] = [0, 8, 16, 23, 31, 39];
+/// Stop labels, left→right. Index is the value returned by [`effort_slider`].
+const E_TIERS: [&str; 6] = ["auto", "low", "medium", "high", "xhigh", "max"];
+/// One-line gist shown under the focused stop.
+const E_DESCS: [&str; 6] = [
+    "detect per-turn from your wording — keyword + complexity",
+    "minimal reasoning — fastest & cheapest",
+    "balanced reasoning — the middle ground",
+    "deep reasoning — the everyday ceiling",
+    "deeper exploration — always thinks deeply",
+    "no limit on thinking depth — slowest & most thorough",
+];
+/// Rows the slider block occupies (title · blank · rail · labels · blank · desc · hint).
+const SLIDER_ROWS: usize = 7;
+
+/// The moonlight-palette colour for a tier: auto = accent, low = green (ok), medium = dim silver,
+/// high/xhigh = the reserved warm gold (matches the `⚡ yolo` "runs hot" cue), max = salmon (the
+/// hottest rung). high and xhigh share the gold; the label text distinguishes them.
+fn e_color(i: usize) -> u8 {
+    match i {
+        1 => theme::OK,
+        2 => theme::ACCENT_DIM,
+        3 => theme::WARN,
+        4 => theme::WARN,
+        5 => theme::ERR,
+        _ => theme::ACCENT,
+    }
+}
+
+/// Build the labels row: each stop centred on its notch, the focused one bold-tinted, the rest faint.
+/// Contiguous cells of the same owner are grouped into one styled span (so the plain names survive as
+/// substrings and the escape count stays small).
+fn labels_line(sel: usize) -> String {
+    let mut owner = [usize::MAX; RAIL + 1];
+    let mut chars = [' '; RAIL + 1];
+    for (li, name) in E_TIERS.iter().enumerate() {
+        let w = name.chars().count();
+        let mut start = NOTCHES[li].saturating_sub(w / 2);
+        if start + w > RAIL + 1 {
+            start = RAIL + 1 - w; // clamp the rightmost label so it can't overflow the rail
+        }
+        for (k, ch) in name.chars().enumerate() {
+            chars[start + k] = ch;
+            owner[start + k] = li;
+        }
+    }
+    let mut out = String::new();
+    let mut c = 0;
+    while c <= RAIL {
+        let o = owner[c];
+        let mut seg = String::new();
+        while c <= RAIL && owner[c] == o {
+            seg.push(chars[c]);
+            c += 1;
+        }
+        if o == usize::MAX {
+            out.push_str(&seg);
+        } else if o == sel {
+            out.push_str(&style(seg).color256(e_color(sel)).bold().to_string());
+        } else {
+            out.push_str(&theme::faint(seg).to_string());
+        }
+    }
+    out
+}
+
+/// Render one frame of the slider: `sel` = focused tier (colours the fill + labels + desc), `knob` =
+/// the knob's current rail cell (may sit *between* notches mid-glide), `glyph` = the knob character
+/// (swapped during the commit pulse). Produces exactly `SLIDER_ROWS` lines joined by `\n` (no trailing
+/// newline); every line begins with a clear-to-EOL so an in-place redraw leaves no residue.
+fn slider_frame(sel: usize, knob: usize, glyph: &str) -> String {
+    let col = e_color(sel);
+    let mut out = String::new();
+    // 1) title
+    out.push_str("\x1b[2K");
+    out.push_str(&theme::muted("  reasoning effort").to_string());
+    out.push('\n');
+    // 2) blank
+    out.push_str("\x1b[2K\n");
+    // 3) rail — filled (tinted) up to the knob, faint beyond it
+    out.push_str("\x1b[2K  ");
+    for c in 0..=RAIL {
+        if c == knob {
+            out.push_str(&style(glyph).color256(col).bold().to_string());
+        } else if c < knob {
+            out.push_str(&style("━").color256(col).to_string());
+        } else {
+            out.push_str(&theme::faint("─").to_string());
+        }
+    }
+    out.push('\n');
+    // 4) labels
+    out.push_str("\x1b[2K  ");
+    out.push_str(&labels_line(sel));
+    out.push('\n');
+    // 5) blank
+    out.push_str("\x1b[2K\n");
+    // 6) description of the focused stop
+    out.push_str("\x1b[2K  ");
+    out.push_str(&style(format!("› {}", E_DESCS[sel])).color256(col).to_string());
+    out.push('\n');
+    // 7) key hints
+    out.push_str("\x1b[2K  ");
+    out.push_str(&theme::faint("← → drag · Enter set · Esc cancel").to_string());
+    out
+}
+
+/// Reprint the block in place: jump the cursor up to the block's top row, then repaint every line
+/// (each clears itself) and drop back below it.
+fn slider_redraw(frame: &str) {
+    println!("\x1b[{SLIDER_ROWS}A{frame}");
+    let _ = std::io::stdout().flush();
+}
+
+/// Glide the knob from one notch to another with an ease-out cubic (fast start, gentle settle) — the
+/// dragging animation. `to` is the destination tier, so the fill/labels recolour to it as it moves.
+fn slider_glide(from: usize, to: usize) {
+    const FRAMES: usize = 7;
+    let (a, b) = (NOTCHES[from] as f32, NOTCHES[to] as f32);
+    for f in 1..=FRAMES {
+        let t = f as f32 / FRAMES as f32;
+        let e = 1.0 - (1.0 - t).powi(3); // ease-out
+        let cell = (a + (b - a) * e).round() as usize;
+        slider_redraw(&slider_frame(to, cell, "●"));
+        std::thread::sleep(Duration::from_millis(16));
+    }
+}
+
+/// A short pulse on the knob when the choice is committed (a little "click" of feedback).
+fn slider_commit_pulse(sel: usize) {
+    for g in ["●", "◉", "●", "◉", "●"] {
+        slider_redraw(&slider_frame(sel, NOTCHES[sel], g));
+        std::thread::sleep(Duration::from_millis(45));
+    }
+}
+
+/// Run the interactive effort slider, starting focused on `start` (0=auto … 3=high). Returns the
+/// chosen index, or `None` if the user cancelled (Esc) or it isn't a TTY. Drives stdin directly, so
+/// the caller must have SUSPENDED the sticky box first (the plain REPL can call it as-is).
+pub fn effort_slider(start: usize) -> Option<usize> {
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    let term = Term::stdout();
+    let _ = term.hide_cursor();
+    let mut sel = start.min(E_TIERS.len() - 1);
+    println!("{}", slider_frame(sel, NOTCHES[sel], "●"));
+    let _ = std::io::stdout().flush();
+    let choice = loop {
+        let key = match term.read_key() {
+            Ok(k) => k,
+            Err(_) => break None,
+        };
+        match key {
+            Key::ArrowRight | Key::Char('l') | Key::Char('L') if sel < E_TIERS.len() - 1 => {
+                slider_glide(sel, sel + 1);
+                sel += 1;
+            }
+            Key::ArrowLeft | Key::Char('h') | Key::Char('H') if sel > 0 => {
+                slider_glide(sel, sel - 1);
+                sel -= 1;
+            }
+            Key::Enter => {
+                slider_commit_pulse(sel);
+                break Some(sel);
+            }
+            Key::Escape | Key::Char('\u{3}') | Key::Char('\u{4}') => break None,
+            _ => {}
+        }
+    };
+    let _ = term.show_cursor();
+    println!();
+    choice
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1282,6 +1608,89 @@ mod tests {
         assert!(buf.contains('❯'), "has the borderless moonlit prompt");
         assert!(!buf.contains('╭') && !buf.contains('╮'), "no box border");
         assert!(!buf.contains('│'), "no box sides");
+    }
+
+    #[test]
+    fn ctx_meter_fills_proportionally_and_reports_percent() {
+        // Empty session → no filled cells; the percent reads 0.
+        let empty = ctx_meter(0);
+        assert_eq!(empty.matches('▓').count(), 0, "0‰ → no filled cells");
+        assert_eq!(empty.matches('░').count(), CTX_BAR_CELLS, "0‰ → all empty cells");
+        assert!(empty.contains("0%"));
+        // Half full → about half the cells filled, and "50%".
+        let half = ctx_meter(500);
+        assert_eq!(half.matches('▓').count(), CTX_BAR_CELLS / 2, "500‰ → half filled");
+        assert!(half.contains("50%"));
+        // Full → every cell filled, "100%".
+        let full = ctx_meter(1000);
+        assert_eq!(full.matches('▓').count(), CTX_BAR_CELLS, "1000‰ → all filled");
+        assert!(full.contains("100%"));
+        // A non-zero-but-tiny fill still lights at least one cell (div_ceil), so progress is visible.
+        assert_eq!(ctx_meter(1).matches('▓').count(), 1, "any non-zero fill shows ≥1 cell");
+    }
+
+    #[test]
+    fn ctx_meter_width_matches_rendered_visible_width() {
+        // The reserved width must equal the de-styled visible width for every fill, so paint_box's
+        // right-alignment math is exact (an off-by-one here wraps the HUD → the footer "doubles").
+        for pm in [0u16, 1, 99, 100, 500, 999, 1000] {
+            let rendered = ctx_meter(pm);
+            // Strip ANSI: measure_text_width already ignores escapes, so compare directly.
+            assert_eq!(
+                measure_text_width(&rendered),
+                ctx_meter_width(pm),
+                "meter width mismatch at {pm}‰"
+            );
+        }
+    }
+
+    #[test]
+    fn work_verb_rotation_advances_and_wraps() {
+        // Successive pulls walk the VERBS list (modulo the shared cursor other tests may have bumped).
+        let base = VERB_CURSOR.load(Ordering::Relaxed);
+        let a = VERBS[base % VERBS.len()];
+        let b = VERBS[(base + 1) % VERBS.len()];
+        assert_eq!(next_work_verb(), a);
+        assert_eq!(next_work_verb(), b);
+    }
+
+    #[test]
+    fn thinking_line_animates_and_keeps_the_verb_intact() {
+        // Pin a known verb, then render several frames. The word's letters must all survive every
+        // frame (the shimmer only re-colours them, never drops any), and successive frames must
+        // differ (the crest sweeps + the dots pulse) so the line actually animates.
+        next_work_verb();
+        let verb = current_verb();
+        let stripped = |f: usize| console::strip_ansi_codes(&thinking_line(f)).to_string();
+        // Every rendered frame contains the whole verb (letters may be individually styled).
+        for f in 0..12 {
+            let vis = stripped(f);
+            assert!(
+                vis.contains(verb),
+                "frame {f} dropped the verb: {vis:?} (want {verb:?})"
+            );
+        }
+        // The shimmer/dots move: at least two of the first several frames must render differently.
+        let frames: Vec<String> = (0..8).map(|f| thinking_line(f)).collect();
+        assert!(
+            frames.iter().any(|f| f != &frames[0]),
+            "thinking line never changed across frames — no animation"
+        );
+    }
+
+    #[test]
+    fn style_hud_preserves_every_chip_and_separator() {
+        // The HUD text must survive styling verbatim (colours may be stripped under the test harness,
+        // but the glyphs/labels always remain) — persona + mode chips coexist without one clobbering
+        // the other, and the "  ·  " separators are kept so the row reads the same shape.
+        let hud = "gpt-model  ·  🎭 Sherlock  ·  ✦ ultimate";
+        let out = style_hud(hud);
+        assert!(out.contains("gpt-model"), "model label kept");
+        assert!(out.contains("🎭 Sherlock"), "persona chip kept");
+        assert!(out.contains("✦ ultimate"), "mode chip kept alongside persona");
+        assert_eq!(out.matches('·').count(), 2, "both separators kept");
+        // A plain status (no chips) is passed through unchanged in content.
+        assert!(style_hud("just-a-model").contains("just-a-model"));
     }
 
     /// The caret must land at the text insertion point: prefix `❯ ` is 2 cells → text at col 3,
@@ -1393,6 +1802,50 @@ mod tests {
         assert!(slash_matches(&v("/model foo")).is_empty(), "once an arg is typed the palette hides");
         assert_eq!(slash_matches(&v("/se")).first().map(|(n, _)| *n), Some("sessions"), "top match earliest-listed");
         assert!(slash_matches(&v("/xyz")).is_empty(), "no match → nothing to complete");
+    }
+
+    #[test]
+    fn slider_frame_has_all_stops_and_bounded_rows() {
+        // A frame must name every tier, describe the focused one, carry the knob glyph, and be
+        // exactly SLIDER_ROWS lines (the redraw jumps up by that count — a mismatch smears the UI).
+        let frame = slider_frame(2, NOTCHES[2], "●");
+        for t in E_TIERS {
+            assert!(frame.contains(t), "frame must show the '{t}' label");
+        }
+        assert!(frame.contains(E_DESCS[2]), "frame shows the focused tier's description");
+        assert!(frame.contains('●'), "frame carries the knob glyph");
+        assert_eq!(frame.lines().count(), SLIDER_ROWS, "frame must be exactly SLIDER_ROWS lines");
+    }
+
+    #[test]
+    fn slider_notches_span_the_rail_in_order() {
+        // The notches must be sorted, start at 0, end at RAIL, and match the tier count — otherwise
+        // the knob would jump off the rail or land between labels.
+        assert_eq!(NOTCHES.len(), E_TIERS.len(), "one notch per tier");
+        assert_eq!(NOTCHES[0], 0, "first stop sits at the rail start");
+        assert_eq!(*NOTCHES.last().unwrap(), RAIL, "last stop sits at the rail end");
+        assert!(NOTCHES.windows(2).all(|w| w[0] < w[1]), "notches strictly ascend");
+    }
+
+    #[test]
+    fn labels_line_contains_every_tier_name() {
+        // Every stop's name must survive as a plain substring regardless of which is focused, so the
+        // label row always reads correctly (the styling groups spans but never splits a name).
+        for sel in 0..E_TIERS.len() {
+            let line = labels_line(sel);
+            for t in E_TIERS {
+                assert!(line.contains(t), "labels row (sel={sel}) must contain '{t}'");
+            }
+        }
+    }
+
+    #[test]
+    fn e_color_maps_each_tier_to_a_palette_role() {
+        // auto→accent, low→ok(green), medium→dim, high→warn(gold). Guards the "high runs hot" cue.
+        assert_eq!(e_color(0), theme::ACCENT);
+        assert_eq!(e_color(1), theme::OK);
+        assert_eq!(e_color(2), theme::ACCENT_DIM);
+        assert_eq!(e_color(3), theme::WARN);
     }
 
     #[test]
