@@ -435,6 +435,9 @@ impl Tool for TaskTool {
             eprintln!("→ task({header_label}): running in yolo approval (sub-agent destructive ops pre-authorized)");
         }
 
+        // Live status for `/workflows` — RAII so a panic mid-dispatch still leaves a terminal row.
+        let track = crate::agent::orchestration::start_task(&header_label);
+
         // Bridge sync→async on the CURRENT runtime (same one the reqwest client was built on).
         // MUST run on a Tokio MULTI-THREAD worker thread — `block_in_place` panics on a
         // current-thread runtime / with no runtime. Both reach paths satisfy this: the async
@@ -453,10 +456,17 @@ impl Tool for TaskTool {
             let _effort = crate::core::cli_config::suppress_effort_override();
             tokio::runtime::Handle::current()
                 .block_on(crate::agent::run_agent(chat, &cfg, &registry, &system, prompt))
-        })
-        .with_context(|| format!("sub-agent ({label}) failed"))?;
+        });
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                track.finish_err(format!("error: {e}"));
+                return Err(e).with_context(|| format!("sub-agent ({label}) failed"));
+            }
+        };
 
-        let stop = match outcome.stop {
+        let stop_kind = outcome.stop;
+        let stop = match &stop_kind {
             crate::agent::StopReason::Done => "done",
             crate::agent::StopReason::Divergence => "diverged (repeated itself)",
             crate::agent::StopReason::MaxIters => "hit the step limit",
@@ -464,6 +474,7 @@ impl Tool for TaskTool {
             // Unreachable for a sub-agent (no `clarify` in any role registry — nobody to answer),
             // but the match must be total.
             crate::agent::StopReason::AwaitingInput(_) => "stopped to ask (no interactive user)",
+            crate::agent::StopReason::Cancelled => "cancelled by user",
         };
         let body = outcome
             .final_text
@@ -491,6 +502,13 @@ impl Tool for TaskTool {
                 }
             },
         };
+        let ok = matches!(stop_kind, crate::agent::StopReason::Done);
+        let detail = format!("{} step(s), {stop}{json_tag}", outcome.iters);
+        if ok {
+            track.finish_ok(detail);
+        } else {
+            track.finish_err(detail);
+        }
         Ok(format!("[task: {header_label}, {} step(s), {stop}{json_tag}]\n{body}", outcome.iters))
     }
 }
@@ -527,9 +545,20 @@ impl TaskTool {
 /// but they do not mutate repository/workspace state and remain parallel-safe. Repository metadata
 /// writers such as `checkpoint` are excluded from the read-only base entirely.
 pub(crate) fn dispatch_is_read_only(r: &crate::agent::tools::ToolRegistry) -> bool {
+    // Includes symbolic-edit tools granted to coder/specialist sub-agents (see
+    // `register_subagent_lsp`). Missing them here would mis-classify a writer as read-only and let
+    // two symbol_replace dispatches race in parallel.
     const WRITERS: &[&str] = &[
-        "file_edit", "multi_edit", "file_write", "file_move", "shell_run", "skill_save", "checkpoint",
+        "file_edit",
+        "multi_edit",
+        "file_write",
+        "file_move",
+        "shell_run",
+        "skill_save",
+        "checkpoint",
         "checkpoint_rewind",
+        "symbol_replace",
+        "symbol_insert",
     ];
     WRITERS.iter().all(|w| r.get(w).is_none())
 }
@@ -540,7 +569,17 @@ static ACTIVE_SUBAGENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 
 /// The concurrent sub-agent cap: `max_parallel_subagents` config, default 3, clamped 1..=5.
 fn max_parallel_subagents() -> usize {
+    max_parallel_subagents_pub()
+}
+
+/// Public read of the concurrent sub-agent cap (for `/workflows` status).
+pub(crate) fn max_parallel_subagents_pub() -> usize {
     crate::core::cli_config::load().max_parallel_subagents.unwrap_or(3).clamp(1, 5)
+}
+
+/// How many sub-agent slots are currently held (process-global gate).
+pub(crate) fn active_subagents() -> usize {
+    ACTIVE_SUBAGENTS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// RAII slot in the sub-agent gate — releases on drop (incl. panic/early-return paths).
@@ -681,22 +720,48 @@ mod tests {
         assert!(coder.get("file_edit").is_some(), "coder can edit");
         assert!(coder.get("shell_run").is_some(), "coder can shell");
         assert!(coder.get("task").is_none(), "NO recursion: sub-registry excludes task");
+        // Symbolic edit rides coder write scope when LSP is enabled (default ON).
+        if crate::agent::lsp::LSP.is_enabled() {
+            assert!(coder.get("symbol_replace").is_some(), "coder gets symbol_replace");
+            assert!(coder.get("lsp_definition").is_some(), "coder gets LSP nav");
+        }
 
         let planner = crate::agent::builtin::role_registry("planner", &root);
         assert!(planner.get("file_read").is_some(), "planner can read");
         assert!(planner.get("file_edit").is_none(), "planner is read-only");
         assert!(planner.get("shell_run").is_none(), "planner has no shell");
         assert!(planner.get("task").is_none());
+        assert!(planner.get("symbol_replace").is_none(), "planner must NOT get symbolic edit");
+        if crate::agent::lsp::LSP.is_enabled() {
+            assert!(planner.get("lsp_definition").is_some(), "planner still gets LSP nav");
+        }
 
         let reviewer = crate::agent::builtin::role_registry("reviewer", &root);
         assert!(reviewer.get("file_edit").is_none() && reviewer.get("shell_run").is_none());
+        assert!(reviewer.get("symbol_replace").is_none());
 
         let tester = crate::agent::builtin::role_registry("tester", &root);
         assert!(tester.get("shell_run").is_some(), "tester can run tests");
         assert!(tester.get("file_edit").is_none(), "tester cannot edit");
+        assert!(tester.get("symbol_replace").is_none(), "tester no symbolic edit");
 
         let unknown = crate::agent::builtin::role_registry("weird", &root);
         assert!(unknown.get("file_edit").is_none(), "unknown role → conservative read-only");
+    }
+
+    #[test]
+    fn dispatch_is_read_only_counts_symbolic_edit_as_write() {
+        // A registry that only has symbol_replace must still count as a writer so two such
+        // dispatches stay serial (parallel symbol_replace races the same files).
+        let root = std::env::temp_dir();
+        let mut r = crate::agent::tools::ToolRegistry::new();
+        if crate::agent::lsp::LSP.is_enabled() {
+            r.register(Box::new(crate::agent::lsp::tools::SymbolReplace::new(root.clone())));
+            assert!(!dispatch_is_read_only(&r), "symbol_replace alone ⇒ writer");
+        }
+        // Empty registry remains read-only.
+        let empty = crate::agent::tools::ToolRegistry::new();
+        assert!(dispatch_is_read_only(&empty));
     }
 
     #[test]
@@ -754,9 +819,15 @@ mod tests {
 
     #[test]
     fn subagent_gate_caps_reserves_and_releases() {
-        // ONE test for the whole gate: both `try_acquire` and `acquire_up_to` mutate the same
-        // process-global counter, so they must be exercised in a single test (cargo runs #[test]
-        // fns concurrently — two tests asserting exact counts on a shared atomic would race).
+        // Process-global counter — serialize against any other test that might touch ACTIVE_SUBAGENTS.
+        // (Default cargo --test-threads>1 races two gate tests on the same atomic.)
+        static GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Drain any leftover slots from a panicked sibling test so this assertion is hermetic.
+        while ACTIVE_SUBAGENTS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            ACTIVE_SUBAGENTS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
 
         // try_acquire: default cap is 3 — three slots acquire, the fourth refuses, a drop frees one.
         let a = SubagentSlot::try_acquire().expect("slot 1");
@@ -781,6 +852,7 @@ mod tests {
         drop(again);
         let one = SubagentSlot::acquire_up_to(1);
         assert_eq!(one.len(), 1, "asking for fewer than the cap yields exactly that many");
+        drop(one);
     }
 
     #[test]

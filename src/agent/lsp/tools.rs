@@ -3,8 +3,8 @@
 //! failure (LSP off, server not installed, no project, timeout) returns a clean message string so
 //! the agent degrades to text search rather than aborting the turn.
 
-use crate::agent::lsp::LSP;
-use crate::agent::tools::Tool;
+use crate::agent::lsp::{InsertWhere, LSP};
+use crate::agent::tools::{Tool, WorkspaceEffect};
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -287,5 +287,207 @@ impl Tool for LspDiagnostics {
         let file = req_str(args, "file")?;
         let path = crate::agent::builtin::confine(&self.root, file, true)?;
         LSP.diagnostics(&path)
+    }
+}
+
+/// `symbol_replace` — rewrite an entire named symbol body via the language-server outline range.
+/// Serena-style: one call replaces a function/type/method without dumping the file or thrashing
+/// `old_string`. Destructive (writes disk); arms the post-edit verify gate + LSP fold.
+pub struct SymbolReplace {
+    root: PathBuf,
+}
+
+impl SymbolReplace {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+impl Tool for SymbolReplace {
+    fn name(&self) -> &str {
+        "symbol_replace"
+    }
+
+    fn description(&self) -> &str {
+        "Replace the FULL body of a named symbol (function / type / method / const / …) using the \
+         language server's outline range — no old_string, no whole-file rewrite. Prefer this over \
+         file_edit when changing an entire item. Pass the complete new body (signature + body). \
+         Optional `file` disambiguates same-named symbols. Destructive; returns a before→after \
+         preview plus any new LSP diagnostics."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "exact symbol name whose full body to replace"
+                },
+                "new_body": {
+                    "type": "string",
+                    "description": "complete new source for the symbol (including signature/header)"
+                },
+                "file": {
+                    "type": "string",
+                    "description": "optional: file containing the symbol (disambiguates same names)"
+                }
+            },
+            "required": ["symbol", "new_body"]
+        })
+    }
+
+    fn is_destructive(&self) -> bool {
+        true
+    }
+
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
+
+    fn workspace_effect(&self, _args: &Value) -> WorkspaceEffect {
+        WorkspaceEffect::Paths
+    }
+
+    fn execute(&self, args: &Value) -> Result<String> {
+        use crate::agent::builtin::{atomic_write, NOOP_WRITE_PREFIX};
+        let symbol = req_str(args, "symbol")?;
+        let new_body = req_str(args, "new_body")?;
+        let anchor = anchor_from(&self.root, args)?;
+        let plan = LSP.replace_symbol(&anchor, symbol, new_body)?;
+        let old = std::fs::read_to_string(&plan.path)
+            .map_err(|e| anyhow!("reading {}: {e}", plan.path.display()))?;
+        if plan.new_content == old {
+            let rel = plan.path.strip_prefix(&self.root).unwrap_or(&plan.path);
+            return Ok(format!(
+                "{NOOP_WRITE_PREFIX}: {} unchanged (symbol body identical)",
+                rel.display()
+            ));
+        }
+        atomic_write(&plan.path, plan.new_content.as_bytes())
+            .map_err(|e| anyhow!("writing {}: {e}", plan.path.display()))?;
+        let rel = plan.path.strip_prefix(&self.root).unwrap_or(&plan.path);
+        let preview_old: String = plan.old_body.chars().take(400).collect();
+        let preview_new: String = new_body.chars().take(400).collect();
+        let mut out = format!(
+            "replaced symbol '{}' in {} (lines {}-{})\n--- before ---\n{}\n--- after ---\n{}",
+            plan.symbol,
+            rel.display(),
+            plan.start_line + 1,
+            plan.end_line + 1,
+            preview_old,
+            preview_new,
+        );
+        if let Some(fb) = LSP.edit_feedback(&plan.path) {
+            out.push('\n');
+            out.push_str(&fb);
+        }
+        Ok(out)
+    }
+}
+
+/// `symbol_insert` — insert text immediately before or after a named symbol's full range.
+pub struct SymbolInsert {
+    root: PathBuf,
+}
+
+impl SymbolInsert {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+impl Tool for SymbolInsert {
+    fn name(&self) -> &str {
+        "symbol_insert"
+    }
+
+    fn description(&self) -> &str {
+        "Insert source text immediately before or after a named symbol (function / type / method …) \
+         using the language-server outline range. Use for adding a helper next to an existing item, \
+         a method after another method, or a use/import near a type — without reading the whole file \
+         or hunting line numbers. `where` is `before` or `after` (default `after`). Destructive."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "anchor symbol name (insert relative to its full body range)"
+                },
+                "text": {
+                    "type": "string",
+                    "description": "source text to insert (one or more lines)"
+                },
+                "where": {
+                    "type": "string",
+                    "description": "\"before\" or \"after\" the symbol (default \"after\")"
+                },
+                "file": {
+                    "type": "string",
+                    "description": "optional: file containing the symbol (disambiguates same names)"
+                }
+            },
+            "required": ["symbol", "text"]
+        })
+    }
+
+    fn is_destructive(&self) -> bool {
+        true
+    }
+
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
+
+    fn workspace_effect(&self, _args: &Value) -> WorkspaceEffect {
+        WorkspaceEffect::Paths
+    }
+
+    fn execute(&self, args: &Value) -> Result<String> {
+        use crate::agent::builtin::atomic_write;
+        let symbol = req_str(args, "symbol")?;
+        let text = req_str(args, "text")?;
+        let where_raw = args
+            .get("where")
+            .and_then(|v| v.as_str())
+            .unwrap_or("after")
+            .trim()
+            .to_ascii_lowercase();
+        let where_ = match where_raw.as_str() {
+            "before" | "pre" | "above" => InsertWhere::Before,
+            "after" | "post" | "below" | "" => InsertWhere::After,
+            other => {
+                return Err(anyhow!(
+                    "invalid `where` '{other}' — use \"before\" or \"after\""
+                ))
+            }
+        };
+        let anchor = anchor_from(&self.root, args)?;
+        let plan = LSP.insert_at_symbol(&anchor, symbol, where_, text)?;
+        atomic_write(&plan.path, plan.new_content.as_bytes())
+            .map_err(|e| anyhow!("writing {}: {e}", plan.path.display()))?;
+        let rel = plan.path.strip_prefix(&self.root).unwrap_or(&plan.path);
+        let side = match where_ {
+            InsertWhere::Before => "before",
+            InsertWhere::After => "after",
+        };
+        let preview: String = text.chars().take(400).collect();
+        let mut out = format!(
+            "inserted {side} '{}' in {} (at line {})\n{}",
+            plan.symbol,
+            rel.display(),
+            plan.start_line + 1,
+            preview
+        );
+        if let Some(fb) = LSP.edit_feedback(&plan.path) {
+            out.push('\n');
+            out.push_str(&fb);
+        }
+        Ok(out)
     }
 }

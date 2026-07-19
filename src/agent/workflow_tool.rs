@@ -17,7 +17,9 @@
 //! Depth 0 only, like `task`. The tool itself is not concurrency-safe — it IS the parallelism.
 
 use crate::agent::tools::Tool;
-use crate::agent::workflow::{run_workflow_collect, Synthesis, WorkflowSpec, WorkflowTask};
+use crate::agent::workflow::{
+    enforce_singular_writer, run_workflow_collect, task_is_writer, Synthesis, WorkflowSpec, WorkflowTask,
+};
 use anyhow::{bail, Result};
 use serde_json::Value;
 
@@ -52,24 +54,6 @@ fn refuter_prompt(finding: &str) -> String {
     )
 }
 
-/// Does this task resolve to a WRITE-capable sub-agent? Mirrors the runner's resolution
-/// (`run_one_task`): a named `agent` supersedes `role`, and its capability is whether the resolved
-/// registry grants any workspace-write tool. The write tool NAMES present don't depend on the root
-/// the registry is built at, so a placeholder root is fine here. An unresolvable slug falls back to
-/// coder (write) scope at run time, so it counts as a writer. Without an agent, the write roles are
-/// `coder` and `tester` (tester runs `shell_run`).
-fn task_is_writer(role: &str, agent: Option<&str>) -> bool {
-    if let Some(slug) = agent.map(str::trim).filter(|s| !s.is_empty()) {
-        return match crate::agents::load(slug) {
-            Some(def) => !crate::agent::task_tool::dispatch_is_read_only(
-                &crate::agent::builtin::agent_registry(&def, std::path::Path::new(".")),
-            ),
-            None => true, // unresolvable slug → runner uses coder scope → treat as a writer
-        };
-    }
-    matches!(role, "coder" | "tester")
-}
-
 /// Build the spec for one call. Pure for role-only tasks; a task naming an `agent` resolves that
 /// specialist from disk to classify its write-capability (see [`task_is_writer`]).
 pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
@@ -88,7 +72,11 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
             for (i, t) in tasks_in.iter().enumerate() {
                 let role = t.get("role").and_then(|v| v.as_str()).unwrap_or("coder").to_string();
                 tasks.push(WorkflowTask {
-                    id: t.get("id").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("t{}", i + 1)),
+                    id: t
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("t{}", i + 1)),
                     role,
                     agent: t.get("agent").and_then(|v| v.as_str()).map(str::to_string),
                     prompt: t
@@ -100,22 +88,23 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                     model: t.get("model").and_then(|v| v.as_str()).map(str::to_string),
                 });
             }
-            // Singular-writer invariant: at most ONE write-capable task may fan out — parallel
-            // writers race file edits and the build lock. Capability is resolved the SAME way the
-            // runner (`run_one_task`) resolves it: a named specialist `agent` supersedes `role`, so
-            // a write-scoped agent counts as a writer even when its `role` label says "reviewer"
-            // (counting the label alone let that case race a real coder). Read-only roles and
-            // read-only specialists fan out freely.
-            let writers = tasks.iter().filter(|t| task_is_writer(&t.role, t.agent.as_deref())).count();
-            if writers > 1 {
-                bail!("at most ONE write-capable task per workflow call (a coder/tester role or a write-scoped agent) — parallel writers race edits; keep the write singular and fan out the reads");
-            }
+            // Singular-writer invariant — shared with CLI `run_workflow` via
+            // `workflow::enforce_singular_writer` so the two paths cannot drift.
             let synthesis = args
                 .get("synthesis")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
-                .map(|p| Synthesis { model: None, prompt: Some(p.to_string()) });
-            Ok((WorkflowSpec { name: "fanout".into(), tasks, synthesis }, true))
+                .map(|p| Synthesis {
+                    model: None,
+                    prompt: Some(p.to_string()),
+                });
+            let spec = WorkflowSpec {
+                name: "fanout".into(),
+                tasks,
+                synthesis,
+            };
+            enforce_singular_writer(&spec)?;
+            Ok((spec, true))
         }
         "verify" => {
             let findings = args
@@ -142,7 +131,14 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                 bail!("verify mode: 'findings' must be strings");
             }
             // No synthesis: per-finding verdicts return raw (a merge would launder the evidence).
-            Ok((WorkflowSpec { name: "verify".into(), tasks, synthesis: None }, false))
+            Ok((
+                WorkflowSpec {
+                    name: "verify".into(),
+                    tasks,
+                    synthesis: None,
+                },
+                false,
+            ))
         }
         other => bail!("unknown workflow mode '{other}' (use fanout or verify)"),
     }

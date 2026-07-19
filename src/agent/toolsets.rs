@@ -82,7 +82,7 @@ pub const CATALOG: &[ToolsetInfo] = &[
     ToolsetInfo {
         id: "lsp",
         label: "lsp",
-        blurb: "references, definition, symbols, diagnostics, repo_map",
+        blurb: "references, definition, symbols, diagnostics, symbol_replace/insert, repo_map",
     },
     ToolsetInfo {
         id: "browser",
@@ -119,6 +119,8 @@ pub fn classify_tool(name: &str) -> Option<&'static str> {
         | "lsp_document_symbols"
         | "lsp_workspace_symbol"
         | "lsp_diagnostics"
+        | "symbol_replace"
+        | "symbol_insert"
         | "repo_map" => Some("lsp"),
         "browser_navigate"
         | "browser_snapshot"
@@ -249,6 +251,10 @@ mod tests {
         assert_eq!(classify_tool("web_search"), Some("web"));
         assert_eq!(classify_tool("task"), Some("delegation"));
         assert_eq!(classify_tool("mcp_github_issues"), Some("mcp"));
+        assert_eq!(classify_tool("lsp_references"), Some("lsp"));
+        assert_eq!(classify_tool("symbol_replace"), Some("lsp"));
+        assert_eq!(classify_tool("symbol_insert"), Some("lsp"));
+        assert_eq!(classify_tool("repo_map"), Some("lsp"));
     }
 
     #[test]

@@ -49,6 +49,7 @@ pub const SLASH: &[(&str, &str)] = &[
     ("help", "commands & tips"),
     ("model", "list + pick the model"),
     ("sessions", "saved chats — restore / save / delete"),
+    ("workflows", "multi-agent status — live tasks & fan-outs"),
     ("timeline", "checkpoint timeline (glance) · pick to restore"),
     ("checkpoint", "save a code restore point"),
     ("compact", "compress context to free tokens"),

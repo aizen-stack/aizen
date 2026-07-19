@@ -1427,6 +1427,7 @@ async fn run_serve_turn(
     }
     history.push(Message::user(task.to_string()));
 
+    arm_lsp_session();
     let registry = agent::builtin::default_registry_with_task(
         http.clone(),
         base_url.to_string(),
@@ -1440,6 +1441,7 @@ async fn run_serve_turn(
         quiet: true,
         enable_verify_gate: false,
         context_window: resolve_ctx_window(model).0,
+        enable_lsp: crate::agent::lsp::LSP.is_enabled(),
         ..Default::default()
     };
     let http_ref = http;
@@ -3405,7 +3407,10 @@ fn status_text(history: &[Message], model: &str) -> String {
         .map(|p| format!("  ·  🎭 {p}"))
         .unwrap_or_default();
     let todos = crate::agent::todo::status_summary().map(|s| format!("  ·  {s}")).unwrap_or_default();
-    format!("{model}{persona}{mode}{todos}")
+    let agents = crate::agent::orchestration::hud_chip()
+        .map(|s| format!("  ·  {s}"))
+        .unwrap_or_default();
+    format!("{model}{persona}{mode}{todos}{agents}")
 }
 
 /// The summarizer endpoint: `roles.summarizer` routing (env > config > main endpoint). Chore
@@ -3565,6 +3570,8 @@ async fn run_menu_sticky() -> Result<()> {
                     history.push(Message::user_with_images(line, images));
                 }
                 let persona_before = cli_config::load().persona;
+                // Arm LSP BEFORE building the registry — tools only register while enabled.
+                arm_lsp_session();
                 let registry = match agent::builtin::default_registry_with_task(
                     http.clone(),
                     base_url.clone(),
@@ -3584,18 +3591,10 @@ async fn run_menu_sticky() -> Result<()> {
                     approval_mode: approval_mode(),
                     context_window: resolve_ctx_window(&model).0,
                     enable_self_review: cli_config::load().self_review.unwrap_or(false),
+                    // Reflect the live manager state (honors `/lsp off` for this turn).
+                    enable_lsp: crate::agent::lsp::LSP.is_enabled(),
                     ..AgentConfig::default()
                 };
-                // Bridge LSP config → the manager (per-request timeout; auto-enable if configured).
-                // Control is normally via `/lsp on|off`; `enable_lsp` is the config/flag path.
-                crate::agent::lsp::LSP.set_request_timeout(cfg.lsp_request_timeout_secs);
-                crate::agent::lsp::LSP
-                    .set_edit_feedback(cli_config::load().lsp_edit_diagnostics.unwrap_or(true));
-                crate::agent::lsp::LSP
-                    .set_edit_feedback(cli_config::load().lsp_edit_diagnostics.unwrap_or(true));
-                if cfg.enable_lsp {
-                    let _ = crate::agent::lsp::LSP.enable();
-                }
 
                 tui::clear_cancel(); // fresh turn → forget any Esc from a previous one
                 while input.cancel.try_recv().is_ok() {} // drain any stale cancel
@@ -3849,6 +3848,7 @@ async fn run_menu_plain() -> Result<()> {
         // Snapshot the active persona so we can detect an in-turn switch (the `persona_create` tool)
         // and resync the system prompt at the turn boundary — prefix-cache safe, takes effect next msg.
         let persona_before = cli_config::load().persona;
+        arm_lsp_session();
         let registry = match agent::builtin::default_registry_with_task(
             http.clone(),
             base_url.clone(),
@@ -3869,6 +3869,7 @@ async fn run_menu_plain() -> Result<()> {
             approval_mode: approval_mode(),
             context_window: resolve_ctx_window(&model).0,
             enable_self_review: cli_config::load().self_review.unwrap_or(false),
+            enable_lsp: crate::agent::lsp::LSP.is_enabled(),
             ..AgentConfig::default()
         };
         let http_ref = &http;
@@ -4858,6 +4859,21 @@ fn approval_mode() -> ApprovalMode {
     cli_config::approval_mode()
 }
 
+/// Arm the LSP manager once per process (default ON, lazy spawn). Safe to call every turn:
+/// - first call enables the runtime (no language server process until a query needs one);
+/// - later calls are no-ops, so a mid-session `/lsp off` stays off until the user runs `/lsp on`.
+/// Always refreshes request timeout + edit-feedback from config.
+fn arm_lsp_session() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    crate::agent::lsp::LSP.set_request_timeout(AgentConfig::default().lsp_request_timeout_secs);
+    crate::agent::lsp::LSP
+        .set_edit_feedback(cli_config::load().lsp_edit_diagnostics.unwrap_or(true));
+    if !ARMED.swap(true, Ordering::Relaxed) {
+        let _ = crate::agent::lsp::LSP.enable();
+    }
+}
+
 /// Whether an active persona evolves (records episodes + reflects). `None` ⇒ default ON.
 fn persona_evolve_enabled() -> bool {
     cli_config::load().persona_evolve.unwrap_or(true)
@@ -5022,6 +5038,7 @@ const SLASH_CMDS: &[(&str, &str)] = &[
     ("mcp", "MCP servers from ~/.aizen/mcp.json (+ a trusted repo's ./.aizen/mcp.json) — list connected tools"),
     ("telegram", "Telegram integration menu (setup · test · status · daemon)"),
     ("sessions", "saved conversations — restore · save · delete (auto-saves as you go)"),
+    ("workflows", "multi-agent status — live task/workflow children + slot gate"),
     ("timeline", "show the checkpoint timeline; /timeline pick to restore (git snapshots)"),
     ("checkpoint", "save a restore point of the code now"),
     ("compact", "summarize older turns to free context now"),
@@ -5071,10 +5088,11 @@ Commands:
   /mcp               MCP servers from ~/.aizen/mcp.json — list connected tools
   /telegram          Telegram integration menu (setup · test · status · start daemon · disable)
   /sessions          saved conversations — restore · save · delete (auto-saves as you go)
+  /workflows         multi-agent status — live task/workflow children, sub-agent slots (also /wf)
   /timeline          show the checkpoint timeline (▸ = current); /timeline pick to restore · also /undo · /redo
   /checkpoint [note] save a restore point of the working tree now
   /compact           summarize older turns to free context now
-  /lsp [on|off|status|restart]  type-aware navigation + diagnostics via a language server (rust-analyzer · pyright · typescript-language-server); default OFF, servers start lazily
+  /lsp [on|off|status|restart]  type-aware navigation + symbol_replace/insert + diagnostics via a language server (rust-analyzer · pyright · typescript-language-server); default ON (lazy spawn), /lsp off reclaims RAM
   /reach [doctor|status]  web-access channels: live-probe every backend (doctor) or show what served this session (status); web_fetch/web_search route through these
   /approval [ask|smart|yolo]  approval level — ask every time, auto-run read-only, or pre-authorize
   /ultimate          toggle ultimate mode — max reasoning effort + prefer launching workflows (aizen's ultracode)
@@ -5122,6 +5140,10 @@ async fn slash_tools(_arg: &str) {
     tui::emit_line(&agent::toolsets::format_config_status());
 }
 
+async fn slash_workflows(_arg: &str) {
+    tui::emit_line(&agent::orchestration::format_status());
+}
+
 async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut String) -> SlashOutcome {
     let mut parts = input.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("").trim();
@@ -5149,6 +5171,7 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                 eprintln!("{} {e}", style("sessions:").red());
             }
         }
+        "workflows" | "workflow" | "wf" | "agents-status" => slash_workflows(arg).await,
         "compact" => {
             // Harvest what the older turns touched BEFORE they collapse — once summarized their tool
             // calls are gone, so the tree must read the history while it's still whole.
@@ -5188,7 +5211,7 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                 "" | "status" | "st" => tui::emit_line(&LSP.status().render()),
                 "on" | "enable" => match LSP.enable() {
                     Ok(_) => tui::emit_line(
-                        &style("LSP on — references · definition · symbols · diagnostics (rust/python/js-ts; servers start lazily on first use; rust-analyzer can use ~1–3GB RAM). /lsp off to stop.")
+                        &style("LSP on — references · definition · symbols · symbol_replace/insert · diagnostics (rust/python/js-ts; servers start lazily on first use; rust-analyzer can use ~1–3GB RAM). /lsp off to stop.")
                             .color256(splash::ACCENT).to_string(),
                     ),
                     Err(e) => tui::emit_line(&format!("{} {e}", style("lsp:").red())),
@@ -6712,6 +6735,7 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
     // Registry includes the `task` sub-agent tool (depth 0); a spawned sub-agent uses a
     // role-scoped registry WITHOUT `task` (no recursion).
     let cli_approval = if args.yes { ApprovalMode::Yolo } else { ApprovalMode::Ask };
+    arm_lsp_session();
     let registry = agent::builtin::default_registry_with_task(
         http.clone(),
         base_url.clone(),
@@ -6726,6 +6750,7 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         auto_extend_to: max.saturating_mul(2),
         approval_mode: cli_approval,
         context_window: resolve_ctx_window(&model).0,
+        enable_lsp: crate::agent::lsp::LSP.is_enabled(),
         ..Default::default()
     };
 
@@ -6767,6 +6792,10 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         // surface the question and exit rather than hang. Re-run in the REPL to answer it.
         StopReason::AwaitingInput(q) => eprintln!(
             "\n[the agent needs clarification — re-run interactively (`aizen`) to answer]\n❓ {q}"
+        ),
+        StopReason::Cancelled => eprintln!(
+            "\n[stopped: cancelled by user after {} step(s)]",
+            outcome.iters
         ),
     }
     Ok(())

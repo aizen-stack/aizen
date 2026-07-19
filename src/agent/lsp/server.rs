@@ -94,6 +94,25 @@ pub struct DocSym {
     pub depth: usize,
 }
 
+/// Resolved full body of a named symbol (for symbolic edit / token-lean replace).
+/// Line numbers are 0-based inclusive, matching LSP `DocumentSymbol.range` after line-rounding.
+#[derive(Debug, Clone)]
+pub struct SymBody {
+    pub path: PathBuf,
+    pub name: String,
+    pub kind: &'static str,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub text: String,
+}
+
+/// Where to place text relative to a symbol's full range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertWhere {
+    Before,
+    After,
+}
+
 /// One project-wide symbol-search hit (`line` is `None` for lazy server entries that carry only a
 /// file, no position).
 #[derive(Debug, Clone)]
@@ -513,6 +532,94 @@ impl LspServer {
         Ok(out)
     }
 
+    /// Resolve a named symbol to its full body text (definition file + inclusive line range).
+    /// Prefer this over `file_read` when the agent only needs one item — much cheaper tokens.
+    pub async fn symbol_body(&self, file_hint: Option<&Path>, symbol: &str) -> Result<SymBody> {
+        let chosen = self.find_symbol(symbol, file_hint).await?;
+        let target = uri::uri_to_path(chosen.uri.as_str())?;
+        self.ensure_open(&target).await?;
+        let full_range = self.outline_range_at(&chosen).await.unwrap_or(chosen.range);
+        let kind = self
+            .outline_kind_at(&chosen)
+            .await
+            .unwrap_or("symbol");
+        let text = tokio::fs::read_to_string(&target)
+            .await
+            .with_context(|| format!("reading {}", target.display()))?;
+        let (start_line, end_line) = line_span(&full_range);
+        let body = slice_lines_inclusive(&text, start_line, end_line);
+        Ok(SymBody {
+            path: target,
+            name: chosen.name,
+            kind,
+            start_line,
+            end_line,
+            text: body,
+        })
+    }
+
+    /// Replace the full body of a named symbol with `new_body`. Returns (path, start, end, old, new).
+    /// Line-based (whole symbol range from the document outline) so UTF-16 LSP columns never bite.
+    pub async fn replace_symbol_body(
+        &self,
+        file_hint: Option<&Path>,
+        symbol: &str,
+        new_body: &str,
+    ) -> Result<(PathBuf, usize, usize, String, String)> {
+        let body = self.symbol_body(file_hint, symbol).await?;
+        let content = tokio::fs::read_to_string(&body.path)
+            .await
+            .with_context(|| format!("reading {}", body.path.display()))?;
+        let new_text = replace_line_span(&content, body.start_line, body.end_line, new_body);
+        Ok((body.path, body.start_line, body.end_line, body.text, new_text))
+    }
+
+    /// Insert `text` immediately before or after a named symbol's full range.
+    pub async fn insert_relative_to_symbol(
+        &self,
+        file_hint: Option<&Path>,
+        symbol: &str,
+        where_: InsertWhere,
+        text: &str,
+    ) -> Result<(PathBuf, usize, String)> {
+        let body = self.symbol_body(file_hint, symbol).await?;
+        let content = tokio::fs::read_to_string(&body.path)
+            .await
+            .with_context(|| format!("reading {}", body.path.display()))?;
+        let new_text = insert_relative_line_span(
+            &content,
+            body.start_line,
+            body.end_line,
+            where_,
+            text,
+        );
+        let at = match where_ {
+            InsertWhere::Before => body.start_line,
+            InsertWhere::After => body.end_line.saturating_add(1),
+        };
+        Ok((body.path, at, new_text))
+    }
+
+    /// Kind label for the outline item enclosing `chosen` (best-effort).
+    async fn outline_kind_at(&self, chosen: &SymHit) -> Option<&'static str> {
+        let mut sock = self.socket.clone();
+        let resp = sock
+            .document_symbol(DocumentSymbolParams {
+                text_document: TextDocumentIdentifier { uri: chosen.uri.clone() },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .ok()??;
+        match resp {
+            DocumentSymbolResponse::Nested(v) => find_enclosing_kind(&v, chosen.range.start),
+            DocumentSymbolResponse::Flat(v) => v
+                .into_iter()
+                .find(|si| si.name == chosen.name && range_contains(&si.location.range, chosen.range.start))
+                .map(|si| kind_label(si.kind)),
+        }
+    }
+
     /// Project-wide fuzzy symbol search by name. Deduplicated — servers can return the same
     /// definition through multiple index routes (rust-analyzer does).
     pub async fn workspace_symbols(&self, query: &str) -> Result<Vec<WsSym>> {
@@ -748,6 +855,112 @@ fn find_enclosing(nodes: &[DocumentSymbol], pos: Position) -> Option<Range> {
     None
 }
 
+/// Same walk as [`find_enclosing`], but returns the kind label of the deepest hit.
+fn find_enclosing_kind(nodes: &[DocumentSymbol], pos: Position) -> Option<&'static str> {
+    for n in nodes {
+        if range_contains(&n.selection_range, pos) {
+            return Some(kind_label(n.kind));
+        }
+        if range_contains(&n.range, pos) {
+            if let Some(children) = &n.children {
+                if let Some(k) = find_enclosing_kind(children, pos) {
+                    return Some(k);
+                }
+            }
+            return Some(kind_label(n.kind));
+        }
+    }
+    None
+}
+
+/// Inclusive 0-based line span of an LSP range (end column 0 still includes that line when the
+/// end character is > 0; if end is at col 0 of a later line, that line is excluded — standard
+/// half-open end semantics reduced to whole lines for text surgery).
+fn line_span(range: &Range) -> (usize, usize) {
+    let start = range.start.line as usize;
+    let end = if range.end.character == 0 && range.end.line > range.start.line {
+        (range.end.line as usize).saturating_sub(1)
+    } else {
+        range.end.line as usize
+    };
+    (start, end.max(start))
+}
+
+/// All lines `first..=last` (0-based inclusive) joined with `\n` — no cap (used for edits).
+fn slice_lines_inclusive(text: &str, first: usize, last: usize) -> String {
+    text.lines()
+        .skip(first)
+        .take(last.saturating_sub(first) + 1)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Replace lines `start..=end` (0-based inclusive) with `new_body`. Preserves the file's EOL
+/// style (CRLF if the original used it) and a trailing newline if the original had one.
+fn replace_line_span(content: &str, start: usize, end: usize, new_body: &str) -> String {
+    let crlf = content.contains("\r\n");
+    let had_trailing_nl = content.ends_with('\n');
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return join_lines(
+            &new_body.lines().map(|s| s.to_string()).collect::<Vec<_>>(),
+            crlf,
+            had_trailing_nl || !new_body.is_empty(),
+        );
+    }
+    let start = start.min(lines.len() - 1);
+    let end = end.min(lines.len() - 1).max(start);
+    let mut owned: Vec<String> = lines[..start].iter().map(|s| (*s).to_string()).collect();
+    if !new_body.is_empty() {
+        owned.extend(new_body.lines().map(|s| s.to_string()));
+    }
+    if end + 1 < lines.len() {
+        owned.extend(lines[end + 1..].iter().map(|s| (*s).to_string()));
+    }
+    join_lines(&owned, crlf, had_trailing_nl)
+}
+
+/// Insert `text` as new lines immediately before `start` or after `end` (0-based inclusive).
+fn insert_relative_line_span(
+    content: &str,
+    start: usize,
+    end: usize,
+    where_: InsertWhere,
+    text: &str,
+) -> String {
+    let crlf = content.contains("\r\n");
+    let had_trailing_nl = content.ends_with('\n');
+    let lines: Vec<&str> = content.lines().collect();
+    let start = start.min(lines.len());
+    let end = if lines.is_empty() {
+        0
+    } else {
+        end.min(lines.len() - 1)
+    };
+    let insert_at = match where_ {
+        InsertWhere::Before => start,
+        InsertWhere::After => end.saturating_add(1).min(lines.len()),
+    };
+    let new_lines: Vec<String> = if text.is_empty() {
+        Vec::new()
+    } else {
+        text.lines().map(|s| s.to_string()).collect()
+    };
+    let mut owned: Vec<String> = lines[..insert_at].iter().map(|s| (*s).to_string()).collect();
+    owned.extend(new_lines);
+    owned.extend(lines[insert_at..].iter().map(|s| (*s).to_string()));
+    join_lines(&owned, crlf, had_trailing_nl)
+}
+
+fn join_lines(lines: &[String], crlf: bool, trailing_nl: bool) -> String {
+    let sep = if crlf { "\r\n" } else { "\n" };
+    let mut s = lines.join(sep);
+    if trailing_nl && !s.ends_with('\n') {
+        s.push_str(sep);
+    }
+    s
+}
+
 /// Flatten a nested outline into display rows, depth-first (document order preserved).
 fn collect_outline(nodes: &[DocumentSymbol], depth: usize, out: &mut Vec<DocSym>) {
     for n in nodes {
@@ -941,6 +1154,42 @@ mod tests {
         assert_eq!(slice_lines(text, 1, 3, 100), ("b\nc\nd".to_string(), false));
         assert_eq!(slice_lines(text, 1, 4, 2), ("b\nc".to_string(), true), "cap cuts");
         assert_eq!(slice_lines(text, 4, 9, 100), ("e".to_string(), false), "EOF-tolerant");
+    }
+
+    #[test]
+    fn line_span_half_open_end() {
+        // end at col 0 of line 5 → lines 2..=4
+        assert_eq!(line_span(&range(2, 0, 5, 0)), (2, 4));
+        // end mid-line 5 → include line 5
+        assert_eq!(line_span(&range(2, 0, 5, 3)), (2, 5));
+        // single-line name range
+        assert_eq!(line_span(&range(3, 4, 3, 10)), (3, 3));
+    }
+
+    #[test]
+    fn replace_line_span_middle() {
+        let content = "a\nb\nc\nd\ne\n";
+        let out = replace_line_span(content, 1, 3, "X\nY");
+        assert_eq!(out, "a\nX\nY\ne\n");
+    }
+
+    #[test]
+    fn replace_line_span_crlf_and_delete() {
+        let content = "a\r\nb\r\nc\r\n";
+        let out = replace_line_span(content, 1, 1, "BB");
+        assert_eq!(out, "a\r\nBB\r\nc\r\n");
+        let deleted = replace_line_span(content, 1, 1, "");
+        assert_eq!(deleted, "a\r\nc\r\n");
+    }
+
+    #[test]
+    fn insert_before_after_symbol_span() {
+        let content = "a\nfn foo() {}\nbar\n";
+        // symbol on line 1
+        let before = insert_relative_line_span(content, 1, 1, InsertWhere::Before, "// hi");
+        assert_eq!(before, "a\n// hi\nfn foo() {}\nbar\n");
+        let after = insert_relative_line_span(content, 1, 1, InsertWhere::After, "// bye");
+        assert_eq!(after, "a\nfn foo() {}\n// bye\nbar\n");
     }
 
     #[test]

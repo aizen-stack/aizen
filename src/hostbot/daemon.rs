@@ -132,6 +132,9 @@ async fn run_serve_turn(
     }
     history.push(Message::user(task.to_string()));
 
+    // Default-ON lazy LSP (same as REPL/agent CLI) so remote coding turns get symbol tools.
+    crate::agent::lsp::LSP.set_request_timeout(AgentConfig::default().lsp_request_timeout_secs);
+    let _ = crate::agent::lsp::LSP.enable();
     let registry = agent::builtin::default_registry_with_task(
         http.clone(),
         base_url.to_string(),
@@ -145,6 +148,7 @@ async fn run_serve_turn(
         quiet: true,
         enable_verify_gate: false,
         context_window: crate::resolve_ctx_window(model).0,
+        enable_lsp: crate::agent::lsp::LSP.is_enabled(),
         ..Default::default()
     };
     let http_ref = http;

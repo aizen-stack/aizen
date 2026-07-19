@@ -27,6 +27,15 @@ use std::path::Path;
 /// Max sub-agents running at once (matches the parallel-tool cap; conservative for a CLI).
 const MAX_PARALLEL: usize = 5;
 
+/// Per-child step budget (mirrors `task` default `max_steps=15`). Workflow children are narrower
+/// than a top-level agent — keep them from burning the full 25/50 default.
+const CHILD_MAX_ITERS: usize = 15;
+/// Hard ceiling on auto-extend for a workflow child (`2 × CHILD_MAX_ITERS`, same shape as task).
+const CHILD_AUTO_EXTEND: usize = 30;
+/// Cap each child's summary before stuffing it into the synthesis prompt (chars). Prevents 5 verbose
+/// children from blowing the synth context / $$.
+const SUMMARY_CHAR_CAP: usize = 4_000;
+
 #[derive(Debug, Deserialize)]
 pub struct WorkflowSpec {
     pub name: String,
@@ -80,6 +89,12 @@ pub struct TaskOutcome {
 /// Run a workflow: fan out the tasks (bounded), then synthesize. Synthesis streams to stdout.
 /// `trace`, when set, writes a JSON record of the fan-out (per-task model + outcome + the synthesis
 /// model) — useful for auditing a mixture-of-agents run's model diversity.
+///
+/// Safety parity with the model-callable `workflow` tool:
+/// - singular-writer invariant (at most one write-capable task),
+/// - process-global `SubagentSlot` accounting,
+/// - orchestration Track for `/workflows`,
+/// - cooperative cancel observed by each child loop.
 pub async fn run_workflow(
     http: &reqwest::Client,
     base_url: &str,
@@ -89,44 +104,61 @@ pub async fn run_workflow(
     spec: &WorkflowSpec,
     trace: Option<&Path>,
 ) -> Result<()> {
-    if spec.tasks.is_empty() {
-        bail!("workflow '{}' has no tasks", spec.name);
-    }
-    // Reject blank/duplicate task ids — the synthesis cites tasks by id; blanks/collisions
-    // corrupt the merge.
-    let mut seen = std::collections::HashSet::new();
-    for t in &spec.tasks {
-        if t.id.trim().is_empty() {
-            bail!("workflow '{}' has a blank task id", spec.name);
-        }
-        if !seen.insert(t.id.as_str()) {
-            bail!("workflow '{}' has a duplicate task id '{}'", spec.name, t.id);
-        }
-    }
+    validate_spec_ids(spec)?;
+    // Same singular-writer gate as `workflow_tool::build_spec` — CLI specs used to skip it and could
+    // launch two default-role `coder`s in parallel (file/build races).
+    enforce_singular_writer(spec)?;
 
     let root = std::env::current_dir()
         .context("resolving cwd")?
         .canonicalize()
         .context("canonicalizing cwd")?;
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    // Honest width: reserve one global slot per concurrent child (shared with in-REPL `task` calls).
+    let want = MAX_PARALLEL.min(spec.tasks.len());
+    let slots = crate::agent::task_tool::SubagentSlot::acquire_up_to(want);
+    if slots.is_empty() {
+        bail!("sub-agent concurrency limit reached — retry when running tasks finish");
+    }
+    let width = slots.len();
     eprintln!(
-        "workflow '{}': {} task(s), up to {} in parallel",
+        "workflow '{}': {} task(s), up to {} in parallel (slots reserved)",
         spec.name,
         spec.tasks.len(),
-        MAX_PARALLEL.min(spec.tasks.len())
+        width
     );
 
-    // Fan out, bounded to MAX_PARALLEL via chunking. The standalone CLI runner is not under the
-    // process-global sub-agent gate (no interleaving `task` calls), so it uses the full width.
-    let results = fan_out(http, base_url, api_key, model, approval_mode, &root, &date, &spec.tasks, MAX_PARALLEL).await;
+    let wf_track = crate::agent::orchestration::start_workflow(&spec.name, spec.tasks.len());
+    let parent_id = wf_track.id();
+    let results = fan_out_tracked(
+        http,
+        base_url,
+        api_key,
+        model,
+        approval_mode,
+        &root,
+        &date,
+        &spec.tasks,
+        width,
+        Some(parent_id),
+    )
+    .await;
+    drop(slots);
 
     for r in &results {
         eprintln!("  • {} ({}/{}) — {} [{} step(s)]", r.id, r.role, r.model, r.status, r.iters);
     }
 
+    if results.iter().any(|r| r.status == "cancelled") {
+        wf_track.finish_err("cancelled");
+        bail!("workflow '{}': cancelled by user", spec.name);
+    }
+
     // If every task errored there is nothing to synthesize — don't spend a synthesis call
     // feeding the model only "error: …" strings.
     if results.iter().all(|r| r.status == "error") {
+        wf_track.finish_err("all tasks failed");
         bail!(
             "workflow '{}': all {} task(s) failed (see per-task errors above) — nothing to synthesize",
             spec.name,
@@ -160,22 +192,84 @@ pub async fn run_workflow(
         }
     }
 
+    if crate::ui::tui::cancel_requested() {
+        wf_track.finish_err("cancelled before synthesis");
+        bail!("workflow '{}': cancelled by user", spec.name);
+    }
+
+    wf_track.set_phase(crate::agent::orchestration::Phase::Synthesizing, format!("via {synth_model}"));
     eprintln!("synthesizing ({synth_model})…\n");
-    stream_chat(http, base_url, api_key, synth_model, vec![Message::user(synth_prompt)])
-        .await
-        .context("workflow synthesis failed")?;
+    match stream_chat(http, base_url, api_key, synth_model, vec![Message::user(synth_prompt)]).await {
+        Ok(_) => {
+            wf_track.finish_ok("synthesized");
+            Ok(())
+        }
+        Err(e) => {
+            wf_track.finish_err(format!("synthesis failed: {e}"));
+            Err(e).context("workflow synthesis failed")
+        }
+    }
+}
+
+/// Blank/duplicate task-id guard shared by CLI + tool paths.
+fn validate_spec_ids(spec: &WorkflowSpec) -> Result<()> {
+    if spec.tasks.is_empty() {
+        bail!("workflow '{}' has no tasks", spec.name);
+    }
+    let mut seen = std::collections::HashSet::new();
+    for t in &spec.tasks {
+        if t.id.trim().is_empty() {
+            bail!("workflow '{}' has a blank task id", spec.name);
+        }
+        if !seen.insert(t.id.as_str()) {
+            bail!("workflow '{}' has a duplicate task id '{}'", spec.name, t.id);
+        }
+    }
     Ok(())
+}
+
+/// At most ONE write-capable task per fan-out (capability resolved the same way as `run_one_task`).
+/// Public so the tool path and tests share one source of truth.
+pub(crate) fn enforce_singular_writer(spec: &WorkflowSpec) -> Result<()> {
+    let writers = spec
+        .tasks
+        .iter()
+        .filter(|t| task_is_writer(&t.role, t.agent.as_deref()))
+        .count();
+    if writers > 1 {
+        bail!(
+            "at most ONE write-capable task per workflow (a coder/tester role or a write-scoped agent) \
+             — parallel writers race edits; keep the write singular and fan out the reads"
+        );
+    }
+    Ok(())
+}
+
+/// Does this task resolve to a WRITE-capable sub-agent? Mirrors the runner's resolution
+/// (`run_one_task`): a named `agent` supersedes `role`. Unresolvable slug → coder (write) fallback.
+pub(crate) fn task_is_writer(role: &str, agent: Option<&str>) -> bool {
+    if let Some(slug) = agent.map(str::trim).filter(|s| !s.is_empty()) {
+        return match crate::agents::load(slug) {
+            Some(def) => !crate::agent::task_tool::dispatch_is_read_only(
+                &crate::agent::builtin::agent_registry(&def, std::path::Path::new(".")),
+            ),
+            None => true, // unresolvable slug → runner uses coder scope → treat as a writer
+        };
+    }
+    matches!(role, "coder" | "tester")
 }
 
 /// Fan the tasks out, bounded to `MAX_PARALLEL` via chunking — shared by the CLI runner and the
 /// model-callable `workflow` tool (see `workflow_tool.rs`).
 ///
-/// `max_parallel` bounds the chunk size: the CLI runner passes [`MAX_PARALLEL`] (standalone, no
-/// global gate), while the model-callable tool passes the number of sub-agent slots it actually
-/// reserved (`SubagentSlot::acquire_up_to`), so a fan-out never runs more concurrent children than
-/// the process-global cap allows. Clamped to `1..=MAX_PARALLEL` so a bad caller can't serialize to
-/// death or oversubscribe.
+/// `max_parallel` bounds the chunk size: both CLI and tool paths pass the number of sub-agent slots
+/// they actually reserved (`SubagentSlot::acquire_up_to`), so a fan-out never runs more concurrent
+/// children than the process-global cap allows. Clamped to `1..=MAX_PARALLEL`.
+///
+/// Cooperative cancel: if Esc is pressed mid-fan-out, remaining chunks are skipped (already-running
+/// children stop at their next loop boundary via `StopReason::Cancelled`).
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // kept as a thin public alias for external/test callers; production uses tracked
 pub(crate) async fn fan_out(
     http: &reqwest::Client,
     base_url: &str,
@@ -187,11 +281,55 @@ pub(crate) async fn fan_out(
     tasks: &[WorkflowTask],
     max_parallel: usize,
 ) -> Vec<TaskOutcome> {
+    fan_out_tracked(http, base_url, api_key, model, approval_mode, root, date, tasks, max_parallel, None).await
+}
+
+/// Like [`fan_out`], but each child is registered under optional parent id for `/workflows`.
+#[allow(clippy::too_many_arguments)]
+async fn fan_out_tracked(
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    approval_mode: crate::core::approval::ApprovalMode,
+    root: &Path,
+    date: &str,
+    tasks: &[WorkflowTask],
+    max_parallel: usize,
+    parent: Option<u64>,
+) -> Vec<TaskOutcome> {
     let width = max_parallel.clamp(1, MAX_PARALLEL);
     let mut results: Vec<TaskOutcome> = Vec::with_capacity(tasks.len());
     for chunk in tasks.chunks(width) {
-        let futs =
-            chunk.iter().map(|t| run_one_task(http, base_url, api_key, model, approval_mode, root, date, t));
+        if crate::ui::tui::cancel_requested() {
+            // Skip not-yet-started tasks; mark them cancelled so the parent doesn't synthesize junk.
+            for t in chunk {
+                results.push(TaskOutcome {
+                    id: t.id.clone(),
+                    role: t.role.clone(),
+                    model: model.to_string(),
+                    status: "cancelled".into(),
+                    summary: "cancelled by user before start".into(),
+                    iters: 0,
+                });
+            }
+            // Also mark any remaining tasks past this chunk.
+            let done = results.len();
+            for t in tasks.iter().skip(done) {
+                results.push(TaskOutcome {
+                    id: t.id.clone(),
+                    role: t.role.clone(),
+                    model: model.to_string(),
+                    status: "cancelled".into(),
+                    summary: "cancelled by user before start".into(),
+                    iters: 0,
+                });
+            }
+            break;
+        }
+        let futs = chunk
+            .iter()
+            .map(|t| run_one_task(http, base_url, api_key, model, approval_mode, root, date, t, parent));
         results.extend(futures_util::future::join_all(futs).await);
     }
     results
@@ -210,25 +348,18 @@ pub(crate) async fn run_workflow_collect(
     spec: &WorkflowSpec,
     synthesize: bool,
 ) -> Result<String> {
-    if spec.tasks.is_empty() {
-        bail!("workflow '{}' has no tasks", spec.name);
-    }
-    let mut seen = std::collections::HashSet::new();
-    for t in &spec.tasks {
-        if t.id.trim().is_empty() {
-            bail!("workflow '{}' has a blank task id", spec.name);
-        }
-        if !seen.insert(t.id.as_str()) {
-            bail!("workflow '{}' has a duplicate task id '{}'", spec.name, t.id);
-        }
-    }
+    validate_spec_ids(spec)?;
+    // Writer guard is applied in `workflow_tool::build_spec` before we get here; re-check so any
+    // future direct caller can't bypass it.
+    enforce_singular_writer(spec)?;
+
     let root = std::env::current_dir().context("resolving cwd")?.canonicalize().context("canonicalizing cwd")?;
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     // Reserve ONE global sub-agent slot per concurrent child (bounded by both the workflow's own
     // MAX_PARALLEL and the number of tasks), so a fan-out is accounted against the process-global
     // cap at its real width — not as a single slot for the whole call. The reserved slots are held
-    // in `_slots` for the duration of the fan-out and released on drop; the fan-out chunks at
-    // exactly the width we secured. An empty reservation (gate already full) is a soft error.
+    // for the duration of the fan-out and released on drop; the fan-out chunks at exactly the width
+    // we secured. An empty reservation (gate already full) is a soft error.
     let want = MAX_PARALLEL.min(spec.tasks.len());
     let slots = crate::agent::task_tool::SubagentSlot::acquire_up_to(want);
     if slots.is_empty() {
@@ -238,9 +369,20 @@ pub(crate) async fn run_workflow_collect(
     // Header line into the transcript so the user sees the fan-out begin (TUI path only; no-op on
     // the CLI runner, which prints its own eprintln banner).
     wf_header(&format!("workflow: {} · {} task(s)", spec.name, spec.tasks.len()));
-    let results = fan_out(http, base_url, api_key, model, approval_mode, &root, &date, &spec.tasks, width).await;
+    // Live status for `/workflows` — parent + per-child tracks (children updated in run_one_task).
+    let wf_track = crate::agent::orchestration::start_workflow(&spec.name, spec.tasks.len());
+    let parent_id = wf_track.id();
+    let results =
+        fan_out_tracked(http, base_url, api_key, model, approval_mode, &root, &date, &spec.tasks, width, Some(parent_id))
+            .await;
     drop(slots); // explicit: hold the reservation across the whole fan-out, free it here
+
+    if results.iter().any(|r| r.status == "cancelled") {
+        wf_track.finish_err("cancelled");
+        bail!("workflow '{}': cancelled by user", spec.name);
+    }
     if results.iter().all(|r| r.status == "error") {
+        wf_track.finish_err("all tasks failed");
         bail!("workflow '{}': all {} task(s) failed — nothing to report", spec.name, results.len());
     }
 
@@ -253,7 +395,17 @@ pub(crate) async fn run_workflow_collect(
         for r in &results {
             out.push_str(&format!("\n── {} ──\n{}\n", r.id, r.summary));
         }
+        let fails = results.iter().filter(|r| r.status == "error").count();
+        if fails > 0 {
+            wf_track.finish_err(format!("{fails} failed · raw verdicts"));
+        } else {
+            wf_track.finish_ok("raw verdicts");
+        }
         return Ok(out.trim_end().to_string());
+    }
+    if crate::ui::tui::cancel_requested() {
+        wf_track.finish_err("cancelled before synthesis");
+        bail!("workflow '{}': cancelled by user", spec.name);
     }
     let synth_model = spec.synthesis.as_ref().and_then(|s| s.model.as_deref()).unwrap_or(model);
     let default_instruction = "Synthesize the sub-agent results below into ONE coherent, \
@@ -261,8 +413,9 @@ pub(crate) async fn run_workflow_collect(
         came from. Do not invent results that no task reported.";
     let instruction = spec.synthesis.as_ref().and_then(|s| s.prompt.as_deref()).unwrap_or(default_instruction);
     let synth_prompt = build_synthesis_prompt(&spec.name, instruction, &results);
+    wf_track.set_phase(crate::agent::orchestration::Phase::Synthesizing, format!("via {synth_model}"));
     wf_trace(&format!("⋯ synthesizing ({synth_model})…"));
-    let merged = crate::llm::client::chat_with_tools(
+    let merged = match crate::llm::client::chat_with_tools(
         http,
         base_url,
         api_key,
@@ -271,11 +424,16 @@ pub(crate) async fn run_workflow_collect(
         &[],
     )
     .await
-    .context("workflow synthesis failed")?
-    .content
-    .unwrap_or_default();
+    {
+        Ok(t) => t.content.unwrap_or_default(),
+        Err(e) => {
+            wf_track.finish_err(format!("synthesis failed: {e}"));
+            return Err(e).context("workflow synthesis failed");
+        }
+    };
     out.push('\n');
     out.push_str(merged.trim());
+    wf_track.finish_ok("synthesized");
     Ok(out)
 }
 
@@ -291,7 +449,19 @@ async fn run_one_task(
     root: &Path,
     date: &str,
     task: &WorkflowTask,
+    parent: Option<u64>,
 ) -> TaskOutcome {
+    // Bail early if cancel already landed before this child was scheduled.
+    if crate::ui::tui::cancel_requested() {
+        return TaskOutcome {
+            id: task.id.clone(),
+            role: task.role.clone(),
+            model: model.to_string(),
+            status: "cancelled".into(),
+            summary: "cancelled by user before start".into(),
+            iters: 0,
+        };
+    }
     // A resolvable `agent` slug supersedes `role` (the specialist/fusion path), mirroring the `task`
     // tool. Model precedence: per-task `model` > the specialist's `def.model` > the workflow default.
     let spec = task
@@ -322,12 +492,22 @@ async fn run_one_task(
         let model = model_s.clone();
         async move { chat_with_tools(&client, &base, &key, &model, &msgs, &defs).await }
     };
-    // Verify gate OFF in workflow sub-agents: up to MAX_PARALLEL concurrent `cargo check`
-    // processes would thrash the same repo's build locks. Verification is a top-level concern.
+    // Mirror `task` budgets: narrow step cap, bounded auto-extend, no nested todo recitation.
+    // Verify gate OFF: concurrent cargo checks thrash the same build lock (top-level verifies).
+    // Checkpoint: keep pre-edit once for writers (Time Machine safety) but skip per-edit stamps
+    // across parallel children — N children × each-edit would spam the store.
+    let is_writer = !crate::agent::task_tool::dispatch_is_read_only(&registry);
     let cfg = AgentConfig {
         approval_mode,
         quiet: true,
         enable_verify_gate: false,
+        max_iters: CHILD_MAX_ITERS,
+        auto_extend_to: CHILD_AUTO_EXTEND,
+        auto_checkpoint: is_writer,
+        checkpoint_each_edit: false,
+        todo_reminder_every: 0,
+        // Sub-agents leave context_window 0 (no tool-result clearing) — workflow children are short.
+        // enable_lsp default true is fine; tools only appear if registered in the sub-agent registry.
         ..AgentConfig::default()
     };
 
@@ -335,6 +515,9 @@ async fn run_one_task(
     // reaches the parent at the end, so without this the user stares at a blank screen while ≤5
     // agents run. Emit a start + finish line per task into the transcript (only under the sticky
     // TUI — the CLI path prints its own eprintln status and isn't TUI-active, so no double lines).
+    // Also register on the process-global orchestration board for `/workflows`.
+    let child_track =
+        crate::agent::orchestration::start_workflow_child(parent, &task.id, label.as_str());
     wf_trace(&format!("⋯ {} ({label}) running…", task.id));
 
     match run_agent(chat, &cfg, &registry, &system, &task.prompt).await {
@@ -346,19 +529,33 @@ async fn run_one_task(
                 StopReason::VerificationFailed => "verification-failed",
                 // Unreachable: workflow sub-agents have no `clarify` tool (nobody to answer).
                 StopReason::AwaitingInput(_) => "awaiting-input",
+                StopReason::Cancelled => "cancelled",
             };
             let ok = status == "done";
+            let detail = format!("{status} [{} step(s)]", o.iters);
+            if ok {
+                child_track.finish_ok(detail);
+            } else {
+                child_track.finish_err(detail);
+            }
             wf_trace_done(ok, &format!("{} ({label}) — {status} [{} step(s)]", task.id, o.iters));
             TaskOutcome {
                 id: task.id.clone(),
                 role: label.clone(),
                 model: task_model.to_string(),
                 status: status.to_string(),
-                summary: o.final_text.unwrap_or_else(|| "(no final answer)".to_string()),
+                summary: o.final_text.unwrap_or_else(|| {
+                    if status == "cancelled" {
+                        "cancelled by user".to_string()
+                    } else {
+                        "(no final answer)".to_string()
+                    }
+                }),
                 iters: o.iters,
             }
         }
         Err(e) => {
+            child_track.finish_err(format!("error: {e}"));
             wf_trace_done(false, &format!("{} ({label}) — error", task.id));
             TaskOutcome {
                 id: task.id.clone(),
@@ -427,6 +624,8 @@ fn write_trace(path: &Path, name: &str, results: &[TaskOutcome], synth_model: &s
 }
 
 /// Build the synthesis prompt from the per-task outcomes (each clearly delimited + labeled).
+/// Long child summaries are hard-capped at [`SUMMARY_CHAR_CAP`] so 5 verbose agents cannot blow
+/// the synth context / $$.
 fn build_synthesis_prompt(name: &str, instruction: &str, results: &[TaskOutcome]) -> String {
     let mut s = format!("You are synthesizing the results of workflow '{name}'.\n\n{instruction}\n\n");
     for r in results {
@@ -435,11 +634,29 @@ fn build_synthesis_prompt(name: &str, instruction: &str, results: &[TaskOutcome]
             r.id,
             r.role,
             r.status,
-            r.summary.trim()
+            truncate_summary(r.summary.trim())
         ));
     }
     s.push_str("=== end of results ===\nProduce the final synthesis now.");
     s
+}
+
+/// Cap a child summary for the synth prompt (char-based; UTF-8 safe via char boundary walk).
+fn truncate_summary(text: &str) -> String {
+    if text.len() <= SUMMARY_CHAR_CAP {
+        return text.to_string();
+    }
+    // Walk back to a char boundary so we never split a multi-byte rune.
+    let mut end = SUMMARY_CHAR_CAP;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}…\n[truncated: {} chars total, kept first {}]",
+        &text[..end],
+        text.len(),
+        end
+    )
 }
 
 #[cfg(test)]
@@ -531,6 +748,82 @@ mod tests {
         assert!(p.contains("found a null deref"));
         assert!(p.contains("task: perf"));
         assert!(p.contains("merge"));
+    }
+
+    #[test]
+    fn synthesis_prompt_truncates_long_summaries() {
+        let long = "x".repeat(SUMMARY_CHAR_CAP + 500);
+        let results = vec![TaskOutcome {
+            id: "a".into(),
+            role: "reviewer".into(),
+            model: "m".into(),
+            status: "done".into(),
+            summary: long,
+            iters: 1,
+        }];
+        let p = build_synthesis_prompt("w", "merge", &results);
+        assert!(p.contains("[truncated:"), "must mark truncation: {p}");
+        assert!(p.len() < SUMMARY_CHAR_CAP + 800, "prompt must not include the full long body");
+    }
+
+    #[test]
+    fn singular_writer_rejects_two_coders() {
+        let spec = WorkflowSpec {
+            name: "race".into(),
+            tasks: vec![
+                WorkflowTask {
+                    id: "a".into(),
+                    role: "coder".into(),
+                    agent: None,
+                    prompt: "edit a".into(),
+                    model: None,
+                },
+                WorkflowTask {
+                    id: "b".into(),
+                    role: "coder".into(),
+                    agent: None,
+                    prompt: "edit b".into(),
+                    model: None,
+                },
+            ],
+            synthesis: None,
+        };
+        let err = enforce_singular_writer(&spec).unwrap_err().to_string();
+        assert!(err.contains("write-capable"), "{err}");
+    }
+
+    #[test]
+    fn singular_writer_allows_one_coder_plus_readers() {
+        let spec = WorkflowSpec {
+            name: "ok".into(),
+            tasks: vec![
+                WorkflowTask {
+                    id: "a".into(),
+                    role: "coder".into(),
+                    agent: None,
+                    prompt: "edit".into(),
+                    model: None,
+                },
+                WorkflowTask {
+                    id: "b".into(),
+                    role: "reviewer".into(),
+                    agent: None,
+                    prompt: "review".into(),
+                    model: None,
+                },
+            ],
+            synthesis: None,
+        };
+        enforce_singular_writer(&spec).unwrap();
+    }
+
+    #[test]
+    fn task_is_writer_classifies_roles() {
+        assert!(task_is_writer("coder", None));
+        assert!(task_is_writer("tester", None));
+        assert!(!task_is_writer("reviewer", None));
+        assert!(!task_is_writer("planner", None));
+        assert!(task_is_writer("reviewer", Some("__no_such_agent__")));
     }
 
     #[tokio::test]

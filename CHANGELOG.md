@@ -7,6 +7,25 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+### Added
+- **Symbolic edit tools** — `symbol_replace` / `symbol_insert` rewrite or insert relative to a
+  named symbol via the language-server outline range (Serena-style; no `old_string` thrash).
+- **`/workflows` multi-agent status** — process-global live registry of `task` / `workflow` /
+  workflow children (phase, elapsed, detail) + sub-agent slot gate (`active/cap`). Open mid-turn
+  to watch fan-outs; aliases `/wf`, `/workflow`. Empty state explains how to launch multi-agent work.
+- **`StopReason::Cancelled`** — cooperative cancel mid-loop (Esc); nested `task` / workflow children
+  stop at the next boundary instead of running to max_iters.
+
+### Changed
+- **LSP default ON (lazy)** — manager arms at session start; language servers still spawn only on
+  first symbol query. `/lsp off` reclaims RAM; tools reappear after `/lsp on`.
+- System prompt prefers outline/definition + symbolic edit over dumping whole files / grep for
+  semantic code questions.
+- **Multi-agent hardening** — CLI `aizen workflow` shares singular-writer + `SubagentSlot` +
+  orchestration Track with the tool path; workflow children use task-like budgets (15/30 steps);
+  synthesis truncates child summaries; sub-agents get LSP nav + coder symbolic edit; ultimate
+  prompt prefers real `workflow` fan-out/verify.
+
 ## [0.4.0] — 2026-07-19
 
 ### Added

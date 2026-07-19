@@ -4,7 +4,9 @@
 //! typescript-language-server, …) over JSON-RPC/stdio, instead of relying on text/grep matching.
 //!
 //! Design (see `.claude/plans/lsp-integration-plan.md`):
-//! - **Default OFF + lazy.** Nothing spawns until the user enables it AND a query actually needs it.
+//! - **Default ON + lazy.** The manager is armed at session start (runtime ready); nothing spawns
+//!   until a query actually needs a language server. `/lsp off` still reclaims RAM; config can
+//!   force-off via `enable_lsp = false`.
 //! - **Robust ("không crash").** A missing / slow / hung / crashing server never aborts the agent
 //!   turn — worst case it degrades to "lsp unavailable" and the agent falls back to grep. A server
 //!   that dies is respawned at most [`MAX_RESPAWNS`] times, then marked disabled for the session
@@ -15,6 +17,8 @@
 //!   all LSP requests run there, and the synchronous `Tool::execute` dispatches a request onto that
 //!   runtime and blocks on a std channel ([`std::sync::mpsc`]) — never `block_on` on a runtime
 //!   worker (which would panic), so it's safe on any thread the tool happens to run on.
+//! - **Symbolic edit.** `symbol_replace` / `symbol_insert` rewrite a whole named item by outline
+//!   range (Serena-style), so the model never dumps the file or thrash-matches `old_string`.
 
 pub mod discovery;
 pub mod jobobject;
@@ -22,9 +26,11 @@ pub mod server;
 pub mod tools;
 pub mod uri;
 
+pub use server::InsertWhere;
+
 use anyhow::{anyhow, bail, Result};
 use once_cell::sync::Lazy;
-use server::{DefHit, DiagItem, DocSym, LspServer, RefHit, WsSym};
+use server::{DefHit, DiagItem, DocSym, LspServer, RefHit, SymBody, WsSym};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -32,6 +38,26 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::{Builder, Handle, Runtime};
+
+/// What kind of symbolic edit was planned (tools apply the write).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolEditKind {
+    Replace,
+    InsertBefore,
+    InsertAfter,
+}
+
+/// Plan produced by a symbolic edit query — the tool writes `new_content` atomically.
+#[derive(Debug, Clone)]
+pub struct SymbolEditPlan {
+    pub path: PathBuf,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub old_body: String,
+    pub new_content: String,
+    pub kind: SymbolEditKind,
+    pub symbol: String,
+}
 
 /// The process-global LSP manager. One per CLI process; servers are spawned lazily and reused.
 pub static LSP: Lazy<LspManager> = Lazy::new(LspManager::new);
@@ -57,7 +83,8 @@ impl LspStatus {
     /// Human-readable summary for `/lsp status`.
     pub fn render(&self) -> String {
         if !self.enabled {
-            return "LSP: off — `/lsp on` to enable type-aware code navigation.".to_string();
+            return "LSP: off — `/lsp on` to enable type-aware code navigation + symbolic edit."
+                .to_string();
         }
         if self.servers.is_empty() {
             return "LSP: on — no server running yet (starts lazily on the first symbol query)."
@@ -259,6 +286,72 @@ impl LspManager {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Resolve a named symbol to its full body text (for token-lean reads before a symbolic edit).
+    pub fn symbol_body(&self, anchor: &Path, symbol: &str) -> Result<String> {
+        let sym = symbol.to_string();
+        let hint = anchor.is_file().then(|| anchor.to_path_buf());
+        self.run_query(anchor, "symbolBody", move |s| async move {
+            let body = s.symbol_body(hint.as_deref(), &sym).await?;
+            Ok(format_sym_body(&s.root, &body))
+        })
+    }
+
+    /// Replace a named symbol's full body. Returns a formatted edit result; caller is responsible
+    /// for writing the new file contents via the returned path+text (tools do the write + fold).
+    /// The manager itself does **not** write — tools own the atomic write + verify-gate arming.
+    pub fn replace_symbol(
+        &self,
+        anchor: &Path,
+        symbol: &str,
+        new_body: &str,
+    ) -> Result<SymbolEditPlan> {
+        let sym = symbol.to_string();
+        let body = new_body.to_string();
+        let hint = anchor.is_file().then(|| anchor.to_path_buf());
+        self.run_query(anchor, "symbolReplace", move |s| async move {
+            let (path, start, end, old, new_text) =
+                s.replace_symbol_body(hint.as_deref(), &sym, &body).await?;
+            Ok(SymbolEditPlan {
+                path,
+                start_line: start,
+                end_line: end,
+                old_body: old,
+                new_content: new_text,
+                kind: SymbolEditKind::Replace,
+                symbol: sym,
+            })
+        })
+    }
+
+    /// Insert text immediately before or after a named symbol's full range.
+    pub fn insert_at_symbol(
+        &self,
+        anchor: &Path,
+        symbol: &str,
+        where_: InsertWhere,
+        text: &str,
+    ) -> Result<SymbolEditPlan> {
+        let sym = symbol.to_string();
+        let body = text.to_string();
+        let hint = anchor.is_file().then(|| anchor.to_path_buf());
+        self.run_query(anchor, "symbolInsert", move |s| async move {
+            let (path, at, new_text) =
+                s.insert_relative_to_symbol(hint.as_deref(), &sym, where_, &body).await?;
+            Ok(SymbolEditPlan {
+                path,
+                start_line: at,
+                end_line: at,
+                old_body: String::new(),
+                new_content: new_text,
+                kind: match where_ {
+                    InsertWhere::Before => SymbolEditKind::InsertBefore,
+                    InsertWhere::After => SymbolEditKind::InsertAfter,
+                },
+                symbol: sym,
+            })
+        })
     }
 
     /// Post-edit diagnostics FOLD: NEW diagnostics for `file` (vs the session baseline), appended
@@ -476,6 +569,20 @@ fn format_def(root: &Path, symbol: &str, def: &DefHit) -> String {
         out.push_str("\n  … (truncated — read the file for the rest)");
     }
     out
+}
+
+/// Render a full symbol body (uncapped definition range) for token-lean symbol reads.
+fn format_sym_body(root: &Path, body: &SymBody) -> String {
+    let rel = rel_display(root, &body.path);
+    format!(
+        "{} '{}' — {}:{}-{}\n{}",
+        body.kind,
+        body.name,
+        rel.display(),
+        body.start_line + 1,
+        body.end_line + 1,
+        body.text
+    )
 }
 
 /// Render a file outline with indentation showing nesting.

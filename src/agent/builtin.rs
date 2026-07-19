@@ -100,15 +100,17 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     // `clarify` yields the turn back to the interactive user — meaningless inside an autonomous
     // sub-agent (no user to answer), so it stays top-level only, like todo/process.
     r.register(Box::new(crate::agent::clarify::Clarify));
-    // LSP navigation + diagnostics (top-level only; default OFF). Registered ONLY once the user
-    // runs `/lsp on` (the registry is rebuilt per turn, so it appears next turn). Sub-agents use
-    // `subagent_read_only_base` and deliberately never get it.
+    // LSP navigation + diagnostics + symbolic edit (top-level only). Default ON + lazy: the
+    // manager is armed at session start; tools register when `LSP.is_enabled()` (still true after
+    // `/lsp on`, false after `/lsp off`). Sub-agents use `subagent_read_only_base` and never get it.
     if crate::agent::lsp::LSP.is_enabled() {
         r.register(Box::new(crate::agent::lsp::tools::LspReferences::new(root.to_path_buf())));
         r.register(Box::new(crate::agent::lsp::tools::LspDefinition::new(root.to_path_buf())));
         r.register(Box::new(crate::agent::lsp::tools::LspDocumentSymbols::new(root.to_path_buf())));
         r.register(Box::new(crate::agent::lsp::tools::LspWorkspaceSymbol::new(root.to_path_buf())));
         r.register(Box::new(crate::agent::lsp::tools::LspDiagnostics::new(root.to_path_buf())));
+        r.register(Box::new(crate::agent::lsp::tools::SymbolReplace::new(root.to_path_buf())));
+        r.register(Box::new(crate::agent::lsp::tools::SymbolInsert::new(root.to_path_buf())));
         // The ranked codebase skeleton rides the LSP gate too (its symbols come from the servers).
         r.register(Box::new(crate::agent::repo_map::RepoMap::new(root.to_path_buf())));
     }
@@ -232,9 +234,9 @@ fn should_register_workflow() -> bool {
 }
 
 /// The read-only tool base shared by EVERY sub-agent registry (role- or specialist-scoped): memory +
-/// read/glob/search + web research + skill_load/registry + telegram/notify (when configured).
-/// NEVER includes `task`, checkpoint, edit/shell, or top-level-only stateful tools. Factored out so
-/// `role_registry` and `agent_registry` cannot drift.
+/// read/glob/search + web research + skill_load/registry + telegram/notify (when configured) + LSP
+/// navigation (when enabled). NEVER includes `task`, checkpoint, edit/shell, or top-level-only
+/// stateful tools. Factored out so `role_registry` and `agent_registry` cannot drift.
 fn subagent_read_only_base(root: &Path) -> ToolRegistry {
     use crate::agent::web_tools::{WebCrawl, WebFetch, WebSearch};
     let mut r = ToolRegistry::new();
@@ -256,7 +258,35 @@ fn subagent_read_only_base(root: &Path) -> ToolRegistry {
     // Self-contained state means concurrent read-only sub-agents (planner/reviewer fan-out) never
     // race on it either.
     r.register(Box::new(crate::agent::todo::ScopedTodo::new()));
+    // LSP READ navigation for sub-agents (same gate as top-level: only when manager is enabled).
+    // Symbolic edit (`symbol_replace`/`symbol_insert`) is granted only to write-capable scopes
+    // below — putting it here would let planner/reviewer mutate the tree.
+    register_subagent_lsp_read(&mut r, root);
     r
+}
+
+/// LSP navigation tools shared by every sub-agent when LSP is enabled. Read-only (references /
+/// definition / outline / workspace symbol / diagnostics / repo_map). No symbolic edit here.
+fn register_subagent_lsp_read(r: &mut ToolRegistry, root: &Path) {
+    if !crate::agent::lsp::LSP.is_enabled() {
+        return;
+    }
+    r.register(Box::new(crate::agent::lsp::tools::LspReferences::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::lsp::tools::LspDefinition::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::lsp::tools::LspDocumentSymbols::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::lsp::tools::LspWorkspaceSymbol::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::lsp::tools::LspDiagnostics::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::repo_map::RepoMap::new(root.to_path_buf())));
+}
+
+/// Symbolic edit tools for write-capable sub-agents (coder / specialist with edit scope). Gated on
+/// the same `LSP.is_enabled()` flag as top-level so `/lsp off` also hides them from sub-agents.
+fn register_subagent_lsp_write(r: &mut ToolRegistry, root: &Path) {
+    if !crate::agent::lsp::LSP.is_enabled() {
+        return;
+    }
+    r.register(Box::new(crate::agent::lsp::tools::SymbolReplace::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::lsp::tools::SymbolInsert::new(root.to_path_buf())));
 }
 
 /// Build a READ/WRITE-scoped registry for a sub-agent of the given `role`. NEVER includes the
@@ -277,11 +307,12 @@ pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
             r.register(Box::new(ShellRun::new(root.to_path_buf())));
             r.register(Box::new(SkillSave));
             register_skill_refine(&mut r);
+            register_subagent_lsp_write(&mut r, root);
         }
         "tester" => {
             r.register(Box::new(ShellRun::new(root.to_path_buf())));
         }
-        // planner / reviewer / unknown → read-only.
+        // planner / reviewer / unknown → read-only (already has LSP nav when enabled).
         _ => {}
     }
     r
@@ -310,9 +341,11 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
         r.register(Box::new(ShellRun::new(root.to_path_buf())));
         r.register(Box::new(SkillSave));
         register_skill_refine(&mut r);
+        register_subagent_lsp_write(&mut r, root);
         return r;
     }
     let mut granted: HashSet<&'static str> = HashSet::new();
+    let mut has_file_edit = false;
     for raw in &def.tools {
         let Some(canon) = canonical_subagent_tool(raw) else {
             continue; // read-only (already in base), forbidden, or unknown
@@ -321,7 +354,10 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
             continue; // dedup
         }
         match canon {
-            "file_edit" => r.register(Box::new(FileEdit::new(root.to_path_buf()))),
+            "file_edit" => {
+                r.register(Box::new(FileEdit::new(root.to_path_buf())));
+                has_file_edit = true;
+            }
             "multi_edit" => r.register(Box::new(MultiEdit::new(root.to_path_buf()))),
             "file_write" => r.register(Box::new(FileWrite::new(root.to_path_buf()))),
             "file_move" => r.register(Box::new(FileMove::new(root.to_path_buf()))),
@@ -334,6 +370,10 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
             }
             _ => unreachable!("canonical_subagent_tool only yields grantable destructive tools"),
         }
+    }
+    // Symbolic edit rides with any file-edit capability (same intent as top-level coder scope).
+    if has_file_edit || granted.contains("multi_edit") || granted.contains("file_write") {
+        register_subagent_lsp_write(&mut r, root);
     }
     r
 }
@@ -1597,7 +1637,7 @@ impl Tool for FileMove {
 /// rewrite would otherwise silently reset mode). The temp file is cleaned up on any failure before
 /// the rename lands. The temp lives in the target's own directory, so the rename never crosses a
 /// filesystem boundary (which would make it non-atomic).
-fn atomic_write(target: &Path, content: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write(target: &Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
     let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));

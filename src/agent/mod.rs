@@ -26,6 +26,7 @@ pub mod project_context;
 pub mod reach;
 pub mod repo_map;
 pub mod search;
+pub mod orchestration;
 pub mod task_tool;
 pub mod todo;
 pub mod tools;
@@ -236,10 +237,15 @@ pub fn build_top_level_system_prompt(
     if crate::core::cli_config::ultimate_enabled() {
         s.push_str(
             "\n<ultimate_mode>\n\
-             You are in ULTIMATE mode. Reason at maximum depth. For any task that decomposes into \
-             independent sub-tasks (multi-file investigation, multi-angle review, broad search), \
-             PREFER launching the `workflow` fan-out tool over doing it serially yourself. Verify \
-             findings adversarially before committing to conclusions.\n\
+             You are in ULTIMATE mode. Reason at maximum depth.\n\
+             - When work decomposes into independent angles (multi-file investigation, multi-angle \
+             review, broad search, parallel research), PREFER the `workflow` tool (mode=fanout, ≤5 \
+             tasks) over serial `task` loops or doing it yourself. Keep writes singular (at most \
+             ONE coder/writer child); fan out the reads.\n\
+             - When you have claims/findings to trust, use `workflow` mode=verify to adversarially \
+             refute each one before committing to conclusions.\n\
+             - Use `task` for a single focused sub-problem; never nest orchestration.\n\
+             - Be thorough: prefer evidence with file:line over narrative summary.\n\
              </ultimate_mode>\n",
         );
     }
@@ -328,10 +334,10 @@ pub struct AgentConfig {
     /// diff against the request — via the `roles.oracle` model when configured, else a nudge to
     /// this model. Costs one turn per editing task; default OFF until measured worth it.
     pub enable_self_review: bool,
-    /// Enable the LSP subsystem (type-aware symbol navigation via a per-language server). Default
-    /// OFF: when false, no language server is ever spawned and the LSP tools aren't registered, so
-    /// the agent behaves exactly as without LSP. Servers are spawned lazily per project language
-    /// only after this is on AND a query needs one. Sub-agents/workflows inherit `false`.
+    /// Enable the LSP subsystem (type-aware symbol navigation + symbolic edit via a per-language
+    /// server). Default ON: tools register and servers spawn lazily on first symbol query (no
+    /// process until needed). Set false / `/lsp off` to reclaim RAM and hide the tools. Sub-agents
+    /// and workflows keep a separate slim registry (no LSP tools).
     pub enable_lsp: bool,
     /// Per-request wall-clock cap (seconds) for an LSP query, so a hung server can never block the
     /// agent turn. Mirrors Helix's 20s default.
@@ -363,7 +369,7 @@ impl Default for AgentConfig {
             context_guard_pct: 90,
             max_verify_attempts: 2,
             enable_self_review: false,
-            enable_lsp: false,
+            enable_lsp: true,
             lsp_request_timeout_secs: 20,
         }
     }
@@ -384,6 +390,10 @@ pub enum StopReason {
     /// message re-enters the loop as the answer. History is left valid (the assistant tool-call
     /// turn and its tool result are already appended).
     AwaitingInput(String),
+    /// The user cancelled mid-loop (Esc / cancel flag). Cooperative: no further model/tool work.
+    /// Nested sub-agents (`task` / `workflow` children) observe the same process-global flag and
+    /// stop at their next loop boundary instead of running to max_iters.
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -562,13 +572,17 @@ where
     let mut iter = 0usize;
 
     while iter < cap {
-        // COOPERATIVE CANCEL: a synchronous tool (a long `shell_run`) just aborted because the user
-        // pressed Esc. The REPL's `select!` couldn't observe the cancel while that tool ran (no
-        // await), so yield HERE — the yield is an await point, letting the `select!` win and drop
-        // this turn before we'd otherwise fire another model call. (No-op outside the sticky REPL,
-        // where the flag is never set.)
+        // COOPERATIVE CANCEL: Esc sets a process-global flag. Top-level REPL also races the turn
+        // future via `select!`, but nested sub-agents (`task` / workflow children) run under
+        // `block_in_place`+`block_on` and would otherwise keep burning steps after cancel. Return a
+        // real `Cancelled` stop so fan-out / task can mark the child done and free slots. (No-op
+        // outside the sticky REPL, where the flag is never set.)
         if crate::ui::tui::cancel_requested() {
-            tokio::task::yield_now().await;
+            return Ok(AgentOutcome {
+                final_text: None,
+                iters: iter,
+                stop: StopReason::Cancelled,
+            });
         }
 
         // Effective request size for ALL guards this iteration: estimate (messages + tool schemas)
@@ -1702,7 +1716,17 @@ fn emit_tool_result(name: &str, out: &str) {
 }
 
 fn is_edit_tool(name: &str) -> bool {
-    matches!(name, "file_edit" | "multi_edit" | "edit_file" | "apply_patch" | "file_write" | "write_file")
+    matches!(
+        name,
+        "file_edit"
+            | "multi_edit"
+            | "edit_file"
+            | "apply_patch"
+            | "file_write"
+            | "write_file"
+            | "symbol_replace"
+            | "symbol_insert"
+    )
 }
 
 /// Count added / removed lines in a unified-diff-bearing result: lines beginning `+` / `-` at
@@ -1789,9 +1813,9 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
                 (true, format!("{} files", out.lines().count()))
             }
         }
-        "file_edit" | "edit_file" | "apply_patch" => {
-            if first.starts_with("created") {
-                (true, edit_target(first))
+        "file_edit" | "edit_file" | "apply_patch" | "symbol_replace" | "symbol_insert" => {
+            if first.starts_with("created") || first.starts_with("inserted") || first.starts_with("replaced") {
+                (true, first.chars().take(80).collect())
             } else {
                 let (a, d) = count_diff(out);
                 (true, format!("{} · +{a} −{d}", edit_target(first)))
@@ -2466,8 +2490,16 @@ fn tool_action(name: &str, args: &serde_json::Value) -> Option<String> {
             format!("Run {}", shell_target(cmd))
         }
         "file_write" | "write_file" => format!("Write {}", base(field("path").or_else(|| field("file")).unwrap_or(""))),
-        "file_edit" | "edit_file" | "apply_patch" | "multi_edit" => {
-            format!("Edit {}", base(field("path").or_else(|| field("file")).unwrap_or("")))
+        "file_edit" | "edit_file" | "apply_patch" | "multi_edit" | "symbol_replace" | "symbol_insert" => {
+            format!(
+                "Edit {}",
+                base(
+                    field("path")
+                        .or_else(|| field("file"))
+                        .or_else(|| field("symbol"))
+                        .unwrap_or("")
+                )
+            )
         }
         "file_read" | "read_file" => format!("Read {}", base(field("path").or_else(|| field("file")).unwrap_or(""))),
         "file_move" | "move_file" | "rename_file" | "file_rename" => {
@@ -2537,8 +2569,9 @@ fn tool_trace(name: &str, args: &serde_json::Value) -> String {
     let field = |k: &str| args.get(k).and_then(|v| v.as_str());
     let salient = match name {
         "shell_run" | "bash" | "powershell" | "shell" => field("command").or_else(|| field("cmd")),
-        "file_edit" | "multi_edit" | "edit_file" | "file_write" | "write_file" | "apply_patch" => {
-            field("path").or_else(|| field("file"))
+        "file_edit" | "multi_edit" | "edit_file" | "file_write" | "write_file" | "apply_patch"
+        | "symbol_replace" | "symbol_insert" => {
+            field("path").or_else(|| field("file")).or_else(|| field("symbol"))
         }
         "file_move" | "move_file" | "rename_file" | "file_rename" => field("from"),
         "file_read" | "read_file" => field("path").or_else(|| field("file")),
@@ -2968,6 +3001,21 @@ mod tests {
         assert_eq!(out.stop, StopReason::Done);
         assert_eq!(out.final_text.as_deref(), Some("hello"));
         assert_eq!(out.iters, 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_flag_stops_loop_with_cancelled() {
+        // Cooperative cancel: set the process-global flag before the loop starts a model call.
+        // The loop must return Cancelled without consuming the scripted turn.
+        crate::ui::tui::request_cancel();
+        let r = registry();
+        let out = run_agent(scripted(vec![final_turn("should-not-run")]), &cfg(), &r, "sys", "task")
+            .await
+            .unwrap();
+        crate::ui::tui::clear_cancel();
+        assert_eq!(out.stop, StopReason::Cancelled);
+        assert!(out.final_text.is_none());
+        assert_eq!(out.iters, 0, "must stop before the first model call");
     }
 
     #[tokio::test]
