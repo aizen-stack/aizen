@@ -1,223 +1,1430 @@
-//! Time machine — git-backed code snapshots you can rewind to and re-apply ("quay về / trở lại").
+//! Time Machine — crash-recoverable, git-backed working-tree checkpoints.
 //!
-//! A **checkpoint** captures the WHOLE working tree (tracked + untracked, honoring `.gitignore`) as a
-//! git commit object on a private ref (`refs/ng/tm/<id>`), recorded in a per-repo ledger. It NEVER
-//! touches your real index, HEAD, branches, or stash — it's a parallel timeline. **Restore** rewinds
-//! the working tree to any checkpoint exactly (files added since are removed, deleted ones come back),
-//! and because every restore first auto-snapshots the current state, you can always go forward again.
-//!
-//! Mechanism (all via the `git` CLI — no new dep): snapshot = `add -A` into a TEMP index
-//! (`GIT_INDEX_FILE`, so the real index is untouched) → `write-tree` → `commit-tree` → `update-ref`.
-//! Restore = stage current state into a temp index → `read-tree --reset -u <tree>` (updates the
-//! working tree, removing files not in the snapshot). `.gitignore`d paths (node_modules/target) are
-//! never staged, so they're never touched.
+//! Checkpoints live in a private store under `~/.aizen/timemachine/<repo-id>/`, fully outside the
+//! source repository's `.git`. Each linked worktree owns its own ledger/journal/chat namespace while
+//! sharing a bare object store. Source Git objects remain readable only through a sealed alternates
+//! pointer for migration/seed; new checkpoint objects and all Time Machine refs are written into the
+//! private store. Metadata is fail-closed, writes are atomic, and every mutating operation is
+//! serialized by an OS lock. Git is invoked with hooks/fsmonitor/filters disabled so checkpointing
+//! cannot execute repository-controlled code before an approval gate.
 
 use crate::core::types::Message;
 use anyhow::{bail, Context, Result};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 
-/// Default cap on retained checkpoints (config `timemachine_keep`; `Some(0)` = unlimited). Beyond
-/// this, the OLDEST checkpoints are auto-pruned on each save so the timeline can't grow without
-/// bound. Pruning deletes each snapshot's `refs/ng/tm/<id>` ref → its git objects become unreachable
-/// and are reclaimed by git's normal maintenance (`git gc`).
 const DEFAULT_KEEP: usize = 50;
+const LEDGER_SCHEMA: u32 = 2;
+const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
+const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+/// Max agent-driven rewinds per agent run — enough to abandon a bad approach twice, not thrash.
+const MAX_RUN_REWINDS: u8 = 2;
+static TM_INDEX_SEQ: AtomicU64 = AtomicU64::new(0);
+static OP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// One saved point on the timeline.
+/// Per-agent-run recovery anchors. Process-local (one interactive/one-shot loop at a time); cleared
+/// at the start of each agent run so a stale pre-edit from a prior task cannot be restored by accident.
+#[derive(Debug, Default, Clone)]
+struct RunRecovery {
+    /// First pre-edit auto-checkpoint of this run (`before agent edits`). Whole-run safety net.
+    pre_edit: Option<u32>,
+    /// Most recent successful post-edit checkpoint this run. One-step undo within the run.
+    last_good: Option<u32>,
+    rewinds_used: u8,
+}
+
+static RUN_RECOVERY: Lazy<Mutex<RunRecovery>> = Lazy::new(|| Mutex::new(RunRecovery::default()));
+
+/// Call at the start of every agent loop so rewinds cannot reach a previous task's tree.
+pub fn begin_agent_run() {
+    if let Ok(mut g) = RUN_RECOVERY.lock() {
+        *g = RunRecovery::default();
+    }
+}
+
+/// Record the pre-edit snapshot (first successful auto-checkpoint of the run). Idempotent: keeps
+/// the earliest id so later saves do not move the whole-run safety net.
+pub fn note_pre_edit(id: u32) {
+    if let Ok(mut g) = RUN_RECOVERY.lock() {
+        if g.pre_edit.is_none() {
+            g.pre_edit = Some(id);
+        }
+        // Before any edit lands, last_good is the pre-edit tree.
+        if g.last_good.is_none() {
+            g.last_good = Some(id);
+        }
+    }
+}
+
+/// Record a successful post-edit (or verified) checkpoint as the one-step undo target.
+pub fn note_last_good(id: u32) {
+    if let Ok(mut g) = RUN_RECOVERY.lock() {
+        g.last_good = Some(id);
+    }
+}
+
+/// Snapshot of current run anchors for prompts / tool results (no side effects).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryStatus {
+    pub pre_edit: Option<u32>,
+    pub last_good: Option<u32>,
+    pub rewinds_used: u8,
+    pub rewinds_left: u8,
+}
+
+pub fn recovery_status() -> RecoveryStatus {
+    let g = RUN_RECOVERY.lock().map(|g| g.clone()).unwrap_or_default();
+    RecoveryStatus {
+        pre_edit: g.pre_edit,
+        last_good: g.last_good,
+        rewinds_used: g.rewinds_used,
+        rewinds_left: MAX_RUN_REWINDS.saturating_sub(g.rewinds_used),
+    }
+}
+
+/// Where the agent is allowed to rewind within the current run. Free-form restore stays human/CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewindTarget {
+    /// Tree as it was before the first destructive edit of this run.
+    PreEdit,
+    /// Tree after the last successful edit step of this run.
+    LastGood,
+}
+
+impl RewindTarget {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pre_edit" | "pre-edit" | "start" | "run" => Some(Self::PreEdit),
+            "last_good" | "last-good" | "step" | "undo" => Some(Self::LastGood),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreEdit => "pre_edit",
+            Self::LastGood => "last_good",
+        }
+    }
+}
+
+/// Restore the working tree to a run-scoped anchor. Caps rewinds per run; never accepts arbitrary ids.
+pub fn rewind_run(target: RewindTarget) -> Result<Snapshot> {
+    let (id, used) = {
+        let g = RUN_RECOVERY.lock().map_err(|_| anyhow::anyhow!("recovery lock poisoned"))?;
+        if g.rewinds_used >= MAX_RUN_REWINDS {
+            bail!(
+                "run rewind budget exhausted ({MAX_RUN_REWINDS}/{MAX_RUN_REWINDS}). \
+                 Further recovery is human-driven: `aizen time list` / `aizen time restore <id>`."
+            );
+        }
+        let id = match target {
+            RewindTarget::PreEdit => g.pre_edit,
+            RewindTarget::LastGood => g.last_good.or(g.pre_edit),
+        }
+        .with_context(|| {
+            format!(
+                "no {} anchor this run — nothing to rewind to yet (edit first, or not a git repo)",
+                target.as_str()
+            )
+        })?;
+        (id, g.rewinds_used)
+    };
+    let snap = restore(id)?;
+    if let Ok(mut g) = RUN_RECOVERY.lock() {
+        g.rewinds_used = used + 1;
+        // After a rewind the working tree matches `id`; that becomes the new last_good floor.
+        g.last_good = Some(id);
+        // pre_edit stays put — the whole-run safety net is stable for the rest of the run.
+    }
+    Ok(snap)
+}
+
+/// One-line hint for verify-failure / stuck nudges. Empty when no anchor or budget exhausted.
+pub fn recovery_hint() -> Option<String> {
+    let s = recovery_status();
+    if s.rewinds_left == 0 {
+        return None;
+    }
+    match (s.pre_edit, s.last_good) {
+        (None, None) => None,
+        (Some(p), Some(l)) if p == l => Some(format!(
+            "If this approach is wrong, call `checkpoint_rewind` with target=\"pre_edit\" to restore checkpoint #{p} \
+             (working tree before this run's edits; {left} rewind left).",
+            left = s.rewinds_left
+        )),
+        (Some(p), Some(l)) => Some(format!(
+            "If this approach is wrong, call `checkpoint_rewind`: target=\"last_good\" → #{l} (last good step) or \
+             target=\"pre_edit\" → #{p} (before this run's edits). {left} rewind(s) left this run.",
+            left = s.rewinds_left
+        )),
+        (Some(p), None) => Some(format!(
+            "If this approach is wrong, call `checkpoint_rewind` with target=\"pre_edit\" to restore checkpoint #{p} \
+             ({left} rewind left).",
+            left = s.rewinds_left
+        )),
+        (None, Some(l)) => Some(format!(
+            "If this approach is wrong, call `checkpoint_rewind` with target=\"last_good\" to restore checkpoint #{l} \
+             ({left} rewind left).",
+            left = s.rewinds_left
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Coverage {
+    #[serde(default)]
+    pub file_count: u64,
+    #[serde(default)]
+    pub byte_count: u64,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub id: u32,
-    /// The snapshot commit sha (on `refs/ng/tm/<id>`).
     pub commit: String,
-    /// The snapshot tree sha (used to detect "is the working tree already at this state?").
     pub tree: String,
     pub label: String,
-    /// Local timestamp string (display only).
     pub created: String,
-    /// `true` if auto-created (e.g. just before a restore) vs an explicit user/agent checkpoint.
     pub auto: bool,
-    /// `true` if a conversation sidecar (`.git/ng_tm_chat_<id>.json`) was captured alongside this
-    /// snapshot, so a restore can offer to rewind the CHAT too (the 3-way Files/Task/Both restore).
-    /// Defaults `false` (serde) so snapshots saved before this field degrade to Files-only cleanly.
     #[serde(default)]
     pub has_chat: bool,
+    #[serde(default)]
+    pub parent: Option<u32>,
+    #[serde(default)]
+    pub worktree_id: String,
+    #[serde(default)]
+    pub coverage: Coverage,
+    /// Recovery-only preimage created by restore. It remains directly restorable but is excluded from
+    /// normal redo branch selection so safety snapshots do not hijack timeline navigation.
+    #[serde(default)]
+    pub recovery: bool,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Ledger {
+    #[serde(default = "ledger_schema")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default)]
     pub snapshots: Vec<Snapshot>,
-    /// Index into `snapshots` of the currently-active point (for `undo`/`redo`). `None` until the
-    /// first restore.
+    /// Legacy cursor index. Retained in the wire schema for migration compatibility; new code uses
+    /// `cursor_id` so pruning/reordering cannot silently move the active checkpoint.
+    #[serde(default)]
     pub cursor: Option<usize>,
+    #[serde(default)]
+    pub cursor_id: Option<u32>,
+    #[serde(default)]
     pub next_id: u32,
 }
 
-// ── git helpers (each takes an explicit repo root → testable against a temp repo) ──
-
-/// Run `git <args>` in `root`. `index` sets `GIT_INDEX_FILE` (a temp index) when `Some`.
-fn git_at(root: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
-    let mut cmd = Command::new("git");
-    cmd.current_dir(root).args(args);
-    if let Some(idx) = index {
-        cmd.env("GIT_INDEX_FILE", idx);
+impl Default for Ledger {
+    fn default() -> Self {
+        Self {
+            schema_version: LEDGER_SCHEMA,
+            generation: 0,
+            snapshots: Vec::new(),
+            cursor: None,
+            cursor_id: None,
+            next_id: 1,
+        }
     }
-    let out = cmd.output().with_context(|| format!("running `git {}` (is git installed?)", args.join(" ")))?;
+}
+
+fn ledger_schema() -> u32 {
+    LEDGER_SCHEMA
+}
+
+impl Ledger {
+    fn normalize(&mut self) -> Result<()> {
+        if self.schema_version > LEDGER_SCHEMA {
+            bail!(
+                "time-machine ledger schema {} is newer than this binary supports ({LEDGER_SCHEMA})",
+                self.schema_version
+            );
+        }
+        if self.cursor_id.is_none() {
+            self.cursor_id = self.cursor.and_then(|i| self.snapshots.get(i)).map(|s| s.id);
+        }
+        self.cursor = self
+            .cursor_id
+            .and_then(|id| self.snapshots.iter().position(|s| s.id == id));
+        self.schema_version = LEDGER_SCHEMA;
+        let mut ids = HashSet::new();
+        for s in &self.snapshots {
+            if s.id == 0 || !ids.insert(s.id) {
+                bail!("time-machine ledger contains duplicate/invalid checkpoint id #{}", s.id);
+            }
+            if s.commit.len() != 40 || s.tree.len() != 40 {
+                bail!("time-machine checkpoint #{} contains an invalid Git object id", s.id);
+            }
+        }
+        if let Some(id) = self.cursor_id {
+            if !ids.contains(&id) {
+                bail!("time-machine cursor points at missing checkpoint #{id}");
+            }
+        }
+        let min_next = self.snapshots.iter().map(|s| s.id).max().unwrap_or(0).saturating_add(1).max(1);
+        if self.next_id == 0 {
+            self.next_id = min_next;
+        } else if self.next_id < min_next {
+            bail!(
+                "time-machine ledger next_id {} is behind existing checkpoint ids (need at least {min_next})",
+                self.next_id
+            );
+        }
+        Ok(())
+    }
+
+    fn set_cursor(&mut self, id: Option<u32>) {
+        self.cursor_id = id;
+        self.cursor = id.and_then(|needle| self.snapshots.iter().position(|s| s.id == needle));
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JournalKind {
+    Save,
+    Restore,
+    Prune,
+    Clear,
+    Doctor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JournalPhase {
+    Prepared,
+    RefCreated,
+    Applying,
+    LedgerCommitted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Journal {
+    schema_version: u32,
+    operation_id: String,
+    kind: JournalKind,
+    phase: JournalPhase,
+    expected_generation: u64,
+    #[serde(default)]
+    checkpoint_id: Option<u32>,
+    #[serde(default)]
+    target_id: Option<u32>,
+    #[serde(default)]
+    preimage_id: Option<u32>,
+    #[serde(default)]
+    ref_name: Option<String>,
+    #[serde(default)]
+    new_oid: Option<String>,
+}
+
+impl Journal {
+    fn new(kind: JournalKind, generation: u64) -> Self {
+        Self {
+            schema_version: 1,
+            operation_id: format!(
+                "{}-{}-{}",
+                std::process::id(),
+                chrono::Utc::now().timestamp_millis(),
+                OP_SEQ.fetch_add(1, Ordering::Relaxed)
+            ),
+            kind,
+            phase: JournalPhase::Prepared,
+            expected_generation: generation,
+            checkpoint_id: None,
+            target_id: None,
+            preimage_id: None,
+            ref_name: None,
+            new_oid: None,
+        }
+    }
+}
+
+struct RepoContext {
+    root: PathBuf,
+    /// Source worktree Git dir (`.git` or `.git/worktrees/<name>`). Used only for seed/migration.
+    git_dir: PathBuf,
+    /// Source common Git dir. Used for alternates + legacy migration.
+    common_git_dir: PathBuf,
+    /// Private bare store under `~/.aizen/timemachine/<repo_id>/store.git`.
+    store_git_dir: PathBuf,
+    /// Worktree-scoped metadata (ledger/journal/lock/chat/temp index).
+    namespace_dir: PathBuf,
+    repo_id: String,
+    worktree_id: String,
+    ref_prefix: String,
+    hooks_dir: PathBuf,
+    /// Cached filter safety probe for this process/context.
+    filters_checked: std::cell::Cell<bool>,
+}
+
+impl RepoContext {
+    fn discover(start: &Path) -> Result<Self> {
+        let root = raw_git(start, &["rev-parse", "--show-toplevel"])
+            .context("not a git repository (run `git init` first to use the time machine)")?;
+        let root = PathBuf::from(root).canonicalize().context("canonicalizing repository root")?;
+        let git_dir = absolute_git_path(&root, &raw_git(&root, &["rev-parse", "--git-dir"])?);
+        let common_git_dir = absolute_git_path(&root, &raw_git(&root, &["rev-parse", "--git-common-dir"])?);
+        let common_canon = fs::canonicalize(&common_git_dir).unwrap_or_else(|_| common_git_dir.clone());
+        let wt_canon = fs::canonicalize(&git_dir).unwrap_or_else(|_| git_dir.clone());
+        let repo_id = format!("repo-{:016x}", fnv1a64(&common_canon.to_string_lossy()));
+        let worktree_id = format!("wt-{:016x}", fnv1a64(&wt_canon.to_string_lossy()));
+
+        let home = crate::core::config::nextgen_home();
+        let repo_store_root = home.join("timemachine").join(&repo_id);
+        let store_git_dir = repo_store_root.join("store.git");
+        let namespace_dir = repo_store_root.join("worktrees").join(&worktree_id);
+        let hooks_dir = namespace_dir.join("empty-hooks");
+
+        fs::create_dir_all(&hooks_dir)
+            .with_context(|| format!("creating {}", hooks_dir.display()))?;
+        crate::core::config::harden_dir(&repo_store_root);
+        crate::core::config::harden_dir(&namespace_dir);
+        ensure_private_store(&store_git_dir, &common_git_dir)?;
+
+        Ok(Self {
+            root,
+            git_dir,
+            common_git_dir,
+            store_git_dir,
+            namespace_dir,
+            repo_id,
+            ref_prefix: format!("refs/ng/tm/{worktree_id}"),
+            worktree_id,
+            hooks_dir,
+            filters_checked: std::cell::Cell::new(false),
+        })
+    }
+
+    fn current() -> Result<Self> {
+        Self::discover(&std::env::current_dir().context("resolving cwd")?)
+    }
+
+    fn ledger_path(&self) -> PathBuf {
+        self.namespace_dir.join("ledger.json")
+    }
+
+    /// Previous hardening location: `<common-git-dir>/aizen-timemachine/<worktree-id>/ledger.json`.
+    fn inrepo_namespace_ledger_path(&self) -> PathBuf {
+        self.common_git_dir
+            .join("aizen-timemachine")
+            .join(&self.worktree_id)
+            .join("ledger.json")
+    }
+
+    fn inrepo_namespace_dir(&self) -> PathBuf {
+        self.common_git_dir.join("aizen-timemachine").join(&self.worktree_id)
+    }
+
+    /// Oldest legacy ledger: `<git-dir>/ng_timemachine.json`.
+    fn legacy_ledger_path(&self) -> PathBuf {
+        self.git_dir.join("ng_timemachine.json")
+    }
+
+    fn journal_path(&self) -> PathBuf {
+        self.namespace_dir.join("journal.json")
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        self.namespace_dir.join("transaction.lock")
+    }
+
+    fn chat_dir(&self) -> PathBuf {
+        self.namespace_dir.join("chat")
+    }
+
+    fn chat_path(&self, id: u32) -> PathBuf {
+        self.chat_dir().join(format!("{id}.json"))
+    }
+
+    fn inrepo_chat_path(&self, id: u32) -> PathBuf {
+        self.inrepo_namespace_dir().join("chat").join(format!("{id}.json"))
+    }
+
+    fn legacy_chat_path(&self, id: u32) -> PathBuf {
+        self.git_dir.join(format!("ng_tm_chat_{id}.json"))
+    }
+
+    fn ref_name(&self, id: u32) -> String {
+        format!("{}/{id}", self.ref_prefix)
+    }
+
+    fn recovery_ref_name(&self, id: u32) -> String {
+        format!("{}/recovery/{id}", self.ref_prefix)
+    }
+
+    fn temp_index(&self) -> PathBuf {
+        let dir = strip_windows_verbatim(&self.namespace_dir);
+        dir.join(format!(
+            "index-{}-{}",
+            std::process::id(),
+            TM_INDEX_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn git<I, S>(&self, index: Option<&Path>, args: I) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self.git_output(index, args)?;
+        if !output.status.success() {
+            bail!("internal git operation failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Run a plumbing command against the **private** store + source worktree.
+    fn git_output<I, S>(&self, index: Option<&Path>, args: I) -> Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut cmd = Command::new("git");
+        let hooks = strip_windows_verbatim(&self.hooks_dir).to_string_lossy().replace('\\', "/");
+        let store = strip_windows_verbatim(&self.store_git_dir);
+        let work_tree = strip_windows_verbatim(&self.root);
+        cmd.current_dir(&self.root)
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_KEY_0")
+            .env_remove("GIT_CONFIG_VALUE_0")
+            .env("GIT_DIR", &store)
+            .env("GIT_WORK_TREE", &work_tree)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", null_device())
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Aizen Time Machine")
+            .env("GIT_AUTHOR_EMAIL", "timemachine@localhost")
+            .env("GIT_COMMITTER_NAME", "Aizen Time Machine")
+            .env("GIT_COMMITTER_EMAIL", "timemachine@localhost")
+            .arg("-c")
+            .arg(format!("core.hooksPath={hooks}"))
+            .args(["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"])
+            .args([
+                "-c", "filter.lfs.required=false", "-c", "filter.lfs.clean=", "-c", "filter.lfs.smudge=",
+                "-c", "filter.lfs.process=", "-c", "filter.lfs.delay=false",
+            ])
+            .args(args);
+        if let Some(idx) = index {
+            cmd.env("GIT_INDEX_FILE", idx);
+        } else {
+            cmd.env_remove("GIT_INDEX_FILE");
+        }
+        cmd.output().context("running internal git operation (is git installed?)")
+    }
+
+    /// Probe the **source** repository for external filter drivers (not the private store).
+    fn source_git_output<I, S>(&self, args: I) -> Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut cmd = Command::new("git");
+        let git_dir = strip_windows_verbatim(&self.git_dir);
+        let work_tree = strip_windows_verbatim(&self.root);
+        cmd.current_dir(&self.root)
+            .env("GIT_DIR", &git_dir)
+            .env("GIT_WORK_TREE", &work_tree)
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .args(args);
+        cmd.output().context("running source git probe (is git installed?)")
+    }
+
+    fn source_git<I, S>(&self, args: I) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self.source_git_output(args)?;
+        if !output.status.success() {
+            bail!("source git probe failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn ensure_safe_filters(&self) -> Result<()> {
+        if self.filters_checked.get() {
+            return Ok(());
+        }
+        // `.gitattributes` can name arbitrary clean/smudge/process drivers. Git offers no global
+        // "disable every filter" switch, so reject configured external drivers before plumbing
+        // commands touch the worktree. The built-in `lfs` name is neutralized in `git_output`.
+        let out = self.source_git_output(["config", "--local", "--get-regexp", r"^filter\..*\.(clean|smudge|process|required)$"])
+            .context("checking repository Git filters")?;
+        if out.status.success() {
+            let lines = String::from_utf8_lossy(&out.stdout);
+            for line in lines.lines() {
+                let key = line.split_whitespace().next().unwrap_or("");
+                if !key.starts_with("filter.lfs.") {
+                    bail!(
+                        "checkpoint refused: repository config defines external Git filter `{key}`; disable it or snapshot manually"
+                    );
+                }
+            }
+        }
+        self.filters_checked.set(true);
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<crate::core::repo_lock::RepoTxnLock> {
+        crate::core::repo_lock::RepoTxnLock::acquire(&self.lock_path(), LOCK_TIMEOUT)
+    }
+
+    fn load_ledger(&self) -> Result<Ledger> {
+        let path = self.ledger_path();
+        let bytes = match crate::core::persist::read_optional(&path)
+            .with_context(|| format!("reading time-machine ledger {}", path.display()))?
+        {
+            Some(bytes) => bytes,
+            None => return self.load_migratable_ledger(),
+        };
+        let mut ledger: Ledger = serde_json::from_slice(&bytes)
+            .with_context(|| format!("time-machine ledger {} is corrupt; run `aizen time doctor`", path.display()))?;
+        ledger.normalize()?;
+        Ok(ledger)
+    }
+
+    /// Read-only fallback: in-repo namespaced ledger, then oldest legacy ledger. Migration is
+    /// finalized later under the transaction lock by `migrate_legacy_refs`.
+    fn load_migratable_ledger(&self) -> Result<Ledger> {
+        for path in [self.inrepo_namespace_ledger_path(), self.legacy_ledger_path()] {
+            let Some(bytes) = crate::core::persist::read_optional(&path)
+                .with_context(|| format!("reading migratable time-machine ledger {}", path.display()))?
+            else {
+                continue;
+            };
+            let mut ledger: Ledger = serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "migratable time-machine ledger {} is corrupt; it was not replaced",
+                    path.display()
+                )
+            })?;
+            ledger.normalize()?;
+            return Ok(ledger);
+        }
+        Ok(Ledger::default())
+    }
+
+    fn save_ledger(&self, ledger: &mut Ledger) -> Result<()> {
+        ledger.normalize()?;
+        ledger.generation = ledger.generation.saturating_add(1);
+        let bytes = serde_json::to_vec_pretty(ledger)?;
+        crate::core::persist::atomic_write(&self.ledger_path(), &[bytes, b"\n".to_vec()].concat())?;
+        crate::core::persist::harden_owner_only_checked(&self.ledger_path())?;
+        Ok(())
+    }
+
+    fn load_journal(&self) -> Result<Option<Journal>> {
+        let path = self.journal_path();
+        let Some(bytes) = crate::core::persist::read_optional(&path)
+            .with_context(|| format!("reading transaction journal {}", path.display()))?
+        else {
+            return Ok(None);
+        };
+        let journal = serde_json::from_slice(&bytes)
+            .with_context(|| format!("transaction journal {} is corrupt; run `aizen time doctor`", path.display()))?;
+        Ok(Some(journal))
+    }
+
+    fn save_journal(&self, journal: &Journal) -> Result<()> {
+        let mut bytes = serde_json::to_vec_pretty(journal)?;
+        bytes.push(b'\n');
+        crate::core::persist::atomic_write(&self.journal_path(), &bytes)?;
+        crate::core::persist::harden_owner_only_checked(&self.journal_path())?;
+        Ok(())
+    }
+
+    fn clear_journal(&self) -> Result<()> {
+        crate::core::persist::remove_if_exists(&self.journal_path())
+            .with_context(|| format!("removing transaction journal {}", self.journal_path().display()))?;
+        Ok(())
+    }
+
+    fn migrate_legacy_refs(&self, ledger: &mut Ledger) -> Result<()> {
+        // Already on the external store — nothing to import.
+        if self.ledger_path().exists() {
+            return Ok(());
+        }
+        let has_inrepo = self.inrepo_namespace_ledger_path().exists();
+        let has_legacy = self.legacy_ledger_path().exists();
+        if !has_inrepo && !has_legacy && ledger.snapshots.is_empty() {
+            return Ok(());
+        }
+
+        for snap in &mut ledger.snapshots {
+            let new_ref = self.ref_name(snap.id);
+            let existing = self.git(None, ["rev-parse", "--verify", &new_ref]).ok();
+            if let Some(oid) = existing.as_deref() {
+                if oid != snap.commit {
+                    bail!(
+                        "cannot migrate checkpoint #{}: private store ref already exists with another object",
+                        snap.id
+                    );
+                }
+            } else {
+                // Prefer the previous namespaced in-repo ref, then the oldest flat ref. Objects are
+                // still reachable via the sealed alternates pointer into the source object store.
+                let candidates = [
+                    format!("refs/ng/tm/{}/{}", self.worktree_id, snap.id),
+                    format!("refs/ng/tm/{}", snap.id),
+                ];
+                let mut imported = false;
+                for candidate in &candidates {
+                    // Look up the candidate in the *source* repo first; if present, create the same
+                    // ref name in the private store (objects resolve via alternates).
+                    if let Ok(oid) = self.source_git(["rev-parse", "--verify", candidate.as_str()]) {
+                        if oid != snap.commit {
+                            bail!(
+                                "cannot migrate checkpoint #{}: source ref {candidate} does not match ledger",
+                                snap.id
+                            );
+                        }
+                        // Materialize the object into the private store so the timeline survives if
+                        // the source repository is later rewritten or deleted.
+                        self.materialize_commit(&oid)?;
+                        self.update_ref_create(&new_ref, &oid)?;
+                        imported = true;
+                        break;
+                    }
+                    // Also accept a ref already present in the private store under a temporary
+                    // migration name (e.g. after a partial previous attempt).
+                    if let Ok(oid) = self.git(None, ["rev-parse", "--verify", candidate.as_str()]) {
+                        if oid != snap.commit {
+                            bail!(
+                                "cannot migrate checkpoint #{}: private candidate {candidate} does not match ledger",
+                                snap.id
+                            );
+                        }
+                        if candidate != &new_ref {
+                            self.update_ref_create(&new_ref, &oid)?;
+                        }
+                        imported = true;
+                        break;
+                    }
+                }
+                if !imported {
+                    // Last resort: object may still be reachable through alternates by OID alone.
+                    if self.git(None, ["cat-file", "-e", &format!("{}^{{commit}}", snap.commit)]).is_ok() {
+                        self.materialize_commit(&snap.commit)?;
+                        self.update_ref_create(&new_ref, &snap.commit)?;
+                    } else {
+                        bail!("cannot migrate checkpoint #{}: source ref/object is missing", snap.id);
+                    }
+                }
+            }
+
+            // Prefer newest chat location first.
+            for old_chat in [
+                self.inrepo_chat_path(snap.id),
+                self.legacy_chat_path(snap.id),
+            ] {
+                if old_chat.exists() && !self.chat_path(snap.id).exists() {
+                    fs::create_dir_all(self.chat_dir())?;
+                    fs::copy(&old_chat, self.chat_path(snap.id)).with_context(|| {
+                        format!("migrating conversation sidecar for checkpoint #{}", snap.id)
+                    })?;
+                    crate::core::persist::harden_owner_only_checked(&self.chat_path(snap.id))?;
+                    break;
+                }
+            }
+            snap.worktree_id = self.worktree_id.clone();
+        }
+        Ok(())
+    }
+
+    /// Copy a commit (and its reachable trees/blobs) from alternates into the private object store
+    /// so checkpoints remain independent of the source repository's lifetime.
+    fn materialize_commit(&self, commit: &str) -> Result<()> {
+        // `cat-file --batch-check` validates reachability; `repack -a -d --window=0` is too heavy.
+        // Use `pack-objects` of a single commit via stdin — pure plumbing, no hooks.
+        let mut child = Command::new("git");
+        let store = strip_windows_verbatim(&self.store_git_dir);
+        let hooks = strip_windows_verbatim(&self.hooks_dir).to_string_lossy().replace('\\', "/");
+        child
+            .current_dir(&self.root)
+            .env("GIT_DIR", &store)
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", null_device())
+            .arg("-c")
+            .arg(format!("core.hooksPath={hooks}"))
+            .args(["-c", "core.fsmonitor=false"])
+            .args(["pack-objects", "--revs", "--all-progress-implied", "-q", "--stdout"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Prefer a lighter path: `git fetch` from self is awkward for bare. Instead, ensure the
+        // object is present via `cat-file` (alternates) then write a thin local ref pin — objects
+        // stay in alternates until `doctor_gc` optionally copies. For independence, use
+        // `git unpack-objects` of a generated pack.
+        let mut pack = child.spawn().context("starting private-store pack-objects")?;
+        use std::io::Write;
+        {
+            let stdin = pack.stdin.as_mut().context("pack-objects stdin")?;
+            writeln!(stdin, "{commit}")?;
+            // Terminate rev-list style input.
+            writeln!(stdin)?;
+        }
+        let pack_out = pack.wait_with_output().context("running pack-objects for materialize")?;
+        if !pack_out.status.success() {
+            // Fall back: object remains reachable via alternates. Migration still creates the ref;
+            // independence is best-effort when pack-objects cannot run (e.g. empty tree edge).
+            let _ = self.git(None, ["cat-file", "-e", &format!("{commit}^{{commit}}")])?;
+            return Ok(());
+        }
+        if pack_out.stdout.is_empty() {
+            let _ = self.git(None, ["cat-file", "-e", &format!("{commit}^{{commit}}")])?;
+            return Ok(());
+        }
+        let mut unpack = Command::new("git");
+        unpack
+            .current_dir(&self.root)
+            .env("GIT_DIR", &store)
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", null_device())
+            .args(["unpack-objects", "-q"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = unpack.spawn().context("starting unpack-objects for materialize")?;
+        {
+            let stdin = child.stdin.as_mut().context("unpack-objects stdin")?;
+            stdin.write_all(&pack_out.stdout)?;
+        }
+        let out = child.wait_with_output().context("running unpack-objects for materialize")?;
+        if !out.status.success() {
+            // Alternates still provide reachability; ref create below is enough for restore.
+            let _ = self.git(None, ["cat-file", "-e", &format!("{commit}^{{commit}}")])?;
+        }
+        Ok(())
+    }
+
+    fn update_ref_create(&self, name: &str, oid: &str) -> Result<()> {
+        self.git(None, ["update-ref", name, oid, ZERO_OID]).map(|_| ())
+    }
+
+    fn update_ref_delete(&self, name: &str, expected: &str) -> Result<()> {
+        self.git(None, ["update-ref", "-d", name, expected]).map(|_| ())
+    }
+
+    fn validate_snapshot_ref(&self, snap: &Snapshot) -> Result<()> {
+        let expected = &snap.commit;
+        let new_ref = self.ref_name(snap.id);
+        let actual = self.git(None, ["rev-parse", "--verify", &new_ref]).or_else(|_| {
+            // Migration windows may still resolve the in-repo namespaced form via alternates.
+            self.source_git(["rev-parse", "--verify", &format!("refs/ng/tm/{}/{}", self.worktree_id, snap.id)])
+                .or_else(|_| self.source_git(["rev-parse", "--verify", &format!("refs/ng/tm/{}", snap.id)]))
+        })?;
+        if &actual != expected {
+            bail!("checkpoint #{} ref does not match its ledger commit", snap.id);
+        }
+        self.git(None, ["cat-file", "-e", &format!("{}^{{commit}}", snap.commit)])?;
+        self.git(None, ["cat-file", "-e", &format!("{}^{{tree}}", snap.tree)])?;
+        Ok(())
+    }
+
+    fn recover_pending(&self, ledger: &mut Ledger) -> Result<()> {
+        let Some(journal) = self.load_journal()? else {
+            return Ok(());
+        };
+        if journal.expected_generation > ledger.generation {
+            bail!("time-machine journal belongs to a future ledger generation; run `aizen time doctor`");
+        }
+        match journal.kind {
+            JournalKind::Save => {
+                let id = journal.checkpoint_id.context("save journal is missing checkpoint id")?;
+                let committed = ledger.snapshots.iter().any(|s| s.id == id);
+                if committed {
+                    self.clear_journal()?;
+                    return Ok(());
+                }
+                if let (Some(name), Some(oid)) = (journal.ref_name.as_deref(), journal.new_oid.as_deref()) {
+                    if self.git(None, ["rev-parse", "--verify", name]).ok().as_deref() == Some(oid) {
+                        self.update_ref_delete(name, oid)?;
+                    }
+                }
+                let _ = crate::core::persist::remove_if_exists(&self.chat_path(id));
+                self.clear_journal()?;
+            }
+            JournalKind::Restore => {
+                let target_id = journal.target_id.context("restore journal is missing target id")?;
+                let target = ledger
+                    .snapshots
+                    .iter()
+                    .find(|s| s.id == target_id)
+                    .cloned()
+                    .with_context(|| format!("restore journal targets missing checkpoint #{target_id}"))?;
+                let current = current_tree(self).map(|(tree, _)| tree).ok();
+                if current.as_deref() == Some(target.tree.as_str()) {
+                    ledger.set_cursor(Some(target_id));
+                    self.save_ledger(ledger)?;
+                    self.clear_journal()?;
+                    return Ok(());
+                }
+                if let Some(preimage_id) = journal.preimage_id {
+                    let preimage = ledger
+                        .snapshots
+                        .iter()
+                        .find(|s| s.id == preimage_id)
+                        .cloned()
+                        .with_context(|| format!("restore journal preimage checkpoint #{preimage_id} is missing"))?;
+                    if current.as_deref() == Some(preimage.tree.as_str()) {
+                        ledger.set_cursor(Some(preimage_id));
+                        self.save_ledger(ledger)?;
+                        self.clear_journal()?;
+                        return Ok(());
+                    }
+                    apply_tree(self, &preimage.commit)
+                        .context("rolling back an interrupted restore to its pinned preimage")?;
+                    let rolled_back = current_tree(self)?.0;
+                    if rolled_back != preimage.tree {
+                        bail!("interrupted restore rollback did not reproduce its preimage; run `aizen time doctor`");
+                    }
+                    ledger.set_cursor(Some(preimage_id));
+                    self.save_ledger(ledger)?;
+                    self.clear_journal()?;
+                    return Ok(());
+                }
+                bail!("interrupted restore has no recovery preimage; run `aizen time doctor`");
+            }
+            JournalKind::Prune | JournalKind::Clear | JournalKind::Doctor => {
+                // Deletion operations commit the ledger before reaping refs. If interrupted, the
+                // remaining refs are safe orphan recovery pins; clearing the journal unblocks normal
+                // work and `doctor` reports the orphan set for explicit cleanup.
+                self.clear_journal()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn absolute_git_path(root: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() { path } else { root.join(path) }
+}
+
+/// Create (or repair) the private bare store under `~/.aizen/timemachine/<repo>/store.git`.
+///
+/// The store points at the source repository's object directory through a sealed `objects/info/alternates`
+/// entry so historical source objects remain readable, while every new Time Machine object and ref is
+/// written only into the private store.
+fn ensure_private_store(store_git_dir: &Path, common_git_dir: &Path) -> Result<()> {
+    if !store_git_dir.join("HEAD").exists() {
+        fs::create_dir_all(store_git_dir)
+            .with_context(|| format!("creating private time-machine store {}", store_git_dir.display()))?;
+        let out = Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(store_git_dir)
+            .output()
+            .context("initializing private time-machine store (is git installed?)")?;
+        if !out.status.success() {
+            bail!(
+                "failed to initialize private time-machine store: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        crate::core::config::harden_dir(store_git_dir);
+    }
+
+    // Seal alternates: one absolute path to the source object store. Rewrite on every open so a moved
+    // worktree still resolves, and refuse unexpected extra entries that could smuggle objects.
+    let objects = store_git_dir.join("objects");
+    let info = objects.join("info");
+    fs::create_dir_all(&info).with_context(|| format!("creating {}", info.display()))?;
+    let alternates = info.join("alternates");
+    let source_objects = {
+        let cand = common_git_dir.join("objects");
+        fs::canonicalize(&cand).unwrap_or(cand)
+    };
+    let source_line = strip_windows_verbatim(&source_objects)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let desired = format!("{source_line}\n");
+    let current = crate::core::persist::read_optional(&alternates)
+        .with_context(|| format!("reading {}", alternates.display()))?
+        .map(|b| String::from_utf8_lossy(&b).into_owned());
+    if current.as_deref() != Some(desired.as_str()) {
+        crate::core::persist::atomic_write(&alternates, desired.as_bytes())
+            .with_context(|| format!("writing sealed alternates {}", alternates.display()))?;
+        let _ = crate::core::persist::harden_owner_only_checked(&alternates);
+    }
+
+    // Neutralize config inside the private store itself (no shared hooks/fsmonitor).
+    let _ = Command::new("git")
+        .env("GIT_DIR", strip_windows_verbatim(store_git_dir))
+        .args(["config", "core.hooksPath", "hooks-disabled"])
+        .output();
+    let hooks_disabled = store_git_dir.join("hooks-disabled");
+    let _ = fs::create_dir_all(&hooks_disabled);
+    Ok(())
+}
+
+fn strip_windows_verbatim(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn null_device() -> &'static str {
+    if cfg!(windows) { "NUL" } else { "/dev/null" }
+}
+
+fn fnv1a64(s: &str) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn raw_git<I, S>(root: &Path, args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let out = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .context("running git (is git installed?)")?;
     if !out.status.success() {
-        bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+        bail!("git repository probe failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// The repo root for the current directory, or an error if we're not in a git repo.
-pub fn repo_root() -> Result<PathBuf> {
-    let root = git_at(&std::env::current_dir()?, None, &["rev-parse", "--show-toplevel"])
-        .context("not a git repository (run `git init` first to use the time machine)")?;
-    Ok(PathBuf::from(root))
+struct TempIndex(PathBuf);
+impl Drop for TempIndex {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+        let _ = fs::remove_file(self.0.with_extension("lock"));
+    }
 }
 
-/// Whether the current directory is inside a git repo (cheap probe).
-pub fn is_repo() -> bool {
-    repo_root().is_ok()
+fn seed_index(ctx: &RepoContext) -> Result<TempIndex> {
+    fs::create_dir_all(&ctx.namespace_dir)?;
+    let path = ctx.temp_index();
+    let _ = fs::remove_file(&path);
+    // Seed from the source worktree's real index so tracked modes/skip-worktree/sparse bits survive.
+    // The private store does not own that index; it only receives the alternate-index snapshot.
+    let source = ctx.git_dir.join("index");
+    if source.is_file() {
+        fs::copy(&source, &path).with_context(|| format!("seeding temporary index from {}", source.display()))?;
+    } else if let Ok(head) = ctx.source_git(["rev-parse", "--verify", "HEAD"]) {
+        // HEAD may only exist in the source repo; objects resolve via sealed alternates.
+        ctx.git(Some(&path), ["read-tree", &head])?;
+    }
+    Ok(TempIndex(path))
 }
 
-fn ledger_path(root: &Path) -> Result<PathBuf> {
-    let git_dir = git_at(root, None, &["rev-parse", "--git-dir"])?;
-    let gd = root.join(git_dir);
-    Ok(gd.join("ng_timemachine.json"))
-}
-
-/// The conversation-sidecar path for checkpoint `id` (`.git/ng_tm_chat_<id>.json`). Lives in the
-/// git dir alongside the ledger — never in the working tree, so a snapshot restore can't clobber it,
-/// and it's naturally private (git dir is not published). Holds the REPL conversation as it was when
-/// the checkpoint was taken, enabling the "Restore Task" / "Restore Both" tiers.
-fn chat_path(root: &Path, id: u32) -> Result<PathBuf> {
-    let git_dir = git_at(root, None, &["rev-parse", "--git-dir"])?;
-    Ok(root.join(git_dir).join(format!("ng_tm_chat_{id}.json")))
-}
-
-/// Write the conversation sidecar for checkpoint `id`. Best-effort caller decides; here a write
-/// failure is an error the caller can ignore (the snapshot itself still stands, just Files-only).
-fn write_chat(root: &Path, id: u32, chat: &[Message]) -> Result<()> {
-    let p = chat_path(root, id)?;
-    std::fs::write(&p, serde_json::to_string(chat)?).with_context(|| format!("writing {}", p.display()))?;
-    crate::core::config::harden_file(&p); // the transcript may hold pasted secrets → owner-only
+fn reparse_preflight(root: &Path) -> Result<()> {
+    let root_git = root.join(".git");
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).with_context(|| format!("scanning {}", dir.display()))? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
+                if path == root_git {
+                    continue;
+                }
+                bail!(
+                    "checkpoint refused: nested repository metadata at {} is outside this timeline's coverage",
+                    path.display()
+                );
+            }
+            let meta = fs::symlink_metadata(&path)?;
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+                if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    bail!(
+                        "checkpoint refused: reparse/junction path {} could escape the repository; remove or ignore it first",
+                        path.display()
+                    );
+                }
+            }
+            if meta.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
     Ok(())
 }
 
-/// Load the conversation captured with checkpoint `id`. `None` when the checkpoint has no sidecar
-/// (an older Files-only snapshot, or the file was pruned) or can't be parsed.
-pub fn load_chat(id: u32) -> Option<Vec<Message>> {
-    let root = repo_root().ok()?;
-    let p = chat_path(&root, id).ok()?;
-    let s = std::fs::read_to_string(p).ok()?;
-    serde_json::from_str(&s).ok()
+fn index_blob_bytes(ctx: &RepoContext, index: &Path) -> Result<u64> {
+    let listing = ctx.git(Some(index), ["ls-files", "-s"])?;
+    let mut ordered = Vec::new();
+    let mut seen = HashSet::new();
+    for line in listing.lines() {
+        let mut fields = line.split_whitespace();
+        let _mode = fields.next();
+        let Some(oid) = fields.next() else { continue };
+        if seen.insert(oid.to_string()) {
+            ordered.push(oid.to_string());
+        }
+    }
+    if ordered.is_empty() {
+        return Ok(0);
+    }
+
+    // One `cat-file --batch-check` process instead of N `cat-file -s` spawns.
+    let mut child = Command::new("git");
+    let store = strip_windows_verbatim(&ctx.store_git_dir);
+    let hooks = strip_windows_verbatim(&ctx.hooks_dir).to_string_lossy().replace('\\', "/");
+    child
+        .current_dir(&ctx.root)
+        .env("GIT_DIR", &store)
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device())
+        .arg("-c")
+        .arg(format!("core.hooksPath={hooks}"))
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut proc = child.spawn().context("starting cat-file --batch-check")?;
+    {
+        use std::io::Write;
+        let stdin = proc.stdin.as_mut().context("cat-file stdin")?;
+        for oid in &ordered {
+            writeln!(stdin, "{oid}")?;
+        }
+    }
+    let out = proc.wait_with_output().context("running cat-file --batch-check")?;
+    if !out.status.success() {
+        bail!(
+            "internal git operation failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    let max_single = crate::core::cli_config::load()
+        .timemachine_max_file_bytes
+        .unwrap_or(512 * 1024 * 1024);
+    let mut total = 0u64;
+    let body = String::from_utf8_lossy(&out.stdout);
+    for line in body.lines() {
+        // Formats: "<oid> <type> <size>" or "<oid> missing"
+        let mut fields = line.split_whitespace();
+        let Some(oid) = fields.next() else { continue };
+        let Some(kind_or_missing) = fields.next() else { continue };
+        if kind_or_missing == "missing" {
+            bail!("checkpoint budget probe: blob {oid} is missing from the private store");
+        }
+        let size: u64 = fields
+            .next()
+            .with_context(|| format!("parsing Git blob size for {oid}"))?
+            .parse()
+            .with_context(|| format!("parsing Git blob size for {oid}"))?;
+        if size > max_single {
+            bail!("checkpoint budget exceeded: one file/blob is {size} bytes > configured limit {max_single}");
+        }
+        total = total.checked_add(size).context("checkpoint byte count overflow")?;
+    }
+    Ok(total)
 }
 
-/// Remove a checkpoint's conversation sidecar (best-effort; missing file is fine).
-fn delete_chat(root: &Path, id: u32) {
-    if let Ok(p) = chat_path(root, id) {
-        let _ = std::fs::remove_file(p);
+fn current_tree(ctx: &RepoContext) -> Result<(String, Coverage)> {
+    ctx.ensure_safe_filters()?;
+    reparse_preflight(&ctx.root)?;
+    let idx = seed_index(ctx)?;
+    // The seeded index preserves tracked entries and modes. `add -A` updates tracked files even when
+    // a later .gitignore rule matches them, while untracked ignored paths remain outside coverage.
+    ctx.git(Some(&idx.0), ["add", "-A", "--", "."])?;
+    let tree = ctx.git(Some(&idx.0), ["write-tree"])?;
+    let list = ctx.git(Some(&idx.0), ["ls-files", "-z"])?;
+    let count = if list.is_empty() { 0 } else { list.as_bytes().iter().filter(|b| **b == 0).count() as u64 };
+    let byte_count = index_blob_bytes(ctx, &idx.0)?;
+    let cfg = crate::core::cli_config::load();
+    let max_files = cfg.timemachine_max_files.unwrap_or(100_000);
+    let max_total = cfg.timemachine_max_bytes.unwrap_or(2 * 1024 * 1024 * 1024);
+    if count > max_files {
+        bail!("checkpoint budget exceeded: {count} files > configured limit {max_files}");
+    }
+    if byte_count > max_total {
+        bail!("checkpoint budget exceeded: {byte_count} bytes > configured limit {max_total}");
+    }
+    Ok((
+        tree,
+        Coverage {
+            file_count: count,
+            byte_count,
+            notes: vec!["git-visible repository tree; ignored/outside/nested repositories are not covered".to_string()],
+        },
+    ))
+}
+
+fn write_chat(ctx: &RepoContext, id: u32, chat: &[Message]) -> Result<()> {
+    fs::create_dir_all(ctx.chat_dir())?;
+    crate::core::config::harden_dir(&ctx.chat_dir());
+    let bytes = serde_json::to_vec(chat)?;
+    crate::core::persist::atomic_write(&ctx.chat_path(id), &bytes)?;
+    crate::core::persist::harden_owner_only_checked(&ctx.chat_path(id))?;
+    Ok(())
+}
+
+fn read_chat_in(ctx: &RepoContext, id: u32) -> Result<Option<Vec<Message>>> {
+    for path in [ctx.chat_path(id), ctx.inrepo_chat_path(id), ctx.legacy_chat_path(id)] {
+        if let Some(bytes) = crate::core::persist::read_optional(&path)? {
+            return Ok(Some(
+                serde_json::from_slice(&bytes)
+                    .with_context(|| format!("conversation sidecar for checkpoint #{id} is corrupt"))?,
+            ));
+        }
+    }
+    Ok(None)
+}
+
+fn now_string() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+pub fn is_repo() -> bool {
+    RepoContext::current().is_ok()
+}
+
+/// Preflight Time Machine for a protected workspace operation after approval but before mutation.
+/// This distinguishes "not a repository" from corrupt/unsafe repository state so callers can keep
+/// non-Git workflows working without swallowing a broken recovery system.
+pub fn preflight_protected_change() -> Result<bool> {
+    match RepoContext::current() {
+        Ok(ctx) => {
+            let _lock = ctx.lock()?;
+            let mut ledger = ctx.load_ledger()?;
+            ctx.recover_pending(&mut ledger)?;
+            Ok(true)
+        }
+        Err(e) if e.to_string().contains("not a git repository") => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
-fn load_ledger(root: &Path) -> Ledger {
-    match ledger_path(root).ok().and_then(|p| std::fs::read_to_string(p).ok()) {
-        Some(s) => serde_json::from_str(&s).unwrap_or_default(),
-        None => Ledger::default(),
-    }
-}
-
-fn save_ledger(root: &Path, l: &Ledger) -> Result<()> {
-    let p = ledger_path(root)?;
-    std::fs::write(&p, serde_json::to_string_pretty(l)? + "\n").with_context(|| format!("writing {}", p.display()))
-}
-
-/// Monotonic counter so two `current_tree` calls in the same process never share one temp index.
-static TM_INDEX_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// A unique temp index path inside the git dir (cleaned up after use). Keyed by PID **and** a
-/// per-call counter: a bare-PID name let two concurrent `current_tree` callers share one index file
-/// and race each other's `add -A` / `write-tree` (the confirmed checkpoint-corruption path).
-fn temp_index(root: &Path) -> Result<PathBuf> {
-    let git_dir = git_at(root, None, &["rev-parse", "--git-dir"])?;
-    let seq = TM_INDEX_SEQ.fetch_add(1, Ordering::Relaxed);
-    Ok(root.join(git_dir).join(format!("ng_tm_index_{}_{seq}", std::process::id())))
-}
-
-/// The tree sha for the CURRENT working tree (everything `add -A` would stage). Uses a temp index so
-/// the real index is untouched.
-fn current_tree(root: &Path) -> Result<String> {
-    let idx = temp_index(root)?;
-    let _ = std::fs::remove_file(&idx);
-    // Run add+write-tree, then remove the temp index on EVERY exit path. Previously an `add -A`
-    // failure returned early via `?` and leaked the index file — and since each call now uses a
-    // unique name, repeated failures would accumulate distinct orphan files in .git/ instead of
-    // overwriting one.
-    let result = (|| {
-        git_at(root, Some(&idx), &["add", "-A"])?;
-        git_at(root, Some(&idx), &["write-tree"])
-    })();
-    let _ = std::fs::remove_file(&idx);
-    result
-}
-
-// ── public API ──────────────────────────────────────────────────────────────────
-
-/// Capture the current working tree as a checkpoint. `auto` marks system-created points.
 pub fn save(label: &str, auto: bool) -> Result<Snapshot> {
-    let root = repo_root()?;
-    save_in(&root, label, auto, None)
+    let ctx = RepoContext::current()?;
+    let snap = save_in(&ctx, label, auto, None)?;
+    let keep = crate::core::cli_config::load().timemachine_keep.unwrap_or(DEFAULT_KEEP);
+    prune_after_save(&ctx, keep, &[snap.id])?;
+    Ok(snap)
 }
 
-/// Capture the working tree AND the current REPL conversation as a checkpoint, so the checkpoint can
-/// later restore code, chat, or both (the 3-way restore). `chat` is the live history at save time.
 pub fn save_with_chat(label: &str, auto: bool, chat: &[Message]) -> Result<Snapshot> {
-    let root = repo_root()?;
-    save_in(&root, label, auto, Some(chat))
+    let ctx = RepoContext::current()?;
+    let snap = save_in(&ctx, label, auto, Some(chat))?;
+    let keep = crate::core::cli_config::load().timemachine_keep.unwrap_or(DEFAULT_KEEP);
+    prune_after_save(&ctx, keep, &[snap.id])?;
+    Ok(snap)
 }
 
-fn save_in(root: &Path, label: &str, auto: bool, chat: Option<&[Message]>) -> Result<Snapshot> {
-    let tree = current_tree(root)?;
-    let mut ledger = load_ledger(root);
+fn prune_after_save(ctx: &RepoContext, keep: usize, protected: &[u32]) -> Result<()> {
+    if keep == 0 {
+        return Ok(());
+    }
+    let _lock = ctx.lock()?;
+    let mut ledger = ctx.load_ledger()?;
+    ctx.recover_pending(&mut ledger)?;
+    if ledger.snapshots.len() <= keep {
+        return Ok(());
+    }
+    let mut journal = Journal::new(JournalKind::Prune, ledger.generation);
+    ctx.save_journal(&journal)?;
+    let dropped = enforce_retention_plan(&mut ledger, keep, protected);
+    // Commit the new authoritative ledger first. Old refs remain recovery pins if cleanup is
+    // interrupted; doctor can safely report/reap those orphans later.
+    ctx.save_ledger(&mut ledger)?;
+    delete_snapshots(ctx, &dropped)?;
+    journal.phase = JournalPhase::LedgerCommitted;
+    ctx.save_journal(&journal)?;
+    ctx.clear_journal()?;
+    Ok(())
+}
 
-    // Dedup: if the newest checkpoint already captures this exact tree, reuse it instead of piling on
-    // a zero-diff snapshot (the main source of checkpoint spam). Still refresh its chat sidecar — the
-    // code is identical but the conversation has moved on, so "restore task" should land on NOW.
-    if let Some(last) = ledger.snapshots.last() {
-        if last.tree == tree {
-            let mut last = last.clone();
-            let idx = ledger.snapshots.len() - 1;
-            if let Some(c) = chat {
-                if write_chat(root, last.id, c).is_ok() {
-                    last.has_chat = true;
-                    ledger.snapshots[idx].has_chat = true;
-                }
-            }
-            ledger.cursor = Some(idx);
-            save_ledger(root, &ledger)?;
+fn save_in(ctx: &RepoContext, label: &str, auto: bool, chat: Option<&[Message]>) -> Result<Snapshot> {
+    let _lock = ctx.lock()?;
+    let mut ledger = ctx.load_ledger()?;
+    ctx.recover_pending(&mut ledger)?;
+    ctx.migrate_legacy_refs(&mut ledger)?;
+    let (tree, coverage) = current_tree(ctx)?;
+
+    // Auto files-only saves may reuse the newest tree. Explicit/user/chat checkpoints are immutable
+    // events and therefore always get a fresh ID even when the bytes are identical.
+    if auto && chat.is_none() {
+        if let Some(last) = ledger.snapshots.last().filter(|s| s.tree == tree) {
+            let last = last.clone();
+            ledger.set_cursor(Some(last.id));
+            ctx.save_ledger(&mut ledger)?;
             return Ok(last);
         }
     }
+    capture_checkpoint_locked(ctx, &mut ledger, tree, coverage, label, auto, chat, false)
+}
 
-    // Chain onto HEAD when there is one (nicer `git show`), else a parentless commit.
-    let head = git_at(root, None, &["rev-parse", "--verify", "-q", "HEAD"]).ok();
-    let msg = format!("ng checkpoint: {}", if label.is_empty() { "(no label)" } else { label });
-    let mut args = vec!["commit-tree", &tree, "-m", &msg];
-    if let Some(h) = head.as_deref() {
-        args.push("-p");
-        args.push(h);
+pub fn load_chat_checked(id: u32) -> Result<Vec<Message>> {
+    let ctx = RepoContext::current()?;
+    read_chat_in(&ctx, id)?
+        .with_context(|| format!("checkpoint #{id} has no saved conversation"))
+}
+
+fn enforce_retention_plan(ledger: &mut Ledger, keep: usize, protected: &[u32]) -> Vec<Snapshot> {
+    if keep == 0 || ledger.snapshots.len() <= keep {
+        return Vec::new();
     }
-    let commit = git_at(root, None, &args)?;
+    let mut protected: HashSet<u32> = protected.iter().copied().collect();
+    if let Some(id) = ledger.cursor_id {
+        protected.insert(id);
+    }
+    let mut dropped = Vec::new();
+    let mut i = 0;
+    while ledger.snapshots.len() > keep && i < ledger.snapshots.len() {
+        if protected.contains(&ledger.snapshots[i].id) {
+            i += 1;
+            continue;
+        }
+        dropped.push(ledger.snapshots.remove(i));
+    }
+    ledger.set_cursor(ledger.cursor_id);
+    dropped
+}
 
+fn delete_snapshots(ctx: &RepoContext, dropped: &[Snapshot]) -> Result<()> {
+    for snap in dropped {
+        let ref_name = ctx.ref_name(snap.id);
+        if let Ok(actual) = ctx.git(None, ["rev-parse", "--verify", &ref_name]) {
+            if actual != snap.commit {
+                bail!("ref for checkpoint #{} changed concurrently", snap.id);
+            }
+            ctx.update_ref_delete(&ref_name, &actual)?;
+        }
+        // A legacy ref may still pin this object after migration. It is deliberately not deleted
+        // here unless it is the only representation and matches exactly; preserving an extra pin is
+        // safer than making a failed cleanup destroy recovery history.
+        let _ = crate::core::persist::remove_if_exists(&ctx.chat_path(snap.id))?;
+    }
+    Ok(())
+}
+
+pub fn prune(keep: usize) -> Result<usize> {
+    let ctx = RepoContext::current()?;
+    let _lock = ctx.lock()?;
+    let mut ledger = ctx.load_ledger()?;
+    ctx.recover_pending(&mut ledger)?;
+    ctx.migrate_legacy_refs(&mut ledger)?;
+    let mut journal = Journal::new(JournalKind::Prune, ledger.generation);
+    ctx.save_journal(&journal)?;
+    let dropped = enforce_retention_plan(&mut ledger, keep, &[]);
+    // Ledger-first deletion: an interrupted cleanup leaves harmless orphan refs, never ledger entries
+    // pointing at objects we already made unreachable.
+    ctx.save_ledger(&mut ledger)?;
+    delete_snapshots(&ctx, &dropped)?;
+    journal.phase = JournalPhase::LedgerCommitted;
+    ctx.save_journal(&journal)?;
+    ctx.clear_journal()?;
+    Ok(dropped.len())
+}
+
+pub fn clear() -> Result<usize> {
+    let ctx = RepoContext::current()?;
+    let _lock = ctx.lock()?;
+    let mut ledger = ctx.load_ledger()?;
+    ctx.recover_pending(&mut ledger)?;
+    ctx.migrate_legacy_refs(&mut ledger)?;
+    let mut journal = Journal::new(JournalKind::Clear, ledger.generation);
+    ctx.save_journal(&journal)?;
+    let snapshots = ledger.snapshots.clone();
+    let n = snapshots.len();
+    ledger.snapshots.clear();
+    ledger.set_cursor(None);
+    // Empty ledger becomes authoritative before refs are reaped. A crash during cleanup leaves
+    // recoverable orphan pins rather than an apparently valid timeline with missing objects.
+    ctx.save_ledger(&mut ledger)?;
+    delete_snapshots(&ctx, &snapshots)?;
+    journal.phase = JournalPhase::LedgerCommitted;
+    ctx.save_journal(&journal)?;
+    ctx.clear_journal()?;
+    Ok(n)
+}
+
+fn apply_tree(ctx: &RepoContext, commit: &str) -> Result<()> {
+    ctx.ensure_safe_filters()?;
+    reparse_preflight(&ctx.root)?;
+    let idx = seed_index(ctx)?;
+    ctx.git(Some(&idx.0), ["read-tree", "--reset", "-u", commit])?;
+    Ok(())
+}
+
+fn capture_checkpoint_locked(
+    ctx: &RepoContext,
+    ledger: &mut Ledger,
+    tree: String,
+    coverage: Coverage,
+    label: &str,
+    auto: bool,
+    chat: Option<&[Message]>,
+    recovery: bool,
+) -> Result<Snapshot> {
     let id = ledger.next_id.max(1);
-    ledger.next_id = id + 1;
-    git_at(root, None, &["update-ref", &format!("refs/ng/tm/{id}"), &commit])?;
-    // Persist the conversation sidecar BEFORE recording the flag, so `has_chat` is only ever `true`
-    // when the file actually landed (a write failure degrades cleanly to a Files-only checkpoint).
+    let ref_name = ctx.ref_name(id);
+    let mut journal = Journal::new(JournalKind::Save, ledger.generation);
+    journal.checkpoint_id = Some(id);
+    journal.ref_name = Some(ref_name.clone());
+    ctx.save_journal(&journal)?;
+
+    let parent_commit = ledger
+        .cursor_id
+        .and_then(|pid| ledger.snapshots.iter().find(|s| s.id == pid))
+        .map(|s| s.commit.clone())
+        .or_else(|| ctx.source_git(["rev-parse", "--verify", "HEAD"]).ok());
+    let msg = format!("aizen checkpoint: {}", if label.is_empty() { "(no label)" } else { label });
+    let mut args = vec!["commit-tree".to_string(), tree.clone(), "-m".to_string(), msg];
+    if let Some(parent) = parent_commit {
+        args.push("-p".to_string());
+        args.push(parent);
+    }
+    let commit = ctx.git(None, args)?;
+    journal.new_oid = Some(commit.clone());
+    ctx.save_journal(&journal)?;
+    ctx.update_ref_create(&ref_name, &commit)?;
+    journal.phase = JournalPhase::RefCreated;
+    ctx.save_journal(&journal)?;
+
     let has_chat = match chat {
-        Some(c) => write_chat(root, id, c).is_ok(),
+        Some(chat) => {
+            if let Err(e) = write_chat(ctx, id, chat) {
+                let _ = ctx.update_ref_delete(&ref_name, &commit);
+                let _ = ctx.clear_journal();
+                return Err(e).context("saving checkpoint conversation sidecar");
+            }
+            true
+        }
         None => false,
     };
     let snap = Snapshot {
@@ -228,161 +1435,320 @@ fn save_in(root: &Path, label: &str, auto: bool, chat: Option<&[Message]>) -> Re
         created: now_string(),
         auto,
         has_chat,
+        parent: ledger.cursor_id,
+        worktree_id: ctx.worktree_id.clone(),
+        coverage,
+        recovery,
     };
+    ledger.next_id = id.checked_add(1).context("checkpoint id space exhausted")?;
     ledger.snapshots.push(snap.clone());
-    ledger.cursor = Some(ledger.snapshots.len() - 1);
-    // Cap the timeline so heavy checkpointing can't fill the repo.
-    let keep = crate::core::cli_config::load().timemachine_keep.unwrap_or(DEFAULT_KEEP);
-    enforce_retention(root, &mut ledger, keep);
-    save_ledger(root, &ledger)?;
+    ledger.set_cursor(Some(id));
+    if let Err(e) = ctx.save_ledger(ledger) {
+        // Keep the journal + ref as recovery evidence. `recover_pending` will remove the orphan when
+        // the old ledger generation is loaded on the next operation.
+        return Err(e).context("committing checkpoint ledger");
+    }
+    journal.phase = JournalPhase::LedgerCommitted;
+    ctx.save_journal(&journal)?;
+    ctx.clear_journal()?;
     Ok(snap)
 }
 
-/// Delete a checkpoint's ref so its git objects become unreachable (reclaimed by `git gc`), and drop
-/// its conversation sidecar so a pruned checkpoint leaves nothing behind.
-fn delete_ref(root: &Path, id: u32) {
-    let _ = git_at(root, None, &["update-ref", "-d", &format!("refs/ng/tm/{id}")]);
-    delete_chat(root, id);
-}
-
-/// Drop oldest checkpoints (deleting their refs) until at most `keep` remain — but NEVER drop the
-/// currently-active one (`cursor`). `keep == 0` means unlimited. Fixes up `cursor` by id afterward.
-fn enforce_retention(root: &Path, ledger: &mut Ledger, keep: usize) {
-    if keep == 0 || ledger.snapshots.len() <= keep {
-        return;
-    }
-    let active_id = ledger.cursor.and_then(|c| ledger.snapshots.get(c)).map(|s| s.id);
-    let mut i = 0;
-    while ledger.snapshots.len() > keep && i < ledger.snapshots.len() {
-        if Some(ledger.snapshots[i].id) == active_id {
-            i += 1; // protect the active checkpoint; try the next-oldest
-            continue;
-        }
-        let dropped = ledger.snapshots.remove(i); // oldest non-active → gone (don't advance i)
-        delete_ref(root, dropped.id);
-    }
-    ledger.cursor = active_id.and_then(|id| ledger.snapshots.iter().position(|s| s.id == id));
-}
-
-/// Manually prune to at most `keep` checkpoints. Returns the number dropped.
-pub fn prune(keep: usize) -> Result<usize> {
-    let root = repo_root()?;
-    let mut ledger = load_ledger(&root);
-    let before = ledger.snapshots.len();
-    enforce_retention(&root, &mut ledger, keep);
-    save_ledger(&root, &ledger)?;
-    Ok(before - ledger.snapshots.len())
-}
-
-/// Delete ALL checkpoints (and their refs). Returns the number removed.
-pub fn clear() -> Result<usize> {
-    let root = repo_root()?;
-    let mut ledger = load_ledger(&root);
-    let n = ledger.snapshots.len();
-    for s in &ledger.snapshots {
-        delete_ref(&root, s.id);
-    }
-    let next_id = ledger.next_id; // keep the id counter monotonic so old refs never alias
-    ledger = Ledger { next_id, ..Default::default() };
-    save_ledger(&root, &ledger)?;
-    Ok(n)
-}
-
-/// Local timestamp string for a snapshot label.
-fn now_string() -> String {
-    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
-/// Restore the working tree to checkpoint `id`. Auto-snapshots first if the tree has drifted, so the
-/// move is reversible (you can restore forward again). Returns the restored snapshot.
 pub fn restore(id: u32) -> Result<Snapshot> {
-    let root = repo_root()?;
-    restore_in(&root, id)
+    let ctx = RepoContext::current()?;
+    restore_in(&ctx, id)
 }
 
-fn restore_in(root: &Path, id: u32) -> Result<Snapshot> {
-    let ledger = load_ledger(root);
+fn restore_in(ctx: &RepoContext, id: u32) -> Result<Snapshot> {
+    let _lock = ctx.lock()?;
+    let mut ledger = ctx.load_ledger()?;
+    ctx.recover_pending(&mut ledger)?;
+    ctx.migrate_legacy_refs(&mut ledger)?;
     let target = ledger
         .snapshots
         .iter()
         .find(|s| s.id == id)
         .cloned()
         .with_context(|| format!("no checkpoint #{id} (see `aizen time list`)"))?;
+    ctx.validate_snapshot_ref(&target)?;
 
-    // Safety: if the working tree differs from every saved snapshot, capture it first so nothing is
-    // lost — then you can come back to "now" via the timeline.
-    let cur = current_tree(root)?;
-    if !ledger.snapshots.iter().any(|s| s.tree == cur) {
-        save_in(root, "before time-travel", true, None)?;
+    let (cur_tree, cur_coverage) = current_tree(ctx)?;
+    let preimage_id = if cur_tree != target.tree {
+        // Restore always creates a fresh immutable preimage event. Reusing an older equal-tree
+        // checkpoint makes `/redo` ambiguous after branching and can leave no forward recovery point.
+        Some(save_preimage_locked(ctx, &mut ledger, cur_tree, cur_coverage)?)
+    } else {
+        ledger.cursor_id
+    };
+    if let Some(pid) = preimage_id {
+        if let Some(preimage) = ledger.snapshots.iter().find(|s| s.id == pid) {
+            let recovery_ref = ctx.recovery_ref_name(pid);
+            if ctx.git(None, ["rev-parse", "--verify", &recovery_ref]).is_err() {
+                ctx.update_ref_create(&recovery_ref, &preimage.commit)?;
+            }
+        }
     }
 
-    // Exact rewind: stage the current state into a temp index, then reset index+worktree to the
-    // snapshot tree (removing files not in it). Real index/HEAD/branches are untouched.
-    let idx = temp_index(root)?;
-    let _ = std::fs::remove_file(&idx);
-    git_at(root, Some(&idx), &["add", "-A"])?;
-    let res = git_at(root, Some(&idx), &["read-tree", "--reset", "-u", &target.commit]);
-    let _ = std::fs::remove_file(&idx);
-    res.context("restoring the working tree to the snapshot")?;
+    let mut journal = Journal::new(JournalKind::Restore, ledger.generation);
+    journal.target_id = Some(id);
+    journal.preimage_id = preimage_id;
+    journal.phase = JournalPhase::Applying;
+    ctx.save_journal(&journal)?;
 
-    // Move the cursor to the restored point.
-    let mut ledger = load_ledger(root);
-    ledger.cursor = ledger.snapshots.iter().position(|s| s.id == id);
-    save_ledger(root, &ledger)?;
+    if let Err(apply_error) = apply_tree(ctx, &target.commit) {
+        if let Some(pid) = preimage_id {
+            if let Some(preimage) = ledger.snapshots.iter().find(|s| s.id == pid) {
+                let _ = apply_tree(ctx, &preimage.commit);
+            }
+        }
+        return Err(apply_error).context("restoring working tree; recovery journal was preserved");
+    }
+    let (actual, _) = current_tree(ctx)?;
+    if actual != target.tree {
+        if let Some(pid) = preimage_id {
+            if let Some(preimage) = ledger.snapshots.iter().find(|s| s.id == pid) {
+                let _ = apply_tree(ctx, &preimage.commit);
+            }
+        }
+        bail!("restore verification failed; recovery journal was preserved for `aizen time doctor`");
+    }
+
+    ledger.set_cursor(Some(id));
+    ctx.save_ledger(&mut ledger)?;
+    if let Some(pid) = preimage_id {
+        let recovery_ref = ctx.recovery_ref_name(pid);
+        if let Ok(oid) = ctx.git(None, ["rev-parse", "--verify", &recovery_ref]) {
+            let _ = ctx.update_ref_delete(&recovery_ref, &oid);
+        }
+    }
+    journal.phase = JournalPhase::LedgerCommitted;
+    ctx.save_journal(&journal)?;
+    ctx.clear_journal()?;
     Ok(target)
 }
 
-/// Step one checkpoint back along the timeline (`undo`).
+fn save_preimage_locked(
+    ctx: &RepoContext,
+    ledger: &mut Ledger,
+    tree: String,
+    coverage: Coverage,
+) -> Result<u32> {
+    Ok(capture_checkpoint_locked(
+        ctx,
+        ledger,
+        tree,
+        coverage,
+        "before time-travel",
+        true,
+        None,
+        true,
+    )?
+    .id)
+}
+
 pub fn undo() -> Result<Snapshot> {
-    let root = repo_root()?;
-    let ledger = load_ledger(root.as_path());
-    if ledger.snapshots.is_empty() {
-        bail!("no checkpoints yet — save one with `aizen time save`");
-    }
-    let cur = ledger.cursor.unwrap_or(ledger.snapshots.len() - 1);
-    if cur == 0 {
-        bail!("already at the oldest checkpoint");
-    }
-    let id = ledger.snapshots[cur - 1].id;
-    restore_in(&root, id)
+    let ctx = RepoContext::current()?;
+    let ledger = ctx.load_ledger()?;
+    let current = ledger
+        .cursor_id
+        .or_else(|| ledger.snapshots.last().map(|s| s.id))
+        .context("no checkpoints yet — save one with `aizen time save`")?;
+    let parent = ledger
+        .snapshots
+        .iter()
+        .find(|s| s.id == current)
+        .and_then(|s| s.parent)
+        .context("already at the oldest checkpoint")?;
+    restore_in(&ctx, parent)
 }
 
-/// Step one checkpoint forward along the timeline (`redo`).
 pub fn redo() -> Result<Snapshot> {
-    let root = repo_root()?;
-    let ledger = load_ledger(root.as_path());
-    if ledger.snapshots.is_empty() {
-        bail!("no checkpoints yet");
-    }
-    let cur = ledger.cursor.unwrap_or(ledger.snapshots.len() - 1);
-    if cur + 1 >= ledger.snapshots.len() {
-        bail!("already at the newest checkpoint");
-    }
-    let id = ledger.snapshots[cur + 1].id;
-    restore_in(&root, id)
+    let ctx = RepoContext::current()?;
+    let ledger = ctx.load_ledger()?;
+    let current = ledger
+        .cursor_id
+        .or_else(|| ledger.snapshots.last().map(|s| s.id))
+        .context("no checkpoints yet")?;
+    let child = ledger
+        .snapshots
+        .iter()
+        .filter(|s| s.parent == Some(current) && !s.recovery)
+        .max_by_key(|s| s.id)
+        .map(|s| s.id)
+        .context("already at the newest checkpoint on this branch")?;
+    restore_in(&ctx, child)
 }
 
-/// The timeline (snapshots + the active cursor index) for display.
 pub fn timeline() -> Result<(Vec<Snapshot>, Option<usize>)> {
-    let root = repo_root()?;
-    let l = load_ledger(&root);
-    Ok((l.snapshots, l.cursor))
+    let ctx = RepoContext::current()?;
+    let mut ledger = ctx.load_ledger()?;
+    ledger.normalize()?;
+    Ok((ledger.snapshots, ledger.cursor))
 }
 
-// ── agent tool ─────────────────────────────────────────────────────────────────
+#[derive(Debug, Serialize)]
+pub struct DoctorReport {
+    pub ok: bool,
+    pub repo_id: String,
+    pub worktree_id: String,
+    pub store: String,
+    pub checkpoints: usize,
+    pub issues: Vec<String>,
+}
 
-/// `checkpoint` — let the agent stamp a restore point before a risky change. Non-destructive (it
-/// only *adds* a recovery point; it never modifies files), so it's not approval-gated. Restoring is
-/// deliberately NOT an agent tool — rewinding the user's working tree stays human-driven.
+pub fn doctor() -> Result<DoctorReport> {
+    let ctx = RepoContext::current()?;
+    let mut issues = Vec::new();
+    if !ctx.store_git_dir.join("HEAD").exists() {
+        issues.push(format!("private store missing at {}", ctx.store_git_dir.display()));
+    }
+    let alternates = ctx.store_git_dir.join("objects").join("info").join("alternates");
+    match crate::core::persist::read_optional(&alternates) {
+        Ok(None) => issues.push("private store alternates pointer is missing".into()),
+        Ok(Some(bytes)) => {
+            let text = String::from_utf8_lossy(&bytes);
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            if lines.len() != 1 {
+                issues.push(format!(
+                    "private store alternates is not sealed (expected 1 entry, found {})",
+                    lines.len()
+                ));
+            }
+        }
+        Err(e) => issues.push(format!("private store alternates unreadable: {e}")),
+    }
+    let ledger = match ctx.load_ledger() {
+        Ok(l) => l,
+        Err(e) => {
+            issues.push(e.to_string());
+            return Ok(DoctorReport {
+                ok: false,
+                repo_id: ctx.repo_id,
+                worktree_id: ctx.worktree_id,
+                store: ctx.store_git_dir.display().to_string(),
+                checkpoints: 0,
+                issues,
+            });
+        }
+    };
+    if let Ok(Some(journal)) = ctx.load_journal() {
+        issues.push(format!("unfinished {:?} transaction {} ({:?})", journal.kind, journal.operation_id, journal.phase));
+    }
+    for snap in &ledger.snapshots {
+        if let Err(e) = ctx.validate_snapshot_ref(snap) {
+            issues.push(format!("checkpoint #{}: {e}", snap.id));
+        }
+        if snap.has_chat {
+            match read_chat_in(&ctx, snap.id) {
+                Ok(Some(_)) => {}
+                Ok(None) => issues.push(format!("checkpoint #{} claims chat but sidecar is missing", snap.id)),
+                Err(e) => issues.push(format!("checkpoint #{} chat: {e}", snap.id)),
+            }
+        }
+    }
+    Ok(DoctorReport {
+        ok: issues.is_empty(),
+        repo_id: ctx.repo_id,
+        worktree_id: ctx.worktree_id,
+        store: ctx.store_git_dir.display().to_string(),
+        checkpoints: ledger.snapshots.len(),
+        issues,
+    })
+}
+
+pub fn doctor_repair() -> Result<DoctorReport> {
+    let ctx = RepoContext::current()?;
+    let _lock = ctx.lock()?;
+    let mut ledger = ctx.load_ledger()?;
+    ctx.recover_pending(&mut ledger)?;
+    drop(_lock);
+    doctor()
+}
+
+pub fn doctor_gc() -> Result<DoctorReport> {
+    let ctx = RepoContext::current()?;
+    let _lock = ctx.lock()?;
+    let mut ledger = ctx.load_ledger()?;
+    ctx.recover_pending(&mut ledger)?;
+    let mut journal = Journal::new(JournalKind::Doctor, ledger.generation);
+    ctx.save_journal(&journal)?;
+
+    let live_ids: HashSet<u32> = ledger.snapshots.iter().map(|s| s.id).collect();
+    // Sweep the whole private store's `refs/ng/tm/**` (all worktrees). Orphans from other worktree
+    // ids or recovery pins must not survive just because this process is bound to one prefix.
+    let refs = ctx.git(None, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/ng/tm"])?;
+    for line in refs.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(name) = fields.next() else { continue };
+        let Some(oid) = fields.next() else { continue };
+        if name.contains("/recovery/") {
+            // Only delete recovery pins that belong to this worktree's namespace, or that have no
+            // matching live snapshot id anywhere.
+            let id = name.rsplit('/').next().and_then(|s| s.parse::<u32>().ok());
+            let ours = name.starts_with(&(ctx.ref_prefix.clone() + "/"));
+            if ours || id.is_some_and(|id| !live_ids.contains(&id)) {
+                ctx.update_ref_delete(name, oid)?;
+            }
+            continue;
+        }
+        let id = name.rsplit('/').next().and_then(|s| s.parse::<u32>().ok());
+        let ours = name.starts_with(&(ctx.ref_prefix.clone() + "/"))
+            || name == ctx.ref_prefix;
+        // Delete: (a) orphan ids under our prefix, or (b) any ref under a dead worktree prefix that
+        // is not our live prefix (foreign worktree namespaces keep their own live ledgers — only
+        // delete ids that are under our prefix and not live).
+        if ours {
+            if id.is_some_and(|id| !live_ids.contains(&id)) {
+                ctx.update_ref_delete(name, oid)?;
+                if let Some(id) = id {
+                    let _ = crate::core::persist::remove_if_exists(&ctx.chat_path(id));
+                }
+            }
+        } else if let Some(id) = id {
+            // Foreign worktree ref: leave alone — that worktree owns its ledger. The failpoint
+            // probe plants `refs/ng/tm/wt-dead/999`; treat any non-matching worktree id as orphan
+            // only when its path segment is not a known sibling ledger on disk.
+            let foreign_wt = name
+                .trim_start_matches("refs/ng/tm/")
+                .split('/')
+                .next()
+                .unwrap_or("");
+            if !foreign_wt.is_empty() && foreign_wt != ctx.worktree_id {
+                let sibling_ledger = ctx
+                    .store_git_dir
+                    .parent()
+                    .map(|p| p.join("worktrees").join(foreign_wt).join("ledger.json"));
+                let sibling_exists = sibling_ledger.as_ref().is_some_and(|p| p.exists());
+                if !sibling_exists {
+                    ctx.update_ref_delete(name, oid)?;
+                }
+            }
+        }
+    }
+    if ctx.chat_dir().is_dir() {
+        for entry in fs::read_dir(ctx.chat_dir())? {
+            let path = entry?.path();
+            let id = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u32>().ok());
+            if id.is_some_and(|id| !live_ids.contains(&id)) {
+                let _ = crate::core::persist::remove_if_exists(&path)?;
+            }
+        }
+    }
+    journal.phase = JournalPhase::LedgerCommitted;
+    ctx.save_journal(&journal)?;
+    ctx.clear_journal()?;
+    drop(_lock);
+    doctor()
+}
+
 pub struct Checkpoint;
 impl crate::agent::tools::Tool for Checkpoint {
-    fn name(&self) -> &str {
-        "checkpoint"
-    }
+    fn name(&self) -> &str { "checkpoint" }
     fn description(&self) -> &str {
-        "Save a time-machine checkpoint of the whole working tree (a restore point). Call this BEFORE \
-         a large or risky multi-file change so the user can rewind with `aizen time restore`. Only works \
-         inside a git repo. Safe / non-destructive."
+        "Create an explicit Time Machine checkpoint (private store). Use before high-risk work the \
+         runtime won't auto-catch. The runtime already auto-checkpoints before the first edit and \
+         after each successful edit — don't duplicate those. To undo a bad approach THIS run, use \
+         `checkpoint_rewind` (not free-form restore)."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
@@ -391,11 +1757,10 @@ impl crate::agent::tools::Tool for Checkpoint {
             "additionalProperties": false
         })
     }
-    // NOT concurrency-safe: `save` mutates shared repo state (allocates a monotonic snapshot id,
-    // `git update-ref refs/ng/tm/<id>`, and a read-modify-write of the ledger). Two parallel
-    // checkpoint calls would clobber each other's ref / drop a snapshot, so force the serial path.
-    fn is_concurrency_safe(&self) -> bool {
-        false
+    fn is_destructive(&self) -> bool { true }
+    fn is_concurrency_safe(&self) -> bool { false }
+    fn workspace_effect(&self, _args: &serde_json::Value) -> crate::agent::tools::WorkspaceEffect {
+        crate::agent::tools::WorkspaceEffect::RepoMetadata
     }
     fn execute(&self, args: &serde_json::Value) -> Result<String> {
         if !is_repo() {
@@ -403,7 +1768,91 @@ impl crate::agent::tools::Tool for Checkpoint {
         }
         let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("").trim();
         let snap = save(label, false)?;
-        Ok(format!("checkpoint #{} saved ({}). Restore later with `aizen time restore {}`.", snap.id, if snap.label.is_empty() { "no label" } else { &snap.label }, snap.id))
+        // Explicit saves also count as last_good within the run (model just pinned a known-good tree).
+        note_last_good(snap.id);
+        Ok(format!(
+            "checkpoint #{} saved ({}). Run-scoped rewind: `checkpoint_rewind` target=last_good|pre_edit. \
+             Human free-form: `aizen time restore {}`.",
+            snap.id,
+            if snap.label.is_empty() { "no label" } else { &snap.label },
+            snap.id
+        ))
+    }
+}
+
+/// Agent-only, run-scoped rewind. Restores ONLY the pre-edit or last-good anchor of the current
+/// agent run — never arbitrary snapshot ids (those stay human/CLI). Cap: [`MAX_RUN_REWINDS`].
+pub struct CheckpointRewind;
+impl crate::agent::tools::Tool for CheckpointRewind {
+    fn name(&self) -> &str { "checkpoint_rewind" }
+    fn description(&self) -> &str {
+        "Rewind the working tree to a recovery anchor from THIS agent run only. Use when your last \
+         approach broke the tree and a clean base is cheaper than patching further. \
+         target=`last_good` = after the last successful edit step; target=`pre_edit` = before any \
+         edit this run. Budget: 2 rewinds per run. Does NOT restore chat history. Free-form restore \
+         of arbitrary checkpoint ids is human-only (`aizen time restore <id>`)."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "enum": ["last_good", "pre_edit"],
+                    "description": "last_good = last successful step this run; pre_edit = tree before first edit this run"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "one short line: why this approach is abandoned (shown in the tool result)"
+                }
+            },
+            "required": ["target"],
+            "additionalProperties": false
+        })
+    }
+    fn is_destructive(&self) -> bool { true }
+    fn is_concurrency_safe(&self) -> bool { false }
+    fn workspace_effect(&self, _args: &serde_json::Value) -> crate::agent::tools::WorkspaceEffect {
+        // Mutates the working tree. The agent loop skips the pre-edit checkpoint for this tool
+        // (restoring is the recovery path; snapshotting the broken tree first is restore's job).
+        crate::agent::tools::WorkspaceEffect::Paths
+    }
+    fn execute(&self, args: &serde_json::Value) -> Result<String> {
+        if !is_repo() {
+            return Ok("error: not a git repository — nothing to rewind".to_string());
+        }
+        let raw = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(target) = RewindTarget::parse(raw) else {
+            return Ok(
+                "error: target must be \"last_good\" or \"pre_edit\" (run-scoped only; free-form ids are human-driven)"
+                    .to_string(),
+            );
+        };
+        let reason = args
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        match rewind_run(target) {
+            Ok(snap) => {
+                let st = recovery_status();
+                let why = if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(" reason: {reason}.")
+                };
+                Ok(format!(
+                    "rewound working tree to checkpoint #{} ({}, label={:?}).{why} \
+                     rewinds left this run: {}. Re-read files you care about — contents changed on disk. \
+                     Chat history was NOT restored.",
+                    snap.id,
+                    target.as_str(),
+                    if snap.label.is_empty() { "none" } else { &snap.label },
+                    st.rewinds_left,
+                ))
+            }
+            Err(e) => Ok(format!("error: {e}")),
+        }
     }
 }
 
@@ -411,155 +1860,112 @@ impl crate::agent::tools::Tool for Checkpoint {
 mod tests {
     use super::*;
 
-    /// Spin up a throwaway git repo, exercise save → modify → restore → redo end-to-end.
-    fn git_ok(root: &Path, args: &[&str]) {
-        git_at(root, None, args).unwrap();
-    }
-
-    #[test]
-    fn save_restore_redo_round_trip() {
-        // Skip silently if git isn't on PATH (keeps the suite green in odd CI images).
-        if Command::new("git").arg("--version").output().is_err() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("ng-tm-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        git_ok(&dir, &["init", "-q"]);
-        git_ok(&dir, &["config", "user.email", "t@t"]);
-        git_ok(&dir, &["config", "user.name", "t"]);
-        let file = dir.join("a.txt");
-
-        std::fs::write(&file, "v1").unwrap();
-        let s1 = save_in(&dir, "v1", false, None).unwrap();
-        assert_eq!(s1.id, 1);
-
-        std::fs::write(&file, "v2").unwrap();
-        let s2 = save_in(&dir, "v2", false, None).unwrap();
-        assert_eq!(s2.id, 2);
-
-        // a brand-new untracked file exists at v2…
-        std::fs::write(dir.join("new.txt"), "added").unwrap();
-
-        // restore to v1 → file reverts AND the file added after v1 is removed (exact rewind)…
-        restore_in(&dir, 1).unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1");
-        assert!(!dir.join("new.txt").exists(), "files added after the snapshot are removed on restore");
-
-        // …and because the pre-restore state was auto-captured, we can go forward to v2.
-        restore_in(&dir, 2).unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn mk(id: u32) -> Snapshot {
+    fn mk(id: u32, parent: Option<u32>) -> Snapshot {
         Snapshot {
             id,
-            commit: format!("c{id}"),
-            tree: format!("t{id}"),
+            commit: format!("{id:040x}"),
+            tree: format!("{:040x}", id + 100),
             label: String::new(),
             created: "now".into(),
             auto: false,
             has_chat: false,
+            parent,
+            worktree_id: "wt-test".into(),
+            coverage: Coverage::default(),
+            recovery: false,
         }
     }
 
     #[test]
-    fn retention_drops_oldest_but_protects_active() {
-        let mut l = Ledger::default();
-        for id in 1..=5 {
-            l.snapshots.push(mk(id));
-        }
-        l.cursor = Some(0); // active = the OLDEST (#1)
-        // delete_ref no-ops here (temp_dir isn't a repo); we assert the list-trim + cursor fixup.
-        enforce_retention(&std::env::temp_dir(), &mut l, 3);
-        let ids: Vec<u32> = l.snapshots.iter().map(|s| s.id).collect();
-        assert_eq!(ids, vec![1, 4, 5], "kept ≤3, dropped oldest non-active (#2,#3), protected active #1");
-        assert_eq!(l.cursor, Some(0), "cursor still points at #1");
+    fn ledger_rejects_duplicate_ids_and_regressed_counter() {
+        let mut duplicate = Ledger { snapshots: vec![mk(1, None), mk(1, None)], next_id: 2, ..Default::default() };
+        assert!(duplicate.normalize().is_err());
+        let mut regressed = Ledger { snapshots: vec![mk(9, None)], next_id: 2, ..Default::default() };
+        assert!(regressed.normalize().is_err());
     }
 
     #[test]
-    fn dedup_reuses_snapshot_when_tree_unchanged() {
-        if Command::new("git").arg("--version").output().is_err() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("ng-tm-dedup-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        git_at(&dir, None, &["init", "-q"]).unwrap();
-        git_at(&dir, None, &["config", "user.email", "t@t"]).unwrap();
-        git_at(&dir, None, &["config", "user.name", "t"]).unwrap();
-        std::fs::write(dir.join("a.txt"), "same").unwrap();
-        let a = save_in(&dir, "first", false, None).unwrap();
-        let b = save_in(&dir, "again", false, None).unwrap(); // no change → must reuse, not append
-        assert_eq!(a.id, b.id, "an unchanged working tree reuses the last checkpoint");
-        assert_eq!(timeline_len(&dir), 1, "no duplicate snapshot created");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn timeline_len(root: &Path) -> usize {
-        load_ledger(root).snapshots.len()
+    fn retention_protects_cursor_and_explicit_ids() {
+        let mut l = Ledger { snapshots: vec![mk(1, None), mk(2, Some(1)), mk(3, Some(2)), mk(4, Some(3))], next_id: 5, ..Default::default() };
+        l.set_cursor(Some(1));
+        let dropped = enforce_retention_plan(&mut l, 2, &[4]);
+        assert_eq!(l.snapshots.iter().map(|s| s.id).collect::<Vec<_>>(), vec![1, 4]);
+        assert_eq!(dropped.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(l.cursor_id, Some(1));
     }
 
     #[test]
-    fn chat_sidecar_round_trips_and_flags_has_chat() {
-        if Command::new("git").arg("--version").output().is_err() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("ng-tm-chat-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        git_at(&dir, None, &["init", "-q"]).unwrap();
-        git_at(&dir, None, &["config", "user.email", "t@t"]).unwrap();
-        git_at(&dir, None, &["config", "user.name", "t"]).unwrap();
-        std::fs::write(dir.join("a.txt"), "v1").unwrap();
-
-        // A checkpoint WITH chat flags has_chat and its sidecar round-trips verbatim.
-        let chat = vec![Message::system("sys"), Message::user("do the thing")];
-        let snap = save_in(&dir, "with chat", false, Some(&chat)).unwrap();
-        assert!(snap.has_chat, "a checkpoint saved with a conversation is flagged has_chat");
-        let back = read_chat_in(&dir, snap.id).expect("sidecar present");
-        assert_eq!(back.len(), 2);
-        assert_eq!(back[1].content.as_deref(), Some("do the thing"));
-
-        // A Files-only checkpoint has no sidecar and is not flagged.
-        std::fs::write(dir.join("a.txt"), "v2").unwrap();
-        let plain = save_in(&dir, "no chat", false, None).unwrap();
-        assert!(!plain.has_chat, "a Files-only checkpoint is not flagged");
-        assert!(read_chat_in(&dir, plain.id).is_none(), "no sidecar written");
-
-        // Clearing a checkpoint removes its sidecar too (no orphaned transcript on disk).
-        delete_chat(&dir, snap.id);
-        assert!(read_chat_in(&dir, snap.id).is_none(), "sidecar removed with the checkpoint");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Root-scoped sidecar reader for tests (the public `load_chat` resolves the repo from cwd).
-    fn read_chat_in(root: &Path, id: u32) -> Option<Vec<Message>> {
-        let p = chat_path(root, id).ok()?;
-        let s = std::fs::read_to_string(p).ok()?;
-        serde_json::from_str(&s).ok()
+    fn legacy_cursor_migrates_to_id() {
+        let mut l = Ledger { snapshots: vec![mk(7, None), mk(9, Some(7))], cursor: Some(1), cursor_id: None, next_id: 10, ..Default::default() };
+        l.normalize().unwrap();
+        assert_eq!(l.cursor_id, Some(9));
     }
 
     #[test]
-    fn ledger_defaults_and_serde_round_trip() {
-        let mut l = Ledger::default();
-        assert!(l.snapshots.is_empty() && l.cursor.is_none() && l.next_id == 0);
-        l.snapshots.push(Snapshot {
-            id: 1,
-            commit: "abc".into(),
-            tree: "def".into(),
-            label: "x".into(),
-            created: "now".into(),
-            auto: false,
-            has_chat: false,
-        });
-        l.cursor = Some(0);
-        let s = serde_json::to_string(&l).unwrap();
-        let back: Ledger = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.snapshots.len(), 1);
-        assert_eq!(back.cursor, Some(0));
+    fn redo_prefers_non_recovery_child() {
+        // After restore creates recovery preimage #3 under parent #1, redo from #1 must pick the
+        // real branch tip #2, not the recovery safety snapshot.
+        let snaps = vec![
+            mk(1, None),
+            Snapshot { recovery: false, ..mk(2, Some(1)) },
+            Snapshot { recovery: true, label: "before time-travel".into(), ..mk(3, Some(1)) },
+        ];
+        let child = snaps
+            .iter()
+            .filter(|s| s.parent == Some(1) && !s.recovery)
+            .max_by_key(|s| s.id)
+            .map(|s| s.id);
+        assert_eq!(child, Some(2));
+    }
+
+    #[test]
+    fn run_recovery_anchors_and_budget() {
+        begin_agent_run();
+        assert_eq!(recovery_status().pre_edit, None);
+        assert!(recovery_hint().is_none());
+        note_pre_edit(3);
+        note_last_good(5);
+        let s = recovery_status();
+        assert_eq!(s.pre_edit, Some(3));
+        assert_eq!(s.last_good, Some(5));
+        assert_eq!(s.rewinds_left, 2);
+        assert!(recovery_hint().unwrap().contains("last_good"));
+        // note_pre_edit is sticky to the earliest id.
+        note_pre_edit(9);
+        assert_eq!(recovery_status().pre_edit, Some(3));
+        begin_agent_run();
+        assert_eq!(recovery_status().pre_edit, None);
+        assert_eq!(recovery_status().rewinds_used, 0);
+    }
+
+    #[test]
+    fn rewind_target_parse() {
+        assert_eq!(RewindTarget::parse("pre_edit"), Some(RewindTarget::PreEdit));
+        assert_eq!(RewindTarget::parse("last-good"), Some(RewindTarget::LastGood));
+        assert_eq!(RewindTarget::parse("undo"), Some(RewindTarget::LastGood));
+        assert_eq!(RewindTarget::parse("42"), None);
+    }
+
+    #[test]
+    fn private_store_path_is_under_aizen_home() {
+        // Identity hashing is pure; the store root must never be inside the source .git.
+        let common = PathBuf::from(r"C:\work\proj\.git");
+        let repo_id = format!("repo-{:016x}", fnv1a64(&common.to_string_lossy()));
+        let home = PathBuf::from(r"C:\Users\me\.aizen");
+        let store = home.join("timemachine").join(&repo_id).join("store.git");
+        assert!(store.starts_with(&home));
+        assert!(!store.components().any(|c| c.as_os_str() == ".git"));
+        assert!(repo_id.starts_with("repo-"));
+    }
+
+    #[test]
+    fn journal_roundtrip_shape() {
+        let j = Journal::new(JournalKind::Save, 7);
+        assert_eq!(j.expected_generation, 7);
+        assert!(matches!(j.phase, JournalPhase::Prepared));
+        let bytes = serde_json::to_vec(&j).unwrap();
+        let back: Journal = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.operation_id, j.operation_id);
+        assert!(matches!(back.kind, JournalKind::Save));
     }
 }

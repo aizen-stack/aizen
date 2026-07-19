@@ -103,8 +103,8 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | `/telegram` | Telegram integration menu: setup · test · status · start daemon · disable |
 | `/sessions` | saved conversations — restore · save · delete (the chat also auto-saves as `last`) |
 | `/compact` | summarize older turns now to free context |
-| `/yolo` | toggle auto-approve (run file edits & shell without asking) — the hard safety floor still blocks catastrophic commands |
-| `/smart` | toggle smart approval (auto-run read-only shell like `git status`/`cargo check`; writes still ask) |
+| `/approval [ask|smart|yolo]` | one approval setting: ask every time, auto-run read-only shell, or pre-authorize tools after the hard safety floor |
+| `/timeline` · `/checkpoint [note]` | inspect or create crash-recoverable, worktree-scoped Git checkpoints; CLI recovery diagnostics: `aizen time doctor` |
 | `/cost` | session token usage + a $ estimate (real provider usage when reported; set rates via `aizen config set --price-in/--price-out`) |
 | `/clear` | fresh conversation · `/tokens` usage · `/quit` exit |
 
@@ -152,6 +152,33 @@ conversation is carried across messages (memory + SOUL + persona seeded once per
 disambiguate it asks (the `clarify` tool) and your next message is the answer. Token lives in
 `~/.aizen/cli-config.json` (or `AIZEN_TELEGRAM_TOKEN`); only `allowed_chat_ids` may talk to it. The
 agent can also call `telegram_send` / `telegram_ask`.
+
+**In-chat command menu**: the bot publishes a `/` menu (`setMyCommands`) so every control is one tap
+away — `/sh <cmd>` (runs now; the `cmd_guard` floor still blocks catastrophic commands), `/cd` · `/pwd`,
+`/approval` · `/ultimate` · `/effort`, `/model`, `/memory`, `/tools`, `/status`.
+
+**Host more than one bot from one daemon**: from the primary bot, `/addbot <name> <token>` validates a
+second @BotFather token and hot-spawns it into the running daemon (no restart); `/bots` lists them and
+`/rmbot <name>` stops one. Extra bots share your `allowed_chat_ids` (a private chat id is your user id,
+identical across all your bots), and a destructive-op approval always returns to the bot the request
+came from. Extra bots persist in `telegram_bots` so a restart re-hosts them.
+
+### Host it 24/7 on a Linux VPS
+
+`aizen serve` is a foreground process — to keep the bot alive across logout, crashes, and reboots, run
+it as a systemd service:
+
+```bash
+aizen telegram setup                    # once: token + your chat id
+aizen serve --install --user --now      # write + enable the user unit, start now
+```
+
+`--install` writes a `Restart=always` unit (auto-restart on crash) with `network-online.target`
+(waits for the network after a reboot); `--user` needs no root and calls `loginctl enable-linger` so it
+survives logout. Drop `--now` to just write the unit and print the enable steps; omit `--user` for a
+system unit (prints the `sudo` steps unless you're already root). `aizen serve --uninstall --user`
+removes it. On Windows/macOS the command prints the NSSM / launchd equivalent. Note: the bot lives only
+while the **VPS is on** — a powered-off VPS runs nothing (systemd restarts it the moment the VPS boots).
 
 ## Configure
 
@@ -234,8 +261,9 @@ Behavior worth knowing:
   concurrently; any turn that edits or runs shell stays serial (and approval-gated).
 - **Approval** — destructive tools (`file_edit`, `shell_run`) prompt before running. In the sticky
   REPL each one shows an inline **`[y]es · [n]o · [a]llow all this session`** prompt (the `[a]`
-  choice is a session-scoped soft `/yolo`, reset by `/clear`); `/yolo` still pre-approves everything,
-  `/smart` auto-runs read-only-shaped shell. Non-TTY (CI/pipes) safely denies unless `--yes` is set;
+  choice is a session-scoped temporary Yolo grant, reset by `/clear`). `/approval` is the persisted
+  three-level setting: `ask` prompts, `smart` auto-runs read-only-shaped shell, and `yolo` pre-authorizes
+  all non-floor operations. Legacy `/smart` and `/yolo` aliases remain accepted. Non-TTY (CI/pipes) safely denies unless `--yes` is set;
   under `aizen serve` the prompt is routed to your phone. The hard `cmd_guard` floor blocks catastrophic
   commands underneath all of these.
 - **Verify gate** — after an editing run, a fast typecheck (`cargo check` / a `typecheck`

@@ -215,12 +215,21 @@ async fn run_one_verify(cwd: &Path, cmd: &VerifyCommand, timeout_secs: u64) -> O
 /// output is SHAPED first: deduped error blocks, capped counts — a 400-line wall of repeated
 /// errors buys nothing but tokens.
 pub fn format_gate_failure(r: &VerifyGateResult) -> String {
-    format!(
+    let mut msg = format!(
         "[aizen verify] `{}` FAILED ({} ms). Fix these errors before reporting the task done:\n\n{}",
         r.command,
         r.duration_ms,
         shape_failure_output(&r.output)
-    )
+    );
+    if let Some(hint) = crate::features::timemachine::recovery_hint() {
+        msg.push_str("\n\n");
+        msg.push_str(&hint);
+        msg.push_str(
+            " Prefer a surgical fix when the error is local; rewind when the approach itself is wrong \
+             (wrong design, cascading breakage). After a rewind, re-read files — disk contents changed.",
+        );
+    }
+    msg
 }
 
 /// Max distinct error blocks/rows surfaced to the model (the rest are counted, not quoted).

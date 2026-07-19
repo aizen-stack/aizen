@@ -11,6 +11,7 @@
 //! (no live calls). Production passes a closure over `client::chat_with_tools`.
 
 pub mod app_catalog;
+pub mod toolsets;
 #[cfg(feature = "browser")]
 pub mod browser;
 pub mod builtin;
@@ -261,13 +262,10 @@ pub struct AgentConfig {
     /// (`max_fetch_chars.max(max_tool_result_chars)`) so these tools are never trimmed *tighter* than
     /// a plain tool — the kept window stays meaningful. Other tools stay at `max_tool_result_chars`.
     pub max_fetch_result_chars: usize,
-    /// Pre-authorize destructive ops (the `--yes` escape hatch / `/yolo`). The hard blocklist in
-    /// `cmd_guard` still applies underneath — `auto_approve` skips the *prompt*, never the floor.
-    pub auto_approve: bool,
-    /// `smart` approval tier: auto-run read-only-shaped shell commands (`ls`/`cat`/`rg`/`git status`/
-    /// `cargo check` …) without a prompt, while writes/network/installs/deletes still ask. Independent
-    /// of `auto_approve`; the hard blocklist applies regardless. Default OFF (= classic `manual`).
-    pub smart_approve: bool,
+    /// Unified approval level. `ask` prompts before destructive tools; `smart` auto-runs only shell
+    /// commands classified read-only by `cmd_guard`; `yolo` pre-authorizes destructive tools. The hard
+    /// blocklist applies at every level.
+    pub approval_mode: crate::core::approval::ApprovalMode,
     /// Suppress the stderr progress trace (tests set this).
     pub quiet: bool,
     /// Run a fast typecheck/build (cargo check / tsc) once after an editing run, before
@@ -347,8 +345,7 @@ impl Default for AgentConfig {
             auto_extend_to: 50,
             max_tool_result_chars: 4096,
             max_fetch_result_chars: 12_000,
-            auto_approve: false,
-            smart_approve: false,
+            approval_mode: crate::core::approval::ApprovalMode::Ask,
             quiet: false,
             enable_verify_gate: true,
             verify_gate_timeout_secs: 90,
@@ -380,6 +377,8 @@ pub enum StopReason {
     Divergence,
     /// The (auto-extended) step cap was exhausted.
     MaxIters,
+    /// The verification gate ran and exhausted its repair budget without a passing result.
+    VerificationFailed,
     /// The model invoked `clarify` — the turn is PAUSED pending the user's answer (the carried
     /// string is the user-facing question + options). The caller surfaces it and the next user
     /// message re-enters the loop as the answer. History is left valid (the assistant tool-call
@@ -497,6 +496,9 @@ where
     O: Fn(Vec<Message>) -> OFut,
     OFut: Future<Output = Result<String>>,
 {
+    // Run-scoped Time Machine anchors (pre_edit / last_good / rewind budget). Must reset every loop
+    // entry so a prior task's safety net cannot be restored into this task by accident.
+    crate::features::timemachine::begin_agent_run();
     let defs = registry.defs();
     // Tool schemas ride on EVERY request but live in no message — count them once here so the
     // context guards below compare the real request size against the window.
@@ -530,9 +532,8 @@ where
     // CUMULATIVE edit flag — set once any successful edit lands; arms the one-shot self-review AND
     // gates the verify gate (a run that never edited has nothing to verify).
     let mut made_any_edits = false;
-    // ONE-SHOT auto-checkpoint latch (W15): before the FIRST turn that will run a destructive tool,
-    // stamp a time-machine restore point so the user can rewind the whole session's edits. Set on
-    // the first attempt regardless of outcome (no repeated attempts if the repo/git is unusable).
+    // Operation-scoped checkpoint latch: set only after a pre-edit checkpoint succeeds. Approval is
+    // evaluated first; a declined call must never run Git hooks/filters or mutate recovery metadata.
     let mut auto_checkpointed = false;
     let mut self_review_done = false;
     let mut context_warned = false;
@@ -549,6 +550,13 @@ where
     let mut real_anchor: Option<RealAnchor> = None;
     // Clearing cadence: (pct-of-window after the last clear, iter at the last clear).
     let mut last_clear: Option<(usize, usize)> = None;
+    // Compaction cadence: (pct-of-window after the last compaction attempt, iter at that attempt).
+    // Mirrors `last_clear`. WITHOUT this, the compaction trigger below re-fires on every consecutive
+    // iteration once history is long enough — each pass re-splices mid-history and busts the prompt
+    // cache from the splice point. The guard makes compaction fire in big infrequent jumps (like
+    // clearing), not a per-turn cache-shredding trickle: it only re-arms when usage grows by
+    // `clear_step_pct` OR `clear_cooldown_iters` iterations have elapsed since the last attempt.
+    let mut last_compact: Option<(usize, usize)> = None;
     // Iter of the last todo-recitation reminder (0 = none yet).
     let mut last_todo_reminder = 0usize;
     let mut iter = 0usize;
@@ -663,22 +671,37 @@ where
                 && cfg.context_window > 0
                 && est_now * 100 >= cfg.context_window * cfg.compact_at_pct as usize
             {
-                if let Ok((before, after)) =
-                    compact::compact_history(messages, summarize, compact::KEEP_TURNS).await
+                let pct = est_now * 100 / cfg.context_window;
+                // CADENCE GUARD (mirror of the clearing path): don't re-compact every iteration once
+                // history sits above `compact_at_pct`. compact_history keeps the last KEEP_TURNS
+                // verbatim, so a single big turn can leave the result still above threshold — without
+                // this the condition stays true and re-splices (cache-busting) every turn. Re-arm only
+                // on `clear_step_pct` growth or after `clear_cooldown_iters` iters (same knobs as
+                // clearing — one cadence policy for both history-shrinking guards).
+                if clearing_due(pct, iter, last_compact, cfg.clear_step_pct, cfg.clear_cooldown_iters)
                 {
-                    context_warned = false; // history shrank — let the wrap-up nudge re-arm if it refills
-                    budget_band_shown = None; // …and the running budget signal (P-ctx1)
-                    real_anchor = None; // spliced history invalidates the anchor
-                    seen_results.clear(); // summarized-away results must not mark a re-read as stale
-                    est_now = estimate_tokens(messages) + schema_overhead;
-                    if !cfg.quiet {
-                        let line = format!("→ context: auto-compacted ~{before} → ~{after} tok");
-                        if crate::ui::tui::active() {
-                            crate::ui::tui::emit_line(&line);
-                        } else {
-                            eprintln!("{line}");
+                    if let Ok((before, after)) =
+                        compact::compact_history(messages, summarize, compact::KEEP_TURNS).await
+                    {
+                        context_warned = false; // history shrank — let the wrap-up nudge re-arm if it refills
+                        budget_band_shown = None; // …and the running budget signal (P-ctx1)
+                        real_anchor = None; // spliced history invalidates the anchor
+                        seen_results.clear(); // summarized-away results must not mark a re-read as stale
+                        est_now = estimate_tokens(messages) + schema_overhead;
+                        if !cfg.quiet {
+                            let line = format!("→ context: auto-compacted ~{before} → ~{after} tok");
+                            if crate::ui::tui::active() {
+                                crate::ui::tui::emit_line(&line);
+                            } else {
+                                eprintln!("{line}");
+                            }
                         }
                     }
+                    // Arm the cadence even when compaction was a no-op (history too short to cut) or
+                    // barely dented size — re-attempting the same summarize every iteration buys
+                    // nothing and each attempt is a model round-trip. Recompute pct against the
+                    // (possibly shrunk) history so the latch reflects the post-compaction size.
+                    last_compact = Some((est_now * 100 / cfg.context_window, iter));
                 }
             }
         }
@@ -839,6 +862,22 @@ where
                     verify_passed = true;
                 }
             }
+            if cfg.enable_verify_gate
+                && made_any_edits
+                && !verify_passed
+                && verify_attempts >= cfg.max_verify_attempts
+            {
+                if let Some(t) = &turn.content {
+                    if !t.trim().is_empty() {
+                        messages.push(Message::assistant(t.clone()));
+                    }
+                }
+                return Ok(AgentOutcome {
+                    final_text: turn.content,
+                    iters: iter + 1,
+                    stop: StopReason::VerificationFailed,
+                });
+            }
             // SELF-REVIEW (opt-in, once per run): after the verify gate is satisfied and before
             // Done, spend ONE extra turn checking the work against the original request. Oracle
             // mode (roles.oracle configured → closure supplied) has a stronger model review the
@@ -874,7 +913,7 @@ where
                             // final assistant text exactly once (no duplicate).
                             if !cfg.quiet {
                                 emit_trace(&format!(
-                                    "  ⎿ self-review: advisory only (no blocking issue)\n{}",
+                                    "  └ self-review: advisory only (no blocking issue)\n{}",
                                     review.findings
                                 ));
                             }
@@ -942,28 +981,6 @@ where
             );
         }
 
-        // AUTO-CHECKPOINT (W15): the first time this run is about to execute a DESTRUCTIVE call,
-        // stamp a time-machine restore point so the whole session's edits are rewindable. Fires at
-        // most once per run; best-effort (a non-git tree / git absence returns Err and is ignored —
-        // `save` also dedups a zero-diff tree, so a checkpoint before a read-only-so-far session is
-        // free). Done BEFORE pre-fill so the snapshot captures the pre-edit tree.
-        if cfg.auto_checkpoint
-            && !auto_checkpointed
-            && turn.tool_calls.iter().any(|tc| {
-                registry.get(&tc.function.name).map(|t| t.is_destructive()).unwrap_or(false)
-            })
-        {
-            auto_checkpointed = true;
-            if let Ok(snap) = crate::features::timemachine::save("before agent edits", true) {
-                if !cfg.quiet {
-                    emit_trace(&format!(
-                        "→ checkpoint #{} saved (restore with `aizen time restore {}`)",
-                        snap.id, snap.id
-                    ));
-                }
-            }
-        }
-
         // PRE-FILL: append the assistant tool-call turn AND one placeholder result per call in a
         // single synchronous block (no await in between) — history is VALID from this instant, so
         // the REPL's `select!` dropping this future mid-batch (Esc) can never leave a dangling
@@ -989,7 +1006,15 @@ where
         // position. Results land in ORIGINAL call order. (A DISCARDED turn — divergence/error —
         // simply drops its eager handles: detached, read-only, harmless.)
         let eager = std::mem::take(&mut turn.eager);
-        let results = execute_calls(registry, &calls, cfg, &mut messages[base..], eager).await;
+        let results = execute_calls(
+            registry,
+            &calls,
+            cfg,
+            &mut messages[base..],
+            eager,
+            &mut auto_checkpointed,
+        )
+        .await;
 
         // Arm the verify gate only if a destructive tool actually SUCCEEDED this turn — a
         // denied/errored edit changed nothing, so it must not make the gate blame the tree.
@@ -1004,11 +1029,19 @@ where
             // a turn that only ran (say) a shell build with no file change costs nothing. Runs AFTER
             // the pre-fill/execute so the snapshot captures the POST-edit tree.
             if cfg.checkpoint_each_edit {
-                if let Ok(snap) = crate::features::timemachine::save("after agent edit", true) {
-                    if !cfg.quiet {
+                match crate::features::timemachine::save("after agent edit", true) {
+                    Ok(snap) => {
+                        crate::features::timemachine::note_last_good(snap.id);
+                        if !cfg.quiet {
+                            emit_trace(&format!(
+                                "  └ checkpoint #{} (agent: `checkpoint_rewind` target=last_good; human: `aizen time restore {}`)",
+                                snap.id, snap.id
+                            ));
+                        }
+                    }
+                    Err(e) => {
                         emit_trace(&format!(
-                            "  ⎿ checkpoint #{} (restore with `aizen time restore {}`)",
-                            snap.id, snap.id
+                            "  └ warning: post-edit checkpoint failed; the latest change may not be independently rewindable: {e}"
                         ));
                     }
                 }
@@ -1187,6 +1220,7 @@ async fn execute_calls(
     cfg: &AgentConfig,
     sink: &mut [Message],
     eager: Vec<(usize, tokio::task::JoinHandle<String>)>,
+    auto_checkpointed: &mut bool,
 ) -> Vec<(String, String)> {
     debug_assert_eq!(sink.len(), calls.len(), "one pre-filled placeholder per call");
     // Eager starts from the streaming path, keyed by position — adopted instead of re-spawned.
@@ -1288,13 +1322,62 @@ async fn execute_calls(
                     Some(tool) => match gate_and_approve(tool.as_ref(), args, cfg) {
                         Some(denied) => denied,
                         None => {
-                            let args = args.clone();
-                            let quiet = cfg.quiet;
-                            let max = cfg.max_tool_result_chars;
-                            let max_fetch = cfg.max_fetch_result_chars;
-                            tokio::task::spawn_blocking(move || run_tool_body(tool, &args, quiet, max, max_fetch))
-                                .await
-                                .unwrap_or_else(|_| "error: tool thread panicked".to_string())
+                            let effect = tool.workspace_effect(args);
+                            // `checkpoint_rewind` IS the recovery path — never nest a pre-edit
+                            // snapshot of the broken tree before undoing it.
+                            let skip_pre_checkpoint = tool.name() == "checkpoint_rewind";
+                            let checkpoint_error = if skip_pre_checkpoint {
+                                None
+                            } else if matches!(effect, crate::agent::tools::WorkspaceEffect::External) {
+                                Some(
+                                    "error: protected change targets a path outside the current repository; Time Machine cannot guarantee rewind coverage. Narrow the path or run it manually with an external backup."
+                                        .to_string(),
+                                )
+                            } else if cfg.auto_checkpoint
+                                && !*auto_checkpointed
+                                && effect.needs_checkpoint()
+                            {
+                                match crate::features::timemachine::preflight_protected_change() {
+                                    Ok(false) => {
+                                        if !cfg.quiet {
+                                            emit_trace("→ checkpoint unavailable: not a git repository");
+                                        }
+                                        None
+                                    }
+                                    Err(e) => Some(format!(
+                                        "error: protected workspace change was not run because Time Machine preflight failed: {e}"
+                                    )),
+                                    Ok(true) => match crate::features::timemachine::save("before agent edits", true) {
+                                        Ok(snap) => {
+                                            *auto_checkpointed = true;
+                                            crate::features::timemachine::note_pre_edit(snap.id);
+                                            if !cfg.quiet {
+                                                emit_trace(&format!(
+                                                    "→ checkpoint #{} saved (agent: `checkpoint_rewind` target=pre_edit; human: `aizen time restore {}`)",
+                                                    snap.id, snap.id
+                                                ));
+                                            }
+                                            None
+                                        }
+                                        Err(e) => Some(format!(
+                                            "error: protected workspace change was not run because the pre-edit checkpoint failed: {e}"
+                                        )),
+                                    },
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some(error) = checkpoint_error {
+                                error
+                            } else {
+                                let args = args.clone();
+                                let quiet = cfg.quiet;
+                                let max = cfg.max_tool_result_chars;
+                                let max_fetch = cfg.max_fetch_result_chars;
+                                tokio::task::spawn_blocking(move || run_tool_body(tool, &args, quiet, max, max_fetch))
+                                    .await
+                                    .unwrap_or_else(|_| "error: tool thread panicked".to_string())
+                            }
                         }
                     },
                 },
@@ -1322,8 +1405,9 @@ fn turn_made_edits(
 ) -> bool {
     calls.iter().zip(results).any(|(tc, (_, result))| {
         let Some(t) = registry.get(&tc.function.name) else { return false };
-        if !t.is_destructive() || result.starts_with("error:") {
-            return false; // unknown tool, or a denied/errored op — changed nothing.
+        let args = parse_call_args(&tc.function.arguments).unwrap_or_else(|_| serde_json::json!({}));
+        if !t.workspace_effect(&args).needs_checkpoint() || result.starts_with("error:") {
+            return false; // no workspace mutation effect, or a denied/errored op.
         }
         // A write tool that no-op'd (target already held identical content) wrote nothing to disk,
         // so it must not arm the verify gate (an unchanged tree can't have broken) — W16.
@@ -1422,7 +1506,9 @@ fn gate_and_approve(tool: &dyn tools::Tool, args: &serde_json::Value, cfg: &Agen
                      unconditionally (even under /yolo). Choose a narrower, safer command."
                 ));
             }
-            cmd_guard::Verdict::Allow => smart_allow = cfg.smart_approve,
+            cmd_guard::Verdict::Allow => {
+                smart_allow = cfg.approval_mode.approves_readonly_shell()
+            },
             cmd_guard::Verdict::Caution(reason) => {
                 // A risky-but-legit git op (force-push, reset --hard, push to main, …). Surface the
                 // specific reason, then ALWAYS fall through to the approval prompt — `smart` must not
@@ -1442,7 +1528,11 @@ fn gate_and_approve(tool: &dyn tools::Tool, args: &serde_json::Value, cfg: &Agen
         }
     }
 
-    if tool.is_destructive() && !cfg.auto_approve && !smart_allow && !approve(tool.name(), args) {
+    if tool.is_destructive()
+        && !cfg.approval_mode.approves_all()
+        && !smart_allow
+        && !approve(tool.name(), args)
+    {
         return Some("error: the user declined this action".to_string());
     }
     None
@@ -1506,16 +1596,82 @@ fn relevance_query_from_args(args: &serde_json::Value) -> String {
     parts.join(" ")
 }
 
-/// The event-anchor line for a tool call — `⏺ name(salient-arg)`: a moonlight dot + tool name, the
-/// salient argument parenthesised and dimmed. Shared by the serial path, the eager-adoption path,
-/// and the approval prompt so every surface renders a call identically.
+/// The event-anchor line for a tool call. When the tool maps to a human action ([`tool_action`]),
+/// it reads `⏺ <verb + target> (tool_name)` — the verb+target in moonlight, the raw tool name
+/// parenthesised + dimmed, so the user sees *what* is happening at a glance and the exact tool only
+/// as a quiet footnote. Tools with no mapping fall back to the older `⏺ name(salient-arg)` shape.
+/// Shared by the serial path, the eager-adoption path, and the approval prompt so every surface
+/// renders a call identically.
 fn tool_call_line(name: &str, args: &serde_json::Value) -> String {
-    format!(
-        "{} {}{}",
-        crate::ui::theme::accent("⏺"),
-        crate::ui::theme::accent(name),
-        crate::ui::theme::accent_dim(format!("({})", tool_trace(name, args)))
-    )
+    match tool_action(name, args) {
+        Some(action) => format!(
+            "{} {} {}",
+            crate::ui::theme::accent("⏺"),
+            crate::ui::theme::accent(action),
+            crate::ui::theme::accent_dim(format!("({name})"))
+        ),
+        None => format!(
+            "{} {}{}",
+            crate::ui::theme::accent("⏺"),
+            crate::ui::theme::accent(name),
+            crate::ui::theme::accent_dim(format!("({})", tool_trace(name, args)))
+        ),
+    }
+}
+
+/// Re-print a restored conversation into the scrolling transcript. `/sessions` restore only
+/// rehydrates `history` (so the model regains context) — the SCREEN stayed blank, which read as
+/// "nothing loaded". This replays each turn with the same surfaces a live turn uses: `❯ user`
+/// echoes, markdown-rendered assistant text, and `⏺ tool` call lines + `└ result` digests. The
+/// system prompt at `[0]` is skipped (it's plumbing, not conversation). Tool-result messages carry
+/// only a `tool_call_id`, so we first index `id → tool name` from the assistant tool-calls to render
+/// each result under its originating tool.
+pub fn replay_transcript(msgs: &[crate::core::types::Message]) {
+    use std::collections::HashMap;
+    let decorate = crate::ui::tui::active() || std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let cols = crate::ui::tui::width();
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    for m in msgs {
+        for c in &m.tool_calls {
+            call_names.insert(c.id.clone(), c.function.name.clone());
+        }
+    }
+    for m in msgs {
+        match m.role.as_str() {
+            "user" => {
+                let body = m.content.as_deref().unwrap_or("").trim();
+                if body.is_empty() && m.images.is_empty() {
+                    continue;
+                }
+                let echo = if body.is_empty() { "(image)" } else { body };
+                emit_trace(&format!("{} {echo}", crate::ui::theme::accent("❯")));
+            }
+            "assistant" => {
+                let body = m.content.as_deref().unwrap_or("").trim();
+                if !body.is_empty() {
+                    let mut md = crate::ui::markdown::MarkdownStream::new(decorate, cols);
+                    let mut rendered = md.push(&format!("{body}\n"));
+                    rendered.push_str(&md.finish());
+                    crate::ui::tui::emit(&rendered);
+                }
+                for c in &m.tool_calls {
+                    let args: serde_json::Value =
+                        serde_json::from_str(&c.function.arguments).unwrap_or(serde_json::json!({}));
+                    emit_trace(&tool_call_line(&c.function.name, &args));
+                }
+            }
+            "tool" => {
+                let name = m
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| call_names.get(id))
+                    .map(String::as_str)
+                    .unwrap_or("tool");
+                emit_tool_result(name, m.content.as_deref().unwrap_or(""));
+            }
+            _ => {} // system prompt + any other roles: not part of the visible conversation
+        }
+    }
 }
 
 /// Emit a trace line into the scroll region (sticky TUI) or stderr (plain / one-shot path).
@@ -1534,7 +1690,7 @@ fn emit_trace(line: &str) {
 /// still goes to the model; only this digest reaches the terminal, so the transcript stays clean.
 fn emit_tool_result(name: &str, out: &str) {
     let (ok, summary) = summarize_result(name, out);
-    let corner = if ok { crate::ui::theme::faint("⎿") } else { crate::ui::theme::err("⎿") };
+    let corner = if ok { crate::ui::theme::faint("└") } else { crate::ui::theme::err("└") };
     if ok {
         emit_trace(&format!("  {corner} {}", crate::ui::theme::faint(&summary)));
     } else {
@@ -2261,12 +2417,12 @@ fn approve(tool: &str, args: &serde_json::Value) -> bool {
         return tokio::task::block_in_place(|| crate::ui::tui::ask_approval(&prompt));
     }
     if !std::io::stdin().is_terminal() {
-        if crate::channels::telegram::daemon_is_active() && crate::channels::telegram::is_configured() {
+        if crate::hostbot::platforms::telegram::daemon_is_active() && crate::hostbot::platforms::telegram::is_configured() {
             let prompt = format!("{tool} {}", compact_args(args));
             // Bridge to the async approval on the current (multi-thread) runtime; the serve poll
             // loop runs on another worker and delivers the callback.
             if let Some(v) = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(crate::channels::telegram::request_approval(&prompt))
+                tokio::runtime::Handle::current().block_on(crate::hostbot::platforms::telegram::request_approval(&prompt))
             }) {
                 return v;
             }
@@ -2295,6 +2451,83 @@ fn compact_args(v: &serde_json::Value) -> String {
     } else {
         s
     }
+}
+
+/// Map a tool call to a short, human-readable **action** phrase — an English verb + the salient
+/// target — so the event line reads like a narration of intent (`Write foo.rs`, `Run build.ps1`,
+/// `Search the web`) instead of a bare tool id. Returns `None` for tools with no natural verb, so
+/// [`tool_call_line`] falls back to the raw `name(arg)` shape. Global product → English, always.
+fn tool_action(name: &str, args: &serde_json::Value) -> Option<String> {
+    let field = |k: &str| args.get(k).and_then(|v| v.as_str());
+    let base = |p: &str| basename(p).to_string();
+    Some(match name {
+        "shell_run" | "bash" | "powershell" | "shell" => {
+            let cmd = field("command").or_else(|| field("cmd")).unwrap_or("");
+            format!("Run {}", shell_target(cmd))
+        }
+        "file_write" | "write_file" => format!("Write {}", base(field("path").or_else(|| field("file")).unwrap_or(""))),
+        "file_edit" | "edit_file" | "apply_patch" | "multi_edit" => {
+            format!("Edit {}", base(field("path").or_else(|| field("file")).unwrap_or("")))
+        }
+        "file_read" | "read_file" => format!("Read {}", base(field("path").or_else(|| field("file")).unwrap_or(""))),
+        "file_move" | "move_file" | "rename_file" | "file_rename" => {
+            format!("Move {}", base(field("from").unwrap_or("")))
+        }
+        "file_glob" => format!("Find files {}", first_line_clip(field("pattern").or_else(|| field("glob")).unwrap_or(""), 48)),
+        "search_files" => format!("Search {}", first_line_clip(field("query").or_else(|| field("pattern")).unwrap_or(""), 48)),
+        "web_fetch" => format!("Fetch {}", url_host(field("url").unwrap_or(""))),
+        "web_crawl" => format!("Crawl {}", url_host(field("url").unwrap_or(""))),
+        "find_symbols" | "lsp_query" => format!("Look up {}", first_line_clip(field("query").or_else(|| field("name")).unwrap_or(""), 48)),
+        "memory_search" => format!("Recall {}", first_line_clip(field("query").or_else(|| field("q")).unwrap_or(""), 48)),
+        "skill_load" => format!("Load skill {}", field("name").unwrap_or("")),
+        "todo_write" => {
+            let n = args.get("todos").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            format!("Plan · {n} step{}", if n == 1 { "" } else { "s" })
+        }
+        "clarify" | "memory_ask" | "telegram_ask" => format!("Ask · {}", first_line_clip(field("question").unwrap_or(""), 48)),
+        n if n.ends_with("_search") || n == "search" => {
+            format!("Search the web · {}", first_line_clip(field("query").or_else(|| field("q")).unwrap_or(""), 44))
+        }
+        _ => return None,
+    })
+}
+
+/// The last path segment of `p` (handles both `/` and `\`), so a long absolute path renders as just
+/// the file name in the action line. Empty stays empty.
+fn basename(p: &str) -> &str {
+    p.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(p)
+}
+
+/// The host of a URL for a compact fetch/crawl label — `https://docs.rs/x` → `docs.rs`. Falls back
+/// to a clipped form of the raw string when there's no recognisable scheme/host.
+fn url_host(u: &str) -> String {
+    let after = u.split("://").nth(1).unwrap_or(u);
+    let host = after.split(['/', '?', '#']).next().unwrap_or(after);
+    if host.is_empty() { first_line_clip(u, 40) } else { host.to_string() }
+}
+
+/// Pull a readable target out of a shell command: prefer an explicit `-File <script>` (PowerShell)
+/// or the first token that looks like a script/path (has an extension or a `./`/`.\` prefix),
+/// rendered as its basename. Otherwise fall back to the clipped command itself.
+fn shell_target(cmd: &str) -> String {
+    let toks: Vec<&str> = cmd.split_whitespace().collect();
+    // `-File <path>` — the canonical "run this script" form on Windows.
+    if let Some(i) = toks.iter().position(|t| t.eq_ignore_ascii_case("-file")) {
+        if let Some(p) = toks.get(i + 1) {
+            return basename(p.trim_matches('"').trim_matches('\'')).to_string();
+        }
+    }
+    // First token that reads like a script/path: `./x.sh`, `foo.py`, `src\a.ps1`.
+    for t in &toks {
+        let clean = t.trim_matches('"').trim_matches('\'');
+        let looks_pathy = clean.starts_with("./")
+            || clean.starts_with(".\\")
+            || (clean.contains('.') && clean.rsplit('.').next().map(|e| e.len() <= 4 && e.chars().all(|c| c.is_ascii_alphanumeric())).unwrap_or(false));
+        if looks_pathy && !clean.starts_with('-') {
+            return basename(clean).to_string();
+        }
+    }
+    first_line_clip(cmd, 52)
 }
 
 /// A human-readable one-line trace of a tool call for the TUI — the *salient* argument shown
@@ -2345,11 +2578,37 @@ mod tests {
 
     // ── display: the ⏺ call line + ⎿ result summary ─────────────────────────
     #[test]
-    fn tool_call_line_uses_the_dot_and_parens() {
+    fn tool_call_line_shows_action_then_dimmed_tool_name() {
+        // A mapped tool reads `⏺ <English verb + target> (tool_name)`.
         let line = tool_call_line("file_read", &serde_json::json!({"path": "src/main.rs"}));
         let plain = console::strip_ansi_codes(&line).to_string();
-        assert!(plain.starts_with("⏺ file_read("), "{plain:?}");
-        assert!(plain.contains("src/main.rs)"), "salient arg parenthesised: {plain:?}");
+        assert!(plain.starts_with("⏺ Read main.rs"), "action-first: {plain:?}");
+        assert!(plain.contains("(file_read)"), "raw tool name parenthesised: {plain:?}");
+    }
+
+    #[test]
+    fn tool_call_line_falls_back_to_name_arg_when_unmapped() {
+        // An unknown tool keeps the older `⏺ name(salient-arg)` shape.
+        let line = tool_call_line("mystery_tool", &serde_json::json!({"foo": "bar"}));
+        let plain = console::strip_ansi_codes(&line).to_string();
+        assert!(plain.starts_with("⏺ mystery_tool("), "{plain:?}");
+    }
+
+    #[test]
+    fn tool_action_maps_common_tools_to_english_verbs() {
+        let action = |n: &str, a: serde_json::Value| tool_action(n, &a).unwrap();
+        assert_eq!(action("file_write", serde_json::json!({"path": "C:\\Users\\admin\\scan.ps1"})), "Write scan.ps1");
+        assert_eq!(action("file_read", serde_json::json!({"path": "/tmp/foo/bar.rs"})), "Read bar.rs");
+        assert_eq!(
+            action("shell_run", serde_json::json!({"command": "powershell -NoProfile -File C:\\Users\\admin\\scan.ps1"})),
+            "Run scan.ps1"
+        );
+        assert_eq!(action("skill_load", serde_json::json!({"name": "scan-windows"})), "Load skill scan-windows");
+        assert_eq!(action("todo_write", serde_json::json!({"todos": [{}, {}, {}]})), "Plan · 3 steps");
+        assert_eq!(action("todo_write", serde_json::json!({"todos": [{}]})), "Plan · 1 step");
+        assert_eq!(action("web_fetch", serde_json::json!({"url": "https://docs.rs/tokio/index.html"})), "Fetch docs.rs");
+        // an unmapped tool has no natural verb
+        assert!(tool_action("mystery_tool", &serde_json::json!({})).is_none());
     }
 
     #[test]
@@ -2432,6 +2691,9 @@ mod tests {
         }
         fn is_destructive(&self) -> bool {
             true
+        }
+        fn workspace_effect(&self, _args: &serde_json::Value) -> crate::agent::tools::WorkspaceEffect {
+            crate::agent::tools::WorkspaceEffect::Paths
         }
         fn execute(&self, _args: &serde_json::Value) -> Result<String> {
             Ok("deleted".into())
@@ -2599,8 +2861,7 @@ mod tests {
             auto_extend_to: 5,
             max_tool_result_chars: 4096,
             max_fetch_result_chars: 12_000,
-            auto_approve: false,
-            smart_approve: false,
+            approval_mode: crate::core::approval::ApprovalMode::Ask,
             quiet: true,
             enable_verify_gate: false,
             verify_gate_timeout_secs: 90,
@@ -2654,7 +2915,8 @@ mod tests {
             .iter()
             .map(|tc| Message::tool_result(tc.id.clone(), INTERRUPTED_TOOL_PLACEHOLDER.to_string()))
             .collect();
-        let results = execute_calls(r, calls, c, &mut sink, Vec::new()).await;
+        let mut checkpointed = false;
+        let results = execute_calls(r, calls, c, &mut sink, Vec::new(), &mut checkpointed).await;
         // The sink must mirror the returned results (the loop relies on it).
         for (k, (_, out)) in results.iter().enumerate() {
             assert_eq!(sink[k].content.as_deref(), Some(out.as_str()), "sink[{k}] mirrors the result");
@@ -2664,12 +2926,12 @@ mod tests {
 
     #[test]
     fn hard_floor_blocks_even_under_yolo() {
-        // THE security invariant: a catastrophic command is refused even with auto_approve (yolo) ON.
-        // The floor runs BEFORE the approval short-circuit, so /yolo cannot bypass it.
+        // THE security invariant: a catastrophic command is refused even with yolo approval.
+        // The floor runs BEFORE the approval short-circuit, so yolo cannot bypass it.
         let mut r = ToolRegistry::new();
         r.register(Box::new(ShellStub));
         let mut c = cfg();
-        c.auto_approve = true; // yolo
+        c.approval_mode = crate::core::approval::ApprovalMode::Yolo; // yolo
         let out = execute_one_for_test(&r, &call("1", "shell_run", r#"{"command":"rm -rf /"}"#), &c);
         assert!(out.contains("blocked by the hard safety floor"), "got: {out}");
         assert!(!out.contains("RAN"), "the command must NOT have executed");
@@ -2681,7 +2943,7 @@ mod tests {
         let mut r = ToolRegistry::new();
         r.register(Box::new(ShellStub));
         let mut c = cfg();
-        c.smart_approve = true;
+        c.approval_mode = crate::core::approval::ApprovalMode::Smart;
         let out = execute_one_for_test(&r, &call("1", "shell_run", r#"{"command":"ls -la"}"#), &c);
         assert_eq!(out, "RAN", "read-only shell should auto-run under smart");
     }
@@ -2692,7 +2954,7 @@ mod tests {
         let mut r = ToolRegistry::new();
         r.register(Box::new(ShellStub));
         let mut c = cfg();
-        c.smart_approve = true; // not yolo
+        c.approval_mode = crate::core::approval::ApprovalMode::Smart; // not yolo
         let out = execute_one_for_test(&r, &call("1", "shell_run", r#"{"command":"rm -rf node_modules"}"#), &c);
         assert!(!out.contains("RAN"), "a write must not auto-run under smart; got: {out}");
     }
@@ -2808,7 +3070,7 @@ mod tests {
     #[tokio::test]
     async fn destructive_denied_non_tty_then_model_finishes() {
         let r = registry();
-        // auto_approve=false + non-TTY test env → safe-deny → "declined" fed back → model stops.
+        // ask mode + non-TTY test env → safe-deny → "declined" fed back → model stops.
         let out = run_agent(
             scripted(vec![tool_turn("delete", "{}"), final_turn("stopped")]),
             &cfg(),
@@ -3014,7 +3276,7 @@ mod tests {
         // THE hardest trap: the system-prompt-sanctioned recovery — a failed edit, then a re-read
         // (stale bytes) to copy exact text, then a SUCCESSFUL edit. Peak streak 2 < STUCK_NUDGE_STREAK,
         // so NO nudge and NO stop — the recovery must never be punished.
-        let c = AgentConfig { auto_approve: true, max_iters: 10, auto_extend_to: 10, ..cfg() };
+        let c = AgentConfig { approval_mode: crate::core::approval::ApprovalMode::Yolo, max_iters: 10, auto_extend_to: 10, ..cfg() };
         let mut messages = vec![Message::system("sys"), Message::user("task")];
         let chat = scripted(vec![
             tool_turn("echo", r#"{"text":"filecontent"}"#), // seed: read the file
@@ -3045,7 +3307,7 @@ mod tests {
         // run to the extended cap re-executing the side effect. Regression guard: a successful edit is
         // "productive" for the thrash streak but must NOT clear the divergence latch (only novel
         // content does), or the insert()==false hard-stop becomes unreachable.
-        let c = AgentConfig { auto_approve: true, max_iters: 4, auto_extend_to: 20, ..cfg() };
+        let c = AgentConfig { approval_mode: crate::core::approval::ApprovalMode::Yolo, max_iters: 4, auto_extend_to: 20, ..cfg() };
         let turns = vec![
             tool_turn("delete", r#"{}"#),
             tool_turn("delete", r#"{}"#),
@@ -3077,7 +3339,7 @@ mod tests {
         let r = registry();
         // A big task that lands many DISTINCT successful edits must never be flagged: each edit is
         // productive (streak pinned 0) and distinct args keep signatures distinct (no divergence).
-        let c = AgentConfig { auto_approve: true, max_iters: 30, auto_extend_to: 30, ..cfg() };
+        let c = AgentConfig { approval_mode: crate::core::approval::ApprovalMode::Yolo, max_iters: 30, auto_extend_to: 30, ..cfg() };
         let turns = vec![
             tool_turn("delete", r#"{"d":"1"}"#),
             tool_turn("delete", r#"{"d":"2"}"#),
@@ -3495,7 +3757,7 @@ mod tests {
         // enable_self_review + an edit → the first "done" is intercepted by ONE review turn
         // (nudge mode — no oracle), the second "done" is accepted.
         let r = registry();
-        let c = AgentConfig { enable_self_review: true, auto_approve: true, ..cfg() };
+        let c = AgentConfig { enable_self_review: true, approval_mode: crate::core::approval::ApprovalMode::Yolo, ..cfg() };
         let mut messages = vec![Message::system("sys"), Message::user("edit something")];
         let chat = scripted(vec![
             tool_turn("delete", "{}"), // a successful destructive op arms made_any_edits
@@ -3550,7 +3812,8 @@ mod tests {
             .iter()
             .map(|tc| Message::tool_result(tc.id.clone(), INTERRUPTED_TOOL_PLACEHOLDER.to_string()))
             .collect();
-        let results = execute_calls(&r, &calls, &cfg(), &mut sink, vec![(0, h)]).await;
+        let mut checkpointed = false;
+        let results = execute_calls(&r, &calls, &cfg(), &mut sink, vec![(0, h)], &mut checkpointed).await;
         assert_eq!(results[0].1, "EAGER_RESULT", "adopted, not re-executed");
         assert_eq!(results[1].1, "normal", "non-eager sibling runs normally");
         assert_eq!(sink[0].content.as_deref(), Some("EAGER_RESULT"), "sink mirrors the adopted result");
@@ -3614,7 +3877,7 @@ mod tests {
         r.register(Box::new(RecordingTool { name: "write_w", destructive: true, log: log.clone(), delay_ms: 5 }));
         r.register(Box::new(RecordingTool { name: "read_c", destructive: false, log: log.clone(), delay_ms: 5 }));
         let mut c = cfg();
-        c.auto_approve = true; // clear the write barrier without a prompt
+        c.approval_mode = crate::core::approval::ApprovalMode::Yolo; // clear the write barrier without a prompt
         let calls = vec![
             call("1", "read_a", "{}"),
             call("2", "read_b", "{}"),

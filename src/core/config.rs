@@ -255,6 +255,47 @@ pub fn style_path() -> PathBuf {
     cli_memory_dir().join("STYLE.md")
 }
 
+/// Sanitize a project slug for use as a single path segment (no `/` `\` `..`).
+fn safe_core_slug(slug: &str) -> String {
+    let s: String = slug
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let s = s.trim_matches('-').to_string();
+    if s.is_empty() {
+        "project".into()
+    } else {
+        s.chars().take(64).collect()
+    }
+}
+
+/// Per-repo always-on frozen core (active). Layout: `cli-memory/core/active/<slug>.md`.
+/// Isolates prefix cache so repo A's core never injects into repo B.
+pub fn core_active_path(slug: &str) -> PathBuf {
+    cli_memory_dir()
+        .join("core")
+        .join("active")
+        .join(format!("{}.md", safe_core_slug(slug)))
+}
+
+/// Per-repo staged core for next session. Layout: `cli-memory/core/next/<slug>.md`.
+pub fn core_next_path(slug: &str) -> PathBuf {
+    cli_memory_dir()
+        .join("core")
+        .join("next")
+        .join(format!("{}.md", safe_core_slug(slug)))
+}
+
+/// Legacy single-file active core (pre per-repo layout). Read-once fallback only.
+pub fn legacy_core_active_path() -> PathBuf {
+    cli_memory_dir().join("core.active.md")
+}
+
+/// Legacy single-file staged core (pre per-repo layout).
+pub fn legacy_core_next_path() -> PathBuf {
+    cli_memory_dir().join("core.next.md")
+}
+
 /// Mid-confidence learned candidates land here for `ng memory review` (P3).
 pub fn review_dir() -> PathBuf {
     cli_memory_dir().join("review")
@@ -302,7 +343,10 @@ pub fn embed_model_name() -> String {
 #[derive(Debug, Clone)]
 pub struct MemorySettings {
     /// Frozen-core hard cap (tokens, chars/4 estimate). Prefix-stability budget.
+    /// Always-on is STYLE + global user prefs only — keep this tight to save tokens.
     pub frozen_core_max_tokens: usize,
+    /// Session working-memory inject cap (tokens, chars/4). 0 disables inject.
+    pub session_mem_max_tokens: usize,
     // Reserved tuning knobs: callers currently pass `k` per-call and `lexical_score_tokens` uses the
     // research-fixed 0.7/0.3 blend, so these defaults aren't read yet (kept for the bench grid-search).
     /// Lazy `search_memory` injection.
@@ -361,7 +405,8 @@ pub struct MemorySettings {
 impl Default for MemorySettings {
     fn default() -> Self {
         Self {
-            frozen_core_max_tokens: 1500,
+            frozen_core_max_tokens: 800,
+            session_mem_max_tokens: 300,
             search_top_k: 5,
             search_max_tokens: 1200,
             w_jaccard: 0.7,

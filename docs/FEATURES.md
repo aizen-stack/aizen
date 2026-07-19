@@ -105,6 +105,7 @@ Every tool is one clear capability. Tools are either **read-only** (run freely, 
 - `persona_create` — mint/switch a persona.
 - `notify` — broadcast a status line to configured channels (only when channels exist).
 - `checkpoint` — save a time-machine restore point before a risky change.
+- `checkpoint_rewind` — run-scoped recovery only (`last_good` / `pre_edit`, max 2 per agent run). Free-form `time restore <id>` stays human/CLI.
 - **MCP tools** — every connected MCP server's tools appear as `mcp_<server>_<tool>`, destructive-by-default unless the server marks them read-only.
 
 ---
@@ -112,11 +113,12 @@ Every tool is one clear capability. Tools are either **read-only** (run freely, 
 ### C. Safety & approval (cross-cutting)
 
 - **Hard command floor (`cmd_guard`)** — an unconditional blocklist that **`/yolo` can never bypass**: `rm -rf /`, `mkfs`, raw `dd` to a device, fork bombs, `curl … | sh`, `chmod -R 777 /`, Windows `format C:` / `del /s C:\`, MBR wipes. Matches the whole command string so chaining can't hide a blocked op.
-- **Tiered approval for destructive ops:**
-  - **Interactive TTY** — inline modal: `[y]es · [n]o · [a]llow all this session`.
-  - **`--yes` / `/yolo`** — pre-authorize (floor still applies).
-  - **`/smart`** — auto-run *read-only-shaped* shell (e.g. `ls`, `git status`, `cargo check`); writes/installs/deletes still ask.
-  - **Daemon (phone)** — when running as a bot, approvals route to **Telegram inline ✓/✗ buttons** (5-min timeout → auto-deny).
+- **Unified approval level (`/approval ask|smart|yolo`):**
+  - **Ask** — interactive destructive tools prompt; non-TTY safely denies.
+  - **Smart** — auto-run *read-only-shaped* shell (e.g. `ls`, `git status`, `cargo check`); writes/installs/deletes still ask.
+  - **Yolo** — pre-authorize tools after the hard floor; `--yes` and `AIZEN_YES` resolve to this level.
+  - Legacy `/smart` and `/yolo` aliases remain accepted for compatibility.
+  - **Daemon (phone)** — in Ask/Smart, remaining approvals route to **Telegram inline ✓/✗ buttons** (5-min timeout → auto-deny).
   - **Non-TTY, no channel** — **safe-deny** (scripts/CI never silently run destructive ops).
 
 ---
@@ -146,9 +148,15 @@ The headline differentiator. **One fact = one markdown file** under `~/.aizen/cl
 | `compact` | Enforce the inferred-fact LRU cap (archive oldest). |
 
 **Key concepts to document:**
-- **Frozen core** — the `<memory>` block injected into *every* prompt prefix. Built fresh at **session start**, then **immutable mid-session** (keeps the prefix byte-stable so provider prompt-caching stays warm). STYLE.md pinned first, then top `user` facts by salience, capped (~2000 tokens); overflow spills to the searchable long tail.
-- **Passive auto-learning** (on by default): free regex extraction (zero token cost) → sanitize (neutralize tag-breakouts/control chars) → **threat-scan** (reject prompt-injection/secrets, fail-closed) → **consolidate** (near-duplicates *reinforce* an existing fact instead of duplicating) → **route by confidence** (drop / queue-for-review / store / promote-to-STYLE.md with confirmation).
-- **Retrieval & ranking:** a BM25 **lexical floor** (always on), an optional **fuzzy** Jaro-Winkler bridge (`AIZEN_MEM_FUZZY=1`), and a **dense semantic** tier via RRF fusion — **on by default on `--features dense` release builds** (the model2vec backend), off on a default build (only the non-semantic fallback embedder ships there). The dense tier is **query-gated**: it fuses only when the top lexical hit covers <60% of the query tokens (paraphrase / cross-lingual), so a confident literal match keeps BM25's precision. Run `aizen memory model-download` once to fetch the ~30 MB model into `~/.aizen/models/`. Override with `AIZEN_MEM_DENSE=0/1`. Final score = `BM25 × decay × salience` — **facts rise/sink on reuse and reinforcement, not age alone**.
+- **Three memory layers (token-lean):**
+  1. **L1 Always-on frozen core** (`<user_memory>`) — **STYLE.md + global user prefs only**. Project-zone facts never spend the prefix budget. Built fresh at **session start**, then **immutable mid-session** (prefix-cache stability). Cap ~800 tokens (chars/4). Stored **per-repo** at `~/.aizen/cli-memory/core/active/<project-slug>.md` so repo A's core never injects into repo B.
+  2. **L2 Session working memory** (`<session_memory>`, optional) — temporary in-process notes for the current session. Inferred / mid-confidence facts park here first (not durable). Cap ~300 tokens; empty → no tag. Cleared on `/new` / `/reset` / handoff / rebuild.
+  3. **L3 Durable long-tail** (`entries/*.md`) — zone-tagged (`scope: <slug>` or global). Retrieved via `memory_search` (default = current workspace + global). Project knowledge lives **here**, not in always-on.
+- **Passive auto-learning** (on by default): free regex extraction (zero token cost) → sanitize → **threat-scan** → **consolidate** → **route**:
+  - **Explicit** (`remember` / correction / `#…`) → durable L3 (and STYLE when confirmed).
+  - **Inferred** preferences / one-shots → L2 session only (no permanent pollution).
+  - Style CorePromote still confirmation-gated (non-TTY / denied → no STYLE write).
+- **Retrieval & ranking:** a BM25 **lexical floor** (always on), an optional **fuzzy** Jaro-Winkler bridge (`AIZEN_MEM_FUZZY=1`), and a **dense semantic** tier via RRF fusion — **on by default on `--features dense` release builds** (the model2vec backend), off on a default build (only the non-semantic fallback embedder ships there). The dense tier is **query-gated**: it fuses only when the top lexical hit covers <60% of the query tokens (paraphrase / cross-lingual), so a confident literal match keeps BM25's precision. Run `aizen memory model-download` once to fetch the ~30 MB model into `~/.aizen/models/`. Override with `AIZEN_MEM_DENSE=0/1`. Final score = `BM25 × decay × salience` — **facts rise/sink on reuse and reinforcement, not age alone**. Workspace scope filter runs **before** BM25 so IDF is computed on the in-view zone only.
 - **Anti-bloat:** LRU caps + archive (recoverable), recency decay (inferred facts only), dedup-on-write, supersede. Deliberate (manual) facts never auto-evict.
 - **Derived views are free/local** (no LLM): `profile` and `ask` compute deterministically and cite their basis; `ask` has a hard **abstain firewall** for unknowns.
 
@@ -158,7 +166,7 @@ The headline differentiator. **One fact = one markdown file** under `~/.aizen/cl
 
 A **persona** is a character the agent role-plays — a markdown "character card" (`~/.aizen/personas/<name>.md`, frontmatter: name/role/voice + body). The active persona is injected as a `<persona>` block.
 
-**Self-memory evolution (Generative-Agents pattern):** the active persona accumulates a **memory stream of episodes** (auto-recorded each turn, importance-scored, capped ~60) which are periodically **reflected into higher-level insights** (durable, capped ~40, ranked above episodes). The top of this stream is injected as a `<self>` block (~700 tokens). Reflection triggers when enough fresh, important episodes accumulate; the model synthesizes 1–3 first-person insights. Gated by `persona_evolve` (default on).
+**Self-memory evolution (lean Generative-Agents × MemoryBank × CoALA):** the active persona keeps a **formative-only memory stream**. Episodes are **event-gated** (correction / preference / remember / substantial tool work / explicit `persona remember`) — small-talk and passive turns write nothing. Bodies are free typed notes (`correction:…`, `preference:…`, `work:…`), near-deduped against a recent window + existing insights, capped ~40. When formative importance piles up, **one reflection call** distills 1–3 durable character/relationship insights (coding-task trivia is rejected). The always-on `<self>` block (~700 tokens) is **insight-first**; only hot episodes (importance ≥ 6) may join. Gated by `persona_evolve` (default on).
 
 **Subcommands:** `list` (● marks active, shows insight/episode counts), `show <name>`, `new <name> [--role --voice --body]`, `use <name>`, `clear`, `self [name]` (view the stream; "primed to reflect" badge), `remember <text> [--importance]` (record an episode, no model call), `block` (print the assembled `<persona>`+`<self>` the model sees).
 
@@ -208,7 +216,7 @@ Connect third-party tools via the **Model Context Protocol** registry. Config li
 
 **Web crawler — `aizen crawl <url…>`** — katana-style BFS: extracts links from HTML and endpoints from JS. Flags: `--depth`, `--max-pages`, `--scope strict|subs`, `--concurrency`, `--timeout`, `--json`, `--show-source`. SSRF floor applies.
 
-**Time machine — `aizen time …`** — git-backed snapshots of the **whole working tree** (tracked + untracked, honoring `.gitignore`) stored on private refs — **never touches your real index/HEAD/branches**. `save [label]`, `list` (▸ marks the active point), `restore <id>` (auto-saves current state first), `undo`, `redo`, `prune [--keep N]`, `clear`. The agent can call `checkpoint` before risky edits. Retention cap `timemachine_keep` (default 50).
+**Time machine — `aizen time …`** — crash-recoverable Git snapshots of the current repository's Git-visible tree. Snapshots and metadata live in a **private store under `~/.aizen/timemachine/<repo-id>/`** (bare object store with a sealed alternates pointer into the source repo + per-worktree ledger/journal/chat); the source `.git` is never written by Time Machine. Metadata is fail-closed and atomically persisted behind an OS cross-process lock; internal Git runs disable hooks/fsmonitor/external filters; restore saves a preimage, verifies the resulting tree, and preserves a recovery journal on interruption. Ignored paths, paths outside the repository, nested repositories and unsafe reparse/junction targets are **not silently promised as covered**. Commands: `save [label]`, `list`, `restore <id>`, branch-aware `undo`/`redo`, `prune [--keep N]`, `doctor [--json] [--repair]`, `gc`, `clear`. The agent creates an operation-scoped checkpoint only after approval and blocks a protected edit if that checkpoint fails; after each successful edit it stamps `last_good`. When an approach is cascading-broken, the agent may call **`checkpoint_rewind`** (`target=last_good|pre_edit`, max 2 rewinds per run) — free-form `restore <id>` stays human/CLI. Retention cap `timemachine_keep` (default 50).
 
 **Scheduled jobs — `aizen cron …`** — register agent tasks with the **OS scheduler** (Windows Task Scheduler / Unix crontab) — no daemon. `add <name> --schedule <daily@HH:MM|hourly|Nm|Nh> --task "…"`, `list`, `remove`. Runs unattended (`auto_approve`, hard floor still applies), pins the model at creation, logs each run to `~/.aizen/cron/<name>.log`.
 
@@ -218,7 +226,7 @@ Connect third-party tools via the **Model Context Protocol** registry. Config li
 
 **Config — `aizen config`** — interactive setup wizard (base URL + key + pick a model from the live `/models` list) or `set` / `show` (key masked) / `path`. Saved at `~/.aizen/config.json`.
 
-**Config fields:** `base_url`, `api_key`, `model`, `model_context_window` (override), `compact_threshold_pct` (auto-compact at %, default 80, 0=off), `auto_skill_learn`, `memory_auto_learn`, `persona_evolve`, `persona` (active), `timemachine_keep`, `price_in`/`price_out` (enable `/cost` USD estimate), `icons` (emoji/nerd/off), `onboarded`.
+**Config fields:** `base_url`, `api_key`, `model`, `model_context_window` (override), `compact_threshold_pct` (auto-compact at %, default 80, 0=off), `auto_skill_learn`, `memory_auto_learn`, `persona_evolve`, `persona` (active), `timemachine_keep`, `timemachine_max_files`, `timemachine_max_bytes`, `timemachine_max_file_bytes`, `price_in`/`price_out` (enable `/cost` USD estimate), `icons` (emoji/nerd/off), `onboarded`.
 
 **Models — `aizen models`** — lists provider models (with context windows when advertised). Feeds the `/model` picker.
 
@@ -237,7 +245,7 @@ Internal quality gates (useful for a "trust/quality" docs section, not end-user 
 A **sticky-footer REPL**: the input box is pinned to the bottom; the agent's work streams in a scroll region above it; a one-line HUD sits between.
 
 ### 4.1 In-chat slash commands (live-filtered palette, ~7 rows, Tab/↑↓ to pick)
-`/help` · `/model` (pick model, shows context windows) · `/sessions` (save/restore/delete chats) · `/timeline` (`/tm`) and `/checkpoint` (`/cp`,`/snapshot`) — time machine · `/compact` (compress context) · `/memory` (`/mem`) · `/persona` (`/character`) · `/skills` · `/apps` · `/mcp` · `/commands` (custom) · `/telegram` (`/tg`) · `/serve` · `/config` (`/setup`) · `/yolo` (toggle auto-approve) · `/smart` (toggle smart approval) · `/cost` (`/usage`) · `/tokens` · `/clear` (`/new`,`/reset`) · `/quit` (`/exit`,`/q`). Plus any user **custom commands**.
+`/help` · `/model` (pick model, shows context windows) · `/sessions` (save/restore/delete chats) · `/timeline` (`/tm`) and `/checkpoint` (`/cp`,`/snapshot`) — time machine · `/compact` (compress context) · `/memory` (`/mem`) · `/persona` (`/character`) · `/skills` · `/apps` · `/mcp` · `/commands` (custom) · `/telegram` (`/tg`) · `/serve` · `/config` (`/setup`) · `/approval ask|smart|yolo` (legacy aliases still accepted) · `/cost` (`/usage`) · `/tokens` · `/clear` (`/new`,`/reset`) · `/quit` (`/exit`,`/q`). Plus any user **custom commands**.
 
 ### 4.2 Landing & onboarding (bare `aizen`)
 Branded **splash** (sun logo via sixel where supported, else braille; block-art "AIZEN" wordmark, tagline "ARTIFICIAL INTELLIGENCE AGENT"), a one-time welcome ("about 30 seconds"), then the **setup wizard**: base URL → API key (hidden) → model picker (live list with context windows, or a custom-id option) → optional compact threshold → optional messaging-app connect. The full splash also renders a **capabilities panel** (tool groups + command list + "N tools · M commands").
@@ -276,10 +284,11 @@ The system prompt is assembled in this fixed order (each block **optional**, kep
 3. `<agent_identity>` — **Soul** (durable operating policies)
 4. `<persona>` — the active character
 5. `<self>` — the persona's accumulated episodes + insights
-6. `<user_memory>` — the frozen core of learned user facts
-7. `<skills>` — the compact skill index
+6. `<user_memory>` — STYLE + global user prefs only (always-on frozen core; per-repo cache)
+7. `<session_memory>` — optional temporary notes for this session (inferred facts; cleared on `/new`)
+8. `<skills>` — the compact skill index
 
-This stack — *operating policy → character → lived experience → who the user is → how to do things* — is the conceptual heart of Aizen and worth a dedicated diagram in the docs.
+This stack — *operating policy → character → lived experience → who the user is → session scratch → how to do things* — is the conceptual heart of Aizen and worth a dedicated diagram in the docs.
 
 ---
 
@@ -299,7 +308,7 @@ This stack — *operating policy → character → lived experience → who the 
 | `aizen apps <list\|search\|add\|info\|login\|remove>` · `aizen mcp <list\|login\|trust\|untrust>` | Apps & MCP. |
 | `aizen serve` · `aizen telegram <setup\|test\|show>` · `aizen discord <setup\|test\|serve\|show\|disable>` | Bots. |
 | `aizen crawl <url…>` | Website crawler. |
-| `aizen time <save\|list\|restore\|undo\|redo\|prune\|clear>` | Time machine. |
+| `aizen time <save\|list\|restore\|undo\|redo\|prune\|doctor\|gc\|clear>` | Crash-recoverable Time Machine with private external store. |
 | `aizen cron <add\|list\|remove>` | OS-scheduled jobs. |
 | `aizen bench <memory\|profile\|dialectic>` | Quality benchmarks. |
 
@@ -313,15 +322,16 @@ Home root: **`~/.aizen/`** (auto-migrated from legacy `~/.nextgen/`). Project-lo
 |---|---|
 | `~/.aizen/config.json` | Endpoint + behavior settings |
 | `~/.aizen/SOUL.md` | Operating identity |
-| `~/.aizen/cli-memory/entries/*.md` | Memory facts (one per file) |
-| `~/.aizen/cli-memory/STYLE.md` | Learned user-style core |
+| `~/.aizen/cli-memory/entries/*.md` | Memory facts (one per file; zone via `scope:`) |
+| `~/.aizen/cli-memory/STYLE.md` | Learned user-style core (always-on) |
+| `~/.aizen/cli-memory/core/active/<slug>.md` | Per-repo frozen-core cache |
 | `~/.aizen/cli-memory/{review,archive,embed-cache}/` | Review queue · LRU archive · dense cache |
 | `~/.aizen/personas/<name>.md` · `<slug>.self/` | Persona cards · self-memory streams |
 | `~/.aizen/skills/*.md` | Saved skills |
 | `~/.aizen/commands/**/*.md` | Custom slash commands |
 | `~/.aizen/mcp.json` · `mcp-tokens/*.json` | MCP servers · cached OAuth tokens |
 | `~/.aizen/cron/<name>.{json,log}` | Scheduled jobs + run logs |
-| `<git-dir>/ng_timemachine.json` + `refs/ng/tm/*` | Time-machine ledger + snapshots |
+| `~/.aizen/timemachine/<repo-id>/store.git` + `worktrees/<wt-id>/` | Private Time Machine store (ledger/journal/chat + sealed object store); source `.git` is never written |
 
 ---
 

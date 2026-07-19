@@ -40,6 +40,7 @@ dialoguer = { version = "0.11", default-features = false, features = ["password"
 # Colored banner output (dialoguer's companion; already in the tree → no extra binary cost).
 # Enables Windows VT + honors NO_COLOR / non-TTY automatically.
 console = "0.15"
+
 # URL parsing/joining for the katana-style crawler (resolve relative links, host/scope checks).
 # Pure-Rust, no native deps → single static binary preserved.
 url = "2"
@@ -135,4 +136,15 @@ png = "0.17"
 # needs MinGW `dlltool.exe` on the *-windows-gnu toolchain (not present here); 0.59 ships classic
 # prebuilt import libs and builds everywhere.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects"] }
+# Features cover: Job Objects (LSP tree-kill), console mode restore (TUI), atomic MoveFileEx +
+# ACL owner-only writes (persist), exclusive file locks (repo_lock), reparse-point checks (TM).
+# PINNED to 0.59 — see comment above. Do NOT promote this to a target-agnostic dep.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+] }

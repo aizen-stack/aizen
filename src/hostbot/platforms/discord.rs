@@ -1,20 +1,27 @@
 //! Discord BOT integration — two-way, pure-Rust DIY: REST (reqwest) to send, the gateway WebSocket
 //! (tokio-tungstenite over rustls) to receive. NO serenity (keeps the lean static binary), mirrors
-//! `telegram.rs`. Powers `ng discord serve`. The gateway v10 handshake is implemented by hand per the
-//! documented protocol: HELLO → heartbeat loop (with **Heartbeat-ACK zombie detection** + handling of
-//! server-initiated op 1 heartbeat-request / op 7 reconnect / op 9 invalid-session), IDENTIFY (with the
-//! privileged MESSAGE_CONTENT intent), MESSAGE_CREATE dispatch, reconnect-with-backoff. Replies go over
-//! REST (independent of the gateway), so the heartbeat keeps flowing while the agent works on a separate
-//! task. (RESUME-after-drop is the remaining refinement — a reconnect re-IDENTIFYs fresh.)
+//! `telegram.rs`. Powers `aizen discord serve` (via `DiscordPlatform`). The gateway v10 handshake is
+//! implemented by hand per the documented protocol: HELLO → heartbeat loop (with **Heartbeat-ACK
+//! zombie detection** + handling of server-initiated op 1 heartbeat-request / op 7 reconnect / op 9
+//! invalid-session), IDENTIFY (with the privileged MESSAGE_CONTENT intent), MESSAGE_CREATE dispatch,
+//! reconnect-with-backoff. Replies go over REST (independent of the gateway), so the heartbeat keeps
+//! flowing while the agent works on a separate task. (RESUME-after-drop is the remaining refinement —
+//! a reconnect re-IDENTIFYs fresh.)
+//!
+//! `DiscordPlatform` (bottom of the file) implements the `Platform` contract: one gateway, one channel
+//! namespace ("default" route), no inline approval buttons + no multi-bot (both inherit the trait's
+//! "unsupported" defaults), so the generic daemon loop stays platform-agnostic.
 
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, Sender};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::core::cli_config::{self, DiscordConfig};
+use crate::hostbot::platform::{Inbound, Platform};
 
 const API_BASE: &str = "https://discord.com/api/v10";
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -74,7 +81,7 @@ impl Client {
         Ok(())
     }
 
-    /// `GET /users/@me` → the bot's username (validates the token; used by `ng discord test`).
+    /// `GET /users/@me` → the bot's username (validates the token; used by `aizen discord test`).
     pub async fn get_me(&self) -> Result<String> {
         let url = format!("{API_BASE}/users/@me");
         let resp =
@@ -282,6 +289,79 @@ fn parse_message_create(d: Option<&Value>) -> Option<Incoming> {
         return None;
     }
     Some(Incoming { channel_id, user_id, content })
+}
+
+// ── DiscordPlatform (the `Platform` impl) ──────────────────────────────────────────
+//
+// One gateway feeding one inbound channel; every message uses the "default" route (Discord has no
+// multi-bot hosting). Inline approval buttons aren't implemented, so `supports_approval` stays false
+// (its trait default) → the agent's approval gate auto-denies destructive ops (they're skipped),
+// exactly as before this refactor.
+
+/// Discord as a hosted platform. `gateway` is the receive task — aborted on shutdown.
+pub struct DiscordPlatform {
+    client: Arc<Client>,
+    cfg: DiscordConfig,
+    token: String,
+    gateway: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl DiscordPlatform {
+    /// Build from `cli-config.json`'s `discord` section. Fails if the bot isn't set up.
+    pub fn from_config() -> Result<Self> {
+        let (client, cfg) =
+            configured().context("Discord bot not configured — run `aizen discord setup`")?;
+        let token = cfg.resolved_token().context("no bot token")?;
+        Ok(Self {
+            client: Arc::new(client),
+            cfg,
+            token,
+            gateway: std::sync::Mutex::new(None),
+        })
+    }
+}
+
+impl Platform for DiscordPlatform {
+    type Chat = u64;
+
+    fn name(&self) -> &'static str {
+        "discord"
+    }
+
+    fn message_max(&self) -> usize {
+        MESSAGE_MAX
+    }
+
+    async fn start(&self, tx: Sender<Inbound<u64>>) -> Result<()> {
+        // Bridge the gateway's `Incoming` onto the generic `Inbound` channel (route is always
+        // "default" — Discord has no sub-bots).
+        let (gtx, mut grx) = mpsc::channel::<Incoming>(64);
+        let token = self.token.clone();
+        let cfg = self.cfg.clone();
+        let gw = tokio::spawn(async move { run_gateway(token, cfg, gtx).await });
+        let bridge = tokio::spawn(async move {
+            while let Some(inc) = grx.recv().await {
+                let _ = tx
+                    .send(Inbound { route: "default".to_string(), chat: inc.channel_id, text: inc.content })
+                    .await;
+            }
+        });
+        // Track the gateway task so shutdown can abort it; the bridge ends when the gateway's sender
+        // drops, so it needs no separate handle.
+        *self.gateway.lock().unwrap() = Some(gw);
+        drop(bridge); // detached — self-terminates when `grx` closes
+        Ok(())
+    }
+
+    async fn send(&self, _route: &str, chat: u64, text: &str) -> Result<()> {
+        self.client.send_message(chat, text).await
+    }
+
+    fn shutdown(&self) {
+        if let Some(gw) = self.gateway.lock().unwrap().take() {
+            gw.abort();
+        }
+    }
 }
 
 #[cfg(test)]

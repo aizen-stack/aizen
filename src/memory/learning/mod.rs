@@ -9,6 +9,7 @@
 //! - **Deferred prefix.** A style promotion stages the core for the NEXT session (prefix-cache
 //!   safety) — it never mutates the live prompt mid-session.
 
+pub mod audit;
 pub mod consolidate;
 pub mod extract_free;
 pub mod route;
@@ -85,6 +86,10 @@ pub struct LearnReport {
     pub dropped: usize,
     /// LRU victims archived by the post-write compaction pass (P4).
     pub archived: Vec<String>,
+    /// (old_id, new_id) when a correction retired a stale fact (E1).
+    pub superseded: Vec<(String, String)>,
+    /// Inferred candidates parked in session working memory (not durable).
+    pub session_notes: Vec<String>,
     /// True when the turn carried no learnable signal (the common, free case).
     pub skipped_passive: bool,
 }
@@ -95,6 +100,8 @@ impl LearnReport {
             || !self.reinforced.is_empty()
             || !self.queued_review.is_empty()
             || !self.core_promoted.is_empty()
+            || !self.superseded.is_empty()
+            || !self.session_notes.is_empty()
     }
 }
 
@@ -121,14 +128,15 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
     }
 
     // The turn-level signal lends trust to whatever was extracted from the same turn.
-    let provenance = if signal.kind == SignalKind::Remember {
-        ProvenanceKind::UserExplicit
-    } else {
-        ProvenanceKind::Inferred
+    // Remember AND correction are treated as user-explicit (durable): a correction is the user
+    // actively fixing the model — parking it only in session would lose supersession.
+    let provenance = match signal.kind {
+        SignalKind::Remember | SignalKind::Correction => ProvenanceKind::UserExplicit,
+        _ => ProvenanceKind::Inferred,
     };
     for c in &mut candidates {
         c.confidence = (c.confidence + 0.15 * signal.strength).min(0.99);
-        if signal.kind == SignalKind::Remember {
+        if matches!(signal.kind, SignalKind::Remember | SignalKind::Correction) {
             c.confidence = c.confidence.max(0.9);
         }
     }
@@ -159,9 +167,21 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
         // facts travel with the user (global); project/reference facts belong to the workspace
         // they were learned in (`p:<slug>` zone) so another repo's session never pays for them.
         let (scope, subpath) = scope_for(&c.mtype);
-        match route::route(&c, &s) {
+        let is_inferred = provenance == ProvenanceKind::Inferred;
+        let r = route::route(&c, &s);
+
+        // L2 session parking: inferred non-style facts stay in working memory this session
+        // (not durable long-tail). Explicit remember → durable. Style CorePromote still goes
+        // through confirm → STYLE (or session/no_core on deny).
+        if is_inferred && matches!(r, Route::Store | Route::Review) {
+            park_session_note(&clean, scope.as_deref(), c.confidence, &c.name, opts, &mut report);
+            continue;
+        }
+
+        match r {
             Route::Drop => report.dropped += 1,
             Route::Review => {
+                // Explicit mid-confidence → human review queue (durable path).
                 if !opts.dry_run {
                     let w = LearnedWrite {
                         name: &c.name,
@@ -182,7 +202,20 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
                 }
             }
             Route::Store => {
-                apply_store(&clean, &c.mtype, provenance, c.confidence, false, scope, subpath, opts, &mut existing, &s, &mut report)?;
+                apply_store(
+                    &clean,
+                    &c.mtype,
+                    provenance,
+                    c.confidence,
+                    false,
+                    scope,
+                    subpath,
+                    signal.kind,
+                    opts,
+                    &mut existing,
+                    &s,
+                    &mut report,
+                )?;
             }
             Route::CorePromote => {
                 let confirmed = confirm_core(&clean, opts);
@@ -192,12 +225,25 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
                     }
                     style_changed = true;
                     report.core_promoted.push(clean);
+                } else if is_inferred {
+                    // Denied style promote + inferred → session only (no durable pollution).
+                    park_session_note(&clean, None, c.confidence, &c.name, opts, &mut report);
                 } else {
-                    // Denied promotion → downgrade to a normal user-fact store, but mark it `no_core`
-                    // so it stays searchable in the long tail yet NEVER re-enters the always-on frozen
-                    // core (which packs all other type=user facts). This honors the explicit "no".
-                    // Style facts are about the USER → always global.
-                    apply_store(&clean, &MemoryType::User, provenance, c.confidence, true, None, None, opts, &mut existing, &s, &mut report)?;
+                    // Explicit style denied → durable searchable, never always-on.
+                    apply_store(
+                        &clean,
+                        &MemoryType::User,
+                        provenance,
+                        c.confidence,
+                        true,
+                        None,
+                        None,
+                        signal.kind,
+                        opts,
+                        &mut existing,
+                        &s,
+                        &mut report,
+                    )?;
                 }
             }
         }
@@ -234,6 +280,36 @@ fn scope_for(mtype: &MemoryType) -> (Option<String>, Option<String>) {
     }
 }
 
+/// Map extractor confidence (0..1) → session-note importance (1..10).
+fn conf_to_importance(confidence: f64) -> u8 {
+    ((confidence.clamp(0.0, 1.0) * 10.0).round() as u8).clamp(1, 10)
+}
+
+/// Park an inferred fact in process session working memory (L2). Not durable.
+fn park_session_note(
+    clean: &str,
+    scope: Option<&str>,
+    confidence: f64,
+    name_fallback: &str,
+    opts: &LearnOptions,
+    report: &mut LearnReport,
+) {
+    if opts.dry_run {
+        report.session_notes.push(name_fallback.to_string());
+        return;
+    }
+    let imp = conf_to_importance(confidence);
+    let id = crate::memory::session_mem::process_session_mem().note(
+        clean,
+        crate::memory::session_mem::SessionNoteKind::Candidate,
+        scope.map(str::to_string),
+        imp,
+    );
+    if !id.is_empty() {
+        report.session_notes.push(id);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_store(
     clean: &str,
@@ -243,31 +319,60 @@ fn apply_store(
     no_core: bool,
     scope: Option<String>,
     subpath: Option<String>,
+    signal_kind: SignalKind,
     opts: &LearnOptions,
     existing: &mut Vec<MemoryEntry>,
     s: &MemorySettings,
     report: &mut LearnReport,
 ) -> Result<()> {
     let toks = tokenize(clean);
-    // Zone isolation for the write-path merge: only consolidate/dedup against entries in the SAME
-    // scope zone as this candidate. A project-A fact must never reinforce a project-B or global
-    // fact (cross-zone signal leak / scope drift), and a global fact must never fold into a zoned
-    // one. Reads (search, frozen_core, caps) are already zoned; this closes the merge gap. The
-    // reinforce still targets the real `existing` entry by id (the zone view holds clones).
     let same_zone: Vec<MemoryEntry> = existing.iter().filter(|e| e.scope == scope).cloned().collect();
-    match consolidate::decide(&toks, &same_zone, s.learn_dedup_threshold) {
+
+    let mut retire_id: Option<String> = None;
+    if signal_kind == SignalKind::Correction {
+        if let Some((id, score)) = consolidate::best_match(&toks, &same_zone) {
+            if score >= consolidate::SUPERSEDE_SLOT_MIN {
+                if let Some(e) = same_zone.iter().find(|e| e.id == id) {
+                    if !e.body.eq_ignore_ascii_case(clean) {
+                        retire_id = Some(id);
+                    }
+                }
+            }
+        }
+    }
+
+    let mem_op = consolidate::decide(&toks, &same_zone, s.learn_dedup_threshold);
+    let op_is_add = matches!(&mem_op, MemOp::Add);
+    match mem_op {
         MemOp::Reinforce { id } => {
-            if let Some(e) = existing.iter().find(|e| e.id == id) {
+            if signal_kind == SignalKind::Correction || retire_id.is_some() {
+                // User is correcting — never strengthen the stale row.
+            } else if let Some(e) = existing.iter().find(|e| e.id == id) {
                 if !opts.dry_run {
                     let _ = store::reinforce(e, &opts.session_id)?;
+                    audit::append(audit::AuditEvent {
+                        ts: audit::ts_now(),
+                        session_id: &opts.session_id,
+                        op: "reinforce",
+                        id: Some(&id),
+                        old_id: None,
+                        new_id: None,
+                        body_preview: None,
+                        signal: Some(signal_kind_label(signal_kind)),
+                    });
                 }
                 report.reinforced.push(id);
             }
         }
-        MemOp::Add => {
-            // Second-chance char-level dedup: catches typo/punctuation/reorder dups that the
-            // token-blend consolidator missed. If found, reinforce instead of inserting a twin.
-            // Same-zone only, for the reason above.
+        MemOp::Add => {}
+    }
+
+    let must_add = op_is_add
+        || retire_id.is_some()
+        || (signal_kind == SignalKind::Correction && !clean.is_empty());
+
+    if must_add {
+        if retire_id.is_none() {
             if let Some(dup) = existing
                 .iter()
                 .find(|e| e.scope == scope && bloat::dedup::is_near_duplicate(clean, &e.body, s.minhash_dup_threshold))
@@ -275,46 +380,99 @@ fn apply_store(
                 let id = dup.id.clone();
                 if !opts.dry_run {
                     let _ = store::reinforce(dup, &opts.session_id)?;
+                    audit::append(audit::AuditEvent {
+                        ts: audit::ts_now(),
+                        session_id: &opts.session_id,
+                        op: "reinforce",
+                        id: Some(&id),
+                        old_id: None,
+                        new_id: None,
+                        body_preview: None,
+                        signal: Some(signal_kind_label(signal_kind)),
+                    });
                 }
                 report.reinforced.push(id);
                 return Ok(());
             }
-            let name = title_for(clean);
-            if opts.dry_run {
-                report.added.push(store::slugify(&name));
-                return Ok(());
-            }
-            let w = LearnedWrite {
-                name: &name,
-                description: "",
-                mtype: *mtype,
-                body: clean,
-                source: provenance,
-                confidence,
-                session_id: &opts.session_id,
-                no_core,
-                scope: scope.clone(),
-                subpath: subpath.clone(),
-            };
-            let id = store::add_learned(&w)?;
-            // reflect the insert in-memory so the next candidate this run dedups against it
-            existing.push(MemoryEntry {
-                id: id.clone(),
-                path: config::entries_dir().join(format!("{id}.md")),
-                name,
-                mtype: *mtype,
-                body: clean.to_string(),
-                tokens: toks,
-                source: provenance,
-                confidence,
-                scope,
-                subpath,
-                ..Default::default()
-            });
-            report.added.push(id);
         }
+
+        let name = title_for(clean);
+        if opts.dry_run {
+            report.added.push(store::slugify(&name));
+            if let Some(old) = &retire_id {
+                report.superseded.push((old.clone(), store::slugify(&name)));
+            }
+            return Ok(());
+        }
+
+        let w = LearnedWrite {
+            name: &name,
+            description: "",
+            mtype: *mtype,
+            body: clean,
+            source: provenance,
+            confidence,
+            session_id: &opts.session_id,
+            no_core,
+            scope: scope.clone(),
+            subpath: subpath.clone(),
+        };
+        let id = store::add_learned(&w)?;
+
+        if let Some(old_id) = retire_id {
+            if let Some(old_e) = existing.iter().find(|e| e.id == old_id) {
+                let _ = store::mark_superseded(old_e, &id)?;
+                report.superseded.push((old_id.clone(), id.clone()));
+                audit::append(audit::AuditEvent {
+                    ts: audit::ts_now(),
+                    session_id: &opts.session_id,
+                    op: "supersede",
+                    id: None,
+                    old_id: Some(&old_id),
+                    new_id: Some(&id),
+                    body_preview: Some(&clean.chars().take(120).collect::<String>()),
+                    signal: Some("correction"),
+                });
+                existing.retain(|e| e.id != old_id);
+            }
+        } else {
+            audit::append(audit::AuditEvent {
+                ts: audit::ts_now(),
+                session_id: &opts.session_id,
+                op: "add",
+                id: Some(&id),
+                old_id: None,
+                new_id: None,
+                body_preview: Some(&clean.chars().take(120).collect::<String>()),
+                signal: Some(signal_kind_label(signal_kind)),
+            });
+        }
+
+        existing.push(MemoryEntry {
+            id: id.clone(),
+            path: config::entries_dir().join(format!("{id}.md")),
+            name,
+            mtype: *mtype,
+            body: clean.to_string(),
+            tokens: toks,
+            source: provenance,
+            confidence,
+            scope,
+            subpath,
+            ..Default::default()
+        });
+        report.added.push(id);
     }
     Ok(())
+}
+
+fn signal_kind_label(k: SignalKind) -> &'static str {
+    match k {
+        SignalKind::Remember => "remember",
+        SignalKind::Correction => "correction",
+        SignalKind::Preference => "preference",
+        SignalKind::Passive => "passive",
+    }
 }
 
 /// A short title for a fact body (the file slug source).
@@ -437,13 +595,39 @@ mod tests {
     }
 
     #[test]
-    fn preference_is_stored() {
+    fn preference_is_parked_in_session_not_durable() {
         with_temp_home("pref", || {
+            // Clear any leftover process session mem from other tests.
+            crate::memory::session_mem::clear_process_session_mem();
+            // Inferred preference (no explicit "remember") → L2 session only, not entries/.
             let r = ingest("I prefer pnpm over npm", &opts()).unwrap();
-            assert!(!r.added.is_empty(), "expected an add, got {r:?}");
-            // and a near-identical restatement reinforces rather than duplicates
+            assert!(
+                !r.session_notes.is_empty(),
+                "inferred prefer should land in session mem, got {r:?}"
+            );
+            assert!(r.added.is_empty(), "inferred must not durable-write, got {r:?}");
+            assert!(
+                store::load_all().unwrap().is_empty(),
+                "entries/ must stay empty for inferred prefer"
+            );
+            // Near-identical restatement reinforces the session note (same id / bumped imp).
             let r2 = ingest("I prefer pnpm over npm", &opts()).unwrap();
-            assert!(!r2.reinforced.is_empty(), "expected reinforce, got {r2:?}");
+            assert!(!r2.session_notes.is_empty(), "expected session re-note, got {r2:?}");
+            assert!(store::load_all().unwrap().is_empty());
+            crate::memory::session_mem::clear_process_session_mem();
+        });
+    }
+
+    #[test]
+    fn explicit_remember_is_stored_durable() {
+        with_temp_home("remember", || {
+            crate::memory::session_mem::clear_process_session_mem();
+            let r = ingest("remember that I deploy on fridays", &opts()).unwrap();
+            assert!(!r.added.is_empty(), "explicit remember must durable-add, got {r:?}");
+            assert!(r.session_notes.is_empty(), "explicit should not park in session");
+            // Restatement reinforces durable entry.
+            let r2 = ingest("remember that I deploy on fridays", &opts()).unwrap();
+            assert!(!r2.reinforced.is_empty() || !r2.added.is_empty(), "expected reinforce/add, got {r2:?}");
         });
     }
 
@@ -466,27 +650,18 @@ mod tests {
     }
 
     #[test]
-    fn style_promotion_denied_downgrades_to_store() {
+    fn style_promotion_denied_parks_inferred_in_session() {
         with_temp_home("core-deny", || {
-            // auto_confirm_core = Some(false) → must NOT touch STYLE.md, but must still store
+            crate::memory::session_mem::clear_process_session_mem();
+            // Inferred style + auto_confirm_core=false → no STYLE.md, no durable entry (session only).
             let r = ingest("please reply in Vietnamese", &opts()).unwrap();
             assert!(r.core_promoted.is_empty(), "denied promotion must not enter core");
-            assert!(!r.added.is_empty(), "denied promotion downgrades to a normal store");
+            assert!(r.added.is_empty(), "inferred denied style must not durable-store");
+            assert!(!r.session_notes.is_empty(), "denied inferred style parks in session");
             let style = std::fs::read_to_string(config::style_path()).unwrap_or_default();
             assert!(!style.to_lowercase().contains("vietnamese"), "STYLE.md must be untouched");
-            // The downgraded fact is stored & searchable, but flagged no-core so it NEVER re-enters
-            // the always-on frozen core (the explicit deny is honored — bug #4).
-            let entries = store::load_all().unwrap();
-            let denied = entries
-                .iter()
-                .find(|e| e.body.to_lowercase().contains("vietnamese"))
-                .expect("the denied fact is stored in the long tail");
-            assert!(denied.core_denied, "denied fact is stored with the no-core flag");
-            let core = crate::memory::frozen_core::build(&entries, None, 4000);
-            assert!(
-                !core.source_ids.contains(&denied.id),
-                "denied fact must stay OUT of the always-on core"
-            );
+            assert!(store::load_all().unwrap().is_empty(), "no durable pollution");
+            crate::memory::session_mem::clear_process_session_mem();
         });
     }
 
@@ -504,10 +679,15 @@ mod tests {
     #[test]
     fn dry_run_writes_nothing() {
         with_temp_home("dry", || {
+            crate::memory::session_mem::clear_process_session_mem();
             let o = LearnOptions { session_id: "s".into(), auto_confirm_core: Some(true), dry_run: true };
             let r = ingest("I prefer pnpm over npm", &o).unwrap();
             assert!(r.changed(), "dry-run still reports what it WOULD do");
             assert!(store::load_all().unwrap().is_empty(), "dry-run must not write");
+            assert!(
+                crate::memory::session_mem::process_session_mem().is_empty(),
+                "dry-run must not park session notes"
+            );
         });
     }
 
@@ -544,6 +724,7 @@ mod tests {
                 false,
                 Some("projb-00000002".to_string()),
                 None,
+                SignalKind::Passive,
                 &opts(),
                 &mut existing,
                 &s,
@@ -564,6 +745,7 @@ mod tests {
                 false,
                 Some("proja-00000001".to_string()),
                 None,
+                SignalKind::Passive,
                 &opts(),
                 &mut existing,
                 &s,
@@ -575,36 +757,82 @@ mod tests {
         });
     }
 
-    /// End-to-end: a fact `ingest` classifies as project-scoped lands tagged with the current zone,
-    /// while a user/feedback fact stays global — so the read-side scope filter has something true to
-    /// filter on. Complements the `scope_for` unit test by proving the tag survives the full pipeline.
+    /// End-to-end: explicit remember about the user is durable+global; explicit remember about the
+    /// project/codebase is zone-tagged with the current slug. Complements `scope_for` by proving
+    /// the tag survives the full pipeline (inferred facts park in session, not entries).
     #[test]
-    fn ingested_project_fact_is_zone_tagged_end_to_end() {
+    fn ingested_explicit_facts_are_scope_tagged_end_to_end() {
         let _g = config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-ingest-zone-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("NEXTGEN_HOME", &dir);
         std::env::set_var("NG_PROJECT_ROOT", &dir); // a stable, isolated zone for this test
+        crate::memory::session_mem::clear_process_session_mem();
 
-        // A stated preference is about the USER → global (no scope), searchable from any project.
-        let r = ingest("I prefer pnpm over npm", &opts()).unwrap();
-        assert!(!r.added.is_empty(), "a preference is learned, got {r:?}");
+        // Explicit user fact → durable global.
+        let r = ingest("remember that I always use tabs not spaces", &opts()).unwrap();
+        assert!(!r.added.is_empty(), "explicit user remember is durable, got {r:?}");
         let entries = store::load_all().unwrap();
-        let pref = entries
+        let user_f = entries
             .iter()
-            .find(|e| e.body.to_lowercase().contains("pnpm"))
-            .expect("the preference is stored");
-        assert!(pref.scope.is_none(), "a user/feedback fact is global, not zoned: {:?}", pref.scope);
-        // Whatever type it resolved to, the router's contract holds: only project/reference get a zone.
+            .find(|e| e.body.to_lowercase().contains("tabs"))
+            .expect("user fact stored");
+        assert!(user_f.scope.is_none(), "user fact is global: {:?}", user_f.scope);
+
+        // Explicit project/codebase fact → durable + current zone.
+        let r2 = ingest(
+            "remember that this project deploy pipeline uses fly.io",
+            &opts(),
+        )
+        .unwrap();
+        assert!(!r2.added.is_empty(), "explicit project remember is durable, got {r2:?}");
+        let entries = store::load_all().unwrap();
+        let proj_f = entries
+            .iter()
+            .find(|e| e.body.to_lowercase().contains("fly"))
+            .expect("project fact stored");
         assert_eq!(
-            scope_for(&pref.mtype).0,
-            pref.scope,
-            "the stored scope matches what scope_for() dictates for its type"
+            proj_f.scope.as_deref(),
+            Some(config::project_slug().as_str()),
+            "project fact is zone-tagged"
         );
 
         std::env::remove_var("NG_PROJECT_ROOT");
         std::env::remove_var("NEXTGEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
+        crate::memory::session_mem::clear_process_session_mem();
+    }
+
+    /// Correction + prefer-X-over-Y retires a stale durable fact (E1).
+    /// Seed via explicit remember (durable); correct via "actually, I prefer …" (Correction signal
+    /// is also UserExplicit so it stays durable and triggers supersession).
+    #[test]
+    fn correction_supersedes_conflicting_preference() {
+        with_temp_home("corr-super", || {
+            crate::memory::session_mem::clear_process_session_mem();
+            let r0 = ingest("remember that I prefer npm over pnpm", &opts()).unwrap();
+            assert!(!r0.added.is_empty(), "seed npm pref, got {r0:?}");
+            let npm_id = r0.added[0].clone();
+
+            let r1 = ingest("actually, I prefer pnpm over npm", &opts()).unwrap();
+            assert!(!r1.added.is_empty(), "pnpm pref added, got {r1:?}");
+            assert!(
+                !r1.superseded.is_empty(),
+                "npm fact should be superseded, got {r1:?}"
+            );
+            assert_eq!(r1.superseded[0].0, npm_id);
+
+            let active = bloat::supersede::active(&store::load_all().unwrap());
+            assert!(
+                active.iter().any(|e| e.body.to_lowercase().contains("pnpm")),
+                "pnpm still active"
+            );
+            assert!(
+                !active.iter().any(|e| e.id == npm_id),
+                "superseded npm must not be in active()"
+            );
+            crate::memory::session_mem::clear_process_session_mem();
+        });
     }
 }

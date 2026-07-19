@@ -162,9 +162,17 @@ async fn run(name: &str) -> Result<()> {
             .context("no endpoint configured for the scheduled run")?;
     let http = crate::http_client()?;
 
-    // Unattended → auto_approve (no human to confirm). The hard cmd_guard floor still refuses
+    // Unattended → yolo approval (no human to confirm). The hard cmd_guard floor still refuses
     // catastrophic shell commands, so this is bounded, not a blank cheque.
-    let result = crate::run_agent_capture(&http, &base_url, &api_key, &model, &job.task, true).await;
+    let result = crate::run_agent_capture(
+        &http,
+        &base_url,
+        &api_key,
+        &model,
+        &job.task,
+        crate::core::approval::ApprovalMode::Yolo,
+    )
+    .await;
 
     let stamp = crate::memory::learning::default_session_id();
     let entry = match &result {

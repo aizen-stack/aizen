@@ -8,7 +8,7 @@
 //! on disk (a relative path still resolves under `root`; `../` and absolute paths escape freely).
 //! SECURITY trade-off: agent-read web/tool content can now steer a write to an arbitrary path.
 
-use crate::agent::tools::{Tool, ToolRegistry};
+use crate::agent::tools::{Tool, ToolRegistry, WorkspaceEffect};
 use anyhow::{bail, Context, Result};
 use ignore::{WalkBuilder, WalkState};
 use once_cell::sync::Lazy;
@@ -80,8 +80,12 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     register_skill_load(&mut r);
     register_skill_registry(&mut r);
     register_telegram(&mut r);
+    // `bot_admin` (host/persona extra bots on the owner's word) is TOP-LEVEL ONLY — never in
+    // `subagent_read_only_base`, so a specialist sub-agent can't touch bot config.
+    register_bot_admin(&mut r);
     register_notify(&mut r);
     r.register(Box::new(crate::features::timemachine::Checkpoint));
+    r.register(Box::new(crate::features::timemachine::CheckpointRewind));
     r.register(Box::new(FileEdit::new(root.to_path_buf())));
     r.register(Box::new(MultiEdit::new(root.to_path_buf())));
     r.register(Box::new(FileWrite::new(root.to_path_buf())));
@@ -149,9 +153,19 @@ fn register_skill_registry(r: &mut ToolRegistry) {
 /// Advertise the Telegram tools only when a bot token + allowed chat are configured (otherwise
 /// they'd be dead tools that just error). Available to every registry.
 fn register_telegram(r: &mut ToolRegistry) {
-    if crate::channels::telegram::is_configured() {
-        r.register(Box::new(crate::channels::telegram::TelegramSend));
-        r.register(Box::new(crate::channels::telegram::TelegramAsk));
+    if crate::hostbot::platforms::telegram::is_configured() {
+        r.register(Box::new(crate::hostbot::platforms::telegram::TelegramSend));
+        r.register(Box::new(crate::hostbot::platforms::telegram::TelegramAsk));
+    }
+}
+
+/// Advertise the `bot_admin` tool only when Telegram is configured — it manages the extra bots this
+/// daemon hosts (add/remove/set-persona from a chat message). Top-level only: NOT added to
+/// `subagent_read_only_base`/`canonical_subagent_tool`, so a specialist sub-agent can't touch the
+/// bot registry or write tokens to config.
+fn register_bot_admin(r: &mut ToolRegistry) {
+    if crate::hostbot::platforms::telegram::is_configured() {
+        r.register(Box::new(crate::hostbot::platforms::telegram::BotAdmin));
     }
 }
 
@@ -173,7 +187,7 @@ pub fn default_registry_with_task(
     base_url: String,
     api_key: String,
     model: String,
-    auto_approve: bool,
+    approval_mode: crate::core::approval::ApprovalMode,
     context_window: usize,
 ) -> Result<ToolRegistry> {
     let root = resolve_root()?;
@@ -184,7 +198,7 @@ pub fn default_registry_with_task(
         base_url.clone(),
         api_key.clone(),
         model.clone(),
-        auto_approve,
+        approval_mode,
         root,
         0,
         context_window,
@@ -194,9 +208,10 @@ pub fn default_registry_with_task(
     // an explicit `workflow_tool: true` in config.
     if should_register_workflow() {
         r.register(Box::new(crate::agent::workflow_tool::WorkflowTool::new(
-            client, base_url, api_key, model, auto_approve, 0,
+            client, base_url, api_key, model, approval_mode, 0,
         )));
     }
+    crate::agent::toolsets::apply_toolset_filter(&mut r);
     // Publish the live surface so the `<skills>` index can hide skills that `require:` an absent tool.
     publish_active_tools(&r);
     Ok(r)
@@ -217,9 +232,8 @@ fn should_register_workflow() -> bool {
 }
 
 /// The read-only tool base shared by EVERY sub-agent registry (role- or specialist-scoped): memory +
-/// read/glob/search + web research + skill_load/registry + telegram/notify (when configured) +
-/// checkpoint. NEVER includes `task` (recursion guard), edit/shell (added per-scope by the caller),
-/// or the top-level-only tools (todo/process/clarify/mcp/persona_create). Factored out so
+/// read/glob/search + web research + skill_load/registry + telegram/notify (when configured).
+/// NEVER includes `task`, checkpoint, edit/shell, or top-level-only stateful tools. Factored out so
 /// `role_registry` and `agent_registry` cannot drift.
 fn subagent_read_only_base(root: &Path) -> ToolRegistry {
     use crate::agent::web_tools::{WebCrawl, WebFetch, WebSearch};
@@ -237,7 +251,6 @@ fn subagent_read_only_base(root: &Path) -> ToolRegistry {
     register_skill_registry(&mut r);
     register_telegram(&mut r);
     register_notify(&mut r);
-    r.register(Box::new(crate::features::timemachine::Checkpoint));
     // W17: a private, per-instance `todo_write` scratch plan (never the top-level TodoWrite — that
     // one owns the process-global list + the user's scroll region, which no sub-agent may touch).
     // Self-contained state means concurrent read-only sub-agents (planner/reviewer fan-out) never
@@ -358,6 +371,27 @@ fn canonical_subagent_tool(raw: &str) -> Option<&'static str> {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+fn write_effect(root: &Path, raw: Option<&str>) -> WorkspaceEffect {
+    let Some(raw) = raw else { return WorkspaceEffect::OpaqueWorkspace };
+    let path = Path::new(raw);
+    let joined = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
+    let parent = if joined.exists() { joined.as_path() } else { joined.parent().unwrap_or(root) };
+    match parent.canonicalize() {
+        Ok(canon) if canon.starts_with(root) => WorkspaceEffect::Paths,
+        _ => WorkspaceEffect::External,
+    }
+}
+
+fn move_effect(root: &Path, args: &Value) -> WorkspaceEffect {
+    let from = write_effect(root, args.get("from").and_then(|v| v.as_str()));
+    let to = write_effect(root, args.get("to").and_then(|v| v.as_str()));
+    if matches!(from, WorkspaceEffect::External) || matches!(to, WorkspaceEffect::External) {
+        WorkspaceEffect::External
+    } else {
+        WorkspaceEffect::Paths
+    }
+}
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args.get(key)
@@ -802,8 +836,9 @@ impl Tool for MemorySearch {
     }
     fn description(&self) -> &str {
         "Find a stored fact about the user or project by lexical/semantic match. Use to recall a \
-         specific past fact. Not for the user's overall preferences → use memory_profile. \
-         Searches the current workspace + global facts by default. Read-only."
+         specific past fact — project knowledge lives HERE (not in the always-on <user_memory> \
+         block, which only holds STYLE + global prefs). Not for the user's overall preferences → \
+         use memory_profile. Searches the current workspace + global facts by default. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -1299,6 +1334,9 @@ impl Tool for FileEdit {
     fn is_concurrency_safe(&self) -> bool {
         false
     }
+    fn workspace_effect(&self, args: &Value) -> WorkspaceEffect {
+        write_effect(&self.root, args.get("path").and_then(|v| v.as_str()))
+    }
     fn execute(&self, args: &Value) -> Result<String> {
         let path = str_arg(args, "path")?;
         let new = str_arg(args, "new_string")?;
@@ -1311,7 +1349,8 @@ impl Tool for FileEdit {
             if target.exists() {
                 bail!("{path} exists; provide old_string to edit it, or use file_write to overwrite the whole file");
             }
-            std::fs::write(&target, new).with_context(|| format!("creating {}", target.display()))?;
+            atomic_write(&target, new.as_bytes())
+                .with_context(|| format!("creating {}", target.display()))?;
             return Ok(format!("created {path}"));
         }
 
@@ -1324,7 +1363,7 @@ impl Tool for FileEdit {
         if applied.content == content {
             return Ok(format!("{NOOP_WRITE_PREFIX}: {path} unchanged (old_string == new_string)"));
         }
-        std::fs::write(&target, &applied.content)
+        atomic_write(&target, applied.content.as_bytes())
             .with_context(|| format!("writing {}", target.display()))?;
         let mut out =
             format!("edited {path} ({})\n{}", applied.summary(), diff_preview(&applied.before, &applied.after));
@@ -1382,6 +1421,9 @@ impl Tool for FileWrite {
     fn is_concurrency_safe(&self) -> bool {
         false
     }
+    fn workspace_effect(&self, args: &Value) -> WorkspaceEffect {
+        write_effect(&self.root, args.get("path").and_then(|v| v.as_str()))
+    }
     fn execute(&self, args: &Value) -> Result<String> {
         let path = str_arg(args, "path")?;
         let content = str_arg(args, "content")?;
@@ -1396,7 +1438,8 @@ impl Tool for FileWrite {
         if existed && before == content {
             return Ok(format!("{NOOP_WRITE_PREFIX}: {path} already holds this exact content"));
         }
-        std::fs::write(&target, content).with_context(|| format!("writing {}", target.display()))?;
+        atomic_write(&target, content.as_bytes())
+            .with_context(|| format!("writing {}", target.display()))?;
         let n = content.lines().count();
         let verb = if existed { "overwrote" } else { "created" };
         let mut out = format!("{verb} {path} ({n} line(s))");
@@ -1461,6 +1504,9 @@ impl Tool for FileMove {
     fn is_concurrency_safe(&self) -> bool {
         false
     }
+    fn workspace_effect(&self, args: &Value) -> WorkspaceEffect {
+        move_effect(&self.root, args)
+    }
     fn execute(&self, args: &Value) -> Result<String> {
         let from = str_arg(args, "from")?;
         let to = str_arg(args, "to")?;
@@ -1488,22 +1534,112 @@ impl Tool for FileMove {
         if src == dst {
             return Ok(format!("{NOOP_WRITE_PREFIX}: {from} and {to} are the same path"));
         }
+        // CASE-ONLY (or otherwise same-inode) rename on a case-insensitive FS: `foo.txt` → `Foo.txt`.
+        // `src` is canonicalized to the on-disk casing while `dst` keeps the requested casing, so
+        // `src == dst` above is FALSE — yet `dst.exists()` is TRUE because both names hit the same
+        // inode. The old code then DELETED that one inode and renamed a now-missing source into the
+        // void: permanent data loss. Detect it by canonicalizing `dst`; if it resolves to `src`, this
+        // is the same file and a direct rename just changes its recorded casing — never delete.
+        let dst_is_src = dst
+            .canonicalize()
+            .map(|c| c == src)
+            .unwrap_or(false);
+        if dst_is_src {
+            move_path(&src, &dst).with_context(|| format!("renaming {from} → {to}"))?;
+            let kind = if dst.is_dir() { "directory" } else { "file" };
+            return Ok(format!("moved {kind} {from} → {to}"));
+        }
         if dst.exists() {
             if !overwrite {
                 bail!("destination {to} already exists; pass overwrite:true to replace it");
             }
-            // Overwrite: remove the existing destination first so rename can't fail on a non-empty
-            // dir (and cross-fs semantics stay uniform). A file or an (empty/non-empty) dir both go.
-            if dst.is_dir() {
-                std::fs::remove_dir_all(&dst).with_context(|| format!("removing existing {to}"))?;
-            } else {
-                std::fs::remove_file(&dst).with_context(|| format!("removing existing {to}"))?;
+            // Overwrite WITHOUT a pre-delete window: if we deleted `dst` first and the subsequent
+            // rename then failed (permissions, a race, source vanished), `dst` would be gone with
+            // nothing put in its place — an irrecoverable clobber. Instead STASH the existing dst to a
+            // sibling temp, attempt the move, and only delete the stash once the move succeeds; on any
+            // failure, rename the stash back so `dst` is exactly as it was.
+            let stash = stash_path(&dst);
+            std::fs::rename(&dst, &stash)
+                .with_context(|| format!("staging existing {to} aside before overwrite"))?;
+            match move_path(&src, &dst) {
+                Ok(()) => {
+                    // Move landed — the stashed old destination is now safe to drop.
+                    if stash.is_dir() {
+                        let _ = std::fs::remove_dir_all(&stash);
+                    } else {
+                        let _ = std::fs::remove_file(&stash);
+                    }
+                }
+                Err(move_err) => {
+                    // Roll back: put the original destination back exactly where it was, then report
+                    // the move failure (not the rollback) as the actionable error.
+                    let _ = std::fs::rename(&stash, &dst);
+                    return Err(anyhow::Error::new(move_err))
+                        .with_context(|| format!("moving {from} → {to} (destination left unchanged)"));
+                }
             }
+            let kind = if dst.is_dir() { "directory" } else { "file" };
+            return Ok(format!("moved {kind} {from} → {to}"));
         }
         move_path(&src, &dst).with_context(|| format!("moving {from} → {to}"))?;
         let kind = if dst.is_dir() { "directory" } else { "file" };
         Ok(format!("moved {kind} {from} → {to}"))
     }
+}
+
+/// Write `content` to `target` ATOMICALLY: stream into a sibling temp file, fsync it, then
+/// `fs::rename` it over the target. A same-directory rename is atomic on every OS we support (POSIX
+/// `rename(2)`; Windows `MoveFileExW` with REPLACE_EXISTING), so a concurrent reader — and, more
+/// importantly, the on-disk state after a crash/kill/disk-full mid-write — is either the intact old
+/// file or the fully-written new one, never a truncated/partial file. Plain `fs::write` truncates
+/// the target in place before streaming, so an interrupted write destroys the original. Preserves
+/// the target's existing permission bits (temp files are created with default perms, so an in-place
+/// rewrite would otherwise silently reset mode). The temp file is cleaned up on any failure before
+/// the rename lands. The temp lives in the target's own directory, so the rename never crosses a
+/// filesystem boundary (which would make it non-atomic).
+fn atomic_write(target: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let fname = target.file_name().and_then(|n| n.to_str()).unwrap_or("out");
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{fname}.ng-tmp.{}.{n}", std::process::id()));
+
+    // Write + fsync, then CLOSE the temp handle before renaming (Windows won't replace the
+    // destination while a handle to the source is open). Any error aborts before the rename, so the
+    // original target is untouched; clean up the temp.
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // Carry over the target's mode so an atomic rewrite preserves permissions. Best-effort: a
+    // metadata/permission hiccup must never turn into data loss.
+    if let Ok(meta) = std::fs::metadata(target) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// A sibling temp path for staging an existing file/dir out of the way during an overwrite. Lives in
+/// the same directory as `p`, so the stash rename stays on one filesystem (and is thus atomic).
+fn stash_path(p: &Path) -> PathBuf {
+    static STASH_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let parent = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("dst");
+    let n = STASH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".{fname}.ng-stash.{}.{n}", std::process::id()))
 }
 
 /// Rename `src` → `dst`, falling back to copy-then-delete when they live on different filesystems
@@ -2072,6 +2208,9 @@ impl Tool for MultiEdit {
     fn is_concurrency_safe(&self) -> bool {
         false
     }
+    fn workspace_effect(&self, args: &Value) -> WorkspaceEffect {
+        write_effect(&self.root, args.get("path").and_then(|v| v.as_str()))
+    }
     fn execute(&self, args: &Value) -> Result<String> {
         let path = str_arg(args, "path")?;
         let edits = args
@@ -2122,7 +2261,7 @@ impl Tool for MultiEdit {
         if buf == original {
             return Ok(format!("{NOOP_WRITE_PREFIX}: {path} unchanged after {} edit(s) net to nothing", edits.len()));
         }
-        std::fs::write(&target, &buf).with_context(|| format!("writing {}", target.display()))?;
+        atomic_write(&target, buf.as_bytes()).with_context(|| format!("writing {}", target.display()))?;
         let mut out = format!(
             "edited {path} ({} edits applied)\n{}\n{}",
             edits.len(),
@@ -2174,6 +2313,9 @@ impl Tool for ShellRun {
     }
     fn is_concurrency_safe(&self) -> bool {
         false
+    }
+    fn workspace_effect(&self, _args: &Value) -> WorkspaceEffect {
+        WorkspaceEffect::OpaqueWorkspace
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let command = str_arg(args, "command")?;
@@ -3304,6 +3446,97 @@ mod tests {
         // destructive to be verified like file_edit/file_write.
         assert!(FileMove::new(PathBuf::from(".")).is_destructive());
         assert!(!FileMove::new(PathBuf::from(".")).is_concurrency_safe());
+    }
+
+    #[test]
+    fn atomic_write_replaces_content_and_leaves_no_temp() {
+        let root = temp_root("atomic-write");
+        let target = root.join("f.txt");
+        // Fresh create.
+        atomic_write(&target, b"first\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "first\n");
+        // Overwrite.
+        atomic_write(&target, b"second\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "second\n");
+        // No sibling temp file survives (the rename consumed it, no failure path leaked one).
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".ng-tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file leaked: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("atomic-perms");
+        let target = root.join("script.sh");
+        atomic_write(&target, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A rewrite must carry the executable bit over (temp files are created 0644 by default).
+        atomic_write(&target, b"#!/bin/sh\necho hi\n").unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "rewrite reset the mode: {:o}", mode & 0o777);
+    }
+
+    #[test]
+    fn file_write_is_atomic_and_leaves_no_temp() {
+        // The file_write tool goes through atomic_write; a successful overwrite must leave the target
+        // holding exactly the new bytes and no staging temp behind.
+        let root = temp_root("fw-atomic");
+        std::fs::write(root.join("a.txt"), "old\n").unwrap();
+        let t = FileWrite::new(root.clone());
+        let r = t.execute(&serde_json::json!({"path": "a.txt", "content": "new\n"})).unwrap();
+        assert!(r.starts_with("overwrote"), "got: {r}");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "new\n");
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.contains(".ng-tmp.") || n.contains(".ng-stash.")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "staging file leaked: {leftovers:?}");
+    }
+
+    #[test]
+    fn file_move_overwrite_leaves_no_stash_behind() {
+        // The overwrite path stashes the old destination out of the way, moves, then deletes the
+        // stash. On success no `.ng-stash.` sibling may survive.
+        let root = temp_root("fmv-stash");
+        std::fs::write(root.join("a.txt"), "A\n").unwrap();
+        std::fs::write(root.join("b.txt"), "B\n").unwrap();
+        let t = FileMove::new(root.clone());
+        t.execute(&serde_json::json!({"from": "a.txt", "to": "b.txt", "overwrite": true}))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "A\n");
+        assert!(!root.join("a.txt").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".ng-stash."))
+            .collect();
+        assert!(leftovers.is_empty(), "stash file leaked: {leftovers:?}");
+    }
+
+    #[test]
+    fn file_move_overwrite_dir_replaces_contents() {
+        // Overwriting a directory must leave the destination holding the SOURCE tree, not a merge
+        // with the old destination's files (the stash removes the old dst entirely before the move).
+        let root = temp_root("fmv-dir-overwrite");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/new.txt"), "new\n").unwrap();
+        std::fs::create_dir_all(root.join("dst")).unwrap();
+        std::fs::write(root.join("dst/old.txt"), "old\n").unwrap();
+        let t = FileMove::new(root.clone());
+        t.execute(&serde_json::json!({"from": "src", "to": "dst", "overwrite": true}))
+            .unwrap();
+        assert!(root.join("dst/new.txt").exists(), "dst holds the source tree");
+        assert!(!root.join("dst/old.txt").exists(), "old dst contents are gone, not merged");
+        assert!(!root.join("src").exists(), "source consumed by the move");
     }
 
     #[test]

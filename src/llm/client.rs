@@ -303,6 +303,77 @@ where
     }
 }
 
+/// Models that rejected `reasoning_effort` with a 400 THIS SESSION. Populated reactively — never
+/// guessed from the model name (a name heuristic would mis-serve every gateway that renames models).
+/// The first time a provider 400s on the field we record the model here, so every later turn strips
+/// it up front: at most ONE failed call per model per session, not one per turn.
+static EFFORT_UNSUPPORTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn effort_unsupported_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    EFFORT_UNSUPPORTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Has `model` already rejected `reasoning_effort` this session? (Then we send the field-free wire.)
+fn effort_known_unsupported(model: &str) -> bool {
+    effort_unsupported_set().lock().map(|s| s.contains(model)).unwrap_or(false)
+}
+
+fn mark_effort_unsupported(model: &str) {
+    if let Ok(mut s) = effort_unsupported_set().lock() {
+        s.insert(model.to_string());
+    }
+}
+
+/// Does this error detail blame `reasoning_effort`? Providers word it differently ("unknown parameter
+/// reasoning_effort", "reasoning_effort: unsupported value", "does not support reasoning effort"), so
+/// match the field name loosely (case-insensitive, with/without the underscore).
+fn body_blames_effort(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    d.contains("reasoning_effort") || d.contains("reasoning effort")
+}
+
+/// POST a chat request with a WIRE-LEVEL effort fallback (the model-agnostic way to honour the
+/// per-model effort ceiling): send the tier as configured; if the provider 400s SPECIFICALLY because
+/// of `reasoning_effort` — a model that doesn't take the field at all, or doesn't accept the tier we
+/// sent (e.g. `max` to an o-series that tops out at `high`) — strip the field, remember the model for
+/// the rest of the session, and retry once. Any other error propagates unchanged. Models already
+/// learned-unsupported get the field stripped up front, so the 400 costs one call per model, once.
+async fn send_chat(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    mut body: ChatRequest,
+) -> Result<reqwest::Response> {
+    if body.reasoning_effort.is_some() && effort_known_unsupported(&body.model) {
+        body.reasoning_effort = None;
+    }
+    let had_effort = body.reasoning_effort.is_some();
+    match send_with_retry(|| client.post(url).bearer_auth(api_key).json(&body)).await {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            let msg = e.to_string();
+            // Only intervene on the exact "400 blames reasoning_effort" case, and only if we sent it.
+            if had_effort && msg.contains("HTTP 400") && body_blames_effort(&msg) {
+                mark_effort_unsupported(&body.model);
+                body.reasoning_effort = None;
+                let note = format!(
+                    "reasoning_effort not accepted by {} — retrying without it (won't send it again this session)",
+                    body.model
+                );
+                if crate::ui::tui::active() {
+                    crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
+                } else {
+                    eprintln!("{}", crate::ui::theme::faint(note));
+                }
+                send_with_retry(|| client.post(url).bearer_auth(api_key).json(&body)).await
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 /// The outcome of one non-streaming tool-calling turn.
 pub struct ChatTurn {
     /// Natural-language content (the final answer when `tool_calls` is empty).
@@ -356,7 +427,7 @@ pub async fn stream_chat(
 
     let mut spin = Some(crate::ui::spinner::Spinner::start("thinking"));
 
-    let resp = match send_with_retry(|| client.post(&url).bearer_auth(api_key).json(&body)).await {
+    let resp = match send_chat(client, &url, api_key, body).await {
         Ok(r) => r,
         Err(e) => {
             spin.take();
@@ -452,7 +523,7 @@ pub async fn chat_with_tools(
         reasoning_effort: crate::core::cli_config::resolved_reasoning_effort(cfg.reasoning_effort.clone()),
     };
 
-    let resp = send_with_retry(|| client.post(&url).bearer_auth(api_key).json(&body)).await?;
+    let resp = send_chat(client, &url, api_key, body).await?;
 
     let parsed: ChatResponse = resp.json().await.context("parsing chat-completions response")?;
     if let Some(u) = &parsed.usage {
@@ -656,7 +727,7 @@ pub async fn stream_chat_with_tools_eager(
     // carriage-return spinner would fight the pinned footer.
     let mut spin = if crate::ui::tui::active() { None } else { Some(crate::ui::spinner::Spinner::start("thinking")) };
 
-    let resp = match send_with_retry(|| client.post(&url).bearer_auth(api_key).json(&body)).await {
+    let resp = match send_chat(client, &url, api_key, body).await {
         Ok(r) => r,
         Err(e) => {
             spin.take(); // clear the spinner before surfacing the error
@@ -878,6 +949,29 @@ mod tests {
         assert_eq!(m.last_call(), Some((2000, 0, 10)), "most recent call wins; no cache → 0");
         m.reset();
         assert_eq!(m.last_call(), None, "reset clears the last-call signal");
+    }
+
+    #[test]
+    fn body_blames_effort_matches_provider_wordings() {
+        // The three shapes real providers use — with/without the underscore, various phrasings.
+        assert!(body_blames_effort("Unknown parameter: reasoning_effort"));
+        assert!(body_blames_effort("reasoning_effort: unsupported value 'max'"));
+        assert!(body_blames_effort("This model does not support reasoning effort"));
+        assert!(body_blames_effort("REASONING_EFFORT is invalid"), "case-insensitive");
+        // A 400 about something else must NOT be mistaken for an effort rejection.
+        assert!(!body_blames_effort("Unknown parameter: temperature"));
+        assert!(!body_blames_effort("context_length_exceeded"));
+    }
+
+    #[test]
+    fn effort_unsupported_set_records_and_reports_per_model() {
+        // A model is "supported" until it 400s once; then it's remembered for the session.
+        let model = "test-only-effort-model-xyz"; // unique so it can't collide with another test
+        assert!(!effort_known_unsupported(model), "unseen model starts supported");
+        mark_effort_unsupported(model);
+        assert!(effort_known_unsupported(model), "marked model is remembered");
+        // An unrelated model is unaffected by the mark above.
+        assert!(!effort_known_unsupported("some-other-model-abc"));
     }
 
     #[test]

@@ -9,6 +9,25 @@ use crate::core::types::ToolDef;
 use anyhow::Result;
 use serde_json::Value;
 
+/// What a tool call may mutate in the local workspace. This is deliberately separate from
+/// `is_destructive`: an outbound notification needs approval but no code checkpoint, while a file
+/// edit needs both. Args-aware classification keeps read-only process actions from creating Git
+/// snapshots merely because their tool shares one broad capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceEffect {
+    None,
+    Paths,
+    OpaqueWorkspace,
+    RepoMetadata,
+    External,
+}
+
+impl WorkspaceEffect {
+    pub fn needs_checkpoint(self) -> bool {
+        matches!(self, Self::Paths | Self::OpaqueWorkspace)
+    }
+}
+
 /// A capability the model may invoke.
 ///
 /// `Send + Sync` is REQUIRED: the agent loop runs each call of a concurrency-safe batch on a
@@ -38,6 +57,11 @@ pub trait Tool: Send + Sync {
     /// registry is read-only). Default: the static flag.
     fn is_concurrency_safe_for(&self, _args: &Value) -> bool {
         self.is_concurrency_safe()
+    }
+    /// Workspace mutation classification used by automatic checkpoints and verification. Override
+    /// this for local writers; approval-only/network/process-control tools keep the default `None`.
+    fn workspace_effect(&self, _args: &Value) -> WorkspaceEffect {
+        WorkspaceEffect::None
     }
     /// Run the tool. `args` is the parsed (object) arguments. Return the result text; return
     /// an `Err` for a real failure — the loop feeds the error back to the model to recover.
@@ -113,6 +137,14 @@ impl ToolRegistry {
     /// skills index can hide skills whose `requires:` tool isn't present in this build/session.
     pub fn names(&self) -> Vec<String> {
         self.tools.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    /// Keep only tools for which `keep(name)` is true (Hermes `disabled_toolsets` filter).
+    pub fn retain<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.tools.retain(|t| keep(t.name()));
     }
 }
 

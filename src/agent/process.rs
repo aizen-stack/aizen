@@ -9,7 +9,7 @@
 //! background `rm -rf /` is refused exactly like a foreground one.
 
 use crate::agent::builtin::confine;
-use crate::agent::tools::Tool;
+use crate::agent::tools::{Tool, WorkspaceEffect};
 use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;
 use serde_json::Value;
@@ -275,6 +275,12 @@ impl Tool for Process {
     }
     fn is_concurrency_safe(&self) -> bool {
         false
+    }
+    fn workspace_effect(&self, args: &Value) -> WorkspaceEffect {
+        match args.get("action").and_then(|v| v.as_str()) {
+            Some("start") | Some("write") => WorkspaceEffect::OpaqueWorkspace,
+            _ => WorkspaceEffect::None,
+        }
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let action = args.get("action").and_then(|v| v.as_str()).context("missing `action`")?;

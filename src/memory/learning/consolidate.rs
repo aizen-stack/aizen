@@ -14,6 +14,22 @@ pub enum MemOp {
     Reinforce { id: String },
 }
 
+/// Lowest lexical score for a same-slot supersede on a **Correction** turn (below
+/// [`learn_dedup_threshold`] so we do not reinforce the stale fact).
+pub const SUPERSEDE_SLOT_MIN: f64 = 0.52;
+
+/// Best lexical match in `existing` for `candidate_tokens`.
+pub fn best_match(candidate_tokens: &[String], existing: &[MemoryEntry]) -> Option<(String, f64)> {
+    let mut best: Option<(String, f64)> = None;
+    for e in existing {
+        let s = lexical_score_tokens(candidate_tokens, &e.tokens);
+        if best.as_ref().map(|(_, bs)| s > *bs).unwrap_or(true) {
+            best = Some((e.id.clone(), s));
+        }
+    }
+    best
+}
+
 /// Decide ADD vs REINFORCE for `candidate_tokens` against the current store.
 /// Picks the single best lexical match; reinforces if it clears `dedup_threshold`.
 pub fn decide(candidate_tokens: &[String], existing: &[MemoryEntry], dedup_threshold: f64) -> MemOp {

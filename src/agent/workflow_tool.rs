@@ -26,7 +26,7 @@ pub struct WorkflowTool {
     base_url: String,
     api_key: String,
     model: String,
-    auto_approve: bool,
+    approval_mode: crate::core::approval::ApprovalMode,
     depth: usize,
 }
 
@@ -36,10 +36,10 @@ impl WorkflowTool {
         base_url: String,
         api_key: String,
         model: String,
-        auto_approve: bool,
+        approval_mode: crate::core::approval::ApprovalMode,
         depth: usize,
     ) -> Self {
-        Self { client, base_url, api_key, model, auto_approve, depth }
+        Self { client, base_url, api_key, model, approval_mode, depth }
     }
 }
 
@@ -195,10 +195,15 @@ impl Tool for WorkflowTool {
         let base = self.base_url.clone();
         let key = self.api_key.clone();
         let model = self.model.clone();
-        let auto = self.auto_approve;
+        let approval = self.approval_mode;
         tokio::task::block_in_place(|| {
+            // EFFORT ISOLATION (same as the `task` tool): disarm the parent's process-global effort
+            // override for this synchronous fan-out so every fanned-out child + the synthesis pass
+            // resolves its own `cfg.reasoning_effort` instead of inheriting the parent's pinned tier.
+            // Restored on drop before control returns to the parent turn.
+            let _effort = crate::core::cli_config::suppress_effort_override();
             tokio::runtime::Handle::current()
-                .block_on(run_workflow_collect(&client, &base, &key, &model, auto, &spec, synthesize))
+                .block_on(run_workflow_collect(&client, &base, &key, &model, approval, &spec, synthesize))
         })
     }
 }
@@ -285,7 +290,14 @@ mod tests {
 
     #[test]
     fn depth_guard_refuses_nested_fanout() {
-        let t = WorkflowTool::new(reqwest::Client::new(), "http://x".into(), "k".into(), "m".into(), false, 1);
+        let t = WorkflowTool::new(
+            reqwest::Client::new(),
+            "http://x".into(),
+            "k".into(),
+            "m".into(),
+            crate::core::approval::ApprovalMode::Ask,
+            1,
+        );
         let err = t.execute(&serde_json::json!({"mode": "verify", "findings": ["x"]})).unwrap_err();
         assert!(err.to_string().contains("depth-capped"), "{err}");
     }

@@ -85,7 +85,7 @@ pub async fn run_workflow(
     base_url: &str,
     api_key: &str,
     model: &str,
-    auto_approve: bool,
+    approval_mode: crate::core::approval::ApprovalMode,
     spec: &WorkflowSpec,
     trace: Option<&Path>,
 ) -> Result<()> {
@@ -118,7 +118,7 @@ pub async fn run_workflow(
 
     // Fan out, bounded to MAX_PARALLEL via chunking. The standalone CLI runner is not under the
     // process-global sub-agent gate (no interleaving `task` calls), so it uses the full width.
-    let results = fan_out(http, base_url, api_key, model, auto_approve, &root, &date, &spec.tasks, MAX_PARALLEL).await;
+    let results = fan_out(http, base_url, api_key, model, approval_mode, &root, &date, &spec.tasks, MAX_PARALLEL).await;
 
     for r in &results {
         eprintln!("  • {} ({}/{}) — {} [{} step(s)]", r.id, r.role, r.model, r.status, r.iters);
@@ -181,7 +181,7 @@ pub(crate) async fn fan_out(
     base_url: &str,
     api_key: &str,
     model: &str,
-    auto_approve: bool,
+    approval_mode: crate::core::approval::ApprovalMode,
     root: &Path,
     date: &str,
     tasks: &[WorkflowTask],
@@ -191,7 +191,7 @@ pub(crate) async fn fan_out(
     let mut results: Vec<TaskOutcome> = Vec::with_capacity(tasks.len());
     for chunk in tasks.chunks(width) {
         let futs =
-            chunk.iter().map(|t| run_one_task(http, base_url, api_key, model, auto_approve, root, date, t));
+            chunk.iter().map(|t| run_one_task(http, base_url, api_key, model, approval_mode, root, date, t));
         results.extend(futures_util::future::join_all(futs).await);
     }
     results
@@ -206,7 +206,7 @@ pub(crate) async fn run_workflow_collect(
     base_url: &str,
     api_key: &str,
     model: &str,
-    auto_approve: bool,
+    approval_mode: crate::core::approval::ApprovalMode,
     spec: &WorkflowSpec,
     synthesize: bool,
 ) -> Result<String> {
@@ -238,7 +238,7 @@ pub(crate) async fn run_workflow_collect(
     // Header line into the transcript so the user sees the fan-out begin (TUI path only; no-op on
     // the CLI runner, which prints its own eprintln banner).
     wf_header(&format!("workflow: {} · {} task(s)", spec.name, spec.tasks.len()));
-    let results = fan_out(http, base_url, api_key, model, auto_approve, &root, &date, &spec.tasks, width).await;
+    let results = fan_out(http, base_url, api_key, model, approval_mode, &root, &date, &spec.tasks, width).await;
     drop(slots); // explicit: hold the reservation across the whole fan-out, free it here
     if results.iter().all(|r| r.status == "error") {
         bail!("workflow '{}': all {} task(s) failed — nothing to report", spec.name, results.len());
@@ -287,7 +287,7 @@ async fn run_one_task(
     base_url: &str,
     api_key: &str,
     model: &str,
-    auto_approve: bool,
+    approval_mode: crate::core::approval::ApprovalMode,
     root: &Path,
     date: &str,
     task: &WorkflowTask,
@@ -325,7 +325,7 @@ async fn run_one_task(
     // Verify gate OFF in workflow sub-agents: up to MAX_PARALLEL concurrent `cargo check`
     // processes would thrash the same repo's build locks. Verification is a top-level concern.
     let cfg = AgentConfig {
-        auto_approve,
+        approval_mode,
         quiet: true,
         enable_verify_gate: false,
         ..AgentConfig::default()
@@ -343,6 +343,7 @@ async fn run_one_task(
                 StopReason::Done => "done",
                 StopReason::Divergence => "diverged",
                 StopReason::MaxIters => "max-iters",
+                StopReason::VerificationFailed => "verification-failed",
                 // Unreachable: workflow sub-agents have no `clarify` tool (nobody to answer).
                 StopReason::AwaitingInput(_) => "awaiting-input",
             };
@@ -385,7 +386,7 @@ fn wf_header(line: &str) {
 /// CLI runner prints its own `eprintln!` status and isn't TUI-active, so this never double-prints.
 fn wf_trace(line: &str) {
     if crate::ui::tui::active() {
-        crate::ui::tui::emit_line(&format!("  {} {}", crate::ui::theme::faint("⎿"), crate::ui::theme::faint(line)));
+        crate::ui::tui::emit_line(&format!("  {} {}", crate::ui::theme::faint("└"), crate::ui::theme::faint(line)));
     }
 }
 
@@ -395,7 +396,7 @@ fn wf_trace_done(ok: bool, line: &str) {
     if !crate::ui::tui::active() {
         return;
     }
-    let corner = if ok { crate::ui::theme::faint("⎿") } else { crate::ui::theme::err("⎿") };
+    let corner = if ok { crate::ui::theme::faint("└") } else { crate::ui::theme::err("└") };
     let body = if ok { crate::ui::theme::faint(line).to_string() } else { crate::ui::theme::err(line).to_string() };
     crate::ui::tui::emit_line(&format!("  {corner} {body}"));
 }
@@ -537,7 +538,7 @@ mod tests {
         let spec = WorkflowSpec { name: "empty".into(), tasks: vec![], synthesis: None };
         let http = reqwest::Client::new();
         // bails on the empty-tasks check BEFORE any network call.
-        let err = run_workflow(&http, "http://localhost", "k", "m", false, &spec, None)
+        let err = run_workflow(&http, "http://localhost", "k", "m", crate::core::approval::ApprovalMode::Ask, &spec, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no tasks"));
@@ -551,7 +552,7 @@ mod tests {
             synthesis: None,
         };
         let http = reqwest::Client::new();
-        let err = run_workflow(&http, "http://localhost", "k", "m", false, &spec, None)
+        let err = run_workflow(&http, "http://localhost", "k", "m", crate::core::approval::ApprovalMode::Ask, &spec, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("blank task id"));
@@ -568,7 +569,7 @@ mod tests {
             synthesis: None,
         };
         let http = reqwest::Client::new();
-        let err = run_workflow(&http, "http://localhost", "k", "m", false, &spec, None)
+        let err = run_workflow(&http, "http://localhost", "k", "m", crate::core::approval::ApprovalMode::Ask, &spec, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("duplicate task id"));

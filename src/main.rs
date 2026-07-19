@@ -12,9 +12,10 @@ mod bench;
 mod memory;
 mod persona;
 // Grouped by role (the src/ reorg — see each folder's mod.rs for what it holds):
-mod channels; // telegram · discord · notify
-mod core; // types · config · cli_config · net_guard
+mod channels; // notify + shared channel glue
+mod core; // types · config · cli_config · approval · net_guard
 mod features; // crawl · timemachine · cron · commands
+mod hostbot; // generic Telegram/Discord daemon
 mod llm; // the OpenAI-compatible chat client
 mod skills; // skill store + registry
 mod ui; // tui · theme · markdown · spinner · splash · icons · image_input
@@ -23,7 +24,8 @@ mod ui; // tui · theme · markdown · spinner · splash · icons · image_input
 // call sites in THIS file referring to the modules by their short names (no behavior
 // change) — every other file already uses the new `crate::<group>::<mod>` paths.
 use crate::agent::app_catalog;
-use crate::channels::{discord, notify, telegram};
+use crate::channels::notify;
+use crate::hostbot::platforms::{discord, telegram};
 use crate::core::{cli_config, config, types};
 use crate::features::{commands, crawl, cron, timemachine};
 use crate::llm::client;
@@ -32,10 +34,11 @@ use crate::skills::{self as skill, registry as skill_registry};
 use crate::ui::{icons, image_input, splash, theme, tui};
 
 use agent::{AgentConfig, AgentOutcome, StopReason};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use console::{style, Style};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
+use crate::core::approval::ApprovalMode;
 use types::{Message, ToolDef};
 
 #[derive(Parser, Debug)]
@@ -102,8 +105,25 @@ enum Commands {
         cmd: ReachCmd,
     },
     /// Run the long-lived daemon: listen on Telegram, run the agent on incoming messages, and
-    /// route destructive-op approvals to your phone.
-    Serve,
+    /// route destructive-op approvals to your phone. `--install` registers it as a systemd service
+    /// (Linux) so it stays alive across crashes + reboots.
+    Serve {
+        /// Install as a systemd service (auto-restart + auto-start on boot). Linux only.
+        #[arg(long)]
+        install: bool,
+        /// Remove the systemd service installed by `--install`.
+        #[arg(long)]
+        uninstall: bool,
+        /// Use a per-user systemd unit (`~/.config/systemd/user/`) instead of a system-wide one.
+        #[arg(long)]
+        user: bool,
+        /// With `--install`/`--uninstall`: also run the enable/start (or disable) now, not just print.
+        #[arg(long)]
+        now: bool,
+        /// Paste the bot token and run in one step; owner pairing happens in chat.
+        #[arg(long)]
+        token: Option<String>,
+    },
     /// Configure / test the Telegram bot integration.
     Telegram {
         #[command(subcommand)]
@@ -407,7 +427,7 @@ enum ReachCmd {
 
 #[derive(Subcommand, Debug)]
 enum TimeCmd {
-    /// Save a checkpoint of the whole working tree (a restore point).
+    /// Save a checkpoint of the current repository's Git-visible tree.
     Save {
         /// Optional label, e.g. `before refactor`.
         label: Vec<String>,
@@ -429,7 +449,18 @@ enum TimeCmd {
         #[arg(short, long)]
         keep: Option<usize>,
     },
-    /// Delete ALL checkpoints (and free their git objects).
+    /// Inspect ledger/refs/sidecars/journal without mutating the working tree.
+    Doctor {
+        /// Emit a machine-readable JSON report.
+        #[arg(long)]
+        json: bool,
+        /// Recover/rollback a valid interrupted transaction before reporting.
+        #[arg(long)]
+        repair: bool,
+    },
+    /// Remove orphan Time Machine refs/sidecars after validating the authoritative ledger.
+    Gc,
+    /// Delete ALL checkpoints (Git objects are reclaimed later by normal Git maintenance).
     Clear,
 }
 
@@ -512,6 +543,15 @@ enum ConfigCmd {
         /// Time-machine checkpoints to keep (oldest auto-pruned past this; `0` = unlimited). Default 50.
         #[arg(long)]
         timemachine_keep: Option<usize>,
+        /// Maximum number of files in one Time Machine snapshot.
+        #[arg(long)]
+        timemachine_max_files: Option<u64>,
+        /// Maximum aggregate bytes in one Time Machine snapshot.
+        #[arg(long)]
+        timemachine_max_bytes: Option<u64>,
+        /// Maximum size of one file in a Time Machine snapshot.
+        #[arg(long)]
+        timemachine_max_file_bytes: Option<u64>,
         /// Auto-detect reasoning effort per turn from your wording (default on). `false` pins the
         /// fixed --reasoning-effort (or omits it if unset).
         #[arg(long)]
@@ -520,6 +560,9 @@ enum ConfigCmd {
         /// Setting it turns auto-detect off.
         #[arg(long)]
         reasoning_effort: Option<String>,
+        /// Approval level for interactive agent tools: ask, smart, or yolo.
+        #[arg(long)]
+        approval: Option<String>,
         /// Ultimate mode: pin max reasoning effort + prefer launching workflows (orchestrate-by-default).
         #[arg(long)]
         ultimate: Option<bool>,
@@ -527,6 +570,12 @@ enum ConfigCmd {
         /// hardest turns (opt-in; default off).
         #[arg(long)]
         adaptive_effort: Option<bool>,
+        /// Comma-separated tool bundles to hide.
+        #[arg(long)]
+        disabled_toolsets: Option<String>,
+        /// Comma-separated tool-bundle whitelist.
+        #[arg(long)]
+        enabled_toolsets: Option<String>,
     },
     /// Show the saved config (API key masked).
     Show,
@@ -789,7 +838,22 @@ async fn main() -> Result<()> {
         Commands::Models(args) => run_models(args).await,
         Commands::Crawl(args) => run_crawl(args).await,
         Commands::Reach { cmd } => run_reach(cmd).await,
-        Commands::Serve => run_serve().await,
+        Commands::Serve { install, uninstall, user, now, token } => {
+            // `--token` = "paste and run": persist it to config before booting, so `serve --token <t>`
+            // on a fresh machine works with no separate `telegram setup` step (pairing captures owner).
+            if let Some(token) = token.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let mut cfg = cli_config::load();
+                let mut tg = cfg.telegram.clone().unwrap_or_default();
+                tg.token = Some(token.to_string());
+                cfg.telegram = Some(tg);
+                cli_config::save(&cfg)?;
+            }
+            if install || uninstall {
+                hostbot::run_serve_service(install, uninstall, user, now).await
+            } else {
+                hostbot::run_serve().await
+            }
+        }
         Commands::Telegram { cmd } => run_telegram(cmd).await,
         Commands::Discord { cmd } => run_discord(cmd).await,
         Commands::Time { cmd } => run_time(cmd),
@@ -1287,7 +1351,7 @@ async fn run_agent_capture(
     api_key: &str,
     model: &str,
     task: &str,
-    auto_approve: bool,
+    approval_mode: ApprovalMode,
 ) -> Result<String> {
     let frozen = memory::refresh_frozen_core();
     let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string());
@@ -1298,10 +1362,10 @@ async fn run_agent_capture(
         base_url.to_string(),
         api_key.to_string(),
         model.to_string(),
-        auto_approve,
+        approval_mode,
         resolve_ctx_window(model).0,
     )?;
-    let cfg = AgentConfig { auto_approve, quiet: true, enable_verify_gate: false, ..Default::default() };
+    let cfg = AgentConfig { approval_mode, quiet: true, enable_verify_gate: false, ..Default::default() };
 
     let http_ref = http;
     let base = base_url;
@@ -1355,7 +1419,7 @@ async fn run_serve_turn(
     model: &str,
     history: &mut Vec<Message>,
     task: &str,
-    auto_approve: bool,
+    approval_mode: ApprovalMode,
 ) -> Result<String> {
     if history.is_empty() {
         // Built once per session → the prefix stays byte-stable across the conversation (cache-warm).
@@ -1368,11 +1432,11 @@ async fn run_serve_turn(
         base_url.to_string(),
         api_key.to_string(),
         model.to_string(),
-        auto_approve,
+        approval_mode,
         resolve_ctx_window(model).0,
     )?;
     let cfg = AgentConfig {
-        auto_approve,
+        approval_mode,
         quiet: true,
         enable_verify_gate: false,
         context_window: resolve_ctx_window(model).0,
@@ -1496,16 +1560,16 @@ async fn run_serve() -> Result<()> {
             let _ = client.send_message(chat, &msg).await;
             continue;
         }
-        let (task, auto) = match trimmed.strip_prefix("/agent ") {
-            Some(rest) => (rest.trim().to_string(), true),
-            None => (trimmed.to_string(), false),
+        let (task, approval) = match trimmed.strip_prefix("/agent ") {
+            Some(rest) => (rest.trim().to_string(), ApprovalMode::Yolo),
+            None => (trimmed.to_string(), approval_mode()),
         };
         if task.is_empty() {
             continue;
         }
         let _ = client.send_message(chat, "⏳ working…").await;
         let history = sessions.entry(chat).or_default();
-        let reply = run_serve_turn(&http, &base_url, &api_key, &model, history, &task, auto)
+        let reply = run_serve_turn(&http, &base_url, &api_key, &model, history, &task, approval)
             .await
             .unwrap_or_else(|e| format!("error: {e}"));
         for piece in chunk_text(&reply, 3500) {
@@ -1528,7 +1592,7 @@ fn run_time(cmd: TimeCmd) -> Result<()> {
             Ok(())
         }
         TimeCmd::List => {
-            print_timeline();
+            print_timeline()?;
             Ok(())
         }
         TimeCmd::Restore { id } => {
@@ -1555,6 +1619,39 @@ fn run_time(cmd: TimeCmd) -> Result<()> {
             let k = keep.or(cli_config::load().timemachine_keep).unwrap_or(50);
             let dropped = timemachine::prune(k)?;
             println!("{} {dropped} old checkpoint(s); kept ≤{k}.", style("🧹 pruned").color256(splash::ACCENT));
+            Ok(())
+        }
+        TimeCmd::Doctor { json, repair } => {
+            let report = if repair { timemachine::doctor_repair()? } else { timemachine::doctor()? };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "{}  repo {} · worktree {} · {} checkpoint(s)",
+                    if report.ok { "✓ time machine healthy" } else { "⚠ time machine needs attention" },
+                    report.repo_id,
+                    report.worktree_id,
+                    report.checkpoints
+                );
+                println!("  store {}", report.store);
+                for issue in &report.issues {
+                    println!("  - {issue}");
+                }
+            }
+            if !report.ok {
+                bail!("time-machine doctor found {} issue(s)", report.issues.len());
+            }
+            Ok(())
+        }
+        TimeCmd::Gc => {
+            let report = timemachine::doctor_gc()?;
+            println!(
+                "{} repo {} · worktree {} · {} checkpoint(s)",
+                style("🧹 time metadata cleaned:").color256(splash::ACCENT),
+                report.repo_id,
+                report.worktree_id,
+                report.checkpoints
+            );
             Ok(())
         }
         TimeCmd::Clear => {
@@ -1621,19 +1718,13 @@ mod rel_time_tests {
 /// `/timeline` — a static, glanceable print of the checkpoint timeline (newest first), with the
 /// active point marked `▸`, relative times, labels, and `auto`/`+chat` tags. Read-only: restoring
 /// stays behind `/timeline pick` (the interactive menu) so a rewind is always a deliberate choice.
-fn print_timeline() {
-    let (snaps, cursor) = match timemachine::timeline() {
-        Ok(t) => t,
-        Err(e) => {
-            tui::emit_line(&style(format!("{e}")).color256(crate::ui::theme::WARN).to_string());
-            return;
-        }
-    };
+fn print_timeline() -> Result<()> {
+    let (snaps, cursor) = timemachine::timeline()?;
     if snaps.is_empty() {
         tui::emit_line(
             &style("⎇ timeline — no checkpoints yet · /checkpoint to save one").dim().to_string(),
         );
-        return;
+        return Ok(());
     }
     let n = snaps.len();
     tui::emit_line(&format!(
@@ -1670,6 +1761,7 @@ fn print_timeline() {
     tui::emit_line(
         &style("▸ = current · restore: /timeline pick   (or /undo · /redo to step)").dim().to_string(),
     );
+    Ok(())
 }
 
 /// `/timeline pick` — interactive time machine: pick a checkpoint to restore, or save a new one.
@@ -1720,7 +1812,12 @@ async fn timeline_menu(history: &mut Vec<Message>, model_label: &mut String) -> 
                 Input::with_theme(&theme).with_prompt("Label (optional)").allow_empty(true).interact_text()?;
             // Capture the conversation alongside the tree so this checkpoint supports task restore.
             match timemachine::save_with_chat(label.trim(), false, history) {
-                Ok(s) => println!("{} #{} (code + chat)", style("✓ checkpoint").color256(splash::ACCENT), s.id),
+                Ok(s) => println!(
+                    "{} #{} ({})",
+                    style("✓ checkpoint").color256(splash::ACCENT),
+                    s.id,
+                    if s.has_chat { "code + chat" } else { "files only" }
+                ),
                 Err(e) => println!("{}", style(format!("save failed: {e}")).red()),
             }
         } else {
@@ -1759,8 +1856,21 @@ fn restore_menu(
         0 => files_restore(snap.id)?,
         1 => task_restore(snap.id, history, model_label)?,
         2 => {
+            // Preflight and durably back up chat BEFORE files move. The live `history` is only assigned
+            // after file restore succeeds, so a failed files phase cannot leave files/chat divergent.
+            let chat = timemachine::load_chat_checked(snap.id)?;
+            if chat.is_empty() {
+                bail!("checkpoint #{} has an empty saved conversation", snap.id);
+            }
+            save_session(history, "last").context("backing up the current conversation before combined restore")?;
             files_restore(snap.id)?;
-            task_restore(snap.id, history, model_label)?;
+            *history = chat;
+            let _ = model_label;
+            println!(
+                "{} #{} — files and conversation rewound",
+                style("⏪ restored both").color256(splash::ACCENT),
+                snap.id
+            );
         }
         _ => {}
     }
@@ -1769,31 +1879,41 @@ fn restore_menu(
 
 /// Rewind only the working tree to checkpoint `id` (reversible — pre-restore tree auto-saved).
 fn files_restore(id: u32) -> Result<()> {
-    match timemachine::restore(id) {
-        Ok(s) => {
-            println!("{} #{} — files rewound; your chat is untouched", style("⏪ restored").color256(splash::ACCENT), s.id);
-            println!("{}", style("  (reversible — the pre-restore tree was auto-saved; pick it to go back)").dim());
-        }
-        Err(e) => println!("{}", style(format!("restore failed: {e}")).red()),
-    }
+    let s = timemachine::restore(id).with_context(|| format!("restoring checkpoint #{id}"))?;
+    println!(
+        "{} #{} — files rewound; your chat is untouched",
+        style("⏪ restored").color256(splash::ACCENT),
+        s.id
+    );
+    println!(
+        "{}",
+        style("  (reversible — the pre-restore tree was auto-saved; pick it to go back)").dim()
+    );
     Ok(())
 }
 
 /// Rewind only the conversation to the sidecar captured with checkpoint `id`; files stay as they are.
 /// Before overwriting, the CURRENT chat is saved to the `last` session so it's never lost.
 fn task_restore(id: u32, history: &mut Vec<Message>, model_label: &mut String) -> Result<()> {
-    match timemachine::load_chat(id) {
-        Some(chat) if !chat.is_empty() => {
-            let _ = save_session(history, "last"); // don't lose the current chat — it's recoverable via /sessions
-            *history = chat;
-            // The restored transcript carries its own system prompt at [0]; refresh the model label
-            // line so the HUD matches, without rebuilding (which would wipe the restored history).
-            let _ = model_label; // label is display-only; the restored chat already holds its system prompt
-            println!("{} #{} — conversation rewound; files untouched", style("⏪ restored task").color256(splash::ACCENT), id);
-            println!("{}", style("  (your previous chat was saved as `last` — /sessions to get it back)").dim());
-        }
-        _ => println!("{}", style(format!("checkpoint #{id} has no saved conversation to restore")).color256(crate::ui::theme::WARN).to_string()),
+    let chat = timemachine::load_chat_checked(id)?;
+    if chat.is_empty() {
+        bail!("checkpoint #{id} has an empty saved conversation");
     }
+    // Fail closed: do not replace the live transcript unless its recovery copy is durable.
+    save_session(history, "last").context("backing up the current conversation before task restore")?;
+    *history = chat;
+    // The restored transcript carries its own system prompt at [0]; refresh the model label line so
+    // the HUD matches, without rebuilding (which would wipe the restored history).
+    let _ = model_label;
+    println!(
+        "{} #{} — conversation rewound; files untouched",
+        style("⏪ restored task").color256(splash::ACCENT),
+        id
+    );
+    println!(
+        "{}",
+        style("  (your previous chat was saved as `last` — /sessions to get it back)").dim()
+    );
     Ok(())
 }
 
@@ -1803,7 +1923,7 @@ async fn run_discord(cmd: DiscordCmd) -> Result<()> {
     match cmd {
         DiscordCmd::Setup => discord_setup().await,
         DiscordCmd::Test => discord_test().await,
-        DiscordCmd::Serve => run_discord_serve().await,
+        DiscordCmd::Serve => hostbot::run_discord_serve().await,
         DiscordCmd::Show => {
             discord_status();
             Ok(())
@@ -1937,16 +2057,16 @@ async fn run_discord_serve() -> Result<()> {
             let _ = client.send_message(inc.channel_id, "🆕 started a fresh conversation — earlier context dropped.").await;
             continue;
         }
-        let (task, auto) = match trimmed.strip_prefix("/agent ") {
-            Some(rest) => (rest.trim().to_string(), true),
-            None => (trimmed.to_string(), false),
+        let (task, approval) = match trimmed.strip_prefix("/agent ") {
+            Some(rest) => (rest.trim().to_string(), ApprovalMode::Yolo),
+            None => (trimmed.to_string(), approval_mode()),
         };
         if task.is_empty() {
             continue;
         }
         let _ = client.send_message(inc.channel_id, "⏳ working…").await;
         let history = sessions.entry(inc.channel_id).or_default();
-        let reply = run_serve_turn(&http, &base_url, &api_key, &model, history, &task, auto)
+        let reply = run_serve_turn(&http, &base_url, &api_key, &model, history, &task, approval)
             .await
             .unwrap_or_else(|e| format!("error: {e}"));
         for piece in chunk_text(&reply, discord::MESSAGE_MAX) {
@@ -2230,7 +2350,7 @@ async fn discord_app_menu() -> Result<()> {
     match pick {
         0 => discord_setup().await,
         1 => discord_test().await,
-        2 => run_discord_serve().await,
+        2 => hostbot::run_discord_serve().await,
         3 => webhook_app_setup(notify::Channel::Discord).await,
         4 => discord_disable(),
         _ => Ok(()),
@@ -2792,7 +2912,7 @@ async fn telegram_menu() -> Result<()> {
         0 => telegram_setup().await,
         1 => telegram_test().await,
         2 => telegram_status().await,
-        3 => run_serve().await,
+        3 => hostbot::run_serve().await,
         4 => telegram_disable(),
         _ => Ok(()),
     }
@@ -3268,11 +3388,12 @@ fn status_text(history: &[Message], model: &str) -> String {
     // Feed the graphical context meter (per-mille for sub-1% resolution); paint_box draws the bar.
     let permille = (toks as f64 / window as f64 * 1000.0).round().clamp(0.0, 1000.0) as u16;
     tui::set_ctx_permille(permille);
+    let approval = approval_mode();
     let mode = if cli_config::ultimate_enabled() {
         "  ·  ✦ ultimate"
-    } else if yolo_enabled() {
+    } else if approval == ApprovalMode::Yolo {
         "  ·  ⚡ yolo"
-    } else if smart_approve_enabled() {
+    } else if approval == ApprovalMode::Smart {
         "  ·  ◆ smart"
     } else {
         ""
@@ -3344,11 +3465,11 @@ async fn run_menu_sticky() -> Result<()> {
             Some(s) => s,
             None => break,
         };
+        tui::note_submission_dequeued();
         match sub {
             tui::Submission::Quit => break,
             tui::Submission::Slash(cmd) => {
-                let name = cmd.split(char::is_whitespace).next().unwrap_or("").trim();
-                if cmd.trim().is_empty() || slash_is_interactive(name) {
+                if cmd.trim().is_empty() || slash_is_interactive(&cmd) {
                     // Dialoguer menus / long-running daemons drive the terminal directly → suspend
                     // the sticky box, run, then re-enter.
                     tui::suspend();
@@ -3427,6 +3548,9 @@ async fn run_menu_sticky() -> Result<()> {
                     tui::emit_line(&style(format!("  {}{}", icons::g(icons::tip()), tip)).dim().to_string());
                 }
                 model_label = model.clone();
+                // The rotating discoverability tip is emitted AFTER the turn finishes (see the
+                // success branch below) so it lands UNDER the model's final answer, not stranded
+                // above it at turn start.
                 // Per-turn reasoning-effort auto-detect: classify the finalized user text, arm the
                 // override the client reads this turn, and show the chosen tier (always, incl. defer).
                 let eff = resolve_turn_effort(&line);
@@ -3446,7 +3570,7 @@ async fn run_menu_sticky() -> Result<()> {
                     base_url.clone(),
                     api_key.clone(),
                     model.clone(),
-                    false,
+                    approval_mode(),
                     resolve_ctx_window(&model).0,
                 ) {
                     Ok(r) => r,
@@ -3457,8 +3581,7 @@ async fn run_menu_sticky() -> Result<()> {
                     }
                 };
                 let cfg = AgentConfig {
-                    auto_approve: yolo_enabled(),
-                    smart_approve: smart_approve_enabled(),
+                    approval_mode: approval_mode(),
                     context_window: resolve_ctx_window(&model).0,
                     enable_self_review: cli_config::load().self_review.unwrap_or(false),
                     ..AgentConfig::default()
@@ -3466,6 +3589,8 @@ async fn run_menu_sticky() -> Result<()> {
                 // Bridge LSP config → the manager (per-request timeout; auto-enable if configured).
                 // Control is normally via `/lsp on|off`; `enable_lsp` is the config/flag path.
                 crate::agent::lsp::LSP.set_request_timeout(cfg.lsp_request_timeout_secs);
+                crate::agent::lsp::LSP
+                    .set_edit_feedback(cli_config::load().lsp_edit_diagnostics.unwrap_or(true));
                 crate::agent::lsp::LSP
                     .set_edit_feedback(cli_config::load().lsp_edit_diagnostics.unwrap_or(true));
                 if cfg.enable_lsp {
@@ -3571,8 +3696,10 @@ async fn run_menu_sticky() -> Result<()> {
                         // queued turn auto-firing.
                         let mut flushed = 0usize;
                         while input.submissions.try_recv().is_ok() {
+                            tui::note_submission_dequeued();
                             flushed += 1;
                         }
+                        tui::clear_submission_depth();
                         if flushed > 0 {
                             tui::emit_line(
                                 &theme::muted(format!("  cleared {flushed} queued message(s).")).to_string(),
@@ -3613,7 +3740,7 @@ async fn run_menu_sticky() -> Result<()> {
                         maybe_evolve_persona(&history, &http, &base_url, &api_key, &model).await;
                         maybe_learn_memory(&history);
                         maybe_auto_compact(&mut history, &http, &base_url, &api_key, &model).await;
-                        autosave_last(&history);
+                        autosave_session(&history, &http, &base_url, &api_key, &model).await;
                     }
                     Some(Err(e)) => {
                         tui::emit_line(&format!("{} {e}", theme::err("error:")));
@@ -3727,7 +3854,7 @@ async fn run_menu_plain() -> Result<()> {
             base_url.clone(),
             api_key.clone(),
             model.clone(),
-            false,
+            approval_mode(),
             resolve_ctx_window(&model).0,
         ) {
             Ok(r) => r,
@@ -3737,12 +3864,9 @@ async fn run_menu_plain() -> Result<()> {
                 continue;
             }
         };
-        // auto_approve follows the `/yolo` toggle (or `AIZEN_YES`): on → destructive ops run without
-        // a prompt; off (default) → each file edit / shell op asks first. `smart` (the `/smart`
-        // toggle) auto-clears read-only shell commands when not in yolo.
+        // Unified ask/smart/yolo approval, with AIZEN_YES forcing yolo.
         let cfg = AgentConfig {
-            auto_approve: yolo_enabled(),
-            smart_approve: smart_approve_enabled(),
+            approval_mode: approval_mode(),
             context_window: resolve_ctx_window(&model).0,
             enable_self_review: cli_config::load().self_review.unwrap_or(false),
             ..AgentConfig::default()
@@ -3820,7 +3944,7 @@ async fn run_menu_plain() -> Result<()> {
                 maybe_learn_memory(&history);
                 maybe_auto_compact(&mut history, &http, &base_url, &api_key, &model).await;
                 // Auto-checkpoint so /sessions can always restore where you left off (no manual save).
-                autosave_last(&history);
+                autosave_session(&history, &http, &base_url, &api_key, &model).await;
             }
             Err(e) => {
                 eprintln!("{} {e}", style("error:").red());
@@ -4130,15 +4254,26 @@ fn maybe_learn_memory(history: &[Message]) {
         Ok(r) => r,
         Err(_) => return, // best-effort; never disrupt the REPL
     };
-    let n = report.added.len() + report.reinforced.len();
-    if n > 0 {
+    let n_durable = report.added.len() + report.reinforced.len();
+    let n_session = report.session_notes.len();
+    if n_durable > 0 {
         tui::emit_line(
             &style(format!(
-                "{}remembered {n} fact{} — /memory to view",
+                "{}remembered {n_durable} fact{} — /memory to view",
                 icons::g(icons::learned()),
-                if n == 1 { "" } else { "s" }
+                if n_durable == 1 { "" } else { "s" }
             ))
             .color256(splash::ACCENT)
+            .dim()
+            .to_string(),
+        );
+    } else if n_session > 0 {
+        // Inferred → session working memory only (not durable). Quiet, dim.
+        tui::emit_line(
+            &style(format!(
+                "{}noted {n_session} for this session (not saved permanently)",
+                icons::g(icons::learned()),
+            ))
             .dim()
             .to_string(),
         );
@@ -4146,9 +4281,12 @@ fn maybe_learn_memory(history: &[Message]) {
 }
 
 /// After a completed turn: if a persona is active and evolution is on, let the character GROW.
-/// Two-tier (Generative-Agents): (1) record a FREE episode of what it just lived through (zero
-/// model cost), (2) when accumulated experience crosses a threshold, run ONE reflection call that
-/// distills recent episodes into durable insights. Best-effort + visible — never disrupts the REPL.
+/// Evolutionary two-tier (Generative-Agents × MemoryBank × CoALA, free-first):
+/// (1) **event-gated** free episode — only formative signals (correction / preference / remember /
+///     substantial work). Small-talk and passive turns cost zero and write nothing.
+/// (2) when formative importance crosses a threshold, ONE reflection call distills recent episodes
+///     into durable character/relationship insights (never coding trivia).
+/// Best-effort + visible — never disrupts the REPL.
 async fn maybe_evolve_persona(
     history: &[Message],
     http: &reqwest::Client,
@@ -4185,24 +4323,16 @@ async fn maybe_evolve_persona(
         .and_then(|m| m.content.clone())
         .unwrap_or_default();
 
-    // Compact, first-person-ish episode body (bounded). The reflection pass reads these later.
-    let outcome = if tool_calls >= 2 {
-        format!("I worked through it across {tool_calls} tool steps")
-    } else if tool_calls == 1 {
-        "I used a tool to handle it".to_string()
-    } else {
-        "I answered directly".to_string()
-    };
-    let gist = if assistant_gist.trim().is_empty() {
-        String::new()
-    } else {
-        format!(" — {}", truncate_chars(assistant_gist.trim(), 120))
-    };
-    let body = format!("The user asked: \"{}\". {outcome}{gist}.", truncate_chars(user_text, 200));
-
-    let corrected = persona::self_mem::looks_like_correction(user_text);
-    let importance = persona::self_mem::episode_importance(user_text, tool_calls, corrected);
-    let _ = persona::self_mem::record_episode(&slug, &body, importance);
+    // Free formative gate — the common case (hello / ok / passive) writes NOTHING.
+    if let Some(sal) = persona::self_mem::classify_turn(user_text, tool_calls) {
+        let body = persona::self_mem::format_episode_body(
+            sal.kind,
+            user_text,
+            tool_calls,
+            assistant_gist.trim(),
+        );
+        let _ = persona::self_mem::record_episode(&slug, &body, sal.importance);
+    }
 
     if persona::self_mem::should_reflect(&slug) {
         run_persona_reflection(&persona, &slug, http, base, key, model).await;
@@ -4266,17 +4396,28 @@ async fn run_persona_reflection(
     }
 }
 
-/// Build the current system prompt (frozen core + persona + skills) for `model`.
+/// Build the current system prompt (frozen core + optional session working memory + persona + skills).
 fn current_system_prompt(model: &str) -> String {
     let frozen = memory::refresh_frozen_core();
     let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    agent::build_top_level_system_prompt(&cwd, std::env::consts::OS, &date, model, Some(&frozen))
+    let mut system =
+        agent::build_top_level_system_prompt(&cwd, std::env::consts::OS, &date, model, Some(&frozen));
+    // L2 session working memory (temporary, budget-capped). Empty → no tag (zero cost).
+    let sess_budget = memory::settings().session_mem_max_tokens;
+    if let Some(block) = memory::session_mem::process_prompt_block(sess_budget) {
+        system.push('\n');
+        system.push_str(&block);
+        system.push('\n');
+    }
+    system
 }
 
 /// Reset the conversation to just the system prompt (fresh session / model change). Rebuilds the
 /// frozen core from the current memory store so newly added `type=user` facts / STYLE are injected.
+/// Drops session working memory — a new thread does not inherit this session's scratch notes.
 fn rebuild_system(history: &mut Vec<Message>, model: &str) {
+    memory::session_mem::clear_process_session_mem();
     history.clear();
     history.push(Message::system(current_system_prompt(model)));
 }
@@ -4712,15 +4853,9 @@ fn auto_skill_learn_enabled() -> bool {
     cli_config::load().auto_skill_learn.unwrap_or(true)
 }
 
-/// "Yolo" mode — auto-approve destructive tools (file edits / shell) without prompting. Off by
-/// default (safe). Forced on by the `AIZEN_YES` env var, else read from the persisted `/yolo` toggle.
-fn yolo_enabled() -> bool {
-    cli_config::branded_flag("YES") || cli_config::load().auto_approve.unwrap_or(false)
-}
-
-/// Whether the `smart` approval tier is on (auto-run read-only shell, ask for the rest). `None` ⇒ OFF.
-fn smart_approve_enabled() -> bool {
-    cli_config::load().smart_approve.unwrap_or(false)
+/// Effective unified approval level; `AIZEN_YES` forces yolo without changing the saved preference.
+fn approval_mode() -> ApprovalMode {
+    cli_config::approval_mode()
 }
 
 /// Whether an active persona evolves (records episodes + reflects). `None` ⇒ default ON.
@@ -4767,10 +4902,13 @@ fn print_status_line(history: &[Message], model: &str) {
     let toks = session_tokens(history);
     let turns = history.iter().filter(|m| m.role == "user").count();
     let tg = if telegram::is_configured() { "  ·  📱 telegram" } else { "" };
-    let yolo = if cli_config::ultimate_enabled() {
-        format!("  ·  {}", style("✦ ultimate").color256(theme::WARN).bold()) // top of the ladder — runs hottest
-    } else if yolo_enabled() {
-        format!("  ·  {}", style("⚡ yolo").color256(theme::WARN)) // reserved gold — runs hot
+    let approval = approval_mode();
+    let mode = if cli_config::ultimate_enabled() {
+        format!("  ·  {}", style("✦ ultimate").color256(theme::WARN).bold())
+    } else if approval == ApprovalMode::Yolo {
+        format!("  ·  {}", style("⚡ yolo").color256(theme::WARN))
+    } else if approval == ApprovalMode::Smart {
+        format!("  ·  {}", style("◆ smart").color256(theme::ACCENT_DIM))
     } else {
         String::new()
     };
@@ -4797,7 +4935,7 @@ fn print_status_line(history: &[Message], model: &str) {
     ))
     .dim();
     // emit_line routes into the sticky scroll region (above the box) when active, else plain stdout.
-    tui::emit_line(&format!("\n{rest}  ·  {ctx}{ac}{cache}{yolo}"));
+    tui::emit_line(&format!("\n{rest}  ·  {ctx}{ac}{cache}{mode}"));
 }
 
 /// How many trailing user turns to keep verbatim when compacting (the rest is summarized).
@@ -4889,8 +5027,8 @@ const SLASH_CMDS: &[(&str, &str)] = &[
     ("compact", "summarize older turns to free context now"),
     ("lsp", "type-aware code navigation (references · definition · symbols · diagnostics) — on/off/status/restart"),
     ("reach", "web-access health check: which backend serves each platform (youtube · twitter · github · hn · wikipedia · feeds · stackexchange · search)"),
-    ("yolo", "toggle auto-approve: run file edits & shell WITHOUT asking each time"),
-    ("smart", "toggle smart approval: auto-run read-only shell, ask for the rest"),
+    ("approval", "approval level: ask · smart (read-only auto) · yolo (pre-authorized)"),
+    ("effort", "reasoning effort per turn: auto-detect (default) / off / pin low|medium|high"),
     ("ultimate", "toggle ultimate mode: max reasoning effort + prefer launching workflows (aizen's ultracode)"),
     ("effort", "reasoning effort — drag the slider (auto · low · medium · high · xhigh · max), or /effort <level>"),
     ("clear", "start a fresh conversation"),
@@ -4925,7 +5063,7 @@ Commands:
   /help              this list
   /model             list the provider's models (with context windows) + pick one
   /config            set endpoint + key + model (wizard)
-  /memory [query]    show your profile, or search memory
+  /memory [query]    show your profile, or search memory; /memory remember <fact> to save
   /persona           pick the character the agent role-plays (list · select · new · clear · delete)
   /skills            saved procedures the agent can load (list · view · new · delete)
   /commands          your custom slash commands — markdown macros in ~/.aizen/commands/ ($ARGUMENTS · @file · !`cmd`)
@@ -4938,8 +5076,7 @@ Commands:
   /compact           summarize older turns to free context now
   /lsp [on|off|status|restart]  type-aware navigation + diagnostics via a language server (rust-analyzer · pyright · typescript-language-server); default OFF, servers start lazily
   /reach [doctor|status]  web-access channels: live-probe every backend (doctor) or show what served this session (status); web_fetch/web_search route through these
-  /yolo              toggle auto-approve — run file edits & shell WITHOUT asking each time
-  /smart             toggle smart approval — auto-run read-only shell, ask for the rest
+  /approval [ask|smart|yolo]  approval level — ask every time, auto-run read-only, or pre-authorize
   /ultimate          toggle ultimate mode — max reasoning effort + prefer launching workflows (aizen's ultracode)
   /effort            drag an animated slider (auto · low · medium · high · xhigh · max); or /effort auto|off|low|medium|high|xhigh|max|clear to set it directly
   /clear             start a fresh conversation
@@ -4961,10 +5098,7 @@ Anything else you type goes to the agent (it chats and uses tools in one loop)."
 fn slash_is_interactive(name: &str) -> bool {
     matches!(
         name,
-        "sessions"
-            | "model"
-            | "models"
-            | "config"
+        "config"
             | "setup"
             | "persona"
             | "personas"
@@ -4984,6 +5118,10 @@ fn slash_is_interactive(name: &str) -> bool {
     )
 }
 
+async fn slash_tools(_arg: &str) {
+    tui::emit_line(&agent::toolsets::format_config_status());
+}
+
 async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut String) -> SlashOutcome {
     let mut parts = input.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("").trim();
@@ -4996,6 +5134,7 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             crate::agent::todo::clear(); // a fresh conversation starts with an empty task list
             client::cost_meter().reset(); // and a fresh cost tally
             tui::reset_session_allow(); // re-confirm destructive ops in the new conversation
+            set_session_slug(None); // the next turn names + autosaves a brand-new session file
             tui::emit_line(&style("(new conversation)").dim().to_string());
         }
         "tokens" => print_status_line(history, model_label),
@@ -5106,37 +5245,34 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                 ),
             }
         }
+        "approval" => {
+            let requested = arg.split_whitespace().next().unwrap_or("status");
+            let mut cfg = cli_config::load();
+            if requested.is_empty() || matches!(requested, "status" | "st") {
+                tui::emit_line(&style(format!("approval: {} · ask=prompt · smart=read-only auto · yolo=pre-authorized", approval_mode())).dim().to_string());
+            } else if let Ok(mode) = requested.parse::<ApprovalMode>() {
+                cfg.set_approval_mode(mode);
+                match cli_config::save(&cfg) {
+                    Ok(_) => tui::emit_line(&style(format!("approval → {mode}")).color256(splash::ACCENT).to_string()),
+                    Err(e) => tui::emit_line(&format!("{} {e}", style("approval:").red())),
+                }
+            } else {
+                tui::emit_line(&style("usage: /approval ask|smart|yolo").dim().to_string());
+            }
+        }
         "yolo" | "auto" | "yes" => {
             let mut cfg = cli_config::load();
-            let now = !cfg.auto_approve.unwrap_or(false);
-            cfg.auto_approve = Some(now);
-            match cli_config::save(&cfg) {
-                Ok(_) if now => tui::emit_line(
-                    &style("⚡ yolo ON — file edits & shell now run WITHOUT asking. /yolo again to turn it off.")
-                        .color256(splash::ACCENT).to_string(),
-                ),
-                Ok(_) => tui::emit_line(&style("yolo OFF — destructive ops will ask for approval again.").dim().to_string()),
-                Err(e) => tui::emit_line(&format!("{} {e}", style("yolo:").red())),
-            }
-            if cli_config::branded_flag("YES") {
-                tui::emit_line(&style("(note: AIZEN_YES is set in your environment — it forces yolo ON regardless of this toggle)").dim().to_string());
-            }
+            let mode = if cfg.persisted_approval_mode() == ApprovalMode::Yolo { ApprovalMode::Ask } else { ApprovalMode::Yolo };
+            cfg.set_approval_mode(mode);
+            let _ = cli_config::save(&cfg);
+            tui::emit_line(&style(format!("approval → {mode} (legacy /yolo alias)")).color256(splash::ACCENT).to_string());
         }
         "smart" => {
             let mut cfg = cli_config::load();
-            let now = !cfg.smart_approve.unwrap_or(false);
-            cfg.smart_approve = Some(now);
-            match cli_config::save(&cfg) {
-                Ok(_) if now => tui::emit_line(
-                    &style("◆ smart ON — read-only shell (ls/cat/rg/git status/cargo check) runs without asking; writes still prompt. /smart again to turn it off.")
-                        .color256(splash::ACCENT).to_string(),
-                ),
-                Ok(_) => tui::emit_line(&style("smart OFF — every destructive op will ask for approval again.").dim().to_string()),
-                Err(e) => tui::emit_line(&format!("{} {e}", style("smart:").red())),
-            }
-            if cfg.auto_approve.unwrap_or(false) || cli_config::branded_flag("YES") {
-                tui::emit_line(&style("(note: yolo is ON — it approves everything, so smart has no extra effect until yolo is off)").dim().to_string());
-            }
+            let mode = if cfg.persisted_approval_mode() == ApprovalMode::Smart { ApprovalMode::Ask } else { ApprovalMode::Smart };
+            cfg.set_approval_mode(mode);
+            let _ = cli_config::save(&cfg);
+            tui::emit_line(&style(format!("approval → {mode} (legacy /smart alias)")).color256(splash::ACCENT).to_string());
         }
         "ultimate" | "ultra" => {
             let mut cfg = cli_config::load();
@@ -5222,9 +5358,12 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             }
         }
         "model" | "models" => {
-            // Merged: `/model` lists the provider's models (with context windows) AND picks one.
             if let Err(e) = slash_model(model_label).await {
-                eprintln!("{} {e}", style("model:").red());
+                if tui::active() {
+                    tui::emit_line(&format!("{} {e}", style("model:").red()));
+                } else {
+                    eprintln!("{} {e}", style("model:").red());
+                }
             } else {
                 rebuild_system(history, model_label);
             }
@@ -5237,9 +5376,24 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             rebuild_system(history, model_label);
         }
         "memory" | "mem" => {
-            let r = if arg.is_empty() { memory::cmd_profile(false) } else { memory::cmd_search(arg, 5, None, None, None) };
-            if let Err(e) = r {
-                eprintln!("{} {e}", style("memory:").red());
+            if let Some(rest) = arg.strip_prefix("remember").map(str::trim).filter(|s| !s.is_empty()) {
+                match memory::remember(rest) {
+                    Ok(id) => tui::emit_line(
+                        &style(format!("{}remembered ({id})", icons::g(icons::learned())))
+                            .color256(splash::ACCENT)
+                            .to_string(),
+                    ),
+                    Err(e) => tui::emit_line(&format!("{} {e}", style("memory:").red())),
+                }
+            } else {
+                let r = if arg.is_empty() {
+                    memory::cmd_profile(false)
+                } else {
+                    memory::cmd_search(arg, 5, None, None, None)
+                };
+                if let Err(e) = r {
+                    eprintln!("{} {e}", style("memory:").red());
+                }
             }
         }
         "persona" | "personas" | "character" => {
@@ -5258,6 +5412,7 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             }
         }
         "mcp" => tui::emit_line(&crate::agent::mcp::summary()),
+        "tools" | "toolsets" => slash_tools(arg).await,
         "commands" | "cmds" => match commands::summary() {
             Some(s) => tui::emit_line(&style(s).dim().to_string()),
             None => tui::emit_line(
@@ -5271,7 +5426,7 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
         }
         // `/serve` kept as a direct shortcut to the daemon (also reachable via the Telegram menu).
         "serve" => {
-            if let Err(e) = run_serve().await {
+            if let Err(e) = hostbot::run_serve().await {
                 eprintln!("{} {e}", style("serve:").red());
             }
         }
@@ -5283,15 +5438,20 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                 if let Err(e) = timeline_menu(history, model_label).await {
                     eprintln!("{} {e}", style("time:").red());
                 }
-            } else {
-                print_timeline();
+            } else if let Err(e) = print_timeline() {
+                tui::emit_line(&style(format!("{e}")).color256(crate::ui::theme::WARN).to_string());
             }
         }
         // Capture the conversation alongside the tree so this checkpoint supports the 3-way restore
         // (Files / Task / Both) later — a `/checkpoint` is a deliberate save point where the chat is
         // worth keeping, unlike the loop's per-edit auto-snapshots.
         "checkpoint" | "snapshot" | "cp" => match timemachine::save_with_chat(arg, false, history) {
-            Ok(s) => tui::emit_line(&format!("{} #{} saved (code + chat)", style("✓ checkpoint").color256(splash::ACCENT), s.id)),
+            Ok(s) => tui::emit_line(&format!(
+                "{} #{} saved ({})",
+                style("✓ checkpoint").color256(splash::ACCENT),
+                s.id,
+                if s.has_chat { "code + chat" } else { "files only" }
+            )),
             Err(e) => tui::emit_line(&style(format!("checkpoint: {e}")).color256(crate::ui::theme::WARN).to_string()),
         },
         "undo" => match timemachine::undo() {
@@ -5324,14 +5484,50 @@ fn sanitize_name(s: &str) -> String {
     let n: String = s.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
     if n.is_empty() { "session".to_string() } else { n }
 }
+/// Suggest a human-readable session name from the conversation's first user turn, so the "Save as"
+/// prompt comes PRE-FILLED with the topic (Enter to accept, or edit) instead of a blank box. A short
+/// hyphenated slug of the first few meaningful words + a date suffix to keep same-topic saves distinct.
+fn suggest_session_name(history: &[Message]) -> String {
+    let date = chrono::Local::now().format("%m%d").to_string();
+    let first = history
+        .iter()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.content.as_deref())
+        .unwrap_or("");
+    // Skip slash-command / leading noise; take the first line, lowercase, keep word-ish chars.
+    let line = first.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let words: Vec<String> = line
+        .split_whitespace()
+        .map(|w| {
+            w.chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+                .to_lowercase()
+        })
+        .filter(|w| w.len() >= 2)
+        .take(5)
+        .collect();
+    let slug = words.join("-");
+    // Cap length so long first messages don't produce an unwieldy default.
+    let slug: String = slug.chars().take(40).collect();
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        format!("chat-{date}")
+    } else {
+        format!("{slug}-{date}")
+    }
+}
 fn save_session(history: &[Message], name: &str) -> Result<String> {
     let dir = sessions_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     config::harden_dir(&dir);
     let path = dir.join(format!("{}.json", sanitize_name(name)));
-    std::fs::write(&path, serde_json::to_string_pretty(history)?).with_context(|| format!("writing {}", path.display()))?;
-    // The transcript can contain pasted secrets / .env contents → owner-only on Unix.
-    config::harden_file(&path);
+    let mut bytes = serde_json::to_vec_pretty(history)?;
+    bytes.push(b'\n');
+    crate::core::persist::atomic_write(&path, &bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    // The transcript can contain pasted secrets / .env contents → owner-only.
+    crate::core::persist::harden_owner_only_checked(&path)?;
     Ok(path.display().to_string())
 }
 fn load_session(history: &mut Vec<Message>, name: &str) -> Result<usize> {
@@ -5339,8 +5535,24 @@ fn load_session(history: &mut Vec<Message>, name: &str) -> Result<usize> {
     let s = std::fs::read_to_string(&path).with_context(|| format!("no saved session '{name}'"))?;
     let loaded: Vec<Message> = serde_json::from_str(&s).context("parsing session file")?;
     *history = loaded;
+    // Continue autosaving into the SAME file we just restored (don't spawn a fresh slug next turn).
+    set_session_slug(Some(sanitize_name(name)));
     Ok(history.len())
 }
+fn set_session_slug(_slug: Option<String>) {}
+fn current_session_slug() -> Option<String> { None }
+fn pretty_session_name(name: &str) -> String { name.replace('-', " ") }
+
+async fn autosave_session(
+    history: &[Message],
+    _http: &reqwest::Client,
+    _base_url: &str,
+    _api_key: &str,
+    _model: &str,
+) {
+    autosave_last(history);
+}
+
 fn list_sessions() -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
@@ -5417,17 +5629,27 @@ async fn sessions_menu(history: &mut Vec<Message>) -> Result<()> {
             let name = &names[pick];
             match load_session(history, name) {
                 Ok(n) => {
-                    println!("{}", style(format!("restored '{name}' ({n} messages)")).color256(splash::ACCENT));
+                    println!("{}", style(format!("restored '{}' ({n} messages)", pretty_session_name(name))).color256(splash::ACCENT));
+                    agent::replay_transcript(history);
                     return Ok(());
                 }
                 Err(e) => eprintln!("{} {e}", style("restore:").red()),
             }
         } else if items[pick].starts_with("+ Save") {
-            let name: String =
-                Input::with_theme(&theme).with_prompt("Save as").interact_text().unwrap_or_default();
+            let suggested = suggest_session_name(history);
+            let name: String = Input::with_theme(&theme)
+                .with_prompt("Save as")
+                .with_initial_text(suggested)
+                .interact_text()
+                .unwrap_or_default();
             if !name.trim().is_empty() {
                 match save_session(history, name.trim()) {
-                    Ok(_) => println!("{}", style(format!("saved '{}'", name.trim())).color256(splash::ACCENT)),
+                    Ok(_) => {
+                        // Pin the session to this name so later autosaves keep rewriting the SAME file
+                        // (both paths route through `sanitize_name`, so the raw name maps to one file).
+                        set_session_slug(Some(name.trim().to_string()));
+                        println!("{}", style(format!("saved '{}'", name.trim())).color256(splash::ACCENT));
+                    }
                     Err(e) => eprintln!("{} {e}", style("save:").red()),
                 }
             }
@@ -5438,8 +5660,23 @@ async fn sessions_menu(history: &mut Vec<Message>) -> Result<()> {
                 .default(0)
                 .interact_opt()
             {
-                match delete_session(&names[i]) {
-                    Ok(_) => println!("{}", style(format!("deleted '{}'", names[i])).color256(splash::ACCENT)),
+                let slug = &names[i];
+                let pretty = pretty_session_name(slug);
+                let confirmed = Confirm::with_theme(&theme)
+                    .with_prompt(format!("Delete '{pretty}' permanently?"))
+                    .default(false)
+                    .interact_opt()?
+                    .unwrap_or(false);
+                if !confirmed {
+                    continue;
+                }
+                match delete_session(slug) {
+                    Ok(_) => {
+                        if current_session_slug().as_deref() == Some(slug.as_str()) {
+                            set_session_slug(None);
+                        }
+                        println!("{}", style(format!("deleted '{pretty}'")).color256(splash::ACCENT));
+                    }
                     Err(e) => eprintln!("{} {e}", style("delete:").red()),
                 }
             }
@@ -5520,32 +5757,39 @@ fn resolve_endpoint(
     Ok((base_url, api_key, model))
 }
 
-/// Resolve just base URL + API key (for `aizen models`, which has no model).
 fn resolve_base_key(base_url: Option<String>, api_key: Option<String>) -> Result<(String, String)> {
     let cfg = cli_config::load();
     let base_url = base_url
         .or_else(|| cli_config::branded_env("BASE_URL"))
         .or(cfg.base_url)
-        .context("no base URL — pass --base-url, set AIZEN_BASE_URL, or run `aizen config set --base-url <url>`")?;
+        .context("no base URL — run `aizen config`")?;
     let api_key = api_key
         .or_else(|| cli_config::branded_env("API_KEY"))
         .or(cfg.api_key)
-        .context("no API key — pass --api-key, set AIZEN_API_KEY, or run `aizen config set --api-key <key>`")?;
+        .context("no API key — run `aizen config`")?;
     Ok((base_url, api_key))
 }
 
 fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("aizen/", env!("CARGO_PKG_VERSION")))
-        // Bound the connect + idle phases so a dead/stalled gateway can't freeze the terminal
-        // forever. We deliberately set NO total `.timeout()` — chat responses stream and may run
-        // for minutes; `read_timeout` caps the gap BETWEEN bytes (a silently stalled SSE stream),
-        // not the whole stream. tcp_keepalive surfaces a half-open connection.
         .connect_timeout(std::time::Duration::from_secs(15))
         .read_timeout(std::time::Duration::from_secs(300))
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()
         .context("building HTTP client")
+}
+
+fn parse_toolset_list(s: &str) -> Option<Vec<String>> {
+    let mut values: Vec<String> = s
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect();
+    values.sort();
+    values.dedup();
+    (!values.is_empty()).then_some(values)
 }
 
 async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
@@ -5554,7 +5798,7 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
         None => return config_wizard().await, // bare `ng config` → interactive setup
     };
     match cmd {
-        ConfigCmd::Set { base_url, api_key, model, context_window, compact_threshold, auto_skill_learn, memory_auto_learn, persona_evolve, price_in, price_out, icons, timemachine_keep, auto_effort, reasoning_effort, ultimate, adaptive_effort } => {
+        ConfigCmd::Set { base_url, api_key, model, context_window, compact_threshold, auto_skill_learn, memory_auto_learn, persona_evolve, price_in, price_out, icons, timemachine_keep, timemachine_max_files, timemachine_max_bytes, timemachine_max_file_bytes, auto_effort, reasoning_effort, approval, ultimate, adaptive_effort, disabled_toolsets, enabled_toolsets } => {
             if base_url.is_none()
                 && api_key.is_none()
                 && model.is_none()
@@ -5567,12 +5811,18 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                 && price_out.is_none()
                 && icons.is_none()
                 && timemachine_keep.is_none()
+                && timemachine_max_files.is_none()
+                && timemachine_max_bytes.is_none()
+                && timemachine_max_file_bytes.is_none()
                 && auto_effort.is_none()
                 && reasoning_effort.is_none()
+                && approval.is_none()
                 && ultimate.is_none()
                 && adaptive_effort.is_none()
+                && disabled_toolsets.is_none()
+                && enabled_toolsets.is_none()
             {
-                anyhow::bail!("nothing to set — pass at least one of --base-url / --api-key / --model / --context-window / --compact-threshold / --auto-skill-learn / --memory-auto-learn / --persona-evolve / --price-in / --price-out / --icons / --timemachine-keep / --auto-effort / --reasoning-effort / --ultimate / --adaptive-effort");
+                anyhow::bail!("nothing to set — pass at least one supported --flag (including --timemachine-keep / --timemachine-max-files / --timemachine-max-bytes / --timemachine-max-file-bytes)");
             }
             let mut cfg = cli_config::load();
             if let Some(v) = base_url {
@@ -5626,6 +5876,15 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             if let Some(k) = timemachine_keep {
                 cfg.timemachine_keep = Some(k); // 0 = unlimited
             }
+            if let Some(k) = timemachine_max_files {
+                cfg.timemachine_max_files = Some(k.max(1));
+            }
+            if let Some(k) = timemachine_max_bytes {
+                cfg.timemachine_max_bytes = Some(k.max(1));
+            }
+            if let Some(k) = timemachine_max_file_bytes {
+                cfg.timemachine_max_file_bytes = Some(k.max(1));
+            }
             if let Some(b) = auto_effort {
                 cfg.auto_effort = Some(b);
             }
@@ -5636,11 +5895,20 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                 }
                 cfg.reasoning_effort = Some(v);
             }
+            if let Some(v) = approval {
+                cfg.set_approval_mode(v.parse::<ApprovalMode>().map_err(anyhow::Error::msg)?);
+            }
             if let Some(b) = ultimate {
                 cfg.ultimate = Some(b);
             }
             if let Some(b) = adaptive_effort {
                 cfg.adaptive_effort = Some(b);
+            }
+            if let Some(v) = disabled_toolsets {
+                cfg.disabled_toolsets = parse_toolset_list(&v);
+            }
+            if let Some(v) = enabled_toolsets {
+                cfg.enabled_toolsets = parse_toolset_list(&v);
             }
             cli_config::save(&cfg)?;
             println!("{} {}", crate::ui::theme::ok("✓"), style("saved").color256(splash::ACCENT));
@@ -5755,6 +6023,15 @@ fn print_config(cfg: &cli_config::CliConfig) {
             k => format!("keep {}  {}", theme::accent(k.to_string()), theme::faint("· auto-prune oldest")),
         },
     );
+    row(
+        "snapshot budget",
+        format!(
+            "{} files · {} total · {} each",
+            cfg.timemachine_max_files.unwrap_or(100_000),
+            fmt_bytes(cfg.timemachine_max_bytes.unwrap_or(2 * 1024 * 1024 * 1024)),
+            fmt_bytes(cfg.timemachine_max_file_bytes.unwrap_or(512 * 1024 * 1024))
+        ),
+    );
 
     // ── Web search ──
     section("Web search");
@@ -5785,6 +6062,21 @@ fn print_config(cfg: &cli_config::CliConfig) {
     section("Display");
     row("icons", theme::accent(cfg.icons.as_deref().unwrap_or("nerd")).to_string());
     println!();
+}
+
+fn fmt_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        format!("{:.1}GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1}MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1}KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes}B")
+    }
 }
 
 /// Given the fetched models + the currently-saved model, the index Select should default to.
@@ -5836,6 +6128,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
         } else {
             "auto".to_string()
         };
+        let approval_h = cfg.persisted_approval_mode().to_string();
         let icons_h = cfg.icons.clone().unwrap_or_else(|| "nerd".into());
 
         let items = vec![
@@ -5844,6 +6137,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             format!("Web search      · tavily {tavily_h}"),
             format!("Session         · compact {compact_h}"),
             format!("Reasoning       · {effort_h}"),
+            format!("Approval        · {approval_h}"),
             format!("Display         · icons {icons_h}"),
             "Show full config".to_string(),
             "Done".to_string(),
@@ -5857,15 +6151,16 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             Some(i) => i,
             None => break,
         };
-        // Sections 0..=5 edit + save; 6 shows the panel; 7 (or Esc) exits.
+        // Sections 0..=6 edit + save; 7 shows the panel; 8 (or Esc) exits.
         let edited = match pick {
             0 => config_edit_connection(&mut cfg),
             1 => config_edit_model(&mut cfg).await,
             2 => config_edit_websearch(&mut cfg),
             3 => config_edit_session(&mut cfg),
             4 => config_edit_reasoning(&mut cfg),
-            5 => config_edit_display(&mut cfg),
-            6 => {
+            5 => config_edit_approval(&mut cfg),
+            6 => config_edit_display(&mut cfg),
+            7 => {
                 print_config(&cfg);
                 continue;
             }
@@ -6075,6 +6370,33 @@ fn config_edit_reasoning(cfg: &mut cli_config::CliConfig) -> Result<()> {
     }
     cfg.ultimate = Some(yn(&theme, "Ultimate mode (max effort + prefer workflows)?", cfg.ultimate.unwrap_or(false))?);
     cfg.adaptive_effort = Some(yn(&theme, "Adaptive effort (let hard turns climb to xhigh)?", cfg.adaptive_effort.unwrap_or(false))?);
+    Ok(())
+}
+
+fn config_edit_approval(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    let modes = [
+        "ask — prompt before destructive tools",
+        "smart — auto-run read-only shell, prompt for the rest",
+        "yolo — pre-authorize tools after the hard safety floor",
+    ];
+    let current = match cfg.persisted_approval_mode() {
+        ApprovalMode::Ask => 0,
+        ApprovalMode::Smart => 1,
+        ApprovalMode::Yolo => 2,
+    };
+    if let Some(pick) = Select::with_theme(&theme)
+        .with_prompt("Approval level (Esc keeps current)")
+        .items(&modes)
+        .default(current)
+        .interact_opt()?
+    {
+        cfg.set_approval_mode(match pick {
+            1 => ApprovalMode::Smart,
+            2 => ApprovalMode::Yolo,
+            _ => ApprovalMode::Ask,
+        });
+    }
     Ok(())
 }
 
@@ -6377,10 +6699,9 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
     let (base_url, api_key, model) = resolve_endpoint(args.base_url, args.api_key, args.model)?;
     let http = http_client()?;
 
-    // Session start: promote any frozen-core rebuild staged by a previous session, then
-    // inject the (now-immutable) core as the always-on <user_memory> block.
-    let _ = memory::frozen_core::promote_pending();
-    let frozen = memory::frozen_core::read_active();
+    // Session start: rebuild the always-on core for THIS project slug (STYLE + global prefs
+    // only). Do not reuse a stale foreign-repo core.active — refresh_frozen_core is slug-aware.
+    let frozen = memory::refresh_frozen_core();
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
@@ -6390,19 +6711,20 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
 
     // Registry includes the `task` sub-agent tool (depth 0); a spawned sub-agent uses a
     // role-scoped registry WITHOUT `task` (no recursion).
+    let cli_approval = if args.yes { ApprovalMode::Yolo } else { ApprovalMode::Ask };
     let registry = agent::builtin::default_registry_with_task(
         http.clone(),
         base_url.clone(),
         api_key.clone(),
         model.clone(),
-        args.yes,
+        cli_approval,
         resolve_ctx_window(&model).0,
     )?;
     let max = args.max_iters.unwrap_or(25).max(1);
     let cfg = AgentConfig {
         max_iters: max,
         auto_extend_to: max.saturating_mul(2),
-        auto_approve: args.yes,
+        approval_mode: cli_approval,
         context_window: resolve_ctx_window(&model).0,
         ..Default::default()
     };
@@ -6437,6 +6759,10 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
             "\n[stopped: hit the step limit ({} steps) — the task may be incomplete]",
             outcome.iters
         ),
+        StopReason::VerificationFailed => eprintln!(
+            "\n[stopped: edits were made but verification never passed after {} steps]",
+            outcome.iters
+        ),
         // One-shot `ng agent` is non-interactive: there is no next message to answer with, so
         // surface the question and exit rather than hang. Re-run in the REPL to answer it.
         StopReason::AwaitingInput(q) => eprintln!(
@@ -6456,7 +6782,8 @@ async fn run_workflow_cmd(args: WorkflowArgs) -> Result<()> {
     let http = http_client()?;
     let trace = args.trace.as_deref().map(std::path::Path::new);
 
-    agent::workflow::run_workflow(&http, &base_url, &api_key, &model, args.yes, &spec, trace).await
+    let approval = if args.yes { ApprovalMode::Yolo } else { ApprovalMode::Ask };
+    agent::workflow::run_workflow(&http, &base_url, &api_key, &model, approval, &spec, trace).await
 }
 
 async fn run_memory(cmd: MemoryCmd) -> Result<()> {
@@ -6578,14 +6905,33 @@ fn run_persona(cmd: PersonaCmd) -> Result<()> {
         PersonaCmd::Remember { text, importance } => {
             let slug = persona::active_slug()
                 .ok_or_else(|| anyhow::anyhow!("no active persona — `aizen persona use <name>` first"))?;
+            // Explicit CLI remember is always formative: force Explicit kind + floor ≥ FORMATIVE_MIN.
             let imp = importance
                 .unwrap_or_else(|| {
-                    persona::self_mem::episode_importance(&text, 0, persona::self_mem::looks_like_correction(&text))
+                    persona::self_mem::classify_turn(&text, 0)
+                        .map(|s| s.importance)
+                        .unwrap_or(6)
                 })
+                .max(persona::self_mem::FORMATIVE_MIN)
                 .min(10);
-            match persona::self_mem::record_episode(&slug, &text, imp)? {
+            let body = if text.trim().starts_with("correction:")
+                || text.trim().starts_with("preference:")
+                || text.trim().starts_with("work:")
+                || text.trim().starts_with("bond:")
+                || text.trim().starts_with("explicit:")
+            {
+                text.clone()
+            } else {
+                persona::self_mem::format_episode_body(
+                    persona::self_mem::EventKind::Explicit,
+                    &text,
+                    0,
+                    "",
+                )
+            };
+            match persona::self_mem::record_episode(&slug, &body, imp)? {
                 Some(id) => println!("recorded episode '{id}' (importance {imp})"),
-                None => println!("(skipped — identical to the last episode)"),
+                None => println!("(skipped — near-duplicate of a recent episode/insight)"),
             }
             Ok(())
         }
@@ -7329,16 +7675,6 @@ mod tests {
     }
 
     #[test]
-    fn ctx_bar_uses_semantic_palette() {
-        // P-ctx4: colour comes from the semantic palette (OK/WARN/ERR) at the 50%/80% thresholds,
-        // not bespoke 256-indices. Force colour on so the ANSI code is actually emitted.
-        console::set_colors_enabled(true);
-        assert!(ctx_bar(30.0).contains(&theme::OK.to_string()), "green below 50%");
-        assert!(ctx_bar(60.0).contains(&theme::WARN.to_string()), "gold from 50%");
-        assert!(ctx_bar(90.0).contains(&theme::ERR.to_string()), "salmon from 80%");
-    }
-
-    #[test]
     fn classify_source_covers_the_matrix() {
         use super::InstallSource::*;
         // GitHub shorthand
@@ -7380,6 +7716,19 @@ mod tests {
         // http(s) are guarded on the path directly, not via this extractor.
         assert_eq!(git_url_host("https://github.com/o/r"), None);
     }
+
+
+    #[test]
+    fn ctx_bar_uses_semantic_palette() {
+        // P-ctx4: colour comes from the semantic palette (OK/WARN/ERR) at the 50%/80% thresholds,
+        // not bespoke 256-indices. Force colour on so the ANSI code is actually emitted.
+        console::set_colors_enabled(true);
+        assert!(ctx_bar(30.0).contains(&theme::OK.to_string()), "green below 50%");
+        assert!(ctx_bar(60.0).contains(&theme::WARN.to_string()), "gold from 50%");
+        assert!(ctx_bar(90.0).contains(&theme::ERR.to_string()), "salmon from 80%");
+    }
+
+
 
     #[test]
     fn ctx_bar_fill_tracks_percentage() {

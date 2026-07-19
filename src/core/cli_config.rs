@@ -6,6 +6,7 @@
 //! The key is stored in plaintext (standard for a CLI credential file, like `~/.aws/credentials`)
 //! but the file is tightened to owner-only (0600) on Unix at write time — see `save`.
 
+use crate::core::approval::ApprovalMode;
 use crate::core::config::nextgen_home;
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
@@ -82,17 +83,15 @@ pub struct CliConfig {
     /// Core promotion always stays human-gated. `None` ⇒ default ON. `Some(false)` ⇒ disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_auto_learn: Option<bool>,
-    /// "Yolo" mode: auto-approve destructive tools (file edits / shell) in the TUI without prompting
-    /// for each one. `None`/`Some(false)` ⇒ ask before every destructive op (safe default).
-    /// `Some(true)` ⇒ run them without asking. Toggle live with `/yolo`; `AIZEN_YES` env also forces it on.
-    /// The hard command blocklist (`cmd_guard`) still applies underneath — yolo skips the prompt, never the floor.
+    /// Unified approval level for agent tools. `None` ⇒ `ask` (safe default). `smart` auto-runs
+    /// read-only-shaped shell commands; `yolo` pre-authorizes destructive tools after the hard floor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<ApprovalMode>,
+    /// Legacy `/yolo` config field. Read for migration only; normalized into `approval_mode` on save.
+    #[serde(default, skip_serializing)]
     pub auto_approve: Option<bool>,
-    /// "Smart" approval: auto-run read-only-shaped shell commands (`ls`/`cat`/`rg`/`git status`/
-    /// `cargo check` …) without a prompt, while writes/network/installs/deletes still ask. Composes
-    /// with `auto_approve` (yolo wins). `None`/`Some(false)` ⇒ ask for every destructive op (manual).
-    /// Toggle live with `/smart`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy `/smart` config field. Read for migration only; normalized into `approval_mode` on save.
+    #[serde(default, skip_serializing)]
     pub smart_approve: Option<bool>,
     /// Optional pricing for the `/cost` estimate: USD per 1,000,000 tokens, input/output. When both
     /// are set AND the provider reports real token usage, `/cost` shows an estimated session $.
@@ -139,6 +138,15 @@ pub struct CliConfig {
     /// active one). `None` ⇒ default 50. `Some(0)` ⇒ unlimited (keep everything).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timemachine_keep: Option<usize>,
+    /// Maximum files in one Time Machine snapshot. `None` ⇒ 100,000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timemachine_max_files: Option<u64>,
+    /// Maximum aggregate Git blob bytes in one snapshot. `None` ⇒ 2 GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timemachine_max_bytes: Option<u64>,
+    /// Maximum size of one file/blob in a snapshot. `None` ⇒ 512 MiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timemachine_max_file_bytes: Option<u64>,
     /// Discord two-way bot (the `ng discord serve` gateway daemon). Distinct from the one-way Discord
     /// webhook under [`NotifyConfig`] — this is a full bot that receives messages and replies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,6 +155,15 @@ pub struct CliConfig {
     /// raise limits / unlock extras. See `agent::reach` and `/reach`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reach: Option<ReachConfig>,
+    /// Hermes-style tool bundles to **disable** on the top-level agent (e.g. `web`, `browser`,
+    /// `delegation`, `mcp`). Shrinks the tool schema sent to the model each turn. Sub-agent
+    /// registries are unaffected. See `agent::toolsets::CATALOG`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_toolsets: Option<Vec<String>>,
+    /// Optional **whitelist**: when non-empty, only these bundles are advertised (plus any tool
+    /// whose bundle is unknown). Overrides `disabled_toolsets` for listed ids. Rare; prefer disable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_toolsets: Option<Vec<String>>,
     /// Per-ROLE model routing: point harness chores (compaction summaries), sub-agents, and the
     /// self-review oracle at different OpenAI-compatible endpoints/models than the main loop —
     /// cheap-fast for chores, stronger for review. Every field optional; unset ⇒ the main model.
@@ -287,6 +304,45 @@ pub fn branded_flag(suffix: &str) -> bool {
     std::env::var_os(format!("AIZEN_{suffix}")).is_some()
 }
 
+impl CliConfig {
+    /// Resolve the persisted approval level, accepting the pre-unification boolean fields as a
+    /// migration fallback. The new enum always wins; if both legacy toggles are true, yolo keeps the
+    /// old runtime precedence over smart.
+    pub fn persisted_approval_mode(&self) -> ApprovalMode {
+        self.approval_mode.unwrap_or_else(|| {
+            if self.auto_approve.unwrap_or(false) {
+                ApprovalMode::Yolo
+            } else if self.smart_approve.unwrap_or(false) {
+                ApprovalMode::Smart
+            } else {
+                ApprovalMode::Ask
+            }
+        })
+    }
+
+    /// Store one canonical approval field and clear the legacy migration inputs.
+    pub fn set_approval_mode(&mut self, mode: ApprovalMode) {
+        self.approval_mode = Some(mode);
+        self.auto_approve = None;
+        self.smart_approve = None;
+    }
+
+    fn normalize_approval(&mut self) {
+        let mode = self.persisted_approval_mode();
+        self.set_approval_mode(mode);
+    }
+}
+
+/// Effective approval for interactive/persisted callers. `AIZEN_YES` is the explicit environment
+/// escape hatch and forces yolo without mutating the saved preference.
+pub fn approval_mode() -> ApprovalMode {
+    if branded_flag("YES") {
+        ApprovalMode::Yolo
+    } else {
+        load().persisted_approval_mode()
+    }
+}
+
 /// Per-turn reasoning-effort override, set by the REPL for one user turn and read by the LLM client
 /// when it builds a request. Kept OUT of `CliConfig` on purpose — effort is a per-turn decision, not
 /// a persisted setting. The nesting distinguishes three states:
@@ -317,6 +373,33 @@ pub fn resolved_reasoning_effort(config_default: Option<String>) -> Option<Strin
     match effort_override() {
         Some(inner) => inner,
         None => config_default,
+    }
+}
+
+/// RAII guard that temporarily DISARMS the per-turn effort override for its lifetime, restoring the
+/// prior state on drop. The problem: the override is a process-global armed at the top of a REPL
+/// turn (e.g. ultimate mode pins `max`) and only cleared when the whole turn ends. A `task`/workflow
+/// sub-agent runs SYNCHRONOUSLY inside that turn (`block_in_place` + `block_on`), so every
+/// `chat_with_tools` call it makes would read the still-armed parent tier via
+/// `resolved_reasoning_effort` — the parent's `max` leaks down the whole fan-out. Wrapping the
+/// sub-agent dispatch in this guard makes `resolved_reasoning_effort` fall through to the caller's
+/// own `cfg.reasoning_effort` (exactly what the doc above promises for subagents), then restores the
+/// parent's override for the rest of the turn. Serial-by-construction: the guard is held across a
+/// blocking dispatch, so no concurrent parent turn can observe the disarmed window.
+pub struct EffortOverrideSuppressed(Option<Option<String>>);
+
+/// Disarm the per-turn effort override until the returned guard drops. See `EffortOverrideSuppressed`.
+#[must_use = "the override stays disarmed only while the guard is held"]
+pub fn suppress_effort_override() -> EffortOverrideSuppressed {
+    let prior = effort_override();
+    *EFFORT_OVERRIDE.write().unwrap_or_else(|e| e.into_inner()) = None;
+    EffortOverrideSuppressed(prior)
+}
+
+impl Drop for EffortOverrideSuppressed {
+    fn drop(&mut self) {
+        // Restore the exact prior override state (outer None = disarmed, Some(inner) = armed).
+        *EFFORT_OVERRIDE.write().unwrap_or_else(|e| e.into_inner()) = self.0.take();
     }
 }
 
@@ -386,6 +469,7 @@ impl TelegramConfig {
     }
 }
 
+
 /// Outbound notification channels — one-way HTTP POST sinks. Each URL can also be supplied via env
 /// (`AIZEN_DISCORD_WEBHOOK`, `AIZEN_SLACK_WEBHOOK`, `AIZEN_WEBHOOK_URL`), which overrides the stored value.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -436,6 +520,8 @@ pub fn load() -> CliConfig {
 /// tightened to owner-only (0600, and the home dir to 0700) on Unix — matching the OAuth/MCP token
 /// caches. No-op on Windows (user-profile ACL governs).
 pub fn save(cfg: &CliConfig) -> Result<()> {
+    let mut canonical = cfg.clone();
+    canonical.normalize_approval();
     let path = config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -449,7 +535,7 @@ pub fn save(cfg: &CliConfig) -> Result<()> {
             let _ = std::fs::copy(&path, path.with_extension("json.bak"));
         }
     }
-    let json = serde_json::to_string_pretty(cfg)?;
+    let json = serde_json::to_string_pretty(&canonical)?;
     std::fs::write(&path, json + "\n").with_context(|| format!("writing {}", path.display()))?;
     crate::core::config::harden_file(&path);
     Ok(())
@@ -541,6 +627,81 @@ mod tests {
 
         std::env::remove_var("NEXTGEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrates_legacy_approval_booleans_to_one_enum() {
+        let smart: CliConfig = serde_json::from_str(r#"{"smart_approve":true}"#).unwrap();
+        assert_eq!(smart.persisted_approval_mode(), ApprovalMode::Smart);
+
+        let yolo: CliConfig = serde_json::from_str(r#"{"auto_approve":true}"#).unwrap();
+        assert_eq!(yolo.persisted_approval_mode(), ApprovalMode::Yolo);
+
+        let both: CliConfig =
+            serde_json::from_str(r#"{"auto_approve":true,"smart_approve":true}"#).unwrap();
+        assert_eq!(both.persisted_approval_mode(), ApprovalMode::Yolo);
+
+        let new_wins: CliConfig = serde_json::from_str(
+            r#"{"approval_mode":"ask","auto_approve":true,"smart_approve":true}"#,
+        )
+        .unwrap();
+        assert_eq!(new_wins.persisted_approval_mode(), ApprovalMode::Ask);
+    }
+
+    #[test]
+    fn save_normalizes_legacy_approval_fields() {
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ng-approval-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("NEXTGEN_HOME", &dir);
+
+        save(&CliConfig { smart_approve: Some(true), ..Default::default() }).unwrap();
+        let raw = std::fs::read_to_string(config_path()).unwrap();
+        assert!(raw.contains("\"approval_mode\": \"smart\""), "{raw}");
+        assert!(!raw.contains("smart_approve"), "{raw}");
+        assert!(!raw.contains("auto_approve"), "{raw}");
+        assert_eq!(load().persisted_approval_mode(), ApprovalMode::Smart);
+
+        std::env::remove_var("NEXTGEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suppress_effort_override_isolates_subagents_then_restores() {
+        // Serialize against any other test that touches the process-global override.
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Start clean.
+        clear_effort_override();
+        assert_eq!(resolved_reasoning_effort(Some("low".into())), Some("low".into()),
+            "disarmed → caller's config default is used");
+
+        // Parent turn arms the override (e.g. ultimate pins `max`).
+        set_effort_override(Some("max".into()));
+        assert_eq!(resolved_reasoning_effort(Some("low".into())), Some("max".into()),
+            "armed → parent tier wins over the caller default");
+
+        // A sub-agent dispatch suppresses it: inside the guard, the caller's own default wins again.
+        {
+            let _s = suppress_effort_override();
+            assert_eq!(resolved_reasoning_effort(Some("low".into())), Some("low".into()),
+                "suppressed → sub-agent resolves its own cfg.reasoning_effort, not the parent's max");
+            assert_eq!(resolved_reasoning_effort(None), None,
+                "suppressed with no caller default → omit the field");
+        }
+        // Guard dropped → the parent's armed override is restored for the rest of the turn.
+        assert_eq!(resolved_reasoning_effort(Some("low".into())), Some("max".into()),
+            "drop restores the parent tier");
+
+        // The nested "omit" state (Some(None)) must also round-trip through suppression.
+        set_effort_override(None); // armed-but-omit
+        {
+            let _s = suppress_effort_override();
+            assert_eq!(resolved_reasoning_effort(Some("high".into())), Some("high".into()));
+        }
+        assert_eq!(resolved_reasoning_effort(Some("high".into())), None,
+            "restored to armed-but-omit (Some(None)), so the field is omitted again");
+
+        clear_effort_override();
     }
 
     #[test]

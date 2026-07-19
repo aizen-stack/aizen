@@ -128,8 +128,9 @@ pub fn slash(name: &str) -> &'static str {
         "clear" => pick("🧹", "\u{f021}"),    // refresh
         "tokens" => pick("📊", "\u{f080}"),   // bar-chart
         "cost" => pick("💰", "\u{f155}"),     // dollar
-        "yolo" => pick("⚡", "\u{f0e7}"),     // bolt
-        "smart" => pick("◆", "\u{f132}"),     // shield
+        "approval" => pick("🛡", "\u{f132}"), // shield
+        "yolo" => pick("⚡", "\u{f0e7}"),     // legacy alias / HUD
+        "smart" => pick("◆", "\u{f132}"),     // legacy alias / HUD
         "quit" => pick("🚪", "\u{f08b}"),     // sign-out
         _ => "•",
     }

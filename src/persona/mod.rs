@@ -30,8 +30,10 @@ use crate::memory::frontmatter;
 use crate::memory::learning::sanitize_facts::threat_scan;
 use crate::skills::sanitize_name; // shared slug rule
 use anyhow::{bail, Context, Result};
+use once_cell::sync::Lazy;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 /// Token budget for the injected `<self>` block (kept small — it sits alongside persona +
 /// user_memory + skills, and must not crowd the prefix).
@@ -167,9 +169,33 @@ pub fn delete(name: &str) -> Result<bool> {
     Ok(removed_card)
 }
 
-/// The currently-active persona (config `persona = "<name>"`), if set + loadable.
+/// A per-turn persona override, layered OVER the global `config.persona`. The host-bot daemon
+/// processes messages serially (one turn at a time), so before each turn it pins the originating
+/// sub-bot's persona here and clears it after — giving each hosted bot its OWN character WITHOUT
+/// touching the global config (and without racing, since turns never overlap). `None` ⇒ fall back
+/// to `config.persona` (the primary "default" bot uses this = the user's own agent identity).
+///
+/// This deliberately affects ONLY the `<persona>` / `<self>` blocks — `<user_memory>` (the frozen
+/// core) stays global, so memory is always the primary agent's, never per-bot.
+static PERSONA_OVERRIDE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+
+/// Pin (or clear with `None`) the per-turn persona override. Called by the serve daemon around each
+/// turn; `None` restores the global `config.persona`.
+pub fn set_override(name: Option<String>) {
+    *PERSONA_OVERRIDE.lock().unwrap() = name;
+}
+
+/// The effective persona name: the per-turn override wins over the global `config.persona`.
+fn effective_name() -> Option<String> {
+    if let Some(name) = PERSONA_OVERRIDE.lock().unwrap().clone() {
+        return Some(name);
+    }
+    crate::core::cli_config::load().persona
+}
+
+/// The currently-active persona (per-turn override, else config `persona = "<name>"`), if loadable.
 pub fn active() -> Option<Persona> {
-    let name = crate::core::cli_config::load().persona?;
+    let name = effective_name()?;
     load(&name)
 }
 
@@ -269,6 +295,27 @@ mod tests {
     }
 
     #[test]
+    fn per_turn_override_wins_over_config_then_clears() {
+        with_home("override", || {
+            save("Aria", "a mentor", "warm", "Aria body.").unwrap();
+            save("Bob", "a coder", "terse", "Bob body.").unwrap();
+            // Global config points at Aria.
+            let mut cfg = crate::core::cli_config::load();
+            cfg.persona = Some("Aria".to_string());
+            crate::core::cli_config::save(&cfg).unwrap();
+            assert_eq!(active().unwrap().name, "Aria", "no override → config persona");
+
+            // Override to Bob for one turn.
+            set_override(Some("Bob".to_string()));
+            assert_eq!(active().unwrap().name, "Bob", "override wins over config");
+
+            // Clear → back to the global config persona (memory/default stays global).
+            set_override(None);
+            assert_eq!(active().unwrap().name, "Aria", "cleared → config persona again");
+        });
+    }
+
+    #[test]
     fn prompt_block_none_until_active_then_renders() {
         with_home("active", || {
             assert!(prompt_block().is_none(), "no persona active");
@@ -295,7 +342,7 @@ mod tests {
         with_home("del-self", || {
             save("Aria", "m", "v", "body").unwrap();
             let slug = sanitize_name("Aria");
-            self_mem::record_episode(&slug, "did a thing", 5).unwrap();
+            self_mem::record_episode(&slug, "correction: user redirected me — \"use tabs\"", 7).unwrap();
             assert!(!self_mem::list(&slug).is_empty());
             delete("Aria").unwrap();
             assert!(self_mem::list(&slug).is_empty(), "self-memory removed with the persona");
@@ -381,9 +428,14 @@ mod tests {
             cfg.persona = Some("Aria".to_string());
             crate::core::cli_config::save(&cfg).unwrap();
             assert!(self_block().is_none(), "active but no experience yet");
-            self_mem::record_episode(&sanitize_name("Aria"), "shipped the redesign", 6).unwrap();
+            self_mem::record_episode(
+                &sanitize_name("Aria"),
+                "correction: user redirected me — \"never force-push main\"",
+                8,
+            )
+            .unwrap();
             let block = self_block().expect("self block renders once there is experience");
-            assert!(block.contains("shipped the redesign"));
+            assert!(block.contains("force-push"));
         });
     }
 }

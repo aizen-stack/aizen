@@ -18,6 +18,7 @@ pub mod profile;
 pub mod provenance;
 pub mod render;
 pub mod score;
+pub mod session_mem;
 pub mod store;
 pub mod tokenize;
 
@@ -28,6 +29,7 @@ use crate::memory::provenance::ProvenanceKind;
 use crate::memory::score::Bm25Index;
 use crate::memory::store::{MemoryEntry, MemoryType};
 use crate::memory::tokenize::tokenize;
+use crate::ui::tui;
 use anyhow::Result;
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -642,11 +644,11 @@ pub fn cmd_search(
     if hits.is_empty() {
         let d = dim.map(|d| format!(" in dimension '{}'", d.as_str())).unwrap_or_default();
         let c = cat.map(|c| format!(" in category '{}'", c.as_str())).unwrap_or_default();
-        println!("(no matches for '{query}'{d}{c})");
+        tui::emit_line(&format!("(no matches for '{query}'{d}{c})"));
         return Ok(());
     }
     for h in &hits {
-        println!(
+        tui::emit_line(&format!(
             "{:.3}  [{}/{}]{}{} {}",
             h.score,
             h.entry.mtype.as_str(),
@@ -654,7 +656,7 @@ pub fn cmd_search(
             zone_tag(&h.entry),
             cat_tag(&h.entry),
             h.entry.name
-        );
+        ));
     }
     Ok(())
 }
@@ -672,7 +674,7 @@ fn cat_tag(e: &MemoryEntry) -> String {
 pub fn cmd_profile(json: bool) -> Result<()> {
     let profile = build_profile()?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&profile)?);
+        tui::emit_line(&serde_json::to_string_pretty(&profile)?);
         return Ok(());
     }
     render_profile(&profile);
@@ -702,7 +704,7 @@ pub fn build_profile() -> Result<profile::UserProfile> {
 }
 
 fn render_profile(p: &profile::UserProfile) {
-    println!("# user profile — derived, free/local (cite-backed)\n");
+    tui::emit_line("# user profile — derived, free/local (cite-backed)\n");
     for d in &p.dims {
         let conf = format!("conf {:.0}%", d.confidence * 100.0);
         let line = match &d.verdict {
@@ -717,10 +719,10 @@ fn render_profile(p: &profile::UserProfile) {
                 format!("{}  {conf}", top.join(", "))
             }
         };
-        println!("{:<13} {line}", d.dim.as_str());
+        tui::emit_line(&format!("{:<13} {line}", d.dim.as_str()));
         if !matches!(d.verdict, profile::Verdict::Insufficient) && !d.basis.is_empty() {
             let cited: Vec<String> = d.basis.iter().take(3).map(|b| b.name.clone()).collect();
-            println!("              ↳ {}", cited.join("; "));
+            tui::emit_line(&format!("              ↳ {}", cited.join("; ")));
         }
     }
 }
@@ -803,6 +805,9 @@ fn print_learn_report(r: &LearnReport, dry_run: bool) {
     }
     for id in &r.queued_review {
         println!("? review     {id} (run `aizen memory review`){tag}");
+    }
+    for (old, new) in &r.superseded {
+        println!("↻ superseded {old} → {new}{tag}");
     }
     for (fact, why) in &r.rejected {
         println!("✗ rejected   {fact}  — {why}");

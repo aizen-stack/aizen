@@ -89,8 +89,8 @@ pub struct TaskTool {
     base_url: String,
     api_key: String,
     model: String,
-    /// Inherited from the parent `--yes` — an explicit autonomy opt-in applies transitively.
-    auto_approve: bool,
+    /// Inherited from the parent: delegated work keeps the same ask/smart/yolo approval tier.
+    approval_mode: crate::core::approval::ApprovalMode,
     /// The confinement root, resolved once with the parent registry.
     root: PathBuf,
     /// Dispatch depth (0 at top level). The guard refuses `>= 1`.
@@ -108,12 +108,12 @@ impl TaskTool {
         base_url: String,
         api_key: String,
         model: String,
-        auto_approve: bool,
+        approval_mode: crate::core::approval::ApprovalMode,
         root: PathBuf,
         depth: usize,
         context_window: usize,
     ) -> Self {
-        Self { client, base_url, api_key, model, auto_approve, root, depth, context_window }
+        Self { client, base_url, api_key, model, approval_mode, root, depth, context_window }
     }
 }
 
@@ -412,7 +412,7 @@ impl Tool for TaskTool {
         // (planner/reviewer) makes no edits, so the gate would only spawn a needless `cargo check`.
         let sub_verify_gate = !dispatch_is_read_only(&registry);
         let cfg = AgentConfig {
-            auto_approve: self.auto_approve, // inherit parent --yes (transitive autonomy)
+            approval_mode: self.approval_mode, // inherit parent approval tier transitively
             quiet: true,                     // suppress nested progress trace
             enable_verify_gate: sub_verify_gate, // ON for write-capable roles; OFF for read-only (W14)
             // The dispatch step budget (default 15 ≪ the top level's 25/50 — a sub-task is
@@ -430,10 +430,9 @@ impl Tool for TaskTool {
             ..AgentConfig::default()
         };
 
-        // Make the transitive --yes grant visible: a sub-agent running unattended-destructive
-        // is easy to miss otherwise.
-        if self.auto_approve {
-            eprintln!("→ task({header_label}): running with --yes (sub-agent destructive ops auto-approved)");
+        // Make a transitive yolo grant visible: an unattended destructive sub-agent is easy to miss.
+        if self.approval_mode.approves_all() {
+            eprintln!("→ task({header_label}): running in yolo approval (sub-agent destructive ops pre-authorized)");
         }
 
         // Bridge sync→async on the CURRENT runtime (same one the reqwest client was built on).
@@ -445,6 +444,13 @@ impl Tool for TaskTool {
         // pass-through there. Never call `execute` from a plain `#[test]` past the early-return
         // guards (no runtime).
         let outcome = tokio::task::block_in_place(|| {
+            // EFFORT ISOLATION: the parent turn may have armed a process-global effort override
+            // (e.g. ultimate mode pins `max`). A sub-agent is a NARROWER task and must pick its own
+            // tier from `cfg.reasoning_effort`, not inherit the parent's — otherwise the whole
+            // fan-out runs at `max` for no measured quality gain (see the effort-leak finding). The
+            // guard disarms the override for exactly this synchronous dispatch and restores it on
+            // drop, before control returns to the parent turn.
+            let _effort = crate::core::cli_config::suppress_effort_override();
             tokio::runtime::Handle::current()
                 .block_on(crate::agent::run_agent(chat, &cfg, &registry, &system, prompt))
         })
@@ -454,6 +460,7 @@ impl Tool for TaskTool {
             crate::agent::StopReason::Done => "done",
             crate::agent::StopReason::Divergence => "diverged (repeated itself)",
             crate::agent::StopReason::MaxIters => "hit the step limit",
+            crate::agent::StopReason::VerificationFailed => "failed verification after repair attempts",
             // Unreachable for a sub-agent (no `clarify` in any role registry — nobody to answer),
             // but the match must be total.
             crate::agent::StopReason::AwaitingInput(_) => "stopped to ask (no interactive user)",
@@ -516,11 +523,14 @@ impl TaskTool {
 /// Does a resolved sub-agent registry grant NO write-capable tool? Checked against the exact set
 /// a sub-agent scope can add (`canonical_subagent_tool`'s whole range + the role add-ons), so the
 /// parallel policy tracks the ACTUAL granted scope. The shared read-only base also carries gated
-/// OUTWARD tools (skill_install / telegram / notify / checkpoint) — network-or-registry side
-/// effects, approval-gated inside the child, and benign under parallelism — deliberately NOT
-/// counted as writes: what must serialize is workspace mutation.
+/// OUTWARD tools (skill_install / telegram / notify) may carry approval-gated network side effects,
+/// but they do not mutate repository/workspace state and remain parallel-safe. Repository metadata
+/// writers such as `checkpoint` are excluded from the read-only base entirely.
 pub(crate) fn dispatch_is_read_only(r: &crate::agent::tools::ToolRegistry) -> bool {
-    const WRITERS: &[&str] = &["file_edit", "multi_edit", "file_write", "file_move", "shell_run", "skill_save"];
+    const WRITERS: &[&str] = &[
+        "file_edit", "multi_edit", "file_write", "file_move", "shell_run", "skill_save", "checkpoint",
+        "checkpoint_rewind",
+    ];
     WRITERS.iter().all(|w| r.get(w).is_none())
 }
 
@@ -642,7 +652,7 @@ mod tests {
             "http://localhost".into(),
             "k".into(),
             "m".into(),
-            false,
+            crate::core::approval::ApprovalMode::Ask,
             std::env::temp_dir(),
             depth,
             0,

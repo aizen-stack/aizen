@@ -2,3 +2,6 @@
 # scratch/debug programs left at the repo root (not part of the build)
 /test_*.rs
 *.exe
+
+# local code-review scratch (never ship)
+.codex-review/
