@@ -7,7 +7,13 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-07-20
+
 ### Added
+- **Harness persistence P0** — incomplete session todos now auto-poke the top-level loop before an
+  early text-only exit; confidence spikes at `Done` trigger one evidence re-check; quantifiable
+  optimization goals are reframed into metric → baseline → iterate loops. The deterministic loop
+  eval suite covers todo-poke, confidence-gate, and hill-climb behavior.
 - **Symbolic edit tools** — `symbol_replace` / `symbol_insert` rewrite or insert relative to a
   named symbol via the language-server outline range (Serena-style; no `old_string` thrash).
 - **`/workflows` multi-agent status** — process-global live registry of `task` / `workflow` /
@@ -25,6 +31,9 @@ development log lives in that monorepo's history.
   orchestration Track with the tool path; workflow children use task-like budgets (15/30 steps);
   synthesis truncates child summaries; sub-agents get LSP nav + coder symbolic edit; ultimate
   prompt prefers real `workflow` fan-out/verify.
+- **Sticky `/sessions` repair** — the conversation picker now suspends the sticky footer and parks
+  the background keyboard reader before dialoguer owns the terminal. Restore/save/delete and
+  confirmation no longer corrupt the footer or merge menu lines.
 
 ## [0.4.0] — 2026-07-19
 

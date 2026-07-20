@@ -342,6 +342,25 @@ pub struct AgentConfig {
     /// Per-request wall-clock cap (seconds) for an LSP query, so a hung server can never block the
     /// agent turn. Mirrors Helix's 20s default.
     pub lsp_request_timeout_secs: u64,
+    /// P0.1: when the model returns text-only while session todos still have pending/in_progress
+    /// items, inject a poke and continue (anti early-exit). Sub-agents leave this OFF — their plan
+    /// lives in ScopedTodo, not the process-global list. Default ON for the top-level loop.
+    pub enable_todo_poke: bool,
+    /// Max incomplete-todo pokes per run before Done is allowed anyway. `0` disables poking even
+    /// when `enable_todo_poke` is true.
+    pub max_todo_poke_attempts: usize,
+    /// P0.2: arm a one-shot re-check when a todo is marked done with a large confidence jump.
+    pub enable_confidence_gate: bool,
+    /// Confidence ≥ this (and a spike of `conf_spike_delta`) when marking done arms the gate.
+    pub conf_high: u8,
+    /// Minimum upward jump in confidence (at Done) that counts as a spike.
+    pub conf_spike_delta: u8,
+    /// P0.3: reframe + cadence nudges for quantifiable goals (optimize/perf/benchmark…).
+    pub enable_hill_climb: bool,
+    /// Self-reported `hill_climbable` below this on an open todo triggers a one-shot reframe.
+    pub hill_climb_gate: u8,
+    /// Re-nudge to re-measure every N iters while hill-climb mode is on. `0` = reframe only.
+    pub hill_climb_reminder_every: usize,
 }
 
 impl Default for AgentConfig {
@@ -371,6 +390,14 @@ impl Default for AgentConfig {
             enable_self_review: false,
             enable_lsp: true,
             lsp_request_timeout_secs: 20,
+            enable_todo_poke: true,
+            max_todo_poke_attempts: 2,
+            enable_confidence_gate: true,
+            conf_high: 90,
+            conf_spike_delta: 40,
+            enable_hill_climb: true,
+            hill_climb_gate: 90,
+            hill_climb_reminder_every: 6,
         }
     }
 }
@@ -569,6 +596,16 @@ where
     let mut last_compact: Option<(usize, usize)> = None;
     // Iter of the last todo-recitation reminder (0 = none yet).
     let mut last_todo_reminder = 0usize;
+    // P0.1: incomplete-todo pokes this run (cap = max_todo_poke_attempts).
+    let mut todo_poke_attempts = 0usize;
+    // P0.2: last confidence per todo content key; spike at Done arms a one-shot gate.
+    let mut conf_last: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+    let mut confidence_gate_armed = false;
+    let mut confidence_gate_cleared = false;
+    // P0.3: hill-climb mode + one-shot reframe + cadence.
+    let mut hill_climb_on = cfg.enable_hill_climb && task_looks_hill_climbable(messages);
+    let mut hill_climb_reframed = false;
+    let mut last_hill_climb_reminder = 0usize;
     let mut iter = 0usize;
 
     while iter < cap {
@@ -948,6 +985,77 @@ where
                 }
             }
 
+            // P0.1 INCOMPLETE-TODO GATE: text-only while session todos still open → poke, don't Done.
+            // Empty list is a no-op (trivial tasks / model never used todos). Exhausted budget → Done.
+            // Sub-agents leave enable_todo_poke false (process-global list ≠ ScopedTodo).
+            if cfg.enable_todo_poke
+                && cfg.max_todo_poke_attempts > 0
+                && todo_poke_attempts < cfg.max_todo_poke_attempts
+            {
+                if let Some(summary) = todo::incomplete_summary(600) {
+                    todo_poke_attempts += 1;
+                    if !cfg.quiet {
+                        let line = format!(
+                            "→ todo-poke: incomplete (attempt {}/{})",
+                            todo_poke_attempts, cfg.max_todo_poke_attempts
+                        );
+                        if crate::ui::tui::active() {
+                            crate::ui::tui::emit_line(&line);
+                        } else {
+                            eprintln!("{line}");
+                        }
+                    }
+                    messages.push(Message {
+                        role: "assistant".to_string(),
+                        content: Some(turn.content.clone().unwrap_or_default()),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        images: Vec::new(),
+                        cache_control: None,
+                    });
+                    messages.push(Message::user(format!(
+                        "{TODO_POKE_PREFIX} Session todos are still incomplete — you may not finish yet.\n\n\
+                         Incomplete:\n{summary}\n\n\
+                         Either (a) finish the remaining items and verify, or (b) mark items done only \
+                         if genuinely complete, or (c) clear the todo list to abandon the plan — then stop.\n\
+                         Attempt {todo_poke_attempts}/{}.",
+                        cfg.max_todo_poke_attempts
+                    )));
+                    iter += 1;
+                    continue;
+                }
+            }
+
+            // P0.2 CONFIDENCE GATE: Done + large confidence jump → one-shot re-check turn.
+            if cfg.enable_confidence_gate && confidence_gate_armed && !confidence_gate_cleared {
+                confidence_gate_cleared = true;
+                if !cfg.quiet {
+                    let line = "→ confidence-gate: large jump at done — re-check once";
+                    if crate::ui::tui::active() {
+                        crate::ui::tui::emit_line(line);
+                    } else {
+                        eprintln!("{line}");
+                    }
+                }
+                messages.push(Message {
+                    role: "assistant".to_string(),
+                    content: Some(turn.content.clone().unwrap_or_default()),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    images: Vec::new(),
+                    cache_control: None,
+                });
+                messages.push(Message::user(format!(
+                    "{CONFIDENCE_GATE_PREFIX} You marked todo(s) done with a large confidence jump \
+                     without stepwise evidence.\n\n\
+                     Before finishing: re-run the relevant check (tests / verify / metric). \
+                     If checks pass, keep Done. If not, reopen the todo and fix.\n\
+                     This gate fires once per run."
+                )));
+                iter += 1;
+                continue;
+            }
+
             // Push the final assistant text so a multi-turn caller (REPL) keeps context.
             if let Some(t) = &turn.content {
                 if !t.trim().is_empty() {
@@ -1114,6 +1222,55 @@ where
                  file_write to create or fully overwrite a file (never blank a file with shell), \
                  verify the real state, or explain what is blocking you.",
             );
+        }
+
+        // P0.2 / P0.3: after tools run, sample process-global todos for confidence spikes and
+        // low hill_climbable self-scores. Only the top-level list is visible here (ScopedTodo is
+        // private to sub-agents — their poke/gates stay off via config).
+        if calls.iter().any(|c| c.function.name == "todo_write") {
+            update_confidence_tracking(
+                &todo::snapshot(),
+                &mut conf_last,
+                &mut confidence_gate_armed,
+                cfg.conf_high,
+                cfg.conf_spike_delta,
+            );
+            if cfg.enable_hill_climb {
+                if todo::snapshot().iter().any(|t| {
+                    t.status != todo::Status::Done
+                        && t.hill_climbable.is_some_and(|h| h < cfg.hill_climb_gate)
+                }) {
+                    hill_climb_on = true;
+                }
+            }
+        }
+
+        // P0.3 hill-climb: one-shot reframe + optional cadence remeasure (system nudges).
+        if hill_climb_on {
+            if !hill_climb_reframed {
+                hill_climb_reframed = true;
+                last_hill_climb_reminder = iter;
+                push_nudge(
+                    messages,
+                    NUDGE_HILL_CLIMB,
+                    "[hill-climb] This goal looks quantifiable. Before more edits, state:\n\
+                     1) metric (e.g. ns/op, pass count, binary KB),\n\
+                     2) baseline measurement command,\n\
+                     3) target direction (higher/lower).\n\
+                     Then iterate: measure → change → measure. Stop when plateau or budget.",
+                );
+            } else if cfg.hill_climb_reminder_every > 0
+                && iter.saturating_sub(last_hill_climb_reminder) >= cfg.hill_climb_reminder_every
+                && todo::has_incomplete()
+            {
+                last_hill_climb_reminder = iter;
+                push_nudge(
+                    messages,
+                    NUDGE_HILL_CLIMB,
+                    "[hill-climb] Re-measure the metric before claiming progress. No metric delta → \
+                     try a different approach or stop.",
+                );
+            }
         }
 
         iter += 1;
@@ -2140,6 +2297,67 @@ fn clearing_due(pct: usize, iter: usize, last: Option<(usize, usize)>, step_pct:
     }
 }
 
+/// P0.2: track per-todo confidence; arm the gate on a Done status with a large upward jump.
+fn update_confidence_tracking(
+    items: &[todo::Todo],
+    conf_last: &mut std::collections::HashMap<String, u8>,
+    confidence_gate_armed: &mut bool,
+    conf_high: u8,
+    conf_spike_delta: u8,
+) {
+    for t in items {
+        let Some(c) = t.confidence else {
+            continue;
+        };
+        let key = t.content.clone();
+        if t.status == todo::Status::Done {
+            if let Some(&prev) = conf_last.get(&key) {
+                if c >= conf_high && c.saturating_sub(prev) >= conf_spike_delta {
+                    *confidence_gate_armed = true;
+                }
+            }
+        }
+        conf_last.insert(key, c);
+    }
+}
+
+/// P0.3: user/task text looks like a quantifiable optimization goal.
+fn task_looks_hill_climbable(messages: &[Message]) -> bool {
+    // Scan recent user messages (skip system). Keywords are word-ish substrings, lowercase.
+    const KEYS: &[&str] = &[
+        "optimize",
+        "optimise",
+        "benchmark",
+        "perf",
+        "latency",
+        "throughput",
+        "minimize",
+        "minimise",
+        "maximize",
+        "maximise",
+        "hill-climb",
+        "hill climb",
+        "faster",
+        "speed up",
+        "fewer allocations",
+        "reduce memory",
+        "smaller binary",
+    ];
+    for m in messages.iter().rev().take(6) {
+        if m.role != "user" {
+            continue;
+        }
+        let Some(text) = m.content.as_deref() else {
+            continue;
+        };
+        let lower = text.to_ascii_lowercase();
+        if KEYS.iter().any(|k| lower.contains(k)) {
+            return true;
+        }
+    }
+    false
+}
+
 // ── self-review (opt-in, one extra turn before Done) ────────────────────────────────────────────
 
 /// Nudge-mode self-review text (no oracle configured): the model re-reads its own diff.
@@ -2236,6 +2454,12 @@ const NUDGE_DIVERGENCE: &str = "You repeated the same tool call(s)";
 const NUDGE_STEP_LIMIT: &str = "You are nearing the step limit";
 const NUDGE_TODO: &str = "Current task list";
 const NUDGE_STUCK: &str = "Several turns in a row made no progress";
+/// P0.1 incomplete-todo gate inject (user role — hard block path, not a soft system nudge).
+const TODO_POKE_PREFIX: &str = "[todo-poke]";
+/// P0.2 confidence-spike gate inject.
+const CONFIDENCE_GATE_PREFIX: &str = "[confidence-gate]";
+/// P0.3 hill-climb reframe / remeasure (system nudge via push_nudge).
+const NUDGE_HILL_CLIMB: &str = "[hill-climb]";
 /// Save-before-clear warning (P-ctx2). Mirrors Claude's server-side "preserve important information"
 /// warning: fired ONCE, the turn BEFORE the first tool-result eviction, so the model can persist
 /// anything durable (memory files, todo_write) while the old results are still in context.
@@ -2914,6 +3138,16 @@ mod tests {
             enable_self_review: false,
             enable_lsp: false,
             lsp_request_timeout_secs: 20,
+            // P0 harness OFF in unit tests unless a test arms them (process-global todos + no
+            // accidental early-exit blocks on unrelated scripts).
+            enable_todo_poke: false,
+            max_todo_poke_attempts: 2,
+            enable_confidence_gate: false,
+            conf_high: 90,
+            conf_spike_delta: 40,
+            enable_hill_climb: false,
+            hill_climb_gate: 90,
+            hill_climb_reminder_every: 6,
         }
     }
 
@@ -3175,7 +3409,15 @@ mod tests {
     #[tokio::test]
     async fn auto_extend_grants_more_room() {
         let r = registry();
-        let c = AgentConfig { max_iters: 2, auto_extend_to: 4, quiet: true, ..Default::default() };
+        let c = AgentConfig {
+            max_iters: 2,
+            auto_extend_to: 4,
+            quiet: true,
+            enable_todo_poke: false,
+            enable_confidence_gate: false,
+            enable_hill_climb: false,
+            ..Default::default()
+        };
         // 3 distinct tool turns then finish: would hit max_iters=2, but auto-extend to 4 lets it finish.
         let turns = vec![
             tool_turn("echo", r#"{"text":"1"}"#),
@@ -3532,7 +3774,16 @@ mod tests {
     #[tokio::test]
     async fn context_guard_warns_once_when_window_nearly_full() {
         let r = registry();
-        let c = AgentConfig { max_iters: 5, auto_extend_to: 5, quiet: true, context_window: 100, ..Default::default() };
+        let c = AgentConfig {
+            max_iters: 5,
+            auto_extend_to: 5,
+            quiet: true,
+            context_window: 100,
+            enable_todo_poke: false,
+            enable_confidence_gate: false,
+            enable_hill_climb: false,
+            ..Default::default()
+        };
         // Prime an oversized history: ~600 chars ≈ 150 tok, well past 90% of the 100-tok window.
         let mut messages = vec![Message::system("sys"), Message::user("x".repeat(600))];
         // Two tool turns then finish — the guard must fire ONCE, not on every iteration.
@@ -3554,7 +3805,15 @@ mod tests {
     async fn context_guard_disabled_when_window_zero() {
         let r = registry();
         // context_window defaults to 0 → guard off even with a huge history.
-        let c = AgentConfig { max_iters: 5, auto_extend_to: 5, quiet: true, ..Default::default() };
+        let c = AgentConfig {
+            max_iters: 5,
+            auto_extend_to: 5,
+            quiet: true,
+            enable_todo_poke: false,
+            enable_confidence_gate: false,
+            enable_hill_climb: false,
+            ..Default::default()
+        };
         let mut messages = vec![Message::system("sys"), Message::user("x".repeat(5000))];
         let chat = scripted(vec![tool_turn("echo", r#"{"text":"a"}"#), final_turn("done")]);
         run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
@@ -3571,7 +3830,13 @@ mod tests {
         let r = registry();
         let mk = |pct: u8| AgentConfig {
             max_iters: 5, auto_extend_to: 5, quiet: true, context_window: 100,
-            context_guard_pct: pct, clear_at_pct: 0, compact_at_pct: 0, ..Default::default()
+            context_guard_pct: pct,
+            clear_at_pct: 0,
+            compact_at_pct: 0,
+            enable_todo_poke: false,
+            enable_confidence_gate: false,
+            enable_hill_climb: false,
+            ..Default::default()
         };
         // ~260 chars ≈ 65 tok → past 50% but under 90% of the 100-tok window.
         let hist = || vec![Message::system("sys"), Message::user("x".repeat(260))];
@@ -3688,7 +3953,16 @@ mod tests {
     #[tokio::test]
     async fn real_usage_anchor_triggers_wrapup_before_estimate_would() {
         let r = registry();
-        let c = AgentConfig { max_iters: 5, auto_extend_to: 5, quiet: true, context_window: 1000, ..Default::default() };
+        let c = AgentConfig {
+            max_iters: 5,
+            auto_extend_to: 5,
+            quiet: true,
+            context_window: 1000,
+            enable_todo_poke: false,
+            enable_confidence_gate: false,
+            enable_hill_climb: false,
+            ..Default::default()
+        };
         // ~1200 chars ≈ 300 tok estimated — far under 90% of the 1000-tok window on its own.
         let mut messages = vec![Message::system("sys"), Message::user("x".repeat(1200))];
         // …but the provider reports the request REALLY was 950 prompt tokens (code-heavy tokenization).
@@ -4454,9 +4728,9 @@ mod tests {
     async fn todo_recitation_fires_replaces_and_respects_cadence() {
         let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         todo::set(vec![
-            todo::Todo { content: "map the module".into(), status: todo::Status::Done },
-            todo::Todo { content: "fix the parser".into(), status: todo::Status::InProgress },
-            todo::Todo { content: "run the tests".into(), status: todo::Status::Pending },
+            todo::Todo::new("map the module", todo::Status::Done),
+            todo::Todo::new("fix the parser", todo::Status::InProgress),
+            todo::Todo::new("run the tests", todo::Status::Pending),
         ]);
         let r = registry();
         let c = AgentConfig { todo_reminder_every: 2, ..cfg() };
@@ -4496,6 +4770,294 @@ mod tests {
             !messages2.iter().any(|m| m.content.as_deref().is_some_and(|c| c.starts_with(NUDGE_TODO))),
             "no todos → no recitation"
         );
+    }
+
+    #[tokio::test]
+    async fn todo_poke_blocks_done_with_pending() {
+        let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        todo::set(vec![
+            todo::Todo::new("done-bit", todo::Status::Done),
+            todo::Todo::new("still-open", todo::Status::Pending),
+        ]);
+        let r = registry();
+        let c = AgentConfig {
+            enable_todo_poke: true,
+            max_todo_poke_attempts: 2,
+            max_iters: 6,
+            auto_extend_to: 6,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("multi-step")];
+        // First text-only → poke; second text-only after model "finishes" todos in real life would
+        // pass — here we clear between by scripting a tool that doesn't clear; instead second
+        // final still incomplete → second poke; third final with list still open but budget=2 → Done.
+        let chat = scripted(vec![
+            final_turn("done early"),
+            final_turn("still done"),
+            final_turn("forced done"),
+        ]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        let pokes = messages
+            .iter()
+            .filter(|m| m.role == "user" && m.content.as_deref().is_some_and(|c| c.starts_with(TODO_POKE_PREFIX)))
+            .count();
+        assert_eq!(pokes, 2, "exactly max_todo_poke_attempts pokes, then Done: {pokes}");
+        assert!(
+            messages.iter().any(|m| {
+                m.role == "user"
+                    && m.content.as_deref().is_some_and(|c| c.contains("[ ] still-open"))
+            }),
+            "poke lists the open item"
+        );
+        todo::clear();
+    }
+
+    #[tokio::test]
+    async fn todo_poke_allows_done_when_all_done() {
+        let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        todo::set(vec![todo::Todo::new("only", todo::Status::Done)]);
+        let r = registry();
+        let c = AgentConfig {
+            enable_todo_poke: true,
+            max_todo_poke_attempts: 2,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let out = run_agent_loop(scripted(vec![final_turn("all good")]), &c, &r, &mut messages)
+            .await
+            .unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.iters, 1);
+        assert!(
+            !messages.iter().any(|m| m.content.as_deref().is_some_and(|c| c.starts_with(TODO_POKE_PREFIX))),
+            "no poke when all todos done"
+        );
+        todo::clear();
+    }
+
+    #[tokio::test]
+    async fn todo_poke_disabled_or_empty_list() {
+        let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Pending todos but poke OFF → Done immediately.
+        todo::set(vec![todo::Todo::new("open", todo::Status::Pending)]);
+        let r = registry();
+        let c = AgentConfig {
+            enable_todo_poke: false,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let out = run_agent_loop(scripted(vec![final_turn("bye")]), &c, &r, &mut messages)
+            .await
+            .unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.iters, 1);
+
+        // Empty list + poke ON → Done.
+        todo::clear();
+        let c2 = AgentConfig {
+            enable_todo_poke: true,
+            max_todo_poke_attempts: 2,
+            ..cfg()
+        };
+        let mut messages2 = vec![Message::system("sys"), Message::user("task")];
+        let out2 = run_agent_loop(scripted(vec![final_turn("bye")]), &c2, &r, &mut messages2)
+            .await
+            .unwrap();
+        assert_eq!(out2.stop, StopReason::Done);
+        assert!(
+            !messages2.iter().any(|m| m.content.as_deref().is_some_and(|c| c.starts_with(TODO_POKE_PREFIX)))
+        );
+    }
+
+    #[tokio::test]
+    async fn confidence_spike_arms_one_shot_gate() {
+        let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        todo::clear();
+        let mut r = registry();
+        r.register(Box::new(todo::TodoWrite));
+        let c = AgentConfig {
+            enable_todo_poke: false, // isolate confidence gate
+            enable_confidence_gate: true,
+            conf_high: 90,
+            conf_spike_delta: 40,
+            max_iters: 8,
+            auto_extend_to: 8,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let chat = scripted(vec![
+            tool_turn(
+                "todo_write",
+                r#"{"todos":[{"content":"ship it","status":"in_progress","confidence":40}]}"#,
+            ),
+            tool_turn(
+                "todo_write",
+                r#"{"todos":[{"content":"ship it","status":"done","confidence":100}]}"#,
+            ),
+            final_turn("done"),
+            final_turn("done after recheck"),
+        ]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        let gates = messages
+            .iter()
+            .filter(|m| {
+                m.role == "user" && m.content.as_deref().is_some_and(|c| c.starts_with(CONFIDENCE_GATE_PREFIX))
+            })
+            .count();
+        assert_eq!(gates, 1, "confidence gate fires exactly once");
+        todo::clear();
+    }
+
+    #[tokio::test]
+    async fn confidence_stepwise_or_omitted_no_gate() {
+        let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        todo::clear();
+        let mut r = registry();
+        r.register(Box::new(todo::TodoWrite));
+        let c = AgentConfig {
+            enable_todo_poke: false,
+            enable_confidence_gate: true,
+            conf_high: 90,
+            conf_spike_delta: 40,
+            max_iters: 8,
+            auto_extend_to: 8,
+            ..cfg()
+        };
+        // Stepwise 40→70→95: no single jump ≥40 into ≥90 from prev.
+        // Actually 70→95 is +25 < 40; 40→70 is +30. No gate.
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let chat = scripted(vec![
+            tool_turn(
+                "todo_write",
+                r#"{"todos":[{"content":"ship","status":"in_progress","confidence":40}]}"#,
+            ),
+            tool_turn(
+                "todo_write",
+                r#"{"todos":[{"content":"ship","status":"in_progress","confidence":70}]}"#,
+            ),
+            tool_turn(
+                "todo_write",
+                r#"{"todos":[{"content":"ship","status":"done","confidence":95}]}"#,
+            ),
+            final_turn("done"),
+        ]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert!(
+            !messages.iter().any(|m| {
+                m.role == "user" && m.content.as_deref().is_some_and(|c| c.starts_with(CONFIDENCE_GATE_PREFIX))
+            }),
+            "stepwise rises must not arm the gate"
+        );
+
+        // Omitted confidence → no gate.
+        todo::clear();
+        let mut messages2 = vec![Message::system("sys"), Message::user("task")];
+        let chat2 = scripted(vec![
+            tool_turn(
+                "todo_write",
+                r#"{"todos":[{"content":"x","status":"done"}]}"#,
+            ),
+            final_turn("done"),
+        ]);
+        run_agent_loop(chat2, &c, &r, &mut messages2).await.unwrap();
+        assert!(
+            !messages2.iter().any(|m| {
+                m.role == "user" && m.content.as_deref().is_some_and(|c| c.starts_with(CONFIDENCE_GATE_PREFIX))
+            })
+        );
+        todo::clear();
+    }
+
+    #[tokio::test]
+    async fn hill_climb_keyword_reframe() {
+        let r = registry();
+        let c = AgentConfig {
+            enable_hill_climb: true,
+            hill_climb_reminder_every: 0, // reframe only
+            max_iters: 6,
+            auto_extend_to: 6,
+            ..cfg()
+        };
+        let mut messages = vec![
+            Message::system("sys"),
+            Message::user("please optimize the float-print hot path"),
+        ];
+        let chat = scripted(vec![
+            tool_turn("echo", r#"{"text":"measure baseline"}"#),
+            final_turn("improved"),
+        ]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert!(
+            messages.iter().any(|m| {
+                m.role == "system" && m.content.as_deref().is_some_and(|c| c.starts_with(NUDGE_HILL_CLIMB))
+            }),
+            "hill-climb reframe must inject after first tool turn"
+        );
+    }
+
+    #[test]
+    fn task_looks_hill_climbable_keywords() {
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("please optimize latency in the parser"),
+        ];
+        assert!(task_looks_hill_climbable(&msgs));
+        let msgs2 = vec![Message::system("sys"), Message::user("rename the helper")];
+        assert!(!task_looks_hill_climbable(&msgs2));
+    }
+
+    #[test]
+    fn update_confidence_tracking_spike_and_stepwise() {
+        let mut map = std::collections::HashMap::new();
+        let mut armed = false;
+        let items1 = vec![todo::Todo {
+            content: "t".into(),
+            status: todo::Status::InProgress,
+            confidence: Some(40),
+            hill_climbable: None,
+        }];
+        update_confidence_tracking(&items1, &mut map, &mut armed, 90, 40);
+        assert!(!armed);
+        let items2 = vec![todo::Todo {
+            content: "t".into(),
+            status: todo::Status::Done,
+            confidence: Some(100),
+            hill_climbable: None,
+        }];
+        update_confidence_tracking(&items2, &mut map, &mut armed, 90, 40);
+        assert!(armed, "40→100 at Done must arm");
+
+        let mut map2 = std::collections::HashMap::new();
+        let mut armed2 = false;
+        update_confidence_tracking(
+            &[todo::Todo {
+                content: "t".into(),
+                status: todo::Status::InProgress,
+                confidence: Some(40),
+                hill_climbable: None,
+            }],
+            &mut map2,
+            &mut armed2,
+            90,
+            40,
+        );
+        update_confidence_tracking(
+            &[todo::Todo {
+                content: "t".into(),
+                status: todo::Status::Done,
+                confidence: Some(70),
+                hill_climbable: None,
+            }],
+            &mut map2,
+            &mut armed2,
+            90,
+            40,
+        );
+        assert!(!armed2, "70 < conf_high → no arm");
     }
 
     #[test]

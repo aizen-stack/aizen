@@ -506,6 +506,10 @@ async fn run_one_task(
         auto_checkpoint: is_writer,
         checkpoint_each_edit: false,
         todo_reminder_every: 0,
+        // P0: workflow children use ScopedTodo; keep process-global poke/gates off.
+        enable_todo_poke: false,
+        enable_confidence_gate: false,
+        enable_hill_climb: false,
         // Sub-agents leave context_window 0 (no tool-result clearing) — workflow children are short.
         // enable_lsp default true is fine; tools only appear if registered in the sub-agent registry.
         ..AgentConfig::default()

@@ -5128,6 +5128,7 @@ fn slash_is_interactive(name: &str) -> bool {
             | "telegram"
             | "tg"
             | "serve"
+            | "sessions"
             | "memory"
             | "mem"
             | "timeline"

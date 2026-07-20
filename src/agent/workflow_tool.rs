@@ -18,8 +18,10 @@
 
 use crate::agent::tools::Tool;
 use crate::agent::workflow::{
-    enforce_singular_writer, run_workflow_collect, task_is_writer, Synthesis, WorkflowSpec, WorkflowTask,
+    enforce_singular_writer, run_workflow_collect, Synthesis, WorkflowSpec, WorkflowTask,
 };
+#[cfg(test)]
+use crate::agent::workflow::task_is_writer;
 use anyhow::{bail, Result};
 use serde_json::Value;
 

@@ -427,6 +427,11 @@ impl Tool for TaskTool {
             // no handle to). Leaving this on would recite the PARENT's plan into a sub-agent's
             // context, which is both wrong and a context leak. Off here, same as the test cfg().
             todo_reminder_every: 0,
+            // P0: sub-agent plan is ScopedTodo, not process-global — poke/confidence/hill-climb on
+            // the global list would mis-fire against the parent's todos.
+            enable_todo_poke: false,
+            enable_confidence_gate: false,
+            enable_hill_climb: false,
             ..AgentConfig::default()
         };
 

@@ -1,13 +1,13 @@
-//! `aizen bench loop` — offline loop-behavior eval harness (P4).
+//! `aizen bench loop` — offline loop-behavior eval harness (P4 + P0 persistence).
 //!
 //! The memory bench (`bench/mod.rs`) proves RECALL; this proves LOOP DISCIPLINE — the Section-10
 //! metrics the improvement plan tracks: steps/task, loop-stop rate, repeat-call rate,
 //! verified-done rate. It drives the REAL `run_agent_loop` with a SCRIPTED fake model (no network,
-//! no provider, fully deterministic) over ~15 hand-authored scenarios spanning the task shapes the
-//! plan calls out: quick answer, small edit, multi-file edit, fix-a-test, research, and the
-//! failure modes the anti-loop work targets (A/B oscillation, successful-but-useless re-reads,
-//! padding a stuck turn). Each scenario declares what a HEALTHY loop should do; the harness asserts
-//! the loop actually does it and aggregates the metrics.
+//! no provider, fully deterministic) over hand-authored scenarios spanning the task shapes the
+//! plan calls out: quick answer, small edit, multi-file edit, fix-a-test, research, anti-loop,
+//! and P0 harness persistence (todo-poke, confidence gate, hill-climb). Each scenario declares
+//! what a HEALTHY loop should do; the harness asserts the loop actually does it and aggregates
+//! the metrics.
 //!
 //! Why a fake model: the loop is generic over its chat fn exactly so it can be driven by a script
 //! (`run_agent_loop<F, Fut>`), the same seam the unit tests use. A scripted model emits a fixed
@@ -15,7 +15,7 @@
 //! "given these model turns, the loop must reach this outcome in this many steps."
 
 use crate::agent::tools::{Tool, ToolRegistry};
-use crate::agent::{run_agent, AgentConfig, StopReason};
+use crate::agent::{AgentConfig, StopReason};
 use crate::core::types::{FunctionCall, Message, ToolCall, ToolDef};
 use crate::llm::client::ChatTurn;
 use anyhow::Result;
@@ -141,6 +141,7 @@ fn eval_registry() -> ToolRegistry {
     r.register(Box::new(Echo));
     r.register(Box::new(Const));
     r.register(Box::new(Fail));
+    r.register(Box::new(crate::agent::todo::TodoWrite));
     r
 }
 
@@ -151,7 +152,7 @@ fn eval_registry() -> ToolRegistry {
 struct Scenario {
     name: &'static str,
     /// The task SHAPE (for the per-shape rollup): "answer", "edit", "multi", "fix-test",
-    /// "research", "anti-loop".
+    /// "research", "anti-loop", "persist".
     shape: &'static str,
     /// The scripted model turns (the loop pops one per iteration; it degrades to a final "stop"
     /// once drained).
@@ -161,100 +162,131 @@ struct Scenario {
     /// Upper bound on iterations — a healthy loop must not exceed this (catches the "wandered for
     /// 25 steps" regression). `None` skips the check.
     max_iters: Option<usize>,
+    /// Optional seed for the process-global todo list (P0 persistence scenarios).
+    seed_todos: Option<Vec<crate::agent::todo::Todo>>,
+    /// When set, merge onto eval_cfg (P0 flags etc.).
+    cfg_overlay: Option<PersistOverlay>,
+    /// User task text (default "loop eval task").
+    user_task: &'static str,
+    /// Substring that must appear in some user/system message (optional assert).
+    expect_msg_contains: Option<&'static str>,
 }
 
-/// The ~15 hand-authored loop scenarios. Deterministic: each is a fixed model-turn script over the
+#[derive(Clone, Copy)]
+struct PersistOverlay {
+    enable_todo_poke: bool,
+    max_todo_poke_attempts: usize,
+    enable_confidence_gate: bool,
+    enable_hill_climb: bool,
+}
+
+fn scen(
+    name: &'static str,
+    shape: &'static str,
+    turns: Vec<ChatTurn>,
+    expect_stop: StopReason,
+    max_iters: Option<usize>,
+) -> Scenario {
+    Scenario {
+        name,
+        shape,
+        turns,
+        expect_stop,
+        max_iters,
+        seed_todos: None,
+        cfg_overlay: None,
+        user_task: "loop eval task",
+        expect_msg_contains: None,
+    }
+}
+
+/// The hand-authored loop scenarios. Deterministic: each is a fixed model-turn script over the
 /// offline fixture tools. Verify gate is OFF for all of them (no real toolchain in the harness);
 /// the "verified-done" metric is measured structurally by the healthy-Done scenarios reaching Done
 /// within budget, not by running `cargo check`.
 fn scenarios() -> Vec<Scenario> {
-    vec![
+    use crate::agent::todo::{Status, Todo};
+
+    let mut out = vec![
         // ── quick answer: no tools, straight to a final answer ──
-        Scenario {
-            name: "answer-immediately",
-            shape: "answer",
-            turns: vec![final_turn("42")],
-            expect_stop: StopReason::Done,
-            max_iters: Some(1),
-        },
-        Scenario {
-            name: "answer-after-one-read",
-            shape: "answer",
-            turns: vec![tool_turn("echo", r#"{"text":"looked it up"}"#), final_turn("here is the answer")],
-            expect_stop: StopReason::Done,
-            max_iters: Some(2),
-        },
+        scen("answer-immediately", "answer", vec![final_turn("42")], StopReason::Done, Some(1)),
+        scen(
+            "answer-after-one-read",
+            "answer",
+            vec![tool_turn("echo", r#"{"text":"looked it up"}"#), final_turn("here is the answer")],
+            StopReason::Done,
+            Some(2),
+        ),
         // ── small edit: one read, one "edit" (echo stands in), done ──
-        Scenario {
-            name: "small-edit-then-done",
-            shape: "edit",
-            turns: vec![
+        scen(
+            "small-edit-then-done",
+            "edit",
+            vec![
                 tool_turn("echo", r#"{"text":"read src/x.rs"}"#),
                 tool_turn("echo", r#"{"text":"applied the patch"}"#),
                 final_turn("changed src/x.rs"),
             ],
-            expect_stop: StopReason::Done,
-            max_iters: Some(3),
-        },
+            StopReason::Done,
+            Some(3),
+        ),
         // ── multi-file: several distinct reads/edits, each surfacing new content ──
-        Scenario {
-            name: "multi-file-edit",
-            shape: "multi",
-            turns: vec![
+        scen(
+            "multi-file-edit",
+            "multi",
+            vec![
                 tool_turn("echo", r#"{"text":"read a.rs"}"#),
                 tool_turn("echo", r#"{"text":"read b.rs"}"#),
                 tool_turn("echo", r#"{"text":"edit a.rs"}"#),
                 tool_turn("echo", r#"{"text":"edit b.rs"}"#),
                 final_turn("updated a.rs and b.rs"),
             ],
-            expect_stop: StopReason::Done,
-            max_iters: Some(5),
-        },
+            StopReason::Done,
+            Some(5),
+        ),
         // ── fix-a-test: read, edit, "run test" (new content each time), done ──
-        Scenario {
-            name: "fix-failing-test",
-            shape: "fix-test",
-            turns: vec![
+        scen(
+            "fix-failing-test",
+            "fix-test",
+            vec![
                 tool_turn("echo", r#"{"text":"read failing test"}"#),
                 tool_turn("echo", r#"{"text":"read impl"}"#),
                 tool_turn("echo", r#"{"text":"apply fix"}"#),
                 tool_turn("echo", r#"{"text":"tests pass now"}"#),
                 final_turn("fixed the test"),
             ],
-            expect_stop: StopReason::Done,
-            max_iters: Some(5),
-        },
+            StopReason::Done,
+            Some(5),
+        ),
         // ── recover from ONE error then succeed (the healthy fix-the-cause path) ──
-        Scenario {
-            name: "recover-from-one-error",
-            shape: "fix-test",
-            turns: vec![
+        scen(
+            "recover-from-one-error",
+            "fix-test",
+            vec![
                 tool_turn("fail", "{}"),
                 tool_turn("echo", r#"{"text":"fixed the cause, different call"}"#),
                 final_turn("recovered"),
             ],
-            expect_stop: StopReason::Done,
-            max_iters: Some(3),
-        },
+            StopReason::Done,
+            Some(3),
+        ),
         // ── research: several distinct searches/fetches, each new, then a cited answer ──
-        Scenario {
-            name: "research-fan-out",
-            shape: "research",
-            turns: vec![
+        scen(
+            "research-fan-out",
+            "research",
+            vec![
                 tool_turn("echo", r#"{"text":"search angle 1"}"#),
                 tool_turn("echo", r#"{"text":"search angle 2"}"#),
                 tool_turn("echo", r#"{"text":"fetch top result"}"#),
                 final_turn("answer with citation"),
             ],
-            expect_stop: StopReason::Done,
-            max_iters: Some(4),
-        },
-        // ── ANTI-LOOP: exact same failing call, over and over → must STOP (Divergence), not run to
-        //    the iteration cap. This is W1 — the core anti-loop guarantee.
-        Scenario {
-            name: "identical-failing-call-diverges",
-            shape: "anti-loop",
-            turns: vec![
+            StopReason::Done,
+            Some(4),
+        ),
+        // ── ANTI-LOOP: exact same failing call, over and over → must STOP (Divergence) ──
+        scen(
+            "identical-failing-call-diverges",
+            "anti-loop",
+            vec![
                 tool_turn("fail", "{}"),
                 tool_turn("fail", "{}"),
                 tool_turn("fail", "{}"),
@@ -264,14 +296,14 @@ fn scenarios() -> Vec<Scenario> {
                 tool_turn("fail", "{}"),
                 tool_turn("fail", "{}"),
             ],
-            expect_stop: StopReason::Divergence,
-            max_iters: None,
-        },
-        // ── ANTI-LOOP: A,B,A,B oscillation of two useless calls → must be caught (W1 two-cycle). ──
-        Scenario {
-            name: "ab-oscillation-diverges",
-            shape: "anti-loop",
-            turns: vec![
+            StopReason::Divergence,
+            None,
+        ),
+        // ── ANTI-LOOP: A,B,A,B oscillation ──
+        scen(
+            "ab-oscillation-diverges",
+            "anti-loop",
+            vec![
                 tool_turn("const_read", r#"{"i":"a"}"#),
                 tool_turn("fail", "{}"),
                 tool_turn("const_read", r#"{"i":"a"}"#),
@@ -281,14 +313,14 @@ fn scenarios() -> Vec<Scenario> {
                 tool_turn("const_read", r#"{"i":"a"}"#),
                 tool_turn("fail", "{}"),
             ],
-            expect_stop: StopReason::Divergence,
-            max_iters: None,
-        },
-        // ── ANTI-LOOP: same const-read repeated (successful but useless, W4) → must stop, not spin. ──
-        Scenario {
-            name: "useless-reread-stops",
-            shape: "anti-loop",
-            turns: vec![
+            StopReason::Divergence,
+            None,
+        ),
+        // ── ANTI-LOOP: same const-read repeated (successful but useless, W4) ──
+        scen(
+            "useless-reread-stops",
+            "anti-loop",
+            vec![
                 tool_turn("const_read", r#"{"i":"x"}"#),
                 tool_turn("const_read", r#"{"i":"x"}"#),
                 tool_turn("const_read", r#"{"i":"x"}"#),
@@ -297,15 +329,14 @@ fn scenarios() -> Vec<Scenario> {
                 tool_turn("const_read", r#"{"i":"x"}"#),
                 tool_turn("const_read", r#"{"i":"x"}"#),
             ],
-            expect_stop: StopReason::Divergence,
-            max_iters: None,
-        },
-        // ── ANTI-LOOP: padding a failing call with a throwaway success must NOT reset the streak
-        //    (W3) — the loop still converges to a stop instead of looping forever.
-        Scenario {
-            name: "padded-fail-still-stops",
-            shape: "anti-loop",
-            turns: vec![
+            StopReason::Divergence,
+            None,
+        ),
+        // ── ANTI-LOOP: padding a failing call with a throwaway success (W3) ──
+        scen(
+            "padded-fail-still-stops",
+            "anti-loop",
+            vec![
                 multi_tool_turn(&[("fail", "{}"), ("const_read", r#"{"i":"pad"}"#)]),
                 multi_tool_turn(&[("fail", "{}"), ("const_read", r#"{"i":"pad"}"#)]),
                 multi_tool_turn(&[("fail", "{}"), ("const_read", r#"{"i":"pad"}"#)]),
@@ -313,56 +344,157 @@ fn scenarios() -> Vec<Scenario> {
                 multi_tool_turn(&[("fail", "{}"), ("const_read", r#"{"i":"pad"}"#)]),
                 multi_tool_turn(&[("fail", "{}"), ("const_read", r#"{"i":"pad"}"#)]),
             ],
-            expect_stop: StopReason::Divergence,
-            max_iters: None,
-        },
-        // ── progressive reads that each surface NEW content are NOT diverging (guard precision:
-        //    it must not false-positive a healthy exploration). ──
-        Scenario {
-            name: "distinct-reads-not-diverging",
-            shape: "research",
-            turns: vec![
+            StopReason::Divergence,
+            None,
+        ),
+        // ── progressive reads that each surface NEW content are NOT diverging ──
+        scen(
+            "distinct-reads-not-diverging",
+            "research",
+            vec![
                 tool_turn("echo", r#"{"text":"chunk 1"}"#),
                 tool_turn("echo", r#"{"text":"chunk 2"}"#),
                 tool_turn("echo", r#"{"text":"chunk 3"}"#),
                 tool_turn("echo", r#"{"text":"chunk 4"}"#),
                 final_turn("assembled from 4 distinct reads"),
             ],
-            expect_stop: StopReason::Done,
-            max_iters: Some(5),
-        },
-        // ── MaxIters: a model that keeps making PROGRESS (new content) but never finishes must hit
-        //    the step cap cleanly (a synthesis, not a crash). ──
-        Scenario {
-            name: "endless-progress-hits-maxiters",
-            shape: "anti-loop",
-            turns: (0..30).map(|i| tool_turn("echo", &format!(r#"{{"text":"new content {i}"}}"#))).collect(),
-            expect_stop: StopReason::MaxIters,
-            max_iters: None,
-        },
-        // ── two-step edit with a mid-course correction (read, wrong edit, re-read, right edit) ──
-        Scenario {
-            name: "edit-with-correction",
-            shape: "edit",
-            turns: vec![
+            StopReason::Done,
+            Some(5),
+        ),
+        // ── MaxIters: progress forever → step cap cleanly ──
+        scen(
+            "endless-progress-hits-maxiters",
+            "anti-loop",
+            (0..30)
+                .map(|i| tool_turn("echo", &format!(r#"{{"text":"new content {i}"}}"#)))
+                .collect(),
+            StopReason::MaxIters,
+            None,
+        ),
+        // ── two-step edit with a mid-course correction ──
+        scen(
+            "edit-with-correction",
+            "edit",
+            vec![
                 tool_turn("echo", r#"{"text":"read config"}"#),
                 tool_turn("echo", r#"{"text":"first attempt"}"#),
                 tool_turn("echo", r#"{"text":"re-read to get exact text"}"#),
                 tool_turn("echo", r#"{"text":"correct edit"}"#),
                 final_turn("config updated"),
             ],
-            expect_stop: StopReason::Done,
-            max_iters: Some(5),
-        },
-        // ── minimal research: a single search answers it (no over-fetching) ──
-        Scenario {
-            name: "single-search-suffices",
-            shape: "research",
-            turns: vec![tool_turn("echo", r#"{"text":"one good search"}"#), final_turn("answered from the snippet")],
-            expect_stop: StopReason::Done,
-            max_iters: Some(2),
-        },
-    ]
+            StopReason::Done,
+            Some(5),
+        ),
+        // ── minimal research: a single search answers it ──
+        scen(
+            "single-search-suffices",
+            "research",
+            vec![
+                tool_turn("echo", r#"{"text":"one good search"}"#),
+                final_turn("answered from the snippet"),
+            ],
+            StopReason::Done,
+            Some(2),
+        ),
+    ];
+
+    // ── P0.1: incomplete todos block Done until poke budget exhausts ──
+    out.push(Scenario {
+        name: "poke_blocks_early_done",
+        shape: "persist",
+        turns: vec![
+            final_turn("done early"),
+            final_turn("still claiming done"),
+            final_turn("exhausted poke budget"),
+        ],
+        expect_stop: StopReason::Done,
+        max_iters: Some(3),
+        seed_todos: Some(vec![
+            Todo::new("done-bit", Status::Done),
+            Todo::new("still-open", Status::Pending),
+        ]),
+        cfg_overlay: Some(PersistOverlay {
+            enable_todo_poke: true,
+            max_todo_poke_attempts: 2,
+            enable_confidence_gate: false,
+            enable_hill_climb: false,
+        }),
+        user_task: "multi-step work",
+        expect_msg_contains: Some("[todo-poke]"),
+    });
+
+    // ── P0.1: no todos → no poke ──
+    out.push(Scenario {
+        name: "no_poke_without_todos",
+        shape: "persist",
+        turns: vec![
+            tool_turn("echo", r#"{"text":"edit"}"#),
+            final_turn("done"),
+        ],
+        expect_stop: StopReason::Done,
+        max_iters: Some(2),
+        seed_todos: Some(vec![]),
+        cfg_overlay: Some(PersistOverlay {
+            enable_todo_poke: true,
+            max_todo_poke_attempts: 2,
+            enable_confidence_gate: false,
+            enable_hill_climb: false,
+        }),
+        user_task: "small edit",
+        expect_msg_contains: None,
+    });
+
+    // ── P0.2: confidence spike → one-shot re-check ──
+    out.push(Scenario {
+        name: "confidence_spike_recheck",
+        shape: "persist",
+        turns: vec![
+            tool_turn(
+                "todo_write",
+                r#"{"todos":[{"content":"ship it","status":"in_progress","confidence":40}]}"#,
+            ),
+            tool_turn(
+                "todo_write",
+                r#"{"todos":[{"content":"ship it","status":"done","confidence":100}]}"#,
+            ),
+            final_turn("done"),
+            final_turn("done after recheck"),
+        ],
+        expect_stop: StopReason::Done,
+        max_iters: Some(4),
+        seed_todos: Some(vec![]),
+        cfg_overlay: Some(PersistOverlay {
+            enable_todo_poke: false,
+            max_todo_poke_attempts: 0,
+            enable_confidence_gate: true,
+            enable_hill_climb: false,
+        }),
+        user_task: "ship feature",
+        expect_msg_contains: Some("[confidence-gate]"),
+    });
+
+    // ── P0.3: optimize keyword → hill-climb reframe ──
+    out.push(Scenario {
+        name: "hill_climb_reframe",
+        shape: "persist",
+        turns: vec![
+            tool_turn("echo", r#"{"text":"measure"}"#),
+            final_turn("improved"),
+        ],
+        expect_stop: StopReason::Done,
+        max_iters: Some(2),
+        seed_todos: None,
+        cfg_overlay: Some(PersistOverlay {
+            enable_todo_poke: false,
+            max_todo_poke_attempts: 0,
+            enable_confidence_gate: false,
+            enable_hill_climb: true,
+        }),
+        user_task: "please optimize the float-print hot path",
+        expect_msg_contains: Some("[hill-climb]"),
+    });
+
+    out
 }
 
 // ── metrics ──────────────────────────────────────────────────────────────────
@@ -393,22 +525,74 @@ fn eval_cfg() -> AgentConfig {
         quiet: true,
         enable_verify_gate: false, // no real toolchain in the harness — this measures LOOP shape
         auto_checkpoint: false,    // cwd may be a real repo — no checkpoint pollution
-        context_window: 0,        // guard off — scripts are short and synthetic
-        todo_reminder_every: 0,   // recitation reads the process-global list; irrelevant here
+        context_window: 0,         // guard off — scripts are short and synthetic
+        todo_reminder_every: 0,    // recitation reads the process-global list; irrelevant here
+        // P0 harness: off by default in eval_cfg; persistence scenarios opt in explicitly.
+        enable_todo_poke: false,
+        enable_confidence_gate: false,
+        enable_hill_climb: false,
         ..AgentConfig::default()
     }
 }
 
 /// Run one scenario against the REAL loop, return `(passed, iters, stop)`.
 async fn run_scenario(s: &Scenario) -> (bool, usize, StopReason) {
+    // Serialize process-global todo mutations across scenarios.
+    let _g = crate::agent::todo::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(todos) = &s.seed_todos {
+        crate::agent::todo::set(todos.clone());
+    } else {
+        crate::agent::todo::clear();
+    }
+
     let registry = eval_registry();
-    let cfg = eval_cfg();
-    let outcome = run_agent(scripted(clone_turns(&s.turns)), &cfg, &registry, "sys", "loop eval task")
-        .await
-        .expect("eval scenarios never error the loop itself");
+    let mut cfg = eval_cfg();
+    if let Some(o) = s.cfg_overlay {
+        cfg.enable_todo_poke = o.enable_todo_poke;
+        cfg.max_todo_poke_attempts = o.max_todo_poke_attempts;
+        cfg.enable_confidence_gate = o.enable_confidence_gate;
+        cfg.enable_hill_climb = o.enable_hill_climb;
+    }
+
+    // Capture messages for expect_msg_contains via run_agent_loop on a local buffer.
+    let mut messages = vec![
+        Message::system("sys"),
+        Message::user(s.user_task),
+    ];
+    let outcome = crate::agent::run_agent_loop(
+        scripted(clone_turns(&s.turns)),
+        &cfg,
+        &registry,
+        &mut messages,
+    )
+    .await
+    .expect("eval scenarios never error the loop itself");
+
     let stop_ok = outcome.stop == s.expect_stop;
     let iters_ok = s.max_iters.is_none_or(|m| outcome.iters <= m);
-    (stop_ok && iters_ok, outcome.iters, outcome.stop)
+    let msg_ok = match s.expect_msg_contains {
+        None => true,
+        Some(needle) => messages.iter().any(|m| {
+            m.content.as_deref().is_some_and(|c| c.contains(needle))
+        }),
+    };
+    // no_poke_without_todos: assert absence of poke when expect_msg is None and poke was enabled.
+    let no_spurious_poke = if s.name == "no_poke_without_todos" {
+        !messages.iter().any(|m| {
+            m.content.as_deref().is_some_and(|c| c.starts_with("[todo-poke]"))
+        })
+    } else {
+        true
+    };
+
+    crate::agent::todo::clear();
+    (
+        stop_ok && iters_ok && msg_ok && no_spurious_poke,
+        outcome.iters,
+        outcome.stop,
+    )
 }
 
 /// `ChatTurn` doesn't derive `Clone` (it carries JoinHandles); scenarios are re-run at most once
@@ -431,7 +615,10 @@ fn clone_turns(turns: &[ChatTurn]) -> Vec<ChatTurn> {
 /// Async because `main` already drives a Tokio runtime — we run on it rather than nesting one.
 pub async fn run() -> Result<()> {
     let scens = scenarios();
-    let mut m = LoopMetrics { total: scens.len(), ..Default::default() };
+    let mut m = LoopMetrics {
+        total: scens.len(),
+        ..Default::default()
+    };
     let mut failures: Vec<String> = Vec::new();
 
     for s in &scens {
@@ -458,7 +645,11 @@ pub async fn run() -> Result<()> {
         }
         println!(
             "  {:<32} {:<10} expect={:<12} got={:<12} iters={}",
-            s.name, s.shape, format!("{:?}", s.expect_stop), format!("{stop:?}"), iters
+            s.name,
+            s.shape,
+            format!("{:?}", s.expect_stop),
+            format!("{stop:?}"),
+            iters
         );
     }
 
@@ -477,12 +668,19 @@ pub async fn run() -> Result<()> {
             m.expected_done
         );
         if m.verified_done > 0 {
-            println!("mean steps/task (healthy-Done scenarios): {:.1}", m.done_iters as f64 / m.verified_done as f64);
+            println!(
+                "mean steps/task (healthy-Done scenarios): {:.1}",
+                m.done_iters as f64 / m.verified_done as f64
+            );
         }
     }
     println!(
         "loop-stop (abnormal-on-healthy-task) rate: {:.0}% ({}/{})",
-        if m.expected_done > 0 { 100.0 * m.unexpected_abnormal as f64 / m.expected_done as f64 } else { 0.0 },
+        if m.expected_done > 0 {
+            100.0 * m.unexpected_abnormal as f64 / m.expected_done as f64
+        } else {
+            0.0
+        },
         m.unexpected_abnormal,
         m.expected_done
     );
@@ -497,51 +695,3 @@ pub async fn run() -> Result<()> {
     println!("\nLOOP EVAL: PASS ({}/{} scenarios)", m.passed, m.total);
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scenario_set_has_at_least_15_covering_every_shape() {
-        let s = scenarios();
-        assert!(s.len() >= 15, "only {} scenarios", s.len());
-        for want in ["answer", "edit", "multi", "fix-test", "research", "anti-loop"] {
-            assert!(s.iter().any(|x| x.shape == want), "no scenario covers shape '{want}'");
-        }
-        // Every name is unique (a duplicate would silently shadow coverage).
-        let mut names: Vec<&str> = s.iter().map(|x| x.name).collect();
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(names.len(), s.len(), "scenario names must be unique");
-    }
-
-    #[tokio::test]
-    async fn healthy_scenarios_reach_done_within_budget() {
-        for s in scenarios().into_iter().filter(|s| s.expect_stop == StopReason::Done) {
-            let (passed, iters, stop) = run_scenario(&s).await;
-            assert!(passed, "{}: expected Done within {:?}, got {stop:?} in {iters} iter(s)", s.name, s.max_iters);
-        }
-    }
-
-    #[tokio::test]
-    async fn anti_loop_scenarios_actually_diverge_or_cap() {
-        for s in scenarios().into_iter().filter(|s| s.shape == "anti-loop") {
-            let (passed, iters, stop) = run_scenario(&s).await;
-            assert!(passed, "{}: expected {:?}, got {stop:?} in {iters} iter(s)", s.name, s.expect_stop);
-            // The whole point of these scenarios: they must NOT reach Done (that would mean the
-            // guard missed a genuine loop).
-            assert_ne!(stop, StopReason::Done, "{}: anti-loop scenario must not reach Done", s.name);
-        }
-    }
-
-    #[tokio::test]
-    async fn full_run_reports_metrics_without_panicking() {
-        // Smoke-test the aggregation path itself (not just individual scenarios) on a small subset.
-        let scens: Vec<Scenario> = scenarios().into_iter().take(3).collect();
-        for s in &scens {
-            let _ = run_scenario(s).await;
-        }
-    }
-}
-

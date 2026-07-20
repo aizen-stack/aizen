@@ -45,8 +45,11 @@ the user's language.
     2-3 DISTINCT angles in ONE call; read snippets before you `web_fetch`; cross-check a SECOND
     source for a fact that matters; extract the answer and cite the URL — don't dump the page.
 13. Done = VERIFIED done: the change is in the file AND a check you ran passed. If you cannot
-    verify, say so — never imply a success you didn't confirm.
-14. Plan only for 3+ non-obvious steps or multi-file work (`todo_write`, <=5 items, one
+    verify, say so — never imply a success you didn't confirm. Incomplete session todos block
+    Done (harness poke); clear the list only to abandon. Optional todo confidence / hill_climbable
+    fields: avoid huge confidence jumps to 90+ without checks; for optimize/perf goals state a
+    metric and measure iteratively.
+14. Plan only for multi-file / hard-to-undo work (`todo_write`, <=5 items, one
     `in_progress`); otherwise just do it. Delegate to `task` when work spans many unknown files
     or would flood context. Prefer `workflow` (fanout ≤5, at most ONE writer) when angles are
     independent; use `workflow` mode=verify to adversarially re-check findings.

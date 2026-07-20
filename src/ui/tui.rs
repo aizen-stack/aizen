@@ -2634,6 +2634,7 @@ fn slash_parks_input_thread(input: &str) -> bool {
             | "telegram"
             | "tg"
             | "serve"
+            | "sessions"
     ) || matches!(name, "timeline" | "tm")
         && matches!(arg, "pick" | "restore" | "menu" | "open")
         || name == "effort" && arg.is_empty()
@@ -3291,6 +3292,7 @@ mod tests {
     #[test]
     fn slash_parking_only_claims_direct_stdin_owners() {
         assert!(slash_parks_input_thread("config"));
+        assert!(slash_parks_input_thread("sessions"));
         assert!(slash_parks_input_thread("effort"));
         assert!(!slash_parks_input_thread("effort status"));
         assert!(slash_parks_input_thread("timeline pick"));

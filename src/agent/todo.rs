@@ -2,6 +2,9 @@
 //! Claude Code's todo list is one of its most legible features. Pure in-memory, zero infra: a
 //! process-global list the model REPLACES each call (send-the-whole-list semantics), rendered as a
 //! checklist into the scroll region + summarised in the status bar. Reset on `/clear`.
+//!
+//! P0 harness persistence: optional `confidence` / `hill_climbable` fields + incomplete helpers
+//! used by the agent loop's todo-poke / confidence-gate / hill-climb paths.
 
 use crate::agent::tools::Tool;
 use anyhow::Result;
@@ -23,10 +26,28 @@ pub struct Todo {
     pub content: String,
     #[serde(default = "default_status")]
     pub status: Status,
+    /// Honest 0–100 confidence (P0.2). Omit on trivial tasks. Used by the confidence-spike gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<u8>,
+    /// How quantifiable/iterable this goal is, 0–100 (P0.3). Below the gate → reframe nudge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hill_climbable: Option<u8>,
 }
 
 fn default_status() -> Status {
     Status::Pending
+}
+
+impl Todo {
+    /// Construct a todo without optional harness fields (tests + internal seeds).
+    pub fn new(content: impl Into<String>, status: Status) -> Self {
+        Self {
+            content: content.into(),
+            status,
+            confidence: None,
+            hill_climbable: None,
+        }
+    }
 }
 
 /// The session's task list. Process-global (one REPL = one session); `/clear` wipes it.
@@ -44,6 +65,35 @@ pub fn snapshot() -> Vec<Todo> {
 /// Wipe the list (called on `/clear` / a fresh conversation).
 pub fn clear() {
     TODOS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// True when any item is still pending or in_progress (empty list → false).
+pub fn has_incomplete() -> bool {
+    snapshot().iter().any(|t| t.status != Status::Done)
+}
+
+/// Format incomplete items as `[>]` / `[ ]` lines for the todo-poke inject. `None` if none open.
+pub fn incomplete_summary(max_chars: usize) -> Option<String> {
+    let items = snapshot();
+    let open: Vec<&Todo> = items.iter().filter(|t| t.status != Status::Done).collect();
+    if open.is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    for t in open {
+        let mark = match t.status {
+            Status::Done => "[x]", // filtered out; defensive
+            Status::InProgress => "[>]",
+            Status::Pending => "[ ]",
+        };
+        let line = format!("{mark} {}\n", t.content);
+        if text.chars().count() + line.chars().count() > max_chars {
+            text.push_str("…\n");
+            break;
+        }
+        text.push_str(&line);
+    }
+    Some(text.trim_end().to_string())
 }
 
 /// `☑ done/total` for the status bar (None when there are no todos).
@@ -102,12 +152,28 @@ fn model_ack(items: &[Todo]) -> String {
     format!("todo list updated: {} item(s), {done} done, {doing} in progress", items.len())
 }
 
+/// Clamp optional 0–100 fields after serde (accepts up to u8::MAX from JSON).
+fn normalize_todos(mut items: Vec<Todo>) -> Vec<Todo> {
+    for t in &mut items {
+        if let Some(c) = t.confidence {
+            t.confidence = Some(c.min(100));
+        }
+        if let Some(h) = t.hill_climbable {
+            t.hill_climbable = Some(h.min(100));
+        }
+    }
+    items
+}
+
 /// Parse a `{"todos": [...]}` args object into a `Vec<Todo>` — shared by the top-level `todo_write`
 /// and the sub-agent-scoped `ScopedTodo`, so both accept exactly the same shape.
 fn parse_todos(args: &serde_json::Value) -> Result<Vec<Todo>> {
     match args.get("todos") {
-        Some(v) => serde_json::from_value(v.clone())
-            .map_err(|e| anyhow::anyhow!("invalid `todos` (expect [{{content, status}}]): {e}")),
+        Some(v) => {
+            let items: Vec<Todo> = serde_json::from_value(v.clone())
+                .map_err(|e| anyhow::anyhow!("invalid `todos` (expect [{{content, status}}]): {e}"))?;
+            Ok(normalize_todos(items))
+        }
         None => anyhow::bail!("missing `todos` array"),
     }
 }
@@ -126,7 +192,19 @@ fn todos_schema() -> serde_json::Value {
                     "additionalProperties": false,
                     "properties": {
                         "content": {"type": "string", "description": "the task, imperative + concise"},
-                        "status": {"type": "string", "enum": ["pending", "in_progress", "done"]}
+                        "status": {"type": "string", "enum": ["pending", "in_progress", "done"]},
+                        "confidence": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
+                            "description": "0–100 honest confidence at assign and at done (optional; omit on trivial tasks)"
+                        },
+                        "hill_climbable": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
+                            "description": "0–100 how quantifiable/iterable this goal is (optional; below ~90 may trigger a reframe nudge)"
+                        }
                     },
                     "required": ["content", "status"]
                 }
@@ -145,9 +223,11 @@ impl Tool for TodoWrite {
     }
     fn description(&self) -> &str {
         "Track a multi-step task as a visible checklist. Send the COMPLETE current list every call \
-         (it REPLACES the previous one). Use it to plan 3+ step work and to mark progress: set ONE \
-         item to in_progress at a time, flip it to done before starting the next. Not for trivial \
-         one-step tasks. The list is shown to the user and resets on /clear."
+         (it REPLACES the previous one). Use it to plan multi-file / hard-to-undo work and to mark \
+         progress: set ONE item to in_progress at a time, flip it to done before starting the next. \
+         Not for trivial one-step tasks. Optional confidence (0–100) at assign/done and \
+         hill_climbable (0–100) for quantifiable goals. The list is shown to the user and resets on \
+         /clear. Leaving items incomplete will block Done (harness poke)."
     }
     fn parameters(&self) -> serde_json::Value {
         todos_schema()
@@ -186,7 +266,9 @@ pub struct ScopedTodo {
 
 impl ScopedTodo {
     pub fn new() -> Self {
-        Self { items: Mutex::new(Vec::new()) }
+        Self {
+            items: Mutex::new(Vec::new()),
+        }
     }
 }
 
@@ -203,9 +285,10 @@ impl Tool for ScopedTodo {
     fn description(&self) -> &str {
         "Track your OWN multi-step plan as a checklist while you work. Send the COMPLETE current \
          list every call (it REPLACES the previous one). Set ONE item to in_progress at a time and \
-         flip it to done before starting the next. Use it to keep a 3+ step task on track; skip it \
-         for trivial one- or two-step work. This is your private scratch plan — it is not shown to \
-         anyone and is discarded when you return your result."
+         flip it to done before starting the next. Use it to keep a multi-step task on track; skip \
+         it for trivial one- or two-step work. Optional confidence / hill_climbable fields allowed. \
+         This is your private scratch plan — it is not shown to anyone and is discarded when you \
+         return your result."
     }
     fn parameters(&self) -> serde_json::Value {
         todos_schema()
@@ -223,9 +306,8 @@ impl Tool for ScopedTodo {
     }
 }
 
-/// Serializes tests that touch the process-global TODOS list (also used by `agent::tests` for the
-/// recitation-reminder loop test).
-#[cfg(test)]
+/// Serializes access to the process-global TODOS list across concurrent tests / loop_eval
+/// scenarios (also used by `agent::tests` for the recitation-reminder loop test).
 pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
@@ -239,15 +321,34 @@ mod tests {
     fn set_and_summary_roundtrip() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set(vec![
-            Todo { content: "a".into(), status: Status::Done },
-            Todo { content: "b".into(), status: Status::InProgress },
-            Todo { content: "c".into(), status: Status::Pending },
+            Todo::new("a", Status::Done),
+            Todo::new("b", Status::InProgress),
+            Todo::new("c", Status::Pending),
         ]);
         assert_eq!(status_summary().as_deref(), Some("☑ 1/3"));
         assert_eq!(snapshot().len(), 3);
+        assert!(has_incomplete());
         clear();
         assert!(status_summary().is_none());
         assert!(snapshot().is_empty());
+        assert!(!has_incomplete());
+    }
+
+    #[test]
+    fn incomplete_summary_lists_open_only() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set(vec![
+            Todo::new("done-one", Status::Done),
+            Todo::new("doing", Status::InProgress),
+            Todo::new("later", Status::Pending),
+        ]);
+        let s = incomplete_summary(600).expect("open items");
+        assert!(s.contains("[>] doing"), "{s}");
+        assert!(s.contains("[ ] later"), "{s}");
+        assert!(!s.contains("done-one"), "{s}");
+        set(vec![Todo::new("all-done", Status::Done)]);
+        assert!(incomplete_summary(600).is_none());
+        clear();
     }
 
     #[test]
@@ -270,9 +371,32 @@ mod tests {
     }
 
     #[test]
+    fn execute_accepts_confidence_and_hill_climbable() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let t = TodoWrite;
+        t.execute(&serde_json::json!({"todos":[{
+            "content":"optimize parser",
+            "status":"in_progress",
+            "confidence": 40,
+            "hill_climbable": 85
+        }]})).unwrap();
+        let s = snapshot();
+        assert_eq!(s[0].confidence, Some(40));
+        assert_eq!(s[0].hill_climbable, Some(85));
+        // Clamp >100.
+        t.execute(&serde_json::json!({"todos":[{
+            "content":"x","status":"done","confidence": 200, "hill_climbable": 150
+        }]})).unwrap();
+        let s = snapshot();
+        assert_eq!(s[0].confidence, Some(100));
+        assert_eq!(s[0].hill_climbable, Some(100));
+        clear();
+    }
+
+    #[test]
     fn render_block_is_empty_when_no_todos() {
         assert!(render_block(&[]).is_empty());
-        let b = render_block(&[Todo { content: "build".into(), status: Status::InProgress }]);
+        let b = render_block(&[Todo::new("build", Status::InProgress)]);
         assert!(b.contains("build"));
         assert!(b.contains("todos:"));
     }
@@ -288,7 +412,7 @@ mod tests {
     fn scoped_todo_keeps_its_own_list_and_never_touches_the_global() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Seed the process-global list (the user's top-level plan).
-        set(vec![Todo { content: "user-task".into(), status: Status::InProgress }]);
+        set(vec![Todo::new("user-task", Status::InProgress)]);
 
         // A sub-agent's ScopedTodo writes its OWN plan.
         let sub = ScopedTodo::new();
@@ -307,7 +431,9 @@ mod tests {
 
         // Two independent sub-agents don't share state (per-instance, not global).
         let other = ScopedTodo::new();
-        let other_ack = other.execute(&serde_json::json!({"todos":[{"content":"x","status":"done"}]})).unwrap();
+        let other_ack = other
+            .execute(&serde_json::json!({"todos":[{"content":"x","status":"done"}]}))
+            .unwrap();
         assert!(other_ack.contains("1 item"), "second sub-agent has its own list");
         // The first sub-agent's list is still its own 2 items.
         assert_eq!(sub.items.lock().unwrap().len(), 2);
@@ -324,8 +450,8 @@ mod tests {
 
     #[test]
     fn scoped_todo_and_todo_write_share_a_schema() {
-        // Both accept the identical `{todos:[{content,status}]}` shape — a sub-agent that learned
-        // todo_write at top level uses it unchanged.
+        // Both accept the identical shape — a sub-agent that learned todo_write at top level uses
+        // it unchanged.
         assert_eq!(TodoWrite.parameters(), ScopedTodo::new().parameters());
         assert_eq!(TodoWrite.name(), ScopedTodo::new().name());
     }
