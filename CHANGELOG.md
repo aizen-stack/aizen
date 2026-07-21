@@ -5,7 +5,7 @@ All notable changes to **Aizen** (`aizen`, alias `ng`) — the pure-Rust agentic
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
-## [Unreleased]
+## [0.4.3] — 2026-07-21
 
 ### Fixed
 - **Retained TUI kept no colour** — every non-assistant line (the `❯` user echo, tool anchors, the
