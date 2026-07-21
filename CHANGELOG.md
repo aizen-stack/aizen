@@ -5,7 +5,7 @@ All notable changes to **Aizen** (`aizen`, alias `ng`) — the pure-Rust agentic
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
-## [Unreleased]
+## [0.4.4] — 2026-07-22
 
 ### Changed
 - **Transcript visuals redesigned around structured events** — tool calls, the plan checklist, edit
@@ -47,6 +47,11 @@ development log lives in that monorepo's history.
   the Enter meant to queue a message became a literal newline and the message sat in the draft
   forever. Detection now measures the gap between successive key *arrivals*, folding the slow
   repaint into the gap so a real keystroke is never mistaken for a paste.
+- **Image-attachment chip missing in the retained TUI** — pressing Ctrl-O (clipboard screenshot) or
+  dropping an image file attached it correctly (the send carried the image), but the retained input
+  box never drew the pending count, so there was no visible confirmation. `draw_footer` now renders
+  the `[Nimg]` chip (matching the classic renderer), reserving its width from the typing budget and
+  offsetting the caret so it never overlaps the typed text.
 
 ### Changed
 - **Tool-call anchor glyph** — replaced the florette `✿` with a solid diamond `◆` (moonlight
