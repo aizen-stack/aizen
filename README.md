@@ -1,11 +1,69 @@
-# `aizen` — Aizen agentic coding CLI
+# `aizen` — the terminal-native coding agent that lives on your machine
 
-A single-binary, terminal-native coding agent: streaming chat, a tool-using agent loop, a
-self-learning **memory brain**, sub-agent dispatch, and lightweight multi-agent workflows.
-Pure Rust, rustls-only, OpenAI-compatible — point it at any OpenAI-style `/chat/completions`
-endpoint (OpenAI, OpenRouter, a local server, or an Anthropic-backed gateway).
+**One static binary. No Node, no Python, no Docker, no cloud account.** Download `aizen`, point it
+at any OpenAI-compatible endpoint, and you have a full agentic coding partner in your terminal — one
+that reads and edits your code, runs your shell, verifies its own work, remembers how you like things
+done, and keeps working when you leave (drive it from Telegram on your phone).
 
 The command is **`aizen`**.
+
+```text
+⚡ gpt-4o-mini  ·  ~1.2K/128K tok  ·  3 turns  ·  ███░░░░░░░ 27% ctx
+╭──────────────────────────────────────────────────────────────────╮
+│ ❯ refactor the parser, run the tests, and commit when green       │
+╰──────────────────────────────────────────────────────────────────╯
+✿ Read src/parse.rs
+✿ Edit src/parse.rs  (rewrite tokenizer)
+✿ Run cargo test  → 42 passed
+```
+
+## Why `aizen`
+
+- **Zero-friction install.** A single self-contained executable — no runtime to install, no
+  containers, no `npm i -g` dependency tree. Grab the binary, run it. It builds pure-Rust with
+  rustls-only TLS, so there's no OpenSSL or native toolchain to fight.
+- **Bring your own model.** Works with *any* OpenAI-style `/chat/completions` API — OpenAI,
+  OpenRouter, a local llama.cpp/vLLM server, or an Anthropic-backed gateway. You pick the provider;
+  you're never locked to one lab. Context window auto-detects from the provider; cost is tracked live.
+- **It actually finishes tasks.** A real tool-using loop reads/edits files, runs shell, searches the
+  web, and — crucially — **verifies before it claims done** (runs your typecheck/tests and fixes what
+  broke). Parallel reads, serial+approval-gated writes.
+- **It remembers you.** A self-learning memory brain, an evolving persona, a durable operating SOUL,
+  and reusable skills mean the agent gets *more* useful over sessions instead of resetting every time.
+- **It runs where you aren't.** `aizen serve` turns any Telegram (or Discord) bot into a remote
+  control for the agent on your machine — approve risky edits from your phone with a tap. Host it
+  24/7 as a systemd service on a VPS.
+- **Safe by construction.** File/shell tools are confined to the working dir; a hard safety floor
+  blocks catastrophic commands *even under auto-approve*; secrets are written owner-only and never
+  printed. You stay in control of every destructive step.
+
+## Feature map
+
+| Area | What you get |
+| --- | --- |
+| **Unified REPL** | One chat+agent loop (no mode switch), a live status HUD (model · tokens · turn · `% context` bar), a real line editor with history, image/vision input, and a retained full-frame TUI with responsive Markdown, tables, and diagrams. |
+| **Agent loop** | Read/edit/glob/search/shell tools · parallel reads · approval-gated writes · a **verify gate** (auto typecheck/test + one fix turn) · `clarify`-don't-guess · sub-agent dispatch (`task`) · LSP-powered symbolic edits. |
+| **Memory brain** | Offline, BM25-ranked, Unicode-aware (Vietnamese-safe) retrieval that **evolves from reuse** — no LLM, zero extra tokens. `#text` remembers a fact in one keystroke. Provable via `aizen bench memory`. |
+| **Persona + SOUL + skills** | A swappable **persona** with evolving self-memory (Generative-Agents style), a durable **SOUL** identity above every persona/project, and **skills** the agent loads on demand and *learns* automatically after real work. |
+| **Multi-agent** | `aizen workflow` fans out role-scoped sub-agents (mixture-of-agents) and merges the results; `/workflows` shows a live status registry of running tasks and workflows. |
+| **Remote control** | `aizen serve` (Telegram) / `aizen discord serve` — full `/` command menu, multi-bot hosting from one daemon, per-chat context, phone approvals, systemd self-host. |
+| **Extensibility** | **MCP** servers (stdio/HTTP, OAuth 2.1 sign-in for Linear/Notion/Slack/Gmail/Atlassian) · custom markdown **slash-command macros** · outbound notify channels. |
+| **Web + browser** | `web_search` / `web_fetch` / `web_crawl` (katana-style crawler, SSRF-guarded) and opt-in **CDP browser tools** that drive a real Chrome/Edge — all pure-Rust, no headless engine bundled. |
+| **Safety + recovery** | Workspace confinement · hard command floor · owner-only secret files · crash-recoverable Git checkpoints (`/timeline` · `/checkpoint`) · per-turn MCP schema pinning · per-conversation browser isolation. |
+
+## 60-second start
+
+```bash
+# 1. install (see below for one-liners / manual download / from source)
+# 2. point it at a provider — interactive:
+aizen config            # base URL → API key → pick a model → saved to ~/.aizen/
+
+# 3. just run it:
+aizen                   # land in the REPL, start typing
+```
+
+That's it — after `aizen config`, every command works with **zero env vars**. Prefer one-shots?
+`aizen agent "add a --version flag and update the help"`. Prefer your phone? `aizen serve`.
 
 ## Install
 
