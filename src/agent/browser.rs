@@ -15,6 +15,7 @@
 //! all run serially (`is_concurrency_safe()=false`) so the shared stream is never interleaved.
 
 use crate::agent::tools::{Tool, ToolRegistry};
+use crate::core::convo::ConversationId;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use once_cell::sync::Lazy;
@@ -22,12 +23,13 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-/// Default CDP host:port; override with `AIZEN_BROWSER_CDP` (e.g. `127.0.0.1:9333`).
-const CDP_DEFAULT: &str = "127.0.0.1:9222";
+mod config;
+
 /// Per-op wall-clock cap so a wedged page can't freeze the agent loop.
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap on snapshot nodes — the a11y tree of a big SPA is huge; keep the injected slice bounded.
@@ -36,13 +38,87 @@ const SNAPSHOT_MAX_NODES: usize = 200;
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// The one shared CDP connection (lazy; reused across calls so the `@ref` map + page survive between
-/// snapshot and click). Browser tools are serial, so the send-then-read-until-id loop is race-free.
-static CLIENT: Lazy<Mutex<Option<CdpClient>>> = Lazy::new(|| Mutex::new(None));
+/// Upper bound on live browser sessions kept in the registry at once — one CDP websocket per
+/// conversation. When a new conversation would exceed this, the least-recently-used idle session is
+/// dropped (its websocket closes on drop). Serving is serial process-wide, so only the active
+/// session is ever locked; every other handle is safe to evict.
+const MAX_SESSIONS: usize = 8;
+
+/// One conversation's browser state: its live CDP websocket (if connected), the profile pinned for
+/// that conversation, an invalidation epoch bumped when a cancel/teardown drops the socket, and a
+/// last-used stamp for LRU eviction. Kept behind `Arc<Mutex<…>>` so a long CDP op holds only THIS
+/// conversation's lock, never a global one — state can never bleed from one conversation to another.
+struct BrowserSession {
+    client: Option<CdpClient>,
+    /// Set true before awaiting transport I/O; a cancelled/aborted op leaves it set so the next op on
+    /// this conversation reconnects on a fresh socket instead of reusing one left mid-exchange.
+    needs_reconnect: bool,
+    epoch: u64,
+    last_used: std::time::Instant,
+}
+
+impl BrowserSession {
+    fn new() -> Self {
+        Self { client: None, needs_reconnect: false, epoch: 0, last_used: std::time::Instant::now() }
+    }
+}
+
+type SessionHandle = Arc<Mutex<BrowserSession>>;
+
+/// Per-conversation CDP sessions. The registry lock (a std mutex) is held only to look up / insert a
+/// handle, never across CDP I/O — the awaited op locks the per-session tokio mutex instead.
+static SESSIONS: Lazy<std::sync::Mutex<HashMap<ConversationId, SessionHandle>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Profile pinned per conversation by the latest navigate (or the config default). Kept independently
+/// from the websocket so a transport reconnect stays on the same profile; a profile switch drops that
+/// conversation's socket + `@ref`s. Sync access (no await) → a plain `RwLock`, keyed by conversation.
+static PINNED: Lazy<std::sync::RwLock<HashMap<ConversationId, String>>> =
+    Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
+
+/// Fetch (or lazily create) the session handle for one conversation, evicting the least-recently-used
+/// idle session when the registry is at capacity. Never evicts a locked (in-use) session.
+fn session_handle(id: &ConversationId) -> SessionHandle {
+    let mut map = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = map.get(id) {
+        return h.clone();
+    }
+    if map.len() >= MAX_SESSIONS {
+        // LRU victim among the sessions we can lock (idle ones); the active session is locked and
+        // thus skipped automatically. `try_lock` reads `last_used` without blocking.
+        let victim = map
+            .iter()
+            .filter_map(|(k, h)| h.try_lock().ok().map(|g| (k.clone(), g.last_used)))
+            .min_by_key(|(_, t)| *t)
+            .map(|(k, _)| k);
+        if let Some(v) = victim {
+            map.remove(&v);
+        }
+    }
+    let h: SessionHandle = Arc::new(Mutex::new(BrowserSession::new()));
+    map.insert(id.clone(), h.clone());
+    h
+}
+
+/// Release one conversation's browser state (drops its websocket + `@ref`s + pinned profile). Called
+/// on `/new`, session deletion, and hostbot route removal so a retired conversation frees its socket.
+pub fn release(id: &ConversationId) {
+    SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    PINNED.write().unwrap_or_else(|e| e.into_inner()).remove(id);
+}
+
+/// Release the conversation currently marked active (the REPL's `/new` / reset path).
+pub fn release_active() {
+    release(&crate::core::convo::active());
+}
 
 struct CdpClient {
     ws: WsStream,
     next_id: u64,
+    /// Named profile pinned for the lifetime of this websocket session.
+    profile: String,
+    /// Sanitized endpoint label (host/base only; never headers or credential values).
+    endpoint: String,
     /// `@ref` number → DOM backendNodeId, rebuilt by each `browser_snapshot`.
     refs: HashMap<u32, i64>,
 }
@@ -97,21 +173,31 @@ impl CdpClient {
     }
 }
 
-/// Discover a page target's websocket URL from the local CDP HTTP endpoint.
-async fn discover_ws_url() -> Result<String> {
-    let host = crate::core::cli_config::branded_env("BROWSER_CDP").unwrap_or_else(|| CDP_DEFAULT.to_string());
-    let url = format!("http://{host}/json");
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .with_context(|| {
-            format!(
-                "no Chrome DevTools endpoint at {host} — launch a browser with remote debugging, e.g. \
-                 `chrome --remote-debugging-port=9222` (or set AIZEN_BROWSER_CDP)"
-            )
+/// Discover a page target's websocket URL from a configured CDP HTTP endpoint. Optional auth is
+/// resolved from an ENVIRONMENT VARIABLE NAME stored in browser.json; the value is never logged.
+async fn discover_ws_url(profile_name: &str, profile: &config::BrowserProfile) -> Result<String> {
+    let endpoint = profile.endpoint.trim().trim_end_matches('/');
+    let base = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    };
+    let url = format!("{base}/json");
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+    let mut rb = client.get(&url);
+    if let Some(var) = profile.auth_env.as_deref() {
+        let value = std::env::var(var).with_context(|| {
+            format!("browser profile '{profile_name}' requires environment variable {var}")
         })?;
+        rb = rb.header(reqwest::header::AUTHORIZATION, value);
+    }
+    let resp = rb.send().await.with_context(|| {
+        format!(
+            "no Chrome DevTools endpoint for browser profile '{profile_name}' at {endpoint} — launch a \
+             browser with remote debugging or update {}",
+            config::config_path().display()
+        )
+    })?;
     let targets: Value = resp.json().await.context("parsing the CDP /json target list")?;
     let arr = targets.as_array().context("CDP /json did not return a list")?;
     let page = arr
@@ -125,13 +211,22 @@ async fn discover_ws_url() -> Result<String> {
         .context("the target has no webSocketDebuggerUrl")
 }
 
-/// Open a fresh CDP connection and enable the domains we use.
-async fn connect() -> Result<CdpClient> {
-    let ws_url = discover_ws_url().await?;
-    let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
+/// Open a fresh CDP connection for a named profile and enable the domains we use. When the profile
+/// declares an `auth_env`, the SAME Authorization value used for HTTP discovery is attached to the
+/// WebSocket upgrade request (a remote CDP behind an auth proxy gates the ws:// upgrade too, not just
+/// the `/json` list). The value is read from the environment at connect time and never logged.
+async fn connect(profile_name: String, profile: config::BrowserProfile) -> Result<CdpClient> {
+    let ws_url = discover_ws_url(&profile_name, &profile).await?;
+    let ws = ws_connect_with_auth(&profile_name, &profile, &ws_url)
         .await
-        .with_context(|| format!("connecting to the CDP websocket {ws_url}"))?;
-    let mut c = CdpClient { ws, next_id: 1, refs: HashMap::new() };
+        .with_context(|| format!("connecting browser profile '{profile_name}' to its CDP websocket"))?;
+    let mut c = CdpClient {
+        ws,
+        next_id: 1,
+        profile: profile_name,
+        endpoint: profile.endpoint,
+        refs: HashMap::new(),
+    };
     // Best-effort domain enables (a browser that doesn't support one shouldn't abort the session).
     let _ = c.call("Page.enable", json!({})).await;
     let _ = c.call("DOM.enable", json!({})).await;
@@ -140,25 +235,119 @@ async fn connect() -> Result<CdpClient> {
     Ok(c)
 }
 
-/// Run an op against the shared connection, connecting on first use. A connection-level failure
-/// drops the client so the next call reconnects (a logical CDP error keeps it — preserving the
-/// `@ref` map). The closure returns a boxed future (the canonical pattern for a closure whose future
-/// borrows its `&mut` argument). The sync `Tool::execute` reaches this via `block`.
-async fn with_cdp<T>(
-    f: impl for<'a> FnOnce(&'a mut CdpClient) -> Pin<Box<dyn Future<Output = Result<T>> + 'a>>,
-) -> Result<T> {
-    let mut guard = CLIENT.lock().await;
-    if guard.is_none() {
-        *guard = Some(connect().await?);
-    }
-    let res = f(guard.as_mut().unwrap()).await;
-    if let Err(e) = &res {
-        let m = e.to_string();
-        if m.contains("closed") || m.contains("read error") || m.contains("CDP send") || m.contains("timed out") {
-            *guard = None; // drop a broken connection; the next call reconnects fresh
+/// Open the CDP WebSocket, attaching the profile's `auth_env` value as an `Authorization` header on
+/// the upgrade request when set. A local `ws://127.0.0.1` endpoint carries no auth (the common case),
+/// so we skip building a custom request there. The header value is pulled from the environment at
+/// call time — it is never persisted in browser.json nor echoed into any error (upgrade failures are
+/// reported by tungstenite without the request headers).
+async fn ws_connect_with_auth(
+    profile_name: &str,
+    profile: &config::BrowserProfile,
+    ws_url: &str,
+) -> Result<WsStream> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let auth_value = match profile.auth_env.as_deref() {
+        Some(var) => Some(std::env::var(var).with_context(|| {
+            format!("browser profile '{profile_name}' requires environment variable {var}")
+        })?),
+        None => None,
+    };
+    match auth_value {
+        None => {
+            let (ws, _) = tokio_tungstenite::connect_async(ws_url).await?;
+            Ok(ws)
+        }
+        Some(value) => {
+            let mut request = ws_url.into_client_request().context("building CDP websocket upgrade request")?;
+            let header_value = value
+                .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
+                .context("browser auth_env value is not a valid HTTP header")?;
+            request.headers_mut().insert(reqwest::header::AUTHORIZATION.as_str(), header_value);
+            let (ws, _) = tokio_tungstenite::connect_async(request).await?;
+            Ok(ws)
         }
     }
-    res
+}
+
+/// Run an op against the ACTIVE conversation's profile-pinned connection. `retry_readonly` permits
+/// ONE reconnect + replay only for observational operations (`browser_snapshot` / status probes).
+/// State-changing navigate/click/type/eval operations drop a broken connection but never replay after
+/// transport ambiguity — their effect may already have happened. Switching profiles drops the prior
+/// websocket and clears all @refs, making cross-profile refs unambiguously invalid. Every session is
+/// keyed by conversation, so one chat's page/refs can never bleed into another's.
+async fn with_cdp<T>(
+    profile_name: String,
+    profile: config::BrowserProfile,
+    retry_readonly: bool,
+    mut f: impl for<'a> FnMut(&'a mut CdpClient) -> Pin<Box<dyn Future<Output = Result<T>> + 'a>>,
+) -> Result<T> {
+    // Bind the session to the conversation active at CALL time — a cancel/teardown that bumps the
+    // epoch afterwards can then tell that a reconnect it caused belongs to a session already retired.
+    let handle = session_handle(&crate::core::convo::active());
+    let mut sess = handle.lock().await;
+    sess.last_used = std::time::Instant::now();
+
+    // A profile switch, or a prior op that left the socket mid-exchange, forces a fresh connect.
+    let profile_switched = sess.client.as_ref().is_some_and(|c| c.profile != profile_name);
+    if profile_switched || sess.needs_reconnect {
+        sess.client = None;
+        sess.needs_reconnect = false;
+    }
+    if sess.client.is_none() {
+        sess.client = Some(connect(profile_name.clone(), profile.clone()).await?);
+    }
+
+    // Mark BEFORE awaiting: if Esc drops this future mid-read, `needs_reconnect` survives so the next
+    // op on THIS conversation reconnects instead of reusing a desynced socket. A clean return clears it.
+    sess.needs_reconnect = true;
+    let first = f(sess.client.as_mut().unwrap()).await;
+    let broken = first.as_ref().err().is_some_and(connection_error);
+    if !broken {
+        sess.needs_reconnect = false;
+        return first;
+    }
+    // Broken transport → drop this conversation's socket + refs.
+    sess.client = None;
+    if !retry_readonly {
+        return first; // needs_reconnect stays set → next op reconnects
+    }
+    // Read-only replay exactly once on a fresh websocket.
+    sess.client = Some(connect(profile_name, profile).await?);
+    sess.needs_reconnect = true;
+    let second = f(sess.client.as_mut().unwrap()).await;
+    if second.as_ref().err().is_some_and(connection_error) {
+        sess.client = None;
+    } else {
+        sess.needs_reconnect = false;
+    }
+    second
+}
+
+fn connection_error(e: &anyhow::Error) -> bool {
+    let m = e.to_string();
+    m.contains("closed") || m.contains("read error") || m.contains("CDP send") || m.contains("timed out")
+}
+
+/// Pin a profile for the ACTIVE conversation (by the URL being navigated to) and return the resolved
+/// target. Per-conversation so two chats can drive different profiles at once.
+fn target_for_url(url: &str) -> Result<(String, config::BrowserProfile)> {
+    let target = config::resolve_for_url(&config::load()?, url)?;
+    PINNED.write().unwrap_or_else(|e| e.into_inner()).insert(crate::core::convo::active(), target.0.clone());
+    Ok(target)
+}
+
+/// The profile pinned for the ACTIVE conversation (falling back to the config default), resolved to a
+/// live profile. Reads only this conversation's pin — never another chat's.
+fn pinned_target() -> Result<(String, config::BrowserProfile)> {
+    let cfg = config::load()?;
+    let name = PINNED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&crate::core::convo::active())
+        .cloned()
+        .unwrap_or_else(|| cfg.default_profile.clone());
+    let profile = config::resolve_named(&cfg, &name)?;
+    Ok((name, profile))
 }
 
 /// Bridge the async CDP op to the sync `Tool::execute` — the shared cancel-aware bridge (valid on
@@ -251,7 +440,10 @@ impl Tool for BrowserNavigate {
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let url = args.get("url").and_then(|v| v.as_str()).context("missing 'url'")?.to_string();
-        block(with_cdp(|c| Box::pin(async move {
+        let (profile_name, profile) = target_for_url(&url)?;
+        block(with_cdp(profile_name, profile, false, |c| Box::pin({
+            let url = url.clone();
+            async move {
             c.call("Page.navigate", json!({"url": url})).await?;
             // Poll readyState rather than racing a load event (simpler + robust across CDP versions).
             let deadline = OP_TIMEOUT;
@@ -271,6 +463,7 @@ impl Tool for BrowserNavigate {
                 .await?;
             let title = t.get("result").and_then(|x| x.get("value")).and_then(|v| v.as_str()).unwrap_or("");
             Ok(format!("navigated — title: \"{title}\" (call browser_snapshot to see elements)"))
+            }
         })))
     }
 }
@@ -295,7 +488,8 @@ impl Tool for BrowserSnapshot {
         false
     }
     fn execute(&self, _args: &Value) -> Result<String> {
-        block(with_cdp(|c| Box::pin(async move {
+        let (profile_name, profile) = pinned_target()?;
+        block(with_cdp(profile_name, profile, true, |c| Box::pin(async move {
             let tree = c.call("Accessibility.getFullAXTree", json!({})).await?;
             let nodes = tree.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
             Ok(render_ax_tree(&nodes, &mut c.refs, SNAPSHOT_MAX_NODES))
@@ -323,7 +517,8 @@ impl Tool for BrowserClick {
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let r = parse_ref(args.get("ref").context("missing 'ref'")?)?;
-        block(with_cdp(|c| Box::pin(async move {
+        let (profile_name, profile) = pinned_target()?;
+        block(with_cdp(profile_name, profile, false, |c| Box::pin(async move {
             let object_id = c.object_for_ref(r).await?;
             c.call(
                 "Runtime.callFunctionOn",
@@ -356,7 +551,10 @@ impl Tool for BrowserType {
     fn execute(&self, args: &Value) -> Result<String> {
         let r = parse_ref(args.get("ref").context("missing 'ref'")?)?;
         let text = args.get("text").and_then(|v| v.as_str()).context("missing 'text'")?.to_string();
-        block(with_cdp(|c| Box::pin(async move {
+        let (profile_name, profile) = pinned_target()?;
+        block(with_cdp(profile_name, profile, false, |c| Box::pin({
+            let text = text.clone();
+            async move {
             let object_id = c.object_for_ref(r).await?;
             c.call(
                 "Runtime.callFunctionOn",
@@ -368,6 +566,7 @@ impl Tool for BrowserType {
             )
             .await?;
             Ok(format!("typed into @{r}"))
+            }
         })))
     }
 }
@@ -393,7 +592,10 @@ impl Tool for BrowserEval {
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let expr = args.get("expression").and_then(|v| v.as_str()).context("missing 'expression'")?.to_string();
-        block(with_cdp(|c| Box::pin(async move {
+        let (profile_name, profile) = pinned_target()?;
+        block(with_cdp(profile_name, profile, false, |c| Box::pin({
+            let expr = expr.clone();
+            async move {
             let r = c
                 .call(
                     "Runtime.evaluate",
@@ -416,8 +618,78 @@ impl Tool for BrowserEval {
                     .unwrap_or("undefined");
                 Ok(desc.to_string())
             }
+            }
         })))
     }
+}
+
+/// Sanitized browser routing/session status. Never includes Authorization values or environment
+/// variable contents — only profile labels, endpoint labels, route names, and whether auth is set.
+pub fn status() -> String {
+    let cfg = match config::load() {
+        Ok(c) => c,
+        Err(e) => return format!("browser config error: {e}"),
+    };
+    // Report only the ACTIVE conversation's pin + session — never another chat's state.
+    let id = crate::core::convo::active();
+    let pinned = PINNED.read().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
+    let mut out = format!(
+        "browser config: {} · default={} · convo={} · pinned={}\n",
+        config::config_path().display(),
+        cfg.default_profile,
+        id,
+        pinned.as_deref().unwrap_or("(none)"),
+    );
+    // Look up (without creating) this conversation's session handle, then read its liveness without
+    // blocking on an in-flight op.
+    let handle = SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
+    let (session, endpoint): (&str, String) = match handle {
+        Some(h) => match h.try_lock() {
+            Ok(g) => g
+                .client
+                .as_ref()
+                .map(|c| ("connected", c.endpoint.clone()))
+                .unwrap_or_else(|| ("disconnected", "-".to_string())),
+            Err(_) => ("busy", "-".to_string()),
+        },
+        None => ("disconnected", "-".to_string()),
+    };
+    let live = SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).len();
+    out.push_str(&format!("session: {session} · endpoint {endpoint} · {live} live session(s)\n"));
+    for (name, p) in &cfg.profiles {
+        let auth = p
+            .auth_env
+            .as_deref()
+            .map(|v| if std::env::var_os(v).is_some() { format!("auth-env {v}=set") } else { format!("auth-env {v}=missing") })
+            .unwrap_or_else(|| "no auth".to_string());
+        out.push_str(&format!("● {name} · {} · {} · {auth}\n", p.provider, p.endpoint));
+    }
+    for (host, profile) in &cfg.routes {
+        out.push_str(&format!("  route {host} → {profile}\n"));
+    }
+    out.trim_end().to_string()
+}
+
+pub async fn doctor() -> String {
+    let cfg = match config::load() {
+        Ok(c) => c,
+        Err(e) => return format!("browser config error: {e}"),
+    };
+    let mut out = String::new();
+    for name in cfg.profiles.keys() {
+        let profile = match config::resolve_named(&cfg, name) {
+            Ok(p) => p,
+            Err(e) => {
+                out.push_str(&format!("○ {name} · {e}\n"));
+                continue;
+            }
+        };
+        match discover_ws_url(name, &profile).await {
+            Ok(_) => out.push_str(&format!("● {name} · reachable · {}\n", profile.endpoint)),
+            Err(e) => out.push_str(&format!("○ {name} · unavailable · {e}\n")),
+        }
+    }
+    if out.is_empty() { "no browser profiles configured".to_string() } else { out.trim_end().to_string() }
 }
 
 /// Register the browser tools into a registry (top-level only). Called from `default_registry_in`
@@ -480,5 +752,58 @@ mod tests {
         let mut refs = HashMap::new();
         let out = render_ax_tree(&[], &mut refs, 200);
         assert!(out.contains("no accessible elements"));
+    }
+
+    #[test]
+    fn browser_status_never_prints_credential_values() {
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("aizen-browser-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("AIZEN_HOME", &root);
+        std::env::set_var("BROWSER_TEST_AUTH", "Bearer top-secret-value");
+        std::fs::write(
+            root.join("browser.json"),
+            r#"{"schema":1,"default_profile":"remote","profiles":{"remote":{"provider":"cdp","endpoint":"https://cdp.example","auth_env":"BROWSER_TEST_AUTH"}},"routes":{}}"#,
+        )
+        .unwrap();
+        let out = status();
+        assert!(out.contains("BROWSER_TEST_AUTH=set"));
+        assert!(!out.contains("top-secret-value"));
+        std::env::remove_var("BROWSER_TEST_AUTH");
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sessions_are_keyed_per_conversation_and_released() {
+        // Two conversations get DISTINCT session handles — one chat's page/refs can never be the
+        // other's. Same id returns the SAME handle (state persists within a conversation).
+        let a = ConversationId::new("test-convo-a");
+        let b = ConversationId::new("test-convo-b");
+        release(&a);
+        release(&b);
+        let ha = session_handle(&a);
+        let hb = session_handle(&b);
+        assert!(!Arc::ptr_eq(&ha, &hb), "distinct conversations must not share a session");
+        assert!(Arc::ptr_eq(&ha, &session_handle(&a)), "same conversation reuses its handle");
+        // Release drops the mapping; the next lookup is a fresh handle.
+        release(&a);
+        assert!(!Arc::ptr_eq(&ha, &session_handle(&a)), "release retires the old session");
+        release(&a);
+        release(&b);
+    }
+
+    #[test]
+    fn pinned_profile_is_per_conversation() {
+        // A profile pinned under one conversation is invisible to another (no cross-chat bleed).
+        let a = ConversationId::new("test-pin-a");
+        let b = ConversationId::new("test-pin-b");
+        PINNED.write().unwrap().insert(a.clone(), "profile-a".to_string());
+        assert_eq!(PINNED.read().unwrap().get(&a).map(String::as_str), Some("profile-a"));
+        assert!(PINNED.read().unwrap().get(&b).is_none(), "b never sees a's pin");
+        release(&a);
+        assert!(PINNED.read().unwrap().get(&a).is_none(), "release clears the pin too");
+        release(&b);
     }
 }

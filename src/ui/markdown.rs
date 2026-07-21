@@ -16,7 +16,8 @@
 //!   comments / numbers / keywords). It never mangles code: anything unrecognised stays default.
 
 use crate::ui::theme;
-use console::{measure_text_width, style};
+use console::{measure_text_width, style, truncate_str};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 /// A left-edge bar marking assistant output. Moonlight silver — the design's `border-left:2px #c3ccd8`.
 fn gutter() -> String {
@@ -30,12 +31,14 @@ pub struct MarkdownStream {
     pending: String,
     in_fence: bool,
     fence_lang: String,
+    table_candidate: Option<String>,
+    table_lines: Vec<String>,
 }
 
 impl MarkdownStream {
     /// `decorate=false` (non-TTY) makes every method a verbatim passthrough.
     pub fn new(decorate: bool, cols: usize) -> Self {
-        Self { decorate, cols: cols.max(24), pending: String::new(), in_fence: false, fence_lang: String::new() }
+        Self { decorate, cols: cols.max(24), pending: String::new(), in_fence: false, fence_lang: String::new(), table_candidate: None, table_lines: Vec::new() }
     }
 
     /// Feed a streamed delta; returns the text ready to print (complete styled lines). Empty when
@@ -49,7 +52,7 @@ impl MarkdownStream {
         while let Some(nl) = self.pending.find('\n') {
             let line: String = self.pending[..nl].to_string();
             self.pending.drain(..=nl);
-            self.render_line(&line, &mut out);
+            self.accept_line(&line, &mut out);
         }
         out
     }
@@ -62,13 +65,58 @@ impl MarkdownStream {
         let mut out = String::new();
         if !self.pending.is_empty() {
             let line = std::mem::take(&mut self.pending);
-            self.render_line(&line, &mut out);
+            self.accept_line(&line, &mut out);
         }
+        self.flush_table_state(&mut out);
         if self.in_fence {
             out.push_str(&self.fence_bottom());
             self.in_fence = false;
         }
         out
+    }
+
+    fn accept_line(&mut self, line: &str, out: &mut String) {
+        if self.in_fence {
+            self.render_line(line, out);
+            return;
+        }
+        if !self.table_lines.is_empty() {
+            if looks_like_table_row(line) {
+                self.table_lines.push(line.to_string());
+                return;
+            }
+            self.flush_table_state(out);
+            self.accept_line(line, out);
+            return;
+        }
+        if let Some(header) = self.table_candidate.take() {
+            if is_table_separator(line, parse_table_row(&header).map_or(0, |r| r.len())) {
+                self.table_lines.push(header);
+                self.table_lines.push(line.to_string());
+                return;
+            }
+            self.render_line(&header, out);
+            self.accept_line(line, out);
+            return;
+        }
+        if looks_like_table_row(line) {
+            self.table_candidate = Some(line.to_string());
+        } else {
+            self.render_line(line, out);
+        }
+    }
+
+    fn flush_table_state(&mut self, out: &mut String) {
+        if let Some(line) = self.table_candidate.take() {
+            self.render_line(&line, out);
+        }
+        if !self.table_lines.is_empty() {
+            let lines = std::mem::take(&mut self.table_lines);
+            match parse_table(&lines) {
+                Some(table) => out.push_str(&render_table_tty(&table, self.cols)),
+                None => for line in lines { self.render_line(&line, out); },
+            }
+        }
     }
 
     // ── line rendering ───────────────────────────────────────────────────────────
@@ -173,15 +221,28 @@ impl MarkdownStream {
         }
     }
 
-    /// A code-fence body line: `▌ │ <highlighted>`, char-wrapped (never word-wrapped — that would
-    /// corrupt code) to the width, the gutter + rule repeated on each wrapped row.
+    /// A code-fence body line: `▌ │ <highlighted> │`, a CLOSED box — content char-wrapped (never
+    /// word-wrapped — that would corrupt code) to the inner width, padded, then the right rule, so
+    /// every row aligns with the top/bottom borders instead of sprawling past a narrow frame.
     fn emit_code(&self, out: &mut String, line: &str) {
-        let prefix = format!("{}{}", gutter(), style("│ ").color256(theme::CODE_RULE));
-        let budget = self.cols.saturating_sub(measure_text_width(&prefix)).max(8);
-        for row in char_chunks(line, budget) {
-            out.push_str(&prefix);
-            out.push_str(&highlight(&row, &self.fence_lang));
+        let left = format!("{}{}", gutter(), style("│ ").color256(theme::CODE_RULE));
+        let inner = self.fence_inner();
+        let right = format!(" {}", style("│").color256(theme::CODE_RULE));
+        let mut row = |visible: &str, styled: String| {
+            out.push_str(&left);
+            out.push_str(&styled);
+            let pad = inner.saturating_sub(measure_text_width(visible));
+            out.push_str(&" ".repeat(pad));
+            out.push_str(&right);
             out.push('\n');
+        };
+        if is_visual_fence(&self.fence_lang) {
+            let shown = truncate_display(line, inner);
+            row(&shown, shown.clone());
+            return;
+        }
+        for chunk in char_chunks(line, inner) {
+            row(&chunk, highlight(&chunk, &self.fence_lang));
         }
     }
 
@@ -191,26 +252,418 @@ impl MarkdownStream {
         format!("{}{}", gutter(), " ".repeat(prefix_w.saturating_sub(2)))
     }
 
+    /// Total inner width of the code box (excluding the gutter), shared by the top border, every body
+    /// row, and the bottom border so the frame is a true rectangle instead of a narrow top over wide
+    /// content. Capped so wide terminals don't stretch code across the whole screen.
+    fn fence_width(&self) -> usize {
+        self.cols.saturating_sub(measure_text_width(&gutter())).min(80).max(16)
+    }
+
+    /// The writable span between the `│ ` left rule and the ` │` right rule.
+    fn fence_inner(&self) -> usize {
+        self.fence_width().saturating_sub(4).max(8)
+    }
+
     /// `▌ ╭─ lang ───────╮`
     fn fence_top(&self) -> String {
         let label = if self.fence_lang.is_empty() { "code" } else { self.fence_lang.as_str() };
-        let w = self.cols.min(60).saturating_sub(4).max(14);
-        let head = format!("╭─ {label} ");
-        let dashes = w.saturating_sub(head.chars().count()).saturating_sub(1);
+        let w = self.fence_width();
+        let label_w = measure_text_width(label).min(w.saturating_sub(6));
+        let label = truncate_display(label, label_w);
+        // border = ╭─ {label} {dashes}╮ ; ╭─ =2, spaces=2, ╮=1 → dashes fill the rest to `w`.
+        let dashes = w.saturating_sub(measure_text_width(&label) + 5);
         format!(
             "{}{}{}{}\n",
             gutter(),
             theme::accent_dim("╭─ "),
-            theme::accent(label),
+            theme::accent(&label),
             theme::accent_dim(format!(" {}╮", "─".repeat(dashes))),
         )
     }
 
     /// `▌ ╰──────────────╯`
     fn fence_bottom(&self) -> String {
-        let w = self.cols.min(60).saturating_sub(4).max(14);
+        let w = self.fence_width();
         format!("{}{}\n", gutter(), theme::accent_dim(format!("╰{}╯", "─".repeat(w.saturating_sub(2)))))
     }
+}
+
+#[derive(Clone, Copy)]
+enum TableAlign { Left, Center, Right }
+
+struct MarkdownTable {
+    headers: Vec<String>,
+    aligns: Vec<TableAlign>,
+    rows: Vec<Vec<String>>,
+}
+
+fn is_visual_fence(lang: &str) -> bool {
+    matches!(lang.trim().to_ascii_lowercase().as_str(), "diagram" | "ascii" | "flow")
+}
+
+fn truncate_display(s: &str, budget: usize) -> String {
+    if measure_text_width(s) <= budget { s.to_string() } else { truncate_str(s, budget, "…").into_owned() }
+}
+
+fn parse_table_row(line: &str) -> Option<Vec<String>> {
+    let mut t = line.trim();
+    if t.starts_with('|') { t = &t[1..]; }
+    if t.ends_with('|') && !t.ends_with("\\|") { t = &t[..t.len() - 1]; }
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut escaped = false;
+    let mut saw_pipe = false;
+    for ch in t.chars() {
+        if escaped {
+            if ch == '|' { cur.push('|'); } else { cur.push('\\'); cur.push(ch); }
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '|' {
+            saw_pipe = true;
+            cells.push(cur.trim().to_string());
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    if escaped { cur.push('\\'); }
+    cells.push(cur.trim().to_string());
+    (saw_pipe || line.trim().starts_with('|') || line.trim().ends_with('|')).then_some(cells)
+}
+
+fn looks_like_table_row(line: &str) -> bool {
+    line.trim().contains('|') && parse_table_row(line).is_some_and(|r| r.len() >= 2)
+}
+
+fn separator_cell(cell: &str) -> Option<TableAlign> {
+    let t = cell.trim();
+    let left = t.starts_with(':');
+    let right = t.ends_with(':');
+    let core = t.trim_matches(':');
+    // GFM only requires at least one hyphen per delimiter cell (`-`, `--`, `:-`, `-:`, `:-:`, …).
+    // The old 3-dash minimum rejected the short separators models routinely emit (e.g. `|--|`),
+    // which failed table detection and dumped the raw pipes to the screen.
+    if core.is_empty() || !core.chars().all(|c| c == '-') { return None; }
+    Some(match (left, right) { (true, true) => TableAlign::Center, (false, true) => TableAlign::Right, _ => TableAlign::Left })
+}
+
+fn is_table_separator(line: &str, expected: usize) -> bool {
+    expected >= 2 && parse_table_row(line).is_some_and(|r| r.len() == expected && r.iter().all(|c| separator_cell(c).is_some()))
+}
+
+fn parse_table(lines: &[String]) -> Option<MarkdownTable> {
+    if lines.len() < 2 { return None; }
+    let headers = parse_table_row(&lines[0])?;
+    if headers.len() < 2 { return None; }
+    let sep = parse_table_row(&lines[1])?;
+    if sep.len() != headers.len() { return None; }
+    let aligns = sep.iter().map(|c| separator_cell(c)).collect::<Option<Vec<_>>>()?;
+    let mut rows = Vec::new();
+    for line in &lines[2..] {
+        let mut row = parse_table_row(line)?;
+        row.resize(headers.len(), String::new());
+        row.truncate(headers.len());
+        rows.push(row);
+    }
+    Some(MarkdownTable { headers, aligns, rows })
+}
+
+fn table_natural_width(table: &MarkdownTable) -> usize {
+    let mut widths: Vec<usize> = table.headers.iter().map(|h| measure_text_width(h).max(1)).collect();
+    for row in &table.rows { for (i, cell) in row.iter().enumerate() { widths[i] = widths[i].max(measure_text_width(cell)); } }
+    widths.iter().sum::<usize>() + table.headers.len() * 3 + 1
+}
+
+fn display_pad(s: &str, width: usize, align: TableAlign) -> String {
+    let gap = width.saturating_sub(measure_text_width(s).min(width));
+    let (left, right) = match align { TableAlign::Left => (0, gap), TableAlign::Right => (gap, 0), TableAlign::Center => (gap / 2, gap - gap / 2) };
+    format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
+}
+
+fn border_line(left: char, join: char, right: char, widths: &[usize]) -> String {
+    let mut s = String::new();
+    s.push(left);
+    for (i, width) in widths.iter().enumerate() {
+        if i > 0 { s.push(join); }
+        s.push_str(&"─".repeat(width + 2));
+    }
+    s.push(right);
+    s
+}
+
+fn render_table_tty(table: &MarkdownTable, cols: usize) -> String {
+    let budget = cols.saturating_sub(measure_text_width(&gutter())).max(8);
+    if table.headers.len() > 5 || table_natural_width(table) > budget { return render_table_stacked_tty(table, cols); }
+    let mut widths: Vec<usize> = table.headers.iter().map(|h| measure_text_width(h).max(1)).collect();
+    for row in &table.rows { for (i, cell) in row.iter().enumerate() { widths[i] = widths[i].max(measure_text_width(cell)); } }
+    let mut out = String::new();
+    let border = |out: &mut String, line: String| { out.push_str(&gutter()); out.push_str(&theme::accent_dim(line).to_string()); out.push('\n'); };
+    border(&mut out, border_line('╭', '┬', '╮', &widths));
+    out.push_str(&gutter()); out.push_str(&theme::accent_dim("│").to_string());
+    for (i, cell) in table.headers.iter().enumerate() {
+        out.push(' '); out.push_str(&theme::accent(display_pad(cell, widths[i], TableAlign::Center)).bold().to_string()); out.push(' '); out.push_str(&theme::accent_dim("│").to_string());
+    }
+    out.push('\n');
+    border(&mut out, border_line('├', '┼', '┤', &widths));
+    for row in &table.rows {
+        out.push_str(&gutter()); out.push_str(&theme::accent_dim("│").to_string());
+        for (i, cell) in row.iter().enumerate() {
+            out.push(' '); out.push_str(&inline(&display_pad(cell, widths[i], table.aligns[i]))); out.push(' '); out.push_str(&theme::accent_dim("│").to_string());
+        }
+        out.push('\n');
+    }
+    border(&mut out, border_line('╰', '┴', '╯', &widths));
+    out
+}
+
+fn render_table_stacked_tty(table: &MarkdownTable, cols: usize) -> String {
+    let prefix = format!("{}  ", gutter());
+    let key_width = table.headers.iter().map(|h| measure_text_width(h)).max().unwrap_or(1).min(18);
+    let budget = cols.saturating_sub(measure_text_width(&prefix) + key_width + 3).max(8);
+    let rows = if table.rows.is_empty() { vec![vec![String::new(); table.headers.len()]] } else { table.rows.clone() };
+    let mut out = String::new();
+    for (ri, row) in rows.iter().enumerate() {
+        out.push_str(&gutter()); out.push_str(&theme::accent(format!("◆ {}", ri + 1)).bold().to_string()); out.push('\n');
+        for (i, header) in table.headers.iter().enumerate() {
+            let key = truncate_display(header, key_width);
+            let value = row.get(i).map(String::as_str).unwrap_or("");
+            let wrapped = { let v = wrap_plain(value, budget); if v.is_empty() { vec![String::new()] } else { v } };
+            for (wi, line) in wrapped.iter().enumerate() {
+                out.push_str(&prefix);
+                if wi == 0 { out.push_str(&theme::muted(display_pad(&key, key_width, TableAlign::Right)).to_string()); out.push_str(&theme::accent_dim(" : ").to_string()); }
+                else { out.push_str(&" ".repeat(key_width + 3)); }
+                out.push_str(&inline(line)); out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Full-message CommonMark/GFM renderer used by the retained viewport. It reparses the whole active
+/// raw message on each content change (historical messages are cached by the retained backend), which
+/// avoids incremental-parser splice artifacts while keeping the classic streaming renderer unchanged.
+pub fn render_retained(input: &str, cols: usize) -> String {
+    let cols = cols.max(24);
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_GFM);
+
+    let mut out = String::new();
+    let mut line = String::new();
+    let mut prefix = String::new();
+    let mut list_stack: Vec<Option<u64>> = Vec::new();
+    let mut link_url: Option<String> = None;
+    let mut in_code = false;
+    let mut code_lang = String::new();
+    let mut code_body = String::new();
+    let mut table_depth = 0usize;
+
+    let flush_line = |out: &mut String, line: &mut String, prefix: &mut String| {
+        if line.is_empty() && prefix.is_empty() {
+            return;
+        }
+        let visible_prefix = if prefix.is_empty() { gutter() } else { format!("{}{}", gutter(), prefix) };
+        let budget = cols.saturating_sub(measure_text_width(&visible_prefix)).max(8);
+        let rows = wrap_plain(line, budget);
+        if rows.is_empty() {
+            out.push_str(&visible_prefix);
+            out.push('\n');
+        } else {
+            for row in rows {
+                out.push_str(&visible_prefix);
+                out.push_str(&row);
+                out.push('\n');
+            }
+        }
+        line.clear();
+        prefix.clear();
+    };
+
+    for event in Parser::new_ext(input, options) {
+        if in_code {
+            match event {
+                Event::End(TagEnd::CodeBlock) => {
+                    let rendered = if code_lang.eq_ignore_ascii_case("mermaid") {
+                        crate::ui::mermaid::render(&code_body, cols.saturating_sub(4))
+                    } else {
+                        None
+                    };
+                    let body = rendered.as_deref().unwrap_or(&code_body);
+                    let label = if rendered.is_some() { "mermaid" } else if code_lang.is_empty() { "code" } else { &code_lang };
+                    // A true closed box: one width shared by the top border, every body row (padded to
+                    // the inner span then closed with a right rule) and the bottom border, so wide
+                    // content can't sprawl past a narrow frame. `visual`/mermaid rows truncate; code
+                    // char-wraps. All measured by display width, never byte length.
+                    let w = cols.saturating_sub(measure_text_width(&gutter())).min(80).max(16);
+                    let inner = w.saturating_sub(4).max(8);
+                    let label_shown = truncate_display(label, inner.saturating_sub(2));
+                    let head_dashes = inner.saturating_sub(measure_text_width(&label_shown) + 1);
+                    out.push_str(&format!("{}╭─ {label_shown} {}╮\n", gutter(), "─".repeat(head_dashes)));
+                    let visual = is_visual_fence(label) || rendered.is_some();
+                    let mut emit_row = |out: &mut String, chunk: &str, styled: String| {
+                        out.push_str(&gutter());
+                        out.push_str("│ ");
+                        out.push_str(&styled);
+                        out.push_str(&" ".repeat(inner.saturating_sub(measure_text_width(chunk))));
+                        out.push_str(" │\n");
+                    };
+                    for source_line in body.lines() {
+                        if visual {
+                            let shown = truncate_display(source_line, inner);
+                            emit_row(&mut out, &shown, shown.clone());
+                        } else {
+                            for chunk in char_chunks(source_line, inner) {
+                                let styled = highlight(&chunk, label);
+                                emit_row(&mut out, &chunk, styled);
+                            }
+                        }
+                    }
+                    out.push_str(&format!("{}╰{}╯\n", gutter(), "─".repeat(w.saturating_sub(2))));
+                    in_code = false;
+                    code_lang.clear();
+                    code_body.clear();
+                }
+                Event::Text(t) | Event::Code(t) => code_body.push_str(&t),
+                Event::SoftBreak | Event::HardBreak => code_body.push('\n'),
+                _ => {}
+            }
+            continue;
+        }
+
+        match event {
+            Event::Start(Tag::Paragraph) => {}
+            Event::End(TagEnd::Paragraph) => flush_line(&mut out, &mut line, &mut prefix),
+            Event::Start(Tag::Heading { level, .. }) => {
+                prefix = match level {
+                    HeadingLevel::H1 | HeadingLevel::H2 => "◆ ".to_string(),
+                    _ => "◇ ".to_string(),
+                };
+            }
+            Event::End(TagEnd::Heading(_)) => flush_line(&mut out, &mut line, &mut prefix),
+            Event::Start(Tag::BlockQuote(_)) => prefix.push_str("▏ "),
+            Event::End(TagEnd::BlockQuote(_)) => flush_line(&mut out, &mut line, &mut prefix),
+            Event::Start(Tag::List(start)) => list_stack.push(start),
+            Event::End(TagEnd::List(_)) => {
+                flush_line(&mut out, &mut line, &mut prefix);
+                list_stack.pop();
+            }
+            Event::Start(Tag::Item) => {
+                let marker = match list_stack.last().copied().flatten() {
+                    Some(n) => format!("{n}. "),
+                    None => "• ".to_string(),
+                };
+                prefix = format!("{}{}", "  ".repeat(list_stack.len().saturating_sub(1)), marker);
+            }
+            Event::End(TagEnd::Item) => flush_line(&mut out, &mut line, &mut prefix),
+            Event::Start(Tag::CodeBlock(kind)) => {
+                flush_line(&mut out, &mut line, &mut prefix);
+                in_code = true;
+                code_lang = match kind {
+                    CodeBlockKind::Fenced(lang) => lang.to_string(),
+                    CodeBlockKind::Indented => String::new(),
+                };
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => link_url = Some(dest_url.to_string()),
+            Event::End(TagEnd::Link) => {
+                if let Some(url) = link_url.take() {
+                    line.push_str(&format!(" ({url})"));
+                }
+            }
+            Event::Start(Tag::Table(_)) => {
+                flush_line(&mut out, &mut line, &mut prefix);
+                table_depth += 1;
+            }
+            Event::End(TagEnd::Table) => table_depth = table_depth.saturating_sub(1),
+            Event::Start(Tag::TableRow) => {}
+            Event::End(TagEnd::TableRow) => {
+                if table_depth > 0 {
+                    flush_line(&mut out, &mut line, &mut prefix);
+                }
+            }
+            Event::Start(Tag::TableCell) => {
+                if !line.is_empty() {
+                    line.push_str(" │ ");
+                }
+            }
+            Event::End(TagEnd::TableCell) => {}
+            Event::Text(t) => line.push_str(&t),
+            Event::Code(t) => {
+                line.push('`');
+                line.push_str(&t);
+                line.push('`');
+            }
+            Event::Html(t) | Event::InlineHtml(t) => line.push_str(&t),
+            Event::SoftBreak => line.push(' '),
+            Event::HardBreak => flush_line(&mut out, &mut line, &mut prefix),
+            Event::Rule => {
+                flush_line(&mut out, &mut line, &mut prefix);
+                out.push_str(&gutter());
+                out.push_str(&"─".repeat(cols.min(52).saturating_sub(2)));
+                out.push('\n');
+            }
+            Event::TaskListMarker(done) => line.push_str(if done { "☑ " } else { "☐ " }),
+            Event::FootnoteReference(name) => line.push_str(&format!("[{name}]")),
+            Event::Start(_) | Event::End(_) | Event::InlineMath(_) | Event::DisplayMath(_) => {}
+        }
+    }
+    if in_code {
+        // A dangling fence (never closed) → same true-rectangle box as the terminated path.
+        let label = if code_lang.is_empty() { "code" } else { &code_lang };
+        let w = cols.saturating_sub(measure_text_width(&gutter())).min(80).max(16);
+        let inner = w.saturating_sub(4).max(8);
+        let label_shown = truncate_display(label, inner.saturating_sub(2));
+        let head_dashes = inner.saturating_sub(measure_text_width(&label_shown) + 1);
+        out.push_str(&format!("{}╭─ {label_shown} {}╮\n", gutter(), "─".repeat(head_dashes)));
+        for source_line in code_body.lines() {
+            for chunk in char_chunks(source_line, inner) {
+                out.push_str(&gutter());
+                out.push_str("│ ");
+                out.push_str(&chunk);
+                out.push_str(&" ".repeat(inner.saturating_sub(measure_text_width(&chunk))));
+                out.push_str(" │\n");
+            }
+        }
+        out.push_str(&format!("{}╰{}╯\n", gutter(), "─".repeat(w.saturating_sub(2))));
+    }
+    flush_line(&mut out, &mut line, &mut prefix);
+    out.trim_end_matches('\n').to_string()
+}
+
+/// Convert Markdown tables to stacked plain text for chat clients without pipe-table rendering.
+pub fn render_plain_blocks(input: &str) -> String {
+    let lines: Vec<&str> = input.lines().collect();
+    let trailing_nl = input.ends_with('\n');
+    let mut out = String::new();
+    let mut i = 0usize;
+    let mut in_fence = false;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim_start().starts_with("```") { in_fence = !in_fence; out.push_str(line); out.push('\n'); i += 1; continue; }
+        if !in_fence && i + 1 < lines.len() {
+            let width = parse_table_row(line).map_or(0, |r| r.len());
+            if looks_like_table_row(line) && is_table_separator(lines[i + 1], width) {
+                let start = i; i += 2;
+                while i < lines.len() && looks_like_table_row(lines[i]) { i += 1; }
+                let block: Vec<String> = lines[start..i].iter().map(|s| (*s).to_string()).collect();
+                if let Some(table) = parse_table(&block) {
+                    for (ri, row) in table.rows.iter().enumerate() {
+                        if table.rows.len() > 1 { out.push_str(&format!("◆ {}\n", ri + 1)); }
+                        for (ci, header) in table.headers.iter().enumerate() { out.push_str(header); out.push_str(": "); out.push_str(row.get(ci).map(String::as_str).unwrap_or("")); out.push('\n'); }
+                        if ri + 1 < table.rows.len() { out.push('\n'); }
+                    }
+                    continue;
+                }
+                i = start;
+            }
+        }
+        out.push_str(line); out.push('\n'); i += 1;
+    }
+    if !trailing_nl && out.ends_with('\n') { out.pop(); }
+    out
 }
 
 // ── wrapping ───────────────────────────────────────────────────────────────────────
@@ -600,5 +1053,88 @@ mod tests {
         let out = strip_ansi_codes(&render_all("see [docs](https://x.io)\n")).to_string();
         assert!(out.contains("docs") && out.contains("https://x.io"), "link text+url kept: {out:?}");
         assert!(!out.contains('[') && !out.contains(']'), "link brackets consumed: {out:?}");
+    }
+
+    #[test]
+    fn wide_and_narrow_tables_are_responsive() {
+        let md = "| File | Status | Count |\n|:---|:---:|---:|\n| src/lib.rs | done | 12 |\n";
+        let wide = strip_ansi_codes(&render_all(md)).to_string();
+        assert!(wide.contains('╭') && wide.contains('┼') && wide.contains("src/lib.rs"), "{wide}");
+        assert!(wide.lines().all(|l| measure_text_width(l) <= 80));
+        let mut s = MarkdownStream::new(true, 28);
+        let mut narrow = s.push(md); narrow.push_str(&s.finish());
+        let narrow = strip_ansi_codes(&narrow).to_string();
+        assert!(narrow.contains("◆ 1") && narrow.contains("File") && narrow.contains("src/lib.rs"), "{narrow}");
+        assert!(narrow.lines().all(|l| measure_text_width(l) <= 28));
+    }
+
+    #[test]
+    fn table_streaming_is_chunk_invariant_and_escaped_pipe_survives() {
+        let md = "before\n| Key | Value |\n|---|---|\n| a\\|b | tiếng Việt |\nafter\n";
+        let expected = render_all(md);
+        for cut in 0..=md.len() {
+            if !md.is_char_boundary(cut) { continue; }
+            let mut s = MarkdownStream::new(true, 80);
+            let mut got = s.push(&md[..cut]); got.push_str(&s.push(&md[cut..])); got.push_str(&s.finish());
+            assert_eq!(strip_ansi_codes(&got), strip_ansi_codes(&expected), "cut={cut}");
+        }
+        assert!(strip_ansi_codes(&expected).contains("a|b"));
+    }
+
+    #[test]
+    fn malformed_table_and_code_fence_fail_open() {
+        let malformed = strip_ansi_codes(&render_all("| a | b |\n| not | separator |\nplain\n")).to_string();
+        assert!(malformed.contains("| a | b |") && malformed.contains("| not | separator |"));
+        let fenced = strip_ansi_codes(&render_all("```txt\n| a | b |\n|---|---|\n```\n")).to_string();
+        assert!(fenced.contains("|---|---|") && !fenced.contains('┼'), "{fenced}");
+    }
+
+    #[test]
+    fn diagram_preserves_topology_and_truncates_instead_of_wrapping() {
+        let mut s = MarkdownStream::new(true, 32);
+        let mut out = s.push("```diagram\n[A]    -->    [B]\n012345678901234567890123456789012345\n```\n");
+        out.push_str(&s.finish());
+        let plain = strip_ansi_codes(&out).to_string();
+        assert!(plain.contains("[A]    -->    [B]") && plain.contains('…'), "{plain}");
+        assert_eq!(plain.lines().filter(|l| l.contains("012345")).count(), 1, "{plain}");
+        assert!(plain.lines().all(|l| measure_text_width(l) <= 32));
+    }
+
+    #[test]
+    fn short_separator_still_detects_table() {
+        // The bug from the screenshot: a `|--|` / `|---|` header separator with 1-2 dashes per cell
+        // used to fail the 3-dash minimum, so the whole table dumped its raw pipes to the screen.
+        // GFM only needs one hyphen per delimiter cell.
+        for sep in ["|--|--|", "|-|-|", "| - | - |"] {
+            let md = format!("| A | B |\n{sep}\n| x | y |\n");
+            let out = strip_ansi_codes(&render_all(&md)).to_string();
+            assert!(out.contains('┼') && out.contains('╭'), "short sep {sep:?} must render a table box: {out}");
+            assert!(!out.contains("|--"), "raw pipes must not leak for {sep:?}: {out}");
+        }
+    }
+
+    #[test]
+    fn code_box_is_a_true_rectangle() {
+        // The other screenshot bug: on a wide terminal the frame was capped narrow while the body ran
+        // to the full width, so a diagram sprawled past its box. Every line of the box (top, body,
+        // bottom) must now share one width and carry the right rule.
+        let cols = 100;
+        let mut s = MarkdownStream::new(true, cols);
+        let mut out = s.push("```diagram\nA --------------------------------------------------> B\n```\n");
+        out.push_str(&s.finish());
+        let plain = strip_ansi_codes(&out).to_string();
+        let box_lines: Vec<&str> = plain.lines().filter(|l| l.contains('╭') || l.contains('╰') || l.contains('│')).collect();
+        assert!(box_lines.len() >= 3, "top + body + bottom: {plain}");
+        let widths: Vec<usize> = box_lines.iter().map(|l| measure_text_width(l)).collect();
+        assert!(widths.iter().all(|w| *w == widths[0]), "every box row same width, got {widths:?}: {plain}");
+        assert!(plain.lines().filter(|l| l.contains('│')).all(|l| l.trim_end().ends_with('│')), "body rows closed by a right rule: {plain}");
+    }
+
+    #[test]
+    fn plain_block_renderer_stacks_tables_and_preserves_diagrams() {
+        let md = "Intro\n| A | B |\n|---|---|\n| x | y |\n\n```diagram\nA --> B\n```";
+        let out = render_plain_blocks(md);
+        assert!(out.contains("A: x\nB: y") && !out.contains("|---|---|"), "{out}");
+        assert!(out.contains("```diagram\nA --> B\n```"), "{out}");
     }
 }

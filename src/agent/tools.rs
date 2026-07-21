@@ -63,6 +63,13 @@ pub trait Tool: Send + Sync {
     fn workspace_effect(&self, _args: &Value) -> WorkspaceEffect {
         WorkspaceEffect::None
     }
+    /// Whether beginning this call may create a durable workspace, process, network, external-service,
+    /// or delegated-agent effect whose completion would be ambiguous after a crash. Defaults to the
+    /// existing safety classifications; pure reads override naturally by being non-destructive with
+    /// no workspace effect.
+    fn recovery_effect(&self, args: &Value) -> bool {
+        self.is_destructive() || self.workspace_effect(args) != WorkspaceEffect::None
+    }
     /// Run the tool. `args` is the parsed (object) arguments. Return the result text; return
     /// an `Err` for a real failure — the loop feeds the error back to the model to recover.
     fn execute(&self, args: &Value) -> Result<String>;
@@ -86,11 +93,15 @@ pub trait Tool: Send + Sync {
 /// worker is the documented sync bridge. Pinned by `bridge_works_inside_spawn_blocking` below so
 /// a future tokio upgrade that changes this fails loudly.
 pub(crate) fn block_for_tool<T>(f: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    let cancel = crate::core::cancel::current();
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            tokio::select! {
-                r = f => r,
-                _ = crate::ui::tui::cancelled() => Err(anyhow::anyhow!("cancelled by user")),
+            match cancel {
+                Some(token) => tokio::select! {
+                    r = f => r,
+                    _ = token.cancelled() => Err(anyhow::anyhow!("cancelled by user")),
+                },
+                None => f.await,
             }
         })
     })
@@ -167,5 +178,23 @@ mod tests {
         // …and on a worker thread (the classic serial path).
         let on_worker = block_for_tool(async { Ok::<_, anyhow::Error>("ok") });
         assert_eq!(on_worker.unwrap(), "ok");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bridge_observes_the_scoped_turn_token() {
+        let token = crate::core::cancel::TurnCancel::new();
+        token.cancel();
+        let err = tokio::task::spawn_blocking(move || {
+            crate::core::cancel::with_current(token, || {
+                block_for_tool(async {
+                    std::future::pending::<()>().await;
+                    Ok::<_, anyhow::Error>(())
+                })
+            })
+        })
+        .await
+        .expect("spawn_blocking join")
+        .unwrap_err();
+        assert!(err.to_string().contains("cancelled by user"), "{err}");
     }
 }

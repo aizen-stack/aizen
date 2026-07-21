@@ -114,17 +114,11 @@ pub fn clear_token(key: &str) {
 }
 
 fn save_token(key: &str, t: &TokenSet) -> Result<()> {
-    let dir = tokens_dir();
-    std::fs::create_dir_all(&dir).ok();
     let p = token_path(key);
-    std::fs::write(&p, serde_json::to_string_pretty(t)? + "\n").with_context(|| format!("writing {}", p.display()))?;
-    // Tokens are bearer credentials → lock to the owner on Unix (Windows profile dir is already ACL'd).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    let mut bytes = serde_json::to_vec_pretty(t)?;
+    bytes.push(b'\n');
+    crate::core::persist::atomic_write_owner_only(&p, &bytes)
+        .with_context(|| format!("writing {}", p.display()))
 }
 
 // ───────────────────────────── crypto / encoding (pure) ─────────────────────────────

@@ -7,6 +7,43 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-07-21
+
+### Fixed
+- **Markdown tables no longer dump raw pipes** — the delimiter-row detector required 3+ dashes per
+  cell, so the short separators models routinely emit (`|--|`, `|-|`) failed table detection and the
+  raw `| … |` rows printed verbatim. Now accepts any GFM-valid delimiter (≥1 hyphen, optional `:`).
+- **Code / `diagram` fences render as a true rectangle** — the top and bottom borders were capped
+  near 56 columns while body content ran to the full terminal width, so wide content sprawled past a
+  narrow frame. All three render paths (streaming, retained, unterminated-fence fallback) now share
+  one capped width for the top border, every body row (padded and closed with a right rule), and the
+  bottom border, measured by display width rather than byte length.
+
+### Changed
+- **Tool-call anchor glyph** — replaced `⏺` (force-rendered as a blue emoji disc by most terminals,
+  ignoring the theme color) with the monochrome florette `✿`, which takes the moonlight-silver accent
+  and echoes the Aizen chrysanthemum-sun mark.
+
+### Added
+- **Retained TUI foundation + runtime safety** — alternate-screen single-owner renderer, structured
+  transcript streaming, full-message Markdown cache, retained overlays/panel status, local frame
+  metrics, adaptive idle donut, and Mermaid-to-Unicode fallback; classic/plain remain rollback paths.
+- **Static/dynamic prompt lanes + crash recovery** — stable project/environment prefix stays cacheable;
+  volatile identity/memory refreshes only at fresh user-turn boundaries. Owner-only recovery leases
+  restore safe history and prefill interrupted drafts without auto-submitting or replaying tools.
+- **MCP lifecycle hardening** — poisoned transport reconnect, one read-only retry only, destructive
+  no-replay after ambiguous failure, manager/connection generations, per-turn schema pinning, and
+  deferred `tools/list_changed` refresh at the next user turn. MCP trust writes are atomic owner-only.
+- **Browser profiles and routing** (`--features browser`) — versioned `~/.aizen/browser.json`, named CDP
+  profiles, host routes, environment-reference-only auth attached to HTTP discovery AND the WebSocket
+  upgrade, per-conversation session isolation (LRU-capped, released on `/new`/route removal), ref
+  invalidation, sanitized `/browser` status, read-only snapshot retry, and no replay of
+  navigate/click/type/eval.
+- **Terminal-native reply visuals** — configurable `auto|always|off` final-answer contract, responsive
+  Markdown tables (boxed wide / stacked narrow), and topology-safe `diagram`/`ascii`/`flow` fences.
+  One-shot chat and workflow synthesis share the renderer; Telegram/Discord receive plain stacked
+  tables with newline-aware UTF-16 chunking.
+
 ## [0.4.1] — 2026-07-20
 
 ### Added

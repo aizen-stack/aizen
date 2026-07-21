@@ -181,6 +181,9 @@ impl Tool for WorkflowTool {
     fn is_concurrency_safe(&self) -> bool {
         false
     }
+    fn recovery_effect(&self, _args: &Value) -> bool {
+        true
+    }
     fn execute(&self, args: &Value) -> Result<String> {
         if self.depth >= 1 {
             bail!("workflow is depth-capped at 1 — a sub-agent cannot orchestrate further fan-outs");
@@ -194,14 +197,17 @@ impl Tool for WorkflowTool {
         let key = self.api_key.clone();
         let model = self.model.clone();
         let approval = self.approval_mode;
+        let cancel = crate::core::cancel::current().unwrap_or_default();
         tokio::task::block_in_place(|| {
-            // EFFORT ISOLATION (same as the `task` tool): disarm the parent's process-global effort
-            // override for this synchronous fan-out so every fanned-out child + the synthesis pass
-            // resolves its own `cfg.reasoning_effort` instead of inheriting the parent's pinned tier.
-            // Restored on drop before control returns to the parent turn.
-            let _effort = crate::core::cli_config::suppress_effort_override();
-            tokio::runtime::Handle::current()
-                .block_on(run_workflow_collect(&client, &base, &key, &model, approval, &spec, synthesize))
+            crate::core::cancel::with_current(cancel, || {
+                // EFFORT ISOLATION (same as the `task` tool): disarm the parent's process-global effort
+                // override for this synchronous fan-out so every fanned-out child + the synthesis pass
+                // resolves its own `cfg.reasoning_effort` instead of inheriting the parent's pinned tier.
+                // Restored on drop before control returns to the parent turn.
+                let _effort = crate::core::cli_config::suppress_effort_override();
+                tokio::runtime::Handle::current()
+                    .block_on(run_workflow_collect(&client, &base, &key, &model, approval, &spec, synthesize))
+            })
         })
     }
 }

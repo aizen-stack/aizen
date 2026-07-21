@@ -30,6 +30,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
+mod retained;
+
 /// Footer height in rows: HUD status line + top rule + the `❯` prompt line + bottom rule.
 const FOOTER: u16 = 4;
 
@@ -43,6 +45,12 @@ const PALETTE_MAX: usize = 7;
 /// jitter (a few ms) yet far below the gap before a human reaches the Enter key (≥ ~100 ms).
 const PASTE_COALESCE_MS: u64 = 50;
 
+/// Lines the transcript scrolls per ↑/↓ keypress at an empty prompt in retained mode. Kept small (a
+/// few lines) because in the alternate-screen backend the mouse wheel is delivered as a burst of ↑/↓
+/// key events — one "wheel notch" is usually 3 events — so a per-key step of 3 lands close to a
+/// native pager's feel without overshooting on a single notch.
+const TRANSCRIPT_ARROW_SCROLL: i32 = 3;
+
 /// Slash commands offered in the live palette (primary name + one-line gist). Mirrors the `match`
 /// in `handle_slash` (main.rs) — keep in sync. Order ≈ most-reached first.
 pub const SLASH: &[(&str, &str)] = &[
@@ -50,6 +58,7 @@ pub const SLASH: &[(&str, &str)] = &[
     ("model", "list + pick the model"),
     ("sessions", "saved chats — restore / save / delete"),
     ("workflows", "multi-agent status — live tasks & fan-outs"),
+    ("recover", "restore a crashed session safely"),
     ("timeline", "checkpoint timeline (glance) · pick to restore"),
     ("checkpoint", "save a code restore point"),
     ("compact", "compress context to free tokens"),
@@ -57,7 +66,8 @@ pub const SLASH: &[(&str, &str)] = &[
     ("persona", "switch persona voice"),
     ("skills", "browse & toggle skills"),
     ("apps", "integrations"),
-    ("mcp", "MCP servers summary"),
+    ("mcp", "MCP lifecycle / schema / tools"),
+    ("browser", "browser profiles & host routes"),
     ("commands", "your custom commands"),
     ("telegram", "telegram bot setup"),
     ("serve", "run the daemon"),
@@ -167,6 +177,9 @@ fn slash_matches(draft: &[char]) -> Vec<&'static (&'static str, &'static str)> {
     SLASH.iter().filter(|(n, _)| n.starts_with(&typed)).collect()
 }
 
+/// Whether a direct retained informational overlay (`/workflows`, later panels) is open.
+static RETAINED_INFO_OVERLAY: AtomicBool = AtomicBool::new(false);
+
 /// Whether the sticky TUI currently owns the terminal (gates `emit`'s behaviour + spinner suppression).
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -174,52 +187,41 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// cancel when working, quit when idle) AND by `paint_box` (the box's working indicator).
 static WORKING: AtomicBool = AtomicBool::new(false);
 
-/// Cooperative cancel flag, set by the input thread on Esc/Ctrl-C while the agent is working.
+/// Turn-scoped cancellation handle currently armed by the interactive REPL.
 ///
-/// The REPL races the turn future against `cancel.recv()` in a `select!`, but `select!` can only
-/// observe the cancel when the future YIELDS (returns Pending). While a synchronous tool runs — a
-/// `shell_run` busy-wait of up to 120s, a parallel read batch — the future never yields, so Esc was
-/// silently ignored until the tool finished. This flag bridges that gap: the input thread sets it
-/// immediately, the synchronous tool path (the shell poll loop) polls it and aborts the child, and
-/// the agent loop yields once it's set so the `select!` can finally drop the turn.
-static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Unlike the old process-global latch, this slot only points at the active logical turn. Children
+/// inherit the same token through `AgentConfig`; unrelated turns/tests own different tokens. The slot
+/// is disarmed by token identity, so a late completion cannot clear a newer turn.
+static ACTIVE_TURN_CANCEL: OnceLock<Mutex<Option<crate::core::cancel::TurnCancel>>> = OnceLock::new();
 
-/// Wakes async waiters ([`cancelled`]) the instant a cancel is requested — the flag alone only
-/// serves pollers; racing a long network tool needs an awaitable signal.
-static CANCEL_NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
-
-fn cancel_notify() -> &'static tokio::sync::Notify {
-    CANCEL_NOTIFY.get_or_init(tokio::sync::Notify::new)
+fn active_turn_cancel() -> &'static Mutex<Option<crate::core::cancel::TurnCancel>> {
+    ACTIVE_TURN_CANCEL.get_or_init(|| Mutex::new(None))
 }
 
-/// Request cancellation of the in-flight turn (called by the input thread on Esc while working).
-pub fn request_cancel() {
-    CANCEL_REQUESTED.store(true, Ordering::Relaxed);
-    cancel_notify().notify_waiters();
+/// Arm cancellation for one interactive turn.
+pub fn arm_cancel(token: crate::core::cancel::TurnCancel) {
+    *active_turn_cancel().lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
 }
 
-/// Resolves when a cancel is requested. Missed-wakeup-safe: registers with the Notify FIRST, then
-/// re-checks the flag, so a request landing between check and await is still seen. Never resolves
-/// outside the sticky REPL (nothing else sets the flag) — racing against it is a no-op there.
-pub async fn cancelled() {
-    loop {
-        if cancel_requested() {
-            return;
-        }
-        let notified = cancel_notify().notified();
-        if cancel_requested() {
-            return;
-        }
-        notified.await;
+/// Disarm only when the slot still refers to this turn (a completed old turn cannot clear a new one).
+pub fn disarm_cancel(token: &crate::core::cancel::TurnCancel) {
+    let mut slot = active_turn_cancel().lock().unwrap_or_else(|e| e.into_inner());
+    if slot.as_ref().is_some_and(|active| active.same_turn(token)) {
+        *slot = None;
     }
 }
-/// Whether a cancel has been requested — polled by the synchronous tool path + the agent loop.
-pub fn cancel_requested() -> bool {
-    CANCEL_REQUESTED.load(Ordering::Relaxed)
+
+/// Request cancellation of the in-flight interactive turn (called by the input thread on Esc).
+pub fn request_cancel() {
+    let token = active_turn_cancel().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(token) = token {
+        token.cancel();
+    }
 }
-/// Clear the cancel flag (called by the REPL at each turn boundary so a stale Esc can't kill the next).
-pub fn clear_cancel() {
-    CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+
+/// Current interactive token, exposed to synchronous pollers outside a tool scope.
+pub fn active_cancel_token() -> Option<crate::core::cancel::TurnCancel> {
+    active_turn_cancel().lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Star frames for the animated working indicator (a lone background thread advances this while
@@ -313,7 +315,11 @@ static CTX_PERMILLE: AtomicU16 = AtomicU16::new(0);
 /// Update the context-meter fill (per-mille, clamped 0..=1000). Called from `status_text` alongside
 /// each status refresh; harmless when the TUI is inactive.
 pub fn set_ctx_permille(v: u16) {
-    CTX_PERMILLE.store(v.min(1000), Ordering::Relaxed);
+    let v = v.min(1000);
+    CTX_PERMILLE.store(v, Ordering::Relaxed);
+    if retained::is_running() {
+        retained::set_context(v);
+    }
 }
 
 /// Current spinner frame index (advanced by the ticker thread; read by `paint_box`).
@@ -386,6 +392,21 @@ pub fn add_stream_chars(n: u64) {
     STREAM_CHARS.fetch_add(n, Ordering::Relaxed);
 }
 
+/// Feed raw assistant Markdown into the retained active-message block. Classic/one-shot callers keep
+/// using [`emit`] with the existing streaming Markdown renderer.
+pub fn assistant_stream_delta(s: &str) {
+    if retained::is_active() {
+        retained::assistant_delta(s);
+    }
+}
+
+/// Close the retained active assistant block at a clean message boundary.
+pub fn assistant_stream_finish(interrupted: bool) {
+    if retained::is_running() {
+        retained::assistant_finish(interrupted);
+    }
+}
+
 /// Estimated streamed OUTPUT tokens this turn (chars ÷ 4) for the working pill's `↑N tok`.
 fn stream_tokens() -> u64 {
     STREAM_CHARS.load(Ordering::Relaxed) / 4
@@ -407,7 +428,11 @@ fn start_ticker() {
             continue;
         }
         WORK_FRAME.fetch_add(1, Ordering::Relaxed);
-        // Repaint the box only. paint_box uses absolute cursor moves and never touches the `\x1b7`
+        if retained::is_active() {
+            retained::tick();
+            continue;
+        }
+        // Repaint the classic box only. paint_box uses absolute cursor moves and never touches the
         // output-save slot (owned by `emit`), so animating from this thread cannot disturb where the
         // next streamed token lands. Serialized with emit/keystrokes on the render lock.
         let r = render().lock().unwrap();
@@ -431,6 +456,9 @@ fn start_resize_poller() {
         std::thread::sleep(Duration::from_millis(250));
         if !ACTIVE.load(Ordering::Relaxed) {
             continue;
+        }
+        if retained::is_running() {
+            continue; // crossterm resize events/autoresize are owned by the retained render loop
         }
         let (rows, cols) = term_size();
         let mut r = render().lock().unwrap();
@@ -558,7 +586,22 @@ pub fn clear_submission_depth() {
 }
 
 pub fn active() -> bool {
-    ACTIVE.load(Ordering::Relaxed)
+    retained::is_active() || ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Whether the retained full-frame backend currently owns the terminal.
+pub fn retained_active() -> bool {
+    retained::is_active()
+}
+
+/// Whether the retained backend's render thread is alive (true even while SUSPENDED for an
+/// interactive dialoguer menu). The render thread keeps folding `Command::Emit` into its block
+/// buffer while suspended (it just doesn't paint), and `resume` redraws from that buffer — so text
+/// emitted during a suspended menu must be sent to the render thread, NOT `print!`ed onto the
+/// dialoguer's screen (where `resume`'s clear+redraw would wipe it). Emit paths therefore route by
+/// `is_running()`, not `is_active()`, so a `/sessions` restore replayed mid-menu survives resume.
+pub fn retained_running() -> bool {
+    retained::is_running()
 }
 
 // ── in-TUI per-action approval bridge ─────────────────────────────────────────
@@ -620,7 +663,9 @@ pub fn ask_approval(prompt_line: &str) -> bool {
 /// the Markdown renderer wraps to exactly the box, not to a separately-probed (possibly larger)
 /// window edge. When the TUI isn't active, falls back to the live terminal width.
 pub fn width() -> usize {
-    if active() {
+    if retained::is_running() {
+        retained::size().1 as usize
+    } else if active() {
         render().lock().unwrap().cols as usize
     } else {
         term_size().1 as usize
@@ -1444,6 +1489,11 @@ pub fn activate(intro: &str, status: &str) {
     if !std::io::stdout().is_terminal() {
         return;
     }
+    if retained::start(intro, status) {
+        ACTIVE.store(false, Ordering::Relaxed);
+        start_resize_poller();
+        return;
+    }
     let mut r = render().lock().unwrap();
     let (rows, cols) = term_size();
     r.rows = rows;
@@ -1469,6 +1519,11 @@ pub fn activate(intro: &str, status: &str) {
 /// Leave sticky mode: reset the scroll region, clear the app's viewport, and return the cursor to
 /// the top-left so the shell prompt starts on a clean screen.
 pub fn deactivate() {
+    if retained::is_running() {
+        retained::stop();
+        ACTIVE.store(false, Ordering::Relaxed);
+        return;
+    }
     // Cleanup must be idempotent and must still run when Windows delivers CTRL_C_EVENT before the
     // keyboard thread observes it. In that race another path may already have cleared `ACTIVE`, but
     // the physical terminal can still contain the sticky frame and restricted scroll region.
@@ -1477,6 +1532,40 @@ pub fn deactivate() {
     reset_region(&mut buf);
     buf.push_str("\x1b[2J\x1b[H\x1b[?25h"); // clear viewport + home + ensure cursor is visible
     flush(&buf);
+}
+
+/// Idempotent, lock-free terminal restore for the two paths that must NEVER hang: a panic unwinding
+/// through the render thread, and a hard Ctrl-C. It writes escape sequences straight to stdout —
+/// show cursor, leave the retained alternate screen, reset the classic scroll region — and resets
+/// Windows stdin to cooked mode. It does NOT lock the render state, the runtime slot, or any mutex a
+/// poisoned/panicking thread might hold, so it is safe to call from a panic hook. Callable any number
+/// of times; a terminal that was never in a given mode ignores the corresponding reset.
+pub fn emergency_restore() {
+    // Retained backend: leave the alternate screen + show cursor without touching its runtime mutex.
+    retained::emergency_restore();
+    ACTIVE.store(false, Ordering::Relaxed);
+    // Classic sticky frame: reset scroll region + show cursor. Kept minimal (no full clear) so a
+    // panic message already printed stays visible above the restored prompt.
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b[r\x1b[?25h");
+    let _ = out.flush();
+    restore_stdin_cooked();
+}
+
+/// Install a one-time panic hook that restores the terminal BEFORE the default hook prints the panic
+/// message — otherwise a panic inside retained/sticky mode dumps the backtrace into the alternate
+/// screen (lost on exit) or onto a frame with a restricted scroll region (mangled). Chains the
+/// previous hook so the normal panic report still runs. Idempotent via a `OnceLock` latch.
+pub fn install_panic_hook() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    if INSTALLED.set(()).is_err() {
+        return;
+    }
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        emergency_restore();
+        prev(info);
+    }));
 }
 
 /// Temporarily yield the terminal so a `dialoguer` slash menu can use stdin/redraw normally. The
@@ -1488,6 +1577,11 @@ pub fn deactivate() {
 /// clear the footer rows, drop the region, and park the cursor where the box was, so the menu
 /// renders at the bottom of the existing transcript and continues it cleanly.
 pub fn suspend() {
+    if retained::is_running() {
+        retained::suspend();
+        prepare_dialoguer_session();
+        return;
+    }
     if !active() {
         return;
     }
@@ -1513,6 +1607,10 @@ pub fn suspend() {
 /// region: agent output always appends there and scrolls up, exactly like the steady state. The
 /// menu's leftover lines stay above as scrollback (harmless) and scroll away as new output arrives.
 pub fn resume(status: &str) {
+    if retained::is_running() {
+        let _ = retained::resume(status);
+        return;
+    }
     if !std::io::stdout().is_terminal() {
         return;
     }
@@ -1560,6 +1658,14 @@ pub fn emit(s: &str) {
         }
         return;
     }
+    if retained::is_running() {
+        // Route to the render thread even while SUSPENDED for a dialoguer menu: it folds this into
+        // its block buffer (no paint yet), and `resume` redraws from that buffer. Printing straight
+        // to the terminal here would be wiped by resume's clear+redraw (the "/sessions restore shows
+        // nothing" bug).
+        retained::emit(s);
+        return;
+    }
     if !active() {
         print!("{s}");
         let _ = std::io::stdout().flush();
@@ -1592,6 +1698,23 @@ pub fn emit_line(s: &str) {
 /// shared slot would corrupt where the next streamed token lands).
 pub fn set_working(working: bool) {
     WORKING.store(working, Ordering::Relaxed);
+    if !working {
+        // Defensive cleanup for error/early-return paths. Normal turns use identity-aware
+        // `disarm_cancel`; clearing here is safe because no turn is active once WORKING is false.
+        *active_turn_cancel().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    if retained::is_running() {
+        if working {
+            *work_start_slot().lock().unwrap() = Some(Instant::now());
+            WORK_FRAME.store(0, Ordering::Relaxed);
+            STREAM_CHARS.store(0, Ordering::Relaxed);
+            start_ticker();
+        } else {
+            *work_start_slot().lock().unwrap() = None;
+        }
+        retained::set_working(working);
+        return;
+    }
     // Reset the elapsed-seconds clock + spinner frame at each task boundary so the counter starts at
     // 0s and the indicator restarts cleanly. The ticker thread animates it while `working`.
     if working {
@@ -1622,6 +1745,10 @@ pub fn set_working(working: bool) {
 /// Update the status text (model · tokens · yolo) and repaint. (Does not touch the output slot —
 /// see [`set_working`].)
 pub fn set_status(status: &str) {
+    if retained::is_running() {
+        retained::set_status(status);
+        return;
+    }
     if !active() {
         return;
     }
@@ -1665,6 +1792,19 @@ pub fn spawn_input() -> InputHandles {
     InputHandles { submissions, cancel, resume: resume_tx, inject, _handle: handle }
 }
 
+/// Replace the live input draft without submitting it. Used by crash recovery: the interrupted user
+/// request is restored for review/editing, never auto-sent to the model. Safe before/after retained
+/// activation because the classic shared Render state remains the input source of truth.
+pub fn set_draft(text: &str) {
+    {
+        let mut r = render().lock().unwrap();
+        r.draft = text.chars().collect();
+        r.cursor = r.draft.len();
+        r.palette_sel = 0;
+    }
+    repaint_force();
+}
+
 /// Repaint the box from the current shared state (used by the input thread after an edit).
 fn repaint() {
     if !active() {
@@ -1673,8 +1813,70 @@ fn repaint() {
     repaint_force();
 }
 
+/// Translate the classic shared input/menu state into one retained-frame snapshot. The input thread
+/// still owns editing semantics; only drawing moved to the render thread.
+fn retained_input_snapshot() -> retained::InputSnapshot {
+    let r = render().lock().unwrap();
+    let overlay = if r.model_menu_active {
+        Some(retained::OverlaySnapshot {
+            title: "model".to_string(),
+            lines: r
+                .model_menu_rows
+                .iter()
+                .map(|row| if row.label.is_empty() { row.id.clone() } else { row.label.clone() })
+                .collect(),
+            selected: Some(r.model_menu_sel),
+            hint: "↑↓ pick · Enter set · Esc cancel".to_string(),
+        })
+    } else if r.sessions_menu_active {
+        Some(retained::OverlaySnapshot {
+            title: "sessions".to_string(),
+            lines: r
+                .sessions_menu_rows
+                .iter()
+                .map(|row| {
+                    if row.subtitle.is_empty() {
+                        row.title.clone()
+                    } else {
+                        format!("{}  ·  {}", row.title, row.subtitle)
+                    }
+                })
+                .collect(),
+            selected: Some(r.sessions_menu_sel),
+            hint: "↑↓ pick · Enter restore · d delete · Esc cancel".to_string(),
+        })
+    } else if r.text_overlay_active {
+        Some(retained::OverlaySnapshot {
+            title: r.text_overlay_title.clone(),
+            lines: r.text_overlay_lines.clone(),
+            selected: None,
+            hint: "↑↓/PgUp/PgDn scroll · Esc/q close".to_string(),
+        })
+    } else {
+        let matches = slash_matches(&r.draft);
+        (!matches.is_empty()).then(|| retained::OverlaySnapshot {
+            title: "commands".to_string(),
+            lines: matches.iter().map(|(name, desc)| format!("/{name}  ·  {desc}")).collect(),
+            selected: Some(r.palette_sel.min(matches.len().saturating_sub(1))),
+            hint: "↑↓ pick · Tab complete · Enter run".to_string(),
+        })
+    };
+    retained::InputSnapshot {
+        draft: r.draft.clone(),
+        cursor: r.cursor,
+        images: r.images,
+        status: r.status.clone(),
+        queued_count: r.queued_count,
+        overlay,
+    }
+}
+
 /// Repaint footer + overlays even when only the model menu needs a refresh.
 fn repaint_force() {
+    if retained::is_running() {
+        retained::update_input(retained_input_snapshot());
+        return;
+    }
     if !active() && !model_menu_active() && !sessions_menu_active() && !text_overlay_active() {
         return;
     }
@@ -1685,6 +1887,50 @@ fn repaint_force() {
     }
     paint_box(&mut buf, &r);
     flush(&buf);
+}
+
+/// Recall the previous history entry into the draft (↑ / Ctrl-P). Shared by the arrow keys and the
+/// readline-style Ctrl bindings so both stay in lock-step. `hist_idx` walks backward through
+/// `history`; the first recall stashes the in-progress draft in `draft_saved` so ↓ can restore it.
+fn recall_history_prev(hist_idx: &mut Option<usize>, draft_saved: &mut Vec<char>, history: &[String]) {
+    if history.is_empty() {
+        return;
+    }
+    let mut r = render().lock().unwrap();
+    let idx = match *hist_idx {
+        None => {
+            *draft_saved = r.draft.clone();
+            history.len() - 1
+        }
+        Some(0) => 0,
+        Some(i) => i - 1,
+    };
+    *hist_idx = Some(idx);
+    r.draft = history[idx].chars().collect();
+    r.cursor = r.draft.len();
+    drop(r);
+    repaint();
+}
+
+/// Recall the next history entry (↓ / Ctrl-N). Walks forward through `history`; stepping past the
+/// newest entry restores the draft that was in progress when history recall began.
+fn recall_history_next(hist_idx: &mut Option<usize>, draft_saved: &[char], history: &[String]) {
+    let mut r = render().lock().unwrap();
+    match *hist_idx {
+        Some(i) if i + 1 < history.len() => {
+            *hist_idx = Some(i + 1);
+            r.draft = history[i + 1].chars().collect();
+            r.cursor = r.draft.len();
+        }
+        Some(_) => {
+            *hist_idx = None;
+            r.draft = draft_saved.to_vec();
+            r.cursor = r.draft.len();
+        }
+        None => {}
+    }
+    drop(r);
+    repaint();
 }
 
 fn input_loop(
@@ -1734,6 +1980,16 @@ fn input_loop(
             continue;
         }
         if text_overlay_handle_key(&key) {
+            continue;
+        }
+        if retained::is_active() && RETAINED_INFO_OVERLAY.load(Ordering::Relaxed) {
+            match key {
+                Key::Escape | Key::Char('q') | Key::Char('Q') => retained_overlay_close(),
+                Key::PageUp => retained::scroll(-8),
+                Key::PageDown => retained::scroll(8),
+                Key::End => retained::scroll_end(),
+                _ => {}
+            }
             continue;
         }
         match key {
@@ -1937,6 +2193,15 @@ fn input_loop(
                 render().lock().unwrap().cursor = 0;
                 repaint();
             }
+            Key::PageUp if retained::is_active() => {
+                retained::scroll(-8);
+            }
+            Key::PageDown if retained::is_active() => {
+                retained::scroll(8);
+            }
+            Key::End if retained::is_active() && render().lock().unwrap().draft.is_empty() => {
+                retained::scroll_end();
+            }
             Key::End => {
                 let mut r = render().lock().unwrap();
                 r.cursor = r.draft.len();
@@ -1959,23 +2224,19 @@ fn input_loop(
                     repaint();
                     continue;
                 }
+                // In the retained alternate-screen backend the terminal has no native scrollback, so
+                // the mouse wheel is delivered as ↑/↓ key events (Windows Terminal "alternateScroll").
+                // At an empty prompt, route ↑ to transcript scroll so the wheel scrolls the chat like a
+                // normal pager instead of recalling the previous message. History recall stays on
+                // Ctrl-P/Ctrl-N. When the draft is non-empty the arrow still recalls history as before.
+                if retained::is_active() && render().lock().unwrap().draft.is_empty() {
+                    retained::scroll(-TRANSCRIPT_ARROW_SCROLL);
+                    continue;
+                }
                 if history.is_empty() {
                     continue;
                 }
-                let mut r = render().lock().unwrap();
-                let idx = match hist_idx {
-                    None => {
-                        draft_saved = r.draft.clone();
-                        history.len() - 1
-                    }
-                    Some(0) => 0,
-                    Some(i) => i - 1,
-                };
-                hist_idx = Some(idx);
-                r.draft = history[idx].chars().collect();
-                r.cursor = r.draft.len();
-                drop(r);
-                repaint();
+                recall_history_prev(&mut hist_idx, &mut draft_saved, &history);
             }
             Key::ArrowDown => {
                 let pal = {
@@ -1991,22 +2252,23 @@ fn input_loop(
                     repaint();
                     continue;
                 }
-                let mut r = render().lock().unwrap();
-                match hist_idx {
-                    Some(i) if i + 1 < history.len() => {
-                        hist_idx = Some(i + 1);
-                        r.draft = history[i + 1].chars().collect();
-                        r.cursor = r.draft.len();
-                    }
-                    Some(_) => {
-                        hist_idx = None;
-                        r.draft = draft_saved.clone();
-                        r.cursor = r.draft.len();
-                    }
-                    None => {}
+                // Symmetric to ArrowUp: at an empty prompt in retained mode, ↓ scrolls the transcript
+                // back toward the newest output (wheel-down). History recall stays on Ctrl-N.
+                if retained::is_active() && render().lock().unwrap().draft.is_empty() {
+                    retained::scroll(TRANSCRIPT_ARROW_SCROLL);
+                    continue;
                 }
-                drop(r);
-                repaint();
+                recall_history_next(&mut hist_idx, &draft_saved, &history);
+            }
+            // Ctrl-P / Ctrl-N: readline-style history recall. Kept reachable even though ↑/↓ at an empty
+            // prompt now drive transcript scroll (so the mouse wheel scrolls the chat) in retained mode.
+            Key::Char('\u{10}') => {
+                if !history.is_empty() {
+                    recall_history_prev(&mut hist_idx, &mut draft_saved, &history);
+                }
+            }
+            Key::Char('\u{e}') => {
+                recall_history_next(&mut hist_idx, &draft_saved, &history);
             }
             _ => {}
         }
@@ -2281,6 +2543,29 @@ pub fn emit_capture_abort() {
 /// Whether the pure-print text overlay currently owns keyboard input.
 pub fn text_overlay_active() -> bool {
     text_overlay_slot().lock().unwrap().active
+}
+
+/// Open an informational overlay directly in retained mode (used by live workflow/status panels).
+pub fn retained_overlay_open(title: impl Into<String>, text: impl Into<String>) -> bool {
+    if !retained::is_active() {
+        return false;
+    }
+    RETAINED_INFO_OVERLAY.store(true, Ordering::Relaxed);
+    retained::open_overlay(retained::OverlaySnapshot {
+        title: title.into(),
+        lines: text.into().lines().map(str::to_string).collect(),
+        selected: None,
+        hint: "Esc/q close · PgUp/PgDn scroll".to_string(),
+    });
+    true
+}
+
+pub fn retained_overlay_close() {
+    RETAINED_INFO_OVERLAY.store(false, Ordering::Relaxed);
+    if retained::is_running() {
+        retained::close_overlay();
+        repaint_force();
+    }
 }
 
 /// True when the sticky REPL can show the native text overlay.

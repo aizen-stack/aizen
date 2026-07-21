@@ -40,6 +40,7 @@ use console::{style, Style};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
 use crate::core::approval::ApprovalMode;
 use types::{Message, ToolDef};
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Parser, Debug)]
 // No explicit `name` — clap uses the package name ("aizen") for `--version` and the actual argv[0]
@@ -540,6 +541,18 @@ enum ConfigCmd {
         /// Icon style: `emoji` (default), `nerd` (needs a Nerd Font), or `off`.
         #[arg(long)]
         icons: Option<String>,
+        /// Final-answer visuals: `auto` (when useful), `always` (substantial replies), or `off`.
+        #[arg(long)]
+        response_visuals: Option<String>,
+        /// Interactive terminal backend: `auto`, `retained`, or `classic`.
+        #[arg(long)]
+        tui_mode: Option<String>,
+        /// Retained-render performance tier: `auto`, `full`, `reduced`, or `minimal`.
+        #[arg(long)]
+        tui_performance: Option<String>,
+        /// Landing/idle animation: `auto`, `on`, or `off`.
+        #[arg(long)]
+        idle_animation: Option<String>,
         /// Time-machine checkpoints to keep (oldest auto-pruned past this; `0` = unlimited). Default 50.
         #[arg(long)]
         timemachine_keep: Option<usize>,
@@ -802,6 +815,10 @@ enum MemoryCmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Restore the terminal (leave alt screen, show cursor, reset scroll region + cooked stdin) BEFORE
+    // the default panic printer runs, so a panic inside retained/sticky mode never dumps its backtrace
+    // into the alternate screen or onto a frame with a restricted scroll region. Idempotent.
+    crate::ui::tui::install_panic_hook();
     let cli = Cli::parse();
     let command = match cli.command {
         Some(c) => c,
@@ -1317,10 +1334,8 @@ SKIPPED unless you prefix with `/agent ` to run fully autonomously (no approval 
 Follow-ups keep context, so \"now fix it\" works. /new (or /reset) starts a fresh conversation · \
 /help shows this.";
 
-/// Split a string so each chunk is `<= max` **UTF-16 code units** — the unit Telegram (4096) and
-/// Discord (2000) actually count their message caps in. Splitting by Unicode scalar undercounts:
-/// an astral char (emoji, math-bold) is 1 scalar but 2 UTF-16 units, so an emoji-heavy reply under
-/// the char cap can still exceed the platform limit → HTTP 400 → the reply is silently dropped.
+/// Split text under a platform's UTF-16 limit, preferring newline boundaries so table records and
+/// text-diagram rows stay intact. A single over-limit line falls back to scalar-safe hard splitting.
 fn chunk_text(s: &str, max: usize) -> Vec<String> {
     if s.encode_utf16().count() <= max {
         return vec![s.to_string()];
@@ -1328,14 +1343,33 @@ fn chunk_text(s: &str, max: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut cur_units = 0usize;
-    for ch in s.chars() {
-        let u = ch.len_utf16();
-        if cur_units + u > max && !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
-            cur_units = 0;
+    for segment in s.split_inclusive('\n') {
+        let units = segment.encode_utf16().count();
+        if units <= max {
+            if cur_units + units > max && !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+                cur_units = 0;
+            }
+            cur.push_str(segment);
+            cur_units += units;
+            continue;
         }
-        cur.push(ch);
-        cur_units += u;
+        if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        let mut piece = String::new();
+        let mut piece_units = 0usize;
+        for ch in segment.chars() {
+            let u = ch.len_utf16();
+            if piece_units + u > max && !piece.is_empty() {
+                out.push(std::mem::take(&mut piece));
+                piece_units = 0;
+            }
+            piece.push(ch);
+            piece_units += u;
+        }
+        cur = piece;
+        cur_units = piece_units;
     }
     if !cur.is_empty() {
         out.push(cur);
@@ -1395,15 +1429,16 @@ const SERVE_SESSION_MAX_MSGS: usize = 40;
 /// until under `max`, always cutting at a `user` boundary so an assistant tool-call turn is never
 /// split from its tool results (a dangling tool_call ⇒ a 400 on strict gateways).
 fn cap_session(history: &mut Vec<Message>, max: usize) {
+    let lead = agent::compact::leading_system_count(history).max(1);
     while history.len() > max {
-        // index of the SECOND user message (the start of the 2nd turn); drop [1, that).
+        // index of the SECOND user message (the start of the 2nd turn); drop after the system prefix.
         let second_user =
-            history.iter().enumerate().filter(|(i, m)| *i >= 1 && m.role == "user").nth(1).map(|(i, _)| i);
+            history.iter().enumerate().filter(|(i, m)| *i >= lead && m.role == "user").nth(1).map(|(i, _)| i);
         match second_user {
-            Some(i) => {
-                history.drain(1..i);
+            Some(i) if i > lead => {
+                history.drain(lead..i);
             }
-            None => break, // only one turn present → nothing safe to drop; the loop guard handles it
+            _ => break, // only one turn present → nothing safe to drop; the loop guard handles it
         }
     }
 }
@@ -1422,8 +1457,12 @@ async fn run_serve_turn(
     approval_mode: ApprovalMode,
 ) -> Result<String> {
     if history.is_empty() {
-        // Built once per session → the prefix stays byte-stable across the conversation (cache-warm).
-        history.push(Message::system(current_system_prompt(model)));
+        // Built once per session → the stable lane stays byte-stable across the conversation.
+        let bundle = current_system_prompt_bundle(model);
+        history.push(Message::system(bundle.stable));
+        if !bundle.dynamic.trim().is_empty() {
+            history.push(Message::system(bundle.dynamic));
+        }
     }
     history.push(Message::user(task.to_string()));
 
@@ -1574,7 +1613,8 @@ async fn run_serve() -> Result<()> {
         let reply = run_serve_turn(&http, &base_url, &api_key, &model, history, &task, approval)
             .await
             .unwrap_or_else(|e| format!("error: {e}"));
-        for piece in chunk_text(&reply, 3500) {
+        let shown = crate::ui::markdown::render_plain_blocks(&reply);
+        for piece in chunk_text(&shown, 3500) {
             let _ = client.send_message(chat, &piece).await;
         }
     }
@@ -1867,7 +1907,8 @@ fn restore_menu(
             save_session(history, "last").context("backing up the current conversation before combined restore")?;
             files_restore(snap.id)?;
             *history = chat;
-            let _ = model_label;
+            migrate_legacy_prompt_lanes(history, model_label);
+            refresh_dynamic_prompt_lane(history, model_label);
             println!(
                 "{} #{} — files and conversation rewound",
                 style("⏪ restored both").color256(splash::ACCENT),
@@ -1904,9 +1945,8 @@ fn task_restore(id: u32, history: &mut Vec<Message>, model_label: &mut String) -
     // Fail closed: do not replace the live transcript unless its recovery copy is durable.
     save_session(history, "last").context("backing up the current conversation before task restore")?;
     *history = chat;
-    // The restored transcript carries its own system prompt at [0]; refresh the model label line so
-    // the HUD matches, without rebuilding (which would wipe the restored history).
-    let _ = model_label;
+    migrate_legacy_prompt_lanes(history, model_label);
+    refresh_dynamic_prompt_lane(history, model_label);
     println!(
         "{} #{} — conversation rewound; files untouched",
         style("⏪ restored task").color256(splash::ACCENT),
@@ -2071,7 +2111,8 @@ async fn run_discord_serve() -> Result<()> {
         let reply = run_serve_turn(&http, &base_url, &api_key, &model, history, &task, approval)
             .await
             .unwrap_or_else(|e| format!("error: {e}"));
-        for piece in chunk_text(&reply, discord::MESSAGE_MAX) {
+        let shown = crate::ui::markdown::render_plain_blocks(&reply);
+        for piece in chunk_text(&shown, discord::MESSAGE_MAX) {
             let _ = client.send_message(inc.channel_id, &piece).await;
         }
     }
@@ -3455,14 +3496,23 @@ async fn run_menu_sticky() -> Result<()> {
     let mut model_label = cli_config::load().model.unwrap_or_else(|| "(no model)".to_string());
     let mut history: Vec<Message> = Vec::new();
     rebuild_system(&mut history, &model_label);
+    let repo_scope = crate::core::recovery::current_repo_scope();
 
+    // Text-only splash: `activate` may pick the retained backend, whose alt-screen renderer sanitizes
+    // CSI but would pass a raw sixel DCS image through as garbage. Braille sun → pure printable text,
+    // safe for both backends. Classic-only sixel isn't worth a backend-conditional intro string.
     let intro = format!(
         "{}\n{}",
-        splash::render(),
+        splash::render_text_only(),
         style("Type to talk — messages queue while it works · Esc cancels a running turn · /help · /quit")
             .dim()
     );
     tui::activate(&intro, &status_text(&history, &model_label));
+    crate::core::recovery::begin(repo_scope.clone(), current_session_slug());
+    if let Some(offer) = crate::core::recovery::scan_stale(&repo_scope).into_iter().next() {
+        tui::emit_line(&style(format!("⟳ {}", crate::core::recovery::format_offer(&offer))).dim().to_string());
+        tui::emit_line(&style("  /recover restore · /recover discard").dim().to_string());
+    }
     let mut input = tui::spawn_input();
 
     loop {
@@ -3553,6 +3603,8 @@ async fn run_menu_sticky() -> Result<()> {
                     tui::emit_line(&style(format!("  {}{}", icons::g(icons::tip()), tip)).dim().to_string());
                 }
                 model_label = model.clone();
+                migrate_legacy_prompt_lanes(&mut history, &model);
+                refresh_dynamic_prompt_lane(&mut history, &model);
                 // The rotating discoverability tip is emitted AFTER the turn finishes (see the
                 // success branch below) so it lands UNDER the model's final answer, not stranded
                 // above it at turn start.
@@ -3561,13 +3613,20 @@ async fn run_menu_sticky() -> Result<()> {
                 let eff = resolve_turn_effort(&line);
                 cli_config::set_effort_override(eff.clone());
                 tui::emit_line(&effort_turn_line(eff.as_deref()));
+                if let Err(e) = crate::core::recovery::checkpoint_history(
+                    &history,
+                    Some(&line),
+                    crate::core::recovery::RecoveryPhase::WaitingModel,
+                ) {
+                    tui::emit_line(&style(format!("recovery boundary unavailable for this turn: {e}")).dim().to_string());
+                }
                 if images.is_empty() {
-                    history.push(Message::user(line));
+                    history.push(Message::user(line.clone()));
                 } else {
                     tui::emit_line(
                         &style(format!("📎 {} image(s) attached", images.len())).color256(splash::ACCENT).to_string(),
                     );
-                    history.push(Message::user_with_images(line, images));
+                    history.push(Message::user_with_images(line.clone(), images));
                 }
                 let persona_before = cli_config::load().persona;
                 // Arm LSP BEFORE building the registry — tools only register while enabled.
@@ -3587,8 +3646,10 @@ async fn run_menu_sticky() -> Result<()> {
                         continue;
                     }
                 };
+                let turn_cancel = crate::core::cancel::TurnCancel::new();
                 let cfg = AgentConfig {
                     approval_mode: approval_mode(),
+                    cancel: turn_cancel.clone(),
                     context_window: resolve_ctx_window(&model).0,
                     enable_self_review: cli_config::load().self_review.unwrap_or(false),
                     // Reflect the live manager state (honors `/lsp off` for this turn).
@@ -3596,8 +3657,8 @@ async fn run_menu_sticky() -> Result<()> {
                     ..AgentConfig::default()
                 };
 
-                tui::clear_cancel(); // fresh turn → forget any Esc from a previous one
-                while input.cancel.try_recv().is_ok() {} // drain any stale cancel
+                tui::arm_cancel(turn_cancel.clone());
+                while input.cancel.try_recv().is_ok() {} // drain any stale wake-up
                 // A quiet "here we go" line: the whimsical working verb ("✦ Pondering…") prints ONCE
                 // into the scrolling transcript at turn start, so each run opens on a fresh word —
                 // instead of the verb cycling in the cramped HUD pill. This path only runs under the
@@ -3613,6 +3674,7 @@ async fn run_menu_sticky() -> Result<()> {
                 // it after the clear+drain guarantees no Esc meant for THIS turn gets swallowed in the
                 // arming window.
                 tui::set_working(true);
+                crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::WaitingModel);
 
                 // Run the turn racing a cancel signal; on cancel the future is DROPPED at its current
                 // await (model stream / tool batch / verify gate), which aborts the in-flight request.
@@ -3681,6 +3743,8 @@ async fn run_menu_sticky() -> Result<()> {
                     }
                 };
                 tui::set_working(false);
+                tui::disarm_cancel(&turn_cancel);
+                crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::Finalizing);
                 // Disarm the per-turn effort override the moment the turn ends — every branch below
                 // (ok / clarify / interrupt / error) flows through here, so effort never leaks into
                 // the next turn regardless of how this one finished.
@@ -3749,10 +3813,18 @@ async fn run_menu_sticky() -> Result<()> {
                     }
                 }
                 tui::set_status(&status_text(&history, &model_label));
+                if let Err(e) = crate::core::recovery::checkpoint_history(
+                    &history,
+                    None,
+                    crate::core::recovery::RecoveryPhase::Idle,
+                ) {
+                    tui::emit_line(&style(format!("recovery checkpoint not updated: {e}")).dim().to_string());
+                }
             }
         }
     }
     tui::deactivate();
+    crate::core::recovery::clear();
     crate::agent::process::kill_all(); // reap any background dev servers/watchers we started
     println!("{}", style("bye.").dim());
     Ok(())
@@ -3830,6 +3902,8 @@ async fn run_menu_plain() -> Result<()> {
             }
         };
         model_label = model.clone();
+        migrate_legacy_prompt_lanes(&mut history, &model);
+        refresh_dynamic_prompt_lane(&mut history, &model);
         // Per-turn reasoning-effort auto-detect (mirrors the sticky REPL): classify the finalized
         // user text, arm the override the client reads this turn, and show the chosen tier.
         let eff = resolve_turn_effort(&line);
@@ -3865,8 +3939,10 @@ async fn run_menu_plain() -> Result<()> {
             }
         };
         // Unified ask/smart/yolo approval, with AIZEN_YES forcing yolo.
+        let turn_cancel = crate::core::cancel::TurnCancel::new();
         let cfg = AgentConfig {
             approval_mode: approval_mode(),
+            cancel: turn_cancel,
             context_window: resolve_ctx_window(&model).0,
             enable_self_review: cli_config::load().self_review.unwrap_or(false),
             enable_lsp: crate::agent::lsp::LSP.is_enabled(),
@@ -4397,21 +4473,64 @@ async fn run_persona_reflection(
     }
 }
 
-/// Build the current system prompt (frozen core + optional session working memory + persona + skills).
-fn current_system_prompt(model: &str) -> String {
+/// Build the current system prompt lanes (stable cache prefix + dynamic identity/memory).
+fn current_system_prompt_bundle(model: &str) -> agent::PromptBundle {
     let frozen = memory::refresh_frozen_core();
     let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let mut system =
-        agent::build_top_level_system_prompt(&cwd, std::env::consts::OS, &date, model, Some(&frozen));
+    let mut bundle =
+        agent::build_top_level_system_prompt_bundle(&cwd, std::env::consts::OS, &date, model, Some(&frozen));
     // L2 session working memory (temporary, budget-capped). Empty → no tag (zero cost).
     let sess_budget = memory::settings().session_mem_max_tokens;
     if let Some(block) = memory::session_mem::process_prompt_block(sess_budget) {
-        system.push('\n');
-        system.push_str(&block);
-        system.push('\n');
+        bundle.dynamic.push('\n');
+        bundle.dynamic.push_str(&block);
+        bundle.dynamic.push('\n');
     }
-    system
+    bundle
+}
+
+/// Flattened system prompt for callers that still expect a single string.
+fn current_system_prompt(model: &str) -> String {
+    current_system_prompt_bundle(model).flatten()
+}
+
+/// Seed both system lanes for a brand-new conversation.
+fn seed_prompt_lanes(history: &mut Vec<Message>, model: &str) {
+    history.clear();
+    let bundle = current_system_prompt_bundle(model);
+    history.push(Message::system(bundle.stable));
+    if !bundle.dynamic.trim().is_empty() {
+        history.push(Message::system(bundle.dynamic));
+    }
+}
+
+/// Replace a persisted zero/one-system legacy prefix with the current two-lane prompt.
+/// Histories already carrying both lanes are left byte-identical.
+fn migrate_legacy_prompt_lanes(history: &mut Vec<Message>, model: &str) {
+    let lead = agent::compact::leading_system_count(history);
+    if lead >= 2 {
+        return;
+    }
+    let tail = history.get(lead..).unwrap_or_default().to_vec();
+    seed_prompt_lanes(history, model);
+    history.extend(tail);
+}
+
+/// Fresh user-turn boundary: refresh only the dynamic lane, preserving stable index 0 byte-for-byte.
+fn refresh_dynamic_prompt_lane(history: &mut Vec<Message>, model: &str) {
+    migrate_legacy_prompt_lanes(history, model);
+    let dynamic = current_system_prompt_bundle(model).dynamic;
+    let lead = agent::compact::leading_system_count(history);
+    if dynamic.trim().is_empty() {
+        if lead > 1 {
+            history.remove(1);
+        }
+    } else if lead > 1 {
+        history[1] = Message::system(dynamic);
+    } else {
+        history.insert(1, Message::system(dynamic));
+    }
 }
 
 /// Reset the conversation to just the system prompt (fresh session / model change). Rebuilds the
@@ -4419,18 +4538,13 @@ fn current_system_prompt(model: &str) -> String {
 /// Drops session working memory — a new thread does not inherit this session's scratch notes.
 fn rebuild_system(history: &mut Vec<Message>, model: &str) {
     memory::session_mem::clear_process_session_mem();
-    history.clear();
-    history.push(Message::system(current_system_prompt(model)));
+    seed_prompt_lanes(history, model);
 }
 
-/// Replace the system message in place WITHOUT clearing the conversation — used when switching
+/// Replace the system lanes in place WITHOUT clearing the conversation — used when switching
 /// persona mid-chat so the new character applies but the history is preserved.
 fn update_system_prompt(history: &mut Vec<Message>, model: &str) {
-    let system = current_system_prompt(model);
-    match history.first_mut() {
-        Some(first) if first.role == "system" => *first = Message::system(system),
-        _ => history.insert(0, Message::system(system)),
-    }
+    refresh_dynamic_prompt_lane(history, model);
 }
 
 /// Approximate context window (tokens) for a model, by name pattern. A rough heuristic for the
@@ -5039,6 +5153,7 @@ const SLASH_CMDS: &[(&str, &str)] = &[
     ("telegram", "Telegram integration menu (setup · test · status · daemon)"),
     ("sessions", "saved conversations — restore · save · delete (auto-saves as you go)"),
     ("workflows", "multi-agent status — live task/workflow children + slot gate"),
+    ("recover", "restore a crashed session safely (no auto tool replay)"),
     ("timeline", "show the checkpoint timeline; /timeline pick to restore (git snapshots)"),
     ("checkpoint", "save a restore point of the code now"),
     ("compact", "summarize older turns to free context now"),
@@ -5085,7 +5200,8 @@ Commands:
   /skills            saved procedures the agent can load (list · view · new · delete)
   /commands          your custom slash commands — markdown macros in ~/.aizen/commands/ ($ARGUMENTS · @file · !`cmd`)
   /apps              connected apps & MCP catalog — Telegram/Discord/Slack/webhook + browser sign-in apps
-  /mcp               MCP servers from ~/.aizen/mcp.json — list connected tools
+  /mcp               MCP servers from ~/.aizen/mcp.json — lifecycle generation, health, pinned schema + tools
+  /browser           browser profile/routes status (when built with --features browser)
   /telegram          Telegram integration menu (setup · test · status · start daemon · disable)
   /sessions          saved conversations — restore · save · delete (auto-saves as you go)
   /workflows         multi-agent status — live task/workflow children, sub-agent slots (also /wf)
@@ -5142,7 +5258,10 @@ async fn slash_tools(_arg: &str) {
 }
 
 async fn slash_workflows(_arg: &str) {
-    tui::emit_line(&agent::orchestration::format_status());
+    let status = agent::orchestration::format_status();
+    if !tui::retained_overlay_open("Activity", &status) {
+        tui::emit_line(&status);
+    }
 }
 
 async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut String) -> SlashOutcome {
@@ -5158,6 +5277,8 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             client::cost_meter().reset(); // and a fresh cost tally
             tui::reset_session_allow(); // re-confirm destructive ops in the new conversation
             set_session_slug(None); // the next turn names + autosaves a brand-new session file
+            #[cfg(feature = "browser")]
+            crate::agent::browser::release_active(); // drop this conversation's browser page/@refs
             tui::emit_line(&style("(new conversation)").dim().to_string());
         }
         "tokens" => print_status_line(history, model_label),
@@ -5168,11 +5289,53 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             tui::emit_line(&style("→ use /sessions — restore / save / delete are all there now").dim().to_string());
         }
         "sessions" => {
-            if let Err(e) = sessions_menu(history).await {
+            if let Err(e) = sessions_menu(history, model_label).await {
                 eprintln!("{} {e}", style("sessions:").red());
             }
         }
         "workflows" | "workflow" | "wf" | "agents-status" => slash_workflows(arg).await,
+        "recover" | "recovery" => {
+            let repo_scope = crate::core::recovery::current_repo_scope();
+            let offers = crate::core::recovery::scan_stale(&repo_scope);
+            if offers.is_empty() {
+                tui::emit_line(&style("no recoverable sessions found").dim().to_string());
+            } else if arg == "discard" || arg == "drop" {
+                for offer in &offers {
+                    let _ = crate::core::recovery::discard(offer);
+                }
+                tui::emit_line(&style(format!("discarded {} recovery lease(s)", offers.len())).dim().to_string());
+            } else {
+                // Restore the newest offer. Side effects are never auto-replayed — only history + draft.
+                let offer = &offers[0];
+                match crate::core::recovery::accept(offer) {
+                    Ok((restored, draft)) => {
+                        *history = restored;
+                        migrate_legacy_prompt_lanes(history, model_label);
+                        refresh_dynamic_prompt_lane(history, model_label);
+                        agent::replay_transcript(history);
+                        if let Some(d) = draft {
+                            tui::set_draft(&d);
+                            tui::emit_line(&style("restored interrupted draft into the input box (not submitted)").dim().to_string());
+                        }
+                        if offer.manifest.side_effects_possible {
+                            let checkpoint = offer
+                                .manifest
+                                .checkpoint_id
+                                .map(|id| format!(" Check Time Machine checkpoint #{id} before retrying."))
+                                .unwrap_or_else(|| " Check Time Machine before retrying.".to_string());
+                            tui::emit_line(
+                                &style(format!(
+                                    "⚠ a previous tool may already have completed; retrying could repeat its side effect.{checkpoint}"
+                                ))
+                                .color256(theme::WARN)
+                                .to_string(),
+                            );
+                        }
+                    }
+                    Err(e) => tui::emit_line(&format!("{} {e}", style("recover:").red())),
+                }
+            }
+        }
         "compact" => {
             // Harvest what the older turns touched BEFORE they collapse — once summarized their tool
             // calls are gone, so the tree must read the history while it's still whole.
@@ -5436,6 +5599,19 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             }
         }
         "mcp" => tui::emit_line(&crate::agent::mcp::summary()),
+        "browser" => {
+            #[cfg(feature = "browser")]
+            {
+                if matches!(arg, "doctor" | "check" | "probe") {
+                    tui::emit_line(&style("probing browser profiles…").dim().to_string());
+                    tui::emit_line(&crate::agent::browser::doctor().await);
+                } else {
+                    tui::emit_line(&crate::agent::browser::status());
+                }
+            }
+            #[cfg(not(feature = "browser"))]
+            tui::emit_line(&style("browser tools are not included in this build (build with --features browser)").dim().to_string());
+        }
         "tools" | "toolsets" => slash_tools(arg).await,
         "commands" | "cmds" => match commands::summary() {
             Some(s) => tui::emit_line(&style(s).dim().to_string()),
@@ -5505,8 +5681,28 @@ fn sessions_dir() -> std::path::PathBuf {
     config::nextgen_home().join("sessions")
 }
 fn sanitize_name(s: &str) -> String {
-    let n: String = s.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-    if n.is_empty() { "session".to_string() } else { n }
+    let n: String = s
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(80)
+        .collect();
+    let n = n.trim_matches(['.', ' ']);
+    // Windows device names resolve specially even with an extension (`CON.json`, `NUL.json`, …).
+    // Prefix them so a saved/restored session can never target a device path.
+    let upper = n.to_ascii_uppercase();
+    let numbered_device = |prefix: &str| {
+        upper.strip_prefix(prefix).is_some_and(|d| d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && d != "0")
+    };
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || numbered_device("COM")
+        || numbered_device("LPT");
+    if n.is_empty() {
+        "session".to_string()
+    } else if reserved {
+        format!("session_{n}")
+    } else {
+        n.to_string()
+    }
 }
 /// Suggest a human-readable session name from the conversation's first user turn, so the "Save as"
 /// prompt comes PRE-FILLED with the topic (Enter to accept, or edit) instead of a blank box. A short
@@ -5554,17 +5750,32 @@ fn save_session(history: &[Message], name: &str) -> Result<String> {
     crate::core::persist::harden_owner_only_checked(&path)?;
     Ok(path.display().to_string())
 }
-fn load_session(history: &mut Vec<Message>, name: &str) -> Result<usize> {
+fn load_session(history: &mut Vec<Message>, name: &str, model: &str) -> Result<usize> {
     let path = sessions_dir().join(format!("{}.json", sanitize_name(name)));
     let s = std::fs::read_to_string(&path).with_context(|| format!("no saved session '{name}'"))?;
     let loaded: Vec<Message> = serde_json::from_str(&s).context("parsing session file")?;
     *history = loaded;
+    migrate_legacy_prompt_lanes(history, model);
+    refresh_dynamic_prompt_lane(history, model);
     // Continue autosaving into the SAME file we just restored (don't spawn a fresh slug next turn).
     set_session_slug(Some(sanitize_name(name)));
     Ok(history.len())
 }
-fn set_session_slug(_slug: Option<String>) {}
-fn current_session_slug() -> Option<String> { None }
+static SESSION_SLUG: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn session_slug_slot() -> &'static Mutex<Option<String>> {
+    SESSION_SLUG.get_or_init(|| Mutex::new(None))
+}
+
+fn set_session_slug(slug: Option<String>) {
+    let slug = slug.map(|s| sanitize_name(&s));
+    *session_slug_slot().lock().unwrap_or_else(|e| e.into_inner()) = slug.clone();
+    crate::core::recovery::set_session_name(slug);
+}
+
+fn current_session_slug() -> Option<String> {
+    session_slug_slot().lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
 fn pretty_session_name(name: &str) -> String { name.replace('-', " ") }
 
 async fn autosave_session(
@@ -5610,14 +5821,23 @@ fn delete_session(name: &str) -> Result<()> {
 /// you can always come back to it via `/sessions` without ever running an explicit save.
 fn autosave_last(history: &[Message]) {
     if history.iter().any(|m| m.role == "user") {
-        let _ = save_session(history, "last");
+        let name = current_session_slug().unwrap_or_else(|| "last".to_string());
+        let _ = save_session(history, &name);
+        if name != "last" {
+            let _ = save_session(history, "last");
+        }
+        let _ = crate::core::recovery::checkpoint_history(
+            history,
+            None,
+            crate::core::recovery::RecoveryPhase::Idle,
+        );
     }
 }
 
 /// `/sessions` — the conversation manager (replaces the old `/save` + `/load`): pick a saved
 /// conversation to RESTORE, save the current one under a name, or delete one. The live chat is also
 /// auto-saved as `last` after every turn, so there's always something to come back to.
-async fn sessions_menu(history: &mut Vec<Message>) -> Result<()> {
+async fn sessions_menu(history: &mut Vec<Message>, model_label: &str) -> Result<()> {
     loop {
         let theme = ui_theme();
         let names = list_sessions();
@@ -5651,7 +5871,7 @@ async fn sessions_menu(history: &mut Vec<Message>) -> Result<()> {
 
         if pick < n_sessions {
             let name = &names[pick];
-            match load_session(history, name) {
+            match load_session(history, name, model_label) {
                 Ok(n) => {
                     println!("{}", style(format!("restored '{}' ({n} messages)", pretty_session_name(name))).color256(splash::ACCENT));
                     agent::replay_transcript(history);
@@ -5822,7 +6042,7 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
         None => return config_wizard().await, // bare `ng config` → interactive setup
     };
     match cmd {
-        ConfigCmd::Set { base_url, api_key, model, context_window, compact_threshold, auto_skill_learn, memory_auto_learn, persona_evolve, price_in, price_out, icons, timemachine_keep, timemachine_max_files, timemachine_max_bytes, timemachine_max_file_bytes, auto_effort, reasoning_effort, approval, ultimate, adaptive_effort, disabled_toolsets, enabled_toolsets } => {
+        ConfigCmd::Set { base_url, api_key, model, context_window, compact_threshold, auto_skill_learn, memory_auto_learn, persona_evolve, price_in, price_out, icons, response_visuals, tui_mode, tui_performance, idle_animation, timemachine_keep, timemachine_max_files, timemachine_max_bytes, timemachine_max_file_bytes, auto_effort, reasoning_effort, approval, ultimate, adaptive_effort, disabled_toolsets, enabled_toolsets } => {
             if base_url.is_none()
                 && api_key.is_none()
                 && model.is_none()
@@ -5834,6 +6054,10 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                 && price_in.is_none()
                 && price_out.is_none()
                 && icons.is_none()
+                && response_visuals.is_none()
+                && tui_mode.is_none()
+                && tui_performance.is_none()
+                && idle_animation.is_none()
                 && timemachine_keep.is_none()
                 && timemachine_max_files.is_none()
                 && timemachine_max_bytes.is_none()
@@ -5896,6 +6120,18 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                     anyhow::bail!("--icons must be one of: emoji, nerd, off");
                 }
                 cfg.icons = Some(v);
+            }
+            if let Some(v) = response_visuals {
+                cfg.response_visuals = Some(v.parse::<cli_config::ResponseVisuals>().map_err(anyhow::Error::msg)?);
+            }
+            if let Some(v) = tui_mode {
+                cfg.tui_mode = Some(v.parse::<cli_config::TuiMode>().map_err(anyhow::Error::msg)?);
+            }
+            if let Some(v) = tui_performance {
+                cfg.tui_performance = Some(v.parse::<cli_config::TuiPerformance>().map_err(anyhow::Error::msg)?);
+            }
+            if let Some(v) = idle_animation {
+                cfg.idle_animation = Some(v.parse::<cli_config::IdleAnimation>().map_err(anyhow::Error::msg)?);
             }
             if let Some(k) = timemachine_keep {
                 cfg.timemachine_keep = Some(k); // 0 = unlimited
@@ -6085,6 +6321,10 @@ fn print_config(cfg: &cli_config::CliConfig) {
     // ── Display ──
     section("Display");
     row("icons", theme::accent(cfg.icons.as_deref().unwrap_or("nerd")).to_string());
+    row("visuals", theme::accent(cfg.response_visuals().to_string()).to_string());
+    row("tui", theme::accent(cfg.tui_mode().to_string()).to_string());
+    row("perf", theme::accent(cfg.tui_performance().to_string()).to_string());
+    row("animation", theme::accent(cfg.idle_animation().to_string()).to_string());
     println!();
 }
 
@@ -6154,6 +6394,8 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
         };
         let approval_h = cfg.persisted_approval_mode().to_string();
         let icons_h = cfg.icons.clone().unwrap_or_else(|| "nerd".into());
+        let visuals_h = cfg.response_visuals().to_string();
+        let tui_h = cfg.tui_mode().to_string();
 
         let items = vec![
             format!("Connection      · api key {key_h}"),
@@ -6162,7 +6404,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             format!("Session         · compact {compact_h}"),
             format!("Reasoning       · {effort_h}"),
             format!("Approval        · {approval_h}"),
-            format!("Display         · icons {icons_h}"),
+            format!("Display         · {tui_h} · icons {icons_h} · visuals {visuals_h}"),
             "Show full config".to_string(),
             "Done".to_string(),
         ];
@@ -6424,7 +6666,7 @@ fn config_edit_approval(cfg: &mut cli_config::CliConfig) -> Result<()> {
     Ok(())
 }
 
-/// Section editor: icon style (nerd / emoji / off), applied immediately.
+/// Section editor: icon style plus final-answer visual structure, both applied on the next turn.
 fn config_edit_display(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let theme = ui_theme();
     let opts = ["nerd (needs a Nerd Font)", "emoji (any font)", "off"];
@@ -6433,21 +6675,110 @@ fn config_edit_display(cfg: &mut cli_config::CliConfig) -> Result<()> {
         "off" | "none" => 2,
         _ => 0,
     };
-    let pick = match Select::with_theme(&theme)
+    if let Some(pick) = Select::with_theme(&theme)
         .with_prompt("Icons (Esc keeps current)")
         .items(&opts)
         .default(cur_idx)
         .interact_opt()?
     {
-        Some(i) => i,
-        None => return Ok(()),
+        cfg.icons = Some(match pick {
+            1 => "emoji",
+            2 => "off",
+            _ => "nerd",
+        }.to_string());
+        icons::set_tier(cfg.icons.as_deref());
+    }
+
+    let visual_opts = [
+        "auto (tables/diagrams when useful)",
+        "always (every substantial final reply)",
+        "off (prose Markdown only)",
+    ];
+    let visual_idx = match cfg.response_visuals() {
+        cli_config::ResponseVisuals::Auto => 0,
+        cli_config::ResponseVisuals::Always => 1,
+        cli_config::ResponseVisuals::Off => 2,
     };
-    cfg.icons = Some(match pick {
-        1 => "emoji",
-        2 => "off",
-        _ => "nerd",
-    }.to_string());
-    icons::set_tier(cfg.icons.as_deref()); // apply immediately
+    if let Some(pick) = Select::with_theme(&theme)
+        .with_prompt("Reply visuals (Esc keeps current)")
+        .items(&visual_opts)
+        .default(visual_idx)
+        .interact_opt()?
+    {
+        cfg.response_visuals = Some(match pick {
+            1 => cli_config::ResponseVisuals::Always,
+            2 => cli_config::ResponseVisuals::Off,
+            _ => cli_config::ResponseVisuals::Auto,
+        });
+    }
+
+    let tui_opts = [
+        "auto (retained, safe fallback)",
+        "retained (full-frame viewport)",
+        "classic (legacy sticky ANSI)",
+    ];
+    let tui_idx = match cfg.tui_mode() {
+        cli_config::TuiMode::Auto => 0,
+        cli_config::TuiMode::Retained => 1,
+        cli_config::TuiMode::Classic => 2,
+    };
+    if let Some(pick) = Select::with_theme(&theme)
+        .with_prompt("Terminal UI (takes effect next launch)")
+        .items(&tui_opts)
+        .default(tui_idx)
+        .interact_opt()?
+    {
+        cfg.tui_mode = Some(match pick {
+            1 => cli_config::TuiMode::Retained,
+            2 => cli_config::TuiMode::Classic,
+            _ => cli_config::TuiMode::Auto,
+        });
+    }
+
+    let perf_opts = [
+        "auto (adapt to terminal)",
+        "full (smoothest)",
+        "reduced (lower CPU)",
+        "minimal (no decoration)",
+    ];
+    let perf_idx = match cfg.tui_performance() {
+        cli_config::TuiPerformance::Auto => 0,
+        cli_config::TuiPerformance::Full => 1,
+        cli_config::TuiPerformance::Reduced => 2,
+        cli_config::TuiPerformance::Minimal => 3,
+    };
+    if let Some(pick) = Select::with_theme(&theme)
+        .with_prompt("TUI performance (Esc keeps current)")
+        .items(&perf_opts)
+        .default(perf_idx)
+        .interact_opt()?
+    {
+        cfg.tui_performance = Some(match pick {
+            1 => cli_config::TuiPerformance::Full,
+            2 => cli_config::TuiPerformance::Reduced,
+            3 => cli_config::TuiPerformance::Minimal,
+            _ => cli_config::TuiPerformance::Auto,
+        });
+    }
+
+    let anim_opts = ["auto", "on", "off"];
+    let anim_idx = match cfg.idle_animation() {
+        cli_config::IdleAnimation::Auto => 0,
+        cli_config::IdleAnimation::On => 1,
+        cli_config::IdleAnimation::Off => 2,
+    };
+    if let Some(pick) = Select::with_theme(&theme)
+        .with_prompt("Idle animation (Esc keeps current)")
+        .items(&anim_opts)
+        .default(anim_idx)
+        .interact_opt()?
+    {
+        cfg.idle_animation = Some(match pick {
+            1 => cli_config::IdleAnimation::On,
+            2 => cli_config::IdleAnimation::Off,
+            _ => cli_config::IdleAnimation::Auto,
+        });
+    }
     Ok(())
 }
 
@@ -6710,7 +7041,7 @@ async fn run_chat(args: ChatArgs) -> Result<()> {
     let http = http_client()?;
 
     let messages = vec![Message::user(prompt)];
-    client::stream_chat(&http, &base_url, &api_key, &model, messages)
+    client::stream_chat_with_visual_contract(&http, &base_url, &api_key, &model, messages, true)
         .await
         .context("chat completion failed")?;
     Ok(())
@@ -7680,6 +8011,11 @@ mod tests {
         }
         assert_eq!(chunks.concat(), s, "reassembles losslessly");
         assert_eq!(chunk_text("hello", 3500), vec!["hello".to_string()], "ASCII under cap stays whole");
+
+        let rows = "alpha row\nbeta row\ngamma row\n";
+        let chunks = chunk_text(rows, 20);
+        assert_eq!(chunks.concat(), rows, "line-aware splitting stays lossless");
+        assert!(chunks[..chunks.len() - 1].iter().all(|c| c.ends_with('\n')), "{chunks:?}");
     }
 
     #[test]
@@ -7859,6 +8195,16 @@ mod tests {
         ];
         assert_eq!(agent::compact::plan_compact_cut(&two, k), Some(3));
         assert_eq!(two[3].role, "user");
+    }
+
+    #[test]
+    fn session_names_are_bounded_and_avoid_windows_devices() {
+        assert_eq!(sanitize_name("../../chat"), "______chat");
+        assert_eq!(sanitize_name("CON"), "session_CON");
+        assert_eq!(sanitize_name("com1"), "session_com1");
+        assert_eq!(sanitize_name("NUL"), "session_NUL");
+        assert_eq!(sanitize_name(""), "session");
+        assert!(sanitize_name(&"a".repeat(200)).len() <= 80);
     }
 
     #[test]

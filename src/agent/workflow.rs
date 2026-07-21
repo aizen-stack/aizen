@@ -18,7 +18,7 @@
 use crate::agent::builtin::{agent_registry, role_registry};
 use crate::agent::task_tool::{build_agent_subagent_prompt, build_subagent_prompt};
 use crate::agent::{run_agent, AgentConfig, StopReason};
-use crate::llm::client::{chat_with_tools, stream_chat};
+use crate::llm::client::{chat_with_tools, stream_chat_with_visual_contract};
 use crate::core::types::{Message, ToolDef};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -104,6 +104,21 @@ pub async fn run_workflow(
     spec: &WorkflowSpec,
     trace: Option<&Path>,
 ) -> Result<()> {
+    let cancel = crate::core::cancel::TurnCancel::new();
+    run_workflow_with_cancel(http, base_url, api_key, model, approval_mode, spec, trace, cancel).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_workflow_with_cancel(
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    approval_mode: crate::core::approval::ApprovalMode,
+    spec: &WorkflowSpec,
+    trace: Option<&Path>,
+    cancel: crate::core::cancel::TurnCancel,
+) -> Result<()> {
     validate_spec_ids(spec)?;
     // Same singular-writer gate as `workflow_tool::build_spec` — CLI specs used to skip it and could
     // launch two default-role `coder`s in parallel (file/build races).
@@ -142,6 +157,7 @@ pub async fn run_workflow(
         &spec.tasks,
         width,
         Some(parent_id),
+        cancel.clone(),
     )
     .await;
     drop(slots);
@@ -192,14 +208,21 @@ pub async fn run_workflow(
         }
     }
 
-    if crate::ui::tui::cancel_requested() {
+    if cancel.is_cancelled() {
         wf_track.finish_err("cancelled before synthesis");
         bail!("workflow '{}': cancelled by user", spec.name);
     }
 
     wf_track.set_phase(crate::agent::orchestration::Phase::Synthesizing, format!("via {synth_model}"));
     eprintln!("synthesizing ({synth_model})…\n");
-    match stream_chat(http, base_url, api_key, synth_model, vec![Message::user(synth_prompt)]).await {
+    match stream_chat_with_visual_contract(
+        http,
+        base_url,
+        api_key,
+        synth_model,
+        vec![Message::user(synth_prompt)],
+        true,
+    ).await {
         Ok(_) => {
             wf_track.finish_ok("synthesized");
             Ok(())
@@ -281,7 +304,20 @@ pub(crate) async fn fan_out(
     tasks: &[WorkflowTask],
     max_parallel: usize,
 ) -> Vec<TaskOutcome> {
-    fan_out_tracked(http, base_url, api_key, model, approval_mode, root, date, tasks, max_parallel, None).await
+    fan_out_tracked(
+        http,
+        base_url,
+        api_key,
+        model,
+        approval_mode,
+        root,
+        date,
+        tasks,
+        max_parallel,
+        None,
+        crate::core::cancel::TurnCancel::new(),
+    )
+    .await
 }
 
 /// Like [`fan_out`], but each child is registered under optional parent id for `/workflows`.
@@ -297,11 +333,12 @@ async fn fan_out_tracked(
     tasks: &[WorkflowTask],
     max_parallel: usize,
     parent: Option<u64>,
+    cancel: crate::core::cancel::TurnCancel,
 ) -> Vec<TaskOutcome> {
     let width = max_parallel.clamp(1, MAX_PARALLEL);
     let mut results: Vec<TaskOutcome> = Vec::with_capacity(tasks.len());
     for chunk in tasks.chunks(width) {
-        if crate::ui::tui::cancel_requested() {
+        if cancel.is_cancelled() {
             // Skip not-yet-started tasks; mark them cancelled so the parent doesn't synthesize junk.
             for t in chunk {
                 results.push(TaskOutcome {
@@ -327,9 +364,20 @@ async fn fan_out_tracked(
             }
             break;
         }
-        let futs = chunk
-            .iter()
-            .map(|t| run_one_task(http, base_url, api_key, model, approval_mode, root, date, t, parent));
+        let futs = chunk.iter().map(|t| {
+            run_one_task(
+                http,
+                base_url,
+                api_key,
+                model,
+                approval_mode,
+                root,
+                date,
+                t,
+                parent,
+                cancel.clone(),
+            )
+        });
         results.extend(futures_util::future::join_all(futs).await);
     }
     results
@@ -348,6 +396,7 @@ pub(crate) async fn run_workflow_collect(
     spec: &WorkflowSpec,
     synthesize: bool,
 ) -> Result<String> {
+    let cancel = crate::core::cancel::current().unwrap_or_default();
     validate_spec_ids(spec)?;
     // Writer guard is applied in `workflow_tool::build_spec` before we get here; re-check so any
     // future direct caller can't bypass it.
@@ -373,8 +422,20 @@ pub(crate) async fn run_workflow_collect(
     let wf_track = crate::agent::orchestration::start_workflow(&spec.name, spec.tasks.len());
     let parent_id = wf_track.id();
     let results =
-        fan_out_tracked(http, base_url, api_key, model, approval_mode, &root, &date, &spec.tasks, width, Some(parent_id))
-            .await;
+        fan_out_tracked(
+            http,
+            base_url,
+            api_key,
+            model,
+            approval_mode,
+            &root,
+            &date,
+            &spec.tasks,
+            width,
+            Some(parent_id),
+            cancel.clone(),
+        )
+        .await;
     drop(slots); // explicit: hold the reservation across the whole fan-out, free it here
 
     if results.iter().any(|r| r.status == "cancelled") {
@@ -403,7 +464,7 @@ pub(crate) async fn run_workflow_collect(
         }
         return Ok(out.trim_end().to_string());
     }
-    if crate::ui::tui::cancel_requested() {
+    if cancel.is_cancelled() {
         wf_track.finish_err("cancelled before synthesis");
         bail!("workflow '{}': cancelled by user", spec.name);
     }
@@ -415,18 +476,25 @@ pub(crate) async fn run_workflow_collect(
     let synth_prompt = build_synthesis_prompt(&spec.name, instruction, &results);
     wf_track.set_phase(crate::agent::orchestration::Phase::Synthesizing, format!("via {synth_model}"));
     wf_trace(&format!("⋯ synthesizing ({synth_model})…"));
-    let merged = match crate::llm::client::chat_with_tools(
-        http,
-        base_url,
-        api_key,
-        synth_model,
-        &[Message::user(synth_prompt)],
-        &[],
+    let merged = match crate::core::cancel::race(
+        &cancel,
+        crate::llm::client::chat_with_tools(
+            http,
+            base_url,
+            api_key,
+            synth_model,
+            &[Message::user(synth_prompt)],
+            &[],
+        ),
     )
     .await
     {
-        Ok(t) => t.content.unwrap_or_default(),
-        Err(e) => {
+        None => {
+            wf_track.finish_err("cancelled during synthesis");
+            bail!("workflow '{}': cancelled by user", spec.name);
+        }
+        Some(Ok(t)) => t.content.unwrap_or_default(),
+        Some(Err(e)) => {
             wf_track.finish_err(format!("synthesis failed: {e}"));
             return Err(e).context("workflow synthesis failed");
         }
@@ -450,9 +518,10 @@ async fn run_one_task(
     date: &str,
     task: &WorkflowTask,
     parent: Option<u64>,
+    cancel: crate::core::cancel::TurnCancel,
 ) -> TaskOutcome {
     // Bail early if cancel already landed before this child was scheduled.
-    if crate::ui::tui::cancel_requested() {
+    if cancel.is_cancelled() {
         return TaskOutcome {
             id: task.id.clone(),
             role: task.role.clone(),
@@ -499,6 +568,7 @@ async fn run_one_task(
     let is_writer = !crate::agent::task_tool::dispatch_is_read_only(&registry);
     let cfg = AgentConfig {
         approval_mode,
+        cancel,
         quiet: true,
         enable_verify_gate: false,
         max_iters: CHILD_MAX_ITERS,

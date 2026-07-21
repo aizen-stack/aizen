@@ -372,6 +372,9 @@ impl Tool for TelegramSend {
     fn is_concurrency_safe(&self) -> bool {
         false
     }
+    fn recovery_effect(&self, _args: &Value) -> bool {
+        true
+    }
     fn execute(&self, args: &Value) -> Result<String> {
         let text = args.get("text").and_then(|v| v.as_str()).context("missing required string arg 'text'")?;
         block(async {
@@ -404,6 +407,9 @@ impl Tool for TelegramAsk {
     }
     fn is_concurrency_safe(&self) -> bool {
         false
+    }
+    fn recovery_effect(&self, _args: &Value) -> bool {
+        true
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let q = args.get("question").and_then(|v| v.as_str()).context("missing required string arg 'question'")?;

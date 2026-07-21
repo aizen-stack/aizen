@@ -71,7 +71,7 @@ A key cross-cutting fact for design: **output adapts to context** — rich ANSI/
 
 ### B. The agent's tools (its capabilities)
 
-Every tool is one clear capability. Tools are either **read-only** (run freely, often in parallel) or **destructive** (approval-gated). Each call renders as a `⏺ tool_name(arg)` event line with an informative `⎿ result` digest under it (lines read, matches found, `+adds −dels`, exit code) — edits also show a compact colour diff. The full output goes to the model; only the digest reaches the terminal.
+Every tool is one clear capability. Tools are either **read-only** (run freely, often in parallel) or **destructive** (approval-gated). Each call renders as a `✿ tool_name(arg)` event line with an informative `⎿ result` digest under it (lines read, matches found, `+adds −dels`, exit code) — edits also show a compact colour diff. The full output goes to the model; only the digest reaches the terminal.
 
 **Memory (read-only):**
 - `memory_search` — recall a specific fact (query + limit).
@@ -197,7 +197,23 @@ Connect third-party tools via the **Model Context Protocol** registry. Config li
 
 **`aizen apps` subcommands:** `list` (featured + custom, ✓/○ connection badges), `search <keywords>`, `add <name>` (interactive: pick a server with a ★-recommended local-first default, runtime-on-PATH check, explicit third-party/OAuth confirm gates, masked-secret review before writing), `info <key>` (config + **live probe** of the tools it exposes), `login <key>` (OAuth), `remove <key>`.
 
-**`aizen mcp` subcommands:** `list` (connected servers + tools), `login <name>`, `trust` / `untrust` (the supply-chain gate for project-local servers).
+**`aizen mcp` subcommands:** `list` (connected servers + tools + lifecycle generation/health/schema pin), `login <name>`, `trust` / `untrust` (the supply-chain gate for project-local servers).
+
+**Lifecycle safety:** tool schemas are pinned for one agent run. `notifications/tools/list_changed` is
+latched and applied only when the next fresh user turn builds its registry. EOF/send/read/timeout poisons
+the connection; read-only calls reconnect and replay at most once after confirming the schema hash is
+unchanged, while destructive calls are never replayed after an ambiguous failure. Trust/config state is
+written atomically owner-only.
+
+**Browser backend (`--features browser`):** five CDP tools drive an existing browser through a named
+profile from `~/.aizen/browser.json`. Host routes select the profile at `browser_navigate`; the session
+is then pinned for snapshot/click/type/eval, and profile changes invalidate `@ref`s. Sessions are keyed
+**per conversation** (REPL session slug, or `serve` platform:route:chat), so one chat's page/`@ref`s never
+bleed into another's; an idle LRU cap bounds open sockets and `/new`/route-removal release a conversation's
+session. `auth_env` stores only an environment variable name (never a credential literal) and is attached
+to both HTTP discovery and the WebSocket upgrade. `/browser` reports sanitized routing, auth-presence and
+session status. Snapshot may reconnect/retry once; state-changing browser calls never replay after
+transport ambiguity.
 
 ---
 
@@ -242,19 +258,33 @@ Internal quality gates (useful for a "trust/quality" docs section, not end-user 
 
 ## 4. The interactive TUI (detailed — primary UI surface)
 
-A **sticky-footer REPL**: the input box is pinned to the bottom; the agent's work streams in a scroll region above it; a one-line HUD sits between.
+A **retained full-frame REPL** is preferred on an interactive TTY: one render thread owns the terminal,
+the input thread only emits events, transcript blocks are re-rendered from state, and resize never
+replays terminal cells. `tui_mode=auto|retained|classic` keeps the former sticky ANSI UI as an instant
+rollback and plain/non-TTY output stays raw. The input/footer remains pinned at the bottom with a HUD;
+PageUp/PageDown enter manual scroll and End/Home returns to live tail — and when an informational
+overlay is open those keys scroll the overlay's own content (clamped to its last page), not the
+transcript behind it. An idle resize is detected on the render thread and repaints without a keystroke.
+Retained overlays, lightweight frame timing/cache counters and an adaptive idle animation share the
+same frame owner; a panic or Ctrl-C restores the terminal (shows the cursor, leaves the alternate
+screen) before the process exits.
 
 ### 4.1 In-chat slash commands (live-filtered palette, ~7 rows, Tab/↑↓ to pick)
-`/help` · `/model` (pick model, shows context windows) · `/sessions` (save/restore/delete chats) · `/timeline` (`/tm`) and `/checkpoint` (`/cp`,`/snapshot`) — time machine · `/compact` (compress context) · `/memory` (`/mem`) · `/persona` (`/character`) · `/skills` · `/apps` · `/mcp` · `/commands` (custom) · `/telegram` (`/tg`) · `/serve` · `/config` (`/setup`) · `/approval ask|smart|yolo` (legacy aliases still accepted) · `/cost` (`/usage`) · `/tokens` · `/clear` (`/new`,`/reset`) · `/quit` (`/exit`,`/q`). Plus any user **custom commands**.
+`/help` · `/model` (pick model, shows context windows) · `/sessions` (save/restore/delete chats) · `/workflows` (`/wf`, retained Activity overlay) · `/recover` (safe crashed-session restore/discard) · `/timeline` (`/tm`) and `/checkpoint` (`/cp`,`/snapshot`) — time machine · `/compact` (compress context) · `/memory` (`/mem`) · `/persona` (`/character`) · `/skills` · `/apps` · `/mcp` · `/browser` (profile/routes status) · `/commands` (custom) · `/telegram` (`/tg`) · `/serve` · `/config` (`/setup`) · `/approval ask|smart|yolo` (legacy aliases still accepted) · `/cost` (`/usage`) · `/tokens` · `/clear` (`/new`,`/reset`) · `/quit` (`/exit`,`/q`). Plus any user **custom commands**.
 
 ### 4.2 Landing & onboarding (bare `aizen`)
-Branded **splash** (sun logo via sixel where supported, else braille; block-art "AIZEN" wordmark, tagline "ARTIFICIAL INTELLIGENCE AGENT"), a one-time welcome ("about 30 seconds"), then the **setup wizard**: base URL → API key (hidden) → model picker (live list with context windows, or a custom-id option) → optional compact threshold → optional messaging-app connect. The full splash also renders a **capabilities panel** (tool groups + command list + "N tools · M commands").
+Branded **splash** (sun logo via sixel where supported, else braille — the retained backend always uses the text-only braille intro so no DCS image reaches the alternate screen; block-art "AIZEN" wordmark, tagline "ARTIFICIAL INTELLIGENCE AGENT"), a one-time welcome ("about 30 seconds"), then the **setup wizard**: base URL → API key (hidden) → model picker (live list with context windows, or a custom-id option) → optional compact threshold → optional messaging-app connect. The full splash also renders a **capabilities panel** (tool groups + command list + "N tools · M commands").
 
 ### 4.3 HUD / status line
 One line, e.g. `opus-4-8 · ~1.2K/200K tok · 5 turns · 42% ctx · ⚡ yolo` — model (gold) · tokens/context-window · turn count · % context used · mode badge (`⚡ yolo` auto-approve, `◆ smart` read-only-auto, or none).
 
 ### 4.4 Streaming output
-Live markdown rendering: syntax-highlighted code fences, gold headings/bullets, italic blockquotes with a faint bar, horizontal rules. A continuous **gold left gutter `▌`** marks assistant lines (vs `❯` user echoes and `⏺`/`⎿` tool call+result traces). Pipes/CI get raw text.
+Live markdown rendering: syntax-highlighted code fences, responsive Markdown tables, topology-safe
+`diagram`/`ascii`/`flow` fences, headings/bullets, italic blockquotes and horizontal rules. A continuous
+moonlight left gutter `▌` marks assistant lines (vs `❯` user echoes and `✿`/`⎿` tool traces). Wide
+terminals get Unicode box tables; narrow widths automatically use stacked records. Pipes/CI retain raw
+Markdown. `response_visuals = auto|always|off` controls whether the top-level model adds useful tables
+or text diagrams to final replies; Telegram/Discord receive plain stacked table records.
 
 ### 4.5 Input, images, keybindings
 - **Image attach:** `Ctrl-O` grabs a clipboard screenshot as a vision attachment; `Ctrl-X` drops the latest; a gold `[2img]` badge shows the count. Multi-line pastes collapse to a chip (`↵ 3 lines pasted · first line…`).
@@ -277,18 +307,24 @@ Live markdown rendering: syntax-highlighted code fences, gold headings/bullets, 
 
 ## 6. The layered prompt / identity model (the core mental model)
 
-The system prompt is assembled in this fixed order (each block **optional**, kept lean & prefix-cache-stable):
+The system prompt is split into two leading `system` messages for provider-cache stability:
 
+**Stable lane** (byte-stable during a session):
 1. **Base** (static instructions)
 2. `<environment>` (cwd, OS, date, model)
-3. `<agent_identity>` — **Soul** (durable operating policies)
-4. `<persona>` — the active character
-5. `<self>` — the persona's accumulated episodes + insights
-6. `<user_memory>` — STYLE + global user prefs only (always-on frozen core; per-repo cache)
-7. `<session_memory>` — optional temporary notes for this session (inferred facts; cleared on `/new`)
-8. `<skills>` — the compact skill index
+3. `<project_context>` (repo conventions)
 
-This stack — *operating policy → character → lived experience → who the user is → session scratch → how to do things* — is the conceptual heart of Aizen and worth a dedicated diagram in the docs.
+**Dynamic lane** (refreshed only at a fresh user-turn boundary — never during tool continuation):
+4. `<agent_identity>` — **Soul** (durable operating policies)
+5. `<persona>` — the active character
+6. `<self>` — the persona's accumulated episodes + insights
+7. `<user_memory>` — STYLE + global user prefs only (always-on frozen core; per-repo cache)
+8. `<session_memory>` — optional temporary notes for this session (inferred facts; cleared on `/new`)
+9. `<skills>` / `<agents>` / reply-visuals / ultimate-mode contracts
+
+Compaction, session caps, cache breakpoints and migration preserve the complete leading-system prefix.
+This stack — *stable operating context → character → lived experience → who the user is → session
+scratch → how to do things* — is the conceptual heart of Aizen.
 
 ---
 
@@ -330,6 +366,8 @@ Home root: **`~/.aizen/`** (auto-migrated from legacy `~/.nextgen/`). Project-lo
 | `~/.aizen/skills/*.md` | Saved skills |
 | `~/.aizen/commands/**/*.md` | Custom slash commands |
 | `~/.aizen/mcp.json` · `mcp-tokens/*.json` | MCP servers · cached OAuth tokens |
+| `~/.aizen/browser.json` | Versioned named CDP profiles + host routes; auth references environment names only |
+| `~/.aizen/recovery/<run-id>/` | Owner-only crash lease, safe history and unsent draft sidecar |
 | `~/.aizen/cron/<name>.{json,log}` | Scheduled jobs + run logs |
 | `~/.aizen/timemachine/<repo-id>/store.git` + `worktrees/<wt-id>/` | Private Time Machine store (ledger/journal/chat + sealed object store); source `.git` is never written |
 

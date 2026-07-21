@@ -693,18 +693,9 @@ fn read_mcp_json() -> Result<Value> {
 
 fn write_mcp_json(root: &Value) -> Result<()> {
     let path = crate::agent::mcp::config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(root)? + "\n").with_context(|| format!("writing {}", path.display()))?;
-    // mcp.json holds API tokens in plaintext → lock it to the owner (Unix; on Windows the per-user
-    // profile dir is already ACL'd to the user).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    let bytes = serde_json::to_vec_pretty(root)?;
+    crate::core::persist::atomic_write_owner_only(&path, &[bytes.as_slice(), b"\n"].concat())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 /// Server keys currently present in HOME mcp.json.

@@ -5,6 +5,7 @@
 pub mod icons;
 pub mod image_input;
 pub mod markdown;
+pub mod mermaid;
 pub mod spinner;
 pub mod splash;
 pub mod theme;

@@ -1,6 +1,6 @@
 [package]
 name = "aizen"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Aizen first-party agentic coding CLI — OpenAI-compatible, hermes-style provider-agnostic API client"
 license = "MIT"
@@ -40,6 +40,15 @@ dialoguer = { version = "0.11", default-features = false, features = ["password"
 # Colored banner output (dialoguer's companion; already in the tree → no extra binary cost).
 # Enables Windows VT + honors NO_COLOR / non-TTY automatically.
 console = "0.15"
+# Retained full-frame TUI. Both crates are pure Rust; the classic ANSI/console backend remains a
+# runtime fallback (`tui_mode=classic`) and the non-TTY path never initializes either backend.
+# Ratatui owns layout/cell diffing; crossterm owns raw input, alternate-screen lifecycle, focus and
+# resize events. Keep the direct Windows binding below pinned at windows-sys 0.59.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+# Full-message retained Markdown parser. The existing dependency-free MarkdownStream remains the
+# classic/one-shot renderer; retained mode reparses the active raw message for correctness.
+pulldown-cmark = { version = "0.12", default-features = false }
 
 # URL parsing/joining for the katana-style crawler (resolve relative links, host/scope checks).
 # Pure-Rust, no native deps → single static binary preserved.

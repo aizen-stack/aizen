@@ -111,6 +111,31 @@ pub fn prompt_tier_for(model: &str, override_tier: Option<&str>) -> PromptTier {
     PromptTier::Full
 }
 
+/// Static/dynamic system-prompt lanes.
+///
+/// The stable lane is intended to stay byte-identical for the life of a session so provider prefix
+/// caches remain warm. The dynamic lane is rewritten only at fresh user-turn boundaries (persona,
+/// memory, skills, visual contract, ultimate mode, recovery notes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptBundle {
+    pub stable: String,
+    pub dynamic: String,
+}
+
+impl PromptBundle {
+    pub fn flatten(&self) -> String {
+        if self.dynamic.trim().is_empty() {
+            self.stable.clone()
+        } else {
+            format!("{}\n{}", self.stable.trim_end(), self.dynamic.trim_start())
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stable.trim().is_empty() && self.dynamic.trim().is_empty()
+    }
+}
+
 /// Assemble the full system prompt: static base → stable-dynamic `<environment>` →
 /// volatile `<user_memory>` (the frozen core). Ordered for prefix-cache stability — the
 /// static base stays byte-identical across turns/sessions so the upstream prefix stays warm.
@@ -121,51 +146,64 @@ pub fn build_system_prompt(
     model: &str,
     frozen_core: Option<&str>,
 ) -> String {
+    build_system_prompt_bundle(cwd, os, date, model, frozen_core).flatten()
+}
+
+/// Same content as [`build_system_prompt`], split into cache-stable vs per-turn dynamic lanes.
+pub fn build_system_prompt_bundle(
+    cwd: &str,
+    os: &str,
+    date: &str,
+    model: &str,
+    frozen_core: Option<&str>,
+) -> PromptBundle {
     // Tier is a pure function of (model, config): fixed within a session, so the prefix stays
     // byte-stable; every model switch already rebuilds the system prompt.
     let base = match prompt_tier_for(model, crate::core::cli_config::load().prompt_tier.as_deref()) {
         PromptTier::Strict => system_base_strict(),
         PromptTier::Full => system_base(),
     };
-    let mut s = String::from(base.trim_end());
-    s.push_str("\n\n<environment>\n");
-    s.push_str(&format!("cwd: {cwd}\nos: {os}\ndate: {date}\nmodel: {model}\n"));
-    s.push_str("</environment>\n");
+    let mut stable = String::from(base.trim_end());
+    stable.push_str("\n\n<environment>\n");
+    stable.push_str(&format!("cwd: {cwd}\nos: {os}\ndate: {date}\nmodel: {model}\n"));
+    stable.push_str("</environment>\n");
+
+    let mut dynamic = String::new();
     // Durable AGENT operating-identity (who the agent IS across every persona/project) — ABOVE the
     // persona costume and the user model. HOME-only + sanitized + fail-closed (see `crate::persona::soul`).
     if let Some(soul) = crate::persona::soul::prompt_block() {
-        s.push_str("\n<agent_identity>\n");
-        s.push_str(soul.trim());
-        s.push_str("\n</agent_identity>\n");
+        dynamic.push_str("\n<agent_identity>\n");
+        dynamic.push_str(soul.trim());
+        dynamic.push_str("\n</agent_identity>\n");
     }
     // Active character card (who the agent IS) — before user_memory (who the user is).
     if let Some(p) = crate::persona::prompt_block() {
-        s.push_str("\n<persona>\n");
-        s.push_str(p.trim());
-        s.push_str("\n</persona>\n");
+        dynamic.push_str("\n<persona>\n");
+        dynamic.push_str(p.trim());
+        dynamic.push_str("\n</persona>\n");
         // The character's accumulated experience (who it has BECOME) — only meaningful with a
         // persona active, so nested under it.
         if let Some(sb) = crate::persona::self_block() {
-            s.push_str("\n<self>\n");
-            s.push_str(sb.trim());
-            s.push_str("\n</self>\n");
+            dynamic.push_str("\n<self>\n");
+            dynamic.push_str(sb.trim());
+            dynamic.push_str("\n</self>\n");
         }
     }
     if let Some(fc) = frozen_core {
         let fc = fc.trim();
         if !fc.is_empty() {
-            s.push_str("\n<user_memory>\n");
-            s.push_str(fc);
-            s.push_str("\n</user_memory>\n");
+            dynamic.push_str("\n<user_memory>\n");
+            dynamic.push_str(fc);
+            dynamic.push_str("\n</user_memory>\n");
         }
     }
     // Compact index of saved skills (procedures); full bodies are pulled on demand via skill_load.
     if let Some(idx) = crate::skills::prompt_index() {
-        s.push_str("\n<skills>\n");
-        s.push_str(&idx);
-        s.push_str("\n</skills>\n");
+        dynamic.push_str("\n<skills>\n");
+        dynamic.push_str(&idx);
+        dynamic.push_str("\n</skills>\n");
     }
-    s
+    PromptBundle { stable, dynamic }
 }
 
 /// The SLIM sub-agent base: static base (tiered) + `<environment>` + `<skills>` — deliberately NO
@@ -203,6 +241,41 @@ pub fn build_subagent_base_prompt(
     s
 }
 
+/// A top-level-only output contract for terminal-native tables and diagrams. Kept as a suffix so the
+/// large static base prompt remains cache-stable; sub-agents intentionally never receive it.
+pub fn response_visuals_prompt_block(
+    mode: crate::core::cli_config::ResponseVisuals,
+) -> Option<String> {
+    use crate::core::cli_config::ResponseVisuals;
+
+    if mode == ResponseVisuals::Off {
+        return None;
+    }
+    let requirement = match mode {
+        ResponseVisuals::Auto => {
+            "Use a visual only when it makes the answer materially easier to scan. Skip it for yes/no, \
+             identity, clarification, short errors, exact JSON/code, raw command output, and other tiny answers."
+        }
+        ResponseVisuals::Always => {
+            "For every substantial final answer, include at least ONE meaningful compact visual (a table OR \
+             a text diagram). The same exceptions apply to yes/no, identity, clarification, short errors, \
+             exact JSON/code, raw command output, and other tiny answers."
+        }
+        ResponseVisuals::Off => unreachable!(),
+    };
+    Some(format!(
+        "<response_visuals mode=\"{mode}\">\n\
+         Make final answers easier to scan without repeating the prose. {requirement}\n\
+         - Use a Markdown table for comparisons, status/files/results/metrics, or several parallel options.\n\
+         - Use a fenced `diagram` block for flows, architecture, dependencies, sequences, or state transitions.\n\
+         - A table OR a diagram is enough; use both only when they communicate different information.\n\
+         - Diagrams must be compact monospace text with clear labels and must not rely on color. Never emit \
+         Mermaid: this terminal does not execute Mermaid.\n\
+         - Lead with the result; the visual supports it and never replaces it.\n\
+         </response_visuals>\n"
+    ))
+}
+
 /// The TOP-LEVEL system prompt: [`build_system_prompt`] plus the `<agents>` index of delegatable
 /// specialists. A thin wrapper (NOT a new `build_system_prompt` parameter) so the shared prefix the
 /// four existing callers depend on stays byte-stable, and so SUB-AGENTS — which call
@@ -216,26 +289,42 @@ pub fn build_top_level_system_prompt(
     model: &str,
     frozen_core: Option<&str>,
 ) -> String {
-    let mut s = build_system_prompt(cwd, os, date, model, frozen_core);
+    build_top_level_system_prompt_bundle(cwd, os, date, model, frozen_core).flatten()
+}
+
+/// Top-level prompt lanes. Stable lane is environment + project conventions; dynamic lane holds
+/// identity/memory/skills/agents/visuals/ultimate and is safe to rewrite at user-turn boundaries.
+pub fn build_top_level_system_prompt_bundle(
+    cwd: &str,
+    os: &str,
+    date: &str,
+    model: &str,
+    frozen_core: Option<&str>,
+) -> PromptBundle {
+    let mut bundle = build_system_prompt_bundle(cwd, os, date, model, frozen_core);
     // Project conventions (AGENTS.md / CLAUDE.md), top-level only: coder turns inherit the repo's
-    // build/test commands and house rules. Pure SUFFIX, absent when no conventions file exists, so
-    // a project without one keeps the byte-identical prefix (zero prefix-cache bust).
+    // build/test commands and house rules. Kept in the stable lane so they don't thrash the cache
+    // every persona/memory refresh.
     if let Some(ctx) = project_context::load_project_context(std::path::Path::new(cwd)) {
-        s.push_str("\n<project_context>\n");
-        s.push_str(&ctx);
-        s.push_str("\n</project_context>\n");
+        bundle.stable.push_str("\n<project_context>\n");
+        bundle.stable.push_str(&ctx);
+        bundle.stable.push_str("\n</project_context>\n");
     }
     if let Some(idx) = crate::agents::prompt_index() {
-        s.push_str("\n<agents>\n");
-        s.push_str(&idx);
-        s.push_str("\n</agents>\n");
+        bundle.dynamic.push_str("\n<agents>\n");
+        bundle.dynamic.push_str(&idx);
+        bundle.dynamic.push_str("\n</agents>\n");
+    }
+    if let Some(block) = response_visuals_prompt_block(crate::core::cli_config::load().response_visuals()) {
+        bundle.dynamic.push('\n');
+        bundle.dynamic.push_str(&block);
     }
     // Ultimate mode (aizen's `ultracode`): a pure SUFFIX telling the model to reason at max depth and
     // orchestrate by default. Absent when off, so the prefix stays byte-identical (zero cache bust).
     // Top-level only — sub-agents call `build_system_prompt` directly and never see this (they can't
     // fan out further anyway; the workflow tool is depth-capped at 1).
     if crate::core::cli_config::ultimate_enabled() {
-        s.push_str(
+        bundle.dynamic.push_str(
             "\n<ultimate_mode>\n\
              You are in ULTIMATE mode. Reason at maximum depth.\n\
              - When work decomposes into independent angles (multi-file investigation, multi-angle \
@@ -249,7 +338,7 @@ pub fn build_top_level_system_prompt(
              </ultimate_mode>\n",
         );
     }
-    s
+    bundle
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +361,9 @@ pub struct AgentConfig {
     /// commands classified read-only by `cmd_guard`; `yolo` pre-authorizes destructive tools. The hard
     /// blocklist applies at every level.
     pub approval_mode: crate::core::approval::ApprovalMode,
+    /// Turn-scoped cooperative cancellation. Top-level turns create a fresh token; delegated
+    /// task/workflow children inherit it so Esc fans out without affecting unrelated turns.
+    pub cancel: crate::core::cancel::TurnCancel,
     /// Suppress the stderr progress trace (tests set this).
     pub quiet: bool,
     /// Run a fast typecheck/build (cargo check / tsc) once after an editing run, before
@@ -371,6 +463,7 @@ impl Default for AgentConfig {
             max_tool_result_chars: 4096,
             max_fetch_result_chars: 12_000,
             approval_mode: crate::core::approval::ApprovalMode::Ask,
+            cancel: crate::core::cancel::TurnCancel::new(),
             quiet: false,
             enable_verify_gate: true,
             verify_gate_timeout_secs: 90,
@@ -572,6 +665,7 @@ where
     // Operation-scoped checkpoint latch: set only after a pre-edit checkpoint succeeds. Approval is
     // evaluated first; a declined call must never run Git hooks/filters or mutate recovery metadata.
     let mut auto_checkpointed = false;
+    crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::WaitingModel);
     let mut self_review_done = false;
     let mut context_warned = false;
     // P-ctx1: the last budget band we surfaced to the model (see `budget_band`). Injected only on a
@@ -609,12 +703,10 @@ where
     let mut iter = 0usize;
 
     while iter < cap {
-        // COOPERATIVE CANCEL: Esc sets a process-global flag. Top-level REPL also races the turn
-        // future via `select!`, but nested sub-agents (`task` / workflow children) run under
-        // `block_in_place`+`block_on` and would otherwise keep burning steps after cancel. Return a
-        // real `Cancelled` stop so fan-out / task can mark the child done and free slots. (No-op
-        // outside the sticky REPL, where the flag is never set.)
-        if crate::ui::tui::cancel_requested() {
+        // COOPERATIVE CANCEL: every top-level turn owns one token and delegated children inherit it.
+        // Unrelated turns therefore cannot cancel one another, while task/workflow fan-out still stops
+        // at the next loop/tool boundary and releases its slots promptly.
+        if cfg.cancel.is_cancelled() {
             return Ok(AgentOutcome {
                 final_text: None,
                 iters: iter,
@@ -805,9 +897,15 @@ where
         // Roll back the just-appended nudge if the model call fails, so a network/gateway error
         // doesn't strand an unanswered system message at the tail of history (the REPL's error path
         // only pops a trailing `user` message, so it wouldn't clean this up).
-        let mut turn = match chat(messages.clone(), defs.clone()).await {
-            Ok(t) => t,
-            Err(e) => {
+        let mut turn = match crate::core::cancel::race(&cfg.cancel, chat(messages.clone(), defs.clone())).await {
+            None => {
+                if nudge_pushed {
+                    messages.pop();
+                }
+                return Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::Cancelled });
+            }
+            Some(Ok(t)) => t,
+            Some(Err(e)) => {
                 if nudge_pushed {
                     messages.pop();
                 }
@@ -1128,6 +1226,7 @@ where
         // position. Results land in ORIGINAL call order. (A DISCARDED turn — divergence/error —
         // simply drops its eager handles: detached, read-only, harmless.)
         let eager = std::mem::take(&mut turn.eager);
+        crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::ExecutingTools);
         let results = execute_calls(
             registry,
             &calls,
@@ -1137,6 +1236,7 @@ where
             &mut auto_checkpointed,
         )
         .await;
+        crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::WaitingModel);
 
         // Arm the verify gate only if a destructive tool actually SUCCEEDED this turn — a
         // denied/errored edit changed nothing, so it must not make the gate blame the tree.
@@ -1423,7 +1523,7 @@ async fn execute_calls(
     let mut i = 0usize;
     let mut cancelled = false;
     while i < n {
-        if cancelled || crate::ui::tui::cancel_requested() {
+        if cancelled || cfg.cancel.is_cancelled() {
             cancelled = true;
             land(i, "error: cancelled by user".to_string(), &mut results, sink);
             i += 1;
@@ -1455,13 +1555,18 @@ async fn execute_calls(
                         let quiet = cfg.quiet;
                         let max = cfg.max_tool_result_chars;
                         let max_fetch = cfg.max_fetch_result_chars;
-                        (k, tokio::task::spawn_blocking(move || run_tool_body(tool, &args, quiet, max, max_fetch)))
+                        let cancel = cfg.cancel.clone();
+                        (k, tokio::task::spawn_blocking(move || {
+                            crate::core::cancel::with_current(cancel, || {
+                                run_tool_body(tool, &args, quiet, max, max_fetch)
+                            })
+                        }))
                     })
                     .collect();
                 for (k, h) in handles {
                     let out = tokio::select! {
                         r = h => r.unwrap_or_else(|_| "error: tool thread panicked".to_string()),
-                        _ = crate::ui::tui::cancelled() => {
+                        _ = cfg.cancel.cancelled() => {
                             // The blocking body keeps running detached; safe calls are read-only,
                             // so discarding the result is harmless.
                             "error: cancelled by user".to_string()
@@ -1472,7 +1577,7 @@ async fn execute_calls(
                     }
                     land(k, out, &mut results, sink);
                 }
-                if crate::ui::tui::cancel_requested() {
+                if cfg.cancel.is_cancelled() {
                     cancelled = true;
                     break 'windows;
                 }
@@ -1522,6 +1627,7 @@ async fn execute_calls(
                                         Ok(snap) => {
                                             *auto_checkpointed = true;
                                             crate::features::timemachine::note_pre_edit(snap.id);
+                                            crate::core::recovery::set_checkpoint(Some(snap.id));
                                             if !cfg.quiet {
                                                 emit_trace(&format!(
                                                     "→ checkpoint #{} saved (agent: `checkpoint_rewind` target=pre_edit; human: `aizen time restore {}`)",
@@ -1545,8 +1651,13 @@ async fn execute_calls(
                                 let quiet = cfg.quiet;
                                 let max = cfg.max_tool_result_chars;
                                 let max_fetch = cfg.max_fetch_result_chars;
-                                tokio::task::spawn_blocking(move || run_tool_body(tool, &args, quiet, max, max_fetch))
-                                    .await
+                                let cancel = cfg.cancel.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    crate::core::cancel::with_current(cancel, || {
+                                        run_tool_body(tool, &args, quiet, max, max_fetch)
+                                    })
+                                })
+                                .await
                                     .unwrap_or_else(|_| "error: tool thread panicked".to_string())
                             }
                         }
@@ -1610,6 +1721,7 @@ pub fn eager_starter<'a>(
     let started = std::sync::atomic::AtomicUsize::new(0);
     let max_chars = cfg.max_tool_result_chars;
     let max_fetch_chars = cfg.max_fetch_result_chars;
+    let cancel = cfg.cancel.clone();
     move |_slot, tc| {
         use std::sync::atomic::Ordering::Relaxed;
         if barrier_hit.load(Relaxed) {
@@ -1627,7 +1739,12 @@ pub fn eager_starter<'a>(
         if started.fetch_add(1, Relaxed) >= MAX_PARALLEL {
             return None; // over the cap: run normally at execution time
         }
-        Some(tokio::task::spawn_blocking(move || run_tool_body(tool, &args, true, max_chars, max_fetch_chars)))
+        let turn_cancel = cancel.clone();
+        Some(tokio::task::spawn_blocking(move || {
+            crate::core::cancel::with_current(turn_cancel, || {
+                run_tool_body(tool, &args, true, max_chars, max_fetch_chars)
+            })
+        }))
     }
 }
 
@@ -1720,9 +1837,12 @@ fn run_tool_body(
     max_chars: usize,
     max_fetch_chars: usize,
 ) -> String {
+    if tool.recovery_effect(args) {
+        crate::core::recovery::mark_side_effects_possible();
+    }
     if !quiet {
-        // The Claude-Code-style event anchor: a moonlight dot `⏺`, the tool name, then the salient
-        // argument parenthesised (unescaped, 1st line, clipped) — `⏺ file_edit(src/foo.rs)`.
+        // The event anchor: a moonlight flower `✿` (the Aizen bloom), the tool name, then the salient
+        // argument parenthesised (unescaped, 1st line, clipped) — `✿ file_edit(src/foo.rs)`.
         emit_trace(&tool_call_line(tool.name(), args));
     }
     let out = match tool.execute(args) {
@@ -1768,22 +1888,22 @@ fn relevance_query_from_args(args: &serde_json::Value) -> String {
 }
 
 /// The event-anchor line for a tool call. When the tool maps to a human action ([`tool_action`]),
-/// it reads `⏺ <verb + target> (tool_name)` — the verb+target in moonlight, the raw tool name
+/// it reads `✿ <verb + target> (tool_name)` — the verb+target in moonlight, the raw tool name
 /// parenthesised + dimmed, so the user sees *what* is happening at a glance and the exact tool only
-/// as a quiet footnote. Tools with no mapping fall back to the older `⏺ name(salient-arg)` shape.
+/// as a quiet footnote. Tools with no mapping fall back to the older `✿ name(salient-arg)` shape.
 /// Shared by the serial path, the eager-adoption path, and the approval prompt so every surface
 /// renders a call identically.
 fn tool_call_line(name: &str, args: &serde_json::Value) -> String {
     match tool_action(name, args) {
         Some(action) => format!(
             "{} {} {}",
-            crate::ui::theme::accent("⏺"),
+            crate::ui::theme::accent("✿"),
             crate::ui::theme::accent(action),
             crate::ui::theme::accent_dim(format!("({name})"))
         ),
         None => format!(
             "{} {}{}",
-            crate::ui::theme::accent("⏺"),
+            crate::ui::theme::accent("✿"),
             crate::ui::theme::accent(name),
             crate::ui::theme::accent_dim(format!("({})", tool_trace(name, args)))
         ),
@@ -1793,13 +1913,15 @@ fn tool_call_line(name: &str, args: &serde_json::Value) -> String {
 /// Re-print a restored conversation into the scrolling transcript. `/sessions` restore only
 /// rehydrates `history` (so the model regains context) — the SCREEN stayed blank, which read as
 /// "nothing loaded". This replays each turn with the same surfaces a live turn uses: `❯ user`
-/// echoes, markdown-rendered assistant text, and `⏺ tool` call lines + `└ result` digests. The
+/// echoes, markdown-rendered assistant text, and `✿ tool` call lines + `└ result` digests. The
 /// system prompt at `[0]` is skipped (it's plumbing, not conversation). Tool-result messages carry
 /// only a `tool_call_id`, so we first index `id → tool name` from the assistant tool-calls to render
 /// each result under its originating tool.
 pub fn replay_transcript(msgs: &[crate::core::types::Message]) {
     use std::collections::HashMap;
-    let decorate = crate::ui::tui::active() || std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let decorate = crate::ui::tui::active()
+        || crate::ui::tui::retained_running()
+        || std::io::IsTerminal::is_terminal(&std::io::stdout());
     let cols = crate::ui::tui::width();
     let mut call_names: HashMap<String, String> = HashMap::new();
     for m in msgs {
@@ -1847,7 +1969,10 @@ pub fn replay_transcript(msgs: &[crate::core::types::Message]) {
 
 /// Emit a trace line into the scroll region (sticky TUI) or stderr (plain / one-shot path).
 fn emit_trace(line: &str) {
-    if crate::ui::tui::active() {
+    // `retained_running()` (not just `active()`) so replay during a SUSPENDED dialoguer menu — e.g.
+    // restoring via `/sessions` — still routes into the render thread's buffer, which `resume`
+    // redraws from. Otherwise the trace would `eprintln!` onto the menu screen and be wiped.
+    if crate::ui::tui::active() || crate::ui::tui::retained_running() {
         crate::ui::tui::emit_line(line);
     } else {
         eprintln!("{line}");
@@ -2652,6 +2777,14 @@ pub fn truncate_result(s: &str, max: usize) -> String {
 /// (inline ✓/✗) instead of denying — this is the unattended "approve rm -rf from your phone" path.
 fn approve(tool: &str, args: &serde_json::Value) -> bool {
     use std::io::{IsTerminal, Write};
+    crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::AwaitingApproval);
+    struct RestorePhase;
+    impl Drop for RestorePhase {
+        fn drop(&mut self) {
+            crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::ExecutingTools);
+        }
+    }
+    let _restore_phase = RestorePhase;
     // Under the sticky TUI the background input thread owns stdin, so we can't run a blocking y/N
     // read inline. Instead, route a per-action prompt THROUGH that thread: `ask_approval` blocks
     // until it presses [y]es / [n]o / [a]llow-all-session. (Destructive tools force the serial path,
@@ -2833,22 +2966,22 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    // ── display: the ⏺ call line + ⎿ result summary ─────────────────────────
+    // ── display: the ✿ call line + ⎿ result summary ─────────────────────────
     #[test]
     fn tool_call_line_shows_action_then_dimmed_tool_name() {
-        // A mapped tool reads `⏺ <English verb + target> (tool_name)`.
+        // A mapped tool reads `✿ <English verb + target> (tool_name)`.
         let line = tool_call_line("file_read", &serde_json::json!({"path": "src/main.rs"}));
         let plain = console::strip_ansi_codes(&line).to_string();
-        assert!(plain.starts_with("⏺ Read main.rs"), "action-first: {plain:?}");
+        assert!(plain.starts_with("✿ Read main.rs"), "action-first: {plain:?}");
         assert!(plain.contains("(file_read)"), "raw tool name parenthesised: {plain:?}");
     }
 
     #[test]
     fn tool_call_line_falls_back_to_name_arg_when_unmapped() {
-        // An unknown tool keeps the older `⏺ name(salient-arg)` shape.
+        // An unknown tool keeps the older `✿ name(salient-arg)` shape.
         let line = tool_call_line("mystery_tool", &serde_json::json!({"foo": "bar"}));
         let plain = console::strip_ansi_codes(&line).to_string();
-        assert!(plain.starts_with("⏺ mystery_tool("), "{plain:?}");
+        assert!(plain.starts_with("✿ mystery_tool("), "{plain:?}");
     }
 
     #[test]
@@ -3119,6 +3252,7 @@ mod tests {
             max_tool_result_chars: 4096,
             max_fetch_result_chars: 12_000,
             approval_mode: crate::core::approval::ApprovalMode::Ask,
+            cancel: crate::core::cancel::TurnCancel::new(),
             quiet: true,
             enable_verify_gate: false,
             verify_gate_timeout_secs: 90,
@@ -3173,7 +3307,9 @@ mod tests {
         if let Some(denied) = gate_and_approve(tool.as_ref(), &args, cfg) {
             return denied;
         }
-        run_tool_body(tool, &args, cfg.quiet, cfg.max_tool_result_chars, cfg.max_fetch_result_chars)
+        crate::core::cancel::with_current(cfg.cancel.clone(), || {
+            run_tool_body(tool, &args, cfg.quiet, cfg.max_tool_result_chars, cfg.max_fetch_result_chars)
+        })
     }
 
     /// Drive the async executor the way the loop does: pre-filled placeholder sink, results out.
@@ -3238,18 +3374,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_flag_stops_loop_with_cancelled() {
-        // Cooperative cancel: set the process-global flag before the loop starts a model call.
-        // The loop must return Cancelled without consuming the scripted turn.
-        crate::ui::tui::request_cancel();
-        let r = registry();
-        let out = run_agent(scripted(vec![final_turn("should-not-run")]), &cfg(), &r, "sys", "task")
-            .await
-            .unwrap();
-        crate::ui::tui::clear_cancel();
-        assert_eq!(out.stop, StopReason::Cancelled);
-        assert!(out.final_text.is_none());
-        assert_eq!(out.iters, 0, "must stop before the first model call");
+    async fn cancellation_is_turn_local() {
+        let cancelled_cfg = cfg();
+        let live_cfg = cfg();
+        cancelled_cfg.cancel.cancel();
+        let r1 = registry();
+        let r2 = registry();
+        let (cancelled, live) = tokio::join!(
+            run_agent(scripted(vec![final_turn("should-not-run")]), &cancelled_cfg, &r1, "sys", "task"),
+            run_agent(scripted(vec![final_turn("still-runs")]), &live_cfg, &r2, "sys", "task"),
+        );
+        let cancelled = cancelled.unwrap();
+        let live = live.unwrap();
+        assert_eq!(cancelled.stop, StopReason::Cancelled);
+        assert_eq!(cancelled.iters, 0);
+        assert_eq!(live.stop, StopReason::Done);
+        assert_eq!(live.final_text.as_deref(), Some("still-runs"));
     }
 
     #[tokio::test]
@@ -4242,11 +4382,7 @@ mod tests {
         assert_eq!(last.content.as_deref(), Some(INTERRUPTED_TOOL_PLACEHOLDER));
     }
 
-    // NOTE deliberately NO test sets `tui::request_cancel()`: the flag is process-global and the
-    // suite runs threaded — setting it (even for a µs) makes any concurrently-executing
-    // `execute_calls`/loop test report "cancelled" (observed in practice: the alphabetically
-    // adjacent barrier test flaked). The cancel-fill arm is 4 straight lines; the pre-fill DROP
-    // test above pins the invariant that actually matters (valid history under interruption).
+    // Turn cancellation is covered with independent tokens above; no test mutates TUI-global state.
 
     #[tokio::test]
     async fn loop_runs_a_parallel_tool_turn_then_finishes() {
@@ -5088,6 +5224,20 @@ mod tests {
         assert!(p3.starts_with(system_base().trim_end()));
     }
 
+    #[test]
+    fn prompt_lanes_stable_byte_identical_when_only_memory_changes() {
+        // Lane invariant: the frozen core (user memory) lives in the DYNAMIC lane, so changing it
+        // must leave the STABLE lane byte-identical — otherwise the provider prefix cache is busted
+        // every time a fact is learned. Only the dynamic lane may differ.
+        let a = build_system_prompt_bundle("/w", "linux", "2026-07-20", "m", Some("- fact one"));
+        let b = build_system_prompt_bundle("/w", "linux", "2026-07-20", "m", Some("- fact two"));
+        assert_eq!(a.stable, b.stable, "stable lane must not change when only memory changes");
+        assert_ne!(a.dynamic, b.dynamic, "the differing memory lands in the dynamic lane");
+        assert!(a.dynamic.contains("fact one") && b.dynamic.contains("fact two"));
+        // The environment (cwd/os/date/model) is what the stable lane carries.
+        assert!(a.stable.contains("cwd: /w") && a.stable.contains("model: m"));
+    }
+
     #[tokio::test]
     async fn clarify_yields_awaiting_input_with_valid_history() {
         // The load-bearing wiring: a `clarify` call PAUSES the loop — it returns AwaitingInput
@@ -5154,19 +5304,46 @@ mod tests {
     }
 
     #[test]
-    fn top_level_prompt_equals_base_when_no_agents() {
+    fn top_level_prompt_equals_base_when_optional_suffixes_are_off() {
         with_agent_sandbox("none", |_root| {
+            crate::core::cli_config::save(&crate::core::cli_config::CliConfig {
+                response_visuals: Some(crate::core::cli_config::ResponseVisuals::Off),
+                ..Default::default()
+            })
+            .unwrap();
             let base = build_system_prompt("/w", "linux", "2026-06-20", "m", None);
             let top = build_top_level_system_prompt("/w", "linux", "2026-06-20", "m", None);
-            // Upgrade safety: a user with no agents gets a byte-identical prompt (no prefix-cache bust).
             assert_eq!(base, top);
             assert!(!top.contains("<agents>"));
+            assert!(!top.contains("<response_visuals"));
         });
+    }
+
+    #[test]
+    fn visual_contract_is_top_level_only_and_mode_specific() {
+        let auto = response_visuals_prompt_block(crate::core::cli_config::ResponseVisuals::Auto).unwrap();
+        assert!(auto.contains("mode=\"auto\""));
+        assert!(auto.contains("Skip it for yes/no"));
+        assert!(auto.contains("fenced `diagram`"));
+        assert!(auto.contains("Never emit Mermaid"));
+
+        let always = response_visuals_prompt_block(crate::core::cli_config::ResponseVisuals::Always).unwrap();
+        assert!(always.contains("at least ONE meaningful compact visual"));
+        assert!(always.contains("exact JSON/code"));
+        assert!(response_visuals_prompt_block(crate::core::cli_config::ResponseVisuals::Off).is_none());
+
+        let sub = build_subagent_base_prompt("/w", "linux", "2026-06-20", "m", false);
+        assert!(!sub.contains("<response_visuals"), "sub-agents must not pay the visual contract tax");
     }
 
     #[test]
     fn top_level_prompt_adds_agents_block_and_keeps_base_prefix() {
         with_agent_sandbox("some", |root| {
+            crate::core::cli_config::save(&crate::core::cli_config::CliConfig {
+                response_visuals: Some(crate::core::cli_config::ResponseVisuals::Off),
+                ..Default::default()
+            })
+            .unwrap();
             let dir = root.join(".aizen/agents");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("code-reviewer.md"), "---\nname: Code Reviewer\ndescription: reviews diffs\n---\nbody").unwrap();

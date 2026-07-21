@@ -361,6 +361,9 @@ impl Tool for TaskTool {
         let d = self.resolve_dispatch(args);
         dispatch_is_read_only(&d.registry)
     }
+    fn recovery_effect(&self, _args: &Value) -> bool {
+        true
+    }
     fn execute(&self, args: &Value) -> Result<String> {
         // Depth guard (belt-and-suspenders; the sub-registry already excludes `task`).
         if self.depth >= 1 {
@@ -411,8 +414,10 @@ impl Tool for TaskTool {
         // gate — which arms on the PARENT's own edit turns — never re-checks them. A read-only role
         // (planner/reviewer) makes no edits, so the gate would only spawn a needless `cargo check`.
         let sub_verify_gate = !dispatch_is_read_only(&registry);
+        let parent_cancel = crate::core::cancel::current().unwrap_or_default();
         let cfg = AgentConfig {
             approval_mode: self.approval_mode, // inherit parent approval tier transitively
+            cancel: parent_cancel,
             quiet: true,                     // suppress nested progress trace
             enable_verify_gate: sub_verify_gate, // ON for write-capable roles; OFF for read-only (W14)
             // The dispatch step budget (default 15 ≪ the top level's 25/50 — a sub-task is

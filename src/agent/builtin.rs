@@ -67,6 +67,10 @@ fn resolve_root() -> Result<PathBuf> {
 /// sub-agent role.
 fn default_registry_in(root: &Path) -> ToolRegistry {
     use crate::agent::web_tools::{WebCrawl, WebFetch, WebSearch};
+    // Registry construction happens exactly once per fresh top-level user turn. Apply any deferred
+    // MCP `tools/list_changed` notification here — never from inside an agent run — so the model's
+    // advertised tool schemas remain pinned for the duration of that run.
+    crate::agent::mcp::prepare_fresh_turn();
     let mut r = ToolRegistry::new();
     r.register(Box::new(MemorySearch));
     r.register(Box::new(MemoryProfile));
@@ -2396,7 +2400,10 @@ impl Tool for ShellRun {
                     // User pressed Esc (cooperative cancel) — kill the child now instead of blocking
                     // the whole turn up to the timeout. This is what makes Esc responsive during a
                     // long command (the confirmed "can't cancel while a tool runs" bug).
-                    if crate::ui::tui::cancel_requested() {
+                    let cancel_requested = crate::core::cancel::current()
+                        .or_else(crate::ui::tui::active_cancel_token)
+                        .is_some_and(|token| token.is_cancelled());
+                    if cancel_requested {
                         let _ = child.kill();
                         let _ = child.wait();
                         cancelled = true;

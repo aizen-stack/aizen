@@ -44,8 +44,8 @@ const HANDOFF_SYS: &str = "You extract ONLY the context relevant to a NEW goal f
 
 /// Build the `/handoff` summarization prompt (goal-conditioned extraction over the transcript).
 pub fn handoff_prompt(history: &[Message], goal: &str) -> Vec<Message> {
-    // Skip [0] (the system prompt is not conversation) — same convention as compaction's cut.
-    let transcript = render_transcript(history.get(1..).unwrap_or_default());
+    let lead = leading_system_count(history);
+    let transcript = render_transcript(history.get(lead..).unwrap_or_default());
     vec![
         Message::system(HANDOFF_SYS),
         Message::user(format!("NEW GOAL:\n{goal}\n\nPrior conversation:\n\n{transcript}")),
@@ -136,20 +136,40 @@ pub fn context_touchpoints(history: &[Message]) -> Touchpoints {
     tp
 }
 
+/// Number of leading `system` messages that form the prompt prefix (stable lane + optional dynamic
+/// lane). Compaction/session caps must preserve all of them. The compaction boundary marker is ALSO
+/// a leading `system` message but is conversation content (a lossy summary), NOT prompt prefix — it
+/// must be foldable into the next compaction, so the count stops at it.
+pub fn leading_system_count(history: &[Message]) -> usize {
+    history
+        .iter()
+        .take_while(|m| {
+            m.role == "system"
+                && !m.content.as_deref().is_some_and(|c| c.starts_with(COMPACT_MARKER_PREFIX))
+        })
+        .count()
+}
+
 /// Compute the compaction cut index: the kept tail starts here. It's always a `user` message, so the
 /// summarized block never ends mid-turn and the tail never begins with an orphan `tool` result.
 /// Keeps the last `keep_turns` user turns verbatim. `None` when the conversation is too short to be
 /// worth compacting.
 pub fn plan_compact_cut(history: &[Message], keep_turns: usize) -> Option<usize> {
-    // User messages (skipping the system prompt at index 0) are the clean turn boundaries.
-    let user_idxs: Vec<usize> =
-        history.iter().enumerate().skip(1).filter(|(_, m)| m.role == "user").map(|(i, _)| i).collect();
+    let lead = leading_system_count(history);
+    // User messages (after the system prefix) are the clean turn boundaries.
+    let user_idxs: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .skip(lead)
+        .filter(|(_, m)| m.role == "user")
+        .map(|(i, _)| i)
+        .collect();
     if user_idxs.len() < 2 {
         return None;
     }
     let keep = keep_turns.min(user_idxs.len() - 1).max(1);
     let cut = user_idxs[user_idxs.len() - keep];
-    if cut <= 1 {
+    if cut <= lead {
         None
     } else {
         Some(cut)
@@ -182,17 +202,18 @@ fn marker_text(seq: usize, summary: &str) -> String {
     format!("{COMPACT_MARKER_PREFIX} to conserve context · #{seq}]\n{summary}")
 }
 
-/// Rebuild `history` in place as: the system prompt (`[0]`) + one summary `system` boundary note +
+/// Rebuild `history` in place as: the leading system prefix + one summary `system` boundary note +
 /// the verbatim tail from `cut`. The summary should already be trimmed. The boundary note carries a
 /// running compaction count: the number is read off any PRIOR boundary note (which is about to be
 /// summarized into this one) and incremented, so the count accumulates across successive
 /// compactions even though each old boundary note is folded into the next summary.
 pub fn splice_compacted(history: &mut Vec<Message>, cut: usize, summary: &str) {
     let seq = compaction_count(history) + 1;
-    let system_prompt = history[0].clone();
+    let lead = leading_system_count(history).min(cut);
+    let prefix: Vec<Message> = history[..lead].to_vec();
     let tail: Vec<Message> = history[cut..].to_vec();
-    let mut rebuilt = Vec::with_capacity(2 + tail.len());
-    rebuilt.push(system_prompt);
+    let mut rebuilt = Vec::with_capacity(prefix.len() + 1 + tail.len());
+    rebuilt.extend(prefix);
     rebuilt.push(Message::system(marker_text(seq, summary)));
     rebuilt.extend(tail);
     *history = rebuilt;
@@ -221,7 +242,8 @@ where
     let before = approx_tokens(history);
     let cut = plan_compact_cut(history, keep_turns)
         .ok_or_else(|| anyhow!("conversation too short to compact (need at least 2 turns)"))?;
-    let older = &history[1..cut];
+    let lead = leading_system_count(history).min(cut);
+    let older = &history[lead..cut];
     if older.is_empty() {
         anyhow::bail!("nothing older to compact");
     }
@@ -244,9 +266,10 @@ mod tests {
     use crate::core::types::{FunctionCall, ToolCall};
 
     #[test]
-    fn handoff_prompt_embeds_goal_and_skips_system() {
+    fn handoff_prompt_embeds_goal_and_skips_system_prefix() {
         let history = vec![
-            Message::system("SYSTEM PROMPT — never in the transcript"),
+            Message::system("STABLE SYSTEM — never in the transcript"),
+            Message::system("DYNAMIC SYSTEM — never in the transcript"),
             Message::user("old task about the parser"),
             Message::assistant("fixed it in src/parse.rs"),
         ];
@@ -256,7 +279,8 @@ mod tests {
         let usr = p[1].content.as_deref().unwrap();
         assert!(usr.contains("NEW GOAL:\nnow optimize the lexer"), "{usr}");
         assert!(usr.contains("src/parse.rs"), "transcript present");
-        assert!(!usr.contains("SYSTEM PROMPT"), "system prompt never leaks into the extraction");
+        assert!(!usr.contains("STABLE SYSTEM"), "stable system prompt never leaks into the extraction");
+        assert!(!usr.contains("DYNAMIC SYSTEM"), "dynamic system prompt never leaks into the extraction");
     }
 
     fn user(s: &str) -> Message {

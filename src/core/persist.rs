@@ -7,10 +7,23 @@
 use anyhow::{Context, Result};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn temp_path(path: &Path) -> PathBuf {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+    parent.join(format!(
+        ".{name}.aizen-tmp-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 
 /// Atomically replace `path` with `bytes`.
 ///
@@ -23,8 +36,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
 
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
-    let tmp = parent.join(format!(".{name}.aizen-tmp-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    let tmp = temp_path(path);
 
     let result = (|| -> Result<()> {
         let mut opts = OpenOptions::new();
@@ -79,6 +91,43 @@ fn replace_file(tmp: &Path, dst: &Path) -> std::io::Result<()> {
     {
         fs::rename(tmp, dst)
     }
+}
+
+/// Atomically replace a sensitive file, hardening the staged bytes before they become visible.
+/// The final path is checked again after replacement so callers never silently commit a transcript
+/// or credential with inherited broad permissions.
+pub fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let tmp = temp_path(path);
+    let result = (|| -> Result<()> {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(&tmp)
+            .with_context(|| format!("creating temporary {}", tmp.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("writing temporary {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("flushing temporary {}", tmp.display()))?;
+        drop(file);
+        harden_owner_only_checked(&tmp)?;
+        replace_file(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+        harden_owner_only_checked(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Owner-only hardening for a newly created metadata file. Unix applies mode 0600. Windows replaces

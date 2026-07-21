@@ -248,8 +248,10 @@ fn logo_is_sixel() -> bool {
 }
 
 /// Print the sun mark, centred over the wordmark: a real sixel image where supported, else braille.
-fn push_sun(out: &mut String) {
-    if logo_is_sixel() {
+/// `allow_sixel` is false for the retained backend, whose alt-screen renderer can't pass a raw DCS
+/// image through — there we always take the braille path so the intro is pure printable text.
+fn push_sun(out: &mut String, allow_sixel: bool) {
+    if allow_sixel && logo_is_sixel() {
         out.push_str("       "); // nudge the image toward the wordmark's centre
         out.push_str(&sun_sixel());
         out.push('\n');
@@ -262,9 +264,9 @@ fn push_sun(out: &mut String) {
 
 /// Append the Aizen logo: the sun mark, then the block-art wordmark (silver gradient), then the
 /// tagline. The sun + silver wordmark = the logo's noir lockup translated to the terminal.
-fn push_title(out: &mut String, word: &str) {
+fn push_title(out: &mut String, word: &str, allow_sixel: bool) {
     out.push('\n');
-    push_sun(out);
+    push_sun(out, allow_sixel);
     out.push('\n');
     for row in 0..5 {
         let line: String = word.chars().map(|c| glyph(c)[row]).collect::<Vec<_>>().join(" ");
@@ -318,10 +320,22 @@ fn wrap_items(items: &str, sep: &str, avail: usize) -> Vec<String> {
     lines
 }
 
-/// Build the whole landing screen (title + info/tools/commands panel) as a string.
+/// Build the whole landing screen (title + info/tools/commands panel) as a string. The sun mark uses
+/// a sixel image where the terminal supports it (classic/plain output can pass a DCS payload through).
 pub fn render() -> String {
+    render_inner(true)
+}
+
+/// Text-only landing screen for the RETAINED backend: its alt-screen renderer sanitizes CSI but a
+/// raw sixel DCS image would survive as garbage, so the sun is always the braille approximation and
+/// nothing DCS-bearing reaches the frame. Identical panel/body otherwise.
+pub fn render_text_only() -> String {
+    render_inner(false)
+}
+
+fn render_inner(allow_sixel: bool) -> String {
     let mut out = String::new();
-    push_title(&mut out, "AIZEN");
+    push_title(&mut out, "AIZEN", allow_sixel);
 
     let cfg = cli_config::load();
     let model = cfg.model.as_deref().unwrap_or("(not set)");
@@ -360,15 +374,17 @@ pub fn render() -> String {
         );
     }
     #[cfg(feature = "browser")]
-    boxline(
-        &mut out,
-        &format!(
-            "  {}{} {}",
-            crate::ui::icons::g(crate::ui::icons::tool_group("browser")),
-            style(format!("{:<9}", "browser")).dim(),
-            style(BROWSER_TOOLS).color256(ACCENT)
-        ),
-    );
+    for line in wrap_items(BROWSER_TOOLS, ", ", INNER.saturating_sub(14)) {
+        boxline(
+            &mut out,
+            &format!(
+                "  {}{} {}",
+                crate::ui::icons::g(crate::ui::icons::tool_group("browser")),
+                style(format!("{:<9}", "browser")).dim(),
+                style(line).color256(ACCENT)
+            ),
+        );
+    }
     boxblank(&mut out);
 
     boxline(
@@ -402,7 +418,7 @@ pub fn print() {
 /// user (no endpoint configured yet) right before the setup wizard — the "intro" before onboarding.
 pub fn welcome() -> String {
     let mut out = String::new();
-    push_title(&mut out, "AIZEN");
+    push_title(&mut out, "AIZEN", true);
     let _ = writeln!(
         out,
         "  {}",
@@ -437,6 +453,18 @@ mod tests {
         ] {
             assert!(COMMANDS.split(" · ").any(|x| x == c), "command '{c}' missing from splash COMMANDS");
         }
+    }
+
+    /// The retained backend sanitizes CSI but would pass a raw sixel DCS image through as garbage, so
+    /// `render_text_only` must never emit a Device Control String (`ESC P` … `ESC \`). The interactive
+    /// `render` MAY (classic/plain output handles it), so we only assert the text-only variant is clean.
+    #[test]
+    fn text_only_splash_has_no_sixel_dcs() {
+        // Colour CSI codes are fine (the retained backend strips them); a DCS image is not — its body
+        // is printable and would survive sanitization as garbage. Assert only that no DCS is opened.
+        let out = render_text_only();
+        assert!(!out.contains("\u{1b}P"), "retained intro must not open a sixel DCS");
+        assert!(!out.contains("\u{1b}\\"), "retained intro must not contain a DCS string terminator");
     }
 
     /// Every bordered line must be exactly the box width — a wider one means content overran the

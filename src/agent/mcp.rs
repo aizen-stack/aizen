@@ -156,9 +156,14 @@ fn load_trust() -> TrustStore {
 fn save_trust(t: &TrustStore) -> Result<()> {
     let p = trust_path();
     if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        crate::core::config::harden_dir(parent);
     }
-    std::fs::write(&p, serde_json::to_string_pretty(t)? + "\n").with_context(|| format!("writing {}", p.display()))
+    let mut bytes = serde_json::to_vec_pretty(t)?;
+    bytes.push(b'\n');
+    crate::core::persist::atomic_write(&p, &bytes).with_context(|| format!("writing {}", p.display()))?;
+    crate::core::persist::harden_owner_only_checked(&p)?;
+    Ok(())
 }
 
 /// Canonical string key for the current project root (best-effort canonicalization).
@@ -254,6 +259,15 @@ fn is_response_to(msg: &Value, id: u64) -> bool {
     msg.get("id").and_then(|v| v.as_u64()) == Some(id)
 }
 
+/// Observe server-initiated lifecycle notifications without mutating the live registry. A
+/// `tools/list_changed` event only latches a dirty bit; the actual reconnect/re-list happens at the
+/// next fresh user-turn boundary via [`prepare_fresh_turn`].
+fn observe_server_message(msg: &Value) {
+    if msg.get("method").and_then(|m| m.as_str()) == Some("notifications/tools/list_changed") {
+        mark_tools_dirty();
+    }
+}
+
 /// A human name for a JSON value's kind (for argument-type error messages).
 fn short_kind(v: &Value) -> &'static str {
     match v {
@@ -300,6 +314,201 @@ fn render_content(result: &Value) -> String {
     out
 }
 
+// ───────────────────────────── secret redaction ─────────────────────────────
+
+/// The placeholder every masked secret collapses to — one token so tests can assert a sentinel is
+/// gone AND that redaction fired.
+const REDACTED: &str = "«redacted»";
+
+/// Mask credentials in any string bound for an error, diagnostic, `/mcp` output, or tool result.
+/// Two layers:
+///   1. `known` — exact literal values (env var values, header values, bearer/refresh tokens) the
+///      caller pulled from the live config/token. Any occurrence is replaced wholesale. This is the
+///      strong layer: it catches a secret no matter where it surfaces (a stderr line, a URL, a body).
+///   2. Generic patterns — `Bearer <...>` / `Basic <...>` authorization values, and `?token=`/
+///      `?key=`/`?access_token=`/`?api_key=` query parameters — masked structurally so an unknown
+///      credential (one we didn't pass in `known`) still doesn't leak.
+/// Short/empty `known` values are skipped so we never blanket-replace a 1-char string across output.
+fn redact_secrets(input: &str, known: &[String]) -> String {
+    let mut s = input.to_string();
+    for secret in known {
+        let secret = secret.trim();
+        // Guard: only mask values long enough to plausibly BE a secret — masking "a" or "" would
+        // shred unrelated text. Real tokens/keys clear this easily.
+        if secret.len() >= 6 {
+            s = s.replace(secret, REDACTED);
+        }
+    }
+    redact_generic(&s)
+}
+
+/// The structural pass of [`redact_secrets`]: mask `Bearer`/`Basic` auth values and known secret
+/// query parameters even when the literal value wasn't supplied. Kept pure + separate so it's unit
+/// -testable and so [`McpTransportError::new`] can run just this layer with no `known` list.
+fn redact_generic(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < input.len() {
+        // Match `Bearer ` / `Basic ` (case-insensitive) then swallow the token that follows.
+        let rest = &input[i..];
+        let lower_rest = rest.to_ascii_lowercase();
+        if lower_rest.starts_with("bearer ") || lower_rest.starts_with("basic ") {
+            let kw_len = if lower_rest.starts_with("bearer ") { "bearer ".len() } else { "basic ".len() };
+            out.push_str(&rest[..kw_len]);
+            // The credential runs until whitespace, a quote, or end-of-string.
+            let after = &rest[kw_len..];
+            let tok_end = after
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
+                .unwrap_or(after.len());
+            if tok_end > 0 {
+                out.push_str(REDACTED);
+            }
+            i += kw_len + tok_end;
+            continue;
+        }
+        // Match a secret query parameter `token=` / `key=` / `access_token=` / `api_key=` / `apikey=`
+        // preceded by `?` or `&`, then swallow the value up to the next `&`, `#`, whitespace, or quote.
+        if bytes[i] == b'?' || bytes[i] == b'&' {
+            let param_rest = &input[i + 1..];
+            let lower = param_rest.to_ascii_lowercase();
+            let names = ["access_token=", "refresh_token=", "api_key=", "apikey=", "token=", "key=", "secret=", "password="];
+            if let Some(name) = names.iter().find(|n| lower.starts_with(**n)) {
+                out.push(bytes[i] as char);
+                out.push_str(&param_rest[..name.len()]);
+                let val = &param_rest[name.len()..];
+                let val_end =
+                    val.find(|c: char| c == '&' || c == '#' || c.is_whitespace() || c == '"' || c == '\'').unwrap_or(val.len());
+                if val_end > 0 {
+                    out.push_str(REDACTED);
+                }
+                i += 1 + name.len() + val_end;
+                continue;
+            }
+        }
+        // Default: copy this char through.
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// The set of literal secret values for one server (env values, header values, OAuth bearer/refresh
+/// tokens) — the `known` list handed to [`redact_secrets`] so they never appear in any diagnostic.
+fn server_secrets(cfg: &ServerConfig, token: Option<&crate::agent::mcp_oauth::TokenSet>) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    // Header VALUES are credentials (Authorization, X-Api-Key, cookies…). Names are safe to show.
+    for hv in cfg.headers.values() {
+        v.push(hv.clone());
+        // A header value may be `Bearer <tok>` / `Basic <tok>` — also mask the bare token part so a
+        // reworded diagnostic that drops the scheme still can't leak it.
+        for scheme in ["Bearer ", "Basic ", "bearer ", "basic "] {
+            if let Some(bare) = hv.strip_prefix(scheme) {
+                v.push(bare.trim().to_string());
+            }
+        }
+    }
+    // Env VALUES commonly carry API keys/tokens for a stdio server.
+    for ev in cfg.env.values() {
+        v.push(ev.clone());
+    }
+    if let Some(t) = token {
+        v.push(t.access_token.clone());
+        if let Some(r) = &t.refresh_token {
+            v.push(r.clone());
+        }
+        if let Some(sec) = &t.client_secret {
+            v.push(sec.clone());
+        }
+    }
+    v
+}
+
+// ───────────────────────────── typed transport errors ─────────────────────────────
+
+/// The kind of a transport-level failure. Health decisions (poison? replay?) branch on the VARIANT,
+/// never on a substring of a human message — a string match is fragile against reworded errors and
+/// localized OS text. Every variant except the auth markers means the connection framing is
+/// desynchronized or the request outcome is unknown, so the connection must be poisoned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportErrorKind {
+    /// The peer closed the stream (EOF) before answering — stdio stdout hit `n == 0`.
+    ConnectionClosed,
+    /// Writing the request out failed (stdin write / HTTP POST send) — the request may be partial.
+    SendFailed,
+    /// Reading the response failed mid-stream (stdout read / body read / bad JSON body).
+    ReadFailed,
+    /// An SSE `text/event-stream` ended without a frame answering the dispatched id.
+    SseTruncated,
+    /// A per-call or schema-probe timeout elapsed — the request was dispatched, outcome unknown.
+    Timeout,
+    /// The user cancelled (Esc) after the request was dispatched — outcome unknown.
+    Cancelled,
+    /// Authentication is required/expired and could not be refreshed. Clean (no framing desync).
+    AuthExpired,
+    /// A reconnect revealed the server's live tool schema no longer matches what the model was shown.
+    SchemaMismatch,
+    /// The request was dispatched but its result can't be determined (garbage/partial response).
+    AmbiguousResult,
+}
+
+impl TransportErrorKind {
+    /// Whether a failure of this kind leaves the connection unsafe to reuse without a reconnect.
+    /// Only the clean auth marker is non-poisoning; every framing/ambiguity failure poisons.
+    fn poisons(self) -> bool {
+        !matches!(self, TransportErrorKind::AuthExpired)
+    }
+}
+
+/// A typed transport failure carried through `anyhow` (so it interleaves with the existing
+/// `SessionExpired` / `Unauthorized` / `NeedsAuth` markers). `detail` is ALREADY redacted at
+/// construction — it may be surfaced to the model / logs verbatim.
+#[derive(Debug)]
+struct McpTransportError {
+    kind: TransportErrorKind,
+    detail: String,
+}
+
+impl McpTransportError {
+    fn new(kind: TransportErrorKind, detail: impl Into<String>) -> Self {
+        // Defense in depth: redact generic auth/query credentials even if a caller forgot to.
+        Self { kind, detail: redact_secrets(&detail.into(), &[]) }
+    }
+}
+
+impl std::fmt::Display for McpTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.detail)
+    }
+}
+impl std::error::Error for McpTransportError {}
+
+/// Classify an `anyhow` transport error into a health decision. Branches on the TYPED variant
+/// (`McpTransportError` / the auth markers), never on a substring of the human message. Anything
+/// unrecognized is treated as `AmbiguousResult` (poisons) — the safe default when the request was
+/// dispatched but its outcome can't be proven.
+fn classify_transport_error(e: &anyhow::Error) -> TransportErrorKind {
+    if let Some(te) = e.downcast_ref::<McpTransportError>() {
+        return te.kind;
+    }
+    // The recoverable auth/session markers are clean — the framing is intact, no poison needed.
+    if e.downcast_ref::<Unauthorized>().is_some()
+        || e.downcast_ref::<NeedsAuth>().is_some()
+        || e.downcast_ref::<SessionExpired>().is_some()
+    {
+        return TransportErrorKind::AuthExpired;
+    }
+    // Unknown error after a dispatched request → ambiguous, poison to be safe.
+    TransportErrorKind::AmbiguousResult
+}
+
+/// Whether an `anyhow` transport error should poison the connection: yes for every framing/ambiguity
+/// failure, no ONLY for the clean recoverable auth/session markers.
+fn err_poisons(e: &anyhow::Error) -> bool {
+    classify_transport_error(e).poisons()
+}
+
 // ───────────────────────────── transport ─────────────────────────────
 
 enum Transport {
@@ -315,34 +524,56 @@ struct StdioTransport {
     /// Tail of the child's stderr (bounded), drained by a background task — so a failed handshake or
     /// a dead child can report WHY (bad token / missing dep / crash) instead of a bare errno/EOF.
     stderr: Arc<std::sync::Mutex<String>>,
+    /// Literal secret values (env/header/token) to strip from the stderr tail before it's surfaced.
+    secrets: Vec<String>,
 }
 
 impl StdioTransport {
+    /// The bounded stderr tail with any known secret + generic auth material masked — a child that
+    /// echoes its own env/token in a log line must NOT leak it through a diagnostic.
     fn stderr_tail(&self) -> String {
-        self.stderr.lock().ok().map(|b| b.trim().to_string()).unwrap_or_default()
+        let raw = self.stderr.lock().ok().map(|b| b.trim().to_string()).unwrap_or_default();
+        redact_secrets(&raw, &self.secrets)
     }
     /// Send a request line, then read newline-delimited messages until the one answering `id`,
-    /// skipping interleaved notifications / log lines.
+    /// skipping interleaved notifications / log lines. Framing failures return a typed
+    /// [`McpTransportError`] so the health layer branches on the VARIANT, not a substring.
     async fn request(&mut self, msg: &Value) -> Result<Value> {
         let id = msg.get("id").and_then(|v| v.as_u64()).context("stdio request needs an id")?;
         let line = serde_json::to_string(msg)? + "\n";
-        self.stdin.write_all(line.as_bytes()).await.context("writing to MCP server stdin")?;
+        if let Err(e) = self.stdin.write_all(line.as_bytes()).await {
+            return Err(anyhow::Error::new(McpTransportError::new(
+                TransportErrorKind::SendFailed,
+                format!("writing to MCP server stdin: {e}"),
+            )));
+        }
         self.stdin.flush().await.ok();
         loop {
             let mut buf = String::new();
-            let n = self.stdout.read_line(&mut buf).await.context("reading MCP server stdout")?;
+            let n = match self.stdout.read_line(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(anyhow::Error::new(McpTransportError::new(
+                        TransportErrorKind::ReadFailed,
+                        format!("reading MCP server stdout: {e}"),
+                    )))
+                }
+            };
             if n == 0 {
                 let tail = self.stderr_tail();
-                if tail.is_empty() {
-                    bail!("MCP server closed stdout before answering");
-                }
-                bail!("MCP server exited before answering — stderr:\n{tail}");
+                let detail = if tail.is_empty() {
+                    "MCP server closed stdout before answering".to_string()
+                } else {
+                    format!("MCP server exited before answering — stderr:\n{tail}")
+                };
+                return Err(anyhow::Error::new(McpTransportError::new(TransportErrorKind::ConnectionClosed, detail)));
             }
             let trimmed = buf.trim();
             if trimmed.is_empty() {
                 continue;
             }
             let Ok(v) = serde_json::from_str::<Value>(trimmed) else { continue };
+            observe_server_message(&v);
             if is_response_to(&v, id) {
                 return Ok(v);
             }
@@ -365,11 +596,16 @@ struct HttpTransport {
     session_id: Option<String>,
     /// Negotiated on `initialize`; sent as `MCP-Protocol-Version` afterwards (spec recommendation).
     protocol_version: Option<String>,
+    /// Server identity/version returned by `initialize.serverInfo`, retained for lifecycle status.
+    server_info: Value,
     /// The mcp.json key, set ONLY for OAuth-enabled remotes (so we can find/refresh the cached token).
     oauth_key: Option<String>,
     /// The cached OAuth token (when `oauth_key` is set + a sign-in has happened). Attached as `Bearer`
     /// on every request and refreshed transparently on expiry / 401.
     token: Option<crate::agent::mcp_oauth::TokenSet>,
+    /// Literal secret values (static header values) to strip from any diagnostic (error body, status).
+    /// The OAuth bearer/refresh token is redacted generically (it's not stable across refreshes).
+    secrets: Vec<String>,
 }
 
 impl HttpTransport {
@@ -420,6 +656,22 @@ impl HttpTransport {
         Ok(())
     }
 
+    /// The live secret list for redaction: the static header secrets plus the CURRENT OAuth token
+    /// material (which rotates on refresh, so it can't be baked into `self.secrets` at connect time).
+    fn live_secrets(&self) -> Vec<String> {
+        let mut v = self.secrets.clone();
+        if let Some(t) = &self.token {
+            v.push(t.access_token.clone());
+            if let Some(r) = &t.refresh_token {
+                v.push(r.clone());
+            }
+            if let Some(sec) = &t.client_secret {
+                v.push(sec.clone());
+            }
+        }
+        v
+    }
+
     async fn request(&mut self, msg: &Value) -> Result<Value> {
         let id = msg.get("id").and_then(|v| v.as_u64()).context("http request needs an id")?;
         if self.oauth_key.is_some() {
@@ -446,11 +698,26 @@ impl HttpTransport {
     }
 
     /// One send + read. Returns typed markers for the two recoverable failures (`SessionExpired` on a
-    /// 404 with a session id, `Unauthorized` on a 401) so the wrappers can retry; everything else is a
-    /// plain error.
+    /// 404 with a session id, `Unauthorized` on a 401) so the wrappers can retry; every genuine
+    /// transport failure is a typed [`McpTransportError`] (so the health layer branches on the
+    /// variant, not a substring) with its detail already run through redaction.
     async fn send_and_read(&mut self, msg: &Value, id: u64) -> Result<Value> {
+        // Snapshot the live secrets + a redacted endpoint up front so diagnostics never echo the
+        // raw URL (it may carry `?token=`) or a header/token value.
+        let secrets = self.live_secrets();
+        let safe_url = redact_secrets(&self.url, &secrets);
         let rb = self.apply_headers(self.client.post(&self.url)).json(msg);
-        let mut resp = rb.send().await.with_context(|| format!("POST {}", self.url))?;
+        let mut resp = match rb.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // A send failure means the request may not have reached the server — treat as
+                // `SendFailed` (request outcome unknown → poison).
+                return Err(anyhow::Error::new(McpTransportError::new(
+                    TransportErrorKind::SendFailed,
+                    format!("POST {safe_url}: {}", redact_secrets(&e.to_string(), &secrets)),
+                )));
+            }
+        };
         // Capture/refresh the session id from the initialize response.
         if let Some(sid) = resp.headers().get("Mcp-Session-Id").and_then(|h| h.to_str().ok()) {
             self.session_id = Some(sid.to_string());
@@ -469,10 +736,16 @@ impl HttpTransport {
             if status.as_u16() == 404 && self.session_id.is_some() {
                 self.session_id = None;
                 self.protocol_version = None;
+                self.server_info = Value::Null;
                 return Err(anyhow::Error::new(SessionExpired));
             }
             let body = resp.text().await.unwrap_or_default();
-            bail!("MCP HTTP {} from {}: {}", status.as_u16(), self.url, body.chars().take(300).collect::<String>());
+            let body = redact_secrets(&body.chars().take(300).collect::<String>(), &secrets);
+            // A non-2xx after the request was accepted leaves the outcome ambiguous → poison.
+            return Err(anyhow::Error::new(McpTransportError::new(
+                TransportErrorKind::AmbiguousResult,
+                format!("MCP HTTP {} from {}: {}", status.as_u16(), safe_url, body),
+            )));
         }
         if ctype.contains("text/event-stream") {
             // Stream the SSE response and return as soon as the frame answering `id` arrives — a
@@ -480,25 +753,52 @@ impl HttpTransport {
             // may hold it open for progress/keep-alive), hanging the whole call until the timeout.
             return read_sse_response(&mut resp, id).await;
         }
-        let body = resp.text().await.context("reading MCP HTTP response body")?;
-        serde_json::from_str::<Value>(&body).context("parsing MCP JSON response")
+        let body = match resp.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(anyhow::Error::new(McpTransportError::new(
+                    TransportErrorKind::ReadFailed,
+                    format!("reading MCP HTTP response body: {}", redact_secrets(&e.to_string(), &secrets)),
+                )))
+            }
+        };
+        match serde_json::from_str::<Value>(&body) {
+            Ok(v) => Ok(v),
+            // A dispatched request answered with a non-JSON / partial body: the outcome is unknown.
+            Err(e) => Err(anyhow::Error::new(McpTransportError::new(
+                TransportErrorKind::AmbiguousResult,
+                format!("parsing MCP JSON response: {e}"),
+            ))),
+        }
     }
 
     async fn notify(&mut self, msg: &Value) -> Result<()> {
         // Notifications expect 202 Accepted with no body. We DO check the status: a 404 means the
         // session expired (surface it so the next request re-inits); other 4xx/5xx shouldn't pass
         // silently.
+        let secrets = self.live_secrets();
+        let safe_url = redact_secrets(&self.url, &secrets);
         let rb = self.apply_headers(self.client.post(&self.url)).json(msg);
-        let resp = rb.send().await.with_context(|| format!("POST notification {}", self.url))?;
+        let resp = match rb.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(anyhow::Error::new(McpTransportError::new(
+                    TransportErrorKind::SendFailed,
+                    format!("POST notification {safe_url}: {}", redact_secrets(&e.to_string(), &secrets)),
+                )))
+            }
+        };
         let status = resp.status();
         if status.as_u16() == 404 && self.session_id.is_some() {
             self.session_id = None;
             self.protocol_version = None;
+            self.server_info = Value::Null;
             return Err(anyhow!(SessionExpired));
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            bail!("MCP notify HTTP {} from {}: {}", status.as_u16(), self.url, body.chars().take(200).collect::<String>());
+            let body = redact_secrets(&body.chars().take(200).collect::<String>(), &secrets);
+            bail!("MCP notify HTTP {} from {}: {}", status.as_u16(), safe_url, body);
         }
         Ok(())
     }
@@ -586,19 +886,39 @@ impl SseParser {
 /// -alive) doesn't block the call to completion.
 async fn read_sse_response(resp: &mut reqwest::Response, id: u64) -> Result<Value> {
     let mut parser = SseParser::default();
-    while let Some(bytes) = resp.chunk().await.context("reading MCP SSE chunk")? {
-        for v in parser.push(&String::from_utf8_lossy(&bytes)) {
-            if is_response_to(&v, id) {
-                return Ok(v);
+    loop {
+        match resp.chunk().await {
+            Ok(Some(bytes)) => {
+                for v in parser.push(&String::from_utf8_lossy(&bytes)) {
+                    observe_server_message(&v);
+                    if is_response_to(&v, id) {
+                        return Ok(v);
+                    }
+                }
+            }
+            Ok(None) => break, // stream ended
+            Err(e) => {
+                // A mid-stream read error after the request was already dispatched: the outcome is
+                // unknown and the connection framing is desynced → typed ReadFailed (poisons).
+                return Err(anyhow::Error::new(McpTransportError::new(
+                    TransportErrorKind::ReadFailed,
+                    format!("reading MCP SSE chunk: {e}"),
+                )));
             }
         }
     }
     if let Some(v) = parser.flush() {
+        observe_server_message(&v);
         if is_response_to(&v, id) {
             return Ok(v);
         }
     }
-    bail!("MCP SSE stream ended without a response to id {id}")
+    // The stream closed before the frame answering our dispatched id arrived → the request was sent
+    // but never answered: typed SseTruncated (poisons; outcome unknown).
+    Err(anyhow::Error::new(McpTransportError::new(
+        TransportErrorKind::SseTruncated,
+        format!("MCP SSE stream ended without a response to id {id}"),
+    )))
 }
 
 impl Transport {
@@ -626,14 +946,80 @@ impl Transport {
 // ───────────────────────────── connection ─────────────────────────────
 
 struct Connection {
+    /// The mcp.json key — carried so a poisoned connection can rebuild its own transport.
+    name: String,
+    /// The server's config — the recipe to respawn/reconnect the transport in place.
+    cfg: ServerConfig,
     transport: Transport,
     next_id: u64,
+    /// A connection-level transport failure (EOF, send/read error, timeout) desyncs stdio framing
+    /// and leaves the HTTP session ambiguous. Once poisoned the connection must NOT be reused for a
+    /// new call until a successful `reconnect()` — a read-only caller may reconnect+replay once; a
+    /// destructive caller must not auto-replay (its side effect may already have happened).
+    poisoned: bool,
+    /// Bumped on every successful (re)connect. A stable generation across a turn means the tool
+    /// schema the model was shown still matches the live server.
+    generation: u64,
 }
 
 impl Connection {
     fn next_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Mark the connection unusable after a transport-level failure (timeout / EOF / mid-call cancel).
+    fn mark_poisoned(&mut self) {
+        self.poisoned = true;
+    }
+
+    /// The current connection generation (bumped on every successful (re)connect).
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Re-list the live server's tools and hash them, to detect a schema change after a reconnect.
+    /// `None` when the re-list itself fails/times out — AND in that case the connection is left
+    /// POISONED so the caller can never fall back to a stale advertised schema: a failed verify is
+    /// treated exactly like "the schema changed" (never replay, rebuild the registry next turn).
+    async fn schema_hash_now(&mut self) -> Option<u64> {
+        match tokio::time::timeout(CONNECT_TIMEOUT, self.list_tools()).await {
+            Ok(Ok(tools)) => {
+                let tools: Vec<ToolMeta> = tools.into_iter().filter(|t| self.cfg.allows(&t.name)).collect();
+                Some(schema_hash(&tools))
+            }
+            // Timeout, or a `tools/list` error: we can NOT confirm the live schema. Poison so no caller
+            // reuses this connection on a stale schema, and report "unknown" (None → caller won't replay).
+            // A `raw_call` error already sets poison; a bare timeout (outer future) does not — pin it here.
+            _ => {
+                self.poisoned = true;
+                None
+            }
+        }
+    }
+
+    /// Rebuild the transport from `self.cfg` and re-run the handshake. Clears poison + bumps the
+    /// generation on success; leaves it poisoned on failure so the caller can surface a clean error.
+    async fn reconnect(&mut self) -> Result<()> {
+        let transport = if self.cfg.command.is_some() {
+            connect_stdio(&self.cfg).await?
+        } else if self.cfg.url.is_some() {
+            connect_http(&self.name, &self.cfg)?
+        } else {
+            bail!("server `{}` has neither `command` (stdio) nor `url` (http)", self.name);
+        };
+        self.transport = transport;
+        self.next_id = 0;
+        tokio::time::timeout(CONNECT_TIMEOUT, self.initialize())
+            .await
+            .map_err(|_| anyhow!("`{}` re-initialize timed out after {}s", self.name, CONNECT_TIMEOUT.as_secs()))??;
+        self.poisoned = false;
+        self.generation += 1;
+        Ok(())
     }
 
     async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -643,6 +1029,7 @@ impl Connection {
             // `initialize` itself is never retried (it can't expire a session it hasn't made yet).
             Err(e) if method != "initialize" && e.downcast_ref::<SessionExpired>().is_some() => {
                 self.initialize().await.context("re-initializing after MCP HTTP session expiry")?;
+                self.poisoned = false; // a clean re-init after 404 restores the connection
                 self.raw_call(method, params).await
             }
             other => other,
@@ -652,8 +1039,28 @@ impl Connection {
     async fn raw_call(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id();
         let msg = rpc_request(id, method, params);
-        let resp = self.transport.request(&msg).await?;
-        rpc_result(resp)
+        let resp = match self.transport.request(&msg).await {
+            Ok(r) => {
+                // A complete response re-synchronizes the connection, including JSON-RPC errors —
+                // the request boundary is known. This also makes the caller's pre-request poison
+                // marker cancellation-safe: if its future is dropped mid-read, this line is never
+                // reached and the connection stays poisoned for the next same-turn caller.
+                self.poisoned = false;
+                r
+            }
+            Err(e) => {
+                // A transport-level failure (EOF / send / read / SSE-truncation / timeout / cancel)
+                // desyncs the connection. The decision is made on the TYPED variant, not a substring:
+                // only the clean recoverable markers (session expiry, 401, needs-auth) leave framing
+                // intact; every framing/ambiguity failure poisons so the next same-turn caller hits
+                // the gate rather than reusing a desynced connection.
+                if err_poisons(&e) {
+                    self.poisoned = true;
+                }
+                return Err(e);
+            }
+        };
+        rpc_result(resp) // an application/protocol error here means the connection is still alive
     }
 
     /// `initialize` handshake + the `notifications/initialized` follow-up. Returns serverInfo.
@@ -665,11 +1072,12 @@ impl Connection {
         });
         // `raw_call` (not `call`) so the session-expiry retry in `call` can't recurse back into us.
         let result = self.raw_call("initialize", params).await?;
-        // Pin the negotiated protocol version on the HTTP transport for subsequent requests.
+        // Pin negotiated lifecycle metadata on the HTTP transport for subsequent requests/status.
         if let Transport::Http(h) = &mut self.transport {
             if let Some(pv) = result.get("protocolVersion").and_then(|v| v.as_str()) {
                 h.protocol_version = Some(pv.to_string());
             }
+            h.server_info = result.get("serverInfo").cloned().unwrap_or(Value::Null);
         }
         self.transport.notify(&rpc_notification("notifications/initialized", json!({}))).await?;
         Ok(result.get("serverInfo").cloned().unwrap_or(Value::Null))
@@ -773,14 +1181,104 @@ struct ServerHandle {
     conn: Arc<Mutex<Connection>>,
     tools: Vec<ToolMeta>,
     server_info: Value,
+    /// Canonical hash of the exposed tool schemas at connect time. `notifications/tools/list_changed`
+    /// marks the manager dirty, but the schema the model sees must NOT change mid-run — the next
+    /// user-turn registry rebuild reconnects, recomputes this, and only then re-exposes changed tools.
+    schema_hash: u64,
+}
+
+/// Canonical, order-independent hash of a tool set's (name, schema) pairs — the pin that lets a
+/// reconnect detect "the server's tools changed underneath us" without trusting field ordering.
+fn schema_hash(tools: &[ToolMeta]) -> u64 {
+    let mut pairs: Vec<String> = tools
+        .iter()
+        .map(|t| {
+            format!(
+                "{}\u{1}{}\u{1}{}",
+                t.name,
+                serde_json::to_string(&t.input_schema).unwrap_or_default(),
+                if t.read_only { "ro" } else { "rw" }
+            )
+        })
+        .collect();
+    pairs.sort();
+    fnv1a(&pairs.join("\u{2}"))
 }
 
 /// All connected MCP servers, established once per process.
 pub struct Manager {
     servers: Vec<ServerHandle>,
+    /// Monotonic manager generation: increments each time the process rebuilds all MCP connections.
+    /// Combined with each connection's local generation this makes lifecycle state observable without
+    /// exposing credentials or endpoint headers.
+    generation: u64,
 }
 
 static MANAGER: std::sync::RwLock<Option<Manager>> = std::sync::RwLock::new(None);
+static NEXT_MANAGER_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A server sent `notifications/tools/list_changed`: its tool surface changed. We do NOT swap the
+/// registry mid-run (a schema change under an in-flight call would invalidate the arguments the
+/// model already produced) — instead the flag is latched and `prepare_fresh_turn()` reconnects at
+/// the next user-turn boundary, where the new surface can be re-listed and re-exposed safely.
+static TOOLS_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Latch a `tools/list_changed` observation (called from the transport read loop). Cheap + lock-free
+/// so it's safe to call from inside a request/notification scan.
+pub fn mark_tools_dirty() {
+    TOOLS_DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Fresh-user-turn boundary hook. When a server announced `tools/list_changed` since the last turn,
+/// we do NOT blindly drop every connection. Instead — for servers that advertise `listChanged` — we
+/// run a bounded, CONSERVATIVE schema probe on each server's CURRENT connection (never a second,
+/// competing reader): a `tools/list` that drains the pending notification and yields a fresh hash.
+///   • Every server still matches its pinned hash → the change was a no-op; KEEP the manager and its
+///     generation (the schemas the model saw last turn are still live).
+///   • Any server's schema moved, or the probe timed out / errored (ambiguous) → `invalidate()` so
+///     the NEXT registry build reconnects, re-lists, and re-exposes the changed surface safely. A
+///     server that then fails to rebuild is omitted by `build_manager` (never exposed on a stale
+///     schema). A failed/timed-out probe also poisons that connection (see `schema_hash_now`).
+/// Deliberately a no-op mid-run — only the top-level REPL calls this between turns, never inside
+/// `run_agent_loop`, so advertised schemas stay pinned for the duration of a run. Idempotent.
+pub fn prepare_fresh_turn() {
+    if !TOOLS_DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    // No runtime (unit tests) → fall back to the safe blunt behavior (drop + rebuild next build).
+    if tokio::runtime::Handle::try_current().is_err() {
+        invalidate();
+        return;
+    }
+    // Probe on the current connections; only invalidate if something actually changed / is unclear.
+    if !block(all_schemas_unchanged()) {
+        invalidate();
+    }
+}
+
+/// Probe every connected server's live tool schema on its CURRENT connection (no competing reader)
+/// and return whether ALL still match their pinned hash. `true` also when nothing is built (nothing
+/// to invalidate). Snapshots the connection handles under a short read lock, then releases it before
+/// awaiting so the probe never holds the manager lock across I/O.
+async fn all_schemas_unchanged() -> bool {
+    let probes: Vec<(Arc<Mutex<Connection>>, u64)> = {
+        let guard = MANAGER.read().unwrap();
+        let Some(mgr) = guard.as_ref() else { return true };
+        mgr.servers.iter().map(|s| (s.conn.clone(), s.schema_hash)).collect()
+    };
+    for (conn, pinned) in probes {
+        let mut c = conn.lock().await;
+        // A poisoned connection can't be trusted for a probe → treat as changed (force a rebuild).
+        if c.is_poisoned() {
+            return false;
+        }
+        match c.schema_hash_now().await {
+            Some(h) if h == pinned => {} // unchanged → keep this server
+            _ => return false,           // changed / failed / timed out (poison held) → rebuild
+        }
+    }
+    true
+}
 
 /// Spawn a stdio child server and return its transport. On **Windows** the launch goes through
 /// `cmd /C` because the common runners (`npx`, `uvx`, `dnx`, `bunx`) are `.cmd`/`.bat` shims that
@@ -829,7 +1327,14 @@ async fn connect_stdio(cfg: &ServerConfig) -> Result<Transport> {
             }
         });
     }
-    Ok(Transport::Stdio(StdioTransport { _child: child, stdin, stdout: BufReader::new(stdout), stderr: stderr_buf }))
+    Ok(Transport::Stdio(StdioTransport {
+        _child: child,
+        stdin,
+        stdout: BufReader::new(stdout),
+        stderr: stderr_buf,
+        // Env values commonly carry the child's API key/token — mask them out of the stderr tail.
+        secrets: server_secrets(cfg, None),
+    }))
 }
 
 fn connect_http(name: &str, cfg: &ServerConfig) -> Result<Transport> {
@@ -847,14 +1352,17 @@ fn connect_http(name: &str, cfg: &ServerConfig) -> Result<Transport> {
     } else {
         (None, None)
     };
+    let secrets = server_secrets(cfg, token.as_ref());
     Ok(Transport::Http(HttpTransport {
         client,
         url,
         headers: cfg.headers.clone(),
         session_id: None,
         protocol_version: None,
+        server_info: Value::Null,
         oauth_key,
         token,
+        secrets,
     }))
 }
 
@@ -877,7 +1385,14 @@ async fn connect_one(name: &str, cfg: &ServerConfig) -> Result<ServerHandle> {
     } else {
         bail!("server `{name}` has neither `command` (stdio) nor `url` (http)");
     };
-    let mut conn = Connection { transport, next_id: 0 };
+    let mut conn = Connection {
+        name: name.to_string(),
+        cfg: cfg.clone(),
+        transport,
+        next_id: 0,
+        poisoned: false,
+        generation: 0,
+    };
     let server_info = match tokio::time::timeout(CONNECT_TIMEOUT, conn.initialize()).await {
         Ok(Ok(si)) => si,
         Ok(Err(e)) => {
@@ -896,7 +1411,8 @@ async fn connect_one(name: &str, cfg: &ServerConfig) -> Result<ServerHandle> {
         Err(_) => bail!("`{name}` tools/list timed out after {}s", CONNECT_TIMEOUT.as_secs()),
     };
     let tools: Vec<ToolMeta> = tools.into_iter().filter(|t| cfg.allows(&t.name)).collect();
-    Ok(ServerHandle { name: name.to_string(), conn: Arc::new(Mutex::new(conn)), tools, server_info })
+    let schema_hash = schema_hash(&tools);
+    Ok(ServerHandle { name: name.to_string(), conn: Arc::new(Mutex::new(conn)), tools, server_info, schema_hash })
 }
 
 /// A live capability probe of ONE configured server (for `ng apps info` / the apps detail view):
@@ -982,10 +1498,11 @@ pub async fn login(key: &str) -> Result<()> {
 /// N×30s with no output. A server that fails to connect is logged and skipped — one broken entry
 /// never takes down the CLI or the others.
 async fn build_manager(cfg: &McpConfig) -> Manager {
+    let generation = NEXT_MANAGER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let enabled: Vec<(String, ServerConfig)> =
         cfg.servers.iter().filter(|(_, sc)| sc.enabled).map(|(n, sc)| (n.clone(), sc.clone())).collect();
     if enabled.is_empty() {
-        return Manager { servers: Vec::new() };
+        return Manager { servers: Vec::new(), generation };
     }
     eprintln!("{}", console::style(format!("mcp: connecting {} server(s)…", enabled.len())).dim());
 
@@ -1015,7 +1532,7 @@ async fn build_manager(cfg: &McpConfig) -> Manager {
     }
     // JoinSet completes out of order; sort for a deterministic tool listing across runs.
     servers.sort_by(|a, b| a.name.cmp(&b.name));
-    Manager { servers }
+    Manager { servers, generation }
 }
 
 /// Drive an async future from the sync `Tool::execute` path (see the module note on the invariant).
@@ -1035,12 +1552,14 @@ fn ensure_manager() {
     let cfg = match load_config() {
         Ok(Some(c)) if c.servers.values().any(|s| s.enabled) => c,
         Ok(_) => {
-            *guard = Some(Manager { servers: Vec::new() }); // no file / nothing enabled → cache empty
+            let generation = NEXT_MANAGER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *guard = Some(Manager { servers: Vec::new(), generation }); // no file / nothing enabled → cache empty
             return;
         }
         Err(e) => {
             eprintln!("{}", console::style(format!("mcp: {e}")).yellow());
-            *guard = Some(Manager { servers: Vec::new() });
+            let generation = NEXT_MANAGER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *guard = Some(Manager { servers: Vec::new(), generation });
             return;
         }
     };
@@ -1070,6 +1589,8 @@ fn fnv1a(s: &str) -> u64 {
     }
     h
 }
+
+// (schema_hash is defined once near ServerHandle — see above.)
 
 /// Sanitize a server/tool name into the `[a-z0-9_]` charset the tool-name grammar expects.
 fn slug(s: &str) -> String {
@@ -1145,6 +1666,12 @@ pub fn discovered_tools() -> Vec<Box<dyn Tool>> {
                 schema: t.input_schema.clone(),
                 destructive: !t.read_only,
                 conn: srv.conn.clone(),
+                // Pin the server's tool-schema hash + connect-time generation (0). A reconnect
+                // mid-turn re-lists the tools and bumps the generation to 1; if the re-listed hash
+                // differs the live surface no longer matches what the model was shown, so the call
+                // isn't replayed and the registry rebuilds next turn.
+                built_generation: 0,
+                built_schema_hash: srv.schema_hash,
             }));
         }
     }
@@ -1181,6 +1708,7 @@ pub fn summary() -> String {
         return format!("{trust_note}No MCP servers connected (all disabled or failed to connect).");
     }
     let mut s = trust_note;
+    s.push_str(&format!("MCP generation {} · schema pinned per turn\n", mgr.generation));
     for srv in &mgr.servers {
         let info = srv
             .server_info
@@ -1188,13 +1716,64 @@ pub fn summary() -> String {
             .and_then(|n| n.as_str())
             .map(|n| format!(" ({n})"))
             .unwrap_or_default();
-        s.push_str(&format!("● {}{} — {} tool(s)\n", srv.name, info, srv.tools.len()));
+        let (conn_gen, health) = match srv.conn.try_lock() {
+            Ok(c) => (c.generation(), if c.is_poisoned() { "poisoned" } else { "healthy" }),
+            Err(_) => (0, "busy"),
+        };
+        s.push_str(&format!(
+            "● {}{} — {} tool(s) · conn gen {} · {} · schema {:016x}\n",
+            srv.name,
+            info,
+            srv.tools.len(),
+            conn_gen,
+            health,
+            srv.schema_hash,
+        ));
         for t in &srv.tools {
             let ro = if t.read_only { " [read-only]" } else { "" };
             s.push_str(&format!("    {}{}\n", qualified_name(&srv.name, &t.name), ro));
         }
     }
     s.trim_end().to_string()
+}
+
+/// One `tools/call`, wall-clock-capped AND raced against the turn's cancel token, mapping the two
+/// non-completion outcomes to TYPED transport errors so the health layer branches on the variant
+/// (never a substring): a `Timeout` when the cap elapses, a `Cancelled` when Esc wins. Both leave the
+/// caller's pre-set poison marker in place (the request was dispatched, outcome unknown) so the
+/// deterministic tail invalidates the manager. `after_reconnect` only tunes the timeout wording.
+async fn call_once(
+    c: &mut Connection,
+    name: &str,
+    args: &Value,
+    cancel: Option<&crate::core::cancel::TurnCancel>,
+    server: &str,
+    after_reconnect: bool,
+) -> Result<String> {
+    let timed = tokio::time::timeout(CALL_TIMEOUT, c.call_tool(name, args));
+    let outcome = match cancel {
+        Some(tok) => tokio::select! {
+            biased;
+            _ = tok.cancelled() => {
+                return Err(anyhow::Error::new(McpTransportError::new(
+                    TransportErrorKind::Cancelled,
+                    format!("MCP tool '{server}/{name}' cancelled by user"),
+                )));
+            }
+            r = timed => r,
+        },
+        None => timed.await,
+    };
+    match outcome {
+        Ok(r) => r,
+        Err(_) => {
+            let where_ = if after_reconnect { " after reconnect" } else { "" };
+            Err(anyhow::Error::new(McpTransportError::new(
+                TransportErrorKind::Timeout,
+                format!("MCP tool '{server}/{name}' timed out{where_} after {}s", CALL_TIMEOUT.as_secs()),
+            )))
+        }
+    }
 }
 
 // ───────────────────────────── the dyn Tool wrapper ─────────────────────────────
@@ -1207,6 +1786,14 @@ struct McpTool {
     schema: Value,
     destructive: bool,
     conn: Arc<Mutex<Connection>>,
+    /// The connection generation this tool's schema was built against. If a reconnect bumps the
+    /// live generation AND the re-listed schema hash differs, the tool the model was shown no longer
+    /// matches the server — fail this call and rebuild the registry on the next turn rather than
+    /// calling a tool whose shape silently changed mid-run.
+    built_generation: u64,
+    /// The server's canonical tool-schema hash at build time (same value across every tool of a
+    /// server). Compared after an in-place reconnect to detect a schema change.
+    built_schema_hash: u64,
 }
 
 impl Tool for McpTool {
@@ -1242,6 +1829,9 @@ impl Tool for McpTool {
         let conn = self.conn.clone();
         let name = self.remote_name.clone();
         let server = self.server.clone();
+        let destructive = self.destructive;
+        let built_gen = self.built_generation;
+        let built_hash = self.built_schema_hash;
         // Coerce null/absent → {}, but DON'T silently discard a real non-object value (a bare
         // string/array/number means the model called the tool wrong — tell it, don't drop the arg).
         let args = match args {
@@ -1252,32 +1842,88 @@ impl Tool for McpTool {
         // The shared cancel-aware bridge: Esc aborts a slow MCP call instead of blocking the turn.
         let out = crate::agent::tools::block_for_tool(async move {
             let mut c = conn.lock().await;
-            match tokio::time::timeout(CALL_TIMEOUT, c.call_tool(&name, &args)).await {
-                Ok(r) => r,
-                Err(_) => {
-                    // The dropped read can leave the stdio BufReader desynced from message boundaries.
-                    // invalidate() nulls the cached Manager so the NEXT turn's registry build reconnects
-                    // from scratch. NOTE it does NOT repair the CURRENT turn: the live McpTools still
-                    // hold Arc<Mutex<Connection>> clones of this (now desynced) connection, so a repeat
-                    // call to the same server this turn keeps re-timing-out until the next message
-                    // rebuilds the registry. (A same-turn in-place reconnect would need a poison flag on
-                    // Connection; deferred — CALL_TIMEOUT is rare and the next turn self-heals.)
-                    drop(c);
-                    invalidate();
-                    Err(anyhow!(
-                        "MCP tool '{server}/{name}' timed out after {}s (connection reset)",
-                        CALL_TIMEOUT.as_secs()
-                    ))
+            // The turn's cancel token (set on this thread by the sync tool bridge). Racing it INSIDE
+            // the body — not only in the outer bridge — lets an Esc mid-call resolve to a typed
+            // `Cancelled` error whose poison flag is observed by the deterministic tail, so the cached
+            // Manager is invalidated rather than left holding a half-used connection.
+            let cancel = crate::core::cancel::current();
+
+            // The call + at-most-one recovery, computed as its own value so the SINGLE tail below can
+            // make the invalidation decision deterministically from the connection's final poison
+            // state — never from string-matching an error message.
+            let result: Result<String> = async {
+                // POISON GATE: a prior transport failure this turn left the connection desynced. A
+                // read-only tool may reconnect+replay once (its call has no side effect to double). A
+                // destructive tool must NOT auto-reconnect-and-run: the earlier failure's side effect
+                // may already have landed on the server, so silently re-running risks a double
+                // mutation. Fail clean and let the next user turn rebuild against a fresh connection.
+                if c.is_poisoned() {
+                    if destructive {
+                        bail!(
+                            "MCP tool '{server}/{name}' not run: the connection was reset after an \
+                             earlier error and this is a state-changing tool — its previous effect may \
+                             already have happened, so it is not auto-retried. It will reconnect on \
+                             your next message."
+                        );
+                    }
+                    c.reconnect()
+                        .await
+                        .map_err(|e| e.context(format!("reconnecting to MCP server '{server}' after a transport error")))?;
+                    // A failed/timed-out schema verify leaves the connection poisoned (see
+                    // `schema_hash_now`), so a stale schema can never be replayed against.
+                    let live_hash = c.schema_hash_now().await;
+                    if c.generation() <= built_gen || live_hash != Some(built_hash) {
+                        // Poison so the deterministic tail invalidates the (now stale) registry even
+                        // when the reconnect itself succeeded — the advertised schema no longer matches.
+                        c.mark_poisoned();
+                        return Err(anyhow::Error::new(McpTransportError::new(
+                            TransportErrorKind::SchemaMismatch,
+                            format!(
+                                "MCP server '{server}' changed its tool schema while reconnecting; \
+                                 '{name}' was not replayed. The updated tools will be available on \
+                                 your next message."
+                            ),
+                        )));
+                    }
                 }
+
+                // Mark BEFORE awaiting transport I/O. If Esc drops this future mid-read, no cleanup
+                // code runs; the marker survives and prevents another live McpTool clone from using a
+                // desynchronized connection. `raw_call` clears it only after a complete response.
+                c.mark_poisoned();
+                let first = call_once(&mut c, &name, &args, cancel.as_ref(), &server, false).await;
+
+                // A read-only call that failed on a freshly-poisoned connection (EOF/send/read
+                // mid-call) gets ONE reconnect+replay — the read has no side effect to double. A
+                // destructive call is NEVER auto-replayed (poison stays set → the next same-server
+                // call hits the gate above). If a reconnect reveals a CHANGED schema, don't replay
+                // against a tool the model never saw.
+                if first.is_err() && !destructive && c.is_poisoned() {
+                    if c.reconnect().await.is_err() {
+                        return first; // still poisoned → tail invalidates
+                    }
+                    if c.generation() <= built_gen || c.schema_hash_now().await != Some(built_hash) {
+                        // Schema moved / verify failed. `schema_hash_now` holds poison on a failed
+                        // verify; force it on a clean-but-changed schema too so the tail invalidates.
+                        c.mark_poisoned();
+                        return first; // don't replay against a tool the model never saw
+                    }
+                    c.mark_poisoned(); // same cancellation-safety invariant for the replay await
+                    return call_once(&mut c, &name, &args, cancel.as_ref(), &server, true).await;
+                }
+                first
             }
-        });
-        // A cancel dropped the read mid-message — the same stdio-framing desync as a timeout, so
-        // the same medicine: reconnect from scratch on the next registry build.
-        if let Err(e) = &out {
-            if e.to_string().contains("cancelled by user") {
+            .await;
+
+            // DETERMINISTIC INVALIDATION: whenever the connection ends this call poisoned (broken
+            // transport, timeout, cancel, or a destructive gate hit), the OTHER live McpTool clones
+            // this turn can't safely reuse it — null the cached Manager BEFORE returning so the next
+            // registry build reconnects from scratch. No string-matching involved.
+            if c.is_poisoned() {
                 invalidate();
             }
-        }
+            result
+        });
         out
     }
 }
@@ -1381,6 +2027,31 @@ mod tests {
     }
 
     #[test]
+    fn tools_list_changed_is_deferred_until_fresh_turn() {
+        TOOLS_DIRTY.store(false, std::sync::atomic::Ordering::Relaxed);
+        observe_server_message(&json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}));
+        assert!(TOOLS_DIRTY.load(std::sync::atomic::Ordering::Relaxed));
+        // A plain notification cannot mutate the live manager/tool registry in place; only the
+        // explicit fresh-turn hook consumes it.
+        prepare_fresh_turn();
+        assert!(!TOOLS_DIRTY.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn schema_hash_is_order_independent_and_tracks_safety() {
+        let ro = ToolMeta {
+            name: "x".into(),
+            description: String::new(),
+            input_schema: json!({"type":"object"}),
+            read_only: true,
+        };
+        let rw = ToolMeta { name: "y".into(), read_only: false, ..ro.clone() };
+        assert_eq!(schema_hash(&[ro.clone(), rw.clone()]), schema_hash(&[rw.clone(), ro.clone()]));
+        let changed = ToolMeta { read_only: false, ..ro.clone() };
+        assert_ne!(schema_hash(&[ro]), schema_hash(&[changed]), "read-only hint is part of the pin");
+    }
+
+    #[test]
     fn sse_parser_handles_events_and_split_chunks() {
         // Two events; the second answers id=3. Also fed split across a chunk boundary mid-line to
         // prove the parser reassembles partial lines (the streaming-transport invariant).
@@ -1458,6 +2129,117 @@ mod tests {
         let m2 = ToolMeta::from_value(&t2).unwrap();
         assert!(!m2.read_only);
         assert!(m2.input_schema["type"] == json!("object"), "defaults to object schema");
+    }
+
+    #[test]
+    fn redact_masks_known_secrets_and_generic_credentials() {
+        // Layer 1: a known literal value is masked wherever it appears (stderr line, URL, body).
+        let secret = "sk-supersecrettoken123456";
+        let line = format!("child crashed: API_KEY={secret} at startup");
+        let out = redact_secrets(&line, &[secret.to_string()]);
+        assert!(!out.contains(secret), "known secret must not survive: {out}");
+        assert!(out.contains(REDACTED), "redaction sentinel must fire: {out}");
+
+        // Layer 2 (generic, no `known` list): Bearer / Basic auth values.
+        let bearer = redact_generic("Authorization: Bearer abc.def.ghij tail");
+        assert!(!bearer.contains("abc.def.ghij"), "bearer token leaked: {bearer}");
+        assert!(bearer.contains("Bearer") && bearer.contains("tail"), "kept scheme + trailing: {bearer}");
+        let basic = redact_generic("hdr Basic dXNlcjpwYXNz,next");
+        assert!(!basic.contains("dXNlcjpwYXNz"), "basic cred leaked: {basic}");
+
+        // Layer 2: secret query parameters, value swallowed to the next delimiter.
+        let q = redact_generic("GET https://h/mcp?access_token=zzz999secret&page=2#frag");
+        assert!(!q.contains("zzz999secret"), "query token leaked: {q}");
+        assert!(q.contains("page=2") && q.contains("#frag"), "non-secret params kept: {q}");
+
+        // Guard: a short `known` value is NOT blanket-replaced (would shred unrelated text).
+        let short = redact_secrets("the letter a appears here", &["a".to_string()]);
+        assert_eq!(short, "the letter a appears here", "short secrets must not be masked");
+    }
+
+    #[test]
+    fn transport_error_kinds_drive_poison_decision() {
+        // Every framing/ambiguity failure poisons; only the clean auth marker does not.
+        for kind in [
+            TransportErrorKind::ConnectionClosed,
+            TransportErrorKind::SendFailed,
+            TransportErrorKind::ReadFailed,
+            TransportErrorKind::SseTruncated,
+            TransportErrorKind::Timeout,
+            TransportErrorKind::Cancelled,
+            TransportErrorKind::SchemaMismatch,
+            TransportErrorKind::AmbiguousResult,
+        ] {
+            assert!(kind.poisons(), "{kind:?} must poison the connection");
+        }
+        assert!(!TransportErrorKind::AuthExpired.poisons(), "clean auth marker must not poison");
+
+        // classify_transport_error branches on the TYPE, never a substring.
+        let te = anyhow::Error::new(McpTransportError::new(TransportErrorKind::ConnectionClosed, "EOF"));
+        assert_eq!(classify_transport_error(&te), TransportErrorKind::ConnectionClosed);
+        assert!(err_poisons(&te));
+
+        // The recoverable auth/session markers classify as AuthExpired (clean, no poison).
+        for e in [
+            anyhow::Error::new(Unauthorized),
+            anyhow::Error::new(SessionExpired),
+            anyhow::Error::new(NeedsAuth { key: "x".into() }),
+        ] {
+            assert_eq!(classify_transport_error(&e), TransportErrorKind::AuthExpired);
+            assert!(!err_poisons(&e), "auth marker must not poison");
+        }
+
+        // An UNKNOWN error after a dispatched request is treated as ambiguous → poison (safe default).
+        let unknown = anyhow!("something odd happened");
+        assert_eq!(classify_transport_error(&unknown), TransportErrorKind::AmbiguousResult);
+        assert!(err_poisons(&unknown));
+    }
+
+    #[test]
+    fn transport_error_detail_is_redacted_at_construction() {
+        // A caller that forgets to redact still can't leak a Bearer through the typed detail.
+        let e = McpTransportError::new(TransportErrorKind::ReadFailed, "POST failed: Bearer leaky.token.here");
+        assert!(!e.detail.contains("leaky.token.here"), "detail must be redacted: {}", e.detail);
+    }
+
+    #[test]
+    fn server_secrets_collects_header_env_and_token_material() {
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_string(), "Bearer header-tok-abcdef".to_string());
+        headers.insert("X-Api-Key".to_string(), "xapikey-value-123".to_string());
+        let mut env = BTreeMap::new();
+        env.insert("TOKEN".to_string(), "env-secret-value-9".to_string());
+        let cfg = ServerConfig {
+            command: Some("x".into()),
+            args: vec![],
+            env,
+            url: None,
+            headers,
+            enabled: true,
+            include: vec![],
+            exclude: vec![],
+            auth: None,
+            oauth: None,
+        };
+        let tok = crate::agent::mcp_oauth::TokenSet {
+            access_token: "access-tok-secret".into(),
+            refresh_token: Some("refresh-tok-secret".into()),
+            expires_at: None,
+            token_endpoint: "https://h/token".into(),
+            client_id: "cid".into(),
+            client_secret: Some("client-sec-secret".into()),
+            scope: None,
+            resource: None,
+        };
+        let secrets = server_secrets(&cfg, Some(&tok));
+        // Whole header value AND the bare token part (scheme stripped) are both listed.
+        assert!(secrets.iter().any(|s| s == "Bearer header-tok-abcdef"));
+        assert!(secrets.iter().any(|s| s == "header-tok-abcdef"), "bare bearer token must be masked too");
+        assert!(secrets.iter().any(|s| s == "xapikey-value-123"));
+        assert!(secrets.iter().any(|s| s == "env-secret-value-9"));
+        assert!(secrets.iter().any(|s| s == "access-tok-secret"));
+        assert!(secrets.iter().any(|s| s == "refresh-tok-secret"));
+        assert!(secrets.iter().any(|s| s == "client-sec-secret"));
     }
 
     #[test]

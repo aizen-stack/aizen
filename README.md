@@ -98,7 +98,8 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | `/persona` | character the agent plays + its evolving self-memory: select · new · paste-to-create · view/reset self-memory |
 | `/skills` | saved procedures the agent can load: list · view · new · delete |
 | `/commands` | your **custom slash commands** — markdown macros you fire (see below) |
-| `/mcp` | MCP servers from `~/.aizen/mcp.json` — list connected tools (see below) |
+| `/mcp` | MCP lifecycle status: connected tools, generation, health, and per-turn schema pinning (see below) |
+| `/browser` | browser profile / host-route / pinned-session status (`--features browser`) |
 | `/apps` | connected apps & MCP catalog — Telegram/Discord/Slack/webhook notify + browser-sign-in MCP apps |
 | `/telegram` | Telegram integration menu: setup · test · status · start daemon · disable |
 | `/sessions` | saved conversations — restore · save · delete (the chat also auto-saves as `last`) |
@@ -133,6 +134,13 @@ The REPL needs a real terminal; piped/CI stdin prints a hint and exits (`AIZEN_M
 "Cascadia Code NF", else you'll see boxes), or `off` (plain text). One-off override: `AIZEN_NERD=1` /
 `AIZEN_NO_ICONS=1`. (A CLI can't bundle a font the terminal will use — `nerd` needs the font set in the
 terminal itself.)
+
+**Reply visuals** — final answers can use responsive terminal tables and compact text diagrams. The
+persisted mode is `auto` (default: only when it clarifies), `always` (every substantial final reply),
+or `off`: choose it under `/config` → Display or run
+`aizen config set --response-visuals <auto|always|off>`. Wide terminals get boxed tables; narrow
+terminals fall back to stacked `key: value` records. Diagram fences preserve their monospace layout;
+piped/CI output remains raw Markdown.
 
 ## Telegram — control `aizen` from your phone
 
@@ -438,7 +446,14 @@ At startup `aizen` connects each enabled server, lists its tools, and exposes ea
 **`mcp_<server>_<tool>`** (per-server `include`/`exclude` filters which). External tools are
 **approval-gated by default** (unless the server marks a tool read-only). A pure-Rust client — no
 Node/Python MCP SDK, no extra runtime; the single static binary is preserved. `aizen mcp list` or
-**`/mcp`** shows what's connected.
+**`/mcp`** shows the manager/connection generation, sanitized health, pinned schema hash, and tools.
+
+MCP schemas are **pinned for one agent run**. If a server emits `notifications/tools/list_changed`,
+Aizen defers the new schema until the next fresh user message instead of mutating the tool registry
+mid-run. Connection EOF/send/read/timeout poisons that connection: a read-only MCP call may reconnect
+and replay once after confirming the schema is unchanged; a state-changing call is never replayed
+after an ambiguous transport failure (its side effect may already have happened). HTTP 404 session
+expiry and OAuth refresh retain their narrow one-retry behavior.
 
 **OAuth sign-in apps** — the marquee SaaS servers (Linear, Notion, Slack, Gmail/Google, Atlassian)
 are OAuth-only. `aizen` speaks the full OAuth 2.1 (PKCE) flow: an entry with `"auth": "oauth"` triggers a
@@ -459,17 +474,40 @@ LOCAL-FIRST: a self-hostable package (runs on your machine with your keys) beats
 
 ### Browser automation (`--features browser`)
 Build with `cargo build --release --features browser` to give the agent five CDP tools that drive an
-**existing** local Chrome/Edge/Brave (it never bundles a browser). Launch one with remote debugging,
-then just ask — "open localhost:3000 and tell me why the login button does nothing":
+**existing** Chrome/Edge/Brave (it never bundles a browser). The legacy local setup still works:
 ```bash
-chrome --remote-debugging-port=9222     # or msedge / brave; override host with AIZEN_BROWSER_CDP
-aizen --features… # (already built) → "go to http://localhost:3000 and debug the login form"
+chrome --remote-debugging-port=9222     # or msedge / brave; AIZEN_BROWSER_CDP overrides local
 ```
+
+For multiple/local-or-remote CDP endpoints, create versioned `~/.aizen/browser.json`:
+```json
+{
+  "schema": 1,
+  "default_profile": "local",
+  "profiles": {
+    "local": { "provider": "cdp", "endpoint": "127.0.0.1:9222" },
+    "work":  { "provider": "cdp", "endpoint": "https://cdp.example.com", "auth_env": "WORK_CDP_AUTH" }
+  },
+  "routes": { "*.corp.example": "work", "localhost": "local" }
+}
+```
+`auth_env` is an **environment-variable name only**; credential values are never accepted in the
+file, tool schemas, status output, or logs. When a profile sets `auth_env`, that value is attached as
+the `Authorization` header on **both** the HTTP `/json` discovery request **and** the WebSocket upgrade,
+so a CDP endpoint behind an auth proxy is reachable. `browser_navigate` resolves the URL host to a
+profile and pins that session; snapshot/click/type/eval continue on the same profile. Switching profiles
+drops the old websocket and invalidates its `@ref`s. Browser sessions are **keyed per conversation**
+(REPL session, or `serve` platform:route:chat), so two chats never share a page, profile, or `@ref`s;
+`/new`, session deletion, and hostbot route removal release a conversation's session. `/browser` shows
+sanitized routing/session status; `/browser doctor` live-probes every profile without printing
+credential values.
+
 Tools: **`browser_navigate`** (open a URL), **`browser_snapshot`** (the page's accessibility tree as
 `[@ref] role "name"` lines), **`browser_click`** / **`browser_type`** (act on a `@ref`), and
-**`browser_eval`** (run JS — read DOM/state, await fetches). Still a **pure-Rust static binary, no C
-toolchain**: CDP's local endpoint is plain `ws://`, so the WebSocket client carries no TLS. An absent
-browser returns an actionable error, not a crash.
+**`browser_eval`** (run JS — read DOM/state, await fetches). `browser_snapshot` may reconnect/retry
+once after a transport failure; navigate/click/type/eval are never replayed after transport ambiguity.
+Still a **pure-Rust static binary, no bundled browser/Node/Playwright/CEF**. An absent browser returns
+an actionable error, not a crash.
 
 ### `aizen memory` — the self-learning brain
 ```bash

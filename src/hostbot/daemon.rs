@@ -68,10 +68,8 @@ fn command_menu() -> Vec<(String, String)> {
     SERVE_COMMANDS.iter().map(|(n, _, d)| (n.to_string(), d.to_string())).collect()
 }
 
-/// Split a string so each chunk is `<= max` **UTF-16 code units** — the unit Telegram (4096) and
-/// Discord (2000) actually count their message caps in. Splitting by Unicode scalar undercounts:
-/// an astral char (emoji, math-bold) is 1 scalar but 2 UTF-16 units, so an emoji-heavy reply under
-/// the char cap can still exceed the platform limit → HTTP 400 → the reply is silently dropped.
+/// Split text under a platform's UTF-16 limit, preferring newline boundaries so table records and
+/// text-diagram rows stay intact. A single over-limit line falls back to scalar-safe splitting.
 fn chunk_text(s: &str, max: usize) -> Vec<String> {
     if s.encode_utf16().count() <= max {
         return vec![s.to_string()];
@@ -79,19 +77,42 @@ fn chunk_text(s: &str, max: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut cur_units = 0usize;
-    for ch in s.chars() {
-        let u = ch.len_utf16();
-        if cur_units + u > max && !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
-            cur_units = 0;
+    for segment in s.split_inclusive('\n') {
+        let units = segment.encode_utf16().count();
+        if units <= max {
+            if cur_units + units > max && !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+                cur_units = 0;
+            }
+            cur.push_str(segment);
+            cur_units += units;
+            continue;
         }
-        cur.push(ch);
-        cur_units += u;
+        if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        let mut piece = String::new();
+        let mut piece_units = 0usize;
+        for ch in segment.chars() {
+            let u = ch.len_utf16();
+            if piece_units + u > max && !piece.is_empty() {
+                out.push(std::mem::take(&mut piece));
+                piece_units = 0;
+            }
+            piece.push(ch);
+            piece_units += u;
+        }
+        cur = piece;
+        cur_units = piece_units;
     }
     if !cur.is_empty() {
         out.push(cur);
     }
     out
+}
+
+fn outbound_reply(raw: &str) -> String {
+    crate::ui::markdown::render_plain_blocks(raw)
 }
 
 /// Hard cap on messages retained in one serve session, so a long conversation can't grow without
@@ -102,14 +123,15 @@ const SERVE_SESSION_MAX_MSGS: usize = 40;
 /// until under `max`, always cutting at a `user` boundary so an assistant tool-call turn is never
 /// split from its tool results (a dangling tool_call ⇒ a 400 on strict gateways).
 fn cap_session(history: &mut Vec<Message>, max: usize) {
+    let lead = crate::agent::compact::leading_system_count(history).max(1);
     while history.len() > max {
         let second_user =
-            history.iter().enumerate().filter(|(i, m)| *i >= 1 && m.role == "user").nth(1).map(|(i, _)| i);
+            history.iter().enumerate().filter(|(i, m)| *i >= lead && m.role == "user").nth(1).map(|(i, _)| i);
         match second_user {
-            Some(i) => {
-                history.drain(1..i);
+            Some(i) if i > lead => {
+                history.drain(lead..i);
             }
-            None => break,
+            _ => break,
         }
     }
 }
@@ -127,8 +149,25 @@ async fn run_serve_turn(
     task: &str,
     approval_mode: ApprovalMode,
 ) -> Result<String> {
-    if history.is_empty() {
-        history.push(Message::system(crate::current_system_prompt(model)));
+    let bundle = crate::current_system_prompt_bundle(model);
+    let lead = crate::agent::compact::leading_system_count(history);
+    if lead < 2 {
+        // Persisted legacy sessions had one flattened system prompt. Replace that stale prefix with
+        // current lanes; never treat old dynamic identity/memory bytes as the stable cache lane.
+        let tail = history.get(lead..).unwrap_or_default().to_vec();
+        history.clear();
+        history.push(Message::system(bundle.stable.clone()));
+        if !bundle.dynamic.trim().is_empty() {
+            history.push(Message::system(bundle.dynamic.clone()));
+        }
+        history.extend(tail);
+    } else {
+        // Fresh platform message: stable lane stays byte-identical; only dynamic lane refreshes.
+        if bundle.dynamic.trim().is_empty() {
+            history.remove(1);
+        } else {
+            history[1] = Message::system(bundle.dynamic.clone());
+        }
     }
     history.push(Message::user(task.to_string()));
 
@@ -143,8 +182,10 @@ async fn run_serve_turn(
         approval_mode,
         crate::resolve_ctx_window(model).0,
     )?;
+    let turn_cancel = crate::core::cancel::TurnCancel::new();
     let cfg = AgentConfig {
         approval_mode,
+        cancel: turn_cancel,
         quiet: true,
         enable_verify_gate: false,
         context_window: crate::resolve_ctx_window(model).0,
@@ -250,17 +291,27 @@ async fn run_daemon<P: Platform>(platform: P) -> Result<()> {
         // blocks change — `<user_memory>` stays global, so memory is always the primary agent's. `None`
         // (the "default" bot / a bot with no persona) falls back to the global `config.persona`.
         crate::persona::set_override(platform.persona_for(&route));
+        // Scope per-conversation resources (e.g. the browser session) to THIS platform+route+chat so
+        // one chat's page/@refs never bleed into another's. Serial loop ⇒ a single active slot suffices.
+        crate::core::convo::set_active(Some(crate::core::convo::ConversationId::new(format!(
+            "{}:{}:{}",
+            platform.name(),
+            route,
+            chat
+        ))));
         let history = sessions.entry((route.clone(), chat)).or_default();
         let reply = run_serve_turn(&http, &base_url, &api_key, &model, history, &task, approval)
             .await
             .unwrap_or_else(|e| format!("error: {e}"));
         crate::persona::set_override(None);
+        crate::core::convo::set_active(None);
         if platform.supports_approval() {
             platform.clear_approval_route();
         }
         // Persist the updated history so a restart keeps this chat's context.
         let _ = store::save_session(platform.name(), &route, &chat.to_string(), history);
-        for piece in chunk_text(&reply, platform.message_max()) {
+        let shown = outbound_reply(&reply);
+        for piece in chunk_text(&shown, platform.message_max()) {
             let _ = platform.send(&route, chat, &piece).await;
         }
     }
@@ -291,6 +342,14 @@ async fn handle_command<P: Platform>(
         "new" | "reset" => {
             sessions.remove(&key);
             store::drop_session(platform.name(), route, &chat.to_string());
+            // Free this chat's browser session too (its page/@refs are part of the dropped context).
+            #[cfg(feature = "browser")]
+            crate::agent::browser::release(&crate::core::convo::ConversationId::new(format!(
+                "{}:{}:{}",
+                platform.name(),
+                route,
+                chat
+            )));
             Some("🆕 started a fresh conversation — earlier context dropped.".to_string())
         }
         "resume" => {
@@ -616,6 +675,24 @@ mod tests {
     #[test]
     fn chunk_text_keeps_short_ascii_whole() {
         assert_eq!(chunk_text("hello", 3500), vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn chunk_text_prefers_complete_lines() {
+        let s = "first row\nsecond row\nthird row\n";
+        let chunks = chunk_text(s, 22);
+        assert_eq!(chunks.concat(), s);
+        assert!(chunks.iter().all(|c| c.encode_utf16().count() <= 22));
+        assert!(chunks[..chunks.len() - 1].iter().all(|c| c.ends_with('\n')), "{chunks:?}");
+    }
+
+    #[test]
+    fn outbound_reply_stacks_tables_but_keeps_diagrams() {
+        let raw = "| File | State |\n|---|---|\n| a.rs | done |\n\n```diagram\nA --> B\n```";
+        let shown = outbound_reply(raw);
+        assert!(shown.contains("File: a.rs\nState: done"), "{shown}");
+        assert!(!shown.contains("|---|---|"), "{shown}");
+        assert!(shown.contains("```diagram\nA --> B\n```"), "{shown}");
     }
 
     #[test]

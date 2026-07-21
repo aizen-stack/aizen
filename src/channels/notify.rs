@@ -226,6 +226,9 @@ impl Tool for Notify {
     fn is_concurrency_safe(&self) -> bool {
         false
     }
+    fn recovery_effect(&self, _args: &Value) -> bool {
+        true
+    }
     fn execute(&self, args: &Value) -> Result<String> {
         let text = args.get("text").and_then(|v| v.as_str()).context("missing required string arg 'text'")?;
         let results = block(async { anyhow::Ok(broadcast(text).await) })?;

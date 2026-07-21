@@ -5,7 +5,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde::Deserialize;
-use std::io::Write;
 
 use crate::core::types::{
     CacheControl, ChatChunk, ChatRequest, ChatResponse, FunctionCall, Message, StreamOptions, ToolCall,
@@ -92,23 +91,28 @@ pub fn cache_enabled(flag: Option<bool>, model: &str) -> bool {
     flag.unwrap_or_else(|| is_anthropic_model(model))
 }
 
-/// Stamp ephemeral cache breakpoints (≤3 of Anthropic's 4): the LAST tool def (caches the whole
-/// tool block), the system message (caches tools+system), and the last stable assistant/tool message
-/// before the newest turn (caches the prior conversation). The volatile newest user turn stays
+/// Stamp ephemeral cache breakpoints (≤4 of Anthropic's 4): the LAST tool def (caches the whole
+/// tool block), the first stable system message, an optional second dynamic system message, and the
+/// last stable assistant/tool message before the newest turn. The volatile newest user turn stays
 /// uncached. Computed per call, never stored, so mid-history `system` nudges don't disturb it.
 fn apply_cache_breakpoints(messages: &mut [Message], tools: &mut [ToolDef]) {
     if let Some(last) = tools.last_mut() {
         last.cache_control = Some(CacheControl::ephemeral());
     }
+    // First system message = stable lane.
     if let Some(first) = messages.first_mut() {
         if first.role == "system" {
             first.cache_control = Some(CacheControl::ephemeral());
         }
     }
+    // Second leading system message = dynamic lane (persona/memory/skills/…); stamp when present.
+    if messages.len() >= 2 && messages[0].role == "system" && messages[1].role == "system" {
+        messages[1].cache_control = Some(CacheControl::ephemeral());
+    }
     let n = messages.len();
     if n >= 3 {
         if let Some(idx) = (0..n).rev().find(|&i| matches!(messages[i].role.as_str(), "assistant" | "tool")) {
-            if idx != 0 {
+            if idx != 0 && !(idx == 1 && messages[0].role == "system") {
                 messages[idx].cache_control = Some(CacheControl::ephemeral());
             }
         }
@@ -409,6 +413,23 @@ pub async fn stream_chat(
     model: &str,
     messages: Vec<Message>,
 ) -> Result<String> {
+    stream_chat_with_visual_contract(client, base_url, api_key, model, messages, false).await
+}
+
+/// Stream one top-level answer with optional visual-response guidance and terminal Markdown rendering.
+pub async fn stream_chat_with_visual_contract(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    mut messages: Vec<Message>,
+    visual_contract: bool,
+) -> Result<String> {
+    if visual_contract {
+        if let Some(block) = crate::agent::response_visuals_prompt_block(crate::core::cli_config::load().response_visuals()) {
+            messages.insert(0, Message::system(block));
+        }
+    }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let body = ChatRequest {
         model: model.to_string(),
@@ -437,7 +458,8 @@ pub async fn stream_chat(
 
     let mut stream = resp.bytes_stream().eventsource();
     let mut full = String::new();
-    let mut stdout = std::io::stdout();
+    let decorate = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let mut md = crate::ui::markdown::MarkdownStream::new(decorate, crate::ui::tui::width());
 
     // Capture a mid-stream transport error and break rather than `?`-ing out, so the closing
     // newline below still runs (a clean line break before the error surfaces) — same invariant
@@ -465,8 +487,11 @@ pub async fn stream_chat(
                 if let Some(choice) = chunk.choices.first() {
                     if let Some(content) = &choice.delta.content {
                         spin.take(); // clear before the first token prints
-                        print!("{content}");
-                        let _ = stdout.flush();
+                        let rendered = md.push(content);
+                        if !rendered.is_empty() {
+                            print!("{rendered}");
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
                         full.push_str(content);
                     }
                 }
@@ -480,6 +505,10 @@ pub async fn stream_chat(
     }
 
     spin.take();
+    let closing = md.finish();
+    if !closing.is_empty() {
+        print!("{closing}");
+    }
     println!();
     if let Some(e) = stream_err {
         return Err(e);
@@ -744,9 +773,11 @@ pub async fn stream_chat_with_tools_eager(
     let mut eager_by_slot: std::collections::HashMap<usize, tokio::task::JoinHandle<String>> =
         std::collections::HashMap::new();
     let mut think = ThinkFilter::default(); // suppress `<think>…</think>` reasoning from the display
-    // Render Markdown for the DISPLAY only (history keeps the raw text via `full`). Decorate when
-    // we own an interactive terminal (sticky TUI or a TTY one-shot); pipes/CI pass through verbatim.
-    let decorate = crate::ui::tui::active() || std::io::IsTerminal::is_terminal(&std::io::stdout());
+    // Retained mode owns raw assistant blocks and reparses the whole active message; classic/one-shot
+    // paths keep the line-buffered display renderer. History always keeps the same raw Markdown.
+    let retained_display = crate::ui::tui::retained_active();
+    let decorate = !retained_display
+        && (crate::ui::tui::active() || std::io::IsTerminal::is_terminal(&std::io::stdout()));
     let cols = crate::ui::tui::width(); // wrap to the box width (not a separately-probed window edge)
     let mut md = crate::ui::markdown::MarkdownStream::new(decorate, cols);
 
@@ -794,9 +825,13 @@ pub async fn stream_chat_with_tools_eager(
                         if !shown.is_empty() {
                             full.push_str(&shown); // history keeps the RAW markdown
                             crate::ui::tui::add_stream_chars(shown.chars().count() as u64); // live ↑tok pill
-                            let rendered = md.push(&shown); // styled, complete lines (gutter, md, code)
-                            if !rendered.is_empty() {
-                                crate::ui::tui::emit(&rendered); // sticky TUI funnel (plain print! when inactive)
+                            if retained_display {
+                                crate::ui::tui::assistant_stream_delta(&shown);
+                            } else {
+                                let rendered = md.push(&shown); // styled, complete lines (gutter, md, code)
+                                if !rendered.is_empty() {
+                                    crate::ui::tui::emit(&rendered); // classic TUI funnel / plain print
+                                }
                             }
                         }
                     }
@@ -826,17 +861,25 @@ pub async fn stream_chat_with_tools_eager(
     let tail = think.finish();
     if !tail.is_empty() {
         full.push_str(&tail);
-        let rendered = md.push(&tail);
-        if !rendered.is_empty() {
-            crate::ui::tui::emit(&rendered);
+        if retained_display {
+            crate::ui::tui::assistant_stream_delta(&tail);
+        } else {
+            let rendered = md.push(&tail);
+            if !rendered.is_empty() {
+                crate::ui::tui::emit(&rendered);
+            }
         }
     }
-    let closing = md.finish(); // flush the final partial line + close any dangling code fence
-    if !closing.is_empty() {
-        crate::ui::tui::emit(&closing);
-    }
-    if !full.is_empty() {
-        crate::ui::tui::emit("\n"); // one blank line of breathing room before the next turn
+    if retained_display {
+        crate::ui::tui::assistant_stream_finish(stream_err.is_some());
+    } else {
+        let closing = md.finish(); // flush the final partial line + close any dangling code fence
+        if !closing.is_empty() {
+            crate::ui::tui::emit(&closing);
+        }
+        if !full.is_empty() {
+            crate::ui::tui::emit("\n"); // one blank line of breathing room before the next turn
+        }
     }
 
     // The display is now clean (fence closed, partial line flushed) — surface any transport error

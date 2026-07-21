@@ -11,8 +11,128 @@ use crate::core::config::nextgen_home;
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::RwLock;
+
+/// How strongly final answers should use terminal-native visual structure.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponseVisuals {
+    #[default]
+    Auto,
+    Always,
+    Off,
+}
+
+impl fmt::Display for ResponseVisuals {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self { Self::Auto => "auto", Self::Always => "always", Self::Off => "off" })
+    }
+}
+
+impl FromStr for ResponseVisuals {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "always" => Ok(Self::Always),
+            "off" => Ok(Self::Off),
+            _ => Err("response visuals must be one of: auto, always, off".to_string()),
+        }
+    }
+}
+
+/// Interactive terminal backend. `auto` prefers retained full-frame rendering and falls back safely.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TuiMode {
+    #[default]
+    Auto,
+    Retained,
+    Classic,
+}
+
+impl fmt::Display for TuiMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self { Self::Auto => "auto", Self::Retained => "retained", Self::Classic => "classic" })
+    }
+}
+
+impl FromStr for TuiMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "retained" | "full" => Ok(Self::Retained),
+            "classic" | "sticky" => Ok(Self::Classic),
+            _ => Err("TUI mode must be one of: auto, retained, classic".to_string()),
+        }
+    }
+}
+
+/// Decorative-rendering budget. Auto is terminal-aware; minimal disables animation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TuiPerformance {
+    #[default]
+    Auto,
+    Full,
+    Reduced,
+    Minimal,
+}
+
+impl fmt::Display for TuiPerformance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self { Self::Auto => "auto", Self::Full => "full", Self::Reduced => "reduced", Self::Minimal => "minimal" })
+    }
+}
+
+impl FromStr for TuiPerformance {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "full" => Ok(Self::Full),
+            "reduced" | "low" => Ok(Self::Reduced),
+            "minimal" | "off" => Ok(Self::Minimal),
+            _ => Err("TUI performance must be one of: auto, full, reduced, minimal".to_string()),
+        }
+    }
+}
+
+/// Whether the landing/idle scene may animate.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IdleAnimation {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl fmt::Display for IdleAnimation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self { Self::Auto => "auto", Self::On => "on", Self::Off => "off" })
+    }
+}
+
+impl FromStr for IdleAnimation {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "on" | "true" => Ok(Self::On),
+            "off" | "false" => Ok(Self::Off),
+            _ => Err("idle animation must be one of: auto, on, off".to_string()),
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CliConfig {
@@ -103,6 +223,19 @@ pub struct CliConfig {
     /// TUI icon style: `"emoji"` (default), `"nerd"` (Nerd Font glyphs), or `"off"`. `None` ⇒ emoji.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icons: Option<String>,
+    /// Final-answer visuals: `auto` (when useful), `always` (substantial replies), or `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_visuals: Option<ResponseVisuals>,
+    /// Interactive TUI backend: `auto` prefers retained full-frame rendering, `classic` keeps the
+    /// legacy ANSI scroll-region implementation as an instant rollback path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tui_mode: Option<TuiMode>,
+    /// Adaptive visual-performance budget for redraws and idle animation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tui_performance: Option<TuiPerformance>,
+    /// Landing/idle decorative animation policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_animation: Option<IdleAnimation>,
     /// Active persona name (a card under `~/.aizen/personas/`). `None` ⇒ default assistant voice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
@@ -325,6 +458,31 @@ impl CliConfig {
         self.approval_mode = Some(mode);
         self.auto_approve = None;
         self.smart_approve = None;
+    }
+
+    pub fn response_visuals(&self) -> ResponseVisuals {
+        self.response_visuals.unwrap_or_default()
+    }
+
+    pub fn tui_mode(&self) -> TuiMode {
+        if let Some(raw) = branded_env("TUI") {
+            if let Ok(mode) = raw.parse() {
+                return mode;
+            }
+        }
+        self.tui_mode.unwrap_or_default()
+    }
+
+    pub fn tui_performance(&self) -> TuiPerformance {
+        self.tui_performance.unwrap_or_default()
+    }
+
+    pub fn idle_animation(&self) -> IdleAnimation {
+        if branded_flag("NO_ANIM") {
+            IdleAnimation::Off
+        } else {
+            self.idle_animation.unwrap_or_default()
+        }
     }
 
     fn normalize_approval(&mut self) {
@@ -627,6 +785,18 @@ mod tests {
 
         std::env::remove_var("NEXTGEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn response_visuals_defaults_parses_and_round_trips() {
+        let legacy: CliConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.response_visuals(), ResponseVisuals::Auto);
+        for (raw, mode) in [("auto", ResponseVisuals::Auto), ("always", ResponseVisuals::Always), ("off", ResponseVisuals::Off)] {
+            assert_eq!(raw.parse::<ResponseVisuals>().unwrap(), mode);
+            let json = serde_json::to_string(&CliConfig { response_visuals: Some(mode), ..Default::default() }).unwrap();
+            assert_eq!(serde_json::from_str::<CliConfig>(&json).unwrap().response_visuals(), mode);
+        }
+        assert!("sometimes".parse::<ResponseVisuals>().is_err());
     }
 
     #[test]
