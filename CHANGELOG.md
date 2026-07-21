@@ -7,6 +7,40 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+### Fixed
+- **Retained TUI kept no colour** — every non-assistant line (the `❯` user echo, tool anchors, the
+  green/salmon edit diff) was run through `strip_ansi_codes` and then repainted one flat grey, so
+  you couldn't tell your own message from the model's reply or read an edit's `+`/`−` at a glance.
+  The retained backend now keeps SGR colour codes (dropping only cursor moves / erases) and parses
+  them into styled ratatui spans at draw time; uncoloured text is unchanged.
+- **User chat lines now read as yours** — the whole `❯ …` echo takes the moonlight accent (was just
+  the arrow), in both a live turn and a `/sessions` restore replay, so it stands apart from the
+  model's grey reply.
+- **Empty / failed API turns are surfaced loudly** — a blank turn (rate-limit swallowed into an
+  empty 200, content filter, or a gateway that closed the stream early) printed a dim grey aside
+  that read like idle. It's now a `⚠ empty reply:` warning naming the likely cause, in both the
+  sticky and plain REPLs.
+- **Messages typed while the agent works no longer get swallowed** — paste-coalescing keyed off how
+  long `read_key` blocked, but a busy output stream makes a hand-typed key arrive pre-buffered, so
+  the Enter meant to queue a message became a literal newline and the message sat in the draft
+  forever. Detection now measures the gap between successive key *arrivals*, folding the slow
+  repaint into the gap so a real keystroke is never mistaken for a paste.
+
+### Changed
+- **Tool-call anchor glyph** — replaced the florette `✿` with a solid diamond `◆` (moonlight
+  silver): a cleaner, more basic mark. The result digest under it still carries state colour
+  (green when done, salmon on error).
+- **Sun logo reads as a sun at terminal resolution** — the brand's 32 thin-ray chrysanthemum sun
+  is faithful in the high-res sixel image, but a low-res braille character grid (the logo on
+  launch) shattered those thin lances into scattered `░▒▓` dots that looked like noise.
+  `petal_mask` is now resolution-aware: sixel (≥128px) keeps the true 16+16 thin rays; the char
+  grid draws a bolder 12-ray sun (thicker lances, larger solid hub).
+
+### Removed
+- **Retained idle "3D" spinning-sun animation** — dropped entirely to keep the TUI light: no
+  per-frame render thread wakeups when idle, and the now-dead `tui_performance` / `idle_animation`
+  config knobs are gone with it. The landing splash logo (static sun) is unchanged.
+
 ## [0.4.2] — 2026-07-21
 
 ### Fixed
@@ -27,7 +61,7 @@ development log lives in that monorepo's history.
 ### Added
 - **Retained TUI foundation + runtime safety** — alternate-screen single-owner renderer, structured
   transcript streaming, full-message Markdown cache, retained overlays/panel status, local frame
-  metrics, adaptive idle donut, and Mermaid-to-Unicode fallback; classic/plain remain rollback paths.
+  metrics, and Mermaid-to-Unicode fallback; classic/plain remain rollback paths.
 - **Static/dynamic prompt lanes + crash recovery** — stable project/environment prefix stays cacheable;
   volatile identity/memory refreshes only at fresh user-turn boundaries. Owner-only recovery leases
   restore safe history and prefill interrupted drafts without auto-submitting or replaying tools.

@@ -1942,9 +1942,11 @@ fn input_loop(
     let mut history: Vec<String> = Vec::new();
     let mut hist_idx: Option<usize> = None;
     let mut draft_saved: Vec<char> = Vec::new();
+    // Arrival time of the PREVIOUS key, so we can measure the inter-key gap (below). `None` until the
+    // first key of the session.
+    let mut last_arrival: Option<Instant> = None;
 
     loop {
-        let t0 = Instant::now();
         let key = match term.read_key() {
             Ok(k) => k,
             Err(_) => {
@@ -1952,9 +1954,18 @@ fn input_loop(
                 return;
             }
         };
-        // A key that came back almost instantly was already waiting in the OS input buffer → it's
-        // part of a burst (a paste), not a deliberate keystroke. See `PASTE_COALESCE_MS`.
-        let buffered = t0.elapsed() < Duration::from_millis(PASTE_COALESCE_MS);
+        // Paste detection by INTER-KEY GAP, not by how long this `read_key` blocked. The old check
+        // (`read_key` returned in < 50 ms) broke while the agent was WORKING: a heavy output stream
+        // slows this loop's repaint, so a hand-typed key is already sitting in the OS buffer by the
+        // time `read_key` runs → it returns instantly → EVERY keystroke (incl. the Enter meant to
+        // queue a message) looked "buffered" and the Enter became a literal newline. The message then
+        // sat in the draft forever ("swallowed"). Measuring the gap between successive key ARRIVALS
+        // folds the slow repaint INTO the gap, so a real keystroke (arrivals ≥ ~100 ms apart) is never
+        // mistaken for a paste (arrivals < 1 ms apart), regardless of how busy the turn is.
+        let now = Instant::now();
+        let buffered =
+            last_arrival.map(|t| now.duration_since(t) < Duration::from_millis(PASTE_COALESCE_MS)).unwrap_or(false);
+        last_arrival = Some(now);
         // If the agent is awaiting a per-action approval, THIS keystroke is the answer — route a
         // y/n/a decision to the blocked gate and never treat it as draft input. Other keys are
         // ignored so a stray press can't accidentally approve.

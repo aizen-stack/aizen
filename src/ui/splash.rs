@@ -60,9 +60,11 @@ fn glyph(c: char) -> [&'static str; 5] {
     }
 }
 
-/// Fill the PetalMark into a `dw`×`dh` boolean pixel mask (true = petal). Resolution-independent, so
-/// braille uses a tiny grid and sixel a large one: 16 long outer petals + 16 shorter inner petals
-/// (offset half a step), each a tapered lance from the centre — the brand's chrysanthemum-sun.
+/// Fill the PetalMark into a `dw`×`dh` boolean pixel mask (true = petal). Resolution-aware so the mark
+/// reads at every size: the high-res sixel raster (200²) keeps the true 16 long + 16 short thin rays of
+/// the brand's chrysanthemum-sun, while a low-res char grid (braille, ≤120px) would shatter those thin
+/// lances into scattered dots — there we draw a bolder 12-ray sun (thicker lances, larger solid core)
+/// so it still reads as a sun instead of noise. Each ray is a tapered lance from the centre.
 fn petal_mask(dw: usize, dh: usize) -> Vec<bool> {
     use std::f64::consts::PI;
     let mut grid = vec![false; dw * dh];
@@ -75,12 +77,17 @@ fn petal_mask(dw: usize, dh: usize) -> Vec<bool> {
         !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
     };
 
-    // (petal count, length, half-width at the shoulder, angular offset in steps). Thin lances so the
-    // DARK GAPS between adjacent rays read clearly. The long rays own the mid-radius (16 of them, wide
-    // gaps); the short rays are small accents between them that END well before mid-radius, so the
-    // middle stays an open rayed sun (not a dense crosshatch).
-    let layers: [(usize, f64, f64, f64); 2] = [(16, r * 0.97, r * 0.026, 0.0), (16, r * 0.40, r * 0.018, 0.5)];
-    for (count, len, halfw, off) in layers {
+    // (petal count, length, half-width at the shoulder, angular offset in steps). High-res sixel keeps
+    // the true 16 long + 16 short thin lances so the DARK GAPS between adjacent rays read clearly; a
+    // low-res char grid (braille) can't resolve 32 thin rays without shattering into scattered dots, so
+    // there we draw a bolder 12-ray single layer (thicker lances) that still reads as a clean sun.
+    let hi_res = dw.min(dh) >= 128;
+    let layers: &[(usize, f64, f64, f64)] = if hi_res {
+        &[(16, r * 0.97, r * 0.026, 0.0), (16, r * 0.40, r * 0.018, 0.5)]
+    } else {
+        &[(12, r * 0.95, r * 0.055, 0.0)]
+    };
+    for &(count, len, halfw, off) in layers {
         for i in 0..count {
             let ang = 2.0 * PI * ((i as f64 + off) / count as f64);
             let (s, co) = ang.sin_cos();
@@ -110,9 +117,10 @@ fn petal_mask(dw: usize, dh: usize) -> Vec<bool> {
         }
     }
     // Solid core: the petals converge to a mathematical point, so the pixels BETWEEN their thin bases
-    // can be left unfilled — a transparent pinhole that reads as a central "eye". Fill a small disc so
-    // the convergence is clean and solid (matches the reference: petals meeting at a filled centre).
-    let core = r * 0.035;
+    // can be left unfilled — a transparent pinhole that reads as a central "eye". Fill a disc so the
+    // convergence is clean and solid (matches the reference: petals meeting at a filled centre). The
+    // low-res mark needs a larger core so the 12 bolder lances knit into a solid hub, not a ragged star.
+    let core = if hi_res { r * 0.035 } else { r * 0.11 };
     for y in 0..dh {
         for x in 0..dw {
             let (dx, dy) = (x as f64 + 0.5 - c.0, y as f64 + 0.5 - c.1);

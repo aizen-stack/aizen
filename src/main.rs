@@ -547,12 +547,6 @@ enum ConfigCmd {
         /// Interactive terminal backend: `auto`, `retained`, or `classic`.
         #[arg(long)]
         tui_mode: Option<String>,
-        /// Retained-render performance tier: `auto`, `full`, `reduced`, or `minimal`.
-        #[arg(long)]
-        tui_performance: Option<String>,
-        /// Landing/idle animation: `auto`, `on`, or `off`.
-        #[arg(long)]
-        idle_animation: Option<String>,
         /// Time-machine checkpoints to keep (oldest auto-pruned past this; `0` = unlimited). Default 50.
         #[arg(long)]
         timemachine_keep: Option<usize>,
@@ -3587,7 +3581,15 @@ async fn run_menu_sticky() -> Result<()> {
                 // Echo the ORIGINAL typed text (not a big @file expansion) into the scrolling
                 // transcript — the box was cleared on submit, so otherwise it wouldn't show.
                 let echo = if echo_src.is_empty() { "(image)".to_string() } else { echo_src };
-                tui::emit_line(&format!("{} {}", style("❯").color256(splash::ACCENT).bold(), echo));
+                // Colour the WHOLE echoed line (arrow + text) in the moonlight accent, not just the
+                // `❯` glyph — so a user turn reads as one distinct block against the model's grey
+                // reply. In the retained TUI the SGR now survives (see `ansi_spans`); classic prints
+                // it directly. The arrow stays bold as the turn anchor.
+                tui::emit_line(&format!(
+                    "{} {}",
+                    style("❯").color256(splash::ACCENT).bold(),
+                    style(&echo).color256(splash::ACCENT)
+                ));
                 let (base_url, api_key, model) = match resolve_endpoint(None, None, None) {
                     Ok(t) => t,
                     Err(_) => {
@@ -3784,9 +3786,14 @@ async fn run_menu_sticky() -> Result<()> {
                         // simply ended without a closing sentence isn't wrongly flagged.
                         let empty = outcome.final_text.as_deref().map(str::trim).unwrap_or("").is_empty();
                         if empty && outcome.iters <= 1 {
-                            tui::emit_line(
-                                &theme::muted("· no response — the model returned nothing (try again, or /model to switch)").to_string(),
-                            );
+                            // A blank turn is a FAILURE, not idle — surface it loudly (warn colour, not
+                            // a dim aside) so an empty 200 / content filter / rate-limit-swallowed-as-200
+                            // / dead endpoint that streams `[DONE]` with no deltas can never pass silently
+                            // for success. This is the "don't swallow API errors" contract.
+                            tui::emit_line(&format!(
+                                "{} the model returned an empty response — no text and no tool calls. Likely a rate limit, content filter, or a gateway that closed the stream early. Try again, or /model to switch.",
+                                theme::warn("⚠ empty reply:")
+                            ));
                         }
                         let persona_after = cli_config::load().persona;
                         if persona_after != persona_before {
@@ -3999,7 +4006,17 @@ async fn run_menu_plain() -> Result<()> {
             Ok(AgentOutcome { stop: StopReason::AwaitingInput(q), .. }) => {
                 show_clarify(&q);
             }
-            Ok(_) => {
+            Ok(outcome) => {
+                // Surface an empty single-call turn (empty 200 / content filter / gateway that
+                // closed the stream early) as a visible warning instead of a silent no-op — the
+                // plain-REPL mirror of the sticky path's `⚠ empty reply` line.
+                let empty = outcome.final_text.as_deref().map(str::trim).unwrap_or("").is_empty();
+                if empty && outcome.iters <= 1 {
+                    eprintln!(
+                        "{} the model returned an empty response — no text and no tool calls. Likely a rate limit, content filter, or a gateway that closed the stream early. Try again, or /model to switch.",
+                        style("⚠ empty reply:").yellow()
+                    );
+                }
                 // The agent may have created/switched personas mid-turn (persona_create tool).
                 // Resync the system prompt now so the new character is live from the next message.
                 let persona_after = cli_config::load().persona;
@@ -6042,7 +6059,7 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
         None => return config_wizard().await, // bare `ng config` → interactive setup
     };
     match cmd {
-        ConfigCmd::Set { base_url, api_key, model, context_window, compact_threshold, auto_skill_learn, memory_auto_learn, persona_evolve, price_in, price_out, icons, response_visuals, tui_mode, tui_performance, idle_animation, timemachine_keep, timemachine_max_files, timemachine_max_bytes, timemachine_max_file_bytes, auto_effort, reasoning_effort, approval, ultimate, adaptive_effort, disabled_toolsets, enabled_toolsets } => {
+        ConfigCmd::Set { base_url, api_key, model, context_window, compact_threshold, auto_skill_learn, memory_auto_learn, persona_evolve, price_in, price_out, icons, response_visuals, tui_mode, timemachine_keep, timemachine_max_files, timemachine_max_bytes, timemachine_max_file_bytes, auto_effort, reasoning_effort, approval, ultimate, adaptive_effort, disabled_toolsets, enabled_toolsets } => {
             if base_url.is_none()
                 && api_key.is_none()
                 && model.is_none()
@@ -6056,8 +6073,6 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                 && icons.is_none()
                 && response_visuals.is_none()
                 && tui_mode.is_none()
-                && tui_performance.is_none()
-                && idle_animation.is_none()
                 && timemachine_keep.is_none()
                 && timemachine_max_files.is_none()
                 && timemachine_max_bytes.is_none()
@@ -6126,12 +6141,6 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             }
             if let Some(v) = tui_mode {
                 cfg.tui_mode = Some(v.parse::<cli_config::TuiMode>().map_err(anyhow::Error::msg)?);
-            }
-            if let Some(v) = tui_performance {
-                cfg.tui_performance = Some(v.parse::<cli_config::TuiPerformance>().map_err(anyhow::Error::msg)?);
-            }
-            if let Some(v) = idle_animation {
-                cfg.idle_animation = Some(v.parse::<cli_config::IdleAnimation>().map_err(anyhow::Error::msg)?);
             }
             if let Some(k) = timemachine_keep {
                 cfg.timemachine_keep = Some(k); // 0 = unlimited
@@ -6323,8 +6332,6 @@ fn print_config(cfg: &cli_config::CliConfig) {
     row("icons", theme::accent(cfg.icons.as_deref().unwrap_or("nerd")).to_string());
     row("visuals", theme::accent(cfg.response_visuals().to_string()).to_string());
     row("tui", theme::accent(cfg.tui_mode().to_string()).to_string());
-    row("perf", theme::accent(cfg.tui_performance().to_string()).to_string());
-    row("animation", theme::accent(cfg.idle_animation().to_string()).to_string());
     println!();
 }
 
@@ -6732,51 +6739,6 @@ fn config_edit_display(cfg: &mut cli_config::CliConfig) -> Result<()> {
             1 => cli_config::TuiMode::Retained,
             2 => cli_config::TuiMode::Classic,
             _ => cli_config::TuiMode::Auto,
-        });
-    }
-
-    let perf_opts = [
-        "auto (adapt to terminal)",
-        "full (smoothest)",
-        "reduced (lower CPU)",
-        "minimal (no decoration)",
-    ];
-    let perf_idx = match cfg.tui_performance() {
-        cli_config::TuiPerformance::Auto => 0,
-        cli_config::TuiPerformance::Full => 1,
-        cli_config::TuiPerformance::Reduced => 2,
-        cli_config::TuiPerformance::Minimal => 3,
-    };
-    if let Some(pick) = Select::with_theme(&theme)
-        .with_prompt("TUI performance (Esc keeps current)")
-        .items(&perf_opts)
-        .default(perf_idx)
-        .interact_opt()?
-    {
-        cfg.tui_performance = Some(match pick {
-            1 => cli_config::TuiPerformance::Full,
-            2 => cli_config::TuiPerformance::Reduced,
-            3 => cli_config::TuiPerformance::Minimal,
-            _ => cli_config::TuiPerformance::Auto,
-        });
-    }
-
-    let anim_opts = ["auto", "on", "off"];
-    let anim_idx = match cfg.idle_animation() {
-        cli_config::IdleAnimation::Auto => 0,
-        cli_config::IdleAnimation::On => 1,
-        cli_config::IdleAnimation::Off => 2,
-    };
-    if let Some(pick) = Select::with_theme(&theme)
-        .with_prompt("Idle animation (Esc keeps current)")
-        .items(&anim_opts)
-        .default(anim_idx)
-        .interact_opt()?
-    {
-        cfg.idle_animation = Some(match pick {
-            1 => cli_config::IdleAnimation::On,
-            2 => cli_config::IdleAnimation::Off,
-            _ => cli_config::IdleAnimation::Auto,
         });
     }
     Ok(())

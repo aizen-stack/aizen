@@ -1841,8 +1841,8 @@ fn run_tool_body(
         crate::core::recovery::mark_side_effects_possible();
     }
     if !quiet {
-        // The event anchor: a moonlight flower `✿` (the Aizen bloom), the tool name, then the salient
-        // argument parenthesised (unescaped, 1st line, clipped) — `✿ file_edit(src/foo.rs)`.
+        // The event anchor: a solid diamond `◆` (moonlight silver), the tool name, then the salient
+        // argument parenthesised (unescaped, 1st line, clipped) — `◆ file_edit(src/foo.rs)`.
         emit_trace(&tool_call_line(tool.name(), args));
     }
     let out = match tool.execute(args) {
@@ -1888,22 +1888,25 @@ fn relevance_query_from_args(args: &serde_json::Value) -> String {
 }
 
 /// The event-anchor line for a tool call. When the tool maps to a human action ([`tool_action`]),
-/// it reads `✿ <verb + target> (tool_name)` — the verb+target in moonlight, the raw tool name
+/// it reads `◆ <verb + target> (tool_name)` — the verb+target in moonlight, the raw tool name
 /// parenthesised + dimmed, so the user sees *what* is happening at a glance and the exact tool only
-/// as a quiet footnote. Tools with no mapping fall back to the older `✿ name(salient-arg)` shape.
+/// as a quiet footnote. Tools with no mapping fall back to the older `◆ name(salient-arg)` shape.
+/// The `◆` anchor is moonlight-silver here (the call is starting); the result corner `└` on the
+/// next line carries the outcome colour (green when ok, salmon on error) — the transcript is
+/// append-only, so state is shown by the follow-up line rather than by recolouring this one.
 /// Shared by the serial path, the eager-adoption path, and the approval prompt so every surface
 /// renders a call identically.
 fn tool_call_line(name: &str, args: &serde_json::Value) -> String {
     match tool_action(name, args) {
         Some(action) => format!(
             "{} {} {}",
-            crate::ui::theme::accent("✿"),
+            crate::ui::theme::accent("◆"),
             crate::ui::theme::accent(action),
             crate::ui::theme::accent_dim(format!("({name})"))
         ),
         None => format!(
             "{} {}{}",
-            crate::ui::theme::accent("✿"),
+            crate::ui::theme::accent("◆"),
             crate::ui::theme::accent(name),
             crate::ui::theme::accent_dim(format!("({})", tool_trace(name, args)))
         ),
@@ -1913,7 +1916,7 @@ fn tool_call_line(name: &str, args: &serde_json::Value) -> String {
 /// Re-print a restored conversation into the scrolling transcript. `/sessions` restore only
 /// rehydrates `history` (so the model regains context) — the SCREEN stayed blank, which read as
 /// "nothing loaded". This replays each turn with the same surfaces a live turn uses: `❯ user`
-/// echoes, markdown-rendered assistant text, and `✿ tool` call lines + `└ result` digests. The
+/// echoes, markdown-rendered assistant text, and `◆ tool` call lines + `└ result` digests. The
 /// system prompt at `[0]` is skipped (it's plumbing, not conversation). Tool-result messages carry
 /// only a `tool_call_id`, so we first index `id → tool name` from the assistant tool-calls to render
 /// each result under its originating tool.
@@ -1937,7 +1940,9 @@ pub fn replay_transcript(msgs: &[crate::core::types::Message]) {
                     continue;
                 }
                 let echo = if body.is_empty() { "(image)" } else { body };
-                emit_trace(&format!("{} {echo}", crate::ui::theme::accent("❯")));
+                // Tint the whole echo line (not just the `❯`) so a restored user turn reads as
+                // clearly the user's voice — matching the live turn's accent-bold echo.
+                emit_trace(&format!("{} {}", crate::ui::theme::accent("❯"), crate::ui::theme::accent(echo)));
             }
             "assistant" => {
                 let body = m.content.as_deref().unwrap_or("").trim();
@@ -2966,22 +2971,22 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    // ── display: the ✿ call line + ⎿ result summary ─────────────────────────
+    // ── display: the ◆ call line + ⎿ result summary ─────────────────────────
     #[test]
     fn tool_call_line_shows_action_then_dimmed_tool_name() {
-        // A mapped tool reads `✿ <English verb + target> (tool_name)`.
+        // A mapped tool reads `◆ <English verb + target> (tool_name)`.
         let line = tool_call_line("file_read", &serde_json::json!({"path": "src/main.rs"}));
         let plain = console::strip_ansi_codes(&line).to_string();
-        assert!(plain.starts_with("✿ Read main.rs"), "action-first: {plain:?}");
+        assert!(plain.starts_with("◆ Read main.rs"), "action-first: {plain:?}");
         assert!(plain.contains("(file_read)"), "raw tool name parenthesised: {plain:?}");
     }
 
     #[test]
     fn tool_call_line_falls_back_to_name_arg_when_unmapped() {
-        // An unknown tool keeps the older `✿ name(salient-arg)` shape.
+        // An unknown tool keeps the older `◆ name(salient-arg)` shape.
         let line = tool_call_line("mystery_tool", &serde_json::json!({"foo": "bar"}));
         let plain = console::strip_ansi_codes(&line).to_string();
-        assert!(plain.starts_with("✿ mystery_tool("), "{plain:?}");
+        assert!(plain.starts_with("◆ mystery_tool("), "{plain:?}");
     }
 
     #[test]

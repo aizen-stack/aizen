@@ -21,7 +21,6 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-mod animation;
 mod metrics;
 
 const FOOTER_ROWS: u16 = 4;
@@ -95,7 +94,7 @@ impl RenderCache {
         self.misses += 1;
         let rows = match block.kind {
             BlockKind::Assistant => render_assistant_rows(&block.content, width as usize),
-            _ => sanitize_text(&block.content).split('\n').map(str::to_string).collect(),
+            _ => sanitize_keep_sgr(&block.content).split('\n').map(str::to_string).collect(),
         };
         if self.rows.len() >= CACHE_LIMIT {
             self.rows.clear();
@@ -128,8 +127,6 @@ struct AppState {
     /// transcript behind it; reset on open/close and clamped to the overlay's own content height.
     overlay_scroll: usize,
     focused: bool,
-    last_interaction: Instant,
-    started: Instant,
     metrics: metrics::FrameMetrics,
     cache: RenderCache,
 }
@@ -154,8 +151,6 @@ impl AppState {
             last_total: 0,
             overlay_scroll: 0,
             focused: true,
-            last_interaction: Instant::now(),
-            started: Instant::now(),
             metrics: metrics::FrameMetrics::default(),
             cache: RenderCache::default(),
         }
@@ -444,14 +439,7 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
     let mut shutdown_ack: Option<Sender<()>> = None;
     let mut dirty = true;
     loop {
-        let wait = if animation::enabled(
-            state.blocks.len() > 1,
-            state.working,
-            state.focused,
-            state.last_interaction.elapsed().as_secs(),
-        ) {
-            Duration::from_millis(animation::target_frame_ms())
-        } else if state.working && state.focused {
+        let wait = if state.working && state.focused {
             Duration::from_millis(110)
         } else {
             Duration::from_millis(250)
@@ -483,21 +471,14 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 dirty = true;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if state.working && state.focused
-                    || animation::enabled(
-                        state.blocks.len() > 1,
-                        state.working,
-                        state.focused,
-                        state.last_interaction.elapsed().as_secs(),
-                    )
-                {
+                if state.working && state.focused {
                     state.frame = state.frame.wrapping_add(1);
                     dirty = true;
                 }
                 // Idle resize: the render below only runs when `dirty`, so a terminal resized while
-                // nothing is happening (no command, no animation) would otherwise never be repainted
-                // until the next keystroke. Probe the real terminal size each tick and force a redraw
-                // when it moved — no second stdin reader, just a cheap ioctl on this render thread.
+                // nothing is happening (no command) would otherwise never be repainted until the next
+                // keystroke. Probe the real terminal size each tick and force a redraw when it moved —
+                // no second stdin reader, just a cheap ioctl on this render thread.
                 if session.is_some() && terminal_size_changed() {
                     dirty = true;
                 }
@@ -567,7 +548,10 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
 fn apply_command(state: &mut AppState, cmd: Command) {
     match cmd {
         Command::Emit(s) => {
-            let clean = sanitize_text(&s);
+            // Keep SGR (colour/bold/dim) so the `❯` user echo, the `◆` tool anchor tinted by state,
+            // and the green/salmon edit diff survive into styled spans — only cursor moves / erases
+            // are stripped. `ansi_spans` turns the kept codes into ratatui spans at draw time.
+            let clean = sanitize_keep_sgr(&s);
             if !clean.is_empty() {
                 state.push_block(BlockKind::Generic, clean, true);
             }
@@ -575,11 +559,7 @@ fn apply_command(state: &mut AppState, cmd: Command) {
         Command::AssistantDelta(s) => state.push_assistant(&s),
         Command::AssistantFinish { interrupted } => state.finish_assistant(interrupted),
         Command::Input(input) => {
-            let changed = input.draft != state.input.draft || input.cursor != state.input.cursor;
             state.input = input;
-            if changed {
-                state.last_interaction = Instant::now();
-            }
         }
         Command::Working(working) => {
             state.working = working;
@@ -594,14 +574,12 @@ fn apply_command(state: &mut AppState, cmd: Command) {
         Command::OpenOverlay(overlay) => {
             state.input.overlay = Some(overlay);
             state.overlay_scroll = 0; // a fresh overlay starts at the top
-            state.last_interaction = Instant::now();
         }
         Command::CloseOverlay => {
             state.input.overlay = None;
             state.overlay_scroll = 0;
         }
         Command::Scroll(delta) => {
-            state.last_interaction = Instant::now();
             // An open informational overlay owns scroll (PageUp/Down/Home/End move ITS content, not
             // the transcript sitting behind it). Clamp happens at draw time against the visible height.
             if state.input.overlay.is_some() {
@@ -623,7 +601,6 @@ fn apply_command(state: &mut AppState, cmd: Command) {
             } else {
                 state.scroll_from_tail = 0;
             }
-            state.last_interaction = Instant::now();
         }
         Command::Focus(v) => state.focused = v,
         Command::Suspend(_) | Command::Resume { .. } | Command::Shutdown(_) => {}
@@ -675,22 +652,6 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    if animation::enabled(
-        state.blocks.len() > 1,
-        state.working,
-        state.focused,
-        state.last_interaction.elapsed().as_secs(),
-    ) && area.width >= 32
-        && area.height >= 10
-    {
-        let anim_w = area.width.min(58);
-        let anim_h = area.height.saturating_sub(2).min(22);
-        let rect = centered(area, anim_w, anim_h);
-        let elapsed = state.started.elapsed().as_secs_f32();
-        let lines = animation::logo_lines(rect.width, rect.height, elapsed);
-        frame.render_widget(Paragraph::new(lines), rect);
-        return;
-    }
     let content_width = area.width.saturating_sub(2).max(8);
     let mut lines: Vec<Line<'static>> = Vec::new();
     for block in &state.blocks {
@@ -713,16 +674,14 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
 
 fn styled_row(kind: BlockKind, row: String) -> Line<'static> {
     match kind {
+        // Intro is sanitised plain (no SGR) → one flat dim line, as before.
         BlockKind::Intro => Line::styled(row, Style::default().fg(Color::DarkGray)),
-        BlockKind::Assistant if row.starts_with('▌') => {
-            let rest = row.strip_prefix('▌').unwrap_or("").to_string();
-            Line::from(vec![
-                Span::styled("▌", Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT))),
-                Span::styled(rest, Style::default().fg(Color::Gray)),
-            ])
+        // Assistant + Generic carry SGR now: parse it into coloured spans over a grey base. The
+        // moonlight `▌` gutter and the state-tinted `◆` tool anchor keep their own colour because
+        // it rode through as SGR; uncoloured text collapses to one grey span (unchanged look).
+        BlockKind::Assistant | BlockKind::Generic => {
+            Line::from(ansi_spans(&row, Style::default().fg(Color::Gray)))
         }
-        BlockKind::Assistant => Line::styled(row, Style::default().fg(Color::Gray)),
-        BlockKind::Generic => Line::styled(row, Style::default().fg(Color::Gray)),
     }
 }
 
@@ -899,16 +858,57 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn render_assistant_rows(raw: &str, width: usize) -> Vec<String> {
-    sanitize_text(&crate::ui::markdown::render_retained(raw, width.max(24)))
+    // Keep SGR: the markdown renderer emits the moonlight gutter, code-box borders, and syntax
+    // highlight as colour codes — `sanitize_keep_sgr` preserves them (dropping only cursor moves)
+    // and `ansi_spans` turns them into styled spans at draw time.
+    sanitize_keep_sgr(&crate::ui::markdown::render_retained(raw, width.max(24)))
         .split('\n')
         .map(str::to_string)
         .collect()
 }
 
+/// Strip ALL terminal control sequences INCLUDING colour/SGR, leaving printable text only. Used for
+/// the intro block (rendered as one flat dim line) and where a plain-text guarantee is wanted.
 fn sanitize_text(input: &str) -> String {
-    let plain = console::strip_ansi_codes(input);
-    let mut out = String::with_capacity(plain.len());
-    for c in plain.chars() {
+    console::strip_ansi_codes(&sanitize_keep_sgr(input)).into_owned()
+}
+
+/// Strip terminal control sequences that would corrupt the retained frame (cursor moves, screen
+/// erase, save/restore, carriage returns) but PRESERVE colour/SGR (`\x1b[…m`) so [`ansi_spans`] can
+/// turn them into styled ratatui spans. This is what keeps the `❯` user echo in accent, the edit
+/// diff green/salmon, and the `◆` tool anchor tinted by state — instead of one flat grey.
+fn sanitize_keep_sgr(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    let mut seq = String::from("\x1b[");
+                    let mut final_byte = None;
+                    while let Some(&pc) = chars.peek() {
+                        chars.next();
+                        seq.push(pc);
+                        // A CSI sequence ends at its final byte (0x40–0x7E). We break on the first
+                        // ASCII letter, which covers every sequence we actually emit: `m` (SGR),
+                        // `J`/`K` (erase), `s`/`u` (save/restore cursor), `H`/`A`…`G` (moves).
+                        if pc.is_ascii_alphabetic() {
+                            final_byte = Some(pc);
+                            break;
+                        }
+                    }
+                    if final_byte == Some('m') {
+                        out.push_str(&seq); // keep colour / bold / dim — drop everything else
+                    }
+                }
+                // A non-CSI escape (e.g. `\x1b7` save cursor): drop the ESC and its one payload byte.
+                _ => {
+                    chars.next();
+                }
+            }
+            continue;
+        }
         match c {
             '\n' => out.push('\n'),
             '\t' => out.push_str("    "),
@@ -918,6 +918,120 @@ fn sanitize_text(input: &str) -> String {
         }
     }
     out
+}
+
+/// Map a basic ANSI colour index (0–15, the `30`–`37` / `90`–`97` SGR families) to a ratatui colour.
+fn basic_color(n: u16) -> Color {
+    match n {
+        0 => Color::Black,
+        1 => Color::Red,
+        2 => Color::Green,
+        3 => Color::Yellow,
+        4 => Color::Blue,
+        5 => Color::Magenta,
+        6 => Color::Cyan,
+        7 => Color::Gray,
+        8 => Color::DarkGray,
+        9 => Color::LightRed,
+        10 => Color::LightGreen,
+        11 => Color::LightYellow,
+        12 => Color::LightBlue,
+        13 => Color::LightMagenta,
+        14 => Color::LightCyan,
+        _ => Color::White,
+    }
+}
+
+/// Fold one SGR parameter list (the `;`-separated numbers before an `m`) into the running style,
+/// resetting to `base` on `0`/`39`. Supports the codes the app actually emits: reset, bold, dim,
+/// italic, underline, the 8+8 basic-colour families, and 256-colour (`38;5;n`) / truecolor (`38;2`).
+fn apply_sgr(base: Style, cur: Style, params: &str) -> Style {
+    let codes: Vec<u16> =
+        params.split(';').filter(|s| !s.is_empty()).filter_map(|s| s.parse::<u16>().ok()).collect();
+    if codes.is_empty() {
+        return base; // a bare `\x1b[m` is `\x1b[0m` — a full reset
+    }
+    let mut style = cur;
+    let mut i = 0;
+    while i < codes.len() {
+        match codes[i] {
+            0 => style = base,
+            1 => style = style.add_modifier(Modifier::BOLD),
+            2 => style = style.add_modifier(Modifier::DIM),
+            3 => style = style.add_modifier(Modifier::ITALIC),
+            4 => style = style.add_modifier(Modifier::UNDERLINED),
+            22 => style = style.remove_modifier(Modifier::BOLD).remove_modifier(Modifier::DIM),
+            30..=37 => style = style.fg(basic_color(codes[i] - 30)),
+            39 => style = style.fg(base.fg.unwrap_or(Color::Gray)),
+            90..=97 => style = style.fg(basic_color(codes[i] - 90 + 8)),
+            38 => match codes.get(i + 1) {
+                Some(5) => {
+                    if let Some(&n) = codes.get(i + 2) {
+                        style = style.fg(Color::Indexed(n as u8));
+                    }
+                    i += 2;
+                }
+                Some(2) => {
+                    if let (Some(&r), Some(&g), Some(&b)) =
+                        (codes.get(i + 2), codes.get(i + 3), codes.get(i + 4))
+                    {
+                        style = style.fg(Color::Rgb(r as u8, g as u8, b as u8));
+                    }
+                    i += 4;
+                }
+                _ => {}
+            },
+            48 => match codes.get(i + 1) {
+                Some(5) => i += 2, // background colour — measured/skipped, foreground is what reads
+                Some(2) => i += 4,
+                _ => {}
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    style
+}
+
+/// Parse a single already-sanitised row (SGR only, no cursor moves) into ratatui spans over `base`.
+/// A row with no colour codes collapses to one span in the base style, so uncoloured output looks
+/// exactly as before.
+fn ansi_spans(row: &str, base: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cur = base;
+    let mut buf = String::new();
+    let mut chars = row.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            let mut params = String::new();
+            let mut final_byte = None;
+            while let Some(&pc) = chars.peek() {
+                chars.next();
+                if pc.is_ascii_digit() || pc == ';' {
+                    params.push(pc);
+                } else {
+                    final_byte = Some(pc);
+                    break;
+                }
+            }
+            if final_byte == Some('m') {
+                if !buf.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut buf), cur));
+                }
+                cur = apply_sgr(base, cur, &params);
+            }
+            continue;
+        }
+        buf.push(c);
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, cur));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base));
+    }
+    spans
 }
 
 fn hash_text(s: &str) -> u64 {
@@ -934,6 +1048,37 @@ mod tests {
     fn sanitizes_terminal_control_sequences() {
         let got = sanitize_text("ok\x1b[2J\x1b[31mred\x1b[0m\nnext\r");
         assert_eq!(got, "okred\nnext");
+    }
+
+    #[test]
+    fn keep_sgr_drops_cursor_moves_but_keeps_colour() {
+        // Erase (`\x1b[2J`) and a save-cursor (`\x1b7`) are stripped; the colour codes survive so
+        // `ansi_spans` can turn them into styled spans.
+        let got = sanitize_keep_sgr("\x1b7\x1b[2Jok\x1b[31mred\x1b[0m\nnext\r");
+        assert_eq!(got, "ok\x1b[31mred\x1b[0m\nnext");
+    }
+
+    #[test]
+    fn ansi_spans_splits_on_colour_and_collapses_when_plain() {
+        // A plain row (no SGR) → exactly one span in the base style, so uncoloured output is byte-
+        // identical to before.
+        let plain = ansi_spans("hello", Style::default().fg(Color::Gray));
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].content.as_ref(), "hello");
+
+        // A coloured segment becomes its own span; a reset (`\x1b[0m`) returns to the base style.
+        let spans = ansi_spans("a\x1b[31mred\x1b[0mb", Style::default().fg(Color::Gray));
+        let texts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, vec!["a", "red", "b"]);
+        assert_eq!(spans[1].style.fg, Some(Color::Red), "the middle span is red");
+        assert_eq!(spans[2].style.fg, Some(Color::Gray), "reset returns to base");
+    }
+
+    #[test]
+    fn ansi_spans_reads_256_colour() {
+        // The app emits 256-colour SGR (`\x1b[38;5;Nm`) for its accent/ok/err palette — parse it.
+        let spans = ansi_spans("\x1b[38;5;71mgreen\x1b[0m", Style::default().fg(Color::Gray));
+        assert_eq!(spans[0].style.fg, Some(Color::Indexed(71)));
     }
 
     #[test]

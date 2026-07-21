@@ -265,9 +265,8 @@ rollback and plain/non-TTY output stays raw. The input/footer remains pinned at 
 PageUp/PageDown enter manual scroll and End/Home returns to live tail — and when an informational
 overlay is open those keys scroll the overlay's own content (clamped to its last page), not the
 transcript behind it. An idle resize is detected on the render thread and repaints without a keystroke.
-Retained overlays, lightweight frame timing/cache counters and an adaptive idle animation share the
-same frame owner; a panic or Ctrl-C restores the terminal (shows the cursor, leaves the alternate
-screen) before the process exits.
+Retained overlays and lightweight frame timing/cache counters share the same frame owner; a panic or
+Ctrl-C restores the terminal (shows the cursor, leaves the alternate screen) before the process exits.
 
 ### 4.1 In-chat slash commands (live-filtered palette, ~7 rows, Tab/↑↓ to pick)
 `/help` · `/model` (pick model, shows context windows) · `/sessions` (save/restore/delete chats) · `/workflows` (`/wf`, retained Activity overlay) · `/recover` (safe crashed-session restore/discard) · `/timeline` (`/tm`) and `/checkpoint` (`/cp`,`/snapshot`) — time machine · `/compact` (compress context) · `/memory` (`/mem`) · `/persona` (`/character`) · `/skills` · `/apps` · `/mcp` · `/browser` (profile/routes status) · `/commands` (custom) · `/telegram` (`/tg`) · `/serve` · `/config` (`/setup`) · `/approval ask|smart|yolo` (legacy aliases still accepted) · `/cost` (`/usage`) · `/tokens` · `/clear` (`/new`,`/reset`) · `/quit` (`/exit`,`/q`). Plus any user **custom commands**.

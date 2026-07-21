@@ -74,66 +74,6 @@ impl FromStr for TuiMode {
     }
 }
 
-/// Decorative-rendering budget. Auto is terminal-aware; minimal disables animation.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TuiPerformance {
-    #[default]
-    Auto,
-    Full,
-    Reduced,
-    Minimal,
-}
-
-impl fmt::Display for TuiPerformance {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self { Self::Auto => "auto", Self::Full => "full", Self::Reduced => "reduced", Self::Minimal => "minimal" })
-    }
-}
-
-impl FromStr for TuiPerformance {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "full" => Ok(Self::Full),
-            "reduced" | "low" => Ok(Self::Reduced),
-            "minimal" | "off" => Ok(Self::Minimal),
-            _ => Err("TUI performance must be one of: auto, full, reduced, minimal".to_string()),
-        }
-    }
-}
-
-/// Whether the landing/idle scene may animate.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum IdleAnimation {
-    #[default]
-    Auto,
-    On,
-    Off,
-}
-
-impl fmt::Display for IdleAnimation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self { Self::Auto => "auto", Self::On => "on", Self::Off => "off" })
-    }
-}
-
-impl FromStr for IdleAnimation {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "on" | "true" => Ok(Self::On),
-            "off" | "false" => Ok(Self::Off),
-            _ => Err("idle animation must be one of: auto, on, off".to_string()),
-        }
-    }
-}
-
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CliConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -230,12 +170,6 @@ pub struct CliConfig {
     /// legacy ANSI scroll-region implementation as an instant rollback path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tui_mode: Option<TuiMode>,
-    /// Adaptive visual-performance budget for redraws and idle animation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tui_performance: Option<TuiPerformance>,
-    /// Landing/idle decorative animation policy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_animation: Option<IdleAnimation>,
     /// Active persona name (a card under `~/.aizen/personas/`). `None` ⇒ default assistant voice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
@@ -471,18 +405,6 @@ impl CliConfig {
             }
         }
         self.tui_mode.unwrap_or_default()
-    }
-
-    pub fn tui_performance(&self) -> TuiPerformance {
-        self.tui_performance.unwrap_or_default()
-    }
-
-    pub fn idle_animation(&self) -> IdleAnimation {
-        if branded_flag("NO_ANIM") {
-            IdleAnimation::Off
-        } else {
-            self.idle_animation.unwrap_or_default()
-        }
     }
 
     fn normalize_approval(&mut self) {
