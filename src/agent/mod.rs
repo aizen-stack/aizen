@@ -976,17 +976,21 @@ where
                     verify_gate::run_verify_gate(&cwd, cfg.verify_gate_timeout_secs).await
                 {
                     if !cfg.quiet {
-                        let line = format!(
-                            "→ verify: {} {} (attempt {}/{})",
-                            result.command,
-                            if result.passed { "passed" } else { "FAILED" },
-                            verify_attempts + 1,
-                            cfg.max_verify_attempts,
-                        );
-                        if crate::ui::tui::active() {
-                            crate::ui::tui::emit_line(&line);
+                        if result.passed {
+                            // The mockup's green success line — `✓ <cmd> — verify gate passed`.
+                            crate::ui::tui::verify_line(&result.command, "verify gate passed");
                         } else {
-                            eprintln!("{line}");
+                            let line = format!(
+                                "→ verify: {} FAILED (attempt {}/{})",
+                                result.command,
+                                verify_attempts + 1,
+                                cfg.max_verify_attempts,
+                            );
+                            if crate::ui::tui::active() {
+                                crate::ui::tui::emit_line(&line);
+                            } else {
+                                eprintln!("{line}");
+                            }
                         }
                     }
                     if !result.passed {
@@ -1498,6 +1502,8 @@ async fn execute_calls(
     // Their bodies ran quiet; the executor emits the trace at adoption and the result marker at
     // landing so the UX is indistinguishable from a normal run.
     let mut adopted: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // The tool-call line `seq` opened at adoption, so the result can update THAT line in place.
+    let mut adopted_seq: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
     let mut eager: std::collections::HashMap<usize, tokio::task::JoinHandle<String>> =
         eager.into_iter().collect();
     // Parse every call's arguments ONCE — used for the safety partition, the gate, and the body.
@@ -1545,7 +1551,7 @@ async fn execute_calls(
                             adopted.insert(k);
                             if !cfg.quiet {
                                 if let (Some(tool), Ok(args)) = (registry.get(&calls[k].function.name), &parsed[k]) {
-                                    emit_trace(&tool_call_line(tool.name(), args));
+                                    adopted_seq.insert(k, emit_tool_call(tool.name(), args));
                                 }
                             }
                             return (k, h);
@@ -1573,7 +1579,12 @@ async fn execute_calls(
                         }
                     };
                     if adopted.contains(&k) && !cfg.quiet {
-                        emit_tool_result(&calls[k].function.name, &out); // eager body ran quiet
+                        // Eager body ran quiet; close the line opened at adoption (matched by seq).
+                        let seq = adopted_seq.get(&k).copied().unwrap_or(0);
+                        if let Ok(args) = &parsed[k] {
+                            // Eager-adopted parallel body: no per-call wall-clock to attribute here.
+                            emit_tool_result(seq, &calls[k].function.name, args, &out, None);
+                        }
                     }
                     land(k, out, &mut results, sink);
                 }
@@ -1840,17 +1851,17 @@ fn run_tool_body(
     if tool.recovery_effect(args) {
         crate::core::recovery::mark_side_effects_possible();
     }
-    if !quiet {
-        // The event anchor: a solid diamond `◆` (moonlight silver), the tool name, then the salient
-        // argument parenthesised (unescaped, 1st line, clipped) — `◆ file_edit(src/foo.rs)`.
-        emit_trace(&tool_call_line(tool.name(), args));
-    }
+    // Open the tool-call line (mockup shape: `⚙ <name>   <target>`, digest filled in on completion).
+    // The `seq` ties the result back to this same line so retained updates it in place.
+    let seq = if !quiet { emit_tool_call(tool.name(), args) } else { 0 };
+    let started = std::time::Instant::now();
     let out = match tool.execute(args) {
         Ok(out) => out,
         Err(e) => format!("error: {e}"),
     };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
     if !quiet {
-        emit_tool_result(tool.name(), &out);
+        emit_tool_result(seq, tool.name(), args, &out, Some(elapsed_ms));
     }
     // Relevance-aware truncation for the READ/FETCH tools whose output is a large document the model
     // is scanning for specifics (W11/W22): keep the region matching the call's query keywords rather
@@ -1892,24 +1903,22 @@ fn relevance_query_from_args(args: &serde_json::Value) -> String {
 /// parenthesised + dimmed, so the user sees *what* is happening at a glance and the exact tool only
 /// as a quiet footnote. Tools with no mapping fall back to the older `◆ name(salient-arg)` shape.
 /// The `◆` anchor is moonlight-silver here (the call is starting); the result corner `└` on the
-/// next line carries the outcome colour (green when ok, salmon on error) — the transcript is
-/// append-only, so state is shown by the follow-up line rather than by recolouring this one.
-/// Shared by the serial path, the eager-adoption path, and the approval prompt so every surface
-/// renders a call identically.
+/// A one-shot styled string form of the call line (mockup shape `⚙ <name>   <target>`) — the raw
+/// tool name in moonlight, its salient target in dim silver. Used for the APPROVAL PROMPT (a single
+/// inline line), where there's no in-place digest to fill later. The live transcript uses the
+/// structured [`emit_tool_call`]/[`emit_tool_result`] pair instead, which right-aligns the digest.
 fn tool_call_line(name: &str, args: &serde_json::Value) -> String {
-    match tool_action(name, args) {
-        Some(action) => format!(
-            "{} {} {}",
-            crate::ui::theme::accent("◆"),
-            crate::ui::theme::accent(action),
-            crate::ui::theme::accent_dim(format!("({name})"))
-        ),
-        None => format!(
-            "{} {}{}",
-            crate::ui::theme::accent("◆"),
+    let icon = tool_icon();
+    let target = tool_target(name, args);
+    if target.is_empty() {
+        format!("{} {}", crate::ui::theme::accent(icon), crate::ui::theme::accent(name))
+    } else {
+        format!(
+            "{} {}   {}",
+            crate::ui::theme::accent(icon),
             crate::ui::theme::accent(name),
-            crate::ui::theme::accent_dim(format!("({})", tool_trace(name, args)))
-        ),
+            crate::ui::theme::accent_dim(target)
+        )
     }
 }
 
@@ -1932,6 +1941,9 @@ pub fn replay_transcript(msgs: &[crate::core::types::Message]) {
             call_names.insert(c.id.clone(), c.function.name.clone());
         }
     }
+    // A restored call line and its result must share a `seq` so the digest lands on the same line
+    // under retained (matched by seq). Keyed by tool_call_id, populated as each call line replays.
+    let mut call_seq: HashMap<String, u64> = HashMap::new();
     for m in msgs {
         match m.role.as_str() {
             "user" => {
@@ -1955,17 +1967,21 @@ pub fn replay_transcript(msgs: &[crate::core::types::Message]) {
                 for c in &m.tool_calls {
                     let args: serde_json::Value =
                         serde_json::from_str(&c.function.arguments).unwrap_or(serde_json::json!({}));
-                    emit_trace(&tool_call_line(&c.function.name, &args));
+                    call_seq.insert(c.id.clone(), emit_tool_call(&c.function.name, &args));
                 }
             }
             "tool" => {
-                let name = m
-                    .tool_call_id
-                    .as_deref()
-                    .and_then(|id| call_names.get(id))
-                    .map(String::as_str)
-                    .unwrap_or("tool");
-                emit_tool_result(name, m.content.as_deref().unwrap_or(""));
+                let id = m.tool_call_id.as_deref().unwrap_or("");
+                let name = call_names.get(id).map(String::as_str).unwrap_or("tool");
+                // Re-parse the originating call's args for the target label; fall back to empty.
+                let args = msgs
+                    .iter()
+                    .flat_map(|mm| &mm.tool_calls)
+                    .find(|c| c.id == id)
+                    .and_then(|c| serde_json::from_str(&c.function.arguments).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let seq = call_seq.get(id).copied().unwrap_or(0);
+                emit_tool_result(seq, name, &args, m.content.as_deref().unwrap_or(""), None);
             }
             _ => {} // system prompt + any other roles: not part of the visible conversation
         }
@@ -1984,21 +2000,84 @@ fn emit_trace(line: &str) {
     }
 }
 
-/// After a tool runs, emit an informative result UNDER the call — `  ⎿ <summary>` — where the
-/// summary carries real signal (lines read, matches found, `+adds −dels`, exit code, …) instead of
-/// a bare check. A failure renders the corner + reason in salmon. For edits, the changed lines then
-/// print as a compact colour diff (added = green `+`, removed = salmon `−`). The full tool output
-/// still goes to the model; only this digest reaches the terminal, so the transcript stays clean.
-fn emit_tool_result(name: &str, out: &str) {
-    let (ok, summary) = summarize_result(name, out);
-    let corner = if ok { crate::ui::theme::faint("└") } else { crate::ui::theme::err("└") };
-    if ok {
-        emit_trace(&format!("  {corner} {}", crate::ui::theme::faint(&summary)));
+/// The tool-call anchor icon — the moonlight cog `⚙` (matching the mockup), or empty when icons are
+/// off. Kept plain (no SGR) so the retained/classic renderer tints it as part of the line.
+fn tool_icon() -> &'static str {
+    if crate::ui::icons::on() {
+        "⚙"
     } else {
-        emit_trace(&format!("  {corner} {}", crate::ui::theme::err(&summary)));
+        "◆"
     }
-    if !out.trim_start().starts_with("error:") && is_edit_tool(name) {
-        emit_edit_diff(out);
+}
+
+/// The compact TARGET shown after the raw tool name — a basename / host / clipped query, reusing the
+/// same salient-field extraction as [`tool_trace`] but WITHOUT a verb (the mockup shows the raw tool
+/// name + its target, e.g. `file_read   src/auth.rs`). Empty when there's nothing salient.
+fn tool_target(name: &str, args: &serde_json::Value) -> String {
+    let field = |k: &str| args.get(k).and_then(|v| v.as_str());
+    let base = |p: &str| basename(p).to_string();
+    match name {
+        "shell_run" | "bash" | "powershell" | "shell" => {
+            shell_target(field("command").or_else(|| field("cmd")).unwrap_or(""))
+        }
+        "file_write" | "write_file" | "file_edit" | "edit_file" | "apply_patch" | "multi_edit"
+        | "symbol_replace" | "symbol_insert" => base(
+            field("path").or_else(|| field("file")).or_else(|| field("symbol")).unwrap_or(""),
+        ),
+        "file_read" | "read_file" => base(field("path").or_else(|| field("file")).unwrap_or("")),
+        "file_move" | "move_file" | "rename_file" | "file_rename" => base(field("from").unwrap_or("")),
+        "file_glob" => first_line_clip(field("pattern").or_else(|| field("glob")).unwrap_or(""), 40),
+        "search_files" => first_line_clip(field("query").or_else(|| field("pattern")).unwrap_or(""), 40),
+        "web_fetch" | "web_crawl" => url_host(field("url").unwrap_or("")),
+        "find_symbols" | "lsp_query" => first_line_clip(field("query").or_else(|| field("name")).unwrap_or(""), 40),
+        "memory_search" => first_line_clip(field("query").or_else(|| field("q")).unwrap_or(""), 40),
+        "skill_load" => field("name").unwrap_or("").to_string(),
+        "todo_write" => String::new(),
+        "clarify" | "memory_ask" | "telegram_ask" => first_line_clip(field("question").unwrap_or(""), 40),
+        n if n.ends_with("_search") || n == "search" => {
+            first_line_clip(field("query").or_else(|| field("q")).unwrap_or(""), 40)
+        }
+        _ => {
+            // Unknown tool: fall back to the salient-arg trace so nothing renders bare.
+            let t = tool_trace(name, args);
+            if t == compact_args(args) && args.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                String::new()
+            } else {
+                first_line_clip(&t, 40)
+            }
+        }
+    }
+}
+
+/// Open a tool-call line (mockup shape `⚙ <name>   <target>`), returning the `seq` so the result can
+/// update the same line in place under retained. Shared by the serial + eager-adoption paths.
+fn emit_tool_call(name: &str, args: &serde_json::Value) -> u64 {
+    crate::ui::tui::tool_call_begin(tool_icon(), name, &tool_target(name, args))
+}
+
+/// Close a tool-call line: compute the result digest (via [`summarize_result`]) and update the line
+/// opened by [`emit_tool_call`] in place (retained) or render it once (classic). Edits then push a
+/// boxed diff; a passing verify-context command gets no special box here (the verify gate emits its
+/// own green line). `seq` matches the [`emit_tool_call`] that opened this line.
+fn emit_tool_result(
+    seq: u64,
+    name: &str,
+    args: &serde_json::Value,
+    out: &str,
+    elapsed_ms: Option<u64>,
+) {
+    let (ok, summary) = summarize_result(name, out);
+    crate::ui::tui::tool_call_end(
+        seq,
+        tool_icon(),
+        name,
+        &tool_target(name, args),
+        &summary,
+        Some(ok),
+        elapsed_ms,
+    );
+    if ok && !out.trim_start().starts_with("error:") && is_edit_tool(name) {
+        emit_edit_diff(&tool_target(name, args), out);
     }
 }
 
@@ -2041,32 +2120,30 @@ fn edit_target(head: &str) -> String {
     }
 }
 
-/// Render up to a few changed lines of an edit result as a colour diff, indented under the `⎿`
-/// (added = green `+`, removed = salmon `−`). Reads the `^[-+]`-prefixed lines the unified
-/// `diff_preview` emitted; context / cap-note lines (space- / `…`-prefixed) are skipped.
-fn emit_edit_diff(out: &str) {
+/// Emit a boxed diff preview for an edit result: header `diff · <path>  +A −D`, then up to a few of
+/// the `^[-+]`-prefixed lines the unified `diff_preview` emitted (added = green `+`, removed = salmon
+/// `−`); context / cap-note lines (space- / `…`-prefixed) are skipped. `path` is the edited target
+/// (already a basename-ish target string). The full diff still reaches the model; only this preview
+/// hits the screen. Under retained this is a framed box; classic re-renders the same box inline.
+fn emit_edit_diff(path: &str, out: &str) {
     const MAX_SHOWN: usize = 8;
-    let budget = crate::ui::tui::width().saturating_sub(8).max(16);
-    let mut shown = 0usize;
+    let (adds, dels) = count_diff(out);
+    let mut lines: Vec<(bool, String)> = Vec::new();
     for l in out.lines() {
         let (is_add, content) = match l.as_bytes().first() {
             Some(b'+') => (true, &l[1..]),
             Some(b'-') => (false, &l[1..]),
             _ => continue,
         };
-        if shown == MAX_SHOWN {
-            emit_trace(&format!("    {}", crate::ui::theme::faint("… (diff trimmed)")));
+        if lines.len() == MAX_SHOWN {
             break;
         }
-        let clipped: String = content.chars().take(budget).collect();
-        let styled = if is_add {
-            crate::ui::theme::ok(format!("+ {clipped}")).to_string()
-        } else {
-            crate::ui::theme::err(format!("− {clipped}")).to_string()
-        };
-        emit_trace(&format!("    {styled}"));
-        shown += 1;
+        lines.push((is_add, content.trim_end().to_string()));
     }
+    if lines.is_empty() {
+        return;
+    }
+    crate::ui::tui::diff_box(path, adds, dels, lines);
 }
 
 /// Build the `⎿` summary for a tool result, returning `(ok, text)` (`ok=false` → coloured as a
@@ -2973,20 +3050,22 @@ mod tests {
 
     // ── display: the ◆ call line + ⎿ result summary ─────────────────────────
     #[test]
-    fn tool_call_line_shows_action_then_dimmed_tool_name() {
-        // A mapped tool reads `◆ <English verb + target> (tool_name)`.
+    fn tool_call_line_shows_raw_name_then_target() {
+        // The mockup shape: `<icon> <raw tool_name>   <target>` — raw tool id first, salient target
+        // after (a basename here), no English verb and no parenthesised footnote.
         let line = tool_call_line("file_read", &serde_json::json!({"path": "src/main.rs"}));
         let plain = console::strip_ansi_codes(&line).to_string();
-        assert!(plain.starts_with("◆ Read main.rs"), "action-first: {plain:?}");
-        assert!(plain.contains("(file_read)"), "raw tool name parenthesised: {plain:?}");
+        assert!(plain.contains("file_read"), "raw tool name shown: {plain:?}");
+        assert!(plain.contains("main.rs"), "salient target shown: {plain:?}");
+        assert!(!plain.contains("Read "), "no English verb: {plain:?}");
     }
 
     #[test]
-    fn tool_call_line_falls_back_to_name_arg_when_unmapped() {
-        // An unknown tool keeps the older `◆ name(salient-arg)` shape.
+    fn tool_call_line_unmapped_shows_bare_name() {
+        // An unknown tool with no salient field renders just the raw name (no crash, no JSON dump).
         let line = tool_call_line("mystery_tool", &serde_json::json!({"foo": "bar"}));
         let plain = console::strip_ansi_codes(&line).to_string();
-        assert!(plain.starts_with("◆ mystery_tool("), "{plain:?}");
+        assert!(plain.contains("mystery_tool"), "{plain:?}");
     }
 
     #[test]

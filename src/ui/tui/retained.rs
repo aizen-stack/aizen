@@ -54,13 +54,121 @@ enum BlockKind {
     Intro,
     Generic,
     Assistant,
+    /// A single tool-call line: `⚙ <name>   <target>            <digest>` — the digest is
+    /// right-aligned by the render width and tinted by [`ToolState`]. Created at call start
+    /// (state `Running`, empty digest) and updated in place when the result lands.
+    Tool,
+    /// The in-place task checklist box (`☑ done/total · plan` + ✓/▸/○ rows). One stable block per
+    /// session, replaced (not appended) on each `todo_write`.
+    Plan,
+    /// A boxed unified-diff preview (`diff · <path>` + `+`/`−` rows).
+    Diff,
+    /// A green verify-gate success line (`✓ <cmd> — <detail>`).
+    Verify,
+}
+
+/// Outcome state for a [`ToolEvent`] — drives the digest colour (running = dim, ok = green,
+/// err = salmon).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ToolState {
+    Running,
+    Ok,
+    Err,
+}
+
+/// A structured tool-call line. Rendered as `<icon> <name>   <target>` on the call line, with the
+/// result `digest` on an indented `└` line below it (tinted by [`ToolState`] and carrying the run
+/// time). `seq` lets the result update the same block in place (parallel batches update by seq).
+#[derive(Clone)]
+pub(super) struct ToolEvent {
+    pub seq: u64,
+    pub icon: String,
+    pub name: String,
+    pub target: String,
+    pub digest: String,
+    pub state: ToolState,
+    /// Wall-clock run time of the tool call in milliseconds, appended to the result line (`· 1.2s`).
+    /// `None` when unknown (restored transcripts, parallel eager-adoption) → no time is shown.
+    pub elapsed_ms: Option<u64>,
+}
+
+/// One checklist row for the plan panel. `status`: 0 = pending (○), 1 = in-progress (▸), 2 = done (✓).
+#[derive(Clone)]
+pub(super) struct PlanRow {
+    pub status: u8,
+    pub text: String,
+}
+
+/// A boxed diff preview: the edited path plus the `+`/`−` lines (`is_add`, content, already clipped
+/// upstream). `adds`/`dels` are the full counts for the header even when `lines` is truncated.
+#[derive(Clone)]
+pub(super) struct DiffPayload {
+    pub path: String,
+    pub adds: usize,
+    pub dels: usize,
+    pub lines: Vec<(bool, String)>,
+}
+
+/// A verify-gate success line: `✓ <cmd> — <detail>` (e.g. `cargo check`, `0 errors · verify gate passed`).
+#[derive(Clone)]
+pub(super) struct VerifyPayload {
+    pub cmd: String,
+    pub detail: String,
+}
+
+/// The body of a transcript block. Text kinds (intro/generic/assistant) keep a raw string that is
+/// re-wrapped per width; the structured kinds carry typed data the renderer lays out by width.
+#[derive(Clone)]
+enum Payload {
+    Text(String),
+    Tool(ToolEvent),
+    Plan(Vec<PlanRow>),
+    Diff(DiffPayload),
+    Verify(VerifyPayload),
+}
+
+impl Payload {
+    /// A stable hash of the payload for the render cache + frame metrics.
+    fn content_hash(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        match self {
+            Payload::Text(s) => s.hash(&mut h),
+            Payload::Tool(t) => {
+                t.name.hash(&mut h);
+                t.target.hash(&mut h);
+                t.digest.hash(&mut h);
+                (t.state as u8).hash(&mut h);
+                t.elapsed_ms.hash(&mut h);
+            }
+            Payload::Plan(rows) => {
+                for r in rows {
+                    r.status.hash(&mut h);
+                    r.text.hash(&mut h);
+                }
+            }
+            Payload::Diff(d) => {
+                d.path.hash(&mut h);
+                d.adds.hash(&mut h);
+                d.dels.hash(&mut h);
+                for (add, line) in &d.lines {
+                    add.hash(&mut h);
+                    line.hash(&mut h);
+                }
+            }
+            Payload::Verify(v) => {
+                v.cmd.hash(&mut h);
+                v.detail.hash(&mut h);
+            }
+        }
+        h.finish()
+    }
 }
 
 #[derive(Clone)]
 struct UiBlock {
     id: u64,
     kind: BlockKind,
-    content: String,
+    payload: Payload,
     complete: bool,
 }
 
@@ -84,7 +192,7 @@ impl RenderCache {
         let key = CacheKey {
             id: block.id,
             width,
-            hash: hash_text(&block.content),
+            hash: block.payload.content_hash(),
             complete: block.complete,
         };
         if let Some(rows) = self.rows.get(&key) {
@@ -92,9 +200,16 @@ impl RenderCache {
             return rows.clone();
         }
         self.misses += 1;
-        let rows = match block.kind {
-            BlockKind::Assistant => render_assistant_rows(&block.content, width as usize),
-            _ => sanitize_keep_sgr(&block.content).split('\n').map(str::to_string).collect(),
+        let w = width as usize;
+        let rows = match &block.payload {
+            Payload::Text(s) => match block.kind {
+                BlockKind::Assistant => render_assistant_rows(s, w),
+                _ => sanitize_keep_sgr(s).split('\n').map(str::to_string).collect(),
+            },
+            Payload::Tool(t) => render_tool_row(t, w).split('\n').map(str::to_string).collect(),
+            Payload::Plan(rows) => render_plan_box(rows, w),
+            Payload::Diff(d) => render_diff_box(d, w),
+            Payload::Verify(v) => vec![render_verify_line(v, w)],
         };
         if self.rows.len() >= CACHE_LIMIT {
             self.rows.clear();
@@ -127,6 +242,10 @@ struct AppState {
     /// transcript behind it; reset on open/close and clamped to the overlay's own content height.
     overlay_scroll: usize,
     focused: bool,
+    /// Block id of the in-place plan panel, if one has been shown this session. `todo_write` replaces
+    /// that block's payload instead of appending a new one, so the checklist updates in place rather
+    /// than stacking a fresh copy on every call. Cleared when the list is emptied.
+    plan_id: Option<u64>,
     metrics: metrics::FrameMetrics,
     cache: RenderCache,
 }
@@ -137,7 +256,7 @@ impl AppState {
             blocks: vec![UiBlock {
                 id: 1,
                 kind: BlockKind::Intro,
-                content: sanitize_text(intro),
+                payload: Payload::Text(sanitize_text(intro)),
                 complete: true,
             }],
             next_id: 2,
@@ -151,15 +270,16 @@ impl AppState {
             last_total: 0,
             overlay_scroll: 0,
             focused: true,
+            plan_id: None,
             metrics: metrics::FrameMetrics::default(),
             cache: RenderCache::default(),
         }
     }
 
-    fn push_block(&mut self, kind: BlockKind, content: String, complete: bool) -> u64 {
+    fn push_block(&mut self, kind: BlockKind, payload: Payload, complete: bool) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
-        self.blocks.push(UiBlock { id, kind, content, complete });
+        self.blocks.push(UiBlock { id, kind, payload, complete });
         if self.blocks.len() > BLOCK_LIMIT {
             let excess = self.blocks.len() - BLOCK_LIMIT;
             self.blocks.drain(0..excess);
@@ -170,17 +290,24 @@ impl AppState {
         id
     }
 
+    /// A plain-text block (generic emit / intro). Convenience over [`push_block`] + [`Payload::Text`].
+    fn push_text(&mut self, kind: BlockKind, content: String, complete: bool) -> u64 {
+        self.push_block(kind, Payload::Text(content), complete)
+    }
+
     fn push_assistant(&mut self, delta: &str) {
         let id = match self.active_assistant {
             Some(id) => id,
             None => {
-                let id = self.push_block(BlockKind::Assistant, String::new(), false);
+                let id = self.push_block(BlockKind::Assistant, Payload::Text(String::new()), false);
                 self.active_assistant = Some(id);
                 id
             }
         };
         if let Some(block) = self.blocks.iter_mut().find(|b| b.id == id) {
-            block.content.push_str(delta);
+            if let Payload::Text(s) = &mut block.payload {
+                s.push_str(delta);
+            }
             block.complete = false;
         }
         // Deliberately no `scroll_from_tail = 0`: a streaming token must not fight a user who has
@@ -191,10 +318,52 @@ impl AppState {
         let Some(id) = self.active_assistant.take() else { return };
         if let Some(block) = self.blocks.iter_mut().find(|b| b.id == id) {
             block.complete = true;
-            if interrupted && !block.content.ends_with('\n') {
-                block.content.push('\n');
+            if interrupted {
+                if let Payload::Text(s) = &mut block.payload {
+                    if !s.ends_with('\n') {
+                        s.push('\n');
+                    }
+                }
             }
         }
+    }
+
+    /// Apply a tool-call event: a `Running` event with a fresh `seq` pushes a new tool block; an
+    /// `Ok`/`Err` event with a `seq` we've seen updates that block in place (so the result lands on
+    /// the same line instead of appending a second row). A result for an unknown seq (e.g. after
+    /// pruning) just pushes a fresh completed row.
+    fn apply_tool_event(&mut self, ev: ToolEvent) {
+        if let Some(block) = self.blocks.iter_mut().find(|b| {
+            b.kind == BlockKind::Tool && matches!(&b.payload, Payload::Tool(t) if t.seq == ev.seq)
+        }) {
+            block.complete = ev.state != ToolState::Running;
+            block.payload = Payload::Tool(ev);
+            return;
+        }
+        let complete = ev.state != ToolState::Running;
+        self.push_block(BlockKind::Tool, Payload::Tool(ev), complete);
+    }
+
+    /// Replace the single in-place plan panel with the current checklist. The panel keeps a stable
+    /// block id: the first `todo_write` pushes it, later calls update THAT block's payload in place
+    /// (so the box refreshes where it first appeared instead of stacking a fresh copy on every call).
+    /// An empty list removes the panel and forgets the id (a cleared plan leaves no empty box behind).
+    fn apply_plan(&mut self, rows: Vec<PlanRow>) {
+        if rows.is_empty() {
+            if let Some(id) = self.plan_id.take() {
+                self.blocks.retain(|b| b.id != id);
+            }
+            return;
+        }
+        if let Some(id) = self.plan_id {
+            if let Some(block) = self.blocks.iter_mut().find(|b| b.id == id) {
+                block.payload = Payload::Plan(rows);
+                block.complete = true;
+                return;
+            }
+            // The id was pruned out of the ring — fall through and push a fresh panel.
+        }
+        self.plan_id = Some(self.push_block(BlockKind::Plan, Payload::Plan(rows), true));
     }
 }
 
@@ -202,6 +371,15 @@ enum Command {
     Emit(String),
     AssistantDelta(String),
     AssistantFinish { interrupted: bool },
+    /// A tool-call event: push a new line at call start (state `Running`), or update the existing
+    /// line in place when the result lands (matched by `seq`).
+    Tool(ToolEvent),
+    /// Replace the in-place plan checklist box with a fresh snapshot (`todo_write`).
+    Plan(Vec<PlanRow>),
+    /// Push a boxed diff preview under the most recent edit.
+    Diff(DiffPayload),
+    /// Push a green verify-gate success line.
+    Verify(VerifyPayload),
     Input(InputSnapshot),
     Working(bool),
     Status(String),
@@ -401,6 +579,26 @@ pub(super) fn set_context(permille: u16) {
     send(Command::Context(permille.min(1000)));
 }
 
+/// Push (state `Running`) or update-in-place (state `Ok`/`Err`, matched by `seq`) a tool-call line.
+pub(super) fn tool_event(ev: ToolEvent) {
+    send(Command::Tool(ev));
+}
+
+/// Replace the in-place plan checklist box with a fresh snapshot (empty → removes the box).
+pub(super) fn plan_update(rows: Vec<PlanRow>) {
+    send(Command::Plan(rows));
+}
+
+/// Push a boxed diff preview under the most recent edit.
+pub(super) fn diff_box(d: DiffPayload) {
+    send(Command::Diff(d));
+}
+
+/// Push a green verify-gate success line.
+pub(super) fn verify_line(v: VerifyPayload) {
+    send(Command::Verify(v));
+}
+
 pub(super) fn tick() {
     send(Command::Tick);
 }
@@ -532,7 +730,7 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 let rows = state
                     .blocks
                     .iter()
-                    .map(|b| format!("{}:{}:{}", b.id, b.content.len(), b.complete))
+                    .map(|b| format!("{}:{:x}:{}", b.id, b.payload.content_hash(), b.complete))
                     .collect::<Vec<_>>();
                 state.metrics.record(started.elapsed(), metrics::hash_rows(&rows), before != after);
             }
@@ -553,11 +751,19 @@ fn apply_command(state: &mut AppState, cmd: Command) {
             // are stripped. `ansi_spans` turns the kept codes into ratatui spans at draw time.
             let clean = sanitize_keep_sgr(&s);
             if !clean.is_empty() {
-                state.push_block(BlockKind::Generic, clean, true);
+                state.push_text(BlockKind::Generic, clean, true);
             }
         }
         Command::AssistantDelta(s) => state.push_assistant(&s),
         Command::AssistantFinish { interrupted } => state.finish_assistant(interrupted),
+        Command::Tool(ev) => state.apply_tool_event(ev),
+        Command::Plan(rows) => state.apply_plan(rows),
+        Command::Diff(d) => {
+            state.push_block(BlockKind::Diff, Payload::Diff(d), true);
+        }
+        Command::Verify(v) => {
+            state.push_block(BlockKind::Verify, Payload::Verify(v), true);
+        }
         Command::Input(input) => {
             state.input = input;
         }
@@ -677,11 +883,15 @@ fn styled_row(kind: BlockKind, row: String) -> Line<'static> {
         // Intro is sanitised plain (no SGR) → one flat dim line, as before.
         BlockKind::Intro => Line::styled(row, Style::default().fg(Color::DarkGray)),
         // Assistant + Generic carry SGR now: parse it into coloured spans over a grey base. The
-        // moonlight `▌` gutter and the state-tinted `◆` tool anchor keep their own colour because
-        // it rode through as SGR; uncoloured text collapses to one grey span (unchanged look).
-        BlockKind::Assistant | BlockKind::Generic => {
-            Line::from(ansi_spans(&row, Style::default().fg(Color::Gray)))
-        }
+        // moonlight `▌` gutter keeps its own colour because it rode through as SGR; uncoloured text
+        // collapses to one grey span (unchanged look). The structured kinds (Tool/Plan/Diff/Verify)
+        // also emit their palette as SGR from their render fns, so they take the same span path.
+        BlockKind::Assistant
+        | BlockKind::Generic
+        | BlockKind::Tool
+        | BlockKind::Plan
+        | BlockKind::Diff
+        | BlockKind::Verify => Line::from(ansi_spans(&row, Style::default().fg(Color::Gray))),
     }
 }
 
@@ -700,14 +910,19 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .split(area);
     let width = area.width as usize;
     let elapsed = state.working_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-    let indicator = if state.working {
+    // Right of the HUD row: the mockup's rounded working pill `⚗ working · 23s · Esc to stop` while
+    // the agent runs (the flask advances with the frame so it reads as alive), else a quiet `● ready`
+    // with the context-fill %. The pill is drawn as its own bracketed run so it reads as one chip.
+    let (right, right_style) = if state.working {
         const STAR: [&str; 6] = ["✶", "✷", "✸", "✹", "✺", "✻"];
-        format!("{} {}s", STAR[state.frame % STAR.len()], elapsed)
+        (
+            format!("{} working · {}s · Esc to stop", STAR[state.frame % STAR.len()], elapsed),
+            Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT)),
+        )
     } else {
-        "● ready".to_string()
+        let pct = state.ctx_permille / 10;
+        (format!("● ready · {pct}% ctx"), Style::default().fg(Color::Indexed(crate::ui::theme::OK)))
     };
-    let pct = state.ctx_permille / 10;
-    let right = format!("{indicator}  {pct}%");
     let right_w = console::measure_text_width(&right);
     let left_budget = width.saturating_sub(right_w + 1);
     let left = console::truncate_str(&state.input.status, left_budget, "…").into_owned();
@@ -716,14 +931,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         Paragraph::new(Line::from(vec![
             Span::styled(left, Style::default().fg(Color::DarkGray)),
             Span::raw(" ".repeat(gap)),
-            Span::styled(
-                right,
-                Style::default().fg(if state.working {
-                    Color::Indexed(crate::ui::theme::ACCENT)
-                } else {
-                    Color::Indexed(crate::ui::theme::OK)
-                }),
-            ),
+            Span::styled(right, right_style),
         ])),
         rows[0],
     );
@@ -736,19 +944,42 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         rows[1],
     );
 
-    let (shown, cursor_off) = input_line(state, width.saturating_sub(3));
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                "❯ ",
-                Style::default()
-                    .fg(Color::Indexed(crate::ui::theme::ACCENT))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(shown, Style::default().fg(Color::White)),
-        ])),
-        rows[2],
-    );
+    // A quiet right-aligned key hint (`↵ send · Tab complete`) shown only while the draft is empty
+    // and an overlay isn't up — it must never fight the typed text or the `/`-command list for the
+    // row. Reserve its width from the typing budget so the hint and the input never overlap.
+    let hint = if state.input.draft.is_empty() && state.input.overlay.is_none() {
+        "↵ send · Tab complete"
+    } else {
+        ""
+    };
+    let hint_w = if hint.is_empty() { 0 } else { console::measure_text_width(hint) + 1 };
+    // A `[Nimg]` chip when vision attachments are pending (Ctrl-O / dropped files) so the input box
+    // shows the attachment count — matches the classic renderer. Its width is reserved from the
+    // typing budget so it never overlaps the typed text or the caret math.
+    let imgtag = if state.input.images > 0 { format!("[{}img] ", state.input.images) } else { String::new() };
+    let imgtag_w = console::measure_text_width(&imgtag);
+    let type_budget = width.saturating_sub(3 + imgtag_w + hint_w);
+    let (shown, cursor_off) = input_line(state, type_budget);
+    let shown_w = console::measure_text_width(&shown);
+    // Pad between the typed text and the right-aligned hint. `3` = `❯ ` (2) + one right margin.
+    let hint_gap = width
+        .saturating_sub(3 + imgtag_w + shown_w + hint_w.saturating_sub(1))
+        .max(if hint.is_empty() { 0 } else { 1 });
+    let mut prompt_spans = vec![Span::styled(
+        "❯ ",
+        Style::default()
+            .fg(Color::Indexed(crate::ui::theme::ACCENT))
+            .add_modifier(Modifier::BOLD),
+    )];
+    if !imgtag.is_empty() {
+        prompt_spans.push(Span::styled(imgtag, Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT))));
+    }
+    prompt_spans.push(Span::styled(shown, Style::default().fg(Color::White)));
+    if !hint.is_empty() {
+        prompt_spans.push(Span::raw(" ".repeat(hint_gap)));
+        prompt_spans.push(Span::styled(hint.to_string(), Style::default().fg(Color::DarkGray)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(prompt_spans)), rows[2]);
     frame.render_widget(
         Paragraph::new(Line::styled(
             rule,
@@ -756,7 +987,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         )),
         rows[3],
     );
-    let cursor_x = rows[2].x.saturating_add(2).saturating_add(cursor_off as u16);
+    let cursor_x = rows[2].x.saturating_add(2).saturating_add(imgtag_w as u16).saturating_add(cursor_off as u16);
     frame.set_cursor_position((cursor_x.min(rows[2].right().saturating_sub(1)), rows[2].y));
 }
 
@@ -865,6 +1096,156 @@ fn render_assistant_rows(raw: &str, width: usize) -> Vec<String> {
         .split('\n')
         .map(str::to_string)
         .collect()
+}
+
+/// Format a run time for the result line: `· 940ms` under a second, `· 1.2s` otherwise. Sub-second
+/// times keep millisecond resolution; longer runs show one decimal of seconds so a slow call reads
+/// at a glance. Empty string for `None` (unknown — restored transcripts / eager-adopted parallel).
+fn fmt_elapsed(ms: Option<u64>) -> String {
+    match ms {
+        None => String::new(),
+        Some(ms) if ms < 1000 => format!(" · {ms}ms"),
+        Some(ms) => format!(" · {:.1}s", ms as f64 / 1000.0),
+    }
+}
+
+/// Lay out one tool-call line under the transcript, mockup-style but result-below: the call
+/// `<icon> <name>   <target>` on its own line (icon + name in moonlight accent, target dim silver),
+/// then an indented `└ <digest> · <time>` line beneath it — the result digest tinted by state
+/// (running = faint, ok = green, err = salmon) and carrying the wall-clock run time. A still-running
+/// call (empty digest) is just the call line; the result line is added when the digest lands.
+pub(super) fn render_tool_row(t: &ToolEvent, width: usize) -> String {
+    use crate::ui::theme;
+    let _ = width; // stacked layout no longer needs the frame width to right-align
+    let icon = if t.icon.is_empty() { String::new() } else { format!("{} ", t.icon) };
+    let name_styled = theme::accent(&t.name).to_string();
+    let call_line = if t.target.is_empty() {
+        format!("{}{}", theme::accent(&icon), name_styled)
+    } else {
+        format!("{}{}   {}", theme::accent(&icon), name_styled, theme::accent_dim(&t.target))
+    };
+    if t.digest.is_empty() {
+        return call_line;
+    }
+    // Result on the line below: `└ <digest> · <time>`, digest tinted by outcome, time dimmed.
+    let digest_styled = match t.state {
+        ToolState::Running => theme::faint(&t.digest).to_string(),
+        ToolState::Ok => theme::ok(&t.digest).to_string(),
+        ToolState::Err => theme::err(&t.digest).to_string(),
+    };
+    let time = fmt_elapsed(t.elapsed_ms);
+    let time_styled = if time.is_empty() { String::new() } else { theme::faint(&time).to_string() };
+    format!("{call_line}\n{} {digest_styled}{time_styled}", theme::faint("└"))
+}
+
+/// Render the in-place plan panel as a boxed checklist: a `☑ done/total · plan` header row, then one
+/// `✓ / ▸ / ○` row per item, framed with the same rounded box the markdown renderer uses. Done rows
+/// are green + dim-struck, the in-progress row is bright moonlight, pending rows are faint.
+pub(super) fn render_plan_box(rows: &[PlanRow], width: usize) -> Vec<String> {
+    use crate::ui::theme;
+    let done = rows.iter().filter(|r| r.status == 2).count();
+    let header = format!("☑ {done}/{} · plan", rows.len());
+    // Inner width: cap so the box doesn't sprawl on a very wide pane; leave room for `│ ` + ` │`.
+    let inner = width.saturating_sub(2).min(72).max(12);
+    let bar = "─".repeat(inner);
+    let mut out = Vec::new();
+    out.push(theme::accent_dim(format!("╭─ {} ─╮", pad_to(&header, inner.saturating_sub(4)))).to_string());
+    for r in rows {
+        let glyph = match r.status {
+            2 => "✓",
+            1 => "▸",
+            _ => "○",
+        };
+        let g = match r.status {
+            2 => theme::ok(glyph).to_string(),
+            1 => theme::accent(glyph).bold().to_string(),
+            _ => theme::faint(glyph).to_string(),
+        };
+        // Body row `│ <glyph> <text><pad> │`: the span BETWEEN the two rules must be exactly `inner`
+        // cells so the right `│` lines up with the border corners. That span is
+        // ` `+glyph(1)+` `+text+pad+` ` = 4 + text + pad, so pad = inner − 4 − text.
+        let text_budget = inner.saturating_sub(4);
+        let clipped = clip_to(&r.text, text_budget);
+        let styled = match r.status {
+            2 => theme::muted(&clipped).to_string(),
+            1 => theme::accent(&clipped).bold().to_string(),
+            _ => theme::faint(&clipped).to_string(),
+        };
+        let pad = inner.saturating_sub(4 + console::measure_text_width(&clipped));
+        out.push(format!(
+            "{} {} {}{} {}",
+            theme::accent_dim("│"),
+            g,
+            styled,
+            " ".repeat(pad),
+            theme::accent_dim("│")
+        ));
+    }
+    out.push(theme::accent_dim(format!("╰{bar}╯")).to_string());
+    out
+}
+
+/// Render a boxed diff preview: a `diff · <path>  +A −D` header, then the `+`/`−` lines (green /
+/// salmon) inside the same rounded frame. Lines are clipped to the inner width.
+pub(super) fn render_diff_box(d: &DiffPayload, width: usize) -> Vec<String> {
+    use crate::ui::theme;
+    let inner = width.saturating_sub(2).min(84).max(12);
+    let bar = "─".repeat(inner);
+    let header = format!("diff · {}   +{} −{}", d.path, d.adds, d.dels);
+    let mut out = Vec::new();
+    out.push(theme::accent_dim(format!("╭─ {} ─╮", pad_to(&header, inner.saturating_sub(4)))).to_string());
+    for (is_add, content) in &d.lines {
+        let budget = inner.saturating_sub(4);
+        let clipped = clip_to(content, budget.saturating_sub(2));
+        let body = if *is_add { format!("+ {clipped}") } else { format!("− {clipped}") };
+        let pad = inner.saturating_sub(2 + console::measure_text_width(&body));
+        let styled = if *is_add { theme::ok(&body).to_string() } else { theme::err(&body).to_string() };
+        out.push(format!("{} {}{} {}", theme::accent_dim("│"), styled, " ".repeat(pad), theme::accent_dim("│")));
+    }
+    out.push(theme::accent_dim(format!("╰{bar}╯")).to_string());
+    out
+}
+
+/// Render the verify-gate success line: a green `✓ <cmd> — <detail>`, clipped to width.
+pub(super) fn render_verify_line(v: &VerifyPayload, width: usize) -> String {
+    use crate::ui::theme;
+    let text = if v.detail.is_empty() {
+        format!("✓ {}", v.cmd)
+    } else {
+        format!("✓ {} — {}", v.cmd, v.detail)
+    };
+    theme::ok(clip_to(&text, width)).to_string()
+}
+
+/// Clip a plain string to `max` display columns (ellipsis when it would overflow). Width-aware so a
+/// wide glyph never half-lands past the frame.
+fn clip_to(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if console::measure_text_width(s) <= max {
+        return s.to_string();
+    }
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = console::measure_text_width(&ch.to_string()).max(1);
+        if w + cw > budget {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// Clip then right-pad a plain string to exactly `width` display columns (for a box header).
+fn pad_to(s: &str, width: usize) -> String {
+    let clipped = clip_to(s, width);
+    let w = console::measure_text_width(&clipped);
+    format!("{clipped}{}", " ".repeat(width.saturating_sub(w)))
 }
 
 /// Strip ALL terminal control sequences INCLUDING colour/SGR, leaving printable text only. Used for
@@ -1034,12 +1415,6 @@ fn ansi_spans(row: &str, base: Style) -> Vec<Span<'static>> {
     spans
 }
 
-fn hash_text(s: &str) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,12 +1459,19 @@ mod tests {
     #[test]
     fn assistant_cache_is_width_and_content_keyed() {
         let mut cache = RenderCache::default();
-        let mut block = UiBlock { id: 7, kind: BlockKind::Assistant, content: "hello world".into(), complete: false };
+        let mut block = UiBlock {
+            id: 7,
+            kind: BlockKind::Assistant,
+            payload: Payload::Text("hello world".into()),
+            complete: false,
+        };
         let a = cache.get_or_render(&block, 40);
         let b = cache.get_or_render(&block, 40);
         assert_eq!(a, b);
         assert_eq!(cache.hits, 1);
-        block.content.push('!');
+        if let Payload::Text(s) = &mut block.payload {
+            s.push('!');
+        }
         let _ = cache.get_or_render(&block, 40);
         let _ = cache.get_or_render(&block, 20);
         assert_eq!(cache.misses, 3);
@@ -1099,10 +1481,10 @@ mod tests {
     fn pruning_keeps_whole_blocks() {
         let mut state = AppState::new("intro", "status");
         for i in 0..BLOCK_LIMIT + 20 {
-            state.push_block(BlockKind::Generic, format!("line-{i}"), true);
+            state.push_text(BlockKind::Generic, format!("line-{i}"), true);
         }
         assert_eq!(state.blocks.len(), BLOCK_LIMIT);
-        assert!(state.blocks.iter().all(|b| !b.content.is_empty()));
+        assert!(state.blocks.iter().all(|b| !matches!(&b.payload, Payload::Text(s) if s.is_empty())));
     }
 
     #[test]
@@ -1161,5 +1543,177 @@ mod tests {
         let (start, offset, _) = resolve_transcript_scroll(3, 4, 4, 10);
         assert_eq!(offset, 0);
         assert_eq!(start, 0);
+    }
+
+    // ── the mockup redesign: structured transcript blocks ────────────────────
+    fn plain(s: &str) -> String {
+        console::strip_ansi_codes(s).into_owned()
+    }
+
+    #[test]
+    fn tool_row_puts_digest_and_time_on_the_line_below() {
+        // The call `⚙ file_read   src/auth.rs` sits on top; the result digest drops to an indented
+        // `└ 142 lines · <time>` line beneath it (not right-aligned on the same row).
+        let ev = ToolEvent {
+            seq: 1,
+            icon: "⚙".into(),
+            name: "file_read".into(),
+            target: "src/auth.rs".into(),
+            digest: "142 lines".into(),
+            state: ToolState::Ok,
+            elapsed_ms: Some(1200),
+        };
+        let row = plain(&render_tool_row(&ev, 60));
+        let lines: Vec<&str> = row.split('\n').collect();
+        assert_eq!(lines.len(), 2, "call line + result line: {row:?}");
+        assert_eq!(lines[0], "⚙ file_read   src/auth.rs", "call on top: {row:?}");
+        assert_eq!(lines[1], "└ 142 lines · 1.2s", "digest + time below: {row:?}");
+    }
+
+    #[test]
+    fn tool_row_shows_ms_for_subsecond_runs() {
+        let ev = ToolEvent {
+            seq: 1,
+            icon: "⚙".into(),
+            name: "search_files".into(),
+            target: "foo".into(),
+            digest: "3 match(es)".into(),
+            state: ToolState::Ok,
+            elapsed_ms: Some(940),
+        };
+        let row = plain(&render_tool_row(&ev, 60));
+        assert!(row.ends_with("└ 3 match(es) · 940ms"), "sub-second → ms: {row:?}");
+    }
+
+    #[test]
+    fn tool_row_omits_time_when_unknown() {
+        // A restored / eager-adopted call has no timing → the result line carries the digest only.
+        let ev = ToolEvent {
+            seq: 1,
+            icon: "⚙".into(),
+            name: "file_read".into(),
+            target: "x.rs".into(),
+            digest: "10 lines".into(),
+            state: ToolState::Ok,
+            elapsed_ms: None,
+        };
+        let row = plain(&render_tool_row(&ev, 60));
+        assert!(row.ends_with("└ 10 lines"), "no time appended: {row:?}");
+        assert!(!row.contains('·'), "no time separator: {row:?}");
+    }
+
+    #[test]
+    fn tool_row_omits_result_line_when_no_digest() {
+        // A still-running call (empty digest) is just the call line, no `└` result line yet.
+        let ev = ToolEvent {
+            seq: 1,
+            icon: "⚙".into(),
+            name: "shell_run".into(),
+            target: "cargo check".into(),
+            digest: String::new(),
+            state: ToolState::Running,
+            elapsed_ms: None,
+        };
+        let row = plain(&render_tool_row(&ev, 60));
+        assert_eq!(row, "⚙ shell_run   cargo check");
+        assert!(!row.contains('\n'), "no result line while running: {row:?}");
+    }
+
+    #[test]
+    fn plan_box_frames_and_counts() {
+        let rows = vec![
+            PlanRow { status: 2, text: "design".into() },
+            PlanRow { status: 1, text: "implement".into() },
+            PlanRow { status: 0, text: "verify".into() },
+        ];
+        let out: Vec<String> = render_plan_box(&rows, 40).iter().map(|s| plain(s)).collect();
+        assert!(out[0].contains("☑ 1/3 · plan"), "header counts done/total: {:?}", out[0]);
+        assert!(out.iter().any(|l| l.contains("✓ design")), "done row: {out:?}");
+        assert!(out.iter().any(|l| l.contains("▸ implement")), "in-progress row: {out:?}");
+        assert!(out.iter().any(|l| l.contains("○ verify")), "pending row: {out:?}");
+        // Top border, three rows, bottom border.
+        assert_eq!(out.len(), 5);
+        // Every framed line is the same display width (a true rectangle).
+        let w0 = console::measure_text_width(&out[0]);
+        assert!(out.iter().all(|l| console::measure_text_width(l) == w0), "uniform width: {out:?}");
+    }
+
+    #[test]
+    fn plan_update_is_in_place_not_appended() {
+        // A second todo_write REPLACES the panel rather than stacking a fresh box (only one Plan block
+        // ever exists), and it keeps its original position among other blocks.
+        let mut state = AppState::new("intro", "status");
+        state.push_text(BlockKind::Generic, "before".into(), true);
+        apply_command(&mut state, Command::Plan(vec![PlanRow { status: 0, text: "a".into() }]));
+        state.push_text(BlockKind::Generic, "after".into(), true);
+        let plan_pos = state.blocks.iter().position(|b| b.kind == BlockKind::Plan).unwrap();
+        apply_command(&mut state, Command::Plan(vec![
+            PlanRow { status: 2, text: "a".into() },
+            PlanRow { status: 1, text: "b".into() },
+        ]));
+        assert_eq!(state.blocks.iter().filter(|b| b.kind == BlockKind::Plan).count(), 1, "exactly one plan block");
+        assert_eq!(
+            state.blocks.iter().position(|b| b.kind == BlockKind::Plan),
+            Some(plan_pos),
+            "the panel stays where it first appeared"
+        );
+        // An empty list removes the panel entirely.
+        apply_command(&mut state, Command::Plan(vec![]));
+        assert!(state.blocks.iter().all(|b| b.kind != BlockKind::Plan), "cleared plan leaves no box");
+    }
+
+    #[test]
+    fn tool_event_updates_the_same_line_by_seq() {
+        // A Running event opens a line; the Ok event with the same seq updates it in place (no second
+        // Tool block appended), and flips it to complete.
+        let mut state = AppState::new("intro", "status");
+        apply_command(&mut state, Command::Tool(ToolEvent {
+            seq: 7,
+            icon: "⚙".into(),
+            name: "file_read".into(),
+            target: "x.rs".into(),
+            digest: String::new(),
+            state: ToolState::Running,
+            elapsed_ms: None,
+        }));
+        assert_eq!(state.blocks.iter().filter(|b| b.kind == BlockKind::Tool).count(), 1);
+        apply_command(&mut state, Command::Tool(ToolEvent {
+            seq: 7,
+            icon: "⚙".into(),
+            name: "file_read".into(),
+            target: "x.rs".into(),
+            digest: "10 lines".into(),
+            state: ToolState::Ok,
+            elapsed_ms: Some(42),
+        }));
+        let tools: Vec<&UiBlock> = state.blocks.iter().filter(|b| b.kind == BlockKind::Tool).collect();
+        assert_eq!(tools.len(), 1, "same line updated in place, not appended");
+        assert!(tools[0].complete, "result flips it complete");
+        match &tools[0].payload {
+            Payload::Tool(t) => assert_eq!(t.digest, "10 lines"),
+            _ => panic!("expected a Tool payload"),
+        }
+    }
+
+    #[test]
+    fn diff_box_frames_add_and_del() {
+        let d = DiffPayload {
+            path: "src/auth.rs".into(),
+            adds: 2,
+            dels: 1,
+            lines: vec![(true, "let x = 1;".into()), (false, "let y = 2;".into())],
+        };
+        let out: Vec<String> = render_diff_box(&d, 48).iter().map(|s| plain(s)).collect();
+        assert!(out[0].contains("diff · src/auth.rs"), "header names the path: {:?}", out[0]);
+        assert!(out[0].contains("+2 −1"), "header carries the counts: {:?}", out[0]);
+        assert!(out.iter().any(|l| l.contains("+ let x = 1;")), "added line: {out:?}");
+        assert!(out.iter().any(|l| l.contains("− let y = 2;")), "removed line: {out:?}");
+    }
+
+    #[test]
+    fn verify_line_reads_green_success() {
+        let v = VerifyPayload { cmd: "cargo check".into(), detail: "0 errors · verify gate passed".into() };
+        let row = plain(&render_verify_line(&v, 80));
+        assert_eq!(row, "✓ cargo check — 0 errors · verify gate passed");
     }
 }

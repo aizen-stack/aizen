@@ -1689,6 +1689,132 @@ pub fn emit_line(s: &str) {
     emit(&line);
 }
 
+// ── structured transcript events (the mockup redesign) ───────────────────────────
+// Tool calls, the plan checklist, edit diffs, and the verify line are no longer pre-styled strings
+// blindly `emit`ted: they flow through here as structured data so the retained backend can
+// right-align digests, box the panels, and update the plan/tool line IN PLACE. When retained isn't
+// running (classic / plain / one-shot), the SAME `retained::render_*` layout is rendered to a string
+// at `width()` and emitted append-only — so every surface reads identically, degrading only where
+// in-place updates are impossible (the plan simply re-prints, a too-narrow digest wraps to `└`).
+
+/// Emit a trace line the way the agent's `emit_trace` does: into the sticky/retained scroll region
+/// when the TUI owns the screen, else `eprintln!` to stderr so a one-shot `aizen agent` keeps stdout
+/// clean (only the model's final answer belongs on stdout there).
+fn emit_trace_line(s: &str) {
+    if active() || retained_running() {
+        emit_line(s);
+    } else {
+        eprintln!("{s}");
+    }
+}
+
+/// Outcome of a tool call, for the digest colour. `None` while it's still running.
+pub type ToolOutcome = Option<bool>;
+
+/// Monotonic id so a tool result can update the same line it opened (retained matches by seq; the
+/// classic path renders the whole line once on `end`, ignoring the intermediate `begin`).
+static TOOL_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_tool_seq() -> u64 {
+    TOOL_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn tool_state(outcome: ToolOutcome) -> retained::ToolState {
+    match outcome {
+        None => retained::ToolState::Running,
+        Some(true) => retained::ToolState::Ok,
+        Some(false) => retained::ToolState::Err,
+    }
+}
+
+/// Open a tool-call line (`⚙ name   target`) with no digest yet. Returns a `seq` to pass back to
+/// [`tool_call_end`] so the result lands on the same line under retained. On the classic path this
+/// renders nothing (the append-only surface can't update a line in place) — the full line is drawn
+/// once by `tool_call_end`; the returned seq is still valid.
+pub fn tool_call_begin(icon: &str, name: &str, target: &str) -> u64 {
+    let seq = next_tool_seq();
+    if retained::is_running() {
+        retained::tool_event(retained::ToolEvent {
+            seq,
+            icon: icon.to_string(),
+            name: name.to_string(),
+            target: target.to_string(),
+            digest: String::new(),
+            state: retained::ToolState::Running,
+            elapsed_ms: None,
+        });
+    }
+    seq
+}
+
+/// Close a tool-call line with its result digest + run time. Under retained this updates the block
+/// opened by [`tool_call_begin`] in place; on the classic path it renders the whole call line plus
+/// the indented `└ <digest> · <time>` result line once, so both surfaces read the same. `elapsed_ms`
+/// is the wall-clock run time (`None` → no time shown, e.g. restored transcripts).
+pub fn tool_call_end(
+    seq: u64,
+    icon: &str,
+    name: &str,
+    target: &str,
+    digest: &str,
+    outcome: ToolOutcome,
+    elapsed_ms: Option<u64>,
+) {
+    let ev = retained::ToolEvent {
+        seq,
+        icon: icon.to_string(),
+        name: name.to_string(),
+        target: target.to_string(),
+        digest: digest.to_string(),
+        state: tool_state(outcome),
+        elapsed_ms,
+    };
+    if retained::is_running() {
+        retained::tool_event(ev);
+    } else {
+        // Classic / plain / one-shot: render the identical stacked layout, emit once (may be 2 lines).
+        for line in retained::render_tool_row(&ev, width()).split('\n') {
+            emit_trace_line(line);
+        }
+    }
+}
+
+/// Replace the in-place plan checklist. `items` = `(status, text)` where status 0/1/2 = pending /
+/// in-progress / done. Empty removes the panel. Classic path re-prints the box each call.
+pub fn plan_update(items: &[(u8, String)]) {
+    let rows: Vec<retained::PlanRow> =
+        items.iter().map(|(s, t)| retained::PlanRow { status: *s, text: t.clone() }).collect();
+    if retained::is_running() {
+        retained::plan_update(rows);
+    } else if !rows.is_empty() {
+        for line in retained::render_plan_box(&rows, width()) {
+            emit_trace_line(&line);
+        }
+    }
+}
+
+/// Push a boxed diff preview. `lines` = `(is_add, content)` already clipped of the leading `+`/`-`.
+pub fn diff_box(path: &str, adds: usize, dels: usize, lines: Vec<(bool, String)>) {
+    let d = retained::DiffPayload { path: path.to_string(), adds, dels, lines };
+    if retained::is_running() {
+        retained::diff_box(d);
+    } else {
+        for line in retained::render_diff_box(&d, width()) {
+            emit_trace_line(&line);
+        }
+    }
+}
+
+/// Push a green verify-gate success line (`✓ <cmd> — <detail>`).
+pub fn verify_line(cmd: &str, detail: &str) {
+    let v = retained::VerifyPayload { cmd: cmd.to_string(), detail: detail.to_string() };
+    if retained::is_running() {
+        retained::verify_line(v);
+    } else {
+        emit_trace_line(&retained::render_verify_line(&v, width()));
+    }
+}
+
 /// Set the working flag (drives the box indicator + the input thread's Esc semantics) and repaint.
 /// Always updates the flag even when the TUI is inactive, so the input thread sees it.
 ///

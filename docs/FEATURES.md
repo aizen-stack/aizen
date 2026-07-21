@@ -71,7 +71,7 @@ A key cross-cutting fact for design: **output adapts to context** — rich ANSI/
 
 ### B. The agent's tools (its capabilities)
 
-Every tool is one clear capability. Tools are either **read-only** (run freely, often in parallel) or **destructive** (approval-gated). Each call renders as a `✿ tool_name(arg)` event line with an informative `⎿ result` digest under it (lines read, matches found, `+adds −dels`, exit code) — edits also show a compact colour diff. The full output goes to the model; only the digest reaches the terminal.
+Every tool is one clear capability. Tools are either **read-only** (run freely, often in parallel) or **destructive** (approval-gated). Each call renders as a `⚙ tool_name   target` event line with its result **digest right-aligned on the same line** (lines read, matches found, `+adds −dels`, exit code), tinted by outcome (green ok / salmon error). Under the retained TUI the digest updates that same line in place; on the classic/one-shot surface the line is drawn once with the digest and a too-narrow terminal wraps it to a second row. Edits push a boxed `diff · <path>` preview, the task list a boxed in-place `☑ done/total · plan` checklist, and a passing verify gate a green `✓ <cmd> — …` line. The full output goes to the model; only the digest reaches the terminal.
 
 **Memory (read-only):**
 - `memory_search` — recall a specific fact (query + limit).
@@ -280,7 +280,9 @@ One line, e.g. `opus-4-8 · ~1.2K/200K tok · 5 turns · 42% ctx · ⚡ yolo` �
 ### 4.4 Streaming output
 Live markdown rendering: syntax-highlighted code fences, responsive Markdown tables, topology-safe
 `diagram`/`ascii`/`flow` fences, headings/bullets, italic blockquotes and horizontal rules. A continuous
-moonlight left gutter `▌` marks assistant lines (vs `❯` user echoes and `✿`/`⎿` tool traces). Wide
+moonlight left gutter `▌` marks assistant lines (vs `❯` user echoes and `⚙ name  target  digest` tool
+lines whose right-aligned digest is tinted by outcome — green ok / salmon error — plus boxed plan / diff
+panels and a green `✓` verify line under the retained backend). Wide
 terminals get Unicode box tables; narrow widths automatically use stacked records. Pipes/CI retain raw
 Markdown. `response_visuals = auto|always|off` controls whether the top-level model adds useful tables
 or text diagrams to final replies; Telegram/Discord receive plain stacked table records.

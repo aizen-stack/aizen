@@ -5,7 +5,29 @@ All notable changes to **Aizen** (`aizen`, alias `ng`) — the pure-Rust agentic
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
-## [0.4.3] — 2026-07-21
+## [Unreleased]
+
+### Changed
+- **Transcript visuals redesigned around structured events** — tool calls, the plan checklist, edit
+  diffs and the verify line are no longer pre-styled strings blindly emitted; they flow through the
+  UI as typed events so the retained backend can lay them out by width and update lines/panels in
+  place. Every surface renders from the same layout code, so classic/plain/one-shot read identically
+  (degrading only where an append-only surface can't update in place).
+  - **Tool-call line** opens with `⚙ <tool_name>   <target>` — the raw tool name in moonlight, its
+    target dim silver — and drops the result to an indented `└ <digest> · <time>` line **beneath**
+    it: the digest tinted by outcome (dim while running, green on ok, salmon on error) and carrying
+    the wall-clock run time (`· 940ms` under a second, `· 1.2s` above). Replaces the old
+    `◆ <verb> (tool)` footnote shape; the earlier right-aligned-digest variant is gone (the digest
+    now always sits below the call, so a long result never collides with the target).
+  - **Plan panel** (`todo_write`) is a boxed checklist — header `☑ done/total · plan`, then ✓/▸/○
+    rows — that **updates in place** under retained instead of re-printing a fresh `todos:` block on
+    every call. Classic re-prints the box; an emptied list removes the panel.
+  - **Edit diffs** render inside a rounded `diff · <path>  +A −D` box (added = green `+`, removed =
+    salmon `−`) instead of loose indented lines.
+  - **Verify gate** success is a green `✓ <cmd> — <detail>` line.
+  - **Footer** — working state shows a live pill `✶ working · Ns · Esc to stop`; the HUD row carries
+    `model · ~<used>/<max> tok · <n> turns · <mode>`; the empty prompt shows a right-aligned
+    `↵ send · Tab complete` hint. The mode chip keeps its colour (`⚡ yolo` gold, `◆ smart` moonlight).
 
 ### Fixed
 - **Retained TUI kept no colour** — every non-assistant line (the `❯` user echo, tool anchors, the

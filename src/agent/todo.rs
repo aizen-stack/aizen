@@ -239,15 +239,21 @@ impl Tool for TodoWrite {
     fn execute(&self, args: &serde_json::Value) -> Result<String> {
         let items = parse_todos(args)?;
         set(items.clone());
-        // Show the checklist to the USER (scroll region above the pinned box, or stderr).
-        let block = render_block(&items);
-        if !block.is_empty() {
-            if crate::ui::tui::active() {
-                crate::ui::tui::emit_line(&block);
-            } else {
-                eprintln!("{block}");
-            }
-        }
+        // Show the checklist to the USER as an in-place plan panel (retained updates the same box;
+        // classic re-prints it). `status`: 0 = pending, 1 = in-progress, 2 = done — matched by the
+        // renderer's ✓/▸/○ glyphs. An empty list removes the panel.
+        let rows: Vec<(u8, String)> = items
+            .iter()
+            .map(|t| {
+                let s = match t.status {
+                    Status::Done => 2u8,
+                    Status::InProgress => 1,
+                    Status::Pending => 0,
+                };
+                (s, t.content.clone())
+            })
+            .collect();
+        crate::ui::tui::plan_update(&rows);
         Ok(model_ack(&items))
     }
 }

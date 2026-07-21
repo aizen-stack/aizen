@@ -369,9 +369,16 @@ fn parse_table(lines: &[String]) -> Option<MarkdownTable> {
     Some(MarkdownTable { headers, aligns, rows })
 }
 
+/// Visible display width of a cell **after** `inline()` styling. `inline()` strips markdown markers
+/// (`*`, `_`, backticks) and emits ANSI (which `measure_text_width` ignores), so this is the true
+/// on-screen column width. Measuring the raw cell over-counts by the marker bytes and drifts borders.
+fn cell_display_width(s: &str) -> usize {
+    measure_text_width(&inline(s))
+}
+
 fn table_natural_width(table: &MarkdownTable) -> usize {
-    let mut widths: Vec<usize> = table.headers.iter().map(|h| measure_text_width(h).max(1)).collect();
-    for row in &table.rows { for (i, cell) in row.iter().enumerate() { widths[i] = widths[i].max(measure_text_width(cell)); } }
+    let mut widths: Vec<usize> = table.headers.iter().map(|h| cell_display_width(h).max(1)).collect();
+    for row in &table.rows { for (i, cell) in row.iter().enumerate() { widths[i] = widths[i].max(cell_display_width(cell)); } }
     widths.iter().sum::<usize>() + table.headers.len() * 3 + 1
 }
 
@@ -395,21 +402,23 @@ fn border_line(left: char, join: char, right: char, widths: &[usize]) -> String 
 fn render_table_tty(table: &MarkdownTable, cols: usize) -> String {
     let budget = cols.saturating_sub(measure_text_width(&gutter())).max(8);
     if table.headers.len() > 5 || table_natural_width(table) > budget { return render_table_stacked_tty(table, cols); }
-    let mut widths: Vec<usize> = table.headers.iter().map(|h| measure_text_width(h).max(1)).collect();
-    for row in &table.rows { for (i, cell) in row.iter().enumerate() { widths[i] = widths[i].max(measure_text_width(cell)); } }
+    // Widths are the VISIBLE width post-`inline()` (markers stripped, ANSI ignored) so styled cells
+    // line up with the border. Measuring the raw cell over-counts by the marker bytes → borders drift.
+    let mut widths: Vec<usize> = table.headers.iter().map(|h| cell_display_width(h).max(1)).collect();
+    for row in &table.rows { for (i, cell) in row.iter().enumerate() { widths[i] = widths[i].max(cell_display_width(cell)); } }
     let mut out = String::new();
     let border = |out: &mut String, line: String| { out.push_str(&gutter()); out.push_str(&theme::accent_dim(line).to_string()); out.push('\n'); };
     border(&mut out, border_line('╭', '┬', '╮', &widths));
     out.push_str(&gutter()); out.push_str(&theme::accent_dim("│").to_string());
     for (i, cell) in table.headers.iter().enumerate() {
-        out.push(' '); out.push_str(&theme::accent(display_pad(cell, widths[i], TableAlign::Center)).bold().to_string()); out.push(' '); out.push_str(&theme::accent_dim("│").to_string());
+        out.push(' '); out.push_str(&theme::accent(display_pad(&inline(cell), widths[i], TableAlign::Center)).bold().to_string()); out.push(' '); out.push_str(&theme::accent_dim("│").to_string());
     }
     out.push('\n');
     border(&mut out, border_line('├', '┼', '┤', &widths));
     for row in &table.rows {
         out.push_str(&gutter()); out.push_str(&theme::accent_dim("│").to_string());
         for (i, cell) in row.iter().enumerate() {
-            out.push(' '); out.push_str(&inline(&display_pad(cell, widths[i], table.aligns[i]))); out.push(' '); out.push_str(&theme::accent_dim("│").to_string());
+            out.push(' '); out.push_str(&display_pad(&inline(cell), widths[i], table.aligns[i])); out.push(' '); out.push_str(&theme::accent_dim("│").to_string());
         }
         out.push('\n');
     }
@@ -1066,6 +1075,26 @@ mod tests {
         let narrow = strip_ansi_codes(&narrow).to_string();
         assert!(narrow.contains("◆ 1") && narrow.contains("File") && narrow.contains("src/lib.rs"), "{narrow}");
         assert!(narrow.lines().all(|l| measure_text_width(l) <= 28));
+    }
+
+    #[test]
+    fn table_body_markers_do_not_drift_borders() {
+        // The screenshot bug: body cells with inline markdown (`*italic*`, `**bold**`, `` `code` ``)
+        // were measured RAW (markers counted) but rendered via `inline()` (markers stripped), so each
+        // styled cell came out short and the closing │ walked left row by row. Every rendered row —
+        // borders, header, body — must share one visible width, and no marker byte may leak.
+        let md = "| Effect | Where | Feel |\n|---|---|---|\n\
+                  | Pixel Snow | full-page bg | steel |\n\
+                  | DecryptedText | hero *remembers you* | cipher |\n\
+                  | ClickSpark | `every click` | **thin** |\n";
+        let plain = strip_ansi_codes(&render_all(md)).to_string();
+        let box_lines: Vec<&str> = plain.lines().filter(|l| l.contains('│') || l.contains('╭') || l.contains('┼') || l.contains('╰')).collect();
+        assert!(box_lines.len() >= 6, "top+header+sep+3 body+bottom: {plain}");
+        let widths: Vec<usize> = box_lines.iter().map(|l| measure_text_width(l)).collect();
+        assert!(widths.iter().all(|w| *w == widths[0]), "every table row same visible width, got {widths:?}: {plain}");
+        // Markers consumed, text kept.
+        assert!(plain.contains("remembers you") && plain.contains("every click") && plain.contains("thin"), "{plain}");
+        assert!(!plain.contains('*') && !plain.contains('`'), "markdown markers must be stripped, not padded: {plain}");
     }
 
     #[test]

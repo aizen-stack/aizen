@@ -13,9 +13,13 @@ install scripts. (The source lives in a separate private repo; this repo is gene
 ╭──────────────────────────────────────────────────────────────────╮
 │ ❯ refactor the parser, run the tests, and commit when green       │
 ╰──────────────────────────────────────────────────────────────────╯
-◆ Read src/parse.rs
-◆ Edit src/parse.rs  (rewrite tokenizer)
-◆ Run cargo test  → 42 passed
+⚙ file_read   src/parse.rs
+└ 142 lines · 0.1s
+⚙ multi_edit   src/parse.rs
+└ 3 edits · 0.3s
+⚙ shell_run   cargo test
+└ 42 passed · 4.2s
+✓ cargo check — 0 errors · verify gate passed
 ```
 
 ## Why `aizen`

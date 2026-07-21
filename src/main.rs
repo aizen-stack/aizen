@@ -3414,17 +3414,20 @@ async fn first_run_onboarding() {
     );
 }
 
-/// The minimal HUD line: `model  ·  ✦ mode`, with an optional TODO summary. Everything numeric
-/// (token counts, turns, cache%) moved OFF this row — the context fill is now the graphical meter
-/// bar painted on the right of the HUD (fed via `tui::set_ctx_permille`), and the raw numbers live
-/// behind `/tokens` · `/cost`. Keeping the left side to just model + mode is the whole point: the
-/// row reads at a glance instead of being a wall of stats.
+/// The HUD line, per the mockup: `model  ·  ~<used>/<max> tok  ·  <n> turns  ·  <mode>` with an
+/// optional persona / todo / agents chip. The raw token + turn counts are back on the row (the
+/// mockup shows them); the graphical context meter is still fed via `tui::set_ctx_permille` and the
+/// mode/persona chips are tinted by the footer's `style_hud` pass.
 fn status_text(history: &[Message], model: &str) -> String {
     let toks = session_tokens(history);
     let (window, _) = resolve_ctx_window(model);
     // Feed the graphical context meter (per-mille for sub-1% resolution); paint_box draws the bar.
     let permille = (toks as f64 / window as f64 * 1000.0).round().clamp(0.0, 1000.0) as u16;
     tui::set_ctx_permille(permille);
+    // One "turn" = one user message that opened an exchange (system prompt at [0] is not a turn).
+    let turns = history.iter().filter(|m| m.role == "user").count();
+    let turns_chip = format!("  ·  {turns} turn{}", if turns == 1 { "" } else { "s" });
+    let tok_chip = format!("  ·  ~{}/{} tok", fmt_k(toks), fmt_k(window));
     let approval = approval_mode();
     let mode = if cli_config::ultimate_enabled() {
         "  ·  ✦ ultimate"
@@ -3445,7 +3448,7 @@ fn status_text(history: &[Message], model: &str) -> String {
     let agents = crate::agent::orchestration::hud_chip()
         .map(|s| format!("  ·  {s}"))
         .unwrap_or_default();
-    format!("{model}{persona}{mode}{todos}{agents}")
+    format!("{model}{tok_chip}{turns_chip}{persona}{mode}{todos}{agents}")
 }
 
 /// The summarizer endpoint: `roles.summarizer` routing (env > config > main endpoint). Chore
