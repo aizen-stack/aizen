@@ -49,6 +49,7 @@ pub struct VerifyGateResult {
     pub command: String,
     pub output: String,
     pub duration_ms: u128,
+    pub stable: bool,
 }
 
 /// Keep only the LAST `MAX_OUTPUT_CHARS` of combined output — compiler error stacks live at the
@@ -154,6 +155,7 @@ pub async fn run_verify_gate(cwd: &Path, timeout_secs: u64) -> Option<VerifyGate
     if cmds.is_empty() {
         return None;
     }
+    let baseline = source_fingerprint(cwd);
     let custom_timeout = custom_verify_timeout(cwd);
     let mut last_pass: Option<VerifyGateResult> = None;
     for cmd in cmds {
@@ -162,9 +164,19 @@ pub async fn run_verify_gate(cwd: &Path, timeout_secs: u64) -> Option<VerifyGate
             _ => timeout_secs,
         };
         match run_one_verify(cwd, &cmd, secs).await {
-            None => continue, // spawn failure (missing toolchain) → best-effort skip
-            Some(r) if !r.passed => return Some(r),
-            Some(r) => last_pass = Some(r),
+            None => continue,
+            Some(mut r) => {
+                r.stable = baseline.is_some() && baseline == source_fingerprint(cwd);
+                if !r.stable {
+                    r.passed = false;
+                    r.output = "verification result ignored: the source workspace changed while the command was running. No success was reported; retry after the other writer finishes".to_string();
+                    return Some(r);
+                }
+                if !r.passed {
+                    return Some(r);
+                }
+                last_pass = Some(r);
+            }
         }
     }
     last_pass
@@ -199,6 +211,7 @@ async fn run_one_verify(cwd: &Path, cmd: &VerifyCommand, timeout_secs: u64) -> O
                 command: command_line,
                 output: tail_chars(combined.trim_end(), MAX_OUTPUT_CHARS),
                 duration_ms: start.elapsed().as_millis(),
+                stable: true,
             })
         }
         Ok(Err(_)) => None, // io error draining output → no-op.
@@ -207,14 +220,64 @@ async fn run_one_verify(cwd: &Path, cmd: &VerifyCommand, timeout_secs: u64) -> O
             command: command_line,
             output: format!("verify timed out after {timeout_secs}s (killed)"),
             duration_ms: start.elapsed().as_millis(),
+            stable: true,
         }),
     }
 }
 
-/// The user-message text injected when the gate fails (the model's one fix-turn prompt). The raw
+fn source_fingerprint(cwd: &Path) -> Option<u64> {
+    let mut files = Vec::new();
+    collect_source_files(cwd, &mut files, 0);
+    files.sort();
+    if files.is_empty() {
+        return None;
+    }
+    let mut data = Vec::new();
+    for path in files {
+        data.extend_from_slice(path.to_string_lossy().as_bytes());
+        data.push(0);
+        data.extend_from_slice(&std::fs::read(&path).ok()?);
+        data.push(0xff);
+    }
+    let digest = ring::digest::digest(&ring::digest::SHA256, &data);
+    Some(u64::from_le_bytes(digest.as_ref()[..8].try_into().ok()?))
+}
+
+fn collect_source_files(dir: &Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
+    if depth > 32 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name == ".git" || name == "target" || name == "node_modules" || name == ".aizen" {
+            continue;
+        }
+        if path.is_dir() {
+            collect_source_files(&path, out, depth + 1);
+        } else if path.is_file() && is_source_or_manifest(&path) {
+            out.push(path);
+        }
+    }
+}
+
+fn is_source_or_manifest(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("rs" | "toml" | "lock" | "json" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "cs" | "cpp" | "h" | "hpp")
+    )
+}
+
 /// output is SHAPED first: deduped error blocks, capped counts — a 400-line wall of repeated
 /// errors buys nothing but tokens.
 pub fn format_gate_failure(r: &VerifyGateResult) -> String {
+    if !r.stable {
+        return format!(
+            "[aizen verify] `{}` was discarded because the source workspace changed while it ran. {}",
+            r.command, r.output
+        );
+    }
     let mut msg = format!(
         "[aizen verify] `{}` FAILED ({} ms). Fix these errors before reporting the task done:\n\n{}",
         r.command,
@@ -483,6 +546,7 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
             command: "cargo check".into(),
             output: "error[E0308]: mismatched types".into(),
             duration_ms: 1234,
+            stable: true,
         };
         let msg = format_gate_failure(&r);
         assert!(msg.contains("cargo check"));

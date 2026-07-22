@@ -12,6 +12,25 @@
 use anyhow::{bail, Result};
 use tokio::sync::mpsc::Sender;
 
+/// One rendered reply piece. Rich platforms also carry a content-equivalent plain fallback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Outbound {
+    pub text: String,
+    pub fallback: String,
+    pub rich: bool,
+}
+
+impl Outbound {
+    pub fn plain(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self { fallback: text.clone(), text, rich: false }
+    }
+}
+
+/// Opaque id for a platform-owned, short-lived working message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatusHandle(pub i64);
+
 /// One inbound message handed to the daemon loop. `route` is the sub-bot name it arrived on
 /// ("default" for the primary / for platforms without multi-bot), used to send the reply back on the
 /// SAME bot and to key the persisted session.
@@ -52,6 +71,30 @@ pub trait Platform: Send + Sync + 'static {
     /// Spawn the listener(s) (poll loop / gateway). Each allowed inbound message → `tx`. Returns once
     /// listeners are launched (they run in the background); an error means the platform can't start.
     async fn start(&self, tx: Sender<Inbound<Self::Chat>>) -> Result<()>;
+
+    /// Render a reply for this platform. Discord/plain platforms inherit this unformatted default.
+    fn render_reply(&self, raw: &str) -> Vec<Outbound> {
+        vec![Outbound::plain(raw)]
+    }
+
+    /// Send a rendered piece. Rich platforms override this to select parse mode + fail-open fallback.
+    async fn send_outbound(&self, route: &str, chat: Self::Chat, outbound: &Outbound) -> Result<()> {
+        self.send(route, chat, &outbound.text).await
+    }
+
+    /// Start/finish one ephemeral working message. Unsupported platforms inherit no-op lifecycle.
+    async fn start_status(&self, _route: &str, _chat: Self::Chat) -> Result<Option<StatusHandle>> {
+        Ok(None)
+    }
+    async fn finish_status(
+        &self,
+        _route: &str,
+        _chat: Self::Chat,
+        _status: Option<StatusHandle>,
+        _failed: bool,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// Send a reply on sub-bot `route` to `chat`.
     async fn send(&self, route: &str, chat: Self::Chat, text: &str) -> Result<()>;

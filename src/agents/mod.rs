@@ -397,6 +397,44 @@ pub fn delete_home(slug: &str) -> Result<bool> {
     Ok(removed)
 }
 
+/// Set (or clear, with `model=None`) the `model:` frontmatter field of an installed agent card,
+/// rewriting the file IN PLACE at its source path so a project card stays a project card. Other
+/// frontmatter fields + the body are preserved. Returns the path written. Errors if the slug
+/// doesn't resolve or the card has no frontmatter fence to edit.
+///
+/// This is the write side of "assign a model to a sub-agent": the pinned model then routes through
+/// [`crate::core::cli_config::endpoint_for_model`] at dispatch, so it carries its own gateway.
+pub fn set_model(slug: &str, model: Option<&str>) -> Result<PathBuf> {
+    let def = load(slug).with_context(|| format!("no agent named '{slug}'"))?;
+    let path = def.source_path.clone();
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let fm = frontmatter::parse(&raw);
+    if !fm.had_frontmatter {
+        anyhow::bail!(
+            "'{slug}' has no frontmatter fence to edit ({}) — add a `---` block first",
+            path.display()
+        );
+    }
+    let mut fields = fm.fields.clone();
+    match model.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(m) => {
+            fields.insert("model".to_string(), m.to_string());
+        }
+        None => {
+            fields.remove("model");
+        }
+    }
+    // Pin the conventional agency-agents field order; unknown fields follow sorted (serialize's rule).
+    let out = frontmatter::serialize(
+        &fields,
+        &fm.body,
+        &["name", "description", "color", "emoji", "vibe", "tools", "model"],
+    );
+    std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
 // ── enable allowlist (the always-on index budget) ──────────────────────────────
 
 /// `~/.aizen/agents/enabled.txt` — newline-delimited slugs the user has pinned to the always-on
@@ -770,6 +808,42 @@ mod tests {
             assert!(!delete_home("proj-one").unwrap(), "refuses to touch a project agent");
             assert!(load("proj-one").is_some(), "project agent survives delete_home");
             assert!(!delete_home("missing").unwrap(), "no-op on a missing slug");
+        });
+    }
+
+    #[test]
+    fn set_model_pins_and_clears_preserving_other_fields() {
+        with_sandbox("setmodel", |root| {
+            // A card with several frontmatter fields + a body; no model pin yet.
+            write_file(
+                &root.join(".aizen/agents"),
+                "rev.md",
+                "---\nname: Rev\ndescription: reviews\ntools: Read, Edit\n---\nYou review code.",
+            );
+            assert!(load("rev").unwrap().model.is_none(), "starts unpinned");
+
+            // Pin a model → reloads with the pin, other fields + body intact.
+            let path = set_model("rev", Some("gpt-4o")).unwrap();
+            assert!(path.ends_with("rev.md"));
+            let def = load("rev").unwrap();
+            assert_eq!(def.model.as_deref(), Some("gpt-4o"));
+            assert_eq!(def.description, "reviews", "description preserved");
+            assert_eq!(def.tools, vec!["Read", "Edit"], "tools preserved");
+            assert_eq!(def.body.trim(), "You review code.", "body preserved");
+
+            // Re-pin overwrites the existing model (not a duplicate field).
+            set_model("rev", Some("claude-opus-4-8")).unwrap();
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(raw.matches("model:").count(), 1, "single model field, overwritten");
+            assert_eq!(load("rev").unwrap().model.as_deref(), Some("claude-opus-4-8"));
+
+            // Clear the pin → field removed, card still valid.
+            set_model("rev", None).unwrap();
+            assert!(load("rev").unwrap().model.is_none(), "pin cleared");
+            assert!(!std::fs::read_to_string(&path).unwrap().contains("model:"));
+
+            // Unknown slug errors (never writes a stray file).
+            assert!(set_model("nope", Some("x")).is_err());
         });
     }
 

@@ -5,3 +5,6 @@
 
 # local code-review scratch (never ship)
 .codex-review/
+
+# runtime state dir (session slots, coordination locks, hostbot/persona/memory state) — never ship
+.aizen/

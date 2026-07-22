@@ -1,16 +1,75 @@
-//! Crash-safe byte persistence shared by metadata stores.
+//! Crash-safe and conflict-aware byte persistence shared by metadata and workspace stores.
 //!
-//! The writer never truncates the destination in place: it writes a uniquely named sibling,
-//! flushes it, and only then replaces the destination. Callers can therefore recover the last
-//! complete generation after a process kill or a disk-full error.
+//! Writers never truncate a destination in place: they write a uniquely named sibling, flush it,
+//! and only then replace the destination. The fingerprint/CAS helpers add a separate guarantee:
+//! content computed from an old generation is never silently committed over a newer one.
 
 use anyhow::{Context, Result};
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn unique_sequence() -> u64 {
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileFingerprint {
+    pub exists: bool,
+    pub byte_len: u64,
+    pub sha256: [u8; 32],
+}
+
+impl FileFingerprint {
+    pub fn missing() -> Self {
+        Self { exists: false, byte_len: 0, sha256: [0; 32] }
+    }
+
+    pub fn for_bytes(bytes: &[u8]) -> Self {
+        let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+        let mut sha256 = [0u8; 32];
+        sha256.copy_from_slice(digest.as_ref());
+        Self { exists: true, byte_len: bytes.len() as u64, sha256 }
+    }
+
+    pub fn short_id(&self) -> String {
+        self.sha256[..6].iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+#[derive(Debug)]
+pub struct WriteConflict {
+    path: PathBuf,
+    expected: FileFingerprint,
+    actual: FileFingerprint,
+}
+
+impl WriteConflict {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl fmt::Display for WriteConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reason = match (self.expected.exists, self.actual.exists) {
+            (false, true) => "was created by another writer",
+            (true, false) => "was removed by another writer",
+            _ => "changed after it was read",
+        };
+        write!(
+            f,
+            "edit conflict: {} {reason}; nothing was written. Re-read the file and retry",
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for WriteConflict {}
 
 fn temp_path(path: &Path) -> PathBuf {
     let parent = path
@@ -21,8 +80,63 @@ fn temp_path(path: &Path) -> PathBuf {
     parent.join(format!(
         ".{name}.aizen-tmp-{}-{}",
         std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
+        unique_sequence()
     ))
+}
+
+/// Read bytes and return the exact content fingerprint used for a later compare-and-swap.
+pub fn read_with_fingerprint(path: &Path) -> Result<(Option<Vec<u8>>, FileFingerprint)> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let fingerprint = FileFingerprint::for_bytes(&bytes);
+            Ok((Some(bytes), fingerprint))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((None, FileFingerprint::missing())),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+pub fn fingerprint(path: &Path) -> Result<FileFingerprint> {
+    read_with_fingerprint(path).map(|(_, fingerprint)| fingerprint)
+}
+
+/// Commit only when the current destination still equals `expected`.
+///
+/// Callers that need coordination against other compliant Aizen writers should also hold the
+/// appropriate resource/workspace lock. This CAS remains the final defense against editors, old
+/// binaries, and other programs that do not honor Aizen's lock protocol.
+pub fn compare_and_atomic_write(
+    path: &Path,
+    expected: &FileFingerprint,
+    bytes: &[u8],
+) -> Result<FileFingerprint> {
+    let actual = fingerprint(path)?;
+    if &actual != expected {
+        return Err(WriteConflict { path: path.to_path_buf(), expected: expected.clone(), actual }.into());
+    }
+    if expected.exists {
+        atomic_write(path, bytes)?;
+    } else {
+        atomic_create(path, bytes)?;
+    }
+    Ok(FileFingerprint::for_bytes(bytes))
+}
+
+pub fn create_if_absent(path: &Path, bytes: &[u8]) -> Result<FileFingerprint> {
+    compare_and_atomic_write(path, &FileFingerprint::missing(), bytes)
+}
+
+pub fn remove_if_unchanged(path: &Path, expected: &FileFingerprint) -> Result<bool> {
+    let actual = fingerprint(path)?;
+    if &actual != expected {
+        return Err(WriteConflict { path: path.to_path_buf(), expected: expected.clone(), actual }.into());
+    }
+    if !expected.exists {
+        return Ok(false);
+    }
+    fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+    sync_parent(path);
+    Ok(true)
 }
 
 /// Atomically replace `path` with `bytes`.
@@ -37,22 +151,8 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
 
     let tmp = temp_path(path);
-
     let result = (|| -> Result<()> {
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts
-            .open(&tmp)
-            .with_context(|| format!("creating temporary {}", tmp.display()))?;
-        file.write_all(bytes)
-            .with_context(|| format!("writing temporary {}", tmp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("flushing temporary {}", tmp.display()))?;
+        write_staged(&tmp, bytes)?;
 
         // Keep the existing mode on Unix. This is intentionally best-effort: the data durability
         // path must not turn a recoverable write into a data-loss path because chmod failed.
@@ -61,8 +161,8 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             let _ = fs::set_permissions(&tmp, meta.permissions());
         }
 
-        replace_file(&tmp, path)
-            .with_context(|| format!("replacing {}", path.display()))?;
+        replace_file(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+        sync_parent(path);
         Ok(())
     })();
 
@@ -70,6 +170,58 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+fn atomic_create(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                WriteConflict {
+                    path: path.to_path_buf(),
+                    expected: FileFingerprint::missing(),
+                    actual: fingerprint(path).unwrap_or_else(|_| FileFingerprint::for_bytes(b"occupied")),
+                }
+                .into()
+            } else {
+                anyhow::Error::from(e).context(format!("creating {}", path.display()))
+            }
+        })?;
+    file.write_all(bytes).with_context(|| format!("writing {}", path.display()))?;
+    file.sync_all().with_context(|| format!("flushing {}", path.display()))?;
+    drop(file);
+    sync_parent(path);
+    Ok(())
+}
+
+fn write_staged(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(path)
+        .with_context(|| format!("creating temporary {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing temporary {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("flushing temporary {}", path.display()))?;
+    Ok(())
 }
 
 fn replace_file(tmp: &Path, dst: &Path) -> std::io::Result<()> {
@@ -93,9 +245,16 @@ fn replace_file(tmp: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
+fn sync_parent(_path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = _path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
 /// Atomically replace a sensitive file, hardening the staged bytes before they become visible.
-/// The final path is checked again after replacement so callers never silently commit a transcript
-/// or credential with inherited broad permissions.
 pub fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -104,23 +263,10 @@ pub fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let tmp = temp_path(path);
     let result = (|| -> Result<()> {
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts
-            .open(&tmp)
-            .with_context(|| format!("creating temporary {}", tmp.display()))?;
-        file.write_all(bytes)
-            .with_context(|| format!("writing temporary {}", tmp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("flushing temporary {}", tmp.display()))?;
-        drop(file);
+        write_staged(&tmp, bytes)?;
         harden_owner_only_checked(&tmp)?;
         replace_file(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+        sync_parent(path);
         harden_owner_only_checked(path)?;
         Ok(())
     })();
@@ -199,8 +345,57 @@ pub fn read_optional(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
 /// Remove a file only when it exists; other errors are returned.
 pub fn remove_if_exists(path: &Path) -> std::io::Result<bool> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            sync_parent(path);
+            Ok(true)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path_named(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "aizen-persist-{name}-{}-{}",
+            std::process::id(),
+            unique_sequence()
+        ))
+    }
+
+    #[test]
+    fn cas_rejects_drift_without_overwrite() {
+        let path = temp_path_named("drift");
+        fs::write(&path, b"base").unwrap();
+        let (_, expected) = read_with_fingerprint(&path).unwrap();
+        fs::write(&path, b"other writer").unwrap();
+        let err = compare_and_atomic_write(&path, &expected, b"stale edit").unwrap_err();
+        assert!(err.downcast_ref::<WriteConflict>().is_some(), "{err:#}");
+        assert_eq!(fs::read(&path).unwrap(), b"other writer");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn create_if_absent_has_exactly_one_winner() {
+        let path = temp_path_named("create");
+        create_if_absent(&path, b"first").unwrap();
+        let err = create_if_absent(&path, b"second").unwrap_err();
+        assert!(err.downcast_ref::<WriteConflict>().is_some(), "{err:#}");
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn cas_replaces_unchanged_generation() {
+        let path = temp_path_named("replace");
+        fs::write(&path, b"old").unwrap();
+        let (_, expected) = read_with_fingerprint(&path).unwrap();
+        let next = compare_and_atomic_write(&path, &expected, b"new").unwrap();
+        assert_eq!(next, FileFingerprint::for_bytes(b"new"));
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        let _ = fs::remove_file(path);
     }
 }

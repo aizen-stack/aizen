@@ -9,7 +9,7 @@
 //! file 0600 on Unix (no-op on Windows, where the profile ACL governs), matching the token-cache
 //! discipline used elsewhere.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -68,12 +68,33 @@ pub fn load_bots() -> Vec<HostedBot> {
     }
 }
 
-/// Persist the hosted-bot list to `hostbot/bots.json`, hardened to 0600 (it holds tokens).
+pub fn update_bots<T>(mutate: impl FnOnce(&mut Vec<HostedBot>) -> Result<T>) -> Result<T> {
+    let path = bots_path();
+    let lock_path = crate::core::workspace_txn::store_lock("hostbot", "bots");
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        std::time::Duration::from_secs(5),
+    )?;
+    let mut bots = match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let result = mutate(&mut bots)?;
+    let json = serde_json::to_string_pretty(&bots)?;
+    crate::core::persist::atomic_write_owner_only(&path, (json + "\n").as_bytes())?;
+    Ok(result)
+}
+
+/// Persist the hosted-bot list to `hostbot/bots.json`, hardened to owner-only.
 pub fn save_bots(bots: &[HostedBot]) -> Result<()> {
     let path = bots_path();
+    let lock_path = crate::core::workspace_txn::store_lock("hostbot", "bots");
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        std::time::Duration::from_secs(5),
+    )?;
     let json = serde_json::to_string_pretty(bots)?;
-    std::fs::write(&path, json + "\n").with_context(|| format!("writing {}", path.display()))?;
-    config::harden_file(&path);
+    crate::core::persist::atomic_write_owner_only(&path, (json + "\n").as_bytes())?;
     Ok(())
 }
 
@@ -129,6 +150,12 @@ pub fn load_sessions(platform: &str) -> Vec<(String, String, Vec<Message>)> {
 /// Persist one session after a turn. `chat` is the `Display` form of the platform's chat id.
 pub fn save_session(platform: &str, route: &str, chat: &str, messages: &[Message]) -> Result<()> {
     let path = session_path(platform, route, chat);
+    let lock_key = format!("{platform}:{route}:{chat}");
+    let lock_path = crate::core::workspace_txn::store_lock("hostbot_session", &lock_key);
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        std::time::Duration::from_secs(5),
+    )?;
     let sf = SessionFile {
         platform: platform.to_string(),
         route: route.to_string(),
@@ -136,8 +163,7 @@ pub fn save_session(platform: &str, route: &str, chat: &str, messages: &[Message
         messages: messages.to_vec(),
     };
     let json = serde_json::to_string(&sf)?;
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
-    config::harden_file(&path);
+    crate::core::persist::atomic_write_owner_only(&path, json.as_bytes())?;
     Ok(())
 }
 

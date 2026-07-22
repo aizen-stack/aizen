@@ -6,13 +6,17 @@
 //! and how many sub-agent slots are free.
 //!
 //! Design notes:
-//! - Pure in-process state (no disk, no network). Cleared only by process exit.
+//! - In-process state is the fast UI path; each run also publishes a redacted, atomic manifest under
+//!   `~/.aizen/orchestration/runs/` so another process can show live activity.
 //! - RAII [`Track`] marks the entry finished on drop if the caller forgot — panic/early-return safe.
 //! - Recent history is capped so a long REPL session doesn't grow unbounded.
 
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Cap on finished entries retained for `/workflows` history.
 const HISTORY_CAP: usize = 16;
@@ -50,10 +54,159 @@ struct Entry {
     detail: String,
     started: Instant,
     finished: Option<Instant>,
+    started_unix: u64,
+    finished_unix: Option<u64>,
     parent: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunManifest {
+    schema: u32,
+    run_id: String,
+    pid: u32,
+    kind: String,
+    name: String,
+    label: String,
+    phase: String,
+    detail: String,
+    parent: Option<u64>,
+    started_unix: u64,
+    finished_unix: Option<u64>,
+    updated_unix: u64,
+}
+
+const RUN_SCHEMA: u32 = 1;
+
+fn manifest_root() -> PathBuf {
+    crate::core::config::nextgen_home().join("orchestration").join("runs")
+}
+
+fn manifest_path(id: u64) -> PathBuf {
+    manifest_root().join(format!("{}-{id}.json", std::process::id()))
+}
+
+fn manifest_lock(id: u64) -> PathBuf {
+    crate::core::workspace_txn::store_lock("orchestration-run", &id.to_string())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn kind_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Task => "task",
+        Kind::Workflow => "workflow",
+        Kind::WorkflowChild => "child",
+    }
+}
+
+fn phase_name(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Running => "running",
+        Phase::Synthesizing => "synthesizing",
+        Phase::Done => "done",
+        Phase::Failed => "failed",
+    }
+}
+
+fn safe_text(value: &str, max: usize) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max)
+        .collect()
+}
+
+fn persist_manifest(e: &Entry) {
+    let path = manifest_path(e.id);
+    let bytes = match serde_json::to_vec_pretty(&RunManifest {
+        schema: RUN_SCHEMA,
+        run_id: e.id.to_string(),
+        pid: std::process::id(),
+        kind: kind_name(e.kind).to_string(),
+        name: safe_text(&e.name, 120),
+        label: safe_text(&e.label, 120),
+        phase: phase_name(e.phase).to_string(),
+        detail: safe_text(&e.detail, 240),
+        parent: e.parent,
+        started_unix: e.started_unix,
+        finished_unix: e.finished_unix,
+        updated_unix: unix_now(),
+    }) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(&manifest_lock(e.id), Duration::from_secs(2)).ok();
+    if _lock.is_none() {
+        return;
+    }
+    let _ = fs::create_dir_all(manifest_root());
+    let _ = crate::core::persist::atomic_write_owner_only(&path, &bytes);
+}
+
+/// Best-effort removal of this run's manifest (called when the run reaches a terminal state — the
+/// remote view only surfaces running/synthesizing rows, so a finished file is just dead weight).
+fn remove_manifest(id: u64) {
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(&manifest_lock(id), Duration::from_secs(1)).ok();
+    let _ = crate::core::persist::remove_if_exists(&manifest_path(id));
+}
+
+/// Manifests older than this since their last update are treated as crashed-process debris and swept
+/// during a load. Generous so a long legitimate fan-out is never pruned out from under itself.
+const MANIFEST_STALE_SECS: u64 = 6 * 3600;
+
+fn load_remote_manifests() -> Vec<RunManifest> {
+    let Ok(entries) = fs::read_dir(manifest_root()) else { return Vec::new() };
+    let now = unix_now();
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let manifest = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<RunManifest>(&bytes).ok())
+            .filter(|m| m.schema == RUN_SCHEMA);
+        let Some(m) = manifest else {
+            // Unparseable/foreign schema debris — sweep it so the dir can't grow unbounded.
+            let _ = crate::core::persist::remove_if_exists(&path);
+            continue;
+        };
+        // A crashed process leaves a "running" manifest forever; the owning process deletes its own
+        // file on finish. Sweep anything that hasn't been touched within the stale window.
+        if now.saturating_sub(m.updated_unix) > MANIFEST_STALE_SECS {
+            let _ = crate::core::persist::remove_if_exists(&path);
+            continue;
+        }
+        out.push(m);
+    }
+    out
+}
+
+fn remote_row(m: &RunManifest) -> String {
+    let elapsed = m.finished_unix.unwrap_or_else(unix_now).saturating_sub(m.started_unix);
+    let mark = match m.phase.as_str() {
+        "running" => "⋯",
+        "synthesizing" => "✦",
+        "done" => "✓",
+        "failed" => "✗",
+        _ => "?",
+    };
+    let label = if m.label.is_empty() || m.label == m.name { String::new() } else { format!(" ({})", m.label) };
+    let detail = if m.detail.is_empty() { String::new() } else { format!(" — {}", m.detail) };
+    format!("  {mark} [{}] {}{}  · {}s{} · pid {}\n", m.kind, m.name, label, elapsed, detail, m.pid)
+}
+
+
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_id() -> u64 {
+    let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff;
+    ((std::process::id() as u64) << 32) | seq
+}
 
 fn store() -> &'static Mutex<Store> {
     static S: OnceLock<Mutex<Store>> = OnceLock::new();
@@ -98,6 +251,11 @@ impl Store {
                 e.detail = detail;
             }
             e.finished = Some(Instant::now());
+            e.finished_unix = Some(unix_now());
+            // Terminal state → drop the cross-process manifest (the remote view only surfaces
+            // running/synthesizing rows, so a finished file is dead weight and would otherwise
+            // linger until the stale sweep).
+            remove_manifest(e.id);
             self.push_history(e);
         }
     }
@@ -109,6 +267,7 @@ impl Store {
             if !detail.is_empty() {
                 e.detail = detail;
             }
+            persist_manifest(e);
         }
     }
 }
@@ -158,7 +317,8 @@ impl Drop for Track {
 }
 
 fn start(kind: Kind, name: impl Into<String>, label: impl Into<String>, parent: Option<u64>) -> Track {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let id = next_id();
+    let now = unix_now();
     let e = Entry {
         id,
         kind,
@@ -168,8 +328,11 @@ fn start(kind: Kind, name: impl Into<String>, label: impl Into<String>, parent: 
         detail: String::new(),
         started: Instant::now(),
         finished: None,
+        started_unix: now,
+        finished_unix: None,
         parent,
     };
+    persist_manifest(&e);
     store().lock().unwrap_or_else(|e| e.into_inner()).push_live(e);
     Track { id, finished: false }
 }
@@ -248,7 +411,7 @@ pub fn format_status() -> String {
         g.live.len()
     ));
 
-    if g.live.is_empty() && g.history.is_empty() {
+    if g.live.is_empty() && g.history.is_empty() && load_remote_manifests().is_empty() {
         out.push_str(
             "\n  (no task/workflow activity this process yet)\n\
              \n  The model launches multi-agent work via the `task` and `workflow` tools\n\
@@ -265,6 +428,20 @@ pub fn format_status() -> String {
         }
     } else {
         out.push_str("\n○ nothing running right now\n");
+    }
+
+    let remote = load_remote_manifests()
+        .into_iter()
+        .filter(|m| {
+            m.pid != std::process::id()
+                && matches!(m.phase.as_str(), "running" | "synthesizing")
+        })
+        .collect::<Vec<_>>();
+    if !remote.is_empty() {
+        out.push_str("\n◎ other process(es)\n");
+        for m in &remote {
+            out.push_str(&remote_row(m));
+        }
     }
 
     if !g.history.is_empty() {

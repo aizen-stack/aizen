@@ -198,15 +198,22 @@ impl Tool for WorkflowTool {
         let model = self.model.clone();
         let approval = self.approval_mode;
         let cancel = crate::core::cancel::current().unwrap_or_default();
+        // Inherit the parent turn's conversation identity so a fanned-out child's tool body scopes
+        // per-conversation resources (the browser session) to the SAME conversation the parent serves.
+        // Read by `run_one_task` when it builds each child's `AgentConfig` (both run on this thread's
+        // `block_on`, so the thread-local is visible there).
+        let exec_ctx = crate::core::exec_ctx::current().unwrap_or_default();
         tokio::task::block_in_place(|| {
             crate::core::cancel::with_current(cancel, || {
-                // EFFORT ISOLATION (same as the `task` tool): disarm the parent's process-global effort
-                // override for this synchronous fan-out so every fanned-out child + the synthesis pass
-                // resolves its own `cfg.reasoning_effort` instead of inheriting the parent's pinned tier.
-                // Restored on drop before control returns to the parent turn.
-                let _effort = crate::core::cli_config::suppress_effort_override();
-                tokio::runtime::Handle::current()
-                    .block_on(run_workflow_collect(&client, &base, &key, &model, approval, &spec, synthesize))
+                crate::core::exec_ctx::with_current(exec_ctx, || {
+                    // EFFORT ISOLATION (same as the `task` tool): disarm the parent's process-global effort
+                    // override for this synchronous fan-out so every fanned-out child + the synthesis pass
+                    // resolves its own `cfg.reasoning_effort` instead of inheriting the parent's pinned tier.
+                    // Restored on drop before control returns to the parent turn.
+                    let _effort = crate::core::cli_config::suppress_effort_override();
+                    tokio::runtime::Handle::current()
+                        .block_on(run_workflow_collect(&client, &base, &key, &model, approval, &spec, synthesize))
+                })
             })
         })
     }

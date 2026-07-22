@@ -208,7 +208,10 @@ piped/CI output remains raw Markdown.
 
 `aizen serve` runs a long-lived daemon that listens on a Telegram bot (long-poll, no public URL): send
 it a message → it runs the agent and replies; **destructive ops (file edits / shell) ask you to
-approve from your phone** (inline ✓/✗). Pure-Rust (no teloxide), single binary.
+approve from your phone** (inline ✓/✗). Replies use Telegram-native formatting: short bold headings,
+clean lists, tappable safe links, copyable code blocks, and narrow stacked table records instead of raw
+Markdown pipes. One temporary `✦ Đang xử lý…` status is removed when the final answer arrives; if rich
+HTML is ever rejected, Aizen retries the same content as plain text. Pure-Rust (no teloxide), single binary.
 
 ```bash
 aizen telegram setup     # paste the @BotFather token, message the bot to capture your chat id

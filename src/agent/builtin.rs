@@ -90,6 +90,8 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     register_notify(&mut r);
     r.register(Box::new(crate::features::timemachine::Checkpoint));
     r.register(Box::new(crate::features::timemachine::CheckpointRewind));
+    r.register(Box::new(crate::features::timemachine::CheckpointList));
+    r.register(Box::new(crate::features::timemachine::CheckpointRestore));
     r.register(Box::new(FileEdit::new(root.to_path_buf())));
     r.register(Box::new(MultiEdit::new(root.to_path_buf())));
     r.register(Box::new(FileWrite::new(root.to_path_buf())));
@@ -1393,21 +1395,22 @@ impl Tool for FileEdit {
             if target.exists() {
                 bail!("{path} exists; provide old_string to edit it, or use file_write to overwrite the whole file");
             }
-            atomic_write(&target, new.as_bytes())
+            crate::core::persist::create_if_absent(&target, new.as_bytes())
                 .with_context(|| format!("creating {}", target.display()))?;
             return Ok(format!("created {path}"));
         }
 
         let target = confine(&self.root, path, true)?;
-        let content = std::fs::read_to_string(&target)
-            .with_context(|| format!("reading {}", target.display()))?;
+        let (content_bytes, expected) = crate::core::persist::read_with_fingerprint(&target)?;
+        let content = String::from_utf8(content_bytes.context("file disappeared while reading")?)
+            .with_context(|| format!("{} is not valid UTF-8", target.display()))?;
         let applied = apply_one_edit(&content, old, new, replace_all, path)?;
         // No-op guard: a match that produced byte-identical content (e.g. old_string == new_string)
         // must not touch disk or arm the verify gate (W16).
         if applied.content == content {
             return Ok(format!("{NOOP_WRITE_PREFIX}: {path} unchanged (old_string == new_string)"));
         }
-        atomic_write(&target, applied.content.as_bytes())
+        crate::core::persist::compare_and_atomic_write(&target, &expected, applied.content.as_bytes())
             .with_context(|| format!("writing {}", target.display()))?;
         let mut out =
             format!("edited {path} ({})\n{}", applied.summary(), diff_preview(&applied.before, &applied.after));
@@ -1474,15 +1477,20 @@ impl Tool for FileWrite {
         // must_exist = false → create-or-overwrite; `confine` still keeps the target inside root and
         // requires the PARENT dir to exist (a clear error the model can act on if it doesn't).
         let target = confine(&self.root, path, false)?;
-        let existed = target.exists();
-        let before = if existed { std::fs::read_to_string(&target).unwrap_or_default() } else { String::new() };
+        let (before_bytes, expected) = crate::core::persist::read_with_fingerprint(&target)?;
+        let existed = expected.exists;
+        let before = match before_bytes {
+            Some(bytes) => String::from_utf8(bytes)
+                .with_context(|| format!("{} is not valid UTF-8", target.display()))?,
+            None => String::new(),
+        };
         // No-op guard: an overwrite that changes nothing must not touch disk (no mtime churn, no
         // needless git-diff noise) and must not arm the verify gate (W16). A create with empty
         // content is a real op (the file did not exist), so gate on `existed`.
         if existed && before == content {
             return Ok(format!("{NOOP_WRITE_PREFIX}: {path} already holds this exact content"));
         }
-        atomic_write(&target, content.as_bytes())
+        crate::core::persist::compare_and_atomic_write(&target, &expected, content.as_bytes())
             .with_context(|| format!("writing {}", target.display()))?;
         let n = content.lines().count();
         let verb = if existed { "overwrote" } else { "created" };
@@ -2263,8 +2271,9 @@ impl Tool for MultiEdit {
             .filter(|a| !a.is_empty())
             .context("multi_edit requires a non-empty 'edits' array")?;
         let target = confine(&self.root, path, true)?;
-        let original = std::fs::read_to_string(&target)
-            .with_context(|| format!("reading {}", target.display()))?;
+        let (original_bytes, expected) = crate::core::persist::read_with_fingerprint(&target)?;
+        let original = String::from_utf8(original_bytes.context("file disappeared while reading")?)
+            .with_context(|| format!("{} is not valid UTF-8", target.display()))?;
 
         // Compute the whole result in memory; write ONCE at the end. Any edit error returns before
         // the write is reached → atomic ("nothing written"), no temp file / rollback needed. Each
@@ -2305,7 +2314,8 @@ impl Tool for MultiEdit {
         if buf == original {
             return Ok(format!("{NOOP_WRITE_PREFIX}: {path} unchanged after {} edit(s) net to nothing", edits.len()));
         }
-        atomic_write(&target, buf.as_bytes()).with_context(|| format!("writing {}", target.display()))?;
+        crate::core::persist::compare_and_atomic_write(&target, &expected, buf.as_bytes())
+            .with_context(|| format!("writing {}", target.display()))?;
         let mut out = format!(
             "edited {path} ({} edits applied)\n{}\n{}",
             edits.len(),

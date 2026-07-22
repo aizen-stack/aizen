@@ -138,7 +138,13 @@ pub fn rewind_run(target: RewindTarget) -> Result<Snapshot> {
         })?;
         (id, g.rewinds_used)
     };
-    let snap = restore(id)?;
+    // Lease-free restore: the agent loop already holds the workspace writer lease for
+    // `checkpoint_rewind` (see execute_calls), and re-acquiring it via the public `restore()` would
+    // self-deadlock — `LockFileEx`/`flock` are per-handle, non-reentrant, so a second acquire of the
+    // same `workspace.lock` blocks until timeout → spurious `Busy`. `restore_in` takes only the
+    // store/metadata locks, which are a different namespace, so it is safe under the held lease.
+    let ctx = RepoContext::current()?;
+    let snap = restore_in(&ctx, id)?;
     if let Ok(mut g) = RUN_RECOVERY.lock() {
         g.rewinds_used = used + 1;
         // After a rewind the working tree matches `id`; that becomes the new last_good floor.
@@ -373,8 +379,24 @@ struct RepoContext {
 
 impl RepoContext {
     fn discover(start: &Path) -> Result<Self> {
-        let root = raw_git(start, &["rev-parse", "--show-toplevel"])
-            .context("not a git repository (run `git init` first to use the time machine)")?;
+        // Only a *genuine* absence of a work tree earns the friendly "run `git init`" message.
+        // Any other git failure — dubious ownership, safe.directory, git missing — is a real,
+        // usually one-command-fixable problem, so surface git's own stderr verbatim rather than
+        // telling the user to run a command they already ran. Callers keying off the
+        // "not a git repository" substring (save_protected_change/is_repo) still treat the benign
+        // case as "checkpoints simply off", while real errors now propagate with their true cause.
+        let root = match raw_git(start, &["rev-parse", "--show-toplevel"]) {
+            Ok(r) if !r.trim().is_empty() => r,
+            // Bare repo or empty toplevel → no work tree to checkpoint; treat as no-TM.
+            Ok(_) => bail!("not a git repository (run `git init` first to use the time machine)"),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("not a git repository") || msg.contains("not a work tree") {
+                    bail!("not a git repository (run `git init` first to use the time machine)");
+                }
+                return Err(e).context("time machine could not use git in this directory");
+            }
+        };
         let root = PathBuf::from(root).canonicalize().context("canonicalizing repository root")?;
         let git_dir = absolute_git_path(&root, &raw_git(&root, &["rev-parse", "--git-dir"])?);
         let common_git_dir = absolute_git_path(&root, &raw_git(&root, &["rev-parse", "--git-common-dir"])?);
@@ -584,6 +606,29 @@ impl RepoContext {
 
     fn lock(&self) -> Result<crate::core::repo_lock::RepoTxnLock> {
         crate::core::repo_lock::RepoTxnLock::acquire(&self.lock_path(), LOCK_TIMEOUT)
+    }
+
+    /// Repository-store lock path, shared by ALL linked worktrees (one level above the per-worktree
+    /// namespace). Ref reads/writes take it SHARED so sibling worktrees coexist; a store-wide sweep
+    /// (`doctor_gc`, which walks every worktree's `refs/ng/tm/**`) takes it EXCLUSIVE so it can never
+    /// race a sibling `save` mid-scan. Ordered before the per-worktree metadata lock (`lock`).
+    fn store_lock_path(&self) -> PathBuf {
+        self.store_git_dir
+            .parent()
+            .map(|p| p.join("store.lock"))
+            .unwrap_or_else(|| self.store_git_dir.join("store.lock"))
+    }
+
+    /// Shared store lease held by ordinary ref-mutating ops (save/restore/prune/clear) so they can
+    /// run concurrently across linked worktrees while still blocking a store-exclusive GC sweep.
+    fn store_shared(&self) -> Result<crate::core::repo_lock::RepoTxnLock> {
+        crate::core::repo_lock::RepoTxnLock::acquire_shared(&self.store_lock_path(), LOCK_TIMEOUT)
+    }
+
+    /// Exclusive store lease for a whole-store sweep (`doctor_gc`): no other worktree may create or
+    /// delete refs while it enumerates and reaps orphans across every namespace.
+    fn store_exclusive(&self) -> Result<crate::core::repo_lock::RepoTxnLock> {
+        crate::core::repo_lock::RepoTxnLock::acquire_exclusive(&self.store_lock_path(), LOCK_TIMEOUT)
     }
 
     fn load_ledger(&self) -> Result<Ledger> {
@@ -1213,9 +1258,9 @@ pub fn is_repo() -> bool {
     RepoContext::current().is_ok()
 }
 
-/// Preflight Time Machine for a protected workspace operation after approval but before mutation.
-/// This distinguishes "not a repository" from corrupt/unsafe repository state so callers can keep
-/// non-Git workflows working without swallowing a broken recovery system.
+/// Validate Time Machine metadata without capturing a tree. Kept for CLI diagnostics; protected
+/// mutations should call [`save_protected_change`] while their workspace writer lease is held.
+#[allow(dead_code)]
 pub fn preflight_protected_change() -> Result<bool> {
     match RepoContext::current() {
         Ok(ctx) => {
@@ -1225,6 +1270,17 @@ pub fn preflight_protected_change() -> Result<bool> {
             Ok(true)
         }
         Err(e) if e.to_string().contains("not a git repository") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Capture the preimage for an already-leased workspace mutation. The caller must hold the
+/// `WorkspaceWriterLease` across this call and the subsequent tool body, closing the old
+/// preflight→save→mutation gap without acquiring a second workspace lock.
+pub fn save_protected_change(label: &str) -> Result<Option<Snapshot>> {
+    match RepoContext::current() {
+        Ok(ctx) => save_in(&ctx, label, true, None).map(Some),
+        Err(e) if e.to_string().contains("not a git repository") => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -1249,6 +1305,7 @@ fn prune_after_save(ctx: &RepoContext, keep: usize, protected: &[u32]) -> Result
     if keep == 0 {
         return Ok(());
     }
+    let _store = ctx.store_shared()?;
     let _lock = ctx.lock()?;
     let mut ledger = ctx.load_ledger()?;
     ctx.recover_pending(&mut ledger)?;
@@ -1269,6 +1326,7 @@ fn prune_after_save(ctx: &RepoContext, keep: usize, protected: &[u32]) -> Result
 }
 
 fn save_in(ctx: &RepoContext, label: &str, auto: bool, chat: Option<&[Message]>) -> Result<Snapshot> {
+    let _store = ctx.store_shared()?;
     let _lock = ctx.lock()?;
     let mut ledger = ctx.load_ledger()?;
     ctx.recover_pending(&mut ledger)?;
@@ -1334,6 +1392,7 @@ fn delete_snapshots(ctx: &RepoContext, dropped: &[Snapshot]) -> Result<()> {
 
 pub fn prune(keep: usize) -> Result<usize> {
     let ctx = RepoContext::current()?;
+    let _store = ctx.store_shared()?;
     let _lock = ctx.lock()?;
     let mut ledger = ctx.load_ledger()?;
     ctx.recover_pending(&mut ledger)?;
@@ -1353,6 +1412,7 @@ pub fn prune(keep: usize) -> Result<usize> {
 
 pub fn clear() -> Result<usize> {
     let ctx = RepoContext::current()?;
+    let _store = ctx.store_shared()?;
     let _lock = ctx.lock()?;
     let mut ledger = ctx.load_ledger()?;
     ctx.recover_pending(&mut ledger)?;
@@ -1456,10 +1516,27 @@ fn capture_checkpoint_locked(
 
 pub fn restore(id: u32) -> Result<Snapshot> {
     let ctx = RepoContext::current()?;
+    let _workspace = crate::core::workspace_txn::WorkspaceWriterLease::acquire(
+        &ctx.root,
+        LOCK_TIMEOUT,
+        None,
+        "time restore",
+    )?;
+    restore_in(&ctx, id)
+}
+
+/// Restore-by-id for callers that ALREADY hold the workspace writer lease (the agent loop takes it
+/// for any `WorkspaceEffect::Paths` tool before running the body). Re-acquiring the same
+/// `workspace.lock` via [`restore`] would self-deadlock — `LockFileEx`/`flock` are per-handle and
+/// non-reentrant — so this skips the lease and takes only the store/metadata locks inside
+/// `restore_in`. Never call this off the agent loop's lease path; use [`restore`] there.
+pub fn restore_under_lease(id: u32) -> Result<Snapshot> {
+    let ctx = RepoContext::current()?;
     restore_in(&ctx, id)
 }
 
 fn restore_in(ctx: &RepoContext, id: u32) -> Result<Snapshot> {
+    let _store = ctx.store_shared()?;
     let _lock = ctx.lock()?;
     let mut ledger = ctx.load_ledger()?;
     ctx.recover_pending(&mut ledger)?;
@@ -1548,6 +1625,12 @@ fn save_preimage_locked(
 
 pub fn undo() -> Result<Snapshot> {
     let ctx = RepoContext::current()?;
+    let _workspace = crate::core::workspace_txn::WorkspaceWriterLease::acquire(
+        &ctx.root,
+        LOCK_TIMEOUT,
+        None,
+        "time undo",
+    )?;
     let ledger = ctx.load_ledger()?;
     let current = ledger
         .cursor_id
@@ -1564,6 +1647,12 @@ pub fn undo() -> Result<Snapshot> {
 
 pub fn redo() -> Result<Snapshot> {
     let ctx = RepoContext::current()?;
+    let _workspace = crate::core::workspace_txn::WorkspaceWriterLease::acquire(
+        &ctx.root,
+        LOCK_TIMEOUT,
+        None,
+        "time redo",
+    )?;
     let ledger = ctx.load_ledger()?;
     let current = ledger
         .cursor_id
@@ -1667,6 +1756,10 @@ pub fn doctor_repair() -> Result<DoctorReport> {
 
 pub fn doctor_gc() -> Result<DoctorReport> {
     let ctx = RepoContext::current()?;
+    // Whole-store sweep: block every sibling worktree's ref creation/deletion for the scan+reap so a
+    // concurrent `save` can't slip a ref past `for-each-ref`. Store-exclusive ordered before the
+    // per-worktree metadata lock.
+    let _store = ctx.store_exclusive()?;
     let _lock = ctx.lock()?;
     let mut ledger = ctx.load_ledger()?;
     ctx.recover_pending(&mut ledger)?;
@@ -1704,7 +1797,7 @@ pub fn doctor_gc() -> Result<DoctorReport> {
                     let _ = crate::core::persist::remove_if_exists(&ctx.chat_path(id));
                 }
             }
-        } else if let Some(id) = id {
+        } else if id.is_some() {
             // Foreign worktree ref: leave alone — that worktree owns its ledger. The failpoint
             // probe plants `refs/ng/tm/wt-dead/999`; treat any non-matching worktree id as orphan
             // only when its path segment is not a known sibling ledger on disk.
@@ -1789,8 +1882,8 @@ impl crate::agent::tools::Tool for CheckpointRewind {
         "Rewind the working tree to a recovery anchor from THIS agent run only. Use when your last \
          approach broke the tree and a clean base is cheaper than patching further. \
          target=`last_good` = after the last successful edit step; target=`pre_edit` = before any \
-         edit this run. Budget: 2 rewinds per run. Does NOT restore chat history. Free-form restore \
-         of arbitrary checkpoint ids is human-only (`aizen time restore <id>`)."
+         edit this run. Budget: 2 rewinds per run. Does NOT restore chat history. To reach a \
+         checkpoint from an EARLIER turn (not this run's own edits), use `checkpoint_restore` by id."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
@@ -1852,6 +1945,121 @@ impl crate::agent::tools::Tool for CheckpointRewind {
                 ))
             }
             Err(e) => Ok(format!("error: {e}")),
+        }
+    }
+}
+
+/// One timeline row shaped for the model: id, whether it is the current cursor, label, whether a
+/// chat sidecar exists, and the creation time. Absolute paths / store internals never leak here.
+fn format_timeline_row(snap: &Snapshot, is_cursor: bool) -> String {
+    let marker = if is_cursor { "▸" } else { " " };
+    let label = if snap.label.is_empty() { "(no label)" } else { &snap.label };
+    let kind = if snap.auto { "auto" } else { "manual" };
+    format!("{marker} #{} — {label} [{kind}, {}]", snap.id, snap.created)
+}
+
+/// Agent-facing timeline read. Read-only, so it fans out safely and needs no approval. Gives the
+/// model the checkpoint ids it needs to call `checkpoint_restore` when the user asks to go back to a
+/// specific earlier state (across turns, where run-scoped `checkpoint_rewind` has no anchor).
+pub struct CheckpointList;
+impl crate::agent::tools::Tool for CheckpointList {
+    fn name(&self) -> &str { "checkpoint_list" }
+    fn description(&self) -> &str {
+        "List Time Machine checkpoints (newest last), with the ▸ marking the current tree. Use to \
+         find the id to pass to `checkpoint_restore` when the user asks to go back to an earlier \
+         state from a PREVIOUS turn (run-scoped `checkpoint_rewind` only reaches this run's own \
+         edits). Read-only."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+    }
+    fn execute(&self, _args: &serde_json::Value) -> Result<String> {
+        if !is_repo() {
+            return Ok("error: not a git repository — no checkpoints (run `git init`)".to_string());
+        }
+        let (snaps, cursor) = timeline()?;
+        if snaps.is_empty() {
+            return Ok("no checkpoints yet — the runtime auto-checkpoints before/after edits, or use `checkpoint` to pin one.".to_string());
+        }
+        // Cap the tail so a long timeline can't blow the tool-result budget; ids are contiguous so
+        // the model can still ask for older ones by number if it needs them.
+        const MAX_ROWS: usize = 40;
+        let cursor_id = cursor.and_then(|i| snaps.get(i)).map(|s| s.id);
+        let start = snaps.len().saturating_sub(MAX_ROWS);
+        let mut out = String::new();
+        if start > 0 {
+            out.push_str(&format!("… {} older checkpoint(s) not shown\n", start));
+        }
+        for snap in &snaps[start..] {
+            out.push_str(&format_timeline_row(snap, Some(snap.id) == cursor_id));
+            out.push('\n');
+        }
+        out.push_str(
+            "\nRestore a specific id with `checkpoint_restore id=<n>` (files only — chat is untouched, and reversible).",
+        );
+        Ok(out)
+    }
+}
+
+/// Agent-facing restore-by-id. Unlike `checkpoint_rewind` (run-scoped anchors only), this reaches
+/// ANY checkpoint in the ledger — the tool the model needs when the user says "go back to how it was
+/// before" across turns. Destructive → approval-gated. Declares `Paths` so the agent loop takes the
+/// workspace writer lease around it; the body therefore uses the lease-free `restore_under_lease`
+/// (re-acquiring the same `workspace.lock` would self-deadlock — see `rewind_run`).
+pub struct CheckpointRestore;
+impl crate::agent::tools::Tool for CheckpointRestore {
+    fn name(&self) -> &str { "checkpoint_restore" }
+    fn description(&self) -> &str {
+        "Restore the working tree to a specific Time Machine checkpoint by id (see `checkpoint_list`). \
+         Use when the user asks to go back to an earlier state — including from a PREVIOUS turn, which \
+         `checkpoint_rewind` cannot reach (it only rewinds this run's own edits). Files only: your \
+         chat/history is untouched, and the pre-restore tree is auto-snapshotted so it is reversible. \
+         After restoring, re-read any files you care about — their contents changed on disk."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "minimum": 1, "description": "checkpoint id from `checkpoint_list`"},
+                "reason": {"type": "string", "description": "one short line: why you are restoring (shown in the result)"}
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        })
+    }
+    fn is_destructive(&self) -> bool { true }
+    fn is_concurrency_safe(&self) -> bool { false }
+    fn workspace_effect(&self, _args: &serde_json::Value) -> crate::agent::tools::WorkspaceEffect {
+        // Mutates the working tree. The loop takes the workspace writer lease for `Paths`; restore
+        // itself takes only store/metadata locks (a different namespace), so no self-deadlock.
+        crate::agent::tools::WorkspaceEffect::Paths
+    }
+    fn execute(&self, args: &serde_json::Value) -> Result<String> {
+        if !is_repo() {
+            return Ok("error: not a git repository — nothing to restore".to_string());
+        }
+        let Some(id) = args.get("id").and_then(|v| v.as_u64()) else {
+            return Ok("error: `id` is required (an integer checkpoint id — see `checkpoint_list`)".to_string());
+        };
+        let id = id as u32;
+        let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim();
+        match restore_under_lease(id) {
+            Ok(snap) => {
+                // Restoring an arbitrary id makes that tree the new run floor: a subsequent
+                // `checkpoint_rewind target=last_good` should land here, not on a stale post-edit id.
+                note_last_good(snap.id);
+                let why = if reason.is_empty() { String::new() } else { format!(" reason: {reason}.") };
+                Ok(format!(
+                    "restored working tree to checkpoint #{} ({}).{why} Files only — chat history was NOT \
+                     changed, and this is reversible (the pre-restore tree was auto-snapshotted; a human can \
+                     `aizen time redo`). Re-read files you care about — contents changed on disk.",
+                    snap.id,
+                    if snap.label.is_empty() { "no label" } else { &snap.label },
+                ))
+            }
+            Err(e) => Ok(format!(
+                "error: {e:#}. Nothing was restored. Check the id with `checkpoint_list`."
+            )),
         }
     }
 }

@@ -115,6 +115,8 @@ pub fn release_active() {
 struct CdpClient {
     ws: WsStream,
     next_id: u64,
+    /// Cross-process ownership for this endpoint/profile/target; held for the websocket lifetime.
+    _ownership: crate::core::repo_lock::RepoTxnLock,
     /// Named profile pinned for the lifetime of this websocket session.
     profile: String,
     /// Sanitized endpoint label (host/base only; never headers or credential values).
@@ -217,12 +219,22 @@ async fn discover_ws_url(profile_name: &str, profile: &config::BrowserProfile) -
 /// the `/json` list). The value is read from the environment at connect time and never logged.
 async fn connect(profile_name: String, profile: config::BrowserProfile) -> Result<CdpClient> {
     let ws_url = discover_ws_url(&profile_name, &profile).await?;
+    let ownership_path = crate::core::workspace_txn::resource_lock(
+        "browser",
+        &format!("{}:{profile_name}:{ws_url}", profile.endpoint),
+    );
+    let ownership = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &ownership_path,
+        std::time::Duration::from_millis(100),
+    )
+    .context("browser target is already owned by another Aizen process")?;
     let ws = ws_connect_with_auth(&profile_name, &profile, &ws_url)
         .await
         .with_context(|| format!("connecting browser profile '{profile_name}' to its CDP websocket"))?;
     let mut c = CdpClient {
         ws,
         next_id: 1,
+        _ownership: ownership,
         profile: profile_name,
         endpoint: profile.endpoint,
         refs: HashMap::new(),

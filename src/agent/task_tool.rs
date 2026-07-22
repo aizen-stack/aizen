@@ -238,6 +238,11 @@ pub(crate) struct Dispatch {
     pub registry: crate::agent::tools::ToolRegistry,
     pub system: String,
     pub model: String,
+    /// The endpoint the resolved `model` runs on. Routed through `endpoint_for_model` so a model
+    /// pinned to a different provider carries ITS gateway (base_url/api_key) instead of the parent's.
+    /// Defaults to the parent endpoint when the model has no registry entry (same-gateway case).
+    pub base_url: String,
+    pub api_key: String,
     /// The dispatch step budget (`max_steps` arg, clamped 1..=50; default 15).
     pub max_steps: usize,
     /// Optional JSON Schema the sub-agent's FINAL answer must satisfy (`expects` arg).
@@ -245,25 +250,39 @@ pub(crate) struct Dispatch {
 }
 
 impl TaskTool {
-    /// The task tool's fallback model: `roles.subagent_default` routing when configured, else the
-    /// parent model. Slots BELOW a specialist's pinned `def.model` in precedence — a card's pin is
-    /// more specific than a global role default.
-    fn default_subagent_model(&self) -> String {
-        crate::core::cli_config::resolve_role(
-            "subagent_default",
-            &crate::core::cli_config::ResolvedEndpoint {
-                base_url: String::new(), // model-only consumer; endpoint stays the parent's
-                api_key: String::new(),
-                model: self.model.clone(),
-            },
-        )
-        .model
+    /// The parent's own endpoint (base_url/api_key/model), the caller every model resolution
+    /// inherits from when a model has no registry entry of its own.
+    fn parent_endpoint(&self) -> crate::core::cli_config::ResolvedEndpoint {
+        crate::core::cli_config::ResolvedEndpoint {
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+        }
+    }
+
+    /// The task tool's fallback endpoint: `roles.subagent_default` routing when configured, THEN
+    /// through the model-endpoint registry so even the role-default model carries its own gateway.
+    /// Slots BELOW a specialist's pinned `def.model` / an explicit `model` arg in precedence — a
+    /// card's pin is more specific than a global role default. Falls back to the parent endpoint.
+    fn default_subagent_endpoint(&self) -> crate::core::cli_config::ResolvedEndpoint {
+        crate::core::cli_config::subagent_endpoint(&self.parent_endpoint())
+    }
+
+    /// Resolve the FULL endpoint (model + base_url + api_key) for a dispatch: an explicit override
+    /// (arg `model` or a card's `def.model`) routes through the model-endpoint registry so it carries
+    /// its own gateway; absent, the role-default subagent endpoint (already registry-routed) is used.
+    fn resolve_endpoint(&self, override_model: Option<String>) -> crate::core::cli_config::ResolvedEndpoint {
+        match override_model {
+            Some(m) => crate::core::cli_config::endpoint_for_model(&m, &self.parent_endpoint()),
+            None => self.default_subagent_endpoint(),
+        }
     }
 
     /// Resolve a dispatch from the tool args. A non-empty `agent` slug that [`crate::agents::load`]
     /// resolves takes the SPECIALIST path; otherwise (no `agent`, or an unknown one) it falls back to
     /// the existing `role` path unchanged. Model precedence: explicit `model` arg > `def.model`
-    /// (specialist path only) > `roles.subagent_default` > the parent model.
+    /// (specialist path only) > `roles.subagent_default` > the parent model. The resolved model is
+    /// then routed through the model-endpoint registry, so its base_url/api_key follow the model.
     pub(crate) fn resolve_dispatch(&self, args: &Value) -> Dispatch {
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let arg_model = args.get("model").and_then(|v| v.as_str()).map(str::to_string);
@@ -275,17 +294,16 @@ impl TaskTool {
                 args.get("agent").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
             {
                 if let Some(def) = crate::agents::load(slug) {
-                    let model = arg_model
-                        .clone()
-                        .or_else(|| def.model.clone())
-                        .unwrap_or_else(|| self.default_subagent_model());
+                    let ep = self.resolve_endpoint(arg_model.clone().or_else(|| def.model.clone()));
                     let registry = crate::agent::builtin::agent_registry(&def, &self.root);
-                    let system = build_agent_subagent_prompt(&def, &self.root, &model, &date, Some(&contract));
+                    let system = build_agent_subagent_prompt(&def, &self.root, &ep.model, &date, Some(&contract));
                     break 'resolved Dispatch {
                         label: def.slug(),
                         registry,
                         system,
-                        model,
+                        model: ep.model,
+                        base_url: ep.base_url,
+                        api_key: ep.api_key,
                         max_steps: contract.max_steps,
                         expects: None,
                     };
@@ -293,10 +311,19 @@ impl TaskTool {
                 // Unknown agent → fall through to the role path (graceful, never an error).
             }
             let role = args.get("role").and_then(|v| v.as_str()).unwrap_or("coder").to_string();
-            let model = arg_model.unwrap_or_else(|| self.default_subagent_model());
+            let ep = self.resolve_endpoint(arg_model);
             let registry = crate::agent::builtin::role_registry(&role, &self.root);
-            let system = build_subagent_prompt(&role, &self.root, &model, &date, Some(&contract));
-            Dispatch { label: role, registry, system, model, max_steps: contract.max_steps, expects: None }
+            let system = build_subagent_prompt(&role, &self.root, &ep.model, &date, Some(&contract));
+            Dispatch {
+                label: role,
+                registry,
+                system,
+                model: ep.model,
+                base_url: ep.base_url,
+                api_key: ep.api_key,
+                max_steps: contract.max_steps,
+                expects: None,
+            }
         };
         // The output contract rides the SYSTEM prompt (an instruction, not a hope) — the harness
         // then validates the final text against it (see `validate_contract`).
@@ -384,8 +411,11 @@ impl Tool for TaskTool {
             .filter(|s| !s.trim().is_empty())
             .context("missing required string arg 'prompt'")?;
 
-        // Agent-vs-role resolution (no network) — a resolvable `agent` slug supersedes `role`.
-        let Dispatch { label, registry, system, model, max_steps, expects } = self.resolve_dispatch(args);
+        // Agent-vs-role resolution (no network) — a resolvable `agent` slug supersedes `role`. The
+        // endpoint rides ALONG the model: `base`/`key` come from the dispatch (registry-routed), not
+        // from `self`, so a sub-agent pinned to another provider's model calls ITS gateway.
+        let Dispatch { label, registry, system, model, base_url, api_key, max_steps, expects } =
+            self.resolve_dispatch(args);
         let user_label = args
             .get("label")
             .and_then(|v| v.as_str())
@@ -396,9 +426,12 @@ impl Tool for TaskTool {
 
         // Non-streaming chat closure: the sub-agent runs silently; the parent streams synthesis.
         let client = self.client.clone();
-        let base = self.base_url.clone();
-        let key = self.api_key.clone();
+        let base = base_url.clone();
+        let key = api_key.clone();
         let model_for_repair = model.clone();
+        // The repair call must hit the same endpoint the sub-agent ran on (not the parent's).
+        let base_for_repair = base_url.clone();
+        let key_for_repair = api_key.clone();
         let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| {
             let client = client.clone();
             let base = base.clone();
@@ -415,9 +448,13 @@ impl Tool for TaskTool {
         // (planner/reviewer) makes no edits, so the gate would only spawn a needless `cargo check`.
         let sub_verify_gate = !dispatch_is_read_only(&registry);
         let parent_cancel = crate::core::cancel::current().unwrap_or_default();
+        // Inherit the parent's conversation identity so a delegated sub-agent shares the same
+        // per-conversation resource scope (e.g. the browser session), exactly as it inherits `cancel`.
+        let parent_ctx = crate::core::exec_ctx::current().unwrap_or_default();
         let cfg = AgentConfig {
             approval_mode: self.approval_mode, // inherit parent approval tier transitively
             cancel: parent_cancel,
+            exec_ctx: parent_ctx,
             quiet: true,                     // suppress nested progress trace
             enable_verify_gate: sub_verify_gate, // ON for write-capable roles; OFF for read-only (W14)
             // The dispatch step budget (default 15 ≪ the top level's 25/50 — a sub-task is
@@ -499,7 +536,14 @@ impl Tool for TaskTool {
             Some(schema) => match validate_contract(&body, schema) {
                 Ok(v) => (serde_json::to_string_pretty(&v).unwrap_or(body), ", json:ok".to_string()),
                 Err(first_err) => {
-                    let repaired = self.repair_contract(&model_for_repair, schema, &body, &first_err);
+                    let repaired = self.repair_contract(
+                        &base_for_repair,
+                        &key_for_repair,
+                        &model_for_repair,
+                        schema,
+                        &body,
+                        &first_err,
+                    );
                     match repaired.as_deref().map(|r| validate_contract(r, schema)) {
                         Some(Ok(v)) => {
                             (serde_json::to_string_pretty(&v).unwrap_or_default(), ", json:ok".to_string())
@@ -526,7 +570,15 @@ impl Tool for TaskTool {
 impl TaskTool {
     /// ONE bounded repair call (no tools, non-streaming): echo the validation error and the bad
     /// reply, ask for corrected JSON. Best-effort — `None` on any failure.
-    fn repair_contract(&self, model: &str, schema: &Value, prev: &str, err: &str) -> Option<String> {
+    fn repair_contract(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        schema: &Value,
+        prev: &str,
+        err: &str,
+    ) -> Option<String> {
         let sys = Message::system(format!(
             "You repair JSON output. Reply with ONLY one JSON object valid against this schema (no prose, no code fences):\n{schema}"
         ));
@@ -534,8 +586,8 @@ impl TaskTool {
             "The previous reply was not valid against the contract: {err}\n\nPrevious reply:\n{prev}\n\nReply with ONLY the corrected JSON."
         ));
         let client = self.client.clone();
-        let base = self.base_url.clone();
-        let key = self.api_key.clone();
+        let base = base_url.to_string();
+        let key = api_key.to_string();
         let model = model.to_string();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
@@ -567,6 +619,7 @@ pub(crate) fn dispatch_is_read_only(r: &crate::agent::tools::ToolRegistry) -> bo
         "skill_save",
         "checkpoint",
         "checkpoint_rewind",
+        "checkpoint_restore",
         "symbol_replace",
         "symbol_insert",
     ];
@@ -592,18 +645,38 @@ pub(crate) fn active_subagents() -> usize {
     ACTIVE_SUBAGENTS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// RAII slot in the sub-agent gate — releases on drop (incl. panic/early-return paths).
-pub(crate) struct SubagentSlot;
+/// RAII slot in the sub-agent gate — releases both the process-local count and cross-process OS slot.
+pub(crate) struct SubagentSlot {
+    _global: crate::core::repo_lock::RepoTxnLock,
+}
 
 impl SubagentSlot {
     pub(crate) fn try_acquire() -> Option<Self> {
         use std::sync::atomic::Ordering;
+        let cap = max_parallel_subagents();
         let prev = ACTIVE_SUBAGENTS.fetch_add(1, Ordering::SeqCst);
-        if prev >= max_parallel_subagents() {
+        if prev >= cap {
             ACTIVE_SUBAGENTS.fetch_sub(1, Ordering::SeqCst);
             return None;
         }
-        Some(Self)
+        let start = (std::process::id() as usize + prev) % cap;
+        let root = crate::core::config::nextgen_home()
+            .join("locks")
+            .join("v1")
+            .join("slots")
+            .join("subagents");
+        for step in 0..cap {
+            let idx = (start + step) % cap;
+            let path = root.join(format!("slot-{idx}.lock"));
+            if let Ok(global) = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+                &path,
+                std::time::Duration::ZERO,
+            ) {
+                return Some(Self { _global: global });
+            }
+        }
+        ACTIVE_SUBAGENTS.fetch_sub(1, Ordering::SeqCst);
+        None
     }
 
     /// Greedily reserve UP TO `want` slots (used by the `workflow` fan-out, which runs several
@@ -1097,6 +1170,51 @@ mod tests {
         assert_eq!(d3.label, "tester", "unknown agent falls back to role");
         assert!(d3.system.contains("<role>"), "role path uses the role brief, not a specialist block");
         assert!(d3.registry.get("shell_run").is_some() && d3.registry.get("file_edit").is_none(), "tester scope");
+
+        for v in ["USERPROFILE", "HOME", "AIZEN_HOME", "NEXTGEN_HOME", "NG_PROJECT_ROOT"] {
+            std::env::remove_var(v);
+        }
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
+    #[test]
+    fn resolve_dispatch_routes_endpoint_by_model() {
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sandbox = std::env::temp_dir().join(format!("ng-disp-ep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        std::env::set_var("USERPROFILE", &sandbox);
+        std::env::set_var("HOME", &sandbox);
+        std::env::set_var("AIZEN_HOME", sandbox.join(".aizen"));
+        std::env::set_var("NEXTGEN_HOME", sandbox.join(".aizen"));
+        std::env::set_var("NG_PROJECT_ROOT", sandbox.join("proj"));
+
+        // Register a model→endpoint entry: a sub-agent pinned to `other-model` runs on ITS gateway.
+        crate::core::cli_config::save(&crate::core::cli_config::CliConfig {
+            model_endpoints: Some(vec![crate::core::cli_config::ModelEndpoint {
+                model: "other-model".into(),
+                base_url: Some("https://other/v1".into()),
+                api_key_ref: Some("literal-other-key".into()),
+            }]),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let t = tool(0); // parent endpoint: http://localhost / "k" / model "m"
+        // A model arg with a registry entry carries its own base_url + api_key.
+        let d = t.resolve_dispatch(&serde_json::json!({"prompt": "x", "role": "planner", "model": "other-model"}));
+        assert_eq!(d.model, "other-model");
+        assert_eq!(d.base_url, "https://other/v1", "endpoint follows the model");
+        assert_eq!(d.api_key, "literal-other-key", "api_key follows the model");
+
+        // A model with NO registry entry keeps the parent endpoint (same-gateway case).
+        let d2 = t.resolve_dispatch(&serde_json::json!({"prompt": "x", "role": "planner", "model": "unmapped"}));
+        assert_eq!(d2.model, "unmapped");
+        assert_eq!(d2.base_url, "http://localhost", "unmapped model inherits the parent endpoint");
+        assert_eq!(d2.api_key, "k");
+
+        // No override at all → parent endpoint (no subagent_default configured here).
+        let d3 = t.resolve_dispatch(&serde_json::json!({"prompt": "x", "role": "planner"}));
+        assert_eq!(d3.base_url, "http://localhost");
 
         for v in ["USERPROFILE", "HOME", "AIZEN_HOME", "NEXTGEN_HOME", "NG_PROJECT_ROOT"] {
             std::env::remove_var(v);

@@ -219,7 +219,7 @@ transport ambiguity.
 
 ### I. Channels — bots & notifications
 
-**Telegram daemon — `aizen serve`** — the long-lived bot: long-polls Telegram, runs the agent per message, keeps **persistent per-chat history** (follow-ups like "now fix it" keep context, capped ~40 msgs). In-chat commands: `/help`·`/start`, `/new`·`/reset`, `/resume`, and `/agent <task>` (autonomous mode). **Destructive-op approvals route to inline ✓/✗ buttons on your phone.** Replies chunked to ≤3500 chars.
+**Telegram daemon — `aizen serve`** — the long-lived bot: long-polls Telegram, runs the agent per message, keeps **persistent per-chat history** (follow-ups like "now fix it" keep context, capped ~40 msgs). In-chat commands: `/help`·`/start`, `/new`·`/reset`, `/resume`, and `/agent <task>` (autonomous mode). **Destructive-op approvals route to inline ✓/✗ buttons on your phone.** Replies use Telegram-native HTML (headings/emphasis, safe links, inline/fenced code, lists/quotes); tables become compact stacked records, and balanced block-aware chunks stay ≤3500 UTF-16 units. One temporary working message is deleted after delivery; rich-format rejection retries once as equivalent plain text.
 - Setup — `aizen telegram setup` (paste BotFather token → message the bot to capture your chat id), `test`, `show`. Allowed-chat allowlist (empty = deny everyone).
 
 **Discord bot — `aizen discord …`** — two-way gateway bot (`setup`/`test`/`serve`/`show`/`disable`); needs the privileged MESSAGE_CONTENT intent; channel allowlist; same in-chat commands; replies chunked to ≤1900 chars. (Inline-button approvals not yet wired — use `/agent` for autonomous edits.)
@@ -285,7 +285,8 @@ lines whose right-aligned digest is tinted by outcome — green ok / salmon erro
 panels and a green `✓` verify line under the retained backend). Wide
 terminals get Unicode box tables; narrow widths automatically use stacked records. Pipes/CI retain raw
 Markdown. `response_visuals = auto|always|off` controls whether the top-level model adds useful tables
-or text diagrams to final replies; Telegram/Discord receive plain stacked table records.
+or text diagrams to final replies; Telegram renders mobile-friendly native HTML with stacked table
+records and balanced chunks, while Discord keeps the plain stacked-table fallback.
 
 ### 4.5 Input, images, keybindings
 - **Image attach:** `Ctrl-O` grabs a clipboard screenshot as a vision attachment; `Ctrl-X` drops the latest; a gold `[2img]` badge shows the count. Multi-line pastes collapse to a chip (`↵ 3 lines pasted · first line…`).

@@ -565,13 +565,20 @@ impl LspServer {
         file_hint: Option<&Path>,
         symbol: &str,
         new_body: &str,
-    ) -> Result<(PathBuf, usize, usize, String, String)> {
+    ) -> Result<(PathBuf, usize, usize, String, String, crate::core::persist::FileFingerprint)> {
         let body = self.symbol_body(file_hint, symbol).await?;
         let content = tokio::fs::read_to_string(&body.path)
             .await
             .with_context(|| format!("reading {}", body.path.display()))?;
+        if slice_lines_inclusive(&content, body.start_line, body.end_line) != body.text {
+            anyhow::bail!(
+                "stale symbol plan for {}: file changed while resolving the symbol; retry",
+                body.path.display()
+            );
+        }
+        let base_fingerprint = crate::core::persist::FileFingerprint::for_bytes(content.as_bytes());
         let new_text = replace_line_span(&content, body.start_line, body.end_line, new_body);
-        Ok((body.path, body.start_line, body.end_line, body.text, new_text))
+        Ok((body.path, body.start_line, body.end_line, body.text, new_text, base_fingerprint))
     }
 
     /// Insert `text` immediately before or after a named symbol's full range.
@@ -581,11 +588,18 @@ impl LspServer {
         symbol: &str,
         where_: InsertWhere,
         text: &str,
-    ) -> Result<(PathBuf, usize, String)> {
+    ) -> Result<(PathBuf, usize, String, crate::core::persist::FileFingerprint)> {
         let body = self.symbol_body(file_hint, symbol).await?;
         let content = tokio::fs::read_to_string(&body.path)
             .await
             .with_context(|| format!("reading {}", body.path.display()))?;
+        if slice_lines_inclusive(&content, body.start_line, body.end_line) != body.text {
+            anyhow::bail!(
+                "stale symbol plan for {}: file changed while resolving the symbol; retry",
+                body.path.display()
+            );
+        }
+        let base_fingerprint = crate::core::persist::FileFingerprint::for_bytes(content.as_bytes());
         let new_text = insert_relative_line_span(
             &content,
             body.start_line,
@@ -597,7 +611,7 @@ impl LspServer {
             InsertWhere::Before => body.start_line,
             InsertWhere::After => body.end_line.saturating_add(1),
         };
-        Ok((body.path, at, new_text))
+        Ok((body.path, at, new_text, base_fingerprint))
     }
 
     /// Kind label for the outline item enclosing `chosen` (best-effort).

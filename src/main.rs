@@ -257,6 +257,18 @@ enum AgentsCmd {
         #[arg(long)]
         all: bool,
     },
+    /// Pin (or clear) the `model:` a specialist runs on. The model routes through the model→endpoint
+    /// registry at dispatch, so it carries its own base_url/api_key (cross-provider sub-agents).
+    #[command(name = "set-model")]
+    SetModel {
+        /// Agent name or slug.
+        name: String,
+        /// Model id to pin (omit or pass an empty string with --clear to remove the pin).
+        model: Option<String>,
+        /// Clear the model pin instead of setting one.
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -583,6 +595,24 @@ enum ConfigCmd {
         /// Comma-separated tool-bundle whitelist.
         #[arg(long)]
         enabled_toolsets: Option<String>,
+        /// Default model for dispatched sub-agents (`roles.subagent_default`). Routes through the
+        /// model→endpoint registry, so pairing it with `--model-endpoint` runs sub-agents on their
+        /// own gateway. Pass an empty string to clear.
+        #[arg(long)]
+        subagent_model: Option<String>,
+        /// Base URL for the sub-agent default endpoint (`roles.subagent_default.base_url`). Usually
+        /// unneeded — prefer `--model-endpoint` so the endpoint follows the model. Empty clears.
+        #[arg(long)]
+        subagent_base_url: Option<String>,
+        /// API-key reference for the sub-agent default endpoint: `env:VAR` (preferred) or a literal
+        /// key. Empty clears. (`roles.subagent_default.api_key_ref`.)
+        #[arg(long)]
+        subagent_api_key_ref: Option<String>,
+        /// Register a model→endpoint mapping so a sub-agent pinned to that model carries its own
+        /// gateway. Format: `model[,base_url=URL][,api_key_ref=env:VAR|KEY]` (repeatable). A bare
+        /// model id with no fields, or `model,clear`, removes the entry.
+        #[arg(long = "model-endpoint")]
+        model_endpoint: Vec<String>,
     },
     /// Show the saved config (API key masked).
     Show,
@@ -3505,6 +3535,7 @@ async fn run_menu_sticky() -> Result<()> {
             .dim()
     );
     tui::activate(&intro, &status_text(&history, &model_label));
+    install_exit_flush_handler(); // flush the live chat if the terminal window is closed (Windows ✕)
     crate::core::recovery::begin(repo_scope.clone(), current_session_slug());
     if let Some(offer) = crate::core::recovery::scan_stale(&repo_scope).into_iter().next() {
         tui::emit_line(&style(format!("⟳ {}", crate::core::recovery::format_offer(&offer))).dim().to_string());
@@ -3633,6 +3664,10 @@ async fn run_menu_sticky() -> Result<()> {
                     );
                     history.push(Message::user_with_images(line.clone(), images));
                 }
+                // Refresh the exit-flush snapshot the moment the turn's user message lands, so an
+                // abrupt window close mid-turn still persists the question (per-turn autosave only
+                // runs on success).
+                update_live_history(&history);
                 let persona_before = cli_config::load().persona;
                 // Arm LSP BEFORE building the registry — tools only register while enabled.
                 arm_lsp_session();
@@ -3833,6 +3868,9 @@ async fn run_menu_sticky() -> Result<()> {
             }
         }
     }
+    // Flush the live conversation on graceful exit (/quit, Ctrl-D, Quit submission) so it's always in
+    // /sessions — the per-turn autosave misses a turn that failed or was cancelled mid-flight.
+    flush_live_session_on_exit();
     tui::deactivate();
     crate::core::recovery::clear();
     crate::agent::process::kill_all(); // reap any background dev servers/watchers we started
@@ -3854,6 +3892,7 @@ async fn run_menu_plain() -> Result<()> {
     let mut history: Vec<Message> = Vec::new();
     let mut input_history: Vec<String> = Vec::new(); // recallable past prompts (↑/↓ in the box)
     rebuild_system(&mut history, &model_label);
+    install_exit_flush_handler(); // flush the live chat if the terminal window is closed (Windows ✕)
 
     loop {
         icons::set_tier(cli_config::load().icons.as_deref()); // refresh after a possible /config change
@@ -3929,6 +3968,9 @@ async fn run_menu_plain() -> Result<()> {
             );
             history.push(Message::user_with_images(line, images));
         }
+        // Refresh the exit-flush snapshot the moment the user turn lands — so a window close mid-turn
+        // (before the per-turn autosave) still persists this message.
+        update_live_history(&history);
         // Snapshot the active persona so we can detect an in-turn switch (the `persona_create` tool)
         // and resync the system prompt at the turn boundary — prefix-cache safe, takes effect next msg.
         let persona_before = cli_config::load().persona;
@@ -4054,6 +4096,9 @@ async fn run_menu_plain() -> Result<()> {
         // sticky REPL's reset). Covers every branch above, incl. clarify/error.
         cli_config::clear_effort_override();
     }
+    // Same graceful-exit flush as the sticky REPL: capture whatever's live even if the last turn
+    // never reached the per-turn autosave.
+    flush_live_session_on_exit();
     crate::agent::process::kill_all(); // reap any background dev servers/watchers we started
     println!("{}", style("bye.").dim());
     Ok(())
@@ -5225,6 +5270,7 @@ Commands:
   /telegram          Telegram integration menu (setup · test · status · start daemon · disable)
   /sessions          saved conversations — restore · save · delete (auto-saves as you go)
   /workflows         multi-agent status — live task/workflow children, sub-agent slots (also /wf)
+  /agents            specialist sub-agents you can delegate to — list · set-model <name> <model> (routes model→endpoint)
   /timeline          show the checkpoint timeline (▸ = current); /timeline pick to restore · also /undo · /redo
   /checkpoint [note] save a restore point of the working tree now
   /compact           summarize older turns to free context now
@@ -5284,6 +5330,59 @@ async fn slash_workflows(_arg: &str) {
     }
 }
 
+/// `/agents` — list installed specialists with their model pin; `/agents set-model <name> <model>`
+/// pins (or, with no model / `clear`, clears) the model a specialist runs on. The pin routes through
+/// the model→endpoint registry at dispatch, so it carries its own gateway (cross-provider).
+fn slash_agents(arg: &str) {
+    let mut parts = arg.splitn(2, char::is_whitespace);
+    let sub = parts.next().unwrap_or("").trim();
+    let rest = parts.next().unwrap_or("").trim();
+    match sub {
+        "set-model" | "model" => {
+            let mut rp = rest.splitn(2, char::is_whitespace);
+            let name = rp.next().unwrap_or("").trim();
+            let model = rp.next().unwrap_or("").trim();
+            if name.is_empty() {
+                tui::emit_line(&style("usage: /agents set-model <name> <model>   (omit <model> or pass `clear` to remove the pin)").dim().to_string());
+                return;
+            }
+            let clear = model.is_empty() || model.eq_ignore_ascii_case("clear") || model == "-";
+            let value = if clear { None } else { Some(model.to_string()) };
+            match agents::set_model(name, value.as_deref()) {
+                Ok(path) => {
+                    let msg = match &value {
+                        Some(m) => format!("pinned '{name}' → model {m}  ({})", path.display()),
+                        None => format!("cleared model pin on '{name}'  ({})", path.display()),
+                    };
+                    tui::emit_line(&style(msg).color256(theme::OK).to_string());
+                }
+                Err(e) => tui::emit_line(&format!("{} {e:#}", style("agents:").red())),
+            }
+        }
+        "" | "list" => {
+            let all = agents::list();
+            if all.is_empty() {
+                tui::emit_line(&style("no specialist agents installed — `aizen agents install msitarzewski/agency-agents`").dim().to_string());
+                return;
+            }
+            let enabled = agents::enabled_set();
+            let mut out = String::from("specialist agents (● pinned to <agents> index / ○ not):\n");
+            for def in &all {
+                let slug = def.slug();
+                let pin = enabled.as_ref().map(|s| s.contains(&slug)).unwrap_or(true);
+                let mark = if pin { "●" } else { "○" };
+                let model = def.model.as_deref().unwrap_or("(parent model)");
+                out.push_str(&format!("  {mark} {:<24} model: {model}\n", slug));
+            }
+            out.push_str("\nset a model:  /agents set-model <name> <model>   ·   clear:  /agents set-model <name> clear");
+            tui::emit_line(&out.trim_end().to_string());
+        }
+        other => {
+            tui::emit_line(&style(format!("unknown /agents subcommand '{other}' — try /agents or /agents set-model <name> <model>")).dim().to_string());
+        }
+    }
+}
+
 async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut String) -> SlashOutcome {
     let mut parts = input.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("").trim();
@@ -5297,6 +5396,8 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             client::cost_meter().reset(); // and a fresh cost tally
             tui::reset_session_allow(); // re-confirm destructive ops in the new conversation
             set_session_slug(None); // the next turn names + autosaves a brand-new session file
+            update_live_history(history); // drop the old chat from the exit-flush snapshot too, so an
+                                          // immediate window-close after /clear doesn't re-save it
             #[cfg(feature = "browser")]
             crate::agent::browser::release_active(); // drop this conversation's browser page/@refs
             tui::emit_line(&style("(new conversation)").dim().to_string());
@@ -5314,6 +5415,7 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             }
         }
         "workflows" | "workflow" | "wf" | "agents-status" => slash_workflows(arg).await,
+        "agents" | "agent" => slash_agents(arg),
         "recover" | "recovery" => {
             let repo_scope = crate::core::recovery::current_repo_scope();
             let offers = crate::core::recovery::scan_stale(&repo_scope);
@@ -5837,15 +5939,87 @@ fn delete_session(name: &str) -> Result<()> {
     std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
     Ok(())
 }
-/// Best-effort auto-save of the live conversation to the `last` session (called after each turn) so
-/// you can always come back to it via `/sessions` without ever running an explicit save.
+/// Pick a distinct on-disk slug for a brand-new (unnamed) conversation: the topic suggestion, plus a
+/// numeric suffix if a session with that name already exists. Without this every unnamed chat collided
+/// on the shared `last` slug and overwrote the previous one, so `/sessions` only ever showed the latest.
+fn allocate_session_slug(history: &[Message]) -> String {
+    let base = sanitize_name(&suggest_session_name(history));
+    let dir = sessions_dir();
+    if !dir.join(format!("{base}.json")).exists() {
+        return base;
+    }
+    for n in 2..1000 {
+        let cand = format!("{base}-{n}");
+        if !dir.join(format!("{cand}.json")).exists() {
+            return cand;
+        }
+    }
+    base
+}
+
+/// A process-global snapshot of the live conversation, kept fresh so the Windows console control
+/// handler (window ✕ / logoff / shutdown) can flush the current chat to disk from its own thread
+/// before the process is killed. The main thread never reads it back — it's write-for-the-handler.
+static LIVE_HISTORY: OnceLock<Mutex<Vec<Message>>> = OnceLock::new();
+
+fn live_history_slot() -> &'static Mutex<Vec<Message>> {
+    LIVE_HISTORY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Refresh the snapshot the exit-flush path saves. Called after every user push (mid-turn safety) and
+/// at the end of each autosave (so the snapshot is always at least as new as what's on disk).
+fn update_live_history(history: &[Message]) {
+    *live_history_slot().lock().unwrap_or_else(|e| e.into_inner()) = history.to_vec();
+}
+
+/// Persist the live conversation on any exit — graceful (/quit, Ctrl-D) or abrupt (window ✕ via the
+/// Windows console handler). Safe to call from a foreign thread: it only does synchronous file I/O.
+fn flush_live_session_on_exit() {
+    let snapshot = live_history_slot().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    autosave_last(&snapshot);
+}
+
+/// Catch the terminal window being closed (✕), user logoff and system shutdown so the live chat is
+/// flushed to `/sessions` before Windows terminates us. Ctrl-C / Ctrl-Break are deliberately left to
+/// the existing in-app cancel handling (we return FALSE for them, changing nothing). No-op elsewhere.
+fn install_exit_flush_handler() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::BOOL;
+        use windows_sys::Win32::System::Console::{
+            SetConsoleCtrlHandler, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+        };
+        unsafe extern "system" fn handler(ctrl_type: u32) -> BOOL {
+            if matches!(ctrl_type, CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT) {
+                // Never let a panic unwind across the FFI boundary into the OS caller.
+                let _ = std::panic::catch_unwind(flush_live_session_on_exit);
+            }
+            0 // FALSE — let the system proceed with default termination in all cases.
+        }
+        unsafe {
+            let _ = SetConsoleCtrlHandler(Some(handler), 1);
+        }
+    }
+}
+
+/// Best-effort auto-save of the live conversation (called after each turn and on exit) so you can
+/// always come back to it via `/sessions` without ever running an explicit save. A brand-new chat is
+/// given its own distinct file on first save so it never overwrites another unnamed conversation.
 fn autosave_last(history: &[Message]) {
     if history.iter().any(|m| m.role == "user") {
-        let name = current_session_slug().unwrap_or_else(|| "last".to_string());
+        let name = match current_session_slug() {
+            Some(n) => n,
+            None => {
+                let slug = allocate_session_slug(history);
+                set_session_slug(Some(slug.clone()));
+                slug
+            }
+        };
         let _ = save_session(history, &name);
         if name != "last" {
-            let _ = save_session(history, "last");
+            let _ = save_session(history, "last"); // keep `last` as the "most recent" pointer
         }
+        update_live_history(history);
         let _ = crate::core::recovery::checkpoint_history(
             history,
             None,
@@ -5894,6 +6068,9 @@ async fn sessions_menu(history: &mut Vec<Message>, model_label: &str) -> Result<
             match load_session(history, name, model_label) {
                 Ok(n) => {
                     println!("{}", style(format!("restored '{}' ({n} messages)", pretty_session_name(name))).color256(splash::ACCENT));
+                    // Keep the exit-flush snapshot in step with what we just restored so an abrupt
+                    // window close right after restore re-saves this conversation, not a stale one.
+                    update_live_history(history);
                     agent::replay_transcript(history);
                     return Ok(());
                 }
@@ -5912,6 +6089,7 @@ async fn sessions_menu(history: &mut Vec<Message>, model_label: &str) -> Result<
                         // Pin the session to this name so later autosaves keep rewriting the SAME file
                         // (both paths route through `sanitize_name`, so the raw name maps to one file).
                         set_session_slug(Some(name.trim().to_string()));
+                        update_live_history(history); // exit-flush snapshot follows the pinned name
                         println!("{}", style(format!("saved '{}'", name.trim())).color256(splash::ACCENT));
                     }
                     Err(e) => eprintln!("{} {e}", style("save:").red()),
@@ -6056,13 +6234,51 @@ fn parse_toolset_list(s: &str) -> Option<Vec<String>> {
     (!values.is_empty()).then_some(values)
 }
 
+/// Apply one `--model-endpoint` spec to the config's model→endpoint registry. Spec is
+/// `model[,base_url=URL][,api_key_ref=env:VAR|KEY]`. The first comma-token is the model id; the
+/// rest are `key=value` fields. A bare model id (no fields) or a `clear` token removes the entry.
+/// Upserts by exact model id.
+fn apply_model_endpoint(cfg: &mut cli_config::CliConfig, spec: &str) -> Result<()> {
+    let mut parts = spec.split(',').map(str::trim).filter(|s| !s.is_empty());
+    let model = parts
+        .next()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .context("--model-endpoint needs a model id (e.g. `gpt-4o,base_url=https://…`)")?;
+    let mut base_url = None;
+    let mut api_key_ref = None;
+    let mut clear = false;
+    for tok in parts {
+        if tok.eq_ignore_ascii_case("clear") {
+            clear = true;
+            continue;
+        }
+        match tok.split_once('=') {
+            Some(("base_url", v)) => base_url = Some(v.trim().to_string()),
+            Some(("api_key_ref", v)) => api_key_ref = Some(v.trim().to_string()),
+            _ => anyhow::bail!(
+                "--model-endpoint field '{tok}' not understood (use base_url=… , api_key_ref=… , or clear)"
+            ),
+        }
+    }
+    let mut list = cfg.model_endpoints.take().unwrap_or_default();
+    list.retain(|e| e.model != model);
+    // A bare model id (no fields) or an explicit `clear` removes the entry (retain above already
+    // dropped it); otherwise upsert the new mapping.
+    if !clear && (base_url.is_some() || api_key_ref.is_some()) {
+        list.push(cli_config::ModelEndpoint { model, base_url, api_key_ref });
+    }
+    cfg.model_endpoints = (!list.is_empty()).then_some(list);
+    Ok(())
+}
+
 async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
     let cmd = match cmd {
         Some(c) => c,
         None => return config_wizard().await, // bare `ng config` → interactive setup
     };
     match cmd {
-        ConfigCmd::Set { base_url, api_key, model, context_window, compact_threshold, auto_skill_learn, memory_auto_learn, persona_evolve, price_in, price_out, icons, response_visuals, tui_mode, timemachine_keep, timemachine_max_files, timemachine_max_bytes, timemachine_max_file_bytes, auto_effort, reasoning_effort, approval, ultimate, adaptive_effort, disabled_toolsets, enabled_toolsets } => {
+        ConfigCmd::Set { base_url, api_key, model, context_window, compact_threshold, auto_skill_learn, memory_auto_learn, persona_evolve, price_in, price_out, icons, response_visuals, tui_mode, timemachine_keep, timemachine_max_files, timemachine_max_bytes, timemachine_max_file_bytes, auto_effort, reasoning_effort, approval, ultimate, adaptive_effort, disabled_toolsets, enabled_toolsets, subagent_model, subagent_base_url, subagent_api_key_ref, model_endpoint } => {
             if base_url.is_none()
                 && api_key.is_none()
                 && model.is_none()
@@ -6087,6 +6303,10 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                 && adaptive_effort.is_none()
                 && disabled_toolsets.is_none()
                 && enabled_toolsets.is_none()
+                && subagent_model.is_none()
+                && subagent_base_url.is_none()
+                && subagent_api_key_ref.is_none()
+                && model_endpoint.is_empty()
             {
                 anyhow::bail!("nothing to set — pass at least one supported --flag (including --timemachine-keep / --timemachine-max-files / --timemachine-max-bytes / --timemachine-max-file-bytes)");
             }
@@ -6181,6 +6401,30 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             }
             if let Some(v) = enabled_toolsets {
                 cfg.enabled_toolsets = parse_toolset_list(&v);
+            }
+            // Sub-agent default endpoint (`roles.subagent_default`): set any of model/base_url/
+            // api_key_ref; an empty string CLEARS that field. Editing any sub-field materializes the
+            // `roles` + `subagent_default` objects; clearing every field drops `subagent_default`.
+            if subagent_model.is_some() || subagent_base_url.is_some() || subagent_api_key_ref.is_some() {
+                let mut roles = cfg.roles.take().unwrap_or_default();
+                let mut sd = roles.subagent_default.take().unwrap_or_default();
+                let apply = |slot: &mut Option<String>, v: Option<String>| {
+                    if let Some(s) = v {
+                        let s = s.trim();
+                        *slot = if s.is_empty() { None } else { Some(s.to_string()) };
+                    }
+                };
+                apply(&mut sd.model, subagent_model);
+                apply(&mut sd.base_url, subagent_base_url);
+                apply(&mut sd.api_key_ref, subagent_api_key_ref);
+                roles.subagent_default =
+                    (sd.model.is_some() || sd.base_url.is_some() || sd.api_key_ref.is_some()).then_some(sd);
+                cfg.roles = roles.has_any().then_some(roles);
+            }
+            // Model→endpoint registry: each `--model-endpoint` is `model[,base_url=URL][,api_key_ref=…]`;
+            // a bare model id or `model,clear` removes the entry.
+            for spec in model_endpoint {
+                apply_model_endpoint(&mut cfg, &spec)?;
             }
             cli_config::save(&cfg)?;
             println!("{} {}", crate::ui::theme::ok("✓"), style("saved").color256(splash::ACCENT));
@@ -7553,6 +7797,27 @@ async fn run_agents(cmd: Option<AgentsCmd>) -> Result<()> {
         }
         Some(AgentsCmd::Enable { name, all }) => agents_set_enabled(name.as_deref(), all, true),
         Some(AgentsCmd::Disable { name, all }) => agents_set_enabled(name.as_deref(), all, false),
+        Some(AgentsCmd::SetModel { name, model, clear }) => {
+            let new_model = if clear {
+                None
+            } else {
+                match model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(m) => Some(m.to_string()),
+                    None => anyhow::bail!("pass a model id (or --clear to remove the pin)"),
+                }
+            };
+            let path = agents::set_model(&name, new_model.as_deref())?;
+            match &new_model {
+                Some(m) => println!(
+                    "{} pinned '{name}' to model {} ({})",
+                    crate::ui::theme::ok("✓"),
+                    style(m).color256(splash::ACCENT),
+                    path.display()
+                ),
+                None => println!("{} cleared the model pin on '{name}' ({})", crate::ui::theme::ok("✓"), path.display()),
+            }
+            Ok(())
+        }
     }
 }
 
@@ -8192,5 +8457,58 @@ mod tests {
         assert_eq!(extract_json_object(s2).unwrap(), s2);
         // no object
         assert!(extract_json_object("no json here").is_none());
+    }
+
+    #[test]
+    fn allocate_session_slug_never_reuses_an_existing_file() {
+        // Two brand-new chats on the same topic must land on DISTINCT files — the old shared-`last`
+        // collision is exactly what made `/sessions` show only the latest conversation.
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-slug-alloc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+
+        let h = vec![Message::system("s"), Message::user("fix the parser bug")];
+        let first = allocate_session_slug(&h);
+        // Simulate the first chat having been saved under that slug.
+        save_session(&h, &first).unwrap();
+        let second = allocate_session_slug(&h);
+        assert_ne!(first, second, "second chat on the same topic must not reuse the first's file");
+        assert!(!first.is_empty() && !second.is_empty());
+
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn exit_flush_persists_the_live_conversation_for_sessions() {
+        // The whole point of the fix: whatever is live at exit (even a turn the per-turn autosave
+        // never reached) is on disk and shows up in /sessions afterwards.
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-exit-flush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        // Start from a clean slug so this chat auto-names a fresh file.
+        set_session_slug(None);
+
+        let live = vec![Message::system("s"), Message::user("remember this across a window close")];
+        update_live_history(&live);
+        flush_live_session_on_exit();
+
+        // It must be discoverable and restorable via the same path /sessions uses.
+        let names = list_sessions();
+        assert!(!names.is_empty(), "exit flush left nothing in /sessions");
+        let slug = current_session_slug().expect("exit flush should have pinned a slug");
+        let mut restored = Vec::new();
+        let n = load_session(&mut restored, &slug, "opus-4-8").unwrap();
+        assert!(n >= 2, "restored conversation kept its messages");
+        assert!(
+            restored.iter().any(|m| m.content.as_deref() == Some("remember this across a window close")),
+            "the live user turn survived the exit flush"
+        );
+
+        set_session_slug(None);
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

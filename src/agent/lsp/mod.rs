@@ -55,6 +55,7 @@ pub struct SymbolEditPlan {
     pub end_line: usize,
     pub old_body: String,
     pub new_content: String,
+    pub base_fingerprint: crate::core::persist::FileFingerprint,
     pub kind: SymbolEditKind,
     pub symbol: String,
 }
@@ -311,7 +312,7 @@ impl LspManager {
         let body = new_body.to_string();
         let hint = anchor.is_file().then(|| anchor.to_path_buf());
         self.run_query(anchor, "symbolReplace", move |s| async move {
-            let (path, start, end, old, new_text) =
+            let (path, start, end, old, new_text, base_fingerprint) =
                 s.replace_symbol_body(hint.as_deref(), &sym, &body).await?;
             Ok(SymbolEditPlan {
                 path,
@@ -319,6 +320,7 @@ impl LspManager {
                 end_line: end,
                 old_body: old,
                 new_content: new_text,
+                base_fingerprint,
                 kind: SymbolEditKind::Replace,
                 symbol: sym,
             })
@@ -337,7 +339,7 @@ impl LspManager {
         let body = text.to_string();
         let hint = anchor.is_file().then(|| anchor.to_path_buf());
         self.run_query(anchor, "symbolInsert", move |s| async move {
-            let (path, at, new_text) =
+            let (path, at, new_text, base_fingerprint) =
                 s.insert_relative_to_symbol(hint.as_deref(), &sym, where_, &body).await?;
             Ok(SymbolEditPlan {
                 path,
@@ -345,6 +347,7 @@ impl LspManager {
                 end_line: at,
                 old_body: String::new(),
                 new_content: new_text,
+                base_fingerprint,
                 kind: match where_ {
                     InsertWhere::Before => SymbolEditKind::InsertBefore,
                     InsertWhere::After => SymbolEditKind::InsertAfter,

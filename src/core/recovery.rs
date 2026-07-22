@@ -318,17 +318,60 @@ fn quarantine(path: &Path) {
     let _ = fs::rename(path, q);
 }
 
-/// Accept one recovery offer: restore its conversation and delete the lease directory.
+/// Accept one recovery offer: restore its conversation and consume the lease directory exactly once.
 pub fn accept(offer: &RecoveryOffer) -> Result<(Vec<Message>, Option<String>)> {
-    let history = offer.history.clone();
-    let draft = offer.pending_draft.clone();
-    fs::remove_dir_all(&offer.path).with_context(|| format!("removing restored lease {}", offer.path.display()))?;
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path(&offer.path),
+        Duration::from_secs(1),
+    )?;
+    let raw = fs::read_to_string(manifest_path(&offer.path))
+        .with_context(|| format!("reading recovery offer {}", offer.path.display()))?;
+    let current: RecoveryManifest = serde_json::from_str(&raw).context("parsing recovery offer")?;
+    if current.run_id != offer.manifest.run_id
+        || current.sidecar_generation != offer.manifest.sidecar_generation
+        || current.updated_unix != offer.manifest.updated_unix
+    {
+        anyhow::bail!("recovery offer changed before it could be consumed; rescan and retry");
+    }
+    let history = read_authoritative_history(&offer.path, &current)?;
+    let draft = fs::read_to_string(draft_path(&offer.path, current.sidecar_generation))
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    consume_dir(&offer.path)?;
     Ok((history, draft))
 }
 
-/// Discard one recovery offer.
+/// Discard one recovery offer exactly once.
 pub fn discard(offer: &RecoveryOffer) -> Result<()> {
-    fs::remove_dir_all(&offer.path).with_context(|| format!("removing {}", offer.path.display()))?;
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path(&offer.path),
+        Duration::from_secs(1),
+    )?;
+    let raw = fs::read_to_string(manifest_path(&offer.path))
+        .with_context(|| format!("reading recovery offer {}", offer.path.display()))?;
+    let current: RecoveryManifest = serde_json::from_str(&raw).context("parsing recovery offer")?;
+    if current.run_id != offer.manifest.run_id || current.updated_unix != offer.manifest.updated_unix {
+        anyhow::bail!("recovery offer changed before it could be discarded; rescan and retry");
+    }
+    consume_dir(&offer.path)
+}
+
+fn read_authoritative_history(path: &Path, manifest: &RecoveryManifest) -> Result<Vec<Message>> {
+    let mut history: Vec<Message> = fs::read(history_path(path, manifest.sidecar_generation))
+        .with_context(|| format!("reading recovery history for run {}", manifest.run_id))
+        .and_then(|b| serde_json::from_slice(&b).context("parsing recovery history"))?;
+    if history.len() < manifest.safe_history_len {
+        anyhow::bail!("recovery history is incomplete; refusing to consume offer");
+    }
+    history.truncate(manifest.safe_history_len);
+    Ok(history)
+}
+
+fn consume_dir(path: &Path) -> Result<()> {
+    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("offer");
+    let consumed = recovery_root().join(format!("consumed-{stem}-{}", now_unix()));
+    fs::rename(path, &consumed).with_context(|| format!("consuming recovery lease {}", path.display()))?;
+    let _ = fs::remove_dir_all(consumed);
     Ok(())
 }
 

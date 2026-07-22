@@ -37,9 +37,15 @@ pub fn set_active(id: Option<ConversationId>) {
     *ACTIVE.write().unwrap_or_else(|e| e.into_inner()) = id;
 }
 
-/// The conversation currently being served, or a stable `"default"` identity when none is set (a
-/// single-shot CLI run). Never panics on a poisoned lock — reads through the poison.
+/// The conversation this turn serves. Prefers the thread-local [`crate::core::exec_ctx`] context
+/// pinned for the running turn — authoritative inside a tool body, which runs on a `spawn_blocking`
+/// worker thread where the process-global slot could otherwise reflect a DIFFERENT interleaved turn.
+/// Falls back to the process-global `ACTIVE` slot (the driver thread's view), then to a stable
+/// `"default"` identity when none is set (a single-shot CLI run). Never panics on a poisoned lock.
 pub fn active() -> ConversationId {
+    if let Some(ctx) = crate::core::exec_ctx::current() {
+        return ctx.conversation();
+    }
     ACTIVE
         .read()
         .unwrap_or_else(|e| e.into_inner())

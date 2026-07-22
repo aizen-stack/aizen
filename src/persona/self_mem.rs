@@ -182,11 +182,18 @@ fn write(persona_slug: &str, kind: Kind, importance: u8, body: &str) -> Result<S
     }
     let dir = self_dir(persona_slug);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let lock_path = crate::core::workspace_txn::store_lock("persona_self", persona_slug);
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        std::time::Duration::from_secs(5),
+    )?;
     let prefix = if kind == Kind::Insight { "in" } else { "ep" };
     let path = unique_path(&dir, prefix, body);
     let now = today();
-    fs::write(&path, render(kind, importance, &now, &now, body))
-        .with_context(|| format!("writing {}", path.display()))?;
+    crate::core::persist::atomic_write_owner_only(
+        &path,
+        render(kind, importance, &now, &now, body).as_bytes(),
+    )?;
     Ok(path.file_stem().and_then(|s| s.to_str()).unwrap_or("mem").to_string())
 }
 

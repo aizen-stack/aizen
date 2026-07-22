@@ -539,21 +539,37 @@ async fn run_one_task(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .and_then(crate::agents::load);
-    let (label, task_model, registry, system) = match &spec {
+    // Model precedence: per-task `model` > the specialist's `def.model` > the workflow default.
+    // The resolved model is then routed through the model-endpoint registry so a task pinned to
+    // another provider's model carries ITS gateway (base_url/api_key) — the caller it inherits from
+    // is the workflow's own endpoint, mirroring the `task` tool's `endpoint_for_model` routing.
+    let caller = crate::core::cli_config::ResolvedEndpoint {
+        base_url: base_url.to_string(),
+        api_key: api_key.to_string(),
+        model: model.to_string(),
+    };
+    let (label, ep, registry, system) = match &spec {
         Some(def) => {
             let m = task.model.as_deref().or(def.model.as_deref()).unwrap_or(model);
-            (def.slug(), m, agent_registry(def, root), build_agent_subagent_prompt(def, root, m, date, None))
+            let ep = crate::core::cli_config::endpoint_for_model(m, &caller);
+            let system = build_agent_subagent_prompt(def, root, &ep.model, date, None);
+            (def.slug(), ep, agent_registry(def, root), system)
         }
         None => {
             let m = task.model.as_deref().unwrap_or(model);
-            (task.role.clone(), m, role_registry(&task.role, root), build_subagent_prompt(&task.role, root, m, date, None))
+            let ep = crate::core::cli_config::endpoint_for_model(m, &caller);
+            let system = build_subagent_prompt(&task.role, root, &ep.model, date, None);
+            (task.role.clone(), ep, role_registry(&task.role, root), system)
         }
     };
 
     let client = http.clone();
-    let base = base_url.to_string();
-    let key = api_key.to_string();
-    let model_s = task_model.to_string();
+    let base = ep.base_url.clone();
+    let key = ep.api_key.clone();
+    let model_s = ep.model.clone();
+    // The result-model label (reported back in TaskOutcome) — a separate owned copy so the `move`
+    // chat closure below can consume `model_s` without leaving the outcome unable to name the model.
+    let result_model = ep.model.clone();
     let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| {
         let client = client.clone();
         let base = base.clone();
@@ -569,6 +585,10 @@ async fn run_one_task(
     let cfg = AgentConfig {
         approval_mode,
         cancel,
+        // Inherit the parent turn's conversation identity so a workflow child's tool bodies (e.g.
+        // browser) scope to the SAME conversation as the orchestrating turn. `default` on the CLI
+        // `run_workflow` path, which has no conversation thread — matching the pre-context behavior.
+        exec_ctx: crate::core::exec_ctx::current().unwrap_or_default(),
         quiet: true,
         enable_verify_gate: false,
         max_iters: CHILD_MAX_ITERS,
@@ -616,7 +636,7 @@ async fn run_one_task(
             TaskOutcome {
                 id: task.id.clone(),
                 role: label.clone(),
-                model: task_model.to_string(),
+                model: result_model.clone(),
                 status: status.to_string(),
                 summary: o.final_text.unwrap_or_else(|| {
                     if status == "cancelled" {
@@ -634,7 +654,7 @@ async fn run_one_task(
             TaskOutcome {
                 id: task.id.clone(),
                 role: label.clone(),
-                model: task_model.to_string(),
+                model: result_model.clone(),
                 status: "error".to_string(),
                 summary: format!("error: {e}"),
                 iters: 0,

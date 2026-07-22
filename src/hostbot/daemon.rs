@@ -111,8 +111,9 @@ fn chunk_text(s: &str, max: usize) -> Vec<String> {
     out
 }
 
-fn outbound_reply(raw: &str) -> String {
-    crate::ui::markdown::render_plain_blocks(raw)
+fn plain_outbound(raw: &str, max: usize) -> Vec<crate::hostbot::platform::Outbound> {
+    let shown = crate::ui::markdown::render_plain_blocks(raw);
+    chunk_text(&shown, max).into_iter().map(crate::hostbot::platform::Outbound::plain).collect()
 }
 
 /// Hard cap on messages retained in one serve session, so a long conversation can't grow without
@@ -148,8 +149,17 @@ async fn run_serve_turn(
     history: &mut Vec<Message>,
     task: &str,
     approval_mode: ApprovalMode,
+    platform_name: &str,
 ) -> Result<String> {
-    let bundle = crate::current_system_prompt_bundle(model);
+    let mut bundle = crate::current_system_prompt_bundle(model);
+    bundle.dynamic.push_str(&format!(
+        "\n<hostbot_surface platform=\"{platform_name}\">\n\
+         Format the final answer for a narrow mobile chat. Lead with the result; keep headings and\n\
+         paragraphs short; prefer bullets or compact key: value lists. Use tables only for genuinely\n\
+         multi-column data. Avoid wide diagrams, box drawing, decorative emoji, and repeated summaries.\n\
+         Keep Markdown code fences and URLs intact.\n\
+         </hostbot_surface>\n"
+    ));
     let lead = crate::agent::compact::leading_system_count(history);
     if lead < 2 {
         // Persisted legacy sessions had one flattened system prompt. Replace that stale prefix with
@@ -186,6 +196,10 @@ async fn run_serve_turn(
     let cfg = AgentConfig {
         approval_mode,
         cancel: turn_cancel,
+        // Seed the turn context from the conversation the daemon just pinned via `set_active`, so a
+        // tool body (e.g. the browser session registry) reads THIS chat's identity across the
+        // `spawn_blocking` hop rather than the process-global slot.
+        exec_ctx: crate::core::exec_ctx::ExecutionContext::new(crate::core::convo::active()),
         quiet: true,
         enable_verify_gate: false,
         context_window: crate::resolve_ctx_window(model).0,
@@ -266,8 +280,10 @@ async fn run_daemon<P: Platform>(platform: P) -> Result<()> {
             if let Some(reply) =
                 handle_command(&*platform, &name, &arg, &mut sessions, &route, chat, &mut model, &tx).await
             {
-                for piece in chunk_text(&reply, platform.message_max()) {
-                    let _ = platform.send(&route, chat, &piece).await;
+                let rendered = platform.render_reply(&reply);
+                let outbound = if rendered.is_empty() { plain_outbound(&reply, platform.message_max()) } else { rendered };
+                for piece in outbound {
+                    let _ = platform.send_outbound(&route, chat, &piece).await;
                 }
                 continue;
             }
@@ -281,7 +297,7 @@ async fn run_daemon<P: Platform>(platform: P) -> Result<()> {
         if task.is_empty() {
             continue;
         }
-        let _ = platform.send(&route, chat, "⏳ working…").await;
+        let status = platform.start_status(&route, chat).await.ok().flatten();
         // Pin the approval route to THIS bot+chat so a destructive-op prompt returns here (serial loop
         // ⇒ no race). No-op on platforms without inline approval (Discord) — those auto-deny + skip.
         if platform.supports_approval() {
@@ -300,9 +316,9 @@ async fn run_daemon<P: Platform>(platform: P) -> Result<()> {
             chat
         ))));
         let history = sessions.entry((route.clone(), chat)).or_default();
-        let reply = run_serve_turn(&http, &base_url, &api_key, &model, history, &task, approval)
-            .await
-            .unwrap_or_else(|e| format!("error: {e}"));
+        let turn = run_serve_turn(&http, &base_url, &api_key, &model, history, &task, approval, platform.name()).await;
+        let failed = turn.is_err();
+        let reply = turn.unwrap_or_else(|e| format!("error: {e}"));
         crate::persona::set_override(None);
         crate::core::convo::set_active(None);
         if platform.supports_approval() {
@@ -310,10 +326,17 @@ async fn run_daemon<P: Platform>(platform: P) -> Result<()> {
         }
         // Persist the updated history so a restart keeps this chat's context.
         let _ = store::save_session(platform.name(), &route, &chat.to_string(), history);
-        let shown = outbound_reply(&reply);
-        for piece in chunk_text(&shown, platform.message_max()) {
-            let _ = platform.send(&route, chat, &piece).await;
+        let rendered = platform.render_reply(&reply);
+        let outbound = if rendered.is_empty() { plain_outbound(&reply, platform.message_max()) } else { rendered };
+        let mut send_failed = false;
+        for piece in outbound {
+            if let Err(e) = platform.send_outbound(&route, chat, &piece).await {
+                eprintln!("[{}] reply send failed: {e}", platform.name());
+                send_failed = true;
+                break;
+            }
         }
+        let _ = platform.finish_status(&route, chat, status, failed || send_failed).await;
     }
 
     platform.shutdown();
@@ -689,7 +712,8 @@ mod tests {
     #[test]
     fn outbound_reply_stacks_tables_but_keeps_diagrams() {
         let raw = "| File | State |\n|---|---|\n| a.rs | done |\n\n```diagram\nA --> B\n```";
-        let shown = outbound_reply(raw);
+        let shown = plain_outbound(raw, 3500);
+        let shown = shown.iter().map(|o| o.text.as_str()).collect::<Vec<_>>().join("");
         assert!(shown.contains("File: a.rs\nState: done"), "{shown}");
         assert!(!shown.contains("|---|---|"), "{shown}");
         assert!(shown.contains("```diagram\nA --> B\n```"), "{shown}");

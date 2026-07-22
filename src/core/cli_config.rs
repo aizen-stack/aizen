@@ -236,6 +236,13 @@ pub struct CliConfig {
     /// cheap-fast for chores, stronger for review. Every field optional; unset ⇒ the main model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roles: Option<RolesConfig>,
+    /// Model → endpoint registry: when a sub-agent (or role) is pinned to a model name, we look it
+    /// up here to find the base_url/api_key that model actually lives on — so a specialist pinned to
+    /// e.g. `gpt-4o` runs on ITS gateway, not the parent's. Without a match, only the model name
+    /// changes and the endpoint stays the caller's (which only works when they share a gateway).
+    /// Keyed by exact model id. See [`endpoint_for_model`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_endpoints: Option<Vec<ModelEndpoint>>,
 }
 
 /// One role's endpoint override. Any subset of fields; the rest inherit the main endpoint.
@@ -263,6 +270,16 @@ pub struct RolesConfig {
     pub oracle: Option<RoleModelConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apply: Option<RoleModelConfig>,
+}
+
+impl RolesConfig {
+    /// Any role configured? Used to drop the whole `roles` object when its last sub-field is cleared.
+    pub fn has_any(&self) -> bool {
+        self.summarizer.is_some()
+            || self.subagent_default.is_some()
+            || self.oracle.is_some()
+            || self.apply.is_some()
+    }
 }
 
 /// A fully-resolved (base_url, api_key, model) triple for one call.
@@ -303,6 +320,68 @@ pub fn resolve_role(role: &str, main: &ResolvedEndpoint) -> ResolvedEndpoint {
             .or_else(|| rc.as_ref().and_then(key_from_ref))
             .unwrap_or_else(|| main.api_key.clone()),
     }
+}
+
+/// One entry in the model → endpoint registry. `model` is the exact model id a sub-agent/role can
+/// be pinned to; `base_url`/`api_key_ref` say where that model lives. Any field except `model` is
+/// optional — an absent field inherits the caller's endpoint (so a same-gateway alias needs only
+/// `model`). `api_key_ref` follows the `env:VAR` indirection convention (the key never touches disk).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ModelEndpoint {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// `env:VAR` (preferred — the key never touches disk) or a literal key (masked in displays).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_ref: Option<String>,
+}
+
+/// Resolve the full endpoint a `model` should run on: if the model-endpoint registry has an entry
+/// for it, that entry's base_url/api_key override `caller` (per field; absent fields inherit
+/// `caller`); otherwise only the model name changes and the endpoint stays `caller`. Env override:
+/// `NG_MODEL_<UPPER>_BASE_URL` / `NG_MODEL_<UPPER>_API_KEY` (the model id uppercased, non-alnum →
+/// `_`) wins over the config entry, matching `resolve_role`'s env-first precedence.
+///
+/// This is what makes "assign a model to a sub-agent" work across providers: the model carries its
+/// own gateway with it instead of being sent to the parent's.
+pub fn endpoint_for_model(model: &str, caller: &ResolvedEndpoint) -> ResolvedEndpoint {
+    let cfg = load();
+    let entry = cfg
+        .model_endpoints
+        .as_ref()
+        .and_then(|list| list.iter().find(|e| e.model == model).cloned());
+    // Env key: NG_MODEL_<sanitized-upper>_{BASE_URL,API_KEY}. Sanitize so `gpt-4o` → `GPT_4O`.
+    let up: String = model
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .collect();
+    let key_from_ref = |e: &ModelEndpoint| {
+        e.api_key_ref.as_ref().and_then(|k| match k.strip_prefix("env:") {
+            Some(var) => env_nonempty(var),
+            None => Some(k.clone()),
+        })
+    };
+    ResolvedEndpoint {
+        model: model.to_string(),
+        base_url: env_nonempty(&format!("NG_MODEL_{up}_BASE_URL"))
+            .or_else(|| entry.as_ref().and_then(|e| e.base_url.clone()))
+            .unwrap_or_else(|| caller.base_url.clone()),
+        api_key: env_nonempty(&format!("NG_MODEL_{up}_API_KEY"))
+            .or_else(|| entry.as_ref().and_then(key_from_ref))
+            .unwrap_or_else(|| caller.api_key.clone()),
+    }
+}
+
+/// The sub-agent's default endpoint: `roles.subagent_default` (env `NG_SUBAGENT_DEFAULT_*` >
+/// config > `main`), THEN routed through the model-endpoint registry so even the role-default model
+/// carries its own gateway. When `subagent_default` sets only `.model`, `endpoint_for_model` finds
+/// that model's endpoint; when it sets base_url/api_key too, those are the caller `endpoint_for_model`
+/// inherits from (registry entry for the same model can still override). The task tool uses this as
+/// its fallback endpoint (below an explicit `model` arg / a card's `def.model`, both of which route
+/// through `endpoint_for_model` themselves).
+pub fn subagent_endpoint(main: &ResolvedEndpoint) -> ResolvedEndpoint {
+    let role = resolve_role("subagent_default", main);
+    endpoint_for_model(&role.model, &role)
 }
 
 /// Is any override configured for `role` (config or env)? Consumers that should stay OFF without
@@ -600,9 +679,18 @@ pub fn load() -> CliConfig {
 /// tightened to owner-only (0600, and the home dir to 0700) on Unix — matching the OAuth/MCP token
 /// caches. No-op on Windows (user-profile ACL governs).
 pub fn save(cfg: &CliConfig) -> Result<()> {
+    let path = config_path();
+    let lock_path = crate::core::workspace_txn::store_lock("cli_config", "global");
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        std::time::Duration::from_secs(5),
+    )?;
+    save_unlocked(cfg, &path)
+}
+
+fn save_unlocked(cfg: &CliConfig, path: &std::path::Path) -> Result<()> {
     let mut canonical = cfg.clone();
     canonical.normalize_approval();
-    let path = config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -681,6 +769,107 @@ mod tests {
         std::env::remove_var("NG_SUMMARIZER_MODEL");
         std::env::remove_var("NEXTGEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn model_endpoint_registry_routes_endpoint_with_model() {
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ng-mep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("NEXTGEN_HOME", &dir);
+        let caller = ResolvedEndpoint {
+            base_url: "https://parent/v1".into(),
+            api_key: "parent-key".into(),
+            model: "parent-model".into(),
+        };
+        // No registry entry → only the model name changes; endpoint stays the caller's.
+        let r = endpoint_for_model("gpt-4o", &caller);
+        assert_eq!(r.model, "gpt-4o");
+        assert_eq!(r.base_url, "https://parent/v1", "no entry ⇒ caller's endpoint");
+        assert_eq!(r.api_key, "parent-key");
+        // Register gpt-4o on its own gateway with an env-indirected key.
+        save(&CliConfig {
+            model_endpoints: Some(vec![ModelEndpoint {
+                model: "gpt-4o".into(),
+                base_url: Some("https://openai/v1".into()),
+                api_key_ref: Some("env:NG_TEST_OAI_KEY".into()),
+            }]),
+            ..Default::default()
+        })
+        .unwrap();
+        std::env::set_var("NG_TEST_OAI_KEY", "oai-secret");
+        let r = endpoint_for_model("gpt-4o", &caller);
+        assert_eq!(
+            (r.model.as_str(), r.base_url.as_str(), r.api_key.as_str()),
+            ("gpt-4o", "https://openai/v1", "oai-secret"),
+            "the model carries its own gateway + key"
+        );
+        // A model with no entry still inherits the caller (registry is per-model, not global).
+        assert_eq!(endpoint_for_model("other", &caller).base_url, "https://parent/v1");
+        std::env::remove_var("NG_TEST_OAI_KEY");
+        // Env override: NG_MODEL_<sanitized-upper>_BASE_URL beats the config entry.
+        std::env::set_var("NG_MODEL_GPT_4O_BASE_URL", "https://env-override/v1");
+        assert_eq!(endpoint_for_model("gpt-4o", &caller).base_url, "https://env-override/v1");
+        std::env::remove_var("NG_MODEL_GPT_4O_BASE_URL");
+        std::env::remove_var("NEXTGEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subagent_endpoint_folds_role_default_through_registry() {
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ng-subep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("NEXTGEN_HOME", &dir);
+        let main = ResolvedEndpoint {
+            base_url: "https://parent/v1".into(),
+            api_key: "parent-key".into(),
+            model: "parent-model".into(),
+        };
+        // No config → the sub-agent default is just the parent endpoint.
+        let r = subagent_endpoint(&main);
+        assert_eq!(
+            (r.model.as_str(), r.base_url.as_str()),
+            ("parent-model", "https://parent/v1")
+        );
+        // roles.subagent_default pins ONLY a model; the model-endpoint registry supplies its gateway.
+        save(&CliConfig {
+            roles: Some(RolesConfig {
+                subagent_default: Some(RoleModelConfig {
+                    model: Some("cheap-fast".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            model_endpoints: Some(vec![ModelEndpoint {
+                model: "cheap-fast".into(),
+                base_url: Some("https://cheap/v1".into()),
+                api_key_ref: Some("cheap-literal-key".into()),
+            }]),
+            ..Default::default()
+        })
+        .unwrap();
+        let r = subagent_endpoint(&main);
+        assert_eq!(
+            (r.model.as_str(), r.base_url.as_str(), r.api_key.as_str()),
+            ("cheap-fast", "https://cheap/v1", "cheap-literal-key"),
+            "role-default model is routed through the registry to carry its own gateway"
+        );
+        std::env::remove_var("NEXTGEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roles_config_has_any_detects_empty() {
+        assert!(!RolesConfig::default().has_any());
+        assert!(RolesConfig {
+            subagent_default: Some(RoleModelConfig {
+                model: Some("m".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .has_any());
     }
 
     #[test]

@@ -632,18 +632,13 @@ pub fn record_retrieval(entry: &MemoryEntry, today: &str) -> Result<bool> {
 /// processes (or threads) writing the same entry never collide on a shared `.entry.md.tmp` and
 /// clobber each other's rename. (P4 adds advisory locking + drift check.)
 pub(crate) fn write_atomic(path: &Path, content: &str) -> Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let dir = path.parent().context("memory path has no parent")?;
-    let tmp = dir.join(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("entry"),
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::write(&tmp, content).with_context(|| format!("writing temp {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
-    Ok(())
+    let key = path.to_string_lossy();
+    let lock_path = crate::core::workspace_txn::store_lock("memory_entry", &key);
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        std::time::Duration::from_secs(5),
+    )?;
+    crate::core::persist::atomic_write(path, content.as_bytes())
 }
 
 #[cfg(test)]

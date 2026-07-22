@@ -21,7 +21,7 @@ use tokio::sync::mpsc::{self, Sender};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::core::cli_config::{self, DiscordConfig};
-use crate::hostbot::platform::{Inbound, Platform};
+use crate::hostbot::platform::{Inbound, Outbound, Platform};
 
 const API_BASE: &str = "https://discord.com/api/v10";
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -353,6 +353,11 @@ impl Platform for DiscordPlatform {
         Ok(())
     }
 
+    fn render_reply(&self, raw: &str) -> Vec<Outbound> {
+        let shown = crate::ui::markdown::render_plain_blocks(raw);
+        chunk_plain(&shown, MESSAGE_MAX).into_iter().map(Outbound::plain).collect()
+    }
+
     async fn send(&self, _route: &str, chat: u64, text: &str) -> Result<()> {
         self.client.send_message(chat, text).await
     }
@@ -362,6 +367,24 @@ impl Platform for DiscordPlatform {
             gw.abort();
         }
     }
+}
+
+fn chunk_plain(s: &str, max: usize) -> Vec<String> {
+    if s.encode_utf16().count() <= max { return vec![s.to_string()]; }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut units = 0usize;
+    for ch in s.chars() {
+        let u = ch.len_utf16();
+        if units + u > max && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            units = 0;
+        }
+        cur.push(ch);
+        units += u;
+    }
+    if !cur.is_empty() { out.push(cur); }
+    out
 }
 
 #[cfg(test)]

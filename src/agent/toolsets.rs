@@ -111,7 +111,7 @@ pub fn classify_tool(name: &str) -> Option<&'static str> {
         "task" | "workflow" => Some("delegation"),
         "todo_write" => Some("todo"),
         "clarify" => Some("clarify"),
-        "checkpoint" | "checkpoint_rewind" => Some("checkpoint"),
+        "checkpoint" | "checkpoint_rewind" | "checkpoint_list" | "checkpoint_restore" => Some("checkpoint"),
         "telegram_send" | "telegram_ask" | "notify" => Some("messaging"),
         "persona_create" => Some("persona"),
         "lsp_references"

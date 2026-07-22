@@ -5,6 +5,20 @@ All notable changes to **Aizen** (`aizen`, alias `ng`) — the pure-Rust agentic
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
+## [Unreleased]
+
+### Changed
+- **Telegram replies are now native, compact HTML instead of raw Markdown** — headings, emphasis,
+  inline/fenced code, safe links, lists and quotes use Telegram's supported formatting; Markdown
+  tables become narrow stacked records rather than raw pipes or terminal boxes. Rendering is parsed
+  with the existing pure-Rust Markdown engine, escapes raw HTML/unsafe links, chunks only at balanced
+  block boundaries, and retries once as equivalent plain text if Telegram rejects rich markup.
+- **Telegram working status no longer clutters the chat** — a single `✦ Đang xử lý…` message is
+  deleted after the final reply is delivered (or edited to a concise success/error state when delete
+  or delivery fails). Hostbot turns also receive a mobile-only response contract: lead with the result,
+  keep paragraphs/headings short, prefer bullets, and avoid wide diagrams or decorative repetition.
+  Discord remains plain text in this scope.
+
 ## [0.4.4] — 2026-07-22
 
 ### Changed

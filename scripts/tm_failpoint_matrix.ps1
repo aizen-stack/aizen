@@ -253,6 +253,87 @@ try {
   Assert-True ($r.Exit -eq 0) "clear ok"
   $r = Invoke-Aizen $repo10 $h10 @("time","list")
   Assert-True ($r.Exit -eq 0) "list after clear ok"
+
+  # ---------- 11. linked worktree gc preserves sibling refs ----------
+  # Two linked worktrees share ONE private store. A gc from worktree A sweeps the whole
+  # `refs/ng/tm/**` namespace but must NOT reap worktree B's live checkpoint refs. This
+  # exercises the store-exclusive lease + the foreign-worktree guard in doctor_gc.
+  Write-Host "`n== 11 linked worktree gc keeps sibling refs =="
+  $h11 = Join-Path $base "h11"
+  New-Item -ItemType Directory -Path $h11 | Out-Null
+  $repo11 = New-TmpRepo (Join-Path $base "r11")
+  $wt11 = Join-Path $base "r11-wt"
+  Push-Location $repo11
+  & $git worktree add -q $wt11 2>&1 | Out-Null
+  Pop-Location
+  if (Test-Path $wt11) {
+    # Each worktree saves its own checkpoint into the shared store (distinct worktree ids).
+    Set-Content -Path (Join-Path $repo11 "file.txt") -Value "main-wt" -Encoding ascii -NoNewline
+    $null = Invoke-Aizen $repo11 $h11 @("time","save","from-main")
+    Set-Content -Path (Join-Path $wt11 "file.txt") -Value "linked-wt" -Encoding ascii -NoNewline
+    $null = Invoke-Aizen $wt11 $h11 @("time","save","from-linked")
+    $store11 = Get-ChildItem -Path (Join-Path $h11 "timemachine") -Recurse -Directory -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -eq "store.git" } | Select-Object -First 1
+    $wtPrefixes = @()
+    if ($store11) {
+      $wtPrefixes = Get-ChildItem -Path (Join-Path $store11.FullName "refs\ng\tm") -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "wt-*" }
+    }
+    Assert-True ($wtPrefixes.Count -ge 2) "two worktree ref namespaces in shared store ($($wtPrefixes.Count))"
+    # gc from the MAIN worktree — the linked worktree's live checkpoint must survive.
+    $r = Invoke-Aizen $repo11 $h11 @("time","gc")
+    Assert-True ($r.Exit -eq 0) "gc from main worktree ok"
+    $r = Invoke-Aizen $wt11 $h11 @("time","list")
+    Assert-True ($r.Exit -eq 0 -and $r.Out -match "from-linked") "linked worktree checkpoint survives sibling gc"
+    # And its restore still works (ref + object intact).
+    Set-Content -Path (Join-Path $wt11 "file.txt") -Value "dirty" -Encoding ascii -NoNewline
+    $null = Invoke-Aizen $wt11 $h11 @("time","restore","1")
+    $c = [System.IO.File]::ReadAllText((Join-Path $wt11 "file.txt")).Trim()
+    Assert-True ($c -eq "linked-wt") "linked worktree restore after sibling gc"
+    Push-Location $repo11
+    & $git worktree remove --force $wt11 2>&1 | Out-Null
+    Pop-Location
+  } else {
+    Assert-True $false "git worktree add failed (skipping linked-worktree gc probe)"
+  }
+
+  # ---------- 12. concurrent restore + save serialize (store-shared lease) ----------
+  # Ref-mutating ops take the store lock SHARED, so sibling processes still serialize on the
+  # per-worktree metadata lock. Racing a restore against saves must never corrupt the ledger:
+  # every op exits cleanly and the timeline stays readable.
+  Write-Host "`n== 12 concurrent restore/save serialize =="
+  $h12 = Join-Path $base "h12"
+  New-Item -ItemType Directory -Path $h12 | Out-Null
+  $repo12 = New-TmpRepo (Join-Path $base "r12")
+  $null = Invoke-Aizen $repo12 $h12 @("time","save","base")
+  Set-Content -Path (Join-Path $repo12 "file.txt") -Value "v2" -Encoding ascii -NoNewline
+  $null = Invoke-Aizen $repo12 $h12 @("time","save","second")
+  $jobs12 = @()
+  1..4 | ForEach-Object {
+    $i = $_
+    $jobs12 += Start-Job -ScriptBlock {
+      param($az, $repo, $aizenHomeDir, $i)
+      $env:AIZEN_HOME = $aizenHomeDir
+      $env:NEXTGEN_HOME = $aizenHomeDir
+      $env:Path = "C:\Users\admin\.rustup\toolchains\stable-x86_64-pc-windows-gnu\bin;C:\Program Files\Git\cmd;" + $env:Path
+      Set-Location $repo
+      if ($i % 2 -eq 0) {
+        & $az time restore 1 2>&1 | Out-String | Out-Null
+      } else {
+        Set-Content -Path "file.txt" -Value ("s$i-" + [guid]::NewGuid().ToString("n")) -Encoding ascii -NoNewline
+        & $az time save "race$i" 2>&1 | Out-String | Out-Null
+      }
+      return $LASTEXITCODE
+    } -ArgumentList $aizen, $repo12, $h12, $i
+  }
+  $codes12 = $jobs12 | Wait-Job | Receive-Job
+  $jobs12 | Remove-Job -Force
+  $ok12 = @($codes12 | Where-Object { $_ -eq 0 }).Count
+  Assert-True ($ok12 -ge 3) "most concurrent restore/save ops succeed ($ok12/4)"
+  $r = Invoke-Aizen $repo12 $h12 @("time","list")
+  Assert-True ($r.Exit -eq 0) "ledger readable after concurrent restore/save"
+  $r = Invoke-Aizen $repo12 $h12 @("time","doctor")
+  Assert-True ($r.Exit -eq 0) "doctor healthy after concurrent restore/save"
 } finally {
   if (Test-Path -LiteralPath $base) {
     Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue

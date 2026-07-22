@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent::tools::Tool;
 use crate::core::cli_config::{self, TelegramConfig};
-use crate::hostbot::platform::{BotInfo, Inbound, Platform};
+use crate::hostbot::platform::{BotInfo, Inbound, Outbound, Platform, StatusHandle};
 use crate::hostbot::store;
 
 const API_BASE: &str = "https://api.telegram.org/bot";
@@ -100,7 +100,11 @@ impl Client {
             .json(&body)
             .send()
             .await
-            .with_context(|| format!("telegram {method} request failed"))?;
+            .map_err(|e| {
+                // reqwest errors can include the request URL, and Telegram embeds the bot token there.
+                let kind = if e.is_timeout() { "timeout" } else if e.is_connect() { "connection" } else { "transport" };
+                anyhow::anyhow!("telegram {method} request failed ({kind})")
+            })?;
         let v: Value = resp.json().await.with_context(|| format!("parsing {method} response"))?;
         if !v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
             let desc = v.get("description").and_then(|d| d.as_str()).unwrap_or("unknown error");
@@ -138,6 +142,15 @@ impl Client {
         .await
     }
 
+    /// Telegram-native HTML. The platform send path retries the renderer's plain fallback on error.
+    pub async fn send_html(&self, chat_id: i64, html: &str) -> Result<Message> {
+        self.call(
+            "sendMessage",
+            json!({"chat_id": chat_id, "text": html, "parse_mode": "HTML", "disable_web_page_preview": true}),
+        )
+        .await
+    }
+
     /// Send a message with a single inline-keyboard row of (label, callback_data) buttons.
     pub async fn send_keyboard(&self, chat_id: i64, text: &str, buttons: &[(&str, String)]) -> Result<Message> {
         let row: Vec<Value> =
@@ -160,6 +173,11 @@ impl Client {
         let _: Value = self
             .call("editMessageText", json!({"chat_id": chat_id, "message_id": message_id, "text": text}))
             .await?;
+        Ok(())
+    }
+
+    pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        let _: Value = self.call("deleteMessage", json!({"chat_id": chat_id, "message_id": message_id})).await?;
         Ok(())
     }
 
@@ -488,6 +506,15 @@ impl TelegramPlatform {
             menu,
         })
     }
+
+    fn route_client(&self, route: &str) -> Result<Arc<Client>> {
+        self.bots
+            .lock()
+            .unwrap()
+            .get(route)
+            .map(|h| h.client.clone())
+            .with_context(|| format!("no hosted bot named '{route}'"))
+    }
 }
 
 /// A short pairing code from process id + nanos (no rng crate — same posture as `next_approval_id`).
@@ -533,7 +560,18 @@ async fn spawn_bot(
     let cmds: Vec<(&str, &str)> = menu.iter().map(|(c, d)| (c.as_str(), d.as_str())).collect();
     let _ = client.set_my_commands(&cmds).await;
     let client = Arc::new(client);
-    let poll = spawn_bot_poll(name.clone(), client.clone(), allowed.clone(), pairing, tx.clone());
+    let lock_path = crate::core::workspace_txn::resource_lock("telegram", &token);
+    let poll_lock = match crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        Duration::from_millis(100),
+    ) {
+        Ok(lock) => lock,
+        Err(_) => {
+            eprintln!("[telegram] bot poller already owned by another Aizen process; refusing duplicate getUpdates");
+            return "busy".to_string();
+        }
+    };
+    let poll = spawn_bot_poll(name.clone(), client.clone(), allowed.clone(), pairing, tx.clone(), poll_lock);
     bots.lock().unwrap().insert(
         name.clone(),
         BotHandle { client, token, username: username.clone(), allowed, persona, poll },
@@ -555,6 +593,7 @@ fn spawn_bot_poll(
     allowed: Arc<Mutex<Vec<i64>>>,
     pairing: Option<String>,
     tx: Sender<Inbound<i64>>,
+    _poll_lock: crate::core::repo_lock::RepoTxnLock,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut offset = client.backlog_offset().await;
@@ -619,15 +658,16 @@ fn spawn_bot_poll(
 
 /// Append/replace a hosted-bot entry in `bots.json` (token stored, allowlist inherited, no persona).
 fn add_bot_entry(name: &str, token: &str) -> Result<()> {
-    let mut list = store::load_bots();
-    list.retain(|b| b.name != name);
-    list.push(store::HostedBot {
-        name: name.to_string(),
-        token: Some(token.to_string()),
-        allowed_chat_ids: Vec::new(), // empty ⇒ inherit the primary's allowlist
-        persona: None,
-    });
-    store::save_bots(&list)
+    store::update_bots(|list| {
+        list.retain(|b| b.name != name);
+        list.push(store::HostedBot {
+            name: name.to_string(),
+            token: Some(token.to_string()),
+            allowed_chat_ids: Vec::new(),
+            persona: None,
+        });
+        Ok(())
+    })
 }
 
 /// Validate `token`, persist it, then hot-spawn the bot into the running daemon. Shared by
@@ -671,9 +711,10 @@ async fn do_remove_bot(bots: &Arc<Mutex<HashMap<String, BotHandle>>>, name: &str
     match handle {
         Some(h) => {
             h.poll.abort();
-            let mut list = store::load_bots();
-            list.retain(|b| b.name != name);
-            let _ = store::save_bots(&list);
+            let _ = store::update_bots(|list| {
+                list.retain(|b| b.name != name);
+                Ok(())
+            });
             store::drop_route_sessions("telegram", name);
             Ok(())
         }
@@ -701,12 +742,13 @@ fn do_set_persona(bots: &Arc<Mutex<HashMap<String, BotHandle>>>, name: &str, per
         h.persona = persona.clone();
     }
     // Update (or create) the persisted entry so it survives a restart.
-    let mut list = store::load_bots();
-    match list.iter_mut().find(|b| b.name == name) {
-        Some(b) => b.persona = persona,
-        None => bail!("no bot named \"{name}\" (see the bot list)."),
-    }
-    store::save_bots(&list)
+    store::update_bots(|list| {
+        match list.iter_mut().find(|b| b.name == name) {
+            Some(b) => b.persona = persona,
+            None => bail!("no bot named \"{name}\" (see the bot list)."),
+        }
+        Ok(())
+    })
 }
 
 impl Platform for TelegramPlatform {
@@ -773,14 +815,45 @@ impl Platform for TelegramPlatform {
         Ok(())
     }
 
+    fn render_reply(&self, raw: &str) -> Vec<Outbound> {
+        crate::ui::channel_markdown::render_telegram_chunks(raw, self.message_max())
+            .into_iter()
+            .map(|chunk| Outbound { text: chunk.html, fallback: chunk.plain, rich: true })
+            .collect()
+    }
+
+    async fn send_outbound(&self, route: &str, chat: i64, outbound: &Outbound) -> Result<()> {
+        let client = self.route_client(route)?;
+        if outbound.rich {
+            match client.send_html(chat, &outbound.text).await {
+                Ok(_) => return Ok(()),
+                Err(e) => eprintln!("[telegram] rich reply rejected; retrying plain: {e}"),
+            }
+        }
+        client.send_message(chat, &outbound.fallback).await?;
+        Ok(())
+    }
+
+    async fn start_status(&self, route: &str, chat: i64) -> Result<Option<StatusHandle>> {
+        let client = self.route_client(route)?;
+        let msg = client.send_message(chat, "✦ Đang xử lý…").await?;
+        Ok(Some(StatusHandle(msg.message_id)))
+    }
+
+    async fn finish_status(&self, route: &str, chat: i64, status: Option<StatusHandle>, failed: bool) -> Result<()> {
+        let Some(StatusHandle(message_id)) = status else { return Ok(()) };
+        let client = self.route_client(route)?;
+        if failed {
+            return client.edit_text(chat, message_id, "⚠ Không thể hoàn tất").await;
+        }
+        if client.delete_message(chat, message_id).await.is_err() {
+            client.edit_text(chat, message_id, "✓ Hoàn tất").await?;
+        }
+        Ok(())
+    }
+
     async fn send(&self, route: &str, chat: i64, text: &str) -> Result<()> {
-        // Clone the Arc out under the lock, then release it BEFORE the await (never hold a std::Mutex
-        // across an await point).
-        let client = {
-            let bots = self.bots.lock().unwrap();
-            bots.get(route).map(|h| h.client.clone())
-        };
-        let client = client.with_context(|| format!("no hosted bot named '{route}'"))?;
+        let client = self.route_client(route)?;
         client.send_message(chat, text).await?;
         Ok(())
     }
@@ -892,13 +965,14 @@ async fn admin_remove_bot(name: &str) -> Result<String> {
             if name == "default" {
                 bail!("cannot remove the primary bot.");
             }
-            let mut list = store::load_bots();
-            let before = list.len();
-            list.retain(|b| b.name != name);
-            if list.len() == before {
+            let removed = store::update_bots(|list| {
+                let before = list.len();
+                list.retain(|b| b.name != name);
+                Ok(list.len() != before)
+            })?;
+            if !removed {
                 bail!("no bot named \"{name}\" in the saved list.");
             }
-            store::save_bots(&list)?;
             store::drop_route_sessions("telegram", name);
             Ok(format!("removed \"{name}\" from the saved list"))
         }
@@ -919,12 +993,13 @@ fn admin_set_persona(name: &str, persona: Option<String>) -> Result<String> {
         Some(bots) => do_set_persona(&bots, name, persona.clone())?,
         None => {
             // No live daemon: edit the persisted entry directly.
-            let mut list = store::load_bots();
-            match list.iter_mut().find(|b| b.name == name) {
-                Some(b) => b.persona = persona.clone(),
-                None => bail!("no bot named \"{name}\" in the saved list."),
-            }
-            store::save_bots(&list)?;
+            store::update_bots(|list| {
+                match list.iter_mut().find(|b| b.name == name) {
+                    Some(b) => b.persona = persona.clone(),
+                    None => bail!("no bot named \"{name}\" in the saved list."),
+                }
+                Ok(())
+            })?;
         }
     }
     store::drop_route_sessions("telegram", name);

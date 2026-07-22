@@ -166,6 +166,21 @@ fn save_trust(t: &TrustStore) -> Result<()> {
     Ok(())
 }
 
+/// Serialize a trust-store read-modify-write under the shared store lock, RELOADING the authoritative
+/// bytes inside the lock so two windows toggling trust for different roots can't lose each other's
+/// change (the old load→mutate→save had a cross-process lost-update window). The mutator runs against
+/// the freshly reloaded store; its result is persisted while the lock is still held.
+fn update_trust(mutate: impl FnOnce(&mut TrustStore)) -> Result<()> {
+    let lock_path = crate::core::workspace_txn::store_lock("mcp-trust", "trust");
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        std::time::Duration::from_secs(5),
+    )?;
+    let mut t = load_trust();
+    mutate(&mut t);
+    save_trust(&t)
+}
+
 /// Canonical string key for the current project root (best-effort canonicalization).
 fn project_key() -> String {
     let root = crate::core::config::project_root();
@@ -181,31 +196,31 @@ pub fn project_trusted() -> bool {
 /// Trust the current repo's project MCP servers (idempotent; clears any prior dismissal).
 pub fn trust_project() -> Result<()> {
     let key = project_key();
-    let mut t = load_trust();
-    t.dismissed.retain(|d| *d != key);
-    if !t.trusted.iter().any(|x| *x == key) {
-        t.trusted.push(key);
-    }
-    save_trust(&t)
+    update_trust(|t| {
+        t.dismissed.retain(|d| *d != key);
+        if !t.trusted.iter().any(|x| *x == key) {
+            t.trusted.push(key.clone());
+        }
+    })
 }
 
 /// Stop trusting the current repo (and forget any dismissal so it can be re-decided).
 pub fn untrust_project() -> Result<()> {
     let key = project_key();
-    let mut t = load_trust();
-    t.trusted.retain(|x| *x != key);
-    t.dismissed.retain(|d| *d != key);
-    save_trust(&t)
+    update_trust(|t| {
+        t.trusted.retain(|x| *x != key);
+        t.dismissed.retain(|d| *d != key);
+    })
 }
 
 /// Record that the user declined to trust this repo (so we don't nag again this/next launch).
 pub fn dismiss_project() -> Result<()> {
     let key = project_key();
-    let mut t = load_trust();
-    if !t.dismissed.iter().any(|x| *x == key) {
-        t.dismissed.push(key);
-    }
-    save_trust(&t)
+    update_trust(|t| {
+        if !t.dismissed.iter().any(|x| *x == key) {
+            t.dismissed.push(key.clone());
+        }
+    })
 }
 
 /// For the interactive entry: how many project MCP servers await a trust decision. `Some(n)` only

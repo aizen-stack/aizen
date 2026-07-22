@@ -364,6 +364,11 @@ pub struct AgentConfig {
     /// Turn-scoped cooperative cancellation. Top-level turns create a fresh token; delegated
     /// task/workflow children inherit it so Esc fans out without affecting unrelated turns.
     pub cancel: crate::core::cancel::TurnCancel,
+    /// Turn-scoped execution context (conversation identity, and — over time — the other per-turn
+    /// facts a tool body needs). Seeded into a thread-local INSIDE the `spawn_blocking` closure
+    /// alongside `cancel`, so tool bodies read this turn's identity instead of whatever the driver
+    /// thread last set process-globally. Delegated children inherit the parent's context.
+    pub exec_ctx: crate::core::exec_ctx::ExecutionContext,
     /// Suppress the stderr progress trace (tests set this).
     pub quiet: bool,
     /// Run a fast typecheck/build (cargo check / tsc) once after an editing run, before
@@ -464,6 +469,7 @@ impl Default for AgentConfig {
             max_fetch_result_chars: 12_000,
             approval_mode: crate::core::approval::ApprovalMode::Ask,
             cancel: crate::core::cancel::TurnCancel::new(),
+            exec_ctx: crate::core::exec_ctx::ExecutionContext::default(),
             quiet: false,
             enable_verify_gate: true,
             verify_gate_timeout_secs: 90,
@@ -665,6 +671,7 @@ where
     // Operation-scoped checkpoint latch: set only after a pre-edit checkpoint succeeds. Approval is
     // evaluated first; a declined call must never run Git hooks/filters or mutate recovery metadata.
     let mut auto_checkpointed = false;
+    let mut writer_lease: Option<crate::core::workspace_txn::WorkspaceWriterLease> = None;
     crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::WaitingModel);
     let mut self_review_done = false;
     let mut context_warned = false;
@@ -1238,6 +1245,7 @@ where
             &mut messages[base..],
             eager,
             &mut auto_checkpointed,
+            &mut writer_lease,
         )
         .await;
         crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::WaitingModel);
@@ -1265,9 +1273,19 @@ where
                             ));
                         }
                     }
+                    // No work tree at all is not a failure — it mirrors the pre-edit path, which
+                    // reports "checkpoint unavailable: not a git repository" and moves on. Only a
+                    // REAL failure (dubious ownership, a corrupt store, a locked ref) is worth a
+                    // cry-wolf warning, and it must carry git's own cause (`{e:#}` = full chain),
+                    // not the swallowed top-level context.
+                    Err(e) if e.to_string().contains("not a git repository") => {
+                        if !cfg.quiet {
+                            emit_trace("  └ checkpoint unavailable: not a git repository");
+                        }
+                    }
                     Err(e) => {
                         emit_trace(&format!(
-                            "  └ warning: post-edit checkpoint failed; the latest change may not be independently rewindable: {e}"
+                            "  └ warning: post-edit checkpoint failed; the latest change may not be independently rewindable: {e:#}"
                         ));
                     }
                 }
@@ -1496,6 +1514,7 @@ async fn execute_calls(
     sink: &mut [Message],
     eager: Vec<(usize, tokio::task::JoinHandle<String>)>,
     auto_checkpointed: &mut bool,
+    writer_lease: &mut Option<crate::core::workspace_txn::WorkspaceWriterLease>,
 ) -> Vec<(String, String)> {
     debug_assert_eq!(sink.len(), calls.len(), "one pre-filled placeholder per call");
     // Eager starts from the streaming path, keyed by position — adopted instead of re-spawned.
@@ -1562,9 +1581,12 @@ async fn execute_calls(
                         let max = cfg.max_tool_result_chars;
                         let max_fetch = cfg.max_fetch_result_chars;
                         let cancel = cfg.cancel.clone();
+                        let exec_ctx = cfg.exec_ctx.clone();
                         (k, tokio::task::spawn_blocking(move || {
                             crate::core::cancel::with_current(cancel, || {
-                                run_tool_body(tool, &args, quiet, max, max_fetch)
+                                crate::core::exec_ctx::with_current(exec_ctx, || {
+                                    run_tool_body(tool, &args, quiet, max, max_fetch)
+                                })
                             })
                         }))
                     })
@@ -1610,10 +1632,39 @@ async fn execute_calls(
                         Some(denied) => denied,
                         None => {
                             let effect = tool.workspace_effect(args);
+                            let lease_error = if writer_lease.is_none()
+                                && (matches!(
+                                    effect,
+                                    crate::agent::tools::WorkspaceEffect::Paths
+                                        | crate::agent::tools::WorkspaceEffect::OpaqueWorkspace
+                                ) || tool.name() == "checkpoint_rewind")
+                            {
+                                let cwd = std::env::current_dir()
+                                    .and_then(|p| p.canonicalize())
+                                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                                match crate::core::workspace_txn::WorkspaceWriterLease::acquire(
+                                    &cwd,
+                                    std::time::Duration::from_secs(5),
+                                    Some(&cfg.cancel),
+                                    tool.name(),
+                                ) {
+                                    Ok(lease) => {
+                                        *writer_lease = Some(lease);
+                                        None
+                                    }
+                                    Err(e) => Some(format!(
+                                        "error: workspace writer lease was not acquired: {e}"
+                                    )),
+                                }
+                            } else {
+                                None
+                            };
                             // `checkpoint_rewind` IS the recovery path — never nest a pre-edit
                             // snapshot of the broken tree before undoing it.
                             let skip_pre_checkpoint = tool.name() == "checkpoint_rewind";
-                            let checkpoint_error = if skip_pre_checkpoint {
+                            let checkpoint_error = if let Some(error) = lease_error {
+                                Some(error)
+                            } else if skip_pre_checkpoint {
                                 None
                             } else if matches!(effect, crate::agent::tools::WorkspaceEffect::External) {
                                 Some(
@@ -1624,33 +1675,28 @@ async fn execute_calls(
                                 && !*auto_checkpointed
                                 && effect.needs_checkpoint()
                             {
-                                match crate::features::timemachine::preflight_protected_change() {
-                                    Ok(false) => {
+                                match crate::features::timemachine::save_protected_change("before agent edits") {
+                                    Ok(None) => {
                                         if !cfg.quiet {
                                             emit_trace("→ checkpoint unavailable: not a git repository");
                                         }
                                         None
                                     }
-                                    Err(e) => Some(format!(
-                                        "error: protected workspace change was not run because Time Machine preflight failed: {e}"
-                                    )),
-                                    Ok(true) => match crate::features::timemachine::save("before agent edits", true) {
-                                        Ok(snap) => {
-                                            *auto_checkpointed = true;
-                                            crate::features::timemachine::note_pre_edit(snap.id);
-                                            crate::core::recovery::set_checkpoint(Some(snap.id));
-                                            if !cfg.quiet {
-                                                emit_trace(&format!(
-                                                    "→ checkpoint #{} saved (agent: `checkpoint_rewind` target=pre_edit; human: `aizen time restore {}`)",
-                                                    snap.id, snap.id
-                                                ));
-                                            }
-                                            None
+                                    Ok(Some(snap)) => {
+                                        *auto_checkpointed = true;
+                                        crate::features::timemachine::note_pre_edit(snap.id);
+                                        crate::core::recovery::set_checkpoint(Some(snap.id));
+                                        if !cfg.quiet {
+                                            emit_trace(&format!(
+                                                "→ checkpoint #{} saved (agent: `checkpoint_rewind` target=pre_edit; human: `aizen time restore {}`)",
+                                                snap.id, snap.id
+                                            ));
                                         }
-                                        Err(e) => Some(format!(
-                                            "error: protected workspace change was not run because the pre-edit checkpoint failed: {e}"
-                                        )),
-                                    },
+                                        None
+                                    }
+                                    Err(e) => Some(format!(
+                                        "error: protected workspace change was not run because the pre-edit checkpoint failed: {e:#}"
+                                    )),
                                 }
                             } else {
                                 None
@@ -1663,9 +1709,12 @@ async fn execute_calls(
                                 let max = cfg.max_tool_result_chars;
                                 let max_fetch = cfg.max_fetch_result_chars;
                                 let cancel = cfg.cancel.clone();
+                                let exec_ctx = cfg.exec_ctx.clone();
                                 tokio::task::spawn_blocking(move || {
                                     crate::core::cancel::with_current(cancel, || {
-                                        run_tool_body(tool, &args, quiet, max, max_fetch)
+                                        crate::core::exec_ctx::with_current(exec_ctx, || {
+                                            run_tool_body(tool, &args, quiet, max, max_fetch)
+                                        })
                                     })
                                 })
                                 .await
@@ -3337,6 +3386,7 @@ mod tests {
             max_fetch_result_chars: 12_000,
             approval_mode: crate::core::approval::ApprovalMode::Ask,
             cancel: crate::core::cancel::TurnCancel::new(),
+            exec_ctx: crate::core::exec_ctx::ExecutionContext::default(),
             quiet: true,
             enable_verify_gate: false,
             verify_gate_timeout_secs: 90,
@@ -3403,7 +3453,8 @@ mod tests {
             .map(|tc| Message::tool_result(tc.id.clone(), INTERRUPTED_TOOL_PLACEHOLDER.to_string()))
             .collect();
         let mut checkpointed = false;
-        let results = execute_calls(r, calls, c, &mut sink, Vec::new(), &mut checkpointed).await;
+        let mut writer_lease = None;
+        let results = execute_calls(r, calls, c, &mut sink, Vec::new(), &mut checkpointed, &mut writer_lease).await;
         // The sink must mirror the returned results (the loop relies on it).
         for (k, (_, out)) in results.iter().enumerate() {
             assert_eq!(sink[k].content.as_deref(), Some(out.as_str()), "sink[{k}] mirrors the result");
@@ -4359,7 +4410,8 @@ mod tests {
             .map(|tc| Message::tool_result(tc.id.clone(), INTERRUPTED_TOOL_PLACEHOLDER.to_string()))
             .collect();
         let mut checkpointed = false;
-        let results = execute_calls(&r, &calls, &cfg(), &mut sink, vec![(0, h)], &mut checkpointed).await;
+        let mut writer_lease = None;
+        let results = execute_calls(&r, &calls, &cfg(), &mut sink, vec![(0, h)], &mut checkpointed, &mut writer_lease).await;
         assert_eq!(results[0].1, "EAGER_RESULT", "adopted, not re-executed");
         assert_eq!(results[1].1, "normal", "non-eager sibling runs normally");
         assert_eq!(sink[0].content.as_deref(), Some("EAGER_RESULT"), "sink mirrors the adopted result");

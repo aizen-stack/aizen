@@ -351,7 +351,7 @@ impl Tool for SymbolReplace {
     }
 
     fn execute(&self, args: &Value) -> Result<String> {
-        use crate::agent::builtin::{atomic_write, NOOP_WRITE_PREFIX};
+        use crate::agent::builtin::NOOP_WRITE_PREFIX;
         let symbol = req_str(args, "symbol")?;
         let new_body = req_str(args, "new_body")?;
         let anchor = anchor_from(&self.root, args)?;
@@ -365,8 +365,12 @@ impl Tool for SymbolReplace {
                 rel.display()
             ));
         }
-        atomic_write(&plan.path, plan.new_content.as_bytes())
-            .map_err(|e| anyhow!("writing {}: {e}", plan.path.display()))?;
+        crate::core::persist::compare_and_atomic_write(
+            &plan.path,
+            &plan.base_fingerprint,
+            plan.new_content.as_bytes(),
+        )
+        .map_err(|e| anyhow!("stale symbolic edit: {e}"))?;
         let rel = plan.path.strip_prefix(&self.root).unwrap_or(&plan.path);
         let preview_old: String = plan.old_body.chars().take(400).collect();
         let preview_new: String = new_body.chars().take(400).collect();
@@ -449,7 +453,6 @@ impl Tool for SymbolInsert {
     }
 
     fn execute(&self, args: &Value) -> Result<String> {
-        use crate::agent::builtin::atomic_write;
         let symbol = req_str(args, "symbol")?;
         let text = req_str(args, "text")?;
         let where_raw = args
@@ -469,8 +472,12 @@ impl Tool for SymbolInsert {
         };
         let anchor = anchor_from(&self.root, args)?;
         let plan = LSP.insert_at_symbol(&anchor, symbol, where_, text)?;
-        atomic_write(&plan.path, plan.new_content.as_bytes())
-            .map_err(|e| anyhow!("writing {}: {e}", plan.path.display()))?;
+        crate::core::persist::compare_and_atomic_write(
+            &plan.path,
+            &plan.base_fingerprint,
+            plan.new_content.as_bytes(),
+        )
+        .map_err(|e| anyhow!("stale symbolic edit: {e}"))?;
         let rel = plan.path.strip_prefix(&self.root).unwrap_or(&plan.path);
         let side = match where_ {
             InsertWhere::Before => "before",

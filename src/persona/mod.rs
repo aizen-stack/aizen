@@ -151,7 +151,12 @@ pub fn save(name: &str, role: &str, voice: &str, body: &str) -> Result<PathBuf> 
     }
     let text = frontmatter::serialize(&fields, body, &["name", "role", "voice"]);
     let path = path_for(name);
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    let lock_path = crate::core::workspace_txn::store_lock("persona", &sanitize_name(name));
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        std::time::Duration::from_secs(5),
+    )?;
+    crate::core::persist::atomic_write_owner_only(&path, text.as_bytes())?;
     Ok(path)
 }
 
