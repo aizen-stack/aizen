@@ -17,6 +17,7 @@ pub mod browser;
 pub mod builtin;
 pub mod clarify;
 pub mod cmd_guard;
+pub mod goal;
 pub mod compact;
 pub mod lsp;
 pub mod mcp;
@@ -458,6 +459,14 @@ pub struct AgentConfig {
     pub hill_climb_gate: u8,
     /// Re-nudge to re-measure every N iters while hill-climb mode is on. `0` = reframe only.
     pub hill_climb_reminder_every: usize,
+    /// GOAL MODE (`/goal <text>`). `Some(goal)` makes the loop run until the goal is genuinely
+    /// finished — the iteration cap is bypassed (stop only on Esc or a verified completion), and
+    /// transient API failures (429/5xx/timeouts/empty-200) auto-retry with backoff instead of
+    /// killing the run. Completion is a two-key handshake: the model must call `goal_complete` AND
+    /// the verify gate must pass. `None` (default) = ordinary behavior (cap applies, API errors are
+    /// fatal after the HTTP client's own retries). The stored string is the goal text, re-injected
+    /// each time the model tries to stop without having genuinely finished.
+    pub goal: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -497,6 +506,7 @@ impl Default for AgentConfig {
             enable_hill_climb: true,
             hill_climb_gate: 90,
             hill_climb_reminder_every: 6,
+            goal: None,
         }
     }
 }
@@ -708,8 +718,12 @@ where
     let mut hill_climb_reframed = false;
     let mut last_hill_climb_reminder = 0usize;
     let mut iter = 0usize;
+    // GOAL MODE bypasses the iteration cap entirely: `/goal` promises to run until the goal is
+    // genuinely finished, so the only exits are Esc (→ Cancelled, via `cancel::race`) or a verified
+    // completion (→ Done, via the goal gate + verify gate). Ordinary turns keep `iter < cap`.
+    let goal_mode = cfg.goal.is_some();
 
-    while iter < cap {
+    while goal_mode || iter < cap {
         // COOPERATIVE CANCEL: every top-level turn owns one token and delegated children inherit it.
         // Unrelated turns therefore cannot cancel one another, while task/workflow fan-out still stops
         // at the next loop/tool boundary and releases its slots promptly.
@@ -904,19 +918,100 @@ where
         // Roll back the just-appended nudge if the model call fails, so a network/gateway error
         // doesn't strand an unanswered system message at the tail of history (the REPL's error path
         // only pops a trailing `user` message, so it wouldn't clean this up).
-        let mut turn = match crate::core::cancel::race(&cfg.cancel, chat(messages.clone(), defs.clone())).await {
-            None => {
-                if nudge_pushed {
-                    messages.pop();
+        //
+        // GOAL MODE (cfg.goal.is_some()) wraps the call in a smart retry loop instead of failing
+        // fatally: the whole point of `/goal` is to survive a flaky API and keep working until the
+        // goal is genuinely done. Transient failures (429/5xx/transport/timeout) AND empty-200s
+        // (HTTP 200 but no content and no tool_calls — this provider does that a lot) retry
+        // indefinitely with growing backoff; permanent client errors (400/401/403/404) retry only a
+        // few times (the provider may be briefly misbehaving) then surface the error. Esc still exits
+        // cleanly every attempt via `cancel::race`. Ordinary turns keep the old fatal-on-error path.
+        let mut turn = if cfg.goal.is_some() {
+            const GOAL_PERMANENT_RETRIES: u32 = 3;
+            let mut attempt: u32 = 0;
+            let mut permanent_tries: u32 = 0;
+            loop {
+                match crate::core::cancel::race(&cfg.cancel, chat(messages.clone(), defs.clone())).await {
+                    None => {
+                        if nudge_pushed {
+                            messages.pop();
+                        }
+                        return Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::Cancelled });
+                    }
+                    Some(Ok(t)) => {
+                        // EMPTY-200: a 200 with neither content nor a tool call, and no completion
+                        // claimed this turn, is a silent provider failure — not a real "done". Retry
+                        // it with backoff rather than feeding an empty turn into the done cascade.
+                        let empty_200 = t.tool_calls.is_empty()
+                            && t.content.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true)
+                            && !goal::is_pending();
+                        if empty_200 {
+                            let delay = crate::llm::client::goal_backoff_ms(attempt);
+                            attempt += 1;
+                            goal_retry_line(&format!("empty response; retry #{attempt}"), delay);
+                            if goal_sleep_or_cancel(&cfg.cancel, delay).await {
+                                if nudge_pushed {
+                                    messages.pop();
+                                }
+                                return Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::Cancelled });
+                            }
+                            continue;
+                        }
+                        break t;
+                    }
+                    Some(Err(e)) => {
+                        match crate::llm::client::classify_api_error(&e) {
+                            crate::llm::client::ApiErrorKind::Permanent => {
+                                permanent_tries += 1;
+                                if permanent_tries > GOAL_PERMANENT_RETRIES {
+                                    if nudge_pushed {
+                                        messages.pop();
+                                    }
+                                    return Err(e);
+                                }
+                                let delay = crate::llm::client::goal_backoff_ms(attempt);
+                                attempt += 1;
+                                goal_retry_line(
+                                    &format!("client error; retry {permanent_tries}/{GOAL_PERMANENT_RETRIES}"),
+                                    delay,
+                                );
+                                if goal_sleep_or_cancel(&cfg.cancel, delay).await {
+                                    if nudge_pushed {
+                                        messages.pop();
+                                    }
+                                    return Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::Cancelled });
+                                }
+                            }
+                            crate::llm::client::ApiErrorKind::Transient => {
+                                let delay = crate::llm::client::goal_backoff_ms(attempt);
+                                attempt += 1;
+                                goal_retry_line(&format!("API error; retry #{attempt}"), delay);
+                                if goal_sleep_or_cancel(&cfg.cancel, delay).await {
+                                    if nudge_pushed {
+                                        messages.pop();
+                                    }
+                                    return Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::Cancelled });
+                                }
+                            }
+                        }
+                    }
                 }
-                return Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::Cancelled });
             }
-            Some(Ok(t)) => t,
-            Some(Err(e)) => {
-                if nudge_pushed {
-                    messages.pop();
+        } else {
+            match crate::core::cancel::race(&cfg.cancel, chat(messages.clone(), defs.clone())).await {
+                None => {
+                    if nudge_pushed {
+                        messages.pop();
+                    }
+                    return Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::Cancelled });
                 }
-                return Err(e);
+                Some(Ok(t)) => t,
+                Some(Err(e)) => {
+                    if nudge_pushed {
+                        messages.pop();
+                    }
+                    return Err(e);
+                }
             }
         };
 
@@ -1002,6 +1097,15 @@ where
                     }
                     if !result.passed {
                         verify_attempts += 1;
+                        // GOAL MODE: a failed verify invalidates any completion claim the model made
+                        // this turn — clear it so the stale claim can't leak through the goal gate to
+                        // Done after the model fixes the errors. The `goal_complete` ack already tells
+                        // the model to call the tool AGAIN once verification passes, so re-declaration
+                        // is the contract; without this clear, a model that fixes-then-just-stops
+                        // (no re-declare) would slip past on the old claim.
+                        if cfg.goal.is_some() {
+                            goal::clear();
+                        }
                         // Record the premature "done" before the user gate-failure message.
                         // Normalize content to "" (never null): an assistant turn with neither
                         // content nor tool_calls is malformed (400) on strict gateways.
@@ -1163,6 +1267,46 @@ where
                 )));
                 iter += 1;
                 continue;
+            }
+
+            // GOAL GATE (`/goal <text>`): the second key of goal mode's completion handshake. A turn
+            // that stops WITHOUT the model having declared completion via `goal_complete` is NOT done
+            // — re-inject the goal text and keep working (mirrors the todo-poke gate's shape). Only a
+            // turn that DID declare completion (its `PENDING` claim, drained here by `take_pending`)
+            // is allowed to fall through to Done. The verify gate above is the FIRST key: it has
+            // already run and PASSED by the time control reaches here, because a failing verify
+            // `continue`s earlier in this same block. So Done in goal mode ⟺ declared + verified.
+            // There is no iteration cap in goal mode, so this poke can re-fire indefinitely — the run
+            // ends only on genuine completion (here) or Esc (`cancel::race` above).
+            if let Some(goal_text) = &cfg.goal {
+                if goal::take_pending().is_none() {
+                    if !cfg.quiet {
+                        let line = "→ goal: not complete yet — keep working";
+                        if crate::ui::tui::active() {
+                            crate::ui::tui::emit_line(line);
+                        } else {
+                            eprintln!("{line}");
+                        }
+                    }
+                    // Record the premature stop (content or "") so history stays coherent, then poke.
+                    messages.push(Message {
+                        role: "assistant".to_string(),
+                        content: Some(turn.content.clone().unwrap_or_default()),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        images: Vec::new(),
+                        cache_control: None,
+                    });
+                    messages.push(Message::user(format!(
+                        "{GOAL_POKE_PREFIX} The goal is NOT complete yet:\n\n{goal_text}\n\n\
+                         Keep working until every part of it is genuinely done. When — and only when \
+                         — you have nothing left to do, call the `goal_complete` tool with a short \
+                         summary of what you accomplished. Do not stop before then."
+                    )));
+                    iter += 1;
+                    continue;
+                }
+                // Declared complete AND verified (or nothing to verify) → fall through to Done.
             }
 
             // Push the final assistant text so a multi-turn caller (REPL) keeps context.
@@ -2716,6 +2860,10 @@ const TODO_POKE_PREFIX: &str = "[todo-poke]";
 const CONFIDENCE_GATE_PREFIX: &str = "[confidence-gate]";
 /// P0.3 hill-climb reframe / remeasure (system nudge via push_nudge).
 const NUDGE_HILL_CLIMB: &str = "[hill-climb]";
+/// GOAL MODE poke (user role — hard block path): the model tried to stop without having declared
+/// completion via `goal_complete`, so we re-inject the goal text and keep it working. Mirrors the
+/// todo-poke gate's shape (a `user` message the model can't ignore), not a soft system nudge.
+const GOAL_POKE_PREFIX: &str = "[goal]";
 /// Save-before-clear warning (P-ctx2). Mirrors Claude's server-side "preserve important information"
 /// warning: fired ONCE, the turn BEFORE the first tool-result eviction, so the model can persist
 /// anything durable (memory files, todo_write) while the old results are still in context.
@@ -2726,6 +2874,28 @@ const NUDGE_SAVE_BEFORE_CLEAR: &str = "Context is filling up";
 /// prompt cache from that byte onward, so a per-turn refresh would trade the very context it reports
 /// on for churn. One `system` nudge, collapsed in place by `push_nudge`.
 const NUDGE_BUDGET: &str = "Context budget:";
+
+/// Print a short GOAL-MODE retry status line. Deliberately terse and secret-free — it names the
+/// failure shape and the wait, never the URL, key, or body (which could leak a token). Routed
+/// through the TUI when active so it lands in the retained buffer, else stderr.
+fn goal_retry_line(reason: &str, delay_ms: u64) {
+    let line = format!("⟳ goal: {reason} — retrying in {delay_ms}ms");
+    if crate::ui::tui::active() {
+        crate::ui::tui::emit_line(&line);
+    } else {
+        eprintln!("{line}");
+    }
+}
+
+/// Sleep `delay_ms`, but wake early (and return `true`) if the turn is cancelled — so Esc during a
+/// long goal-mode backoff exits promptly instead of waiting out the full delay. Returns `false` when
+/// the sleep completed normally (caller should retry). Mirrors `cancel::race`'s select shape.
+async fn goal_sleep_or_cancel(token: &crate::core::cancel::TurnCancel, delay_ms: u64) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => false,
+        _ = token.cancelled() => true,
+    }
+}
 
 /// The coarse band a usage fraction falls in, for the running budget signal. Returns `None` below
 /// the floor (no point nagging about budget when the window is nearly empty), else a decile
@@ -3416,6 +3586,7 @@ mod tests {
             enable_hill_climb: false,
             hill_climb_gate: 90,
             hill_climb_reminder_every: 6,
+            goal: None, // goal mode OFF in unit tests unless a test arms it
         }
     }
 
@@ -4606,6 +4777,158 @@ mod tests {
         .unwrap();
         assert_eq!(out.stop, StopReason::Done);
         assert_eq!(out.final_text.as_deref(), Some("done"));
+    }
+
+    // ── GOAL MODE (`/goal <text>`): the real loop paths ─────────────────────────
+    // These drive `run_agent_loop` with `cfg.goal = Some(..)` through scripted turns to exercise the
+    // ACTUAL goal gate + smart-retry code (not a re-implementation): premature-stop re-poke, the
+    // declared+verified handshake reaching Done, empty-200 retry (not treated as done), transient
+    // retry-then-succeed, permanent give-up after a bounded count, and clean Esc/cancel. They
+    // serialize on `goal::TEST_LOCK` because the completion handshake uses a process-global `PENDING`.
+
+    fn empty_turn() -> ChatTurn {
+        // An HTTP-200 with neither content nor a tool call — this provider's most common silent
+        // failure. Goal mode must retry it, ordinary mode feeds it to the done cascade.
+        ChatTurn { content: None, tool_calls: vec![], finish_reason: Some("stop".into()), usage: None, eager: Vec::new() }
+    }
+
+    /// Like `scripted`, but each queued item is a full `Result` so a test can script `chat()` ERRORS
+    /// (goal mode's retry classifies these); exhausting the queue yields a final `Ok("stop")`.
+    fn scripted_results(items: Vec<Result<ChatTurn>>) -> impl Fn(Vec<Message>, Vec<ToolDef>) -> std::future::Ready<Result<ChatTurn>> {
+        let q = Mutex::new(VecDeque::from(items));
+        move |_m, _d| {
+            let next = q.lock().unwrap().pop_front().unwrap_or_else(|| Ok(final_turn("stop")));
+            std::future::ready(next)
+        }
+    }
+
+    fn goal_registry() -> ToolRegistry {
+        // The real `goal_complete` tool, so a scripted call actually records the PENDING claim the
+        // goal gate then drains — the genuine handshake, not a stub.
+        let mut r = registry();
+        r.register(Box::new(crate::agent::goal::GoalComplete));
+        r
+    }
+
+    #[tokio::test]
+    async fn goal_gate_pokes_premature_stop_then_done_after_complete() {
+        let _g = crate::agent::goal::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::agent::goal::clear();
+        let r = goal_registry();
+        let c = AgentConfig { goal: Some("add a --version flag".into()), quiet: true, ..cfg() };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        // 1) model stops WITHOUT declaring → must be poked, not Done. 2) it calls goal_complete
+        // (records PENDING). 3) it stops → gate drains PENDING → Done.
+        let chat = scripted(vec![
+            final_turn("I think that's everything"),
+            tool_turn("goal_complete", r#"{"summary":"added the flag"}"#),
+            final_turn("all done"),
+        ]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done, "reaches Done only after declared + (no-op) verify");
+        let pokes = messages
+            .iter()
+            .filter(|m| m.role == "user" && m.content.as_deref().is_some_and(|c| c.starts_with(GOAL_POKE_PREFIX)))
+            .count();
+        assert_eq!(pokes, 1, "the one premature stop was poked exactly once");
+        assert!(
+            crate::agent::goal::take_pending().is_none(),
+            "the gate drained the completion claim on the way to Done"
+        );
+        crate::agent::goal::clear();
+    }
+
+    #[tokio::test]
+    async fn goal_mode_retries_empty_200_instead_of_treating_it_as_done() {
+        let _g = crate::agent::goal::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::agent::goal::clear();
+        let r = goal_registry();
+        let c = AgentConfig { goal: Some("do the thing".into()), quiet: true, ..cfg() };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        // An empty-200 FIRST: if it were fed to the done cascade the goal gate would poke (take_pending
+        // is None). Instead it must be retried silently — so we expect ZERO `[goal]` pokes and a
+        // non-empty Done from the real turn that follows.
+        let chat = scripted(vec![
+            empty_turn(),
+            tool_turn("goal_complete", r#"{"summary":"finished"}"#),
+            final_turn("done"),
+        ]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.final_text.as_deref(), Some("done"), "returns the real turn, not the empty one");
+        let pokes = messages
+            .iter()
+            .filter(|m| m.role == "user" && m.content.as_deref().is_some_and(|c| c.starts_with(GOAL_POKE_PREFIX)))
+            .count();
+        assert_eq!(pokes, 0, "empty-200 was retried, never poked as a premature stop");
+        crate::agent::goal::clear();
+    }
+
+    #[tokio::test]
+    async fn goal_mode_retries_transient_chat_error_then_succeeds() {
+        let _g = crate::agent::goal::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::agent::goal::clear();
+        let r = goal_registry();
+        let c = AgentConfig { goal: Some("keep going".into()), quiet: true, ..cfg() };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        // A 5xx (transient) then the real work — goal mode must survive it (ordinary mode would return
+        // Err here, see `normal_mode_chat_error_is_fatal`).
+        let chat = scripted_results(vec![
+            Err(anyhow::anyhow!("upstream returned HTTP 503 Service Unavailable: overloaded")),
+            Ok(tool_turn("goal_complete", r#"{"summary":"done despite the blip"}"#)),
+            Ok(final_turn("finished")),
+        ]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done, "a transient error is retried, not fatal");
+        crate::agent::goal::clear();
+    }
+
+    #[tokio::test]
+    async fn goal_mode_gives_up_after_bounded_permanent_retries() {
+        let _g = crate::agent::goal::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::agent::goal::clear();
+        let r = goal_registry();
+        let c = AgentConfig { goal: Some("nope".into()), quiet: true, ..cfg() };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        // A permanent 401 on every call: goal mode retries a small bounded number of times then
+        // SURFACES the error (it can't be fixed by retrying) — the "retry a few times then stop"
+        // product decision. Contrast with the transient case above which retries indefinitely.
+        let chat = scripted_results(vec![
+            Err(anyhow::anyhow!("upstream returned HTTP 401 Unauthorized: bad key")),
+            Err(anyhow::anyhow!("upstream returned HTTP 401 Unauthorized: bad key")),
+            Err(anyhow::anyhow!("upstream returned HTTP 401 Unauthorized: bad key")),
+            Err(anyhow::anyhow!("upstream returned HTTP 401 Unauthorized: bad key")),
+            Err(anyhow::anyhow!("upstream returned HTTP 401 Unauthorized: bad key")),
+        ]);
+        let res = run_agent_loop(chat, &c, &r, &mut messages).await;
+        assert!(res.is_err(), "a permanent client error stops the run after the bounded retries");
+        crate::agent::goal::clear();
+    }
+
+    #[tokio::test]
+    async fn normal_mode_chat_error_is_fatal_and_no_goal_tool() {
+        // The control: with goal mode OFF, a chat error stays fatal (the old behavior is unchanged),
+        // proving the retry logic is gated strictly on `cfg.goal`.
+        let r = registry();
+        let c = cfg(); // goal: None
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let chat = scripted_results(vec![Err(anyhow::anyhow!("upstream returned HTTP 503: overloaded"))]);
+        let res = run_agent_loop(chat, &c, &r, &mut messages).await;
+        assert!(res.is_err(), "ordinary turns keep the fatal-on-error path");
+    }
+
+    #[tokio::test]
+    async fn goal_mode_esc_during_retry_returns_cancelled() {
+        let _g = crate::agent::goal::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::agent::goal::clear();
+        let r = goal_registry();
+        let c = AgentConfig { goal: Some("interrupt me".into()), quiet: true, ..cfg() };
+        c.cancel.cancel(); // Esc already pressed → the retry loop's `cancel::race` must bail cleanly.
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let chat = scripted(vec![empty_turn(), final_turn("never reached")]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Cancelled, "Esc exits goal mode as Cancelled, not Done");
+        crate::agent::goal::clear();
     }
 
     #[test]

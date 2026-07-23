@@ -1053,10 +1053,13 @@ fn paint_model_menu(buf: &mut String, r: &Render, top_row: u16, w: usize) {
     let mut row_idx = 0u16;
     goto(buf, top_row - 1 - row_idx, 1);
     clear_line(buf);
+    // Truncate the PLAIN title before styling — never let a styled string reach `truncate_to_width`
+    // (it iterates raw chars and would slice an ANSI escape, bleeding colour across the layout).
+    let title_plain = truncate_to_width(&format!("model  ·  {n} available"), w.saturating_sub(4));
     buf.push_str(&format!(
         "  {} {}",
         style("◎").color256(ACCENT).bold(),
-        style(format!("model  ·  {n} available")).color256(ACCENT)
+        style(title_plain).color256(ACCENT)
     ));
     row_idx += 1;
 
@@ -1066,29 +1069,44 @@ fn paint_model_menu(buf: &mut String, r: &Render, top_row: u16, w: usize) {
         goto(buf, top_row - 1 - row_idx, 1);
         clear_line(buf);
         let is_sel = mi == sel;
+        let edge = (i == list_vis - 1 && more_above) || (i == 0 && more_below);
+        let ctx = row.label.strip_prefix(&row.id).unwrap_or("").trim();
+
+        // Budget for content after the "  " prefix + marker + space (4 cols). Reserve room for the
+        // edge "⋯" ("  ⋯" = 3 cols) so it never gets clipped. Truncate the PLAIN id/ctx BEFORE
+        // styling — same reason as the title above — with the id taking priority over the ctx.
+        let content_budget = w.saturating_sub(4).saturating_sub(if edge { 3 } else { 0 });
+        let id_plain = truncate_to_width(&row.id, content_budget);
+        let id_w = measure_text_width(&id_plain);
+        let ctx_plain = if ctx.is_empty() {
+            String::new()
+        } else {
+            let rem = content_budget.saturating_sub(id_w + 2);
+            if rem == 0 {
+                String::new()
+            } else {
+                truncate_to_width(ctx, rem)
+            }
+        };
+
         let marker = if is_sel {
             style("›").color256(ACCENT).bold().to_string()
         } else {
             " ".to_string()
         };
         let id_styled = if is_sel {
-            style(&row.id).color256(ACCENT).bold().to_string()
+            style(&id_plain).color256(ACCENT).bold().to_string()
         } else {
-            style(&row.id).color256(theme::ACCENT_DIM).to_string()
+            style(&id_plain).color256(theme::ACCENT_DIM).to_string()
         };
-        let ctx = row.label.strip_prefix(&row.id).unwrap_or("").trim();
-        let ctx_styled = if ctx.is_empty() {
+        let ctx_styled = if ctx_plain.is_empty() {
             String::new()
         } else {
-            format!("  {}", theme::faint(ctx))
+            format!("  {}", theme::faint(&ctx_plain))
         };
         let mut line = format!("  {marker} {id_styled}{ctx_styled}");
-        if (i == list_vis - 1 && more_above) || (i == 0 && more_below) {
+        if edge {
             line.push_str(&format!("  {}", theme::faint("⋯")));
-        }
-        let budget = w.saturating_sub(4);
-        if measure_text_width(&line) > budget {
-            line = truncate_to_width(&line, budget);
         }
         buf.push_str(&line);
         row_idx += 1;
@@ -1096,7 +1114,8 @@ fn paint_model_menu(buf: &mut String, r: &Render, top_row: u16, w: usize) {
 
     goto(buf, top_row - 1 - row_idx, 1);
     clear_line(buf);
-    buf.push_str(&theme::faint("  ↑↓ pick · Enter set · Esc cancel").to_string());
+    let hint_plain = truncate_to_width("  ↑↓ pick · Enter set · Esc cancel", w);
+    buf.push_str(&theme::faint(hint_plain.as_str()).to_string());
     row_idx += 1;
 
     LAST_MODEL_MENU.store(row_idx as u16, Ordering::Relaxed);
@@ -3057,6 +3076,7 @@ fn slash_parks_input_thread(input: &str) -> bool {
             | "tg"
             | "serve"
             | "sessions"
+            | "model" // dialoguer Select owns stdin → park the keyboard thread (mirrors /sessions)
     ) || matches!(name, "timeline" | "tm")
         && matches!(arg, "pick" | "restore" | "menu" | "open")
         || name == "effort" && arg.is_empty()

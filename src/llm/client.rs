@@ -307,6 +307,47 @@ where
     }
 }
 
+/// Classification of a `chat()` error for GOAL MODE's smart retry (see the goal loop in
+/// `src/agent/mod.rs`). Goal mode keeps working through API flakiness, but must distinguish a
+/// transient upstream hiccup (retry indefinitely with backoff) from a permanent client error (bad
+/// key/request/endpoint — retry only a few times then give up, since hammering it just burns calls).
+/// Ordinary (non-goal) turns never call this — their errors stay fatal after the HTTP client's own
+/// bounded retries inside `send_with_retry`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiErrorKind {
+    /// 429 / 5xx / transport / timeout / mid-stream drop — safe to retry indefinitely with backoff.
+    Transient,
+    /// 400 / 401 / 403 / 404 — a client/config error retrying can't fix. Goal mode retries a small
+    /// bounded number of times (the provider may be briefly misbehaving) then stops with the error.
+    Permanent,
+}
+
+/// Classify a `chat()` error for goal-mode retry. `send_with_retry` surfaces upstream failures as
+/// `upstream returned HTTP {status}: …` (where `{status}` renders like `400 Bad Request`) and
+/// transport failures as `request failed after retries`; the streaming path adds `SSE stream error:
+/// …`. We match the permanent 4xx shapes and treat everything else as Transient — goal mode's whole
+/// point is surviving a flaky API, so the default leans toward retrying, not giving up.
+pub fn classify_api_error(e: &anyhow::Error) -> ApiErrorKind {
+    let msg = e.to_string();
+    for code in ["HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404"] {
+        if msg.contains(code) {
+            return ApiErrorKind::Permanent;
+        }
+    }
+    ApiErrorKind::Transient
+}
+
+/// Full-jitter backoff (ms) for GOAL MODE's loop-level retry, indexed by attempt. Reuses the exact
+/// full-jitter formula as the HTTP client's own `send_with_retry` (spreads retries, no thundering
+/// herd) but with a higher ceiling: goal mode may retry a flaky endpoint many times over a long run,
+/// so the per-attempt wait grows to a ~30s plateau instead of the client's 8s (which is tuned for 3
+/// quick tries inside a single call).
+pub fn goal_backoff_ms(attempt: u32) -> u64 {
+    const BASE_MS: u64 = 500;
+    const CAP_MS: u64 = 30_000;
+    backoff_ms(attempt, BASE_MS, CAP_MS)
+}
+
 /// Models that rejected `reasoning_effort` with a 400 THIS SESSION. Populated reactively — never
 /// guessed from the model name (a name heuristic would mis-serve every gateway that renames models).
 /// The first time a provider 400s on the field we record the model here, so every later turn strips
@@ -853,7 +894,16 @@ pub async fn stream_chat_with_tools_eager(
             }
             Err(e) => {
                 spin.take();
-                eprintln!("\n[warn] unparseable stream frame ({e}): {}", event.data);
+                // Gateways (vLLM/LiteLLM/OpenRouter) interleave keepalive / non-JSON frames mid-stream.
+                // A raw `eprintln!` here writes straight to the terminal, bypassing the retained render
+                // thread → corrupts the pinned frame ("breaks during work"). Route through the TUI funnel
+                // when it owns the screen; only fall back to stderr when it doesn't.
+                let warn = format!("[warn] unparseable stream frame ({e}): {}", event.data);
+                if crate::ui::tui::active() {
+                    crate::ui::tui::emit_line(&crate::ui::theme::faint(warn).to_string());
+                } else {
+                    eprintln!("\n{warn}");
+                }
             }
         }
     }

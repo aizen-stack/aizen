@@ -478,8 +478,15 @@ impl Tool for TaskTool {
         };
 
         // Make a transitive yolo grant visible: an unattended destructive sub-agent is easy to miss.
+        // Route through the TUI funnel when it owns the screen — a raw `eprintln!` mid-turn writes
+        // straight to the terminal, bypassing the retained render thread and corrupting the frame.
         if self.approval_mode.approves_all() {
-            eprintln!("→ task({header_label}): running in yolo approval (sub-agent destructive ops pre-authorized)");
+            let note = format!("→ task({header_label}): running in yolo approval (sub-agent destructive ops pre-authorized)");
+            if crate::ui::tui::active() {
+                crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
+            } else {
+                eprintln!("{note}");
+            }
         }
 
         // Live status for `/workflows` — RAII so a panic mid-dispatch still leaves a terminal row.

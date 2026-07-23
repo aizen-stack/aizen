@@ -106,6 +106,12 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     // `clarify` yields the turn back to the interactive user — meaningless inside an autonomous
     // sub-agent (no user to answer), so it stays top-level only, like todo/process.
     r.register(Box::new(crate::agent::clarify::Clarify));
+    // `goal_complete` is the DONE-signal for goal mode (`/goal <text>`). Gated on `goal::is_armed()`
+    // so ordinary chat/agent turns never pay its schema cost; top-level only (a sub-agent has no
+    // goal of its own to declare complete), just like clarify/todo/process.
+    if crate::agent::goal::is_armed() {
+        r.register(Box::new(crate::agent::goal::GoalComplete));
+    }
     // LSP navigation + diagnostics + symbolic edit (top-level only). Default ON + lazy: the
     // manager is armed at session start; tools register when `LSP.is_enabled()` (still true after
     // `/lsp on`, false after `/lsp off`). Sub-agents use `subagent_read_only_base` and never get it.

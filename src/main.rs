@@ -3694,6 +3694,9 @@ async fn run_menu_sticky() -> Result<()> {
                     enable_self_review: cli_config::load().self_review.unwrap_or(false),
                     // Reflect the live manager state (honors `/lsp off` for this turn).
                     enable_lsp: crate::agent::lsp::LSP.is_enabled(),
+                    // Goal mode (set by `/goal <text>`): threads the live goal into this turn so the
+                    // loop runs cap-free with smart retry until the goal is declared + verified.
+                    goal: crate::agent::goal::current_goal(),
                     ..AgentConfig::default()
                 };
 
@@ -3816,6 +3819,22 @@ async fn run_menu_sticky() -> Result<()> {
                         show_clarify(&q);
                     }
                     Some(Ok(outcome)) => {
+                        // Goal mode finishes only on a verify-passing `Done` (the goal gate lets the
+                        // turn reach Done solely after `goal_complete` + a green verify gate). Clear it
+                        // here so the next turn is an ordinary capped turn again. Esc (Cancelled) lands
+                        // in the `None` arm and intentionally leaves the goal armed — the user can retry.
+                        if crate::agent::goal::current_goal().is_some()
+                            && matches!(outcome.stop, StopReason::Done)
+                        {
+                            crate::agent::goal::set_goal(None);
+                            crate::agent::goal::arm(false);
+                            crate::agent::goal::clear();
+                            tui::emit_line(
+                                &style("🎯 goal complete — verified. goal mode off.")
+                                    .color256(splash::ACCENT)
+                                    .to_string(),
+                            );
+                        }
                         // An EMPTY answer from a SINGLE model call (no tool work, no streamed text)
                         // used to vanish silently — a blank turn (a rate-limit swallowed into an empty
                         // 200, a content filter, a dead endpoint that streams `[DONE]` with no deltas)
@@ -3998,6 +4017,9 @@ async fn run_menu_plain() -> Result<()> {
             context_window: resolve_ctx_window(&model).0,
             enable_self_review: cli_config::load().self_review.unwrap_or(false),
             enable_lsp: crate::agent::lsp::LSP.is_enabled(),
+            // Goal mode (set by `/goal <text>`): threads the live goal so the loop runs cap-free
+            // with smart retry until the goal is declared + verified.
+            goal: crate::agent::goal::current_goal(),
             ..AgentConfig::default()
         };
         let http_ref = &http;
@@ -5207,6 +5229,7 @@ enum SlashOutcome {
 const SLASH_CMDS: &[(&str, &str)] = &[
     ("help", "show this list"),
     ("handoff", "start a fresh thread carrying only what matters for a new goal"),
+    ("goal", "run until a goal is done (self-declared + verified), auto-retrying API errors — /goal <text>, /goal off"),
     ("model", "list + pick the model (with context windows)"),
     ("config", "set endpoint + key + model (wizard)"),
     ("memory", "show your profile / search memory"),
@@ -5274,6 +5297,7 @@ Commands:
   /timeline          show the checkpoint timeline (▸ = current); /timeline pick to restore · also /undo · /redo
   /checkpoint [note] save a restore point of the working tree now
   /compact           summarize older turns to free context now
+  /goal <text>       run until the goal is done — model self-declares (goal_complete) + verify passes; no iteration cap, auto-retries API errors (incl. empty 200); /goal off to stop, Esc to cancel
   /lsp [on|off|status|restart]  type-aware navigation + symbol_replace/insert + diagnostics via a language server (rust-analyzer · pyright · typescript-language-server); default ON (lazy spawn), /lsp off reclaims RAM
   /reach [doctor|status]  web-access channels: live-probe every backend (doctor) or show what served this session (status); web_fetch/web_search route through these
   /approval [ask|smart|yolo]  approval level — ask every time, auto-run read-only, or pre-authorize
@@ -5311,6 +5335,7 @@ fn slash_is_interactive(name: &str) -> bool {
             | "tg"
             | "serve"
             | "sessions"
+            | "model" // dialoguer Select owns stdin → must suspend retained first (mirrors /sessions)
             | "memory"
             | "mem"
             | "timeline"
@@ -5488,6 +5513,30 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                     }
                     Err(e) => tui::emit_line(&format!("{} {e}", style("handoff:").red())),
                 }
+            }
+        }
+        "goal" => {
+            // Goal mode: run cap-free with smart retry until the model declares completion
+            // (`goal_complete`) AND the verify gate passes. `/goal off` (or bare `/goal`) turns it off.
+            let a = arg.trim();
+            if a.is_empty() || a.eq_ignore_ascii_case("off") || a.eq_ignore_ascii_case("stop") {
+                crate::agent::goal::set_goal(None);
+                crate::agent::goal::arm(false);
+                crate::agent::goal::clear();
+                tui::emit_line(&style("goal mode off.").dim().to_string());
+            } else {
+                // Arm the tool gate + record the goal for every subsequent turn, and drain any stale
+                // completion claim from a previous goal so it can't leak into this one.
+                crate::agent::goal::set_goal(Some(a.to_string()));
+                crate::agent::goal::arm(true);
+                crate::agent::goal::clear();
+                tui::emit_line(
+                    &style("🎯 goal mode: running until done (self-declared + verified). Esc to cancel.")
+                        .color256(splash::ACCENT)
+                        .to_string(),
+                );
+                // Kick off immediately by submitting the goal text as the first user turn.
+                return SlashOutcome::Submit(a.to_string());
             }
         }
         "lsp" => {
