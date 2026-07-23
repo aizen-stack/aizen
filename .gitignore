@@ -8,3 +8,6 @@
 
 # runtime state dir (session slots, coordination locks, hostbot/persona/memory state) — never ship
 .aizen/
+
+# demo video is embedded via GitHub web upload (user-attachments URL), not tracked in the repo
+dist/liveaizen.mp4
