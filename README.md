@@ -10,7 +10,11 @@ install scripts. (The source lives in a separate private repo; this repo is gene
 
 ## Demo
 
-https://github.com/dawnofcd/aizen/raw/main/liveaizen.mp4
+
+
+https://github.com/user-attachments/assets/be9fcacf-76ef-4124-9f78-4645e86565f1
+
+
 
 ## Why `aizen`
 
