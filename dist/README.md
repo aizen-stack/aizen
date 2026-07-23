@@ -12,20 +12,6 @@ install scripts. (The source lives in a separate private repo; this repo is gene
 
 https://github.com/dawnofcd/aizen/raw/main/liveaizen.mp4
 
-```text
-⚡ gpt-4o-mini  ·  ~1.2K/128K tok  ·  3 turns  ·  ███░░░░░░░ 27% ctx
-╭──────────────────────────────────────────────────────────────────╮
-│ ❯ refactor the parser, run the tests, and commit when green       │
-╰──────────────────────────────────────────────────────────────────╯
-⚙ file_read   src/parse.rs
-└ 142 lines · 0.1s
-⚙ multi_edit   src/parse.rs
-└ 3 edits · 0.3s
-⚙ shell_run   cargo test
-└ 42 passed · 4.2s
-✓ cargo check — 0 errors · verify gate passed
-```
-
 ## Why `aizen`
 
 - **Zero-friction install.** A single self-contained executable — no runtime, no containers, no
