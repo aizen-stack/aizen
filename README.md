@@ -8,6 +8,10 @@ done, and keeps working when you leave (drive it from Telegram on your phone).
 The command is **`aizen`**. This repository is the **download channel** — prebuilt binaries and the
 install scripts. (The source lives in a separate private repo; this repo is generated.)
 
+## Demo
+
+https://github.com/dawnofcd/aizen/raw/main/liveaizen.mp4
+
 ```text
 ⚡ gpt-4o-mini  ·  ~1.2K/128K tok  ·  3 turns  ·  ███░░░░░░░ 27% ctx
 ╭──────────────────────────────────────────────────────────────────╮
