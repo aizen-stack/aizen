@@ -3541,6 +3541,10 @@ async fn run_menu_sticky() -> Result<()> {
         tui::emit_line(&style(format!("⟳ {}", crate::core::recovery::format_offer(&offer))).dim().to_string());
         tui::emit_line(&style("  /recover restore · /recover discard").dim().to_string());
     }
+    // Background model health poller: colours the idle `● ready` chip green/yellow/red from a real
+    // GET /models probe every 60s (plus once immediately). Independent of the chat HTTP client so a
+    // long-running turn's keep-alive doesn't share the short health timeout.
+    spawn_health_poller();
     let mut input = tui::spawn_input();
 
     loop {
@@ -3656,13 +3660,17 @@ async fn run_menu_sticky() -> Result<()> {
                 ) {
                     tui::emit_line(&style(format!("recovery boundary unavailable for this turn: {e}")).dim().to_string());
                 }
+                // Fold codebase RAG into the SENT content (not the dynamic system lane) so index 1
+                // stays byte-stable and the transcript-tail prefix cache holds. `line` itself is
+                // unchanged → checkpoint / display / persisted history keep the clean user text.
+                let sent = fold_retrieval_into_query(&line);
                 if images.is_empty() {
-                    history.push(Message::user(line.clone()));
+                    history.push(Message::user(sent));
                 } else {
                     tui::emit_line(
                         &style(format!("📎 {} image(s) attached", images.len())).color256(splash::ACCENT).to_string(),
                     );
-                    history.push(Message::user_with_images(line.clone(), images));
+                    history.push(Message::user_with_images(sent, images));
                 }
                 // Refresh the exit-flush snapshot the moment the turn's user message lands, so an
                 // abrupt window close mid-turn still persists the question (per-turn autosave only
@@ -3977,15 +3985,18 @@ async fn run_menu_plain() -> Result<()> {
         let eff = resolve_turn_effort(&line);
         cli_config::set_effort_override(eff.clone());
         println!("{}", effort_turn_line(eff.as_deref()));
+        // Fold codebase-index retrieval into the SENT content (not the cached system lane) — see
+        // `fold_retrieval_into_query`. `line` stays the original for persisted history / display.
+        let sent = fold_retrieval_into_query(&line);
         if images.is_empty() {
-            history.push(Message::user(line));
+            history.push(Message::user(sent));
         } else {
             println!(
                 "{}",
                 style(format!("📎 {} image{} attached", images.len(), if images.len() == 1 { "" } else { "s" }))
                     .color256(splash::ACCENT)
             );
-            history.push(Message::user_with_images(line, images));
+            history.push(Message::user_with_images(sent, images));
         }
         // Refresh the exit-flush snapshot the moment the user turn lands — so a window close mid-turn
         // (before the per-turn autosave) still persists this message.
@@ -4604,6 +4615,11 @@ fn migrate_legacy_prompt_lanes(history: &mut Vec<Message>, model: &str) {
     history.extend(tail);
 }
 
+/// Per-turn budget (tokens, chars/4 estimate) for the `/init` codebase-retrieval block folded into
+/// the CURRENT user turn (see [`fold_retrieval_into_query`]). Small enough to stay well under the
+/// frozen-core/session budgets but big enough for ~5-8 chunks with attribution.
+const CODEBASE_RETRIEVAL_BUDGET_TOKENS: usize = 1500;
+
 /// Fresh user-turn boundary: refresh only the dynamic lane, preserving stable index 0 byte-for-byte.
 fn refresh_dynamic_prompt_lane(history: &mut Vec<Message>, model: &str) {
     migrate_legacy_prompt_lanes(history, model);
@@ -4617,6 +4633,32 @@ fn refresh_dynamic_prompt_lane(history: &mut Vec<Message>, model: &str) {
         history[1] = Message::system(dynamic);
     } else {
         history.insert(1, Message::system(dynamic));
+    }
+}
+
+/// Automatic codebase RAG, folded into the CURRENT user turn (NOT the dynamic system lane).
+///
+/// When `/init` has built an index, the top-ranked chunks (path + line range + real content,
+/// source-attributed) are prepended to the user's message so the model sees relevant code before it
+/// even calls a tool. Placing it on the user turn — the volatile, already-uncached message — keeps
+/// index 1 (the dynamic system lane) byte-stable, so the provider's prefix cache still covers the
+/// whole transcript tail up to the last stable turn. Folding into the dynamic lane instead would
+/// vary index 1 every turn and force the entire transcript after it to re-bill uncached (the
+/// Anthropic prefix-cache breakpoint sits on the last stable assistant/tool message).
+///
+/// Returns the message content to send. The caller keeps the ORIGINAL `query` for checkpoint /
+/// display / persisted history — only the sent content carries the (ephemeral, per-turn) block.
+/// No-op passthrough when there is no index / no query terms / nothing clears the relevance gate.
+fn fold_retrieval_into_query(query: &str) -> String {
+    if query.trim().is_empty() {
+        return query.to_string();
+    }
+    // Kick a background drift check: if source files changed since the last /init, an incremental
+    // rebuild runs off-turn so the NEXT turn sees fresh context. Never blocks this turn (#17).
+    crate::agent::codebase::ensure_fresh();
+    match crate::agent::codebase::retrieval_block(query, CODEBASE_RETRIEVAL_BUDGET_TOKENS) {
+        Some(block) => format!("{block}\n\n{query}"),
+        None => query.to_string(),
     }
 }
 
@@ -4913,6 +4955,20 @@ mod context_breakdown_tests {
         let rows = system_block_chars(sys);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], ("base instructions", sys.chars().count()));
+    }
+
+    #[test]
+    fn fold_retrieval_passthrough_when_empty_or_no_index() {
+        // Empty / whitespace query → returned verbatim (nothing to retrieve against).
+        assert_eq!(fold_retrieval_into_query(""), "");
+        assert_eq!(fold_retrieval_into_query("   "), "   ");
+        // A real query is either an identity passthrough (no index) or `block\n\n{query}` (index
+        // hit). Either way the ORIGINAL query text is preserved intact at the END — the RAG fold
+        // only ever PREPENDS attributed context, never rewrites the user's words. (Robust whether or
+        // not this repo has a persisted /init index, since tests share the process cwd.)
+        let q = "how does the payment flow work";
+        let sent = fold_retrieval_into_query(q);
+        assert!(sent == q || sent.ends_with(&format!("\n\n{q}")), "query must be preserved: {sent:?}");
     }
 }
 
@@ -5225,55 +5281,23 @@ enum SlashOutcome {
     Submit(String),
 }
 
-/// The slash commands, shown in the `/` picker (name, one-line description).
-const SLASH_CMDS: &[(&str, &str)] = &[
-    ("help", "show this list"),
-    ("handoff", "start a fresh thread carrying only what matters for a new goal"),
-    ("goal", "run until a goal is done (self-declared + verified), auto-retrying API errors — /goal <text>, /goal off"),
-    ("model", "list + pick the model (with context windows)"),
-    ("config", "set endpoint + key + model (wizard)"),
-    ("memory", "show your profile / search memory"),
-    ("persona", "pick the character the agent role-plays (or author one)"),
-    ("skills", "saved procedures — list/view/new/delete (the agent loads them)"),
-    ("commands", "your custom slash commands (markdown macros you fire)"),
-    ("apps", "connect apps (GitHub · Notion · Slack · Filesystem · …) as tools via MCP — needs npx/uvx for local apps"),
-    ("mcp", "MCP servers from ~/.aizen/mcp.json (+ a trusted repo's ./.aizen/mcp.json) — list connected tools"),
-    ("telegram", "Telegram integration menu (setup · test · status · daemon)"),
-    ("sessions", "saved conversations — restore · save · delete (auto-saves as you go)"),
-    ("workflows", "multi-agent status — live task/workflow children + slot gate"),
-    ("recover", "restore a crashed session safely (no auto tool replay)"),
-    ("timeline", "show the checkpoint timeline; /timeline pick to restore (git snapshots)"),
-    ("checkpoint", "save a restore point of the code now"),
-    ("compact", "summarize older turns to free context now"),
-    ("lsp", "type-aware code navigation (references · definition · symbols · diagnostics) — on/off/status/restart"),
-    ("reach", "web-access health check: which backend serves each platform (youtube · twitter · github · hn · wikipedia · feeds · stackexchange · search)"),
-    ("approval", "approval level: ask · smart (read-only auto) · yolo (pre-authorized)"),
-    ("effort", "reasoning effort per turn: auto-detect (default) / off / pin low|medium|high"),
-    ("ultimate", "toggle ultimate mode: max reasoning effort + prefer launching workflows (aizen's ultracode)"),
-    ("effort", "reasoning effort — drag the slider (auto · low · medium · high · xhigh · max), or /effort <level>"),
-    ("clear", "start a fresh conversation"),
-    ("tokens", "show session token usage"),
-    ("context", "break down what fills the context window (prompt · tools · history)"),
-    ("cost", "session token usage + $ estimate (real usage when the provider reports it)"),
-    ("quit", "exit"),
-];
-
 /// Bare `/` → an arrow-key picker over the slash commands; runs the chosen one (default args).
-/// User-defined custom commands are appended after the built-ins so they're discoverable too.
+/// Built-ins and user-defined custom commands both come from the shared [`crate::features::slash`]
+/// catalog, so the picker, the live palette, and `/help` can never drift apart.
 async fn slash_menu(history: &mut Vec<Message>, model_label: &mut String) -> SlashOutcome {
-    let mut items: Vec<String> =
-        SLASH_CMDS.iter().map(|(n, d)| format!("{}/{n}  —  {d}", icons::g(icons::slash(n)))).collect();
-    let custom = commands::list();
-    for c in &custom {
-        let hint = if c.argument_hint.is_empty() { String::new() } else { format!(" {}", c.argument_hint) };
-        let desc = if c.description.is_empty() { "(custom command)".to_string() } else { c.description.clone() };
-        items.push(format!("{}/{}{hint}  —  {desc}", icons::g(icons::slash("commands")), c.name));
-    }
+    let catalog = crate::features::slash::list();
+    let items: Vec<String> = catalog
+        .iter()
+        .map(|c| {
+            let hint = if c.argument_hint.is_empty() { String::new() } else { format!(" {}", c.argument_hint) };
+            let icon = icons::g(icons::slash(if c.custom { "commands" } else { &c.name }));
+            format!("{icon}/{}{hint}  —  {}", c.name, c.description)
+        })
+        .collect();
     let theme = ui_theme();
     match Select::with_theme(&theme).with_prompt("slash command").items(&items).default(0).interact_opt() {
-        Ok(Some(i)) if i < SLASH_CMDS.len() => handle_slash(SLASH_CMDS[i].0, history, model_label).await,
-        // A custom command was picked — dispatch by name (no args from the picker).
-        Ok(Some(i)) => handle_slash(&custom[i - SLASH_CMDS.len()].name, history, model_label).await,
+        // Every entry (built-in or custom) dispatches by name through the one `handle_slash` path.
+        Ok(Some(i)) => handle_slash(&catalog[i].name, history, model_label).await,
         _ => SlashOutcome::Continue, // Esc / error → back to the prompt
     }
 }
@@ -5281,6 +5305,7 @@ async fn slash_menu(history: &mut Vec<Message>, model_label: &mut String) -> Sla
 const SLASH_HELP: &str = "\
 Commands:
   /help              this list
+  /init [--force|--status]  index the codebase into a semantic chunk index (SHA-256 incremental, secrets redacted); powers codebase_search + auto per-turn retrieval. --force rebuilds, --status shows state, Esc cancels
   /model             list the provider's models (with context windows) + pick one
   /config            set endpoint + key + model (wizard)
   /memory [query]    show your profile, or search memory; /memory remember <fact> to save
@@ -5352,6 +5377,152 @@ async fn slash_workflows(_arg: &str) {
     let status = agent::orchestration::format_status();
     if !tui::retained_overlay_open("Activity", &status) {
         tui::emit_line(&status);
+    }
+}
+
+/// `/init` — build (or incrementally refresh) the per-repo codebase index that powers
+/// `codebase_search` + automatic per-turn retrieval. `--force`/`-f` rebuilds from scratch;
+/// `--status`/`-s` shows the current index without scanning. Esc cancels a running scan cleanly
+/// (the existing index is left untouched). The scan runs on a blocking thread so the REPL stays
+/// responsive; progress is reported by phase (scan → chunk → build), never one line per file.
+async fn slash_init(arg: &str) {
+    use crate::agent::codebase;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let flags: Vec<String> = arg.split_whitespace().map(|s| s.to_ascii_lowercase()).collect();
+    let want = |names: &[&str]| flags.iter().any(|f| names.contains(&f.as_str()));
+
+    // `--status`: print the current index state, no scan.
+    if want(&["--status", "-s", "status"]) {
+        match codebase::load() {
+            Some(idx) => {
+                let ago = fmt_time_ago(idx.built_unix);
+                tui::emit_line(&format!(
+                    "{} {} file(s), {} chunk(s) — indexed {}",
+                    style("✓ codebase index:").color256(splash::ACCENT),
+                    idx.files.len(),
+                    idx.chunks.len(),
+                    ago
+                ));
+                let summary = codebase::analysis_summary(&idx.analysis);
+                if !summary.trim().is_empty() {
+                    tui::emit_line(&style(summary).dim().to_string());
+                }
+            }
+            None => tui::emit_line(
+                &style("no codebase index yet — run /init to build it").dim().to_string(),
+            ),
+        }
+        return;
+    }
+
+    let force = want(&["--force", "-f", "force", "rebuild"]);
+    let incremental = !force;
+
+    // Arm a cancel token for this scan so Esc aborts it (the input thread calls request_cancel).
+    let cancel = crate::core::cancel::TurnCancel::new();
+    tui::arm_cancel(cancel.clone());
+    tui::emit_line(&style(if force { "rebuilding codebase index…" } else { "indexing codebase…" }).dim().to_string());
+
+    // Phase progress, decile-throttled so a large scan reports ~10 lines, not one per file.
+    let last_decile = std::sync::Arc::new(AtomicUsize::new(usize::MAX));
+    let ld = last_decile.clone();
+    let progress = move |phase: codebase::Phase| match phase {
+        codebase::Phase::Scanning { done, total } => {
+            if total == 0 {
+                return;
+            }
+            let decile = done * 10 / total.max(1);
+            if ld.swap(decile, Ordering::Relaxed) != decile {
+                tui::emit_line(&style(format!("  scanning… {}%", decile * 10)).dim().to_string());
+            }
+        }
+        codebase::Phase::Chunking => tui::emit_line(&style("  chunking symbols…").dim().to_string()),
+        codebase::Phase::Building => tui::emit_line(&style("  building index…").dim().to_string()),
+    };
+
+    let cancel_for_task = cancel.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        codebase::build_index(incremental, Some(&cancel_for_task), &progress)
+    })
+    .await;
+    tui::disarm_cancel(&cancel);
+
+    match result {
+        Ok(Ok(stats)) => {
+            let mut parts = vec![
+                format!("{} file(s)", stats.indexed),
+                format!("{} chunk(s)", stats.chunks),
+            ];
+            if stats.reused > 0 {
+                parts.push(format!("{} reused", stats.reused));
+            }
+            if stats.added > 0 {
+                parts.push(format!("{} updated", stats.added));
+            }
+            if stats.removed > 0 {
+                parts.push(format!("{} removed", stats.removed));
+            }
+            tui::emit_line(&format!(
+                "{} {} in {}ms",
+                style("✓ codebase indexed:").color256(splash::ACCENT),
+                parts.join(", "),
+                stats.elapsed_ms
+            ));
+            // Sensitivity / skip accounting — surfaced so the user knows coverage + that secrets
+            // were protected, without ever printing a path or a secret value.
+            let mut notes = Vec::new();
+            if stats.sensitive > 0 {
+                notes.push(format!("{} sensitive file(s) stored path-only", stats.sensitive));
+            }
+            if stats.redacted > 0 {
+                notes.push(format!("{} file(s) had secrets redacted", stats.redacted));
+            }
+            if stats.skipped_large > 0 {
+                notes.push(format!("{} oversized skipped", stats.skipped_large));
+            }
+            if stats.skipped_binary > 0 {
+                notes.push(format!("{} binary skipped", stats.skipped_binary));
+            }
+            if stats.capped {
+                notes.push("scan hit the file cap (coverage bounded)".to_string());
+            }
+            if !notes.is_empty() {
+                tui::emit_line(&style(format!("  {}", notes.join(" · "))).dim().to_string());
+            }
+            let summary = codebase::analysis_summary(&codebase::load().map(|i| i.analysis).unwrap_or_default());
+            if !summary.trim().is_empty() {
+                tui::emit_line(&style(summary).dim().to_string());
+            }
+        }
+        Ok(Err(e)) => {
+            // A cancel is a clean, expected outcome — show it calmly, not as a hard error.
+            let msg = e.to_string();
+            if msg.contains("cancelled") {
+                tui::emit_line(&style("/init cancelled — the existing index was left unchanged").color256(theme::WARN).to_string());
+            } else {
+                tui::emit_line(&format!("{} {msg}", style("/init:").red()));
+            }
+        }
+        Err(e) => tui::emit_line(&format!("{} scan task failed: {e}", style("/init:").red())),
+    }
+}
+
+/// Compact "N ago" for a Unix-seconds timestamp (for `/init --status`).
+fn fmt_time_ago(built_unix: u64) -> String {
+    let now = chrono::Utc::now().timestamp() as u64;
+    if built_unix == 0 || built_unix > now {
+        return "just now".to_string();
+    }
+    let secs = now - built_unix;
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{} min ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{} hour(s) ago", secs / 3600)
+    } else {
+        format!("{} day(s) ago", secs / 86_400)
     }
 }
 
@@ -5833,6 +6004,12 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             Ok(s) => tui::emit_line(&format!("{} checkpoint #{}", style("⏩ re-applied").color256(splash::ACCENT), s.id)),
             Err(e) => tui::emit_line(&style(format!("redo: {e}")).color256(crate::ui::theme::WARN).to_string()),
         },
+        // Codebase index: scan the repo into a semantic chunk index for `codebase_search` +
+        // per-turn retrieval injection. `/init` incrementally refreshes; `/init --force` rebuilds
+        // from scratch; `/init --status` shows the current index without scanning. Esc cancels.
+        "init" | "index" => {
+            slash_init(arg).await;
+        }
         // A user-defined command (`~/.nextgen/commands/<name>.md`) → expand its template and run it
         // as a normal chat turn. Falls back to "unknown" only when no command matches.
         other => match commands::find(other) {
@@ -6269,6 +6446,74 @@ fn http_client() -> Result<reqwest::Client> {
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()
         .context("building HTTP client")
+}
+
+/// Short-timeout client for the health probe only — a dead endpoint must fail the chip fast, not
+/// wait out the chat client's 300s read timeout. Connect + total request each capped at 4s.
+fn health_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(concat!("aizen/", env!("CARGO_PKG_VERSION"), " health"))
+        .connect_timeout(std::time::Duration::from_secs(4))
+        .timeout(std::time::Duration::from_secs(4))
+        .build()
+        .context("building health HTTP client")
+}
+
+/// How often the idle `●` chip re-probes the provider. Confirmed: 60s.
+const HEALTH_POLL_SECS: u64 = 60;
+/// A successful `GET /models` slower than this is painted yellow (unstable). Confirmed: 2s.
+const HEALTH_SLOW_MS: u128 = 2_000;
+
+/// Classify a single probe outcome into the idle-chip colour. Pure so it can be unit-tested
+/// without a network. Rules (user-confirmed):
+/// - Ok + latency ≤ 2s → green (`Ok`)
+/// - Ok + latency > 2s → yellow (`Unstable`)
+/// - Err classified Transient (429/5xx/timeout/transport) → yellow (`Unstable`)
+/// - Err classified Permanent (400/401/403/404) → red (`Down`)
+/// - Missing config (no base/key) is treated as Permanent → red
+fn classify_health_probe(result: Result<std::time::Duration, anyhow::Error>) -> tui::HealthKind {
+    match result {
+        Ok(latency) if latency.as_millis() > HEALTH_SLOW_MS => tui::HealthKind::Unstable,
+        Ok(_) => tui::HealthKind::Ok,
+        Err(e) => match client::classify_api_error(&e) {
+            client::ApiErrorKind::Permanent => tui::HealthKind::Down,
+            client::ApiErrorKind::Transient => tui::HealthKind::Unstable,
+        },
+    }
+}
+
+/// Spawn a background task that paints the idle `● ready` chip from a real `GET /models` probe.
+/// Runs once immediately, then every [`HEALTH_POLL_SECS`]. Lives for the process (the REPL owns
+/// the runtime); each tick re-resolves base_url/api_key so a mid-session `/config` takes effect
+/// without a restart. Failures never surface as text — only as the chip colour.
+fn spawn_health_poller() {
+    tokio::spawn(async move {
+        let http = match health_http_client() {
+            Ok(c) => c,
+            Err(_) => {
+                tui::set_health(tui::HealthKind::Down);
+                return;
+            }
+        };
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(HEALTH_POLL_SECS));
+        // The first tick completes immediately (tokio interval behaviour) → first probe is eager.
+        loop {
+            interval.tick().await;
+            let kind = match resolve_base_key(None, None) {
+                Ok((base, key)) => {
+                    let t0 = std::time::Instant::now();
+                    let result = client::probe_models(&http, &base, &key)
+                        .await
+                        .map(|_| t0.elapsed());
+                    classify_health_probe(result)
+                }
+                // Not configured yet → permanent unavailability until /config. Don't lean on
+                // classify_api_error (which would paint yellow for a message without an HTTP code).
+                Err(_) => tui::HealthKind::Down,
+            };
+            tui::set_health(kind);
+        }
+    });
 }
 
 fn parse_toolset_list(s: &str) -> Option<Vec<String>> {
@@ -7015,28 +7260,8 @@ fn config_edit_display(cfg: &mut cli_config::CliConfig) -> Result<()> {
         });
     }
 
-    let tui_opts = [
-        "auto (retained, safe fallback)",
-        "retained (full-frame viewport)",
-        "classic (legacy sticky ANSI)",
-    ];
-    let tui_idx = match cfg.tui_mode() {
-        cli_config::TuiMode::Auto => 0,
-        cli_config::TuiMode::Retained => 1,
-        cli_config::TuiMode::Classic => 2,
-    };
-    if let Some(pick) = Select::with_theme(&theme)
-        .with_prompt("Terminal UI (takes effect next launch)")
-        .items(&tui_opts)
-        .default(tui_idx)
-        .interact_opt()?
-    {
-        cfg.tui_mode = Some(match pick {
-            1 => cli_config::TuiMode::Retained,
-            2 => cli_config::TuiMode::Classic,
-            _ => cli_config::TuiMode::Auto,
-        });
-    }
+    // Retained full-frame is the only interactive UI; the classic sticky renderer is kept solely as
+    // the automatic non-TTY fallback and is no longer user-selectable. No picker row remains.
     Ok(())
 }
 
@@ -8251,6 +8476,51 @@ mod tests {
 
     fn models() -> Vec<String> {
         vec!["opus-4-8".to_string(), "sonnet-4-6".to_string(), "minimax-m3".to_string()]
+    }
+
+    #[test]
+    fn classify_health_probe_rules() {
+        // Ok + fast → green.
+        assert_eq!(
+            classify_health_probe(Ok(std::time::Duration::from_millis(500))),
+            tui::HealthKind::Ok
+        );
+        // Ok + at the threshold still green (strictly > 2s is yellow).
+        assert_eq!(
+            classify_health_probe(Ok(std::time::Duration::from_millis(HEALTH_SLOW_MS as u64))),
+            tui::HealthKind::Ok
+        );
+        // Ok + slow → yellow.
+        assert_eq!(
+            classify_health_probe(Ok(std::time::Duration::from_millis(HEALTH_SLOW_MS as u64 + 1))),
+            tui::HealthKind::Unstable
+        );
+        // Transient error → yellow.
+        assert_eq!(
+            classify_health_probe(Err(anyhow!("upstream returned HTTP 503 Service Unavailable: try later"))),
+            tui::HealthKind::Unstable
+        );
+        assert_eq!(
+            classify_health_probe(Err(anyhow!("request failed after retries"))),
+            tui::HealthKind::Unstable
+        );
+        // Permanent 4xx → red.
+        assert_eq!(
+            classify_health_probe(Err(anyhow!("upstream returned HTTP 401 Unauthorized: bad key"))),
+            tui::HealthKind::Down
+        );
+        assert_eq!(
+            classify_health_probe(Err(anyhow!("upstream returned HTTP 404 Not Found: no such path"))),
+            tui::HealthKind::Down
+        );
+        // Missing config is handled by the poller as Down (not via this classifier) — here we only
+        // assert network-shaped errors.
+        let missing = classify_health_probe(Err(anyhow!("no API key — run `aizen config`")));
+        assert_eq!(
+            missing,
+            tui::HealthKind::Unstable,
+            "bare 'no API key' has no HTTP code → Transient/yellow; poller maps resolve fail → red"
+        );
     }
 
     #[test]

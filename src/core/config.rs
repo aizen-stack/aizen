@@ -255,6 +255,13 @@ pub fn style_path() -> PathBuf {
     cli_memory_dir().join("STYLE.md")
 }
 
+/// Per-repo codebase index (`/init`). Layout: `cli-memory/codebase/<slug>.json`.
+/// The slug is sanitized to a single safe path segment so a hostile repo name can't
+/// escape the index dir.
+pub fn codebase_index_path(slug: &str) -> PathBuf {
+    cli_memory_dir().join("codebase").join(format!("{}.json", safe_core_slug(slug)))
+}
+
 /// Sanitize a project slug for use as a single path segment (no `/` `\` `..`).
 fn safe_core_slug(slug: &str) -> String {
     let s: String = slug

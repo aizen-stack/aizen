@@ -4,13 +4,17 @@
 //! owns the alternate screen from one render thread; every other thread only sends commands.
 
 use crossterm::cursor::{Hide, Show};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block as FrameBlock, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block as FrameBlock, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Wrap,
+};
 use ratatui::{Frame, Terminal};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -20,6 +24,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use super::HealthKind;
 
 mod metrics;
 
@@ -228,6 +234,8 @@ struct AppState {
     working_since: Option<Instant>,
     frame: usize,
     ctx_permille: u16,
+    /// Live model health for the idle `● ready` chip (fed by `Command::Health`).
+    health: HealthKind,
     /// Transcript scroll offset measured in wrapped lines UP from the bottom. `0` means "follow the
     /// tail" — the newest output stays pinned to the bottom as it streams. Any positive value means
     /// the user scrolled up to read; while scrolled up, new content arriving at the bottom must NOT
@@ -246,8 +254,106 @@ struct AppState {
     /// that block's payload instead of appending a new one, so the checklist updates in place rather
     /// than stacking a fresh copy on every call. Cleared when the list is emptied.
     plan_id: Option<u64>,
+    /// Absolute (line, col) selection in the flat wrapped-line space. Drawn reversed; cleared on a
+    /// plain click outside the range / Esc.
+    selection: Option<SelectionRange>,
     metrics: metrics::FrameMetrics,
     cache: RenderCache,
+}
+
+/// Absolute character selection over the flat list of wrapped transcript rows.
+/// `line` is the absolute wrapped-line index; `col` is a display-cell offset within that row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct SelectionRange {
+    pub anchor_line: usize,
+    pub anchor_col: usize,
+    pub cursor_line: usize,
+    pub cursor_col: usize,
+}
+
+/// Geometry of the last transcript viewport — input thread maps mouse coords → (line, col).
+#[derive(Clone, Debug, Default)]
+struct TranscriptGeom {
+    start: usize,
+    visible: usize,
+    total: usize,
+    area: Rect,
+    /// Plain (SGR-stripped) wrapped rows of the full transcript at last draw — used to extract the
+    /// selected text on mouse-up without re-rendering on the input thread.
+    plain_rows: Vec<String>,
+}
+
+fn transcript_geom_slot() -> &'static Mutex<TranscriptGeom> {
+    static SLOT: OnceLock<Mutex<TranscriptGeom>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(TranscriptGeom::default()))
+}
+
+/// Snapshot of the last transcript geometry for mouse hit-testing (selection / scrollbar drag).
+pub(super) fn last_transcript_geom() -> (usize, usize, usize, Rect) {
+    let g = transcript_geom_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    (g.start, g.visible, g.total, g.area)
+}
+
+/// Extract plain text covering `sel` from the last drawn plain rows. Empty if nothing is selected
+/// or geometry is stale.
+pub(super) fn extract_selection_text(sel: SelectionRange) -> String {
+    let g = transcript_geom_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    extract_from_plain_rows(&g.plain_rows, sel)
+}
+
+fn extract_from_plain_rows(rows: &[String], sel: SelectionRange) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let (mut a_line, mut a_col, mut b_line, mut b_col) =
+        (sel.anchor_line, sel.anchor_col, sel.cursor_line, sel.cursor_col);
+    if (a_line, a_col) > (b_line, b_col) {
+        std::mem::swap(&mut a_line, &mut b_line);
+        std::mem::swap(&mut a_col, &mut b_col);
+    }
+    let a_line = a_line.min(rows.len().saturating_sub(1));
+    let b_line = b_line.min(rows.len().saturating_sub(1));
+    let mut out = String::new();
+    for (i, row) in rows.iter().enumerate().take(b_line + 1).skip(a_line) {
+        let plain = console::strip_ansi_codes(row);
+        let start_col = if i == a_line { a_col } else { 0 };
+        let end_col = if i == b_line {
+            b_col
+        } else {
+            console::measure_text_width(plain.as_ref()).saturating_add(1)
+        };
+        let slice = slice_by_display_cols(plain.as_ref(), start_col, end_col);
+        if i > a_line {
+            out.push('\n');
+        }
+        out.push_str(&slice);
+    }
+    out
+}
+
+/// Take the substring of `s` whose display-cell range is `[start_col, end_col)`.
+fn slice_by_display_cols(s: &str, start_col: usize, end_col: usize) -> String {
+    if end_col <= start_col {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut col = 0usize;
+    for ch in s.chars() {
+        let w = console::measure_text_width(&ch.to_string()).max(1);
+        let next = col.saturating_add(w);
+        if next > start_col && col < end_col {
+            out.push(ch);
+        }
+        col = next;
+        if col >= end_col {
+            break;
+        }
+    }
+    out
 }
 
 impl AppState {
@@ -266,11 +372,13 @@ impl AppState {
             working_since: None,
             frame: 0,
             ctx_permille: 0,
+            health: HealthKind::Unknown,
             scroll_from_tail: 0,
             last_total: 0,
             overlay_scroll: 0,
             focused: true,
             plan_id: None,
+            selection: None,
             metrics: metrics::FrameMetrics::default(),
             cache: RenderCache::default(),
         }
@@ -384,11 +492,20 @@ enum Command {
     Working(bool),
     Status(String),
     Context(u16),
+    /// Idle `● ready` chip colour/label — green/yellow/red based on the last `/models` probe.
+    Health(HealthKind),
     Tick,
     OpenOverlay(OverlaySnapshot),
     CloseOverlay,
     Scroll(i32),
+    /// Jump the transcript so absolute wrapped-line `start` is at the top of the viewport
+    /// (used by scrollbar thumb drag).
+    ScrollTo(usize),
     ScrollEnd,
+    /// Set or replace the live mouse selection (rendered reversed).
+    SetSelection(SelectionRange),
+    /// Drop the current selection highlight.
+    ClearSelection,
     Focus(bool),
     Suspend(Sender<()>),
     Resume { status: String, ack: Sender<bool> },
@@ -412,7 +529,9 @@ struct TerminalSession {
 impl TerminalSession {
     fn enter() -> io::Result<Self> {
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, Hide)?;
+        // EnableMouseCapture: the terminal reports wheel/click/drag as crossterm mouse events
+        // instead of leaking the wheel through as ↑/↓ keys (Windows Terminal "alternateScroll").
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
@@ -423,15 +542,15 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = self.terminal.show_cursor();
-        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, Show, LeaveAlternateScreen);
     }
 }
 
 pub(super) fn preferred() -> bool {
-    if !io::stdout().is_terminal() || crate::core::cli_config::branded_flag("NO_STICKY") {
-        return false;
-    }
-    !matches!(crate::core::cli_config::load().tui_mode(), crate::core::cli_config::TuiMode::Classic)
+    // Retained is the only interactive UI: with a TTY it always wins. The classic sticky renderer
+    // survives ONLY as the non-TTY / `NO_STICKY` fallback (piped output, CI, dumb terminals) — it is
+    // no longer user-selectable, so the `tui_mode` setting no longer gates this.
+    io::stdout().is_terminal() && !crate::core::cli_config::branded_flag("NO_STICKY")
 }
 
 pub(super) fn is_active() -> bool {
@@ -445,10 +564,13 @@ pub(super) fn is_active() -> bool {
 /// does NOT `join` the render thread — a panic hook must never block.
 pub(super) fn emergency_restore() {
     ACTIVE.store(false, Ordering::Relaxed);
-    // `\x1b[?25h` show cursor · `\x1b[?1049l` leave alternate screen (crossterm's EnterAlternateScreen
-    // uses the same private mode). Written unconditionally — if we never entered the alt screen the
-    // terminal ignores the leave.
-    let _ = write!(io::stdout(), "\x1b[?25h\x1b[?1049l");
+    // `\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l` disable mouse reporting (all modes
+    // EnableMouseCapture turns on) · `\x1b[?25h` show cursor · `\x1b[?1049l` leave alternate screen.
+    // Written unconditionally — a terminal not in a given mode just ignores the corresponding reset.
+    let _ = write!(
+        io::stdout(),
+        "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[?1049l"
+    );
     let _ = io::stdout().flush();
 }
 
@@ -577,6 +699,23 @@ pub(super) fn set_status(status: &str) {
 
 pub(super) fn set_context(permille: u16) {
     send(Command::Context(permille.min(1000)));
+}
+
+pub(super) fn set_health(kind: HealthKind) {
+    send(Command::Health(kind));
+}
+
+pub(super) fn set_selection(sel: SelectionRange) {
+    send(Command::SetSelection(sel));
+}
+
+pub(super) fn clear_selection() {
+    send(Command::ClearSelection);
+}
+
+/// Jump the transcript viewport so absolute wrapped-line `start` is at the top (scrollbar drag).
+pub(super) fn scroll_to(start: usize) {
+    send(Command::ScrollTo(start));
 }
 
 /// Push (state `Running`) or update-in-place (state `Ok`/`Err`, matched by `seq`) a tool-call line.
@@ -765,7 +904,17 @@ fn apply_command(state: &mut AppState, cmd: Command) {
             state.push_block(BlockKind::Verify, Payload::Verify(v), true);
         }
         Command::Input(input) => {
+            // Preserve a non-empty HUD status if the snapshot arrives with an empty one
+            // (classic shared Render can lag a frame behind `Command::Status` after activate).
+            let keep_status = if input.status.is_empty() && !state.input.status.is_empty() {
+                Some(state.input.status.clone())
+            } else {
+                None
+            };
             state.input = input;
+            if let Some(s) = keep_status {
+                state.input.status = s;
+            }
         }
         Command::Working(working) => {
             state.working = working;
@@ -776,6 +925,7 @@ fn apply_command(state: &mut AppState, cmd: Command) {
         }
         Command::Status(status) => state.input.status = status,
         Command::Context(v) => state.ctx_permille = v,
+        Command::Health(h) => state.health = h,
         Command::Tick => state.frame = state.frame.wrapping_add(1),
         Command::OpenOverlay(overlay) => {
             state.input.overlay = Some(overlay);
@@ -800,6 +950,28 @@ fn apply_command(state: &mut AppState, cmd: Command) {
                 state.scroll_from_tail = state.scroll_from_tail.saturating_sub(delta as usize);
             }
         }
+        Command::ScrollTo(start) => {
+            // Invert resolve_transcript_scroll: start = tail_start - scroll_from_tail →
+            // scroll_from_tail = total.saturating_sub(visible).saturating_sub(start).
+            // `last_total` is used as a stand-in for total until the next draw re-clamps.
+            let total = state.last_total;
+            let visible = state
+                .input
+                .overlay
+                .as_ref()
+                .map(|_| 0)
+                .unwrap_or(ROWS.load(Ordering::Relaxed).saturating_sub(FOOTER_ROWS) as usize);
+            // Prefer the last stashed geometry when available (more accurate than ROWS estimate).
+            let (geom_start, geom_visible, geom_total, _) = last_transcript_geom();
+            let (total, visible) = if geom_total > 0 {
+                (geom_total, geom_visible.max(1))
+            } else {
+                (total, visible.max(1))
+            };
+            let _ = geom_start;
+            let tail_start = total.saturating_sub(visible);
+            state.scroll_from_tail = tail_start.saturating_sub(start.min(tail_start));
+        }
         Command::ScrollEnd => {
             // End/Home resets whichever surface is active: the open overlay, else the transcript.
             if state.input.overlay.is_some() {
@@ -808,6 +980,8 @@ fn apply_command(state: &mut AppState, cmd: Command) {
                 state.scroll_from_tail = 0;
             }
         }
+        Command::SetSelection(sel) => state.selection = Some(sel),
+        Command::ClearSelection => state.selection = None,
         Command::Focus(v) => state.focused = v,
         Command::Suspend(_) | Command::Resume { .. } | Command::Shutdown(_) => {}
     }
@@ -858,13 +1032,21 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    // Leave 1 cell on the right for the scrollbar track when content overflows — content already
+    // reserves `width-2` so the thumb never paints over text.
     let content_width = area.width.saturating_sub(2).max(8);
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut plain_rows: Vec<String> = Vec::new();
     for block in &state.blocks {
         let rows = state.cache.get_or_render(block, content_width);
         for row in rows {
+            plain_rows.push(console::strip_ansi_codes(&row).into_owned());
             lines.push(styled_row(block.kind, row));
         }
+    }
+    // Apply selection reverse highlight before scrolling into the viewport.
+    if let Some(sel) = state.selection {
+        apply_selection_highlight(&mut lines, sel);
     }
     let total = lines.len();
     let visible = area.height as usize;
@@ -876,6 +1058,96 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         .style(Style::default().fg(Color::Gray))
         .scroll((start.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(paragraph, area);
+
+    // Dim vertical scrollbar when content overflows the viewport. Style is quiet (FAINT track,
+    // MUTED thumb) so it doesn't compete with the transcript. Positioned on the right edge of
+    // `area` — content_width already left a 2-cell gutter so text is never covered.
+    if total > visible {
+        let mut sb_state = ScrollbarState::new(total.saturating_sub(visible)).position(start);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("█")
+            .style(Style::default().fg(Color::Indexed(crate::ui::theme::MUTED)))
+            .track_style(Style::default().fg(Color::Indexed(crate::ui::theme::FAINT)));
+        frame.render_stateful_widget(scrollbar, area, &mut sb_state);
+    }
+
+    // Stash geometry + plain rows so the input thread can map mouse → (line, col) and extract text.
+    if let Ok(mut slot) = transcript_geom_slot().lock() {
+        *slot = TranscriptGeom {
+            start,
+            visible,
+            total,
+            area,
+            plain_rows,
+        };
+    }
+}
+
+/// Paint `REVERSED` over the spans that fall inside `sel` (absolute wrapped-line coords).
+fn apply_selection_highlight(lines: &mut [Line<'static>], sel: SelectionRange) {
+    if lines.is_empty() {
+        return;
+    }
+    let (mut a_line, mut a_col, mut b_line, mut b_col) =
+        (sel.anchor_line, sel.anchor_col, sel.cursor_line, sel.cursor_col);
+    if (a_line, a_col) > (b_line, b_col) {
+        std::mem::swap(&mut a_line, &mut b_line);
+        std::mem::swap(&mut a_col, &mut b_col);
+    }
+    let a_line = a_line.min(lines.len().saturating_sub(1));
+    let b_line = b_line.min(lines.len().saturating_sub(1));
+    for i in a_line..=b_line {
+        let start_col = if i == a_line { a_col } else { 0 };
+        // end_col exclusive; for mid-range lines reverse the whole row (large end_col).
+        let end_col = if i == b_line { b_col } else { usize::MAX };
+        if end_col <= start_col {
+            continue;
+        }
+        reverse_line_cols(&mut lines[i], start_col, end_col);
+    }
+}
+
+/// Split/restyle the spans of `line` so display-cells in `[start_col, end_col)` get REVERSED.
+fn reverse_line_cols(line: &mut Line<'static>, start_col: usize, end_col: usize) {
+    let old = std::mem::take(&mut line.spans);
+    let mut new_spans: Vec<Span<'static>> = Vec::with_capacity(old.len() + 2);
+    let mut col = 0usize;
+    for span in old {
+        let text = span.content;
+        let style = span.style;
+        if text.is_empty() {
+            continue;
+        }
+        // Walk chars, grouping into before / inside / after the selection window.
+        let mut before = String::new();
+        let mut mid = String::new();
+        let mut after = String::new();
+        for ch in text.chars() {
+            let w = console::measure_text_width(&ch.to_string()).max(1);
+            let next = col.saturating_add(w);
+            if next <= start_col {
+                before.push(ch);
+            } else if col >= end_col {
+                after.push(ch);
+            } else {
+                mid.push(ch);
+            }
+            col = next;
+        }
+        if !before.is_empty() {
+            new_spans.push(Span::styled(before, style));
+        }
+        if !mid.is_empty() {
+            new_spans.push(Span::styled(mid, style.add_modifier(Modifier::REVERSED)));
+        }
+        if !after.is_empty() {
+            new_spans.push(Span::styled(after, style));
+        }
+    }
+    line.spans = new_spans;
 }
 
 fn styled_row(kind: BlockKind, row: String) -> Line<'static> {
@@ -910,31 +1182,58 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .split(area);
     let width = area.width as usize;
     let elapsed = state.working_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-    // Right of the HUD row: the mockup's rounded working pill `⚗ working · 23s · Esc to stop` while
-    // the agent runs (the flask advances with the frame so it reads as alive), else a quiet `● ready`
-    // with the context-fill %. The pill is drawn as its own bracketed run so it reads as one chip.
-    let (right, right_style) = if state.working {
+    // Right of the HUD row: working pill while the agent runs, else coloured health chip + a
+    // compact context meter `⟦▓▓░░…⟧ N%` (matches classic `ctx_meter` look). Green = OK, yellow =
+    // slow/transient, red = permanent unavailability, muted = still checking.
+    //
+    // Built as spans (not a single pre-coloured string) so the bar can take its own fill colour
+    // independent of the health dot.
+    let right_spans: Vec<Span<'static>> = if state.working {
         const STAR: [&str; 6] = ["✶", "✷", "✸", "✹", "✺", "✻"];
-        (
+        vec![Span::styled(
             format!("{} working · {}s · Esc to stop", STAR[state.frame % STAR.len()], elapsed),
             Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT)),
-        )
+        )]
     } else {
-        let pct = state.ctx_permille / 10;
-        (format!("● ready · {pct}% ctx"), Style::default().fg(Color::Indexed(crate::ui::theme::OK)))
+        let pm = state.ctx_permille.min(1000);
+        let pct = (pm as f64 / 10.0).round() as u16;
+        // Compact bar (6 cells) so it fits beside model/status on typical widths; colour tracks fill.
+        const CELLS: usize = 6;
+        let filled = (pm as usize * CELLS).div_ceil(1000).min(CELLS);
+        let bar_color = if pm >= 900 {
+            crate::ui::theme::ERR
+        } else if pm >= 700 {
+            crate::ui::theme::WARN
+        } else {
+            crate::ui::theme::ACCENT_DIM
+        };
+        let mut bar = String::with_capacity(CELLS);
+        for i in 0..CELLS {
+            bar.push(if i < filled { '▓' } else { '░' });
+        }
+        let health_style = Style::default().fg(Color::Indexed(state.health.color_code()));
+        let bar_style = Style::default().fg(Color::Indexed(bar_color));
+        let faint = Style::default().fg(Color::Indexed(crate::ui::theme::FAINT));
+        let muted = Style::default().fg(Color::Indexed(crate::ui::theme::MUTED));
+        vec![
+            Span::styled(format!("● {} ", state.health.label(false)), health_style),
+            Span::styled("⟦".to_string(), faint),
+            Span::styled(bar, bar_style),
+            Span::styled("⟧ ".to_string(), faint),
+            Span::styled(format!("{pct}%"), muted),
+        ]
     };
-    let right_w = console::measure_text_width(&right);
+    let right_plain: String = right_spans.iter().map(|s| s.content.as_ref()).collect();
+    let right_w = console::measure_text_width(&right_plain);
     let left_budget = width.saturating_sub(right_w + 1);
     let left = console::truncate_str(&state.input.status, left_budget, "…").into_owned();
     let gap = width.saturating_sub(console::measure_text_width(&left) + right_w);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(left, Style::default().fg(Color::DarkGray)),
-            Span::raw(" ".repeat(gap)),
-            Span::styled(right, right_style),
-        ])),
-        rows[0],
-    );
+    let mut hud_spans = vec![
+        Span::styled(left, Style::default().fg(Color::DarkGray)),
+        Span::raw(" ".repeat(gap)),
+    ];
+    hud_spans.extend(right_spans);
+    frame.render_widget(Paragraph::new(Line::from(hud_spans)), rows[0]);
     let rule = "─".repeat(width);
     frame.render_widget(
         Paragraph::new(Line::styled(
@@ -1001,7 +1300,12 @@ fn input_line(state: &AppState, budget: usize) -> (String, usize) {
         let ph = if state.working { format!("Queue a message · Esc stops{q}") } else { format!("Type a message · / commands{q}") };
         return (console::truncate_str(&ph, budget, "…").into_owned(), 0);
     }
-    if state.input.draft.contains(&'\n') {
+    // Only collapse to a "N lines pasted" chip for a genuinely large paste — match the classic
+    // renderer's `>= 5 lines` threshold (tui.rs). A short multi-line draft (e.g. one char then
+    // Shift+Enter) stays inline: turning a two-line note into a misleading "2 lines pasted" chip
+    // is exactly the bug we're fixing.
+    let nlines = state.input.draft.iter().filter(|&&c| c == '\n').count() + 1;
+    if nlines >= 5 {
         let text: String = state.input.draft.iter().collect();
         let n = text.lines().count().max(1);
         let chip = format!("↵ {n} lines pasted");
@@ -1009,7 +1313,10 @@ fn input_line(state: &AppState, budget: usize) -> (String, usize) {
         return (console::truncate_str(&chip, budget, "…").into_owned(), w.min(budget));
     }
     let cursor = state.input.cursor.min(state.input.draft.len());
-    let cellw = |c: char| console::measure_text_width(&c.to_string()).max(1);
+    // The input box is a single physical row, so render an embedded newline as a visible `↵`
+    // glyph (width 1) rather than a raw `\n` that ratatui can't lay out on one line.
+    let disp = |c: char| -> char { if c == '\n' { '↵' } else { c } };
+    let cellw = |c: char| console::measure_text_width(&disp(c).to_string()).max(1);
     let mut start = cursor;
     let mut caret = 0usize;
     while start > 0 {
@@ -1027,7 +1334,7 @@ fn input_line(state: &AppState, budget: usize) -> (String, usize) {
         if used + cw > budget {
             break;
         }
-        shown.push(c);
+        shown.push(disp(c));
         used += cw;
     }
     (shown, caret)
@@ -1431,6 +1738,30 @@ mod tests {
         // `ansi_spans` can turn them into styled spans.
         let got = sanitize_keep_sgr("\x1b7\x1b[2Jok\x1b[31mred\x1b[0m\nnext\r");
         assert_eq!(got, "ok\x1b[31mred\x1b[0m\nnext");
+    }
+
+    #[test]
+    fn short_multiline_draft_stays_inline() {
+        let mut state = AppState::new("intro", "status");
+        state.input.draft = "x\n".chars().collect();
+        state.input.cursor = state.input.draft.len();
+
+        let (shown, caret) = input_line(&state, 40);
+
+        assert_eq!(shown, "x↵", "a short Shift+Enter draft is shown inline");
+        assert_eq!(caret, 2, "caret advances over the visible newline glyph");
+        assert!(!shown.contains("lines pasted"), "short text must not look like a paste chip");
+    }
+
+    #[test]
+    fn large_multiline_draft_uses_paste_chip() {
+        let mut state = AppState::new("intro", "status");
+        state.input.draft = "a\nb\nc\nd\ne".chars().collect();
+        state.input.cursor = state.input.draft.len();
+
+        let (shown, _) = input_line(&state, 40);
+
+        assert_eq!(shown, "↵ 5 lines pasted");
     }
 
     #[test]

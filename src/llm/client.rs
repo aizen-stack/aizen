@@ -181,6 +181,32 @@ pub struct ModelInfo {
     pub context_length: Option<usize>,
 }
 
+/// Lightweight reachability probe for the TUI health chip: a single `GET {base}/models` with **no**
+/// retry/backoff (unlike [`fetch_models_info`]). Callers should pass a short-timeout client so a dead
+/// endpoint fails fast. Success = 2xx (body is discarded). Failures surface as the same
+/// `upstream returned HTTP {status}: …` / transport error shapes [`classify_api_error`] already knows.
+pub async fn probe_models(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> Result<()> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .context("health probe request failed")?;
+    let status = resp.status();
+    if status.is_success() {
+        // Drain the body so the connection can be reused; ignore parse — status alone is the signal.
+        let _ = resp.bytes().await;
+        return Ok(());
+    }
+    let detail = resp.text().await.unwrap_or_default();
+    bail!("upstream returned HTTP {status}: {detail}");
+}
+
 /// Fetch the provider's model list with context windows when available (see [`ModelInfo`]).
 pub async fn fetch_models_info(
     client: &reqwest::Client,
@@ -1101,6 +1127,34 @@ mod tests {
                 let d = backoff_ms(attempt, base, cap);
                 assert!(d >= ceil / 2 && d <= ceil, "jitter {d} outside [{}, {ceil}]", ceil / 2);
             }
+        }
+    }
+
+    #[test]
+    fn classify_api_error_splits_permanent_from_transient() {
+        // Permanent 4xx — retrying can't fix these.
+        for code in ["HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404"] {
+            let e = anyhow::anyhow!("upstream returned {code} Bad Request: nope");
+            assert_eq!(
+                classify_api_error(&e),
+                ApiErrorKind::Permanent,
+                "{code} must be Permanent"
+            );
+        }
+        // Everything else leans Transient (goal mode's survival bias).
+        for msg in [
+            "upstream returned HTTP 429 Too Many Requests: slow down",
+            "upstream returned HTTP 503 Service Unavailable: try later",
+            "request failed after retries",
+            "SSE stream error: connection reset",
+            "health probe request failed",
+        ] {
+            let e = anyhow::anyhow!(msg);
+            assert_eq!(
+                classify_api_error(&e),
+                ApiErrorKind::Transient,
+                "{msg} must be Transient"
+            );
         }
     }
 

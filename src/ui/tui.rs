@@ -22,7 +22,7 @@ use crate::ui::splash::ACCENT;
 use crate::ui::theme;
 use console::{measure_text_width, style, Key, Term};
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc as stdmpsc;
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -44,40 +44,6 @@ const PALETTE_MAX: usize = 7;
 /// for a multi-line paste firing one message per line. Comfortably above buffered-read scheduling
 /// jitter (a few ms) yet far below the gap before a human reaches the Enter key (≥ ~100 ms).
 const PASTE_COALESCE_MS: u64 = 50;
-
-/// Lines the transcript scrolls per ↑/↓ keypress at an empty prompt in retained mode. Kept small (a
-/// few lines) because in the alternate-screen backend the mouse wheel is delivered as a burst of ↑/↓
-/// key events — one "wheel notch" is usually 3 events — so a per-key step of 3 lands close to a
-/// native pager's feel without overshooting on a single notch.
-const TRANSCRIPT_ARROW_SCROLL: i32 = 3;
-
-/// Slash commands offered in the live palette (primary name + one-line gist). Mirrors the `match`
-/// in `handle_slash` (main.rs) — keep in sync. Order ≈ most-reached first.
-pub const SLASH: &[(&str, &str)] = &[
-    ("help", "commands & tips"),
-    ("model", "list + pick the model"),
-    ("sessions", "saved chats — restore / save / delete"),
-    ("workflows", "multi-agent status — live tasks & fan-outs"),
-    ("recover", "restore a crashed session safely"),
-    ("timeline", "checkpoint timeline (glance) · pick to restore"),
-    ("checkpoint", "save a code restore point"),
-    ("compact", "compress context to free tokens"),
-    ("memory", "your memory profile / search"),
-    ("persona", "switch persona voice"),
-    ("skills", "browse & toggle skills"),
-    ("apps", "integrations"),
-    ("mcp", "MCP lifecycle / schema / tools"),
-    ("browser", "browser profiles & host routes"),
-    ("commands", "your custom commands"),
-    ("telegram", "telegram bot setup"),
-    ("serve", "run the daemon"),
-    ("config", "endpoint / key setup"),
-    ("approval", "ask / smart / yolo"),
-    ("cost", "session token cost"),
-    ("tokens", "context token status"),
-    ("clear", "new conversation"),
-    ("quit", "exit aizen"),
-];
 
 /// Rows the palette painted last time — so a shrinking/closing palette clears its stale lines.
 static LAST_PAL: AtomicU16 = AtomicU16::new(0);
@@ -164,8 +130,10 @@ fn text_overlay_slot() -> &'static Mutex<TextOverlayState> {
 }
 
 /// Slash commands matching the current draft. Empty unless the draft is a bare `/<prefix>` with no
-/// space yet (once you type an argument the palette gets out of the way).
-fn slash_matches(draft: &[char]) -> Vec<&'static (&'static str, &'static str)> {
+/// space yet (once you type an argument the palette gets out of the way). Drawn from the shared
+/// [`crate::features::slash`] catalog so the live palette, the bare-`/` picker, and `/help` never
+/// drift apart — every executable command (built-in or custom) shows up here.
+fn slash_matches(draft: &[char]) -> Vec<crate::features::slash::SlashCommand> {
     if draft.first() != Some(&'/') {
         return Vec::new();
     }
@@ -174,7 +142,10 @@ fn slash_matches(draft: &[char]) -> Vec<&'static (&'static str, &'static str)> {
         return Vec::new(); // argument phase → hide the palette
     }
     let typed = rest.to_lowercase();
-    SLASH.iter().filter(|(n, _)| n.starts_with(&typed)).collect()
+    crate::features::slash::list()
+        .into_iter()
+        .filter(|c| c.name.starts_with(&typed))
+        .collect()
 }
 
 /// Whether a direct retained informational overlay (`/workflows`, later panels) is open.
@@ -312,6 +283,61 @@ fn current_verb() -> &'static str {
 /// percent) so the bar has sub-1% resolution without a float in the hot paint path.
 static CTX_PERMILLE: AtomicU16 = AtomicU16::new(0);
 
+/// Live model/endpoint health for the idle footer chip (`● ready` / `● unstable` / `● down`).
+/// Polled in the background against `GET {base}/models` (see `run_menu_sticky`'s health poller).
+/// Encoding matches [`HealthKind`] so a single `AtomicU8` is enough for both backends.
+static HEALTH: AtomicU8 = AtomicU8::new(HealthKind::Unknown as u8);
+
+/// Provider reachability for the idle `●` chip. Green = answered fast; yellow = flaky/slow;
+/// red = permanent unavailability (bad key/endpoint or missing config).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HealthKind {
+    /// `GET /models` succeeded within the slow threshold.
+    Ok = 0,
+    /// Transient error (429/5xx/timeout/transport) OR success slower than the slow threshold.
+    Unstable = 1,
+    /// Permanent failure: 400/401/403/404, missing config, or endpoint unreachable as a client error.
+    Down = 2,
+    /// No probe result yet (boot / first poll in flight).
+    Unknown = 3,
+}
+
+impl HealthKind {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Ok,
+            1 => Self::Unstable,
+            2 => Self::Down,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Footer label. Narrow terminals get a short form so the HUD still fits.
+    pub fn label(self, narrow: bool) -> &'static str {
+        match (self, narrow) {
+            (Self::Ok, true) => "ok",
+            (Self::Ok, _) => "ready",
+            (Self::Unstable, true) => "slow",
+            (Self::Unstable, _) => "unstable",
+            (Self::Down, true) => "down",
+            (Self::Down, _) => "down",
+            (Self::Unknown, true) => "…",
+            (Self::Unknown, _) => "checking",
+        }
+    }
+
+    /// 256-colour index for the `●` (and the retained right-hand chip).
+    pub fn color_code(self) -> u8 {
+        match self {
+            Self::Ok => theme::OK,
+            Self::Unstable => theme::WARN,
+            Self::Down => theme::ERR,
+            Self::Unknown => theme::MUTED,
+        }
+    }
+}
+
 /// Update the context-meter fill (per-mille, clamped 0..=1000). Called from `status_text` alongside
 /// each status refresh; harmless when the TUI is inactive.
 pub fn set_ctx_permille(v: u16) {
@@ -320,6 +346,28 @@ pub fn set_ctx_permille(v: u16) {
     if retained::is_running() {
         retained::set_context(v);
     }
+}
+
+/// Push a new health reading into the idle footer chip. Harmless when the TUI is inactive.
+pub fn set_health(kind: HealthKind) {
+    HEALTH.store(kind as u8, Ordering::Relaxed);
+    if retained::is_running() {
+        retained::set_health(kind);
+        return;
+    }
+    if !active() {
+        return;
+    }
+    // Classic path: repaint so the coloured `●` updates without waiting for the next keystroke.
+    let mut r = render().lock().unwrap();
+    let mut buf = String::new();
+    reconcile_geometry(&mut r, &mut buf);
+    paint_box(&mut buf, &r);
+    flush(&buf);
+}
+
+fn current_health() -> HealthKind {
+    HealthKind::from_u8(HEALTH.load(Ordering::Relaxed))
 }
 
 /// Current spinner frame index (advanced by the ticker thread; read by `paint_box`).
@@ -335,47 +383,15 @@ static WORK_START: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 static TICKER_STARTED: AtomicBool = AtomicBool::new(false);
 /// Guards the resize poller (Claude-Code-style live reflow when the terminal window changes).
 static RESIZE_POLL_STARTED: AtomicBool = AtomicBool::new(false);
-/// Height changed while the agent was working — full scroll-region rebuild is deferred to the next
-/// safe point (turn end / idle keystroke) so we never move the output save-slot mid-stream.
-static PENDING_HEIGHT_RESIZE: AtomicBool = AtomicBool::new(false);
-
-/// Mirror of everything printed into the scroll region above the footer (the intro splash + every
-/// [`emit`]). The terminal does NOT reliably reflow scroll-region content when the window is resized,
-/// and we never otherwise redraw above the footer — so a stale copy tears/ghosts on resize (a fixed-
-/// width splash box wraps, old footer rows strand mid-screen, an open overlay's rows scatter). The
-/// fix is to stop trusting the terminal's reflow: on a resize we clear the viewport and REPRINT this
-/// buffer at the new width (see [`reconcile_geometry`]). Bounded to the most recent slice — older
-/// lines are dropped exactly as a terminal's finite scrollback would eventually drop them.
-static TRANSCRIPT: OnceLock<Mutex<String>> = OnceLock::new();
-fn transcript_slot() -> &'static Mutex<String> {
-    TRANSCRIPT.get_or_init(|| Mutex::new(String::new()))
-}
-/// Cap the retained transcript so a long session doesn't grow unbounded / make resize reprints slow.
-const TRANSCRIPT_CAP: usize = 96 * 1024;
-/// Append emitted content to the transcript mirror, trimming the front (at a line boundary, with a
-/// leading SGR reset so a dropped colour can't bleed) once it grows past the cap.
-fn transcript_push(s: &str) {
-    let mut t = transcript_slot().lock().unwrap();
-    t.push_str(s);
-    if t.len() > TRANSCRIPT_CAP {
-        let target = t.len().saturating_sub(TRANSCRIPT_CAP * 3 / 4);
-        let mut cut = target;
-        while cut < t.len() && !t.is_char_boundary(cut) {
-            cut += 1;
-        }
-        if let Some(nl) = t[cut..].find('\n') {
-            cut += nl + 1;
-        }
-        let tail = t.split_off(cut);
-        *t = format!("\x1b[0m{tail}");
-    }
-}
-/// Reset the transcript mirror to exactly `s` (used when [`activate`] seeds the intro splash).
-fn transcript_reset(s: &str) {
-    let mut t = transcript_slot().lock().unwrap();
-    t.clear();
-    t.push_str(s);
-}
+/// 1-based terminal row of the footer's HUD line as of the last paint. `0` = uninitialised, so
+/// [`paint_box`] falls back to the bottom-glued anchor `rows-FOOTER+1`. The classic footer is no
+/// longer pinned by a DECSTBM scroll-region (that discarded lines scrolled off the top, so the
+/// terminal's native scrollbar had nothing to scroll). Instead the footer FLOATS directly below the
+/// content: each [`emit`] erases the old footer, prints output (whose newlines scroll the terminal
+/// naturally, pushing the top line into REAL scrollback), then advances this anchor and repaints the
+/// footer just below the new output. An in-place refresh (spinner tick / draft edit / resize) repaints
+/// at the SAME stored anchor — it must never advance, or the footer would walk down one row per tick.
+static FOOTER_TOP: AtomicU16 = AtomicU16::new(0);
 
 fn work_start_slot() -> &'static Mutex<Option<Instant>> {
     WORK_START.get_or_init(|| Mutex::new(None))
@@ -442,9 +458,10 @@ fn start_ticker() {
     });
 }
 
-/// Poll terminal dimensions ~4×/s and reflow the pinned footer (Claude Code–style live resize).
-/// Width changes repaint immediately (even mid-turn). Height changes rebuild the scroll region only
-/// when idle — mid-turn height deltas are left to [`set_working`]/[`set_status`]/idle [`repaint`].
+/// Poll terminal dimensions ~4×/s and reflow the floating footer (Claude Code–style live resize).
+/// Both width and height changes repaint immediately (even mid-turn): with no scroll-region there's
+/// no protected slot to defer for, so [`reconcile_geometry`] just records the size + re-clamps the
+/// footer anchor and [`paint_box`] redraws the footer there. The terminal reflows scrollback itself.
 fn start_resize_poller() {
     if !std::io::stdout().is_terminal() {
         return;
@@ -465,23 +482,14 @@ fn start_resize_poller() {
         if rows == r.rows && cols == r.cols {
             continue;
         }
-        let working = WORKING.load(Ordering::Relaxed);
+        // No scroll-region to protect and no output slot to preserve, so width AND height changes are
+        // both safe to apply immediately (even mid-turn): reconcile only records dimensions + clamps
+        // the anchor, then paint_box erases and redraws the footer at the clamped anchor. The terminal
+        // reflows the scrollback history above it on its own.
         let mut buf = String::new();
-        if working {
-            if cols != r.cols {
-                r.cols = cols;
-                paint_box(&mut buf, &r);
-                flush(&buf);
-            }
-            if rows != r.rows {
-                PENDING_HEIGHT_RESIZE.store(true, Ordering::Relaxed);
-            }
-        } else {
-            reconcile_geometry(&mut r, &mut buf);
-            paint_box(&mut buf, &r);
-            flush(&buf);
-            PENDING_HEIGHT_RESIZE.store(false, Ordering::Relaxed);
-        }
+        reconcile_geometry(&mut r, &mut buf);
+        paint_box(&mut buf, &r);
+        flush(&buf);
     });
 }
 
@@ -679,21 +687,14 @@ fn term_size() -> (u16, u16) {
 }
 
 /// Reconcile the stored geometry against the live terminal after a possible resize. Returns whether
-/// anything changed (the caller repaints the box afterward either way it returns true).
+/// anything changed (the caller repaints the footer afterward; `true` on any delta).
 ///
-/// THE resize fix: the footer is pinned to absolute rows derived from `r.rows`, and the scroll
-/// region is `1..r.rows-FOOTER`. If the window's HEIGHT changes and we keep the stale `r.rows`, the
-/// footer is painted at the old offset while a later paint lands one row off — leaving a *ghost*
-/// status/box line behind (the "duplicated status line / vỡ layout" bug). So on a height change we
-/// wipe the union of the old+new footer bands, rebuild the scroll region to the new size, and
-/// re-anchor the output slot at the new region bottom (same move as [`resume`]); the transcript
-/// above stays as scrollback. A width-only change just updates `cols` (the box + streamed wrap track
-/// it) with no region rebuild. Emits ANSI into `buf` ONLY on an actual change, so per-keystroke
-/// callers stay cheap and never disturb the output slot when nothing moved.
-///
-/// MUST NOT be called mid-stream (it moves the scroll region + output slot). Safe points only:
-/// turn start/end ([`set_working`]), post-turn status ([`set_status`]), and idle keystrokes
-/// ([`repaint`], which gates on `!WORKING`).
+/// With the floating footer there's no scroll-region or output slot to rebuild — the content above
+/// the footer is genuine terminal scrollback and the terminal reflows it on resize by itself. So this
+/// only records the new `rows`/`cols` and re-clamps [`FOOTER_TOP`] so a shrunk window still fits the
+/// 4-row footer; the caller's [`paint_box`] then erases + redraws the footer at the clamped anchor.
+/// Emits NO ANSI (the `buf` param is retained only to keep the call sites unchanged). Safe to call
+/// mid-stream now — it moves nothing.
 fn reconcile_geometry(r: &mut Render, buf: &mut String) -> bool {
     let (rows, cols) = term_size();
     if rows == r.rows && cols == r.cols {
@@ -701,29 +702,17 @@ fn reconcile_geometry(r: &mut Render, buf: &mut String) -> bool {
     }
     r.rows = rows;
     r.cols = cols;
-    // Stop trusting the terminal to reflow the frozen content above the footer. Everything up there —
-    // the splash box, chat transcript, an open /model or /sessions overlay — was printed ONCE into the
-    // scroll region and never redrawn; a window resize rewraps that grid (a fixed-width splash box
-    // wraps, old footer/overlay rows strand mid-screen) and no code fixes it, so the frame tears and
-    // stays torn. The deterministic recovery is to REPRINT from our own model: clear the viewport and
-    // replay the transcript mirror at the new width, exactly as [`activate`] first seeded it, then
-    // rebuild the region + re-anchor the output slot. No stale cell survives and nothing is lost.
-    // (This runs only at safe points — idle poll / turn boundary — never mid-stream.)
-    let transcript = transcript_slot().lock().unwrap().clone();
-    let region_bottom = rows.saturating_sub(FOOTER).max(1);
-    reset_region(buf);
-    buf.push_str("\x1b[2J\x1b[H"); // clear + home (full screen, region reset so it scrolls cleanly)
-    set_region(buf, 1, region_bottom);
-    goto(buf, 1, 1);
-    buf.push_str(&transcript); // taller-than-region transcripts scroll within the region → tail shows
-    if !transcript.ends_with('\n') {
-        buf.push('\n');
+    // Without a scroll-region the content above the footer is genuine terminal scrollback, and the
+    // terminal reflows IT on resize — we no longer mirror or reprint anything. Just record the new
+    // dimensions; clamp the footer anchor so a shrunk window can still fit the 4-row footer (the next
+    // `paint_box` erases + redraws it there). `buf` is kept in the signature so the 4 call sites and
+    // their flush stay unchanged; we intentionally emit no ANSI here.
+    let _ = &buf;
+    let max_top = rows.saturating_sub(FOOTER) + 1;
+    let raw = FOOTER_TOP.load(Ordering::Relaxed);
+    if raw != 0 {
+        FOOTER_TOP.store(raw.clamp(1, max_top), Ordering::Relaxed);
     }
-    save_cursor(buf); // output continues at the region bottom, exactly like the steady state
-    LAST_PAL.store(0, Ordering::Relaxed);
-    LAST_MODEL_MENU.store(0, Ordering::Relaxed);
-    LAST_SESSIONS_MENU.store(0, Ordering::Relaxed);
-    LAST_TEXT_OVERLAY.store(0, Ordering::Relaxed);
     true
 }
 
@@ -919,24 +908,49 @@ fn ctx_meter_width(permille: u16, compact: bool) -> usize {
 }
 
 // ── ANSI helpers (written into a String, flushed under the lock) ──────────────────────────────
-fn set_region(buf: &mut String, top: u16, bot: u16) {
-    buf.push_str(&format!("\x1b[{top};{bot}r"));
-}
+/// Reset the DECSTBM scroll region to the full screen. The floating footer no longer SETS a region,
+/// but [`activate`] still resets one defensively (a prior mode / crash could have left one set).
 fn reset_region(buf: &mut String) {
     buf.push_str("\x1b[r");
 }
 fn goto(buf: &mut String, row: u16, col: u16) {
     buf.push_str(&format!("\x1b[{row};{col}H"));
 }
-fn save_cursor(buf: &mut String) {
-    buf.push_str("\x1b7");
-}
-fn restore_cursor(buf: &mut String) {
-    buf.push('\x1b');
-    buf.push('8');
-}
 fn clear_line(buf: &mut String) {
     buf.push_str("\x1b[2K");
+}
+/// Erase from the cursor to the end of the screen (`ED 0`). Used to wipe the old floating footer
+/// block before repainting it: one escape, correctly clears a footer that shrank (an overlay that
+/// closed), no per-row bookkeeping. Always preceded by `goto(FOOTER_TOP, 1)`.
+fn erase_below(buf: &mut String) {
+    buf.push_str("\x1b[0J");
+}
+/// How many visual terminal rows a printed chunk advances the cursor, at width `cols`. Strips SGR
+/// (colour never advances the cursor), splits on '\n', and for each segment adds `ceil(width/cols)`
+/// (min 1). Biased to round UP: an overcount self-heals next frame, but an undercount would leave
+/// `goto(FOOTER_TOP,1)` mid-output and `erase_below` would wipe a real line. In practice `emit` is
+/// line-buffered and its content is already wrapped to `width()`, so this equals the newline count —
+/// the width term is defensive against an unwrapped line slipping through.
+fn visual_rows_advanced(s: &str, cols: u16) -> u16 {
+    if s.is_empty() {
+        return 0;
+    }
+    let cols = cols.max(1) as usize;
+    let plain = console::strip_ansi_codes(s);
+    // A trailing '\n' means the final segment is empty (cursor moved to a fresh line) — `split` yields
+    // that empty tail, correctly counted as one advanced row below.
+    let mut rows: usize = 0;
+    for (i, seg) in plain.split('\n').enumerate() {
+        if i > 0 {
+            rows += 1; // the '\n' itself moved the cursor down one row
+        }
+        let w = measure_text_width(seg);
+        // Extra rows from wrapping a too-wide segment (0 when it fits in one row).
+        if w > cols {
+            rows += (w - 1) / cols;
+        }
+    }
+    rows.min(u16::MAX as usize) as u16
 }
 
 /// Draw the live slash palette in the rows directly above the status line (`top_row`). Filters as
@@ -969,7 +983,8 @@ fn paint_palette(buf: &mut String, r: &Render, top_row: u16, w: usize) {
     let more_below = start > 0; // lower-index items off the bottom (toward the input box)
     for i in 0..vis {
         let mi = start + i;
-        let (name, desc) = matches[mi];
+        let name = matches[mi].name.as_str();
+        let desc = matches[mi].description.as_str();
         goto(buf, top_row - 1 - i as u16, 1);
         clear_line(buf);
         let is_sel = mi == sel;
@@ -1337,7 +1352,19 @@ fn paint_box(buf: &mut String, r: &Render) {
     let w = layout.w;
     let inner = layout.inner;
     let inset = layout.inset;
-    let top_row = r.rows.saturating_sub(FOOTER) + 1;
+    // The footer now FLOATS below the content instead of being pinned by a scroll-region. Its anchor
+    // is [`FOOTER_TOP`] (advanced only by `emit` after it prints + scrolls output into real
+    // scrollback), clamped so a 4-row footer still fits on screen. `0` = uninitialised → bottom-glued
+    // fallback (`rows-FOOTER+1`). Erase from the anchor down first so a footer that shrank (a closed
+    // overlay) leaves nothing stranded; the transcript above the anchor is untouched (it's genuine
+    // terminal scrollback now). Re-store the SAME clamped value — an in-place refresh (spinner tick,
+    // draft edit) must NOT advance the anchor, or the footer would walk down one row per repaint.
+    let max_top = r.rows.saturating_sub(FOOTER) + 1;
+    let raw = FOOTER_TOP.load(Ordering::Relaxed);
+    let top_row = if raw == 0 { max_top } else { raw.clamp(1, max_top) };
+    FOOTER_TOP.store(top_row, Ordering::Relaxed);
+    goto(buf, top_row, 1);
+    erase_below(buf);
     let prompt_col = (inset + 1) as u16;
 
     if r.model_menu_active {
@@ -1387,7 +1414,13 @@ fn paint_box(buf: &mut String, r: &Render) {
             theme::faint(format!("{secs}s{toktail}{esc_hint}"))
         )
     } else {
-        format!("{} {}", theme::ok("●"), theme::faint(if layout.narrow { "ok" } else { "ready" }))
+        // Idle chip reflects real provider health (polled every ~60s against GET /models).
+        let h = current_health();
+        format!(
+            "{} {}",
+            style("●").color256(h.color_code()),
+            theme::faint(h.label(layout.narrow))
+        )
     };
     let right = if layout.narrow {
         state.clone()
@@ -1432,11 +1465,11 @@ fn paint_box(buf: &mut String, r: &Render) {
     let (shown, caret_off) = if r.draft.is_empty() && r.images == 0 {
         let ph: String = ph_base.chars().take(inner).collect();
         (theme::faint(ph).italic().to_string(), 0)
-    } else if r.draft.contains(&'\n') {
+    } else if r.draft.iter().filter(|&&c| c == '\n').count() + 1 >= 5 {
         let text: String = r.draft.iter().collect();
         let nlines = text.lines().count().max(1);
         let first = text.lines().find(|l| !l.trim().is_empty()).map(str::trim).unwrap_or("");
-        let head = format!("↵ {nlines} lines pasted");
+        let head = format!("[+{nlines} lines pasted]");
         let room = inner.saturating_sub(head.chars().count() + 3);
         let chip = if room > 4 && !first.is_empty() {
             let peek: String = first.chars().take(room).collect();
@@ -1508,6 +1541,13 @@ pub fn activate(intro: &str, status: &str) {
     if !std::io::stdout().is_terminal() {
         return;
     }
+    // Always seed the classic shared Render status — retained repaints pull from it via
+    // `retained_input_snapshot()`. If we skip this when retained wins, the first keystroke sends an
+    // empty `InputSnapshot.status` and wipes the HUD left side (model · tokens · yolo).
+    {
+        let mut r = render().lock().unwrap();
+        r.status = status.to_string();
+    }
     if retained::start(intro, status) {
         ACTIVE.store(false, Ordering::Relaxed);
         start_resize_poller();
@@ -1519,16 +1559,22 @@ pub fn activate(intro: &str, status: &str) {
     r.cols = cols;
     r.status = status.to_string();
     let mut buf = String::new();
-    reset_region(&mut buf);
-    buf.push_str("\x1b[2J\x1b[H"); // clear + home
-    set_region(&mut buf, 1, rows.saturating_sub(FOOTER).max(1));
-    goto(&mut buf, 1, 1);
+    reset_region(&mut buf); // belt-and-braces: drop any stale DECSTBM region from a prior mode
+    buf.push_str("\x1b[2J\x1b[H"); // clear + home → cursor at row 1
     buf.push_str(intro);
-    buf.push('\n');
-    save_cursor(&mut buf); // output continues from here
-    // Seed the transcript mirror so a resize can reprint the intro from our own model (the terminal
-    // won't reflow the frozen splash cleanly — see [`reconcile_geometry`]).
-    transcript_reset(&format!("{intro}\n"));
+    buf.push('\n'); // the intro splash goes into the terminal's real scrollback
+    // Anchor the footer DIRECTLY below the intro (Claude-CLI style — it floats below content, not
+    // glued to the bottom of an empty screen). After the clear+home the cursor was at row 1; the intro
+    // plus its trailing '\n' advanced it `visual_rows_advanced(intro)+1` rows, so the footer's HUD line
+    // sits at `1 + that`, clamped so a 4-row footer still fits. No scroll-region: lines scrolled off
+    // the top land in native scrollback (see [`FOOTER_TOP`]).
+    let max_top = r.rows.saturating_sub(FOOTER) + 1;
+    let intro_end = 1u32 + visual_rows_advanced(intro, r.cols) as u32 + 1;
+    FOOTER_TOP.store(intro_end.min(max_top as u32).max(1) as u16, Ordering::Relaxed);
+    LAST_PAL.store(0, Ordering::Relaxed);
+    LAST_MODEL_MENU.store(0, Ordering::Relaxed);
+    LAST_SESSIONS_MENU.store(0, Ordering::Relaxed);
+    LAST_TEXT_OVERLAY.store(0, Ordering::Relaxed);
     paint_box(&mut buf, &r);
     flush(&buf);
     ACTIVE.store(true, Ordering::Relaxed);
@@ -1538,19 +1584,29 @@ pub fn activate(intro: &str, status: &str) {
 /// Leave sticky mode: reset the scroll region, clear the app's viewport, and return the cursor to
 /// the top-left so the shell prompt starts on a clean screen.
 pub fn deactivate() {
+    // The crossterm input loop leaves stdin in raw mode; return it to cooked so the `bye.` line and the
+    // shell prompt after us echo normally. Idempotent and safe even if the loop never enabled raw.
+    restore_stdin_cooked();
     if retained::is_running() {
         retained::stop();
         ACTIVE.store(false, Ordering::Relaxed);
         return;
     }
     // Cleanup must be idempotent and must still run when Windows delivers CTRL_C_EVENT before the
-    // keyboard thread observes it. In that race another path may already have cleared `ACTIVE`, but
-    // the physical terminal can still contain the sticky frame and restricted scroll region.
+    // keyboard thread observes it. In that race another path may already have cleared `ACTIVE`.
     ACTIVE.store(false, Ordering::Relaxed);
+    // No scroll-region to reset and NO `\x1b[2J`: the finished session now lives in real scrollback,
+    // so wiping the viewport would throw the transcript away. Erase the floating footer where it sits,
+    // drop the cursor below it on a fresh line, and show it so the shell prompt continues cleanly.
+    let r = render().lock().unwrap();
+    let max_top = r.rows.saturating_sub(FOOTER) + 1;
+    let raw = FOOTER_TOP.load(Ordering::Relaxed);
+    let top = if raw == 0 { max_top } else { raw.clamp(1, max_top) };
     let mut buf = String::new();
-    reset_region(&mut buf);
-    buf.push_str("\x1b[2J\x1b[H\x1b[?25h"); // clear viewport + home + ensure cursor is visible
+    goto(&mut buf, top, 1);
+    buf.push_str("\x1b[0J\x1b[?25h"); // erase footer downward + ensure cursor visible
     flush(&buf);
+    FOOTER_TOP.store(0, Ordering::Relaxed);
 }
 
 /// Idempotent, lock-free terminal restore for the two paths that must NEVER hang: a panic unwinding
@@ -1568,6 +1624,7 @@ pub fn emergency_restore() {
     let mut out = std::io::stdout();
     let _ = out.write_all(b"\x1b[r\x1b[?25h");
     let _ = out.flush();
+    FOOTER_TOP.store(0, Ordering::Relaxed);
     restore_stdin_cooked();
 }
 
@@ -1607,16 +1664,20 @@ pub fn suspend() {
     prepare_dialoguer_session();
     ACTIVE.store(false, Ordering::Relaxed);
     let r = render().lock().unwrap();
-    let top = r.rows.saturating_sub(FOOTER) + 1;
+    // Erase the floating footer where it sits and leave the cursor there so the dialoguer menu renders
+    // at the bottom of the existing transcript and continues it cleanly. No region to reset.
+    let max_top = r.rows.saturating_sub(FOOTER) + 1;
+    let raw = FOOTER_TOP.load(Ordering::Relaxed);
+    let top = if raw == 0 { max_top } else { raw.clamp(1, max_top) };
     let mut buf = String::new();
-    for row in top..=r.rows {
-        goto(&mut buf, row, 1);
-        clear_line(&mut buf);
-    }
-    LAST_PAL.store(0, Ordering::Relaxed);
-    reset_region(&mut buf);
     goto(&mut buf, top, 1);
+    erase_below(&mut buf);
+    LAST_PAL.store(0, Ordering::Relaxed);
+    LAST_MODEL_MENU.store(0, Ordering::Relaxed);
+    LAST_SESSIONS_MENU.store(0, Ordering::Relaxed);
+    LAST_TEXT_OVERLAY.store(0, Ordering::Relaxed);
     flush(&buf);
+    FOOTER_TOP.store(0, Ordering::Relaxed);
 }
 
 /// Re-enter sticky mode after a slash menu. A `dialoguer` menu leaves the physical cursor at an
@@ -1626,6 +1687,10 @@ pub fn suspend() {
 /// region: agent output always appends there and scrolls up, exactly like the steady state. The
 /// menu's leftover lines stay above as scrollback (harmless) and scroll away as new output arrives.
 pub fn resume(status: &str) {
+    {
+        let mut r = render().lock().unwrap();
+        r.status = status.to_string();
+    }
     if retained::is_running() {
         let _ = retained::resume(status);
         return;
@@ -1638,13 +1703,15 @@ pub fn resume(status: &str) {
     r.rows = rows;
     r.cols = cols;
     r.status = status.to_string();
-    let region_bottom = rows.saturating_sub(FOOTER).max(1);
     let mut buf = String::new();
-    reset_region(&mut buf);
-    set_region(&mut buf, 1, region_bottom);
-    goto(&mut buf, region_bottom, 1); // anchor the output slot at the region bottom…
-    clear_line(&mut buf); // …on a clean line, so the next token doesn't overprint menu residue
-    save_cursor(&mut buf);
+    // Re-anchor the footer to the bottom (anchor 0 → paint_box uses `rows-FOOTER+1`). The menu's
+    // leftover lines stay above as real scrollback (harmless) and scroll away as new output arrives.
+    // No scroll-region, no saved output slot: the next `emit` re-anchors below its own output.
+    FOOTER_TOP.store(0, Ordering::Relaxed);
+    LAST_PAL.store(0, Ordering::Relaxed);
+    LAST_MODEL_MENU.store(0, Ordering::Relaxed);
+    LAST_SESSIONS_MENU.store(0, Ordering::Relaxed);
+    LAST_TEXT_OVERLAY.store(0, Ordering::Relaxed);
     paint_box(&mut buf, &r);
     flush(&buf);
     ACTIVE.store(true, Ordering::Relaxed);
@@ -1690,13 +1757,32 @@ pub fn emit(s: &str) {
         let _ = std::io::stdout().flush();
         return;
     }
-    transcript_push(s); // mirror into the resize-reprint buffer BEFORE painting
     let r = render().lock().unwrap();
+    // Floating-footer emit (no scroll-region). Erase the old footer at its anchor, print the output
+    // where the footer's HUD line was so its newlines scroll the terminal NATURALLY — pushing the top
+    // line into REAL scrollback (that's what makes the native scrollbar + mouse selection work) — then
+    // reserve the footer's rows and repaint it just below the new output.
+    let max_top = r.rows.saturating_sub(FOOTER) + 1;
+    let raw = FOOTER_TOP.load(Ordering::Relaxed);
+    let footer_top = if raw == 0 { max_top } else { raw.clamp(1, max_top) };
     let mut buf = String::new();
-    restore_cursor(&mut buf); // back to the saved output position (inside the scroll region)
+    goto(&mut buf, footer_top, 1);
+    erase_below(&mut buf);
     buf.push_str(s);
-    save_cursor(&mut buf); // remember where output continues
-    paint_box(&mut buf, &r);
+    // Reserve the FOOTER-1 rows below the fresh output line. When the screen is full these newlines
+    // scroll the terminal (into scrollback) so the footer region is free; when it isn't, they are
+    // blank rows the footer overwrites (no visible gap). This is what forces the scroll BEFORE the
+    // footer is drawn — without it, output landing between `max_top` and the fresh line would be
+    // erased by paint_box's `erase_below`. `emit` is line-buffered + pre-wrapped, so `visual_rows_
+    // advanced` never undercounts the newline rows (it may over-count on an unwrapped wide line, which
+    // only leaves a self-healing gap — never data loss).
+    for _ in 0..FOOTER.saturating_sub(1) {
+        buf.push('\n');
+    }
+    let advanced = visual_rows_advanced(s, r.cols);
+    let new_top = (footer_top as u32 + advanced as u32).min(max_top as u32).max(1) as u16;
+    FOOTER_TOP.store(new_top, Ordering::Relaxed);
+    paint_box(&mut buf, &r); // reads FOOTER_TOP, draws the footer at `new_top`
     flush(&buf);
 }
 
@@ -1877,12 +1963,11 @@ pub fn set_working(working: bool) {
         return;
     }
     let mut r = render().lock().unwrap();
-    // Turn boundary (not mid-stream) → safe to fully reconcile a resized/maximised window: width so
-    // the box + streamed wrap (`width()`) track it, AND height so the scroll region + footer rows
-    // snap to the new size instead of leaving a ghost footer behind.
+    // Turn boundary → reconcile a resized/maximised window: width so the box + streamed wrap
+    // (`width()`) track it, height so the footer anchor re-clamps to the new size. paint_box then
+    // redraws the footer at the clamped anchor.
     let mut buf = String::new();
     reconcile_geometry(&mut r, &mut buf);
-    PENDING_HEIGHT_RESIZE.store(false, Ordering::Relaxed);
     paint_box(&mut buf, &r);
     flush(&buf);
 }
@@ -1890,6 +1975,11 @@ pub fn set_working(working: bool) {
 /// Update the status text (model · tokens · yolo) and repaint. (Does not touch the output slot —
 /// see [`set_working`].)
 pub fn set_status(status: &str) {
+    // Keep the classic shared status in sync even under retained — every keystroke snapshot reads it.
+    {
+        let mut r = render().lock().unwrap();
+        r.status = status.to_string();
+    }
     if retained::is_running() {
         retained::set_status(status);
         return;
@@ -1898,11 +1988,8 @@ pub fn set_status(status: &str) {
         return;
     }
     let mut r = render().lock().unwrap();
-    r.status = status.to_string();
     let mut buf = String::new();
-    // Post-turn — safe point to fix a resize that happened mid-turn.
     reconcile_geometry(&mut r, &mut buf);
-    PENDING_HEIGHT_RESIZE.store(false, Ordering::Relaxed);
     paint_box(&mut buf, &r);
     flush(&buf);
 }
@@ -2001,7 +2088,7 @@ fn retained_input_snapshot() -> retained::InputSnapshot {
         let matches = slash_matches(&r.draft);
         (!matches.is_empty()).then(|| retained::OverlaySnapshot {
             title: "commands".to_string(),
-            lines: matches.iter().map(|(name, desc)| format!("/{name}  ·  {desc}")).collect(),
+            lines: matches.iter().map(|c| format!("/{}  ·  {}", c.name, c.description)).collect(),
             selected: Some(r.palette_sel.min(matches.len().saturating_sub(1))),
             hint: "↑↓ pick · Tab complete · Enter run".to_string(),
         })
@@ -2078,35 +2165,268 @@ fn recall_history_next(hist_idx: &mut Option<usize>, draft_saved: &[char], histo
     repaint();
 }
 
+/// Translate a crossterm `KeyEvent` into the `console::Key` the rest of the input stack already
+/// speaks, so migrating the reader from `console::read_key` to crossterm's event stream doesn't
+/// force a re-type of every menu/overlay handler. Returns `None` for keys we don't act on.
+///
+/// Control combos are folded back to their ASCII control codepoint (Ctrl-C → `'\u{3}'`, Ctrl-O →
+/// `'\u{f}'`, …) — the exact bytes the old `console` reader produced and every downstream `match`
+/// arm expects. Shift+Enter is handled by the caller BEFORE this (crossterm can see the SHIFT bit
+/// that `console` could not), so it never reaches here.
+fn crossterm_to_console_key(ev: crossterm::event::KeyEvent) -> Option<Key> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+    Some(match ev.code {
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Esc => Key::Escape,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Delete => Key::Del,
+        KeyCode::Left => Key::ArrowLeft,
+        KeyCode::Right => Key::ArrowRight,
+        KeyCode::Up => Key::ArrowUp,
+        KeyCode::Down => Key::ArrowDown,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::BackTab => Key::BackTab,
+        KeyCode::Insert => Key::Insert,
+        KeyCode::Char(c) => {
+            if ctrl && c.is_ascii_alphabetic() {
+                // Ctrl-A..Ctrl-Z → U+0001..U+001A (Ctrl-C → '\u{3}', matching the old console bytes).
+                Key::Char(((c.to_ascii_uppercase() as u8) - b'A' + 1) as char)
+            } else if ctrl {
+                return None; // Ctrl+non-letter: nothing downstream binds it
+            } else {
+                Key::Char(c)
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Phase 3 mouse handler for the retained backend: wheel scroll, text selection (drag + copy-on-
+/// release), and scrollbar thumb drag. Mutates `selecting` / `dragging_scrollbar` so state survives
+/// across successive mouse events. No-ops harmlessly when geometry is empty (first frame).
+fn handle_retained_mouse(
+    kind: crossterm::event::MouseEventKind,
+    col: u16,
+    row: u16,
+    selecting: &mut Option<retained::SelectionRange>,
+    dragging_scrollbar: &mut bool,
+) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (start, visible, total, area) = retained::last_transcript_geom();
+    if area.width == 0 || area.height == 0 {
+        // Still allow wheel even before first paint — scroll is idempotent.
+        match kind {
+            MouseEventKind::ScrollUp => retained::scroll(-3),
+            MouseEventKind::ScrollDown => retained::scroll(3),
+            _ => {}
+        }
+        return;
+    }
+    // Scrollbar gutter = rightmost cell of the transcript area.
+    let on_scrollbar = col >= area.x.saturating_add(area.width.saturating_sub(1))
+        && row >= area.y
+        && row < area.y.saturating_add(area.height);
+    let in_transcript = col >= area.x
+        && col < area.x.saturating_add(area.width.saturating_sub(1))
+        && row >= area.y
+        && row < area.y.saturating_add(area.height);
+
+    match kind {
+        MouseEventKind::ScrollUp => retained::scroll(-3),
+        MouseEventKind::ScrollDown => retained::scroll(3),
+        MouseEventKind::Down(MouseButton::Left) => {
+            if on_scrollbar && total > visible {
+                *dragging_scrollbar = true;
+                *selecting = None;
+                retained::clear_selection();
+                let rel_y = row.saturating_sub(area.y) as usize;
+                let max_start = total.saturating_sub(visible);
+                let desired = if area.height <= 1 {
+                    0
+                } else {
+                    (rel_y.saturating_mul(max_start)) / (area.height as usize - 1).max(1)
+                };
+                retained::scroll_to(desired.min(max_start));
+            } else if in_transcript {
+                *dragging_scrollbar = false;
+                let line = start.saturating_add(row.saturating_sub(area.y) as usize);
+                let c = col.saturating_sub(area.x) as usize;
+                let sel = retained::SelectionRange {
+                    anchor_line: line,
+                    anchor_col: c,
+                    cursor_line: line,
+                    cursor_col: c,
+                };
+                *selecting = Some(sel);
+                retained::set_selection(sel);
+            } else {
+                // Click outside transcript/scrollbar clears any live selection.
+                *dragging_scrollbar = false;
+                *selecting = None;
+                retained::clear_selection();
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if *dragging_scrollbar && total > visible {
+                let rel_y = row.saturating_sub(area.y) as usize;
+                let max_start = total.saturating_sub(visible);
+                let desired = if area.height <= 1 {
+                    0
+                } else {
+                    (rel_y.saturating_mul(max_start)) / (area.height as usize - 1).max(1)
+                };
+                retained::scroll_to(desired.min(max_start));
+            } else if let Some(sel) = selecting.as_mut() {
+                // Velocity-based auto-scroll: deeper past the edge → faster (1/2/4 lines). Geometry
+                // is only updated after the render thread paints, so we apply an optimistic start
+                // delta locally — otherwise the selection lag-stutters one frame behind the scroll.
+                let top = area.y as i32;
+                let bot = area.y.saturating_add(area.height.saturating_sub(1)) as i32;
+                let r = row as i32;
+                let (scroll_delta, start_delta): (i32, isize) = if r <= top {
+                    let dist = (top - r + 1) as i32;
+                    let n = if dist >= 4 { 4 } else if dist >= 2 { 2 } else { 1 };
+                    (-n, -(n as isize))
+                } else if r >= bot {
+                    let dist = (r - bot + 1) as i32;
+                    let n = if dist >= 4 { 4 } else if dist >= 2 { 2 } else { 1 };
+                    (n, n as isize)
+                } else if r <= top + 1 {
+                    (-1, -1)
+                } else if r >= bot - 1 {
+                    (1, 1)
+                } else {
+                    (0, 0)
+                };
+                if scroll_delta != 0 {
+                    retained::scroll(scroll_delta);
+                }
+                // Clamp the cursor into the transcript area for col/line mapping, but keep absolute
+                // line growing via optimistic start so the selection extends while auto-scrolling.
+                let start2 = if start_delta < 0 {
+                    start.saturating_sub((-start_delta) as usize)
+                } else {
+                    start.saturating_add(start_delta as usize)
+                };
+                let clamp_row = row.clamp(area.y, area.y.saturating_add(area.height.saturating_sub(1)));
+                let clamp_col = col.clamp(
+                    area.x,
+                    area.x.saturating_add(area.width.saturating_sub(2)),
+                );
+                let line = start2.saturating_add(clamp_row.saturating_sub(area.y) as usize);
+                let c = clamp_col.saturating_sub(area.x) as usize;
+                // Skip no-op updates — floods of identical Drag events were jamming the render queue.
+                if sel.cursor_line != line || sel.cursor_col != c {
+                    sel.cursor_line = line;
+                    sel.cursor_col = c;
+                    retained::set_selection(*sel);
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if *dragging_scrollbar {
+                *dragging_scrollbar = false;
+            } else if let Some(sel) = selecting.take() {
+                // Keep highlight until next click; copy text to the OS clipboard on release.
+                retained::set_selection(sel);
+                let text = retained::extract_selection_text(sel);
+                if !text.is_empty() {
+                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                        let _ = cb.set_text(text);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn input_loop(
     sub_tx: UnboundedSender<Submission>,
     cancel_tx: UnboundedSender<()>,
     resume_rx: stdmpsc::Receiver<()>,
 ) {
-    let term = Term::stdout();
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     let mut history: Vec<String> = Vec::new();
     let mut hist_idx: Option<usize> = None;
     let mut draft_saved: Vec<char> = Vec::new();
     // Arrival time of the PREVIOUS key, so we can measure the inter-key gap (below). `None` until the
     // first key of the session.
     let mut last_arrival: Option<Instant> = None;
+    // Phase 3 mouse drag state (retained only). `selecting` tracks left-drag text selection;
+    // `dragging_scrollbar` tracks thumb drag on the right gutter. Cleared on mouse-up / Esc.
+    let mut selecting: Option<retained::SelectionRange> = None;
+    let mut dragging_scrollbar = false;
 
     loop {
-        let key = match term.read_key() {
-            Ok(k) => k,
-            Err(_) => {
-                let _ = sub_tx.send(Submission::Quit);
-                return;
+        // Raw mode is required for crossterm's event reader (no line buffering / echo). Re-assert it
+        // every iteration: it's idempotent, and a slash command that parked us for a `dialoguer` menu
+        // flips stdin back to cooked mode (see `prepare_dialoguer_session`) — re-enabling here restores
+        // raw the moment we're unparked, without threading any state through the park/resume dance.
+        let _ = crossterm::terminal::enable_raw_mode();
+        // Read the next actionable key from crossterm's event stream. Non-key events are handled and
+        // skipped inline: on Windows the console delivers BOTH press AND release records, so we keep
+        // only `Press` (otherwise every key fires twice). With mouse capture on (retained): wheel
+        // scrolls the transcript; left-drag selects text (copy-on-release via arboard); the right
+        // gutter scrollbar is draggable. Shift+Enter inserts a literal newline into the draft.
+        let key = loop {
+            let ev = match event::read() {
+                Ok(ev) => ev,
+                Err(_) => {
+                    let _ = sub_tx.send(Submission::Quit);
+                    return;
+                }
+            };
+            match ev {
+                Event::Key(ke) if ke.kind == KeyEventKind::Press => {
+                    if ke.code == KeyCode::Enter && ke.modifiers.contains(KeyModifiers::SHIFT) {
+                        let mut r = render().lock().unwrap();
+                        let cur = r.cursor;
+                        r.draft.insert(cur, '\n');
+                        r.cursor += 1;
+                        r.palette_sel = 0;
+                        drop(r);
+                        hist_idx = None;
+                        repaint();
+                        continue;
+                    }
+                    // Esc while a selection is active just clears it (does not quit / cancel turn).
+                    if ke.code == KeyCode::Esc && selecting.is_some() {
+                        selecting = None;
+                        retained::clear_selection();
+                        continue;
+                    }
+                    match crossterm_to_console_key(ke) {
+                        Some(k) => break k,
+                        None => continue,
+                    }
+                }
+                Event::Mouse(me) if retained::is_active() => {
+                    handle_retained_mouse(
+                        me.kind,
+                        me.column,
+                        me.row,
+                        &mut selecting,
+                        &mut dragging_scrollbar,
+                    );
+                    continue;
+                }
+                // Release/Repeat key records, other mouse, resize, focus, paste → not actioned here.
+                _ => continue,
             }
         };
-        // Paste detection by INTER-KEY GAP, not by how long this `read_key` blocked. The old check
-        // (`read_key` returned in < 50 ms) broke while the agent was WORKING: a heavy output stream
-        // slows this loop's repaint, so a hand-typed key is already sitting in the OS buffer by the
-        // time `read_key` runs → it returns instantly → EVERY keystroke (incl. the Enter meant to
-        // queue a message) looked "buffered" and the Enter became a literal newline. The message then
-        // sat in the draft forever ("swallowed"). Measuring the gap between successive key ARRIVALS
-        // folds the slow repaint INTO the gap, so a real keystroke (arrivals ≥ ~100 ms apart) is never
-        // mistaken for a paste (arrivals < 1 ms apart), regardless of how busy the turn is.
+        // Paste detection by INTER-KEY GAP. Windows Terminal delivers a paste as a burst of individual
+        // key events (crossterm has no bracketed-paste on Windows), so we infer a paste from how close
+        // successive key ARRIVALS are. Measuring the gap (not how long the read blocked) folds a slow
+        // repaint while the agent is WORKING into the gap, so a real keystroke (arrivals ≥ ~100 ms
+        // apart) is never mistaken for a paste (arrivals < 1 ms apart), regardless of how busy the turn
+        // is. Consumed only by the `Key::Enter if buffered` arm → a newline inside a paste becomes a
+        // literal `\n` instead of firing one message per line.
         let now = Instant::now();
         let buffered =
             last_arrival.map(|t| now.duration_since(t) < Duration::from_millis(PASTE_COALESCE_MS)).unwrap_or(false);
@@ -2173,7 +2493,7 @@ fn input_loop(
                     let pick = if images > 0 || matches.is_empty() {
                         None // an image attachment makes it a chat message, not a slash command
                     } else {
-                        Some(matches[r.palette_sel.min(matches.len() - 1)].0.to_string())
+                        Some(matches[r.palette_sel.min(matches.len() - 1)].name.clone())
                     };
                     r.draft.clear();
                     r.cursor = 0;
@@ -2236,32 +2556,25 @@ fn input_loop(
                 if WORKING.load(Ordering::Relaxed) {
                     request_cancel(); // cooperative: lets a running tool (e.g. a long shell) abort now
                     let _ = cancel_tx.send(()); // and wake the REPL's select! at the next yield point
+                } else if matches!(key, Key::CtrlC | Key::Char('\u{3}')) {
+                    // Ctrl-C is THE way to quit the app (Esc no longer exits). Unconditional process
+                    // exit — it must not merely clear a draft first, or some Windows terminals kill us
+                    // before the REPL reaches its normal `deactivate()` cleanup path.
+                    let _ = sub_tx.send(Submission::Quit);
+                    return;
                 } else {
-                    // Ctrl-C is an unconditional process exit. Unlike Esc/Ctrl-D, it must not merely
-                    // clear a non-empty draft: doing that makes the OS terminate us on some Windows
-                    // terminals before the REPL reaches its normal `deactivate()` cleanup path.
-                    if matches!(key, Key::CtrlC | Key::Char('\u{3}')) {
-                        let _ = sub_tx.send(Submission::Quit);
-                        return;
+                    // Esc / Ctrl-D never quit anymore: they only clear a pending draft (and drop image
+                    // attachments). An empty prompt press is a no-op — closing the app is Ctrl-C only.
+                    let mut r = render().lock().unwrap();
+                    if !r.draft.is_empty() || r.images > 0 {
+                        r.draft.clear();
+                        r.cursor = 0;
+                        r.images = 0;
+                        drop(r);
+                        clear_pending_images();
+                        hist_idx = None;
+                        repaint();
                     }
-                    let empty = {
-                        let mut r = render().lock().unwrap();
-                        if r.draft.is_empty() && r.images == 0 {
-                            true
-                        } else {
-                            r.draft.clear();
-                            r.cursor = 0;
-                            r.images = 0;
-                            clear_pending_images();
-                            false
-                        }
-                    };
-                    if empty {
-                        let _ = sub_tx.send(Submission::Quit);
-                        return;
-                    }
-                    hist_idx = None;
-                    repaint();
                 }
             }
             Key::Tab => {
@@ -2270,7 +2583,7 @@ fn input_loop(
                 let name = {
                     let r = render().lock().unwrap();
                     let m = slash_matches(&r.draft);
-                    (!m.is_empty()).then(|| m[r.palette_sel.min(m.len() - 1)].0.to_string())
+                    (!m.is_empty()).then(|| m[r.palette_sel.min(m.len() - 1)].name.clone())
                 };
                 if let Some(name) = name {
                     let mut r = render().lock().unwrap();
@@ -2365,30 +2678,27 @@ fn input_loop(
                 repaint();
             }
             Key::ArrowUp => {
-                // While the slash palette is open, ↑/↓ move the highlight (over the FULL match list —
-                // the palette window scrolls to follow) instead of recalling history.
+                // While the slash palette is open, ↑/↓ move the highlight over the FULL match list. The
+                // two backends stack the list in OPPOSITE directions: classic draws index 0 nearest the
+                // box (list climbs UP, so ↑ = index+1), retained's overlay draws index 0 at the TOP
+                // (list runs DOWN, so ↑ = index-1). Match the visual direction per backend.
                 let pal = {
                     let r = render().lock().unwrap();
                     slash_matches(&r.draft).len()
                 };
                 if pal > 0 {
                     let mut r = render().lock().unwrap();
-                    if r.palette_sel + 1 < pal {
+                    if retained::is_active() {
+                        r.palette_sel = r.palette_sel.saturating_sub(1);
+                    } else if r.palette_sel + 1 < pal {
                         r.palette_sel += 1;
                     }
                     drop(r);
                     repaint();
                     continue;
                 }
-                // In the retained alternate-screen backend the terminal has no native scrollback, so
-                // the mouse wheel is delivered as ↑/↓ key events (Windows Terminal "alternateScroll").
-                // At an empty prompt, route ↑ to transcript scroll so the wheel scrolls the chat like a
-                // normal pager instead of recalling the previous message. History recall stays on
-                // Ctrl-P/Ctrl-N. When the draft is non-empty the arrow still recalls history as before.
-                if retained::is_active() && render().lock().unwrap().draft.is_empty() {
-                    retained::scroll(-TRANSCRIPT_ARROW_SCROLL);
-                    continue;
-                }
+                // ↑ at the prompt recalls the previous message (readline-style), in BOTH backends.
+                // Transcript scrolling lives on PageUp/PageDown, so arrows are never stolen from recall.
                 if history.is_empty() {
                     continue;
                 }
@@ -2401,29 +2711,18 @@ fn input_loop(
                 };
                 if pal > 0 {
                     let mut r = render().lock().unwrap();
-                    if r.palette_sel > 0 {
-                        r.palette_sel -= 1;
+                    if retained::is_active() {
+                        if r.palette_sel + 1 < pal {
+                            r.palette_sel += 1;
+                        }
+                    } else {
+                        r.palette_sel = r.palette_sel.saturating_sub(1);
                     }
                     drop(r);
                     repaint();
                     continue;
                 }
-                // Symmetric to ArrowUp: at an empty prompt in retained mode, ↓ scrolls the transcript
-                // back toward the newest output (wheel-down). History recall stays on Ctrl-N.
-                if retained::is_active() && render().lock().unwrap().draft.is_empty() {
-                    retained::scroll(TRANSCRIPT_ARROW_SCROLL);
-                    continue;
-                }
-                recall_history_next(&mut hist_idx, &draft_saved, &history);
-            }
-            // Ctrl-P / Ctrl-N: readline-style history recall. Kept reachable even though ↑/↓ at an empty
-            // prompt now drive transcript scroll (so the mouse wheel scrolls the chat) in retained mode.
-            Key::Char('\u{10}') => {
-                if !history.is_empty() {
-                    recall_history_prev(&mut hist_idx, &mut draft_saved, &history);
-                }
-            }
-            Key::Char('\u{e}') => {
+                // Symmetric to ArrowUp: ↓ walks history forward. No transcript-scroll hijack.
                 recall_history_next(&mut hist_idx, &draft_saved, &history);
             }
             _ => {}
@@ -2783,26 +3082,13 @@ fn text_overlay_finish() {
         r.text_overlay_title.clear();
         r.text_overlay_lines.clear();
     }
-    // Rebuild the viewport from the transcript mirror: merely clearing overlay rows would erase the
-    // transcript cells they temporarily covered instead of restoring the exact prior screen.
+    // Repaint at the floating anchor: `paint_box` erases the footer downward and its now-inactive
+    // `paint_text_overlay` branch clears the overlay rows it painted above the anchor. The transcript
+    // below/above is genuine terminal scrollback (no mirror to replay); the overlay covered cells that
+    // were already scrolled out of the live viewport, so nothing beneath it is lost.
     if active() {
         let r = render().lock().unwrap();
-        let transcript = transcript_slot().lock().unwrap().clone();
-        let region_bottom = r.rows.saturating_sub(FOOTER).max(1);
         let mut buf = String::new();
-        reset_region(&mut buf);
-        buf.push_str("\x1b[2J\x1b[H");
-        set_region(&mut buf, 1, region_bottom);
-        goto(&mut buf, 1, 1);
-        buf.push_str(&transcript);
-        if !transcript.ends_with('\n') {
-            buf.push('\n');
-        }
-        save_cursor(&mut buf);
-        LAST_PAL.store(0, Ordering::Relaxed);
-        LAST_MODEL_MENU.store(0, Ordering::Relaxed);
-        LAST_SESSIONS_MENU.store(0, Ordering::Relaxed);
-        LAST_TEXT_OVERLAY.store(0, Ordering::Relaxed);
         paint_box(&mut buf, &r);
         flush(&buf);
     }
@@ -2837,8 +3123,12 @@ pub fn prepare_dialoguer_session() {
     }
 }
 
-/// After `read_key` / dialoguer, `stdin` may be raw on Windows — `read_line` then shows nothing.
+/// After the crossterm input loop / dialoguer, `stdin` may be raw on Windows — `read_line` then shows
+/// nothing. Also clears crossterm's own raw-mode latch so its state agrees with the cooked mode we set.
 pub fn restore_stdin_cooked() {
+    // Clear crossterm's internal raw-mode flag first (it caches the pre-raw console mode); the explicit
+    // `SetConsoleMode` below then pins a clean cooked mode regardless of what crossterm restored.
+    let _ = crossterm::terminal::disable_raw_mode();
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -3319,6 +3609,24 @@ mod tests {
     }
 
     #[test]
+    fn health_kind_labels_and_colours_are_stable() {
+        // Idle chip copy + palette must stay distinct so green/yellow/red keep meaning.
+        assert_eq!(HealthKind::Ok.label(false), "ready");
+        assert_eq!(HealthKind::Ok.label(true), "ok");
+        assert_eq!(HealthKind::Unstable.label(false), "unstable");
+        assert_eq!(HealthKind::Down.label(false), "down");
+        assert_eq!(HealthKind::Unknown.label(false), "checking");
+        assert_eq!(HealthKind::Ok.color_code(), theme::OK);
+        assert_eq!(HealthKind::Unstable.color_code(), theme::WARN);
+        assert_eq!(HealthKind::Down.color_code(), theme::ERR);
+        assert_eq!(HealthKind::Unknown.color_code(), theme::MUTED);
+        // Round-trip through the atomic encoding.
+        for h in [HealthKind::Ok, HealthKind::Unstable, HealthKind::Down, HealthKind::Unknown] {
+            assert_eq!(HealthKind::from_u8(h as u8), h);
+        }
+    }
+
+    #[test]
     fn session_allow_short_circuits_approval() {
         reset_session_allow();
         assert!(!session_allow_all(), "starts off");
@@ -3531,7 +3839,8 @@ mod tests {
         // A multi-line draft (a paste) must render as ONE collapsed chip — line count + a peek — not
         // the raw lines crammed into the box. The full text is still what gets submitted.
         WORKING.store(false, Ordering::Relaxed);
-        let draft = "Trả lời tự nhiên\nKhông nhắc là AI\nCó thể pha trò";
+        FOOTER_TOP.store(0, Ordering::Relaxed); // bottom-glued fallback → top = rows-FOOTER+1 = 21
+        let draft = "Trả lời tự nhiên\nKhông nhắc là AI\nCó thể pha trò\ndòng bốn\ndòng năm";
         let r = Render {
             cols: 60,
             rows: 24,
@@ -3555,7 +3864,7 @@ mod tests {
         };
         let mut buf = String::new();
         paint_box(&mut buf, &r);
-        assert!(buf.contains("3 lines pasted"), "chip shows the line count");
+        assert!(buf.contains("5 lines pasted"), "chip shows the line count");
         assert!(!buf.contains("Không nhắc là AI"), "interior lines are collapsed, not shown raw");
         // The collapsed prompt row must still fit the width (no wrap).
         let top = r.rows - FOOTER + 1;
@@ -3580,6 +3889,7 @@ mod tests {
         // A very long status on a narrow box must be truncated so the line can't wrap (wrap doubles
         // the footer). Check the painted status row stays within `cols`.
         WORKING.store(false, Ordering::Relaxed);
+        FOOTER_TOP.store(0, Ordering::Relaxed); // bottom-glued fallback → top = rows-FOOTER+1 = 21
         let r = Render {
             cols: 30,
             rows: 24,
@@ -3616,13 +3926,18 @@ mod tests {
     fn slash_palette_filters_live() {
         let v = |s: &str| s.chars().collect::<Vec<_>>();
         assert!(slash_matches(&v("hello")).is_empty(), "no leading slash → no palette");
-        assert_eq!(slash_matches(&v("/")).len(), SLASH.len(), "bare / lists everything");
-        let se: Vec<&str> = slash_matches(&v("/se")).iter().map(|(n, _)| *n).collect();
-        assert!(se.contains(&"sessions") && se.contains(&"serve"), "/se → sessions, serve");
-        assert!(!se.contains(&"model"), "/se excludes non-matches");
+        assert_eq!(
+            slash_matches(&v("/")).len(),
+            crate::features::slash::list().len(),
+            "bare / lists the whole catalog"
+        );
+        let se: Vec<String> = slash_matches(&v("/se")).into_iter().map(|c| c.name).collect();
+        assert!(se.contains(&"sessions".to_string()) && se.contains(&"serve".to_string()), "/se → sessions, serve");
+        assert!(!se.contains(&"model".to_string()), "/se excludes non-matches");
         assert!(slash_matches(&v("/model foo")).is_empty(), "once an arg is typed the palette hides");
-        assert_eq!(slash_matches(&v("/se")).first().map(|(n, _)| *n), Some("sessions"), "top match earliest-listed");
-        assert!(slash_matches(&v("/xyz")).is_empty(), "no match → nothing to complete");
+        assert!(!slash_matches(&v("/xyz")).iter().any(|c| c.name == "xyz"), "no /xyz command to complete");
+        // /init must be reachable from the live palette (the reported bug).
+        assert!(slash_matches(&v("/init")).iter().any(|c| c.name == "init"), "/init appears in the palette");
     }
 
     #[test]

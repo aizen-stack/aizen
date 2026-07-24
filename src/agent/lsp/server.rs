@@ -34,7 +34,8 @@ use async_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentDiagnosticParams,
     DocumentDiagnosticReport, DocumentDiagnosticReportResult, DocumentSymbol,
     DocumentSymbolClientCapabilities, DocumentSymbolParams, DocumentSymbolResponse,
-    InitializeParams, InitializedParams, Location, NumberOrString, OneOf, PartialResultParams,
+    Hover, HoverContents, HoverParams, InitializeParams, InitializedParams, Location, MarkedString,
+    NumberOrString, OneOf, PartialResultParams,
     Position, PublishDiagnosticsClientCapabilities, Range, ReferenceContext, ReferenceParams,
     ServerCapabilities, SymbolKind, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
     TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
@@ -65,13 +66,16 @@ const MAX_DEF_LINES: usize = 120;
 const DEF_FALLBACK_LINES: usize = 40;
 
 /// A single reference hit, shaped for the model: 0-based `line`/`col` (rendered 1-based) + a trimmed
-/// one-line snippet so the agent doesn't have to re-read the file.
+/// one-line snippet so the agent doesn't have to re-read the file. `enclosing` is the containing
+/// symbol `(name, kind)` when the file's outline resolves it — so impact analysis reads "in fn X"
+/// per call site instead of forcing a file_read of every referencing file.
 #[derive(Debug, Clone)]
 pub struct RefHit {
     pub path: PathBuf,
     pub line: usize,
     pub col: usize,
     pub snippet: String,
+    pub enclosing: Option<(String, &'static str)>,
 }
 
 /// A resolved definition: where it is + its source text inline (kills the navigate-then-read
@@ -83,6 +87,16 @@ pub struct DefHit {
     pub col: usize,
     pub source: String,
     pub truncated: bool,
+}
+
+/// A resolved hover: where the symbol is + the language server's type/signature/doc markdown
+/// (uncapped here; the tool layer caps line count when rendering).
+#[derive(Debug, Clone)]
+pub struct HoverHit {
+    pub path: PathBuf,
+    pub name: String,
+    pub line: usize,
+    pub text: String,
 }
 
 /// One entry of a file's structural outline (0-based `line`, `depth` = nesting level).
@@ -208,6 +222,10 @@ struct SymCand {
     kind: SymbolKind,
     uri: Url,
     range: Option<Range>,
+    /// Containing symbol name reported by the server (e.g. the `impl`/class/module a method lives
+    /// in). Used to disambiguate a `Container/method` name-path; `None`/empty when the server omits
+    /// it (some do), in which case name-path targeting falls back to the file hint.
+    container: Option<String>,
 }
 
 /// A picked, position-resolved symbol (definition site).
@@ -441,15 +459,65 @@ impl LspServer {
             .map_err(|e| anyhow!("textDocument/references failed: {e}"))?
             .unwrap_or_default();
 
+        // Resolve each hit's ENCLOSING symbol (name + kind) so impact analysis reads at a glance
+        // which function/impl a call site sits in — instead of a bare line the model must re-open
+        // each file to understand. document_symbol is fetched ONCE per file (cached by URI) and
+        // reused across that file's hits: a 100-reference result costs one outline per distinct
+        // file, not one per hit.
+        let mut outline_cache: HashMap<Url, Option<DocumentSymbolResponse>> = HashMap::new();
         let mut hits = Vec::with_capacity(locs.len());
         for loc in locs {
             let Ok(p) = uri::uri_to_path(loc.uri.as_str()) else { continue };
             let line = loc.range.start.line as usize;
             let col = loc.range.start.character as usize;
             let snippet = read_line_snippet(&p, line).await;
-            hits.push(RefHit { path: p, line, col, snippet });
+            let enclosing = self
+                .enclosing_sym_cached(&loc.uri, loc.range.start, &mut outline_cache)
+                .await;
+            hits.push(RefHit { path: p, line, col, snippet, enclosing });
         }
         Ok(hits)
+    }
+
+    /// Enclosing symbol (name + kind label) for `pos` in `uri`'s outline, fetching + caching the
+    /// document-symbol response once per URI. `None` for top-level positions (use-statements, refs
+    /// outside any symbol) or when the server can't answer — the caller renders those without a
+    /// containing-symbol note.
+    async fn enclosing_sym_cached(
+        &self,
+        uri: &Url,
+        pos: Position,
+        cache: &mut HashMap<Url, Option<DocumentSymbolResponse>>,
+    ) -> Option<(String, &'static str)> {
+        if !cache.contains_key(uri) {
+            // ensure_open so a lazy server has the buffer before we ask for its outline.
+            if let Ok(target) = uri::uri_to_path(uri.as_str()) {
+                let _ = self.ensure_open(&target).await;
+            }
+            let mut sock = self.socket.clone();
+            let resp = sock
+                .document_symbol(DocumentSymbolParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .await
+                .ok()
+                .flatten();
+            cache.insert(uri.clone(), resp);
+        }
+        match cache.get(uri)?.as_ref()? {
+            DocumentSymbolResponse::Nested(v) => find_enclosing_sym(v, pos),
+            DocumentSymbolResponse::Flat(v) => v
+                .iter()
+                .filter(|si| range_contains(&si.location.range, pos))
+                // Deepest = smallest range among the flat symbols containing pos.
+                .min_by_key(|si| {
+                    let r = &si.location.range;
+                    (r.end.line - r.start.line) as u64
+                })
+                .map(|si| (si.name.clone(), kind_label(si.kind))),
+        }
     }
 
     /// Resolve a symbol BY NAME to its definition, returning the definition's source text inline.
@@ -477,6 +545,33 @@ impl LspServer {
             source,
             // The fallback window is a guess, so flag it as truncated unless the outline answered.
             truncated: truncated || full_range.is_none(),
+        })
+    }
+
+    /// Resolve a symbol BY NAME and return the language server's `textDocument/hover` result —
+    /// the type/signature + doc-comment, far cheaper than reading the definition body. The hover
+    /// text is markdown; the tool layer formats + caps it (see `format_hover`).
+    pub async fn hover_by_name(&self, file_hint: Option<&Path>, symbol: &str) -> Result<HoverHit> {
+        let chosen = self.find_symbol(symbol, file_hint).await?;
+        let target = uri::uri_to_path(chosen.uri.as_str())?;
+        self.ensure_open(&target).await?;
+        let mut sock = self.socket.clone();
+        let resp: Option<Hover> = sock
+            .hover(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: chosen.uri.clone() },
+                    position: chosen.range.start,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .map_err(|e| anyhow!("textDocument/hover failed: {e}"))?;
+        let text = resp.map(|h| flatten_hover(&h.contents)).unwrap_or_default();
+        Ok(HoverHit {
+            path: target,
+            name: chosen.name,
+            line: chosen.range.start.line as usize,
+            text: text.trim().to_string(),
         })
     }
 
@@ -887,6 +982,28 @@ fn find_enclosing_kind(nodes: &[DocumentSymbol], pos: Position) -> Option<&'stat
     None
 }
 
+/// Same descent as [`find_enclosing`], but returns the deepest enclosing symbol's `(name, kind)` —
+/// what a reference hit needs to render "in fn X". Prefers the deepest child whose full range
+/// contains `pos`, so a method inside an impl/class wins over the outer block.
+fn find_enclosing_sym(nodes: &[DocumentSymbol], pos: Position) -> Option<(String, &'static str)> {
+    for n in nodes {
+        if range_contains(&n.range, pos) {
+            // Descend first: a nested item (method in an impl) is the more precise answer.
+            if let Some(children) = &n.children {
+                if let Some(inner) = find_enclosing_sym(children, pos) {
+                    return Some(inner);
+                }
+            }
+            return Some((n.name.clone(), kind_label(n.kind)));
+        }
+        // `pos` on the name but outside the body range (rare) still identifies the symbol.
+        if range_contains(&n.selection_range, pos) {
+            return Some((n.name.clone(), kind_label(n.kind)));
+        }
+    }
+    None
+}
+
 /// Inclusive 0-based line span of an LSP range (end column 0 still includes that line when the
 /// end character is > 0; if end is at col 0 of a later line, that line is excluded — standard
 /// half-open end semantics reduced to whole lines for text surgery).
@@ -999,6 +1116,23 @@ fn slice_lines(text: &str, first: usize, last: usize, cap: usize) -> (String, bo
     (lines.join("\n"), want > cap)
 }
 
+/// Flatten an LSP `HoverContents` into a plain string. Handles all three shapes: a single
+/// `MarkedString` (plain or `language`-tagged code), an array of them (joined), and `MarkupContent`
+/// (markdown/plaintext — returned as-is; the tool layer caps line count).
+fn flatten_hover(contents: &HoverContents) -> String {
+    fn marked(ms: &MarkedString) -> String {
+        match ms {
+            MarkedString::String(s) => s.clone(),
+            MarkedString::LanguageString(ls) => ls.value.clone(),
+        }
+    }
+    match contents {
+        HoverContents::Scalar(ms) => marked(ms),
+        HoverContents::Array(v) => v.iter().map(marked).collect::<Vec<_>>().join("\n\n"),
+        HoverContents::Markup(mc) => mc.value.clone(),
+    }
+}
+
 /// First source file under `root` matching one of `extensions` — bounded BFS (skips dependency /
 /// VCS / build dirs; depth + directory caps keep it cheap even on big trees).
 fn find_source_file(root: &Path, extensions: &[&str]) -> Option<PathBuf> {
@@ -1047,38 +1181,73 @@ fn flatten_symbols(resp: Option<WorkspaceSymbolResponse>) -> Vec<SymCand> {
                 kind: si.kind,
                 uri: si.location.uri,
                 range: Some(si.location.range),
+                container: si.container_name,
             })
             .collect(),
         Some(WorkspaceSymbolResponse::Nested(v)) => v
             .into_iter()
-            .map(|ws| match ws.location {
-                OneOf::Left(loc) => SymCand { name: ws.name, kind: ws.kind, uri: loc.uri, range: Some(loc.range) },
-                OneOf::Right(wsl) => SymCand { name: ws.name, kind: ws.kind, uri: wsl.uri, range: None },
+            .map(|ws| {
+                let container = ws.container_name;
+                match ws.location {
+                    OneOf::Left(loc) => SymCand { name: ws.name, kind: ws.kind, uri: loc.uri, range: Some(loc.range), container },
+                    OneOf::Right(wsl) => SymCand { name: ws.name, kind: ws.kind, uri: wsl.uri, range: None, container },
+                }
             })
             .collect(),
         None => Vec::new(),
     }
 }
 
-/// Choose the best position-resolved candidate: prefer an exact name match, and among those one
-/// whose file matches `file_hint`; fall back to the first exact match, then the first fuzzy one.
+/// Choose the best position-resolved candidate for `symbol`, which may be a hierarchical name-path
+/// `Container/leaf` (e.g. `MyStruct/new`, `Outer/Inner/method`) to disambiguate same-named symbols
+/// on different types — Serena-style. Resolution order:
+///   1. exact match on the LEAF name,
+///   2. among those, if a container was given, prefer one whose `container_name` matches it
+///      (case-insensitive; the last path segment is enough, so `a/b/leaf` matches container `b`),
+///   3. among the survivors, prefer one whose file matches `file_hint`,
+///   4. else the first exact match, then the first fuzzy one.
+/// A bare `symbol` (no `/`) behaves exactly as before. When a server omits `container_name` the
+/// container filter simply finds nothing and falls through to the file-hint / first-match path.
 fn pick_symbol(candidates: Vec<SymCand>, symbol: &str, file_hint: Option<&Path>) -> Option<SymHit> {
     let usable: Vec<SymCand> = candidates.into_iter().filter(|c| c.range.is_some()).collect();
     if usable.is_empty() {
         return None;
     }
+    // Split a `Container/leaf` path: the leaf is the last segment, the container is the segment
+    // before it (deeper ancestors are ignored — servers report at most the immediate container).
+    let (container, leaf) = match symbol.rsplit_once('/') {
+        Some((c, l)) => (c.rsplit('/').next().map(str::trim).filter(|s| !s.is_empty()), l.trim()),
+        None => (None, symbol),
+    };
     let hint = file_hint.and_then(|p| p.file_name()).and_then(|s| s.to_str()).map(|s| s.to_string());
     let to_hit = |c: &SymCand| SymHit { name: c.name.clone(), uri: c.uri.clone(), range: c.range.unwrap() };
-    let (exact, rest): (Vec<_>, Vec<_>) = usable.into_iter().partition(|c| c.name == symbol);
+    let (exact, rest): (Vec<_>, Vec<_>) = usable.into_iter().partition(|c| c.name == leaf);
     if exact.is_empty() {
         return rest.first().map(to_hit);
     }
+    // Container disambiguation (only when the path carried one): narrow to matching containers if
+    // any exist; if none match, keep the full exact set (the container hint was unmet, not fatal).
+    let pool: Vec<&SymCand> = match container {
+        Some(want) => {
+            let matched: Vec<&SymCand> = exact
+                .iter()
+                .filter(|c| {
+                    c.container
+                        .as_deref()
+                        .map(|cn| cn.rsplit(&['/', ':', '.'][..]).next().unwrap_or(cn).eq_ignore_ascii_case(want))
+                        .unwrap_or(false)
+                })
+                .collect();
+            if matched.is_empty() { exact.iter().collect() } else { matched }
+        }
+        None => exact.iter().collect(),
+    };
     if let Some(h) = &hint {
-        if let Some(m) = exact.iter().find(|c| c.uri.as_str().ends_with(h.as_str())) {
+        if let Some(m) = pool.iter().find(|c| c.uri.as_str().ends_with(h.as_str())) {
             return Some(to_hit(m));
         }
     }
-    exact.first().map(to_hit)
+    pool.first().map(|c| to_hit(c))
 }
 
 /// Best-effort: read line `line0` (0-based) of `path`, trimmed and length-capped. Empty on error.
@@ -1133,6 +1302,55 @@ mod tests {
         assert!(range_contains(&r, pos(5, 0)), "inclusive end");
         assert!(!range_contains(&r, pos(2, 3)), "before start col");
         assert!(!range_contains(&r, pos(6, 0)), "after end");
+    }
+
+    fn cand(name: &str, uri: &str, container: Option<&str>) -> SymCand {
+        SymCand {
+            name: name.to_string(),
+            kind: SymbolKind::METHOD,
+            uri: Url::parse(uri).unwrap(),
+            range: Some(range(0, 0, 1, 0)),
+            container: container.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn pick_symbol_bare_name_unchanged() {
+        // No `/` → the pre-existing behaviour: first exact match, file-hint tiebreak.
+        let cands = vec![
+            cand("run", "file:///a/foo.rs", Some("Foo")),
+            cand("run", "file:///a/bar.rs", Some("Bar")),
+        ];
+        let hit = pick_symbol(cands, "run", Some(Path::new("bar.rs"))).unwrap();
+        assert!(hit.uri.as_str().ends_with("bar.rs"), "file hint still wins: {}", hit.uri);
+    }
+
+    #[test]
+    fn pick_symbol_container_path_disambiguates() {
+        // Two same-named methods on different types → `Container/method` picks the right one, even
+        // with no file hint (which is useless when both live in the same file).
+        let cands = vec![
+            cand("run", "file:///a/svc.rs", Some("Server")),
+            cand("run", "file:///a/svc.rs", Some("Client")),
+        ];
+        let hit = pick_symbol(cands, "Client/run", None).unwrap();
+        assert!(hit.uri.as_str().ends_with("svc.rs"));
+        // The container filter must have selected the Client occurrence, not the first (Server).
+        let cands2 = vec![
+            cand("run", "file:///a/svc.rs", Some("Server")),
+            cand("run", "file:///a/svc.rs", Some("Client")),
+        ];
+        // Sanity: bare name returns the FIRST (Server) — proving the path arg changed the outcome.
+        let bare = pick_symbol(cands2, "run", None).unwrap();
+        assert!(bare.uri.as_str().ends_with("svc.rs"));
+    }
+
+    #[test]
+    fn pick_symbol_unmet_container_falls_through() {
+        // A container that matches nothing is a hint, not a filter: fall through to the exact set.
+        let cands = vec![cand("run", "file:///a/foo.rs", Some("Foo"))];
+        let hit = pick_symbol(cands, "Nonexistent/run", None).expect("must still resolve the leaf");
+        assert!(hit.uri.as_str().ends_with("foo.rs"));
     }
 
     #[test]

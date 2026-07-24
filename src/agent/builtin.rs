@@ -78,6 +78,9 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     r.register(Box::new(FileRead::new(root.to_path_buf())));
     r.register(Box::new(FileGlob::new(root.to_path_buf())));
     r.register(Box::new(crate::agent::search::SearchFiles::new(root.to_path_buf())));
+    // Semantic chunk search over the `/init` index (read-only). Self-errors with "run /init" when
+    // the index is missing, so it's safe to always advertise.
+    r.register(Box::new(crate::agent::codebase::CodebaseSearch));
     r.register(Box::new(WebSearch));
     r.register(Box::new(WebFetch));
     r.register(Box::new(WebCrawl));
@@ -118,6 +121,8 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     if crate::agent::lsp::LSP.is_enabled() {
         r.register(Box::new(crate::agent::lsp::tools::LspReferences::new(root.to_path_buf())));
         r.register(Box::new(crate::agent::lsp::tools::LspDefinition::new(root.to_path_buf())));
+        r.register(Box::new(crate::agent::lsp::tools::LspSymbolBody::new(root.to_path_buf())));
+        r.register(Box::new(crate::agent::lsp::tools::LspHover::new(root.to_path_buf())));
         r.register(Box::new(crate::agent::lsp::tools::LspDocumentSymbols::new(root.to_path_buf())));
         r.register(Box::new(crate::agent::lsp::tools::LspWorkspaceSymbol::new(root.to_path_buf())));
         r.register(Box::new(crate::agent::lsp::tools::LspDiagnostics::new(root.to_path_buf())));
@@ -258,6 +263,7 @@ fn subagent_read_only_base(root: &Path) -> ToolRegistry {
     r.register(Box::new(FileRead::new(root.to_path_buf())));
     r.register(Box::new(FileGlob::new(root.to_path_buf())));
     r.register(Box::new(crate::agent::search::SearchFiles::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::codebase::CodebaseSearch));
     r.register(Box::new(WebSearch));
     r.register(Box::new(WebFetch));
     r.register(Box::new(WebCrawl));
@@ -285,6 +291,8 @@ fn register_subagent_lsp_read(r: &mut ToolRegistry, root: &Path) {
     }
     r.register(Box::new(crate::agent::lsp::tools::LspReferences::new(root.to_path_buf())));
     r.register(Box::new(crate::agent::lsp::tools::LspDefinition::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::lsp::tools::LspSymbolBody::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::lsp::tools::LspHover::new(root.to_path_buf())));
     r.register(Box::new(crate::agent::lsp::tools::LspDocumentSymbols::new(root.to_path_buf())));
     r.register(Box::new(crate::agent::lsp::tools::LspWorkspaceSymbol::new(root.to_path_buf())));
     r.register(Box::new(crate::agent::lsp::tools::LspDiagnostics::new(root.to_path_buf())));
@@ -1051,7 +1059,8 @@ impl Tool for FileRead {
          prefix each line with its 1-based number (`N|line`) for orientation — leave it off (the \
          default) when you'll feed the text back into file_edit's old_string. A relative path \
          resolves under the working directory; an absolute path or `../` reads elsewhere too. \
-         Read-only."
+         To learn a file's shape use lsp_document_symbols, and to read ONE named item use \
+         read_symbol — both are far cheaper than dumping the whole file here. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({

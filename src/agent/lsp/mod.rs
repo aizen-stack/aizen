@@ -30,7 +30,7 @@ pub use server::InsertWhere;
 
 use anyhow::{anyhow, bail, Result};
 use once_cell::sync::Lazy;
-use server::{DefHit, DiagItem, DocSym, LspServer, RefHit, SymBody, WsSym};
+use server::{DefHit, DiagItem, DocSym, HoverHit, LspServer, RefHit, SymBody, WsSym};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -245,6 +245,16 @@ impl LspManager {
         self.run_query(anchor, "definition", move |s| async move {
             let def = s.definition_by_name(hint.as_deref(), &sym).await?;
             Ok(format_def(&s.root, &sym, &def))
+        })
+    }
+
+    /// Resolve `symbol` (by NAME) to the language server's hover (type/signature + doc), capped.
+    pub fn hover(&self, anchor: &Path, symbol: &str) -> Result<String> {
+        let sym = symbol.to_string();
+        let hint = anchor.is_file().then(|| anchor.to_path_buf());
+        self.run_query(anchor, "hover", move |s| async move {
+            let hit = s.hover_by_name(hint.as_deref(), &sym).await?;
+            Ok(format_hover(&s.root, &sym, &hit))
         })
     }
 
@@ -545,7 +555,8 @@ fn rel_display(root: &Path, path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Render reference hits as a compact, capped block: `relpath:line:col  snippet` (1-based display).
+/// Render reference hits as a compact, capped block: `relpath:line:col  [in kind name]  snippet`
+/// (1-based display; the `[in …]` note is omitted for top-level hits with no enclosing symbol).
 fn format_hits(root: &Path, symbol: &str, hits: &[RefHit]) -> String {
     if hits.is_empty() {
         return format!("no references found for '{symbol}'");
@@ -554,7 +565,18 @@ fn format_hits(root: &Path, symbol: &str, hits: &[RefHit]) -> String {
     let mut out = format!("{} reference(s) to '{}':\n", hits.len(), symbol);
     for h in hits.iter().take(MAX) {
         let rel = rel_display(root, &h.path);
-        out.push_str(&format!("  {}:{}:{}  {}\n", rel.display(), h.line + 1, h.col + 1, h.snippet));
+        let ctx = match &h.enclosing {
+            Some((name, kind)) => format!("[in {kind} {name}]  "),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "  {}:{}:{}  {}{}\n",
+            rel.display(),
+            h.line + 1,
+            h.col + 1,
+            ctx,
+            h.snippet
+        ));
     }
     if hits.len() > MAX {
         out.push_str(&format!("  … (+{} more)\n", hits.len() - MAX));
@@ -586,6 +608,25 @@ fn format_sym_body(root: &Path, body: &SymBody) -> String {
         body.end_line + 1,
         body.text
     )
+}
+
+/// Cap on hover text lines (rust-analyzer embeds the full doc-comment as multi-line markdown).
+const HOVER_MAX_LINES: usize = 24;
+
+/// Render a hover result — type/signature + doc-comment, capped to [`HOVER_MAX_LINES`] lines.
+fn format_hover(root: &Path, symbol: &str, hit: &HoverHit) -> String {
+    let rel = rel_display(root, &hit.path);
+    if hit.text.is_empty() {
+        return format!("no hover info for '{symbol}' ({}:{})", rel.display(), hit.line + 1);
+    }
+    let mut lines: Vec<&str> = hit.text.lines().collect();
+    let truncated = lines.len() > HOVER_MAX_LINES;
+    lines.truncate(HOVER_MAX_LINES);
+    let mut body = lines.join("\n");
+    if truncated {
+        body.push_str("\n  … (truncated — use read_symbol for the full body)");
+    }
+    format!("hover '{}' — {}:{}\n{}", hit.name, rel.display(), hit.line + 1, body)
 }
 
 /// Render a file outline with indentation showing nesting.
@@ -718,6 +759,32 @@ mod tests {
     }
 
     #[test]
+    fn hits_formatting_shows_enclosing_symbol() {
+        let hits = vec![
+            RefHit {
+                path: PathBuf::from(r"C:\proj\src\a.rs"),
+                line: 41,
+                col: 8,
+                snippet: "foo();".into(),
+                enclosing: Some(("run_loop".into(), "fn")),
+            },
+            // Top-level reference (use-statement, etc.) → no enclosing note.
+            RefHit {
+                path: PathBuf::from(r"C:\proj\src\b.rs"),
+                line: 2,
+                col: 4,
+                snippet: "use crate::foo;".into(),
+                enclosing: None,
+            },
+        ];
+        let out = format_hits(Path::new(r"C:\proj"), "foo", &hits);
+        assert!(out.contains("2 reference(s) to 'foo'"), "{out}");
+        assert!(out.contains(r"a.rs:42:9  [in fn run_loop]  foo();"), "enclosing shown: {out}");
+        assert!(out.contains(r"b.rs:3:5  use crate::foo;"), "no bracket when None: {out}");
+        assert!(!out.contains("[in  ]"), "no empty bracket: {out}");
+    }
+
+    #[test]
     fn rel_display_handles_verbatim_and_drive_case() {
         // Plain prefix → strip_prefix path.
         assert_eq!(
@@ -754,6 +821,48 @@ mod tests {
         assert!(!out.contains("truncated"), "{out}");
         let def_t = DefHit { truncated: true, ..def };
         assert!(format_def(Path::new(r"C:\proj"), "Foo", &def_t).contains("truncated"));
+    }
+
+    #[test]
+    fn sym_body_formatting() {
+        // read_symbol renders: "{kind} '{name}' — rel:start-end\n{text}" (1-based, uncapped body).
+        let body = SymBody {
+            path: PathBuf::from(r"C:\proj\src\lib.rs"),
+            name: "do_thing".into(),
+            kind: "function",
+            start_line: 41,
+            end_line: 48,
+            text: "fn do_thing() {\n    // body\n}".into(),
+        };
+        let out = format_sym_body(Path::new(r"C:\proj"), &body);
+        assert!(out.starts_with("function 'do_thing' — "), "{out}");
+        assert!(out.contains(":42-49"), "1-based inclusive range: {out}");
+        assert!(out.contains("fn do_thing() {"), "full body present: {out}");
+    }
+
+    #[test]
+    fn hover_formatting_caps_and_labels() {
+        // lsp_hover renders: "hover '{name}' — rel:line\n{markdown}" (1-based line, capped).
+        let hit = HoverHit {
+            path: PathBuf::from(r"C:\proj\src\lib.rs"),
+            name: "Foo".into(),
+            line: 9,
+            text: "pub struct Foo\n/// docs".into(),
+        };
+        let out = format_hover(Path::new(r"C:\proj"), "Foo", &hit);
+        assert!(out.starts_with("hover 'Foo' — "), "{out}");
+        assert!(out.contains(":10\n"), "1-based line: {out}");
+        assert!(out.contains("pub struct Foo"), "signature present: {out}");
+        assert!(!out.contains("truncated"), "short hover not truncated: {out}");
+        // Over-cap hover → truncated marker pointing at read_symbol.
+        let long = (0..HOVER_MAX_LINES + 5).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let hit_long = HoverHit { text: long, ..hit.clone() };
+        let out_long = format_hover(Path::new(r"C:\proj"), "Foo", &hit_long);
+        assert!(out_long.contains("truncated — use read_symbol"), "{out_long}");
+        // Empty hover → honest "no hover info" with location.
+        let hit_empty = HoverHit { text: String::new(), ..hit };
+        let out_empty = format_hover(Path::new(r"C:\proj"), "Foo", &hit_empty);
+        assert!(out_empty.starts_with("no hover info for 'Foo'"), "{out_empty}");
     }
 
     #[test]

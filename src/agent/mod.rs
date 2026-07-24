@@ -16,6 +16,7 @@ pub mod toolsets;
 pub mod browser;
 pub mod builtin;
 pub mod clarify;
+pub mod codebase;
 pub mod cmd_guard;
 pub mod goal;
 pub mod compact;

@@ -34,7 +34,7 @@ const SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// so the plain NUL sniff would wrongly write it off as binary and the search would silently miss
 /// it. We detect UTF-16 by BOM first (unambiguous), then by a strong alternating-NUL heuristic on
 /// the head. Returns `None` for genuine binary (so the caller skips it).
-fn decode_text(bytes: &[u8]) -> Option<String> {
+pub(crate) fn decode_text(bytes: &[u8]) -> Option<String> {
     // BOM-based detection (unambiguous).
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
         let u16s: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();

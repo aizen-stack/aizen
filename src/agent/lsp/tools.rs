@@ -49,7 +49,8 @@ impl Tool for LspReferences {
          language server. Type-aware and exact: unlike text search it skips comments, strings, and \
          unrelated same-named symbols, and spans all files. Use it for impact analysis before \
          changing a function/type, or to find all call sites to update. Returns `path:line:col  \
-         snippet` per hit. Read-only."
+         [in <kind> <symbol>]  snippet` per hit — the enclosing function/impl is shown so you can \
+         assess each call site without re-opening its file. Read-only."
     }
 
     fn parameters(&self) -> Value {
@@ -59,7 +60,7 @@ impl Tool for LspReferences {
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "the symbol name to find references to (function / type / method / variable name)"
+                    "description": "the symbol name to find references to (function / type / method / variable name). Disambiguate a method on a specific type with `Container/method` (e.g. `Config/load`)."
                 },
                 "file": {
                     "type": "string",
@@ -108,7 +109,8 @@ impl Tool for LspDefinition {
         "Go to the definition of a symbol BY NAME via the language server and return the \
          definition's source code inline (file:line plus the item's text), so you see the signature \
          and body without a separate file read. Works for named items (functions, types, methods, \
-         constants) — not local variables. Read-only."
+         constants) — not local variables. Capped at 120 lines; for a longer body use read_symbol. \
+         Read-only."
     }
 
     fn parameters(&self) -> Value {
@@ -118,7 +120,7 @@ impl Tool for LspDefinition {
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "the symbol name to resolve (function / type / method / constant name)"
+                    "description": "the symbol name to resolve (function / type / method / constant name). Disambiguate a method on a specific type with `Container/method` (e.g. `Config/load`)."
                 },
                 "file": {
                     "type": "string",
@@ -137,6 +139,115 @@ impl Tool for LspDefinition {
         let symbol = req_str(args, "symbol")?;
         let anchor = anchor_from(&self.root, args)?;
         LSP.definition(&anchor, symbol)
+    }
+}
+
+/// `read_symbol` — resolve a named symbol to its FULL body text (uncapped) via the language-server
+/// outline range, without dumping the whole file or hitting `lsp_definition`'s 120-line cap.
+/// Serena's `find_symbol(include_body=true)` workhorse. Read-only.
+pub struct LspSymbolBody {
+    root: PathBuf,
+}
+
+impl LspSymbolBody {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+impl Tool for LspSymbolBody {
+    fn name(&self) -> &str {
+        "read_symbol"
+    }
+
+    fn description(&self) -> &str {
+        "Read the FULL source of ONE named symbol (function / type / method / const / …) via the \
+         language server — its complete body plus file:line range, with no whole-file dump and no \
+         line-count cap. Prefer this over file_read when you need a single item, and over \
+         lsp_definition when the body may exceed its 120-line cap. Optional `file` disambiguates \
+         same-named symbols. Read-only."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "the symbol name to read (function / type / method / constant name). Disambiguate a method on a specific type with `Container/method` (e.g. `Config/load`)."
+                },
+                "file": {
+                    "type": "string",
+                    "description": "optional: a file in the relevant project — helps pick the language and disambiguate same-named symbols; defaults to the working directory"
+                }
+            },
+            "required": ["symbol"]
+        })
+    }
+
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
+
+    fn execute(&self, args: &Value) -> Result<String> {
+        let symbol = req_str(args, "symbol")?;
+        let anchor = anchor_from(&self.root, args)?;
+        LSP.symbol_body(&anchor, symbol)
+    }
+}
+
+/// `lsp_hover` — the language server's hover for a named symbol: resolved type / signature /
+/// doc-comment, capped to a few lines. Far cheaper than `lsp_definition` (up to 120 lines) or
+/// `read_symbol` (full body) when you only need "what type is X / what's its signature". Read-only.
+pub struct LspHover {
+    root: PathBuf,
+}
+
+impl LspHover {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+impl Tool for LspHover {
+    fn name(&self) -> &str {
+        "lsp_hover"
+    }
+
+    fn description(&self) -> &str {
+        "Get the language server's hover for a symbol BY NAME — its resolved type, signature, and \
+         doc-comment (a few lines), without reading the definition or the file. Use for \"what type \
+         is X\", \"what's this function's signature\", or a quick doc lookup; it is far cheaper than \
+         lsp_definition or read_symbol. Optional `file` disambiguates same-named symbols. Read-only."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "the symbol name to hover (function / type / method / constant name). Disambiguate a method on a specific type with `Container/method` (e.g. `Config/load`)."
+                },
+                "file": {
+                    "type": "string",
+                    "description": "optional: a file in the relevant project — helps pick the language and disambiguate same-named symbols; defaults to the working directory"
+                }
+            },
+            "required": ["symbol"]
+        })
+    }
+
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
+
+    fn execute(&self, args: &Value) -> Result<String> {
+        let symbol = req_str(args, "symbol")?;
+        let anchor = anchor_from(&self.root, args)?;
+        LSP.hover(&anchor, symbol)
     }
 }
 
@@ -323,7 +434,7 @@ impl Tool for SymbolReplace {
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "exact symbol name whose full body to replace"
+                    "description": "exact symbol name whose full body to replace. Disambiguate a method on a specific type with `Container/method` (e.g. `Config/load`)."
                 },
                 "new_body": {
                     "type": "string",
@@ -421,7 +532,7 @@ impl Tool for SymbolInsert {
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "anchor symbol name (insert relative to its full body range)"
+                    "description": "anchor symbol name (insert relative to its full body range). Disambiguate a method on a specific type with `Container/method` (e.g. `Config/load`)."
                 },
                 "text": {
                     "type": "string",
