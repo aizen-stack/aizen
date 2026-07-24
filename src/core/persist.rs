@@ -248,7 +248,7 @@ fn replace_file(tmp: &Path, dst: &Path) -> std::io::Result<()> {
 fn sync_parent(_path: &Path) {
     #[cfg(unix)]
     if let Some(parent) = _path.parent() {
-        if let Ok(dir) = File::open(parent) {
+        if let Ok(dir) = std::fs::File::open(parent) {
             let _ = dir.sync_all();
         }
     }

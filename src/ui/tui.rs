@@ -2336,15 +2336,25 @@ fn handle_retained_mouse(
                 retained::set_selection(sel);
                 let text = retained::extract_selection_text(sel);
                 if !text.is_empty() {
-                    if let Ok(mut cb) = arboard::Clipboard::new() {
-                        let _ = cb.set_text(text);
-                    }
+                    copy_to_os_clipboard(&text);
                 }
             }
         }
         _ => {}
     }
 }
+
+/// Copy selected transcript text to the OS clipboard. DESKTOP-ONLY: `arboard` is target-gated to
+/// Windows/macOS (Linux would need X11/Wayland libs at runtime, breaking the headless static binary
+/// — see Cargo.toml), so on Linux this is a no-op and selection copy silently does nothing there.
+#[cfg(any(windows, target_os = "macos"))]
+fn copy_to_os_clipboard(text: &str) {
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(text.to_string());
+    }
+}
+#[cfg(not(any(windows, target_os = "macos")))]
+fn copy_to_os_clipboard(_text: &str) {}
 
 fn input_loop(
     sub_tx: UnboundedSender<Submission>,
