@@ -1,11 +1,33 @@
-# `aizen` — the terminal-native coding agent that lives on your machine
+<div align="center">
 
-**One static binary. No Node, no Python, no Docker, no cloud account.** Download `aizen`, point it
-at any OpenAI-compatible endpoint, and you have a full agentic coding partner in your terminal — one
-that reads and edits your code, runs your shell, verifies its own work, remembers how you like things
-done, and keeps working when you leave (drive it from Telegram on your phone).
+# ⚡ Aizen
 
-The command is **`aizen`**.
+### The terminal-native coding agent that actually *lives* on your machine.
+
+**One static binary. No Node. No Python. No Docker. No cloud account.**
+Point it at any OpenAI-compatible endpoint and you've got a full agentic coding partner in your
+terminal — one that reads and edits your code, runs your shell, verifies its own work, remembers how
+*you* like things, and keeps grinding after you walk away.
+
+<br/>
+
+[![Latest release](https://img.shields.io/github/v/release/dawnofcd/aizen?style=for-the-badge&label=release&color=6c5ce7)](https://github.com/dawnofcd/aizen/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-00b894?style=for-the-badge)](LICENSE)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-e17055?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+
+![Windows](https://img.shields.io/badge/Windows-0078D6?style=flat-square&logo=windows&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-333?style=flat-square&logo=linux&logoColor=white)
+![macOS](https://img.shields.io/badge/macOS%20(Apple%20Silicon)-000?style=flat-square&logo=apple&logoColor=white)
+![Zero deps](https://img.shields.io/badge/runtime%20deps-0-brightgreen?style=flat-square)
+![Single binary](https://img.shields.io/badge/install-1%20binary-6c5ce7?style=flat-square)
+
+</div>
+
+---
+
+> **This is the private source repo.** The command is **`aizen`**. The public download channel
+> (prebuilt binaries + install scripts) is generated from [`dist/`](dist/) — edit docs there for
+> what users see. This README is the full developer reference.
 
 ```text
 ⚡ gpt-4o-mini  ·  ~1.2K/128K tok  ·  3 turns  ·  ███░░░░░░░ 27% ctx
@@ -21,7 +43,22 @@ The command is **`aizen`**.
 ✓ cargo check — 0 errors · verify gate passed
 ```
 
-## Why `aizen`
+## 📚 Table of contents
+
+- [Why Aizen](#-why-aizen)
+- [Feature map](#feature-map)
+- [60-second start](#60-second-start)
+- [Install](#install)
+- [Interactive REPL](#interactive-repl-just-run-aizen)
+- [Telegram — control from your phone](#telegram--control-aizen-from-your-phone)
+- [Configure](#configure)
+- [Commands](#commands) — [chat](#aizen-chat--one-shot-streaming-chat) · [agent](#aizen-agent--the-tool-using-loop) · [workflow](#aizen-workflow-specjson--fan-out--synthesis) · [crawl](#aizen-crawl-url--katana-style-web-crawler)
+- [persona](#persona--a-character-that-evolves) · [soul](#aizen-soul--the-agents-operating-identity) · [skill](#aizen-skill--reusable-procedures-skills) · [custom commands](#custom-slash-commands--markdown-macros-you-fire)
+- [MCP servers](#mcp-servers-mcp--bring-your-own-tools) · [browser](#browser-automation---features-browser) · [memory](#aizen-memory--the-self-learning-brain) · [bench](#aizen-bench--anti-oracle-benches)
+- [Safety model](#safety-model)
+- [Remote control & notifications](#remote-control--notifications)
+
+## 🎯 Why `aizen`
 
 - **Zero-friction install.** A single self-contained executable — no runtime to install, no
   containers, no `npm i -g` dependency tree. Grab the binary, run it. It builds pure-Rust with
