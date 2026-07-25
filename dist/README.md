@@ -12,7 +12,7 @@ terminal — one that reads and edits your code, runs your shell, verifies its o
 <br/>
 
 [![Latest release](https://img.shields.io/github/v/release/dawnofcd/aizen?style=for-the-badge&label=release&color=6c5ce7)](https://github.com/dawnofcd/aizen/releases/latest)
-[![License: MIT](https://img.shields.io/badge/license-MIT-00b894?style=for-the-badge)](LICENSE)
+[![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm%20Noncommercial-00b894?style=for-the-badge)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-e17055?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 
 ![Platforms](https://img.shields.io/badge/Windows-0078D6?style=flat-square&logo=windows&logoColor=white)
@@ -183,7 +183,7 @@ Yep — <code>aizen serve</code> exposes the agent through a Telegram/Discord bo
 
 ## 📄 License
 
-**MIT** — see [LICENSE](LICENSE). Build cool things.
+**PolyForm Noncommercial 1.0.0** — see [LICENSE](LICENSE). Free for personal, research, and other noncommercial use; commercial use requires a separate license from the author.
 
 <div align="center">
 <br/>
