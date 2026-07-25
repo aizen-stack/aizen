@@ -29,19 +29,13 @@ terminal — one that reads and edits your code, runs your shell, verifies its o
 > (prebuilt binaries + install scripts) is generated from [`dist/`](dist/) — edit docs there for
 > what users see. This README is the full developer reference.
 
-```text
-⚡ gpt-4o-mini  ·  ~1.2K/128K tok  ·  3 turns  ·  ███░░░░░░░ 27% ctx
-╭──────────────────────────────────────────────────────────────────╮
-│ ❯ refactor the parser, run the tests, and commit when green       │
-╰──────────────────────────────────────────────────────────────────╯
-⚙ file_read   src/parse.rs
-└ 142 lines · 0.1s
-⚙ multi_edit   src/parse.rs
-└ 3 edits · 0.3s
-⚙ shell_run   cargo test
-└ 42 passed · 4.2s
-✓ cargo check — 0 errors · verify gate passed
-```
+
+
+https://github.com/user-attachments/assets/45bbdfc8-09a3-4995-870f-eb92452743c9
+
+
+
+
 
 ## 📚 Table of contents
 
