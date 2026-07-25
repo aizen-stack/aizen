@@ -3,7 +3,7 @@ name = "aizen"
 version = "0.4.5"
 edition = "2021"
 description = "Aizen first-party agentic coding CLI — OpenAI-compatible, hermes-style provider-agnostic API client"
-license = "MIT"
+license-file = "LICENSE"
 
 # The product brand is Aizen → `aizen` is the one and only command.
 [[bin]]
@@ -40,6 +40,11 @@ dialoguer = { version = "0.11", default-features = false, features = ["password"
 # Colored banner output (dialoguer's companion; already in the tree → no extra binary cost).
 # Enables Windows VT + honors NO_COLOR / non-TTY automatically.
 console = "0.15"
+# Pure-Rust PNG decode/encode. Used unconditionally now: the feature cards are baked as PNG and
+# re-encoded to sixel at the terminal's exact pixel size at runtime (cover-crop fullscreen), which
+# must work on every sixel-capable platform (incl. Linux), not just Windows/macOS. Also backs the
+# clipboard image encode in `image_input`. Pure-Rust → single static binary preserved.
+png = "0.17"
 # Retained full-frame TUI. Both crates are pure Rust; the classic ANSI/console backend remains a
 # runtime fallback (`tui_mode=classic`) and the non-TTY path never initializes either backend.
 # Ratatui owns layout/cell diffing; crossterm owns raw input, alternate-screen lifecycle, focus and
@@ -129,13 +134,12 @@ debug = false
 # Image (vision) input — encode a pasted clipboard image into a data URL for OpenAI-compatible
 # vision models (paste a screenshot straight into the chat box with Ctrl-V). Clipboard access is
 # DESKTOP-ONLY: `arboard` needs X11/Wayland libraries on Linux at runtime, which would break the
-# headless single static binary that `aizen serve` ships as — so the clipboard path (arboard + a
-# pure-Rust PNG encode of the raw RGBA pixels) is target-gated to Windows/macOS. Both crates are
-# pure-Rust there (clipboard-win links only system DLLs), so the single-static-binary posture holds
-# (objdump-verified). Linux/headless builds pull neither.
+# headless single static binary that `aizen serve` ships as — so only the clipboard grab is
+# target-gated to Windows/macOS (the PNG encode of its RGBA pixels uses the now-unconditional `png`
+# dep above). arboard is pure-Rust there (clipboard-win links only system DLLs), so the
+# single-static-binary posture holds (objdump-verified). Linux/headless builds don't pull arboard.
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 arboard = { version = "3", default-features = false, features = ["image-data"] }
-png = "0.17"
 
 # Windows Job Object (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) so killing a node-based language server
 # (`typescript-language-server.cmd` → cmd.exe → node.exe) reaps the WHOLE process tree —

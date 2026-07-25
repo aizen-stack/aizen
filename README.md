@@ -12,7 +12,7 @@ terminal — one that reads and edits your code, runs your shell, verifies its o
 <br/>
 
 [![Latest release](https://img.shields.io/github/v/release/dawnofcd/aizen?style=for-the-badge&label=release&color=6c5ce7)](https://github.com/dawnofcd/aizen/releases/latest)
-[![License: MIT](https://img.shields.io/badge/license-MIT-00b894?style=for-the-badge)](LICENSE)
+[![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm%20Noncommercial-00b894?style=for-the-badge)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-e17055?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 
 ![Windows](https://img.shields.io/badge/Windows-0078D6?style=flat-square&logo=windows&logoColor=white)
@@ -655,3 +655,13 @@ treated as data, never as instructions.
 Discord bot (pure-Rust gateways, no SDKs); destructive ops ask for approval from your phone. `aizen
 cron` schedules unattended runs (model pinned at create time). Outbound `notify` channels (Discord /
 Slack / generic webhook) and the two-way bots are all managed from the **`/apps`** hub.
+
+## License
+Aizen is **source-available**, not open source, under the
+[PolyForm Noncommercial License 1.0.0](LICENSE).
+
+You may read, run, modify, and share the source **for any noncommercial purpose** — personal
+projects, study, research, and use by nonprofit/educational/government organizations. **Commercial
+use is not permitted** under this license.
+
+Want to use Aizen commercially? Reach out for a separate commercial license.

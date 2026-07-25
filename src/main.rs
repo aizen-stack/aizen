@@ -162,6 +162,8 @@ enum Commands {
         #[command(subcommand)]
         cmd: Option<AgentsCmd>,
     },
+    /// Render the moonlit braille art scene (one frame) to the terminal.
+    Art,
 }
 
 #[derive(Subcommand, Debug)]
@@ -927,6 +929,10 @@ async fn main() -> Result<()> {
         },
         Commands::Apps { cmd } => run_apps(cmd).await,
         Commands::Agents { cmd } => run_agents(cmd).await,
+        Commands::Art => {
+            crate::ui::moonscape::run();
+            Ok(())
+        }
     }
 }
 

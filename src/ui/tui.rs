@@ -45,6 +45,10 @@ const PALETTE_MAX: usize = 7;
 /// jitter (a few ms) yet far below the gap before a human reaches the Enter key (≥ ~100 ms).
 const PASTE_COALESCE_MS: u64 = 50;
 
+/// Idle seconds before the screensaver card is raised (retained backend only). Reset by any key or
+/// mouse event; gated on !working and no open menu/overlay so it never fires mid-task or over a menu.
+const IDLE_SCREENSAVER_SECS: u64 = 15;
+
 /// Rows the palette painted last time — so a shrinking/closing palette clears its stale lines.
 static LAST_PAL: AtomicU16 = AtomicU16::new(0);
 
@@ -652,6 +656,9 @@ pub fn ask_approval(prompt_line: &str) -> bool {
         return false;
     }
     emit_line(prompt_line);
+    // Point the idle screensaver's context card at "Safe autonomy": a risky action just raised this
+    // gate, so if the user steps away right after, the card reflects the guardrail they saw.
+    crate::ui::cards::note_approval();
     let (tx, rx) = stdmpsc::channel::<char>();
     *approval_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     APPROVAL_PENDING.store(true, Ordering::Relaxed);
@@ -2240,6 +2247,21 @@ fn handle_retained_mouse(
         MouseEventKind::ScrollUp => retained::scroll(-3),
         MouseEventKind::ScrollDown => retained::scroll(3),
         MouseEventKind::Down(MouseButton::Left) => {
+            // Floating "jump to bottom" button takes priority: a click anywhere on it lands the
+            // viewport back on the live tail (only present while scrolled up off the tail).
+            if let Some(b) = retained::jump_button_rect() {
+                if col >= b.x
+                    && col < b.x.saturating_add(b.width)
+                    && row >= b.y
+                    && row < b.y.saturating_add(b.height)
+                {
+                    *dragging_scrollbar = false;
+                    *selecting = None;
+                    retained::clear_selection();
+                    retained::scroll_end();
+                    return;
+                }
+            }
             if on_scrollbar && total > visible {
                 *dragging_scrollbar = true;
                 *selecting = None;
@@ -2372,6 +2394,26 @@ fn input_loop(
     // `dragging_scrollbar` tracks thumb drag on the right gutter. Cleared on mouse-up / Esc.
     let mut selecting: Option<retained::SelectionRange> = None;
     let mut dragging_scrollbar = false;
+    // Idle screensaver state (retained only). After IDLE_SCREENSAVER secs with no key/mouse activity
+    // — and only when idle, not working, and no menu/overlay is open — the render thread blits one
+    // static feature card over the alt-screen. The next input event clears it (and is swallowed, so
+    // the wake key never edits the draft). `last_activity` is the wall-clock of the last event.
+    let mut last_activity = Instant::now();
+    let mut screensaver_up = false;
+
+    // Startup card: show ONE rotating feature card over the landing screen the moment the sticky TUI
+    // is up (retained only — the blit is a raw sixel the alt-screen renderer can't carry any other
+    // way). It rides the SAME blit path as the idle screensaver, so the first keystroke tears it down
+    // and is swallowed (revealing the landing splash underneath). `next_startup_card` advances a
+    // persisted counter so each launch shows the next card. Skipped when sixel isn't supported (the
+    // card would be escape-code garbage) — the text splash already stands on its own there.
+    if retained::is_active() && crate::ui::splash::logo_is_sixel() {
+        if let Some(idx) = crate::ui::cards::next_startup_card() {
+            retained::screensaver(Some(idx));
+            screensaver_up = true;
+            last_activity = Instant::now();
+        }
+    }
 
     loop {
         // Raw mode is required for crossterm's event reader (no line buffering / echo). Re-assert it
@@ -2385,6 +2427,35 @@ fn input_loop(
         // scrolls the transcript; left-drag selects text (copy-on-release via arboard); the right
         // gutter scrollbar is draggable. Shift+Enter inserts a literal newline into the draft.
         let key = loop {
+            // Poll (not a bare blocking read) so the idle clock is checked on a ~1s cadence: after
+            // IDLE_SCREENSAVER_SECS of no input — and only when quiescent (retained, not working, no
+            // menu/overlay/approval up) — the render thread blits one static card. A busy turn or an
+            // open menu never triggers it. When there IS input the read below returns immediately.
+            let have_event = match event::poll(Duration::from_millis(1000)) {
+                Ok(v) => v,
+                Err(_) => {
+                    let _ = sub_tx.send(Submission::Quit);
+                    return;
+                }
+            };
+            if !have_event {
+                if !screensaver_up
+                    && retained::is_active()
+                    && !WORKING.load(Ordering::Relaxed)
+                    && !APPROVAL_PENDING.load(Ordering::Relaxed)
+                    && !model_menu_active()
+                    && !sessions_menu_active()
+                    && !text_overlay_active()
+                    && !RETAINED_INFO_OVERLAY.load(Ordering::Relaxed)
+                    && last_activity.elapsed() >= Duration::from_secs(IDLE_SCREENSAVER_SECS)
+                {
+                    if let Some(idx) = crate::ui::cards::screensaver_card() {
+                        retained::screensaver(Some(idx));
+                        screensaver_up = true;
+                    }
+                }
+                continue;
+            }
             let ev = match event::read() {
                 Ok(ev) => ev,
                 Err(_) => {
@@ -2392,6 +2463,15 @@ fn input_loop(
                     return;
                 }
             };
+            // Any real event is activity: reset the idle clock, and if the screensaver is up, tear it
+            // down and SWALLOW this event so the wake keystroke never also edits the draft (mirrors the
+            // RETAINED_INFO_OVERLAY key-swallow below).
+            last_activity = Instant::now();
+            if screensaver_up {
+                retained::screensaver(None);
+                screensaver_up = false;
+                continue;
+            }
             match ev {
                 Event::Key(ke) if ke.kind == KeyEventKind::Press => {
                     if ke.code == KeyCode::Enter && ke.modifiers.contains(KeyModifiers::SHIFT) {

@@ -259,6 +259,15 @@ struct AppState {
     selection: Option<SelectionRange>,
     metrics: metrics::FrameMetrics,
     cache: RenderCache,
+    /// When `Some(idx)`, the idle screensaver is up: the render thread cover-encodes card `idx` to its
+    /// current pixel size, blits that sixel over the whole alt-screen, and skips the normal ratatui
+    /// frame until it's cleared (`None`) — at which point the transcript is force-repainted. Set/cleared
+    /// by `Command::Screensaver`.
+    screensaver: Option<usize>,
+    /// Cache of the last cover-encoded screensaver sixel, keyed by `(card_idx, px_w, px_h)`. The encode
+    /// is ~tens of ms, so we reuse it across idle repaints and only re-encode when the card or the
+    /// terminal's pixel geometry changes (e.g. a window resize while the screensaver is up).
+    screensaver_cache: Option<(usize, u32, u32, String)>,
 }
 
 /// Absolute character selection over the flat list of wrapped transcript rows.
@@ -281,6 +290,10 @@ struct TranscriptGeom {
     /// Plain (SGR-stripped) wrapped rows of the full transcript at last draw — used to extract the
     /// selected text on mouse-up without re-rendering on the input thread.
     plain_rows: Vec<String>,
+    /// Screen rect of the floating "jump to bottom" button, present only while the transcript is
+    /// scrolled up off the tail. `None` when at the tail (button hidden). The input thread hit-tests
+    /// a left-click against this before anything else so the button lands the viewport back on tail.
+    jump_button: Option<Rect>,
 }
 
 fn transcript_geom_slot() -> &'static Mutex<TranscriptGeom> {
@@ -294,6 +307,15 @@ pub(super) fn last_transcript_geom() -> (usize, usize, usize, Rect) {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     (g.start, g.visible, g.total, g.area)
+}
+
+/// Screen rect of the floating "jump to bottom" button at last draw, or `None` if the transcript is
+/// already at the tail (button hidden). The input thread hit-tests a left-click against this.
+pub(super) fn jump_button_rect() -> Option<Rect> {
+    let g = transcript_geom_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    g.jump_button
 }
 
 /// Extract plain text covering `sel` from the last drawn plain rows. Empty if nothing is selected
@@ -381,6 +403,8 @@ impl AppState {
             selection: None,
             metrics: metrics::FrameMetrics::default(),
             cache: RenderCache::default(),
+            screensaver: None,
+            screensaver_cache: None,
         }
     }
 
@@ -502,6 +526,11 @@ enum Command {
     /// (used by scrollbar thumb drag).
     ScrollTo(usize),
     ScrollEnd,
+    /// Idle screensaver / startup card: `Some(idx)` fills the alt-screen with feature card `idx`
+    /// (encoded to the terminal's exact pixel size at draw time, cover-cropped — a raw DCS can't ride
+    /// through the ratatui widget model, so it's blitted directly); `None` clears it and forces a full
+    /// transcript repaint. Driven by the input thread (startup + 15s idle timer).
+    Screensaver(Option<usize>),
     /// Set or replace the live mouse selection (rendered reversed).
     SetSelection(SelectionRange),
     /// Drop the current selection highlight.
@@ -758,6 +787,94 @@ pub(super) fn scroll_end() {
     send(Command::ScrollEnd);
 }
 
+/// Raise (`Some(idx)`) or clear (`None`) the idle screensaver. The render thread cover-encodes card
+/// `idx` to its own pixel size and blits it fullscreen, restoring the transcript on clear.
+pub(super) fn screensaver(card: Option<usize>) {
+    send(Command::Screensaver(card));
+}
+
+/// The terminal's pixel dimensions, for encoding a card that fills the whole screen. Prefers the
+/// terminal's reported pixel size; when a terminal doesn't report pixels (`width`/`height` = 0) it
+/// falls back to the cell grid times a typical ~8×18 px monospace cell, so the fill is still full-size
+/// (just at an assumed cell aspect) rather than degenerate.
+fn terminal_pixels() -> (u32, u32) {
+    match crossterm::terminal::window_size() {
+        Ok(ws) if ws.width > 0 && ws.height > 0 => (ws.width as u32, ws.height as u32),
+        _ => {
+            let cols = COLS.load(Ordering::Relaxed) as u32;
+            let rows = ROWS.load(Ordering::Relaxed) as u32;
+            (cols * 8, rows * 18)
+        }
+    }
+}
+
+/// Cover-encode card `idx` to the terminal's pixel size (reusing the cached sixel when the card and
+/// geometry are unchanged) and blit it fullscreen over the alt-screen, bypassing ratatui. Clears the
+/// screen first so the transcript underneath is gone, homes the cursor, writes the DCS, then flushes.
+/// Called only from the render thread (the sole owner of the alt-screen `Stdout`), so there is no
+/// contention with `terminal.draw`. Best-effort: a degenerate size or an encode failure just leaves
+/// the cleared screen (the next keystroke restores the transcript).
+fn blit_screensaver(session: &mut TerminalSession, state: &mut AppState, idx: usize) {
+    use crossterm::cursor::MoveTo;
+    use crossterm::terminal::{Clear, ClearType};
+    let (pw, ph) = terminal_pixels();
+    let cols = COLS.load(Ordering::Relaxed).max(1);
+    let rows = ROWS.load(Ordering::Relaxed).max(1);
+    // Pixels-per-cell (integer). We encode to a WHOLE number of cells and place the sixel at a cell
+    // origin, so it lands exactly where the terminal expects a character — no sub-cell drift.
+    let cell_w = (pw / cols as u32).max(1);
+    let cell_h = (ph / rows as u32).max(1);
+    // Reserve a symmetric margin: 2 columns and 2 rows total (1 cell all around). This (a) centers the
+    // image so any pixel-reporting slop splits evenly instead of piling up bottom-right, and (b) keeps
+    // the sixel off the last row, which would otherwise scroll the alt-screen. The card is cover-cropped
+    // so shrinking by one cell each edge is imperceptible.
+    let grid_cols = (cols.saturating_sub(2)).max(1);
+    let grid_rows = (rows.saturating_sub(2)).max(1);
+    let enc_w = grid_cols as u32 * cell_w;
+    let enc_h = grid_rows as u32 * cell_h;
+    let col_off = (cols - grid_cols) / 2;
+    let row_off = (rows - grid_rows) / 2;
+    // Reuse the cached encode unless the card or the encoded geometry changed (resize while idle).
+    let hit = matches!(&state.screensaver_cache, Some((ci, cw, ch, _)) if *ci == idx && *cw == enc_w && *ch == enc_h);
+    if !hit {
+        if let Some(sixel) = crate::ui::cards::render_cover_sixel(idx, enc_w, enc_h) {
+            state.screensaver_cache = Some((idx, enc_w, enc_h, sixel));
+        } else {
+            state.screensaver_cache = None;
+        }
+    }
+    let Some((_, _, _, sixel)) = &state.screensaver_cache else {
+        // Encode failed — clear so we don't leave a stale transcript half-under a missing image.
+        let out = session.terminal.backend_mut();
+        let _ = execute!(out, Clear(ClearType::All), Hide);
+        let _ = out.flush();
+        return;
+    };
+    // Reuse the backend's own writer so we share its flushed state (no second Stdout handle racing).
+    let out = session.terminal.backend_mut();
+    // Clear removes the transcript; `Hide` re-hides the cursor (the last `terminal.draw` before the
+    // screensaver came up positioned + showed it for the input line, so it would blink over the image);
+    // `MoveTo` homes to the centred cell origin. The next keystroke force-redraws and restores both.
+    let _ = execute!(out, Clear(ClearType::All), Hide, MoveTo(col_off, row_off));
+    let _ = out.write_all(sixel.as_bytes());
+    // Caption: the feature's name, dim + centred on the reserved bottom margin row (the sixel stops
+    // one row short of it, so this never overlaps the image or scrolls the alt-screen). Skipped when
+    // the title can't fit the width. Purely decorative — a failed write just leaves the bare image.
+    if let Some(title) = crate::ui::cards::card_title(idx) {
+        let len = title.chars().count() as u16;
+        if len < cols {
+            let cap_col = (cols - len) / 2;
+            let cap_row = rows.saturating_sub(1);
+            let _ = execute!(out, MoveTo(cap_col, cap_row));
+            // Dim (SGR 2) so the caption reads as a subtle label, not a headline; reset after.
+            let _ = out.write_all(b"\x1b[2m");
+            let _ = out.write_all(title.as_bytes());
+            let _ = out.write_all(b"\x1b[0m");
+        }
+    }
+    let _ = out.flush();
+}
+
 #[allow(dead_code)]
 pub(super) fn set_focus(focused: bool) {
     send(Command::Focus(focused));
@@ -775,6 +892,16 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
     let _ = ready.send(true);
     let mut shutdown_ack: Option<Sender<()>> = None;
     let mut dirty = true;
+    // Tracks whether the screensaver sixel is currently painted over the alt-screen. When it flips
+    // off we must force ratatui to redraw every cell (the DCS blit wrote outside the frame model, so
+    // ratatui's diff still believes the old transcript is on screen and would paint nothing).
+    let mut screensaver_shown = false;
+    // Tracks the working flag across ticks so we can re-assert terminal modes the instant a turn ends.
+    // A tool that spawned a child (shell / MCP / LSP server) may have let it reset our console input
+    // mode on Windows — clearing ENABLE_MOUSE_INPUT, which silently kills mouse capture so the wheel
+    // leaks back through as ↑/↓ and the transcript stops scrolling. Re-emitting the mode setters is
+    // idempotent and cheap; doing it on the true→false edge restores scroll without a per-frame cost.
+    let mut was_working = false;
     loop {
         let wait = if state.working && state.focused {
             Duration::from_millis(110)
@@ -855,6 +982,16 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 }
             }
         }
+        // Turn just ended (working true→false): a tool may have spawned a child that reset our
+        // console input mode, dropping mouse capture. Re-assert it (and raw mode + cursor hide) so the
+        // wheel keeps arriving as mouse events and the transcript stays scrollable. Idempotent — a
+        // terminal already in these modes ignores the repeat. Only on the edge, so it costs nothing
+        // during a turn or while idle.
+        if was_working && !state.working && session.is_some() {
+            let _ = crossterm::terminal::enable_raw_mode();
+            let _ = execute!(io::stdout(), EnableMouseCapture, Hide);
+        }
+        was_working = state.working;
         if dirty {
             if let Some(s) = session.as_mut() {
                 let before = s.terminal.size().ok();
@@ -864,14 +1001,29 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     COLS.store(area.width.max(20), Ordering::Relaxed);
                     ROWS.store(area.height.max(8), Ordering::Relaxed);
                 }
-                let started = Instant::now();
-                let _ = s.terminal.draw(|frame| draw(frame, &mut state));
-                let rows = state
-                    .blocks
-                    .iter()
-                    .map(|b| format!("{}:{:x}:{}", b.id, b.payload.content_hash(), b.complete))
-                    .collect::<Vec<_>>();
-                state.metrics.record(started.elapsed(), metrics::hash_rows(&rows), before != after);
+                if let Some(idx) = state.screensaver {
+                    // Screensaver up: cover-encode the card to the terminal's pixel size and blit it
+                    // fullscreen, bypassing the ratatui frame (a DCS can't ride through the widget
+                    // model). Clear first so the transcript underneath is gone, then blit.
+                    blit_screensaver(s, &mut state, idx);
+                    screensaver_shown = true;
+                } else {
+                    // Leaving the screensaver: the DCS wrote outside ratatui's cell buffer, so its
+                    // diff still thinks the old transcript is on screen. Force a full redraw so the
+                    // transcript is restored from scratch (no replay — blocks live in AppState).
+                    if screensaver_shown {
+                        let _ = s.terminal.clear();
+                        screensaver_shown = false;
+                    }
+                    let started = Instant::now();
+                    let _ = s.terminal.draw(|frame| draw(frame, &mut state));
+                    let rows = state
+                        .blocks
+                        .iter()
+                        .map(|b| format!("{}:{:x}:{}", b.id, b.payload.content_hash(), b.complete))
+                        .collect::<Vec<_>>();
+                    state.metrics.record(started.elapsed(), metrics::hash_rows(&rows), before != after);
+                }
             }
             dirty = false;
         }
@@ -980,6 +1132,7 @@ fn apply_command(state: &mut AppState, cmd: Command) {
                 state.scroll_from_tail = 0;
             }
         }
+        Command::Screensaver(card) => state.screensaver = card,
         Command::SetSelection(sel) => state.selection = Some(sel),
         Command::ClearSelection => state.selection = None,
         Command::Focus(v) => state.focused = v,
@@ -1074,6 +1227,35 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         frame.render_stateful_widget(scrollbar, area, &mut sb_state);
     }
 
+    // Floating "jump to bottom" button — only while scrolled up off the tail (`start` below the
+    // tail_start means the reader has paged up). It sits in the bottom-right corner, just left of
+    // the scrollbar gutter, so a click lands the viewport back on the live tail without having to
+    // wheel all the way down. Hidden (rect = None) at the tail, so it never covers streaming output.
+    let tail_start = total.saturating_sub(visible);
+    let jump_button = if total > visible && start < tail_start {
+        const LABEL: &str = " ↓ bottom ";
+        let label_w = console::measure_text_width(LABEL) as u16;
+        // Keep the button inside the content gutter (1 cell reserved on the right for the scrollbar).
+        if area.width > label_w + 1 && area.height >= 1 {
+            let bx = area.x + area.width - 1 - label_w;
+            let by = area.y + area.height - 1;
+            let brect = Rect::new(bx, by, label_w, 1);
+            let btn = Paragraph::new(Line::from(Span::styled(
+                LABEL,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Indexed(crate::ui::theme::ACCENT))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            frame.render_widget(btn, brect);
+            Some(brect)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Stash geometry + plain rows so the input thread can map mouse → (line, col) and extract text.
     if let Ok(mut slot) = transcript_geom_slot().lock() {
         *slot = TranscriptGeom {
@@ -1082,6 +1264,7 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
             total,
             area,
             plain_rows,
+            jump_button,
         };
     }
 }

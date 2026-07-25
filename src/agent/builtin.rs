@@ -2405,7 +2405,15 @@ impl Tool for ShellRun {
             c.arg("-c").arg(command);
             c
         };
-        cmd.current_dir(&dir).stdout(Stdio::piped()).stderr(Stdio::piped());
+        // stdin = null (not inherited): on Windows a shared console-input handle lets `cmd.exe`
+        // (and the CRT) call SetConsoleMode on OUR input buffer and reset it on exit — clearing
+        // ENABLE_MOUSE_INPUT and re-enabling QuickEdit. That silently kills the retained TUI's mouse
+        // capture, so after a shell command the wheel leaks back through as ↑/↓ keys and the
+        // transcript can no longer be scrolled (the "can't scroll during/after a task" bug). A null
+        // stdin means the child never touches the console input handle, so our mode survives. The
+        // command already runs non-interactively (drained pipes, wall-clock timeout), so it has no
+        // legitimate use for the terminal's stdin anyway.
+        cmd.current_dir(&dir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd.spawn().with_context(|| format!("spawning shell for `{command}`"))?;
 
         // Drain the pipes on threads so a chatty command can't deadlock on a full buffer,

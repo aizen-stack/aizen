@@ -2261,6 +2261,12 @@ fn emit_tool_result(
     elapsed_ms: Option<u64>,
 ) {
     let (ok, summary) = summarize_result(name, out);
+    // Point the idle screensaver's context card at the feature this tool illustrates (a sub-agent
+    // spawn → "Delegate", a web_search → "Researches the web", …). Only on success — a failed call
+    // didn't really exercise the feature. A no-op for tools with no card.
+    if ok {
+        crate::ui::cards::note_tool_activity(name);
+    }
     crate::ui::tui::tool_call_end(
         seq,
         tool_icon(),

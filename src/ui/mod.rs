@@ -2,11 +2,13 @@
 //! rendering, the `spinner`, the `splash`/landing screen, `icons`, and clipboard
 //! `image_input`. Everything the user sees or types lives here.
 
+pub mod cards;
 pub mod channel_markdown;
 pub mod icons;
 pub mod image_input;
 pub mod markdown;
 pub mod mermaid;
+pub mod moonscape;
 pub mod spinner;
 pub mod splash;
 pub mod theme;

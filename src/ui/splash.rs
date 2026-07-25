@@ -222,7 +222,7 @@ fn sun_sixel() -> String {
 /// braille fallback. Sixel-capable Linux terminals — **foot, WezTerm, mlterm, recent xterm, Konsole
 /// ≥22.04, contour** — show the real image (auto-detected where they self-identify, else
 /// `AIZEN_LOGO=sixel`). macOS: **iTerm2** yes; Terminal.app no.
-fn logo_is_sixel() -> bool {
+pub(crate) fn logo_is_sixel() -> bool {
     if cfg!(test) {
         return false;
     }
