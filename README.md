@@ -1,31 +1,7 @@
 <div align="center">
 
-#  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
-  <rect width="64" height="64" rx="14" fill="#0b0b0a"/>
-  <g fill="#f5f4f0" transform="translate(32 32)">
-    <!-- simplified petal mark (16 outer) -->
-    <g>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(0)"/>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(22.5)"/>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(45)"/>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(67.5)"/>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(90)"/>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(112.5)"/>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(135)"/>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(157.5)"/>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(180)"/>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(202.5)"/>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(225)"/>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(247.5)"/>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(270)"/>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(292.5)"/>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(315)"/>
-      <path d="M0,-26 C3.2,-18 3.2,-10 0,0 C-3.2,-10 -3.2,-18 0,-26Z" transform="rotate(337.5)"/>
-    </g>
-  </g>
-</svg>
- <img width="150" height="150" alt="favicon" src="https://github.com/user-attachments/assets/3403e348-7b83-4206-a85e-ee5cb7379638" />
- Aizen
+<img width="260" height="242" alt="image" src="https://github.com/user-attachments/assets/742348fb-7095-4aa4-8c89-75f7cb324934" />
+
 
 ### The terminal-native coding agent that actually *lives* on your machine.
 
