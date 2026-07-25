@@ -375,6 +375,13 @@ struct RepoContext {
     hooks_dir: PathBuf,
     /// Cached filter safety probe for this process/context.
     filters_checked: std::cell::Cell<bool>,
+    /// Cached reparse/nested-repo walk for this process/context. A `RepoContext` is built per public
+    /// operation, so this dedupes the 2-3 walks a single save/restore performs (`current_tree` runs
+    /// twice in `restore_in`, plus `apply_tree`) without letting a stale result survive the operation.
+    reparse_checked: std::cell::Cell<bool>,
+    /// Cached ignored-directory set (see `uncovered_dirs`). Same per-operation lifetime as
+    /// `reparse_checked`: one `ls-files` probe instead of one per walk.
+    skip_dirs: std::cell::RefCell<Option<HashSet<PathBuf>>>,
 }
 
 impl RepoContext {
@@ -428,6 +435,8 @@ impl RepoContext {
             worktree_id,
             hooks_dir,
             filters_checked: std::cell::Cell::new(false),
+            reparse_checked: std::cell::Cell::new(false),
+            skip_dirs: std::cell::RefCell::new(None),
         })
     }
 
@@ -1088,13 +1097,70 @@ fn seed_index(ctx: &RepoContext) -> Result<TempIndex> {
     Ok(TempIndex(path))
 }
 
-fn reparse_preflight(root: &Path) -> Result<()> {
+/// Directory subtrees the timeline provably never covers: fully-untracked, fully-ignored trees like
+/// `target/` or `node_modules/`.
+///
+/// `ls-files --others --ignored --directory` only *collapses* a directory when nothing inside it is
+/// tracked, so every path it names contributes zero bytes to the snapshot tree — descending into one
+/// can only cost wall-clock. That cost is not marginal: on this repo the full walk visits 41k entries
+/// (0.66s) of which 39k live under `target/`, and `restore` runs the walk three times (two
+/// `current_tree` + one `apply_tree`), so a rewind paid ~2s of pure `readdir`.
+///
+/// Skipping them is also safe for the two things the walk is looking for. A nested `.git` or a
+/// junction inside an ignored tree is outside coverage either way: `add -A` never stages it, so a
+/// restore cannot write through it. The bail still fires for uncovered paths that are *not* ignored,
+/// which is the case a user would actually be surprised by.
+fn uncovered_dirs(ctx: &RepoContext) -> HashSet<PathBuf> {
+    // Cached per context: `restore` calls the walk three times and the ignored-dir set cannot
+    // meaningfully change inside one operation.
+    if let Some(cached) = ctx.skip_dirs.borrow().as_ref() {
+        return cached.clone();
+    }
+    let found = compute_uncovered_dirs(ctx);
+    *ctx.skip_dirs.borrow_mut() = Some(found.clone());
+    found
+}
+
+fn compute_uncovered_dirs(ctx: &RepoContext) -> HashSet<PathBuf> {
+    // Best-effort: on any git hiccup, fall back to walking everything (correct, just slower).
+    let Ok(out) = ctx.source_git_output([
+        "ls-files",
+        "-z",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+    ]) else {
+        return HashSet::new();
+    };
+    if !out.status.success() {
+        return HashSet::new();
+    }
+    // `-z` avoids git's quoting of non-ASCII paths; only entries ending in `/` are collapsed dirs.
+    String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|s| s.ends_with('/'))
+        .map(|s| ctx.root.join(s.trim_end_matches('/')))
+        .collect()
+}
+
+fn reparse_preflight(ctx: &RepoContext) -> Result<()> {
+    // One walk per public operation: `restore_in` calls `current_tree` twice plus `apply_tree`, and
+    // the tree cannot sprout a junction mid-operation while we hold the workspace writer lease.
+    if ctx.reparse_checked.get() {
+        return Ok(());
+    }
+    let root = &ctx.root;
+    let skip = uncovered_dirs(ctx);
     let root_git = root.join(".git");
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).with_context(|| format!("scanning {}", dir.display()))? {
             let entry = entry?;
             let path = entry.path();
+            if skip.contains(&path) {
+                continue;
+            }
             if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
                 if path == root_git {
                     continue;
@@ -1121,6 +1187,7 @@ fn reparse_preflight(root: &Path) -> Result<()> {
             }
         }
     }
+    ctx.reparse_checked.set(true);
     Ok(())
 }
 
@@ -1201,7 +1268,7 @@ fn index_blob_bytes(ctx: &RepoContext, index: &Path) -> Result<u64> {
 
 fn current_tree(ctx: &RepoContext) -> Result<(String, Coverage)> {
     ctx.ensure_safe_filters()?;
-    reparse_preflight(&ctx.root)?;
+    reparse_preflight(ctx)?;
     let idx = seed_index(ctx)?;
     // The seeded index preserves tracked entries and modes. `add -A` updates tracked files even when
     // a later .gitignore rule matches them, while untracked ignored paths remain outside coverage.
@@ -1435,7 +1502,7 @@ pub fn clear() -> Result<usize> {
 
 fn apply_tree(ctx: &RepoContext, commit: &str) -> Result<()> {
     ctx.ensure_safe_filters()?;
-    reparse_preflight(&ctx.root)?;
+    reparse_preflight(ctx)?;
     let idx = seed_index(ctx)?;
     ctx.git(Some(&idx.0), ["read-tree", "--reset", "-u", commit])?;
     Ok(())
@@ -1673,6 +1740,270 @@ pub fn timeline() -> Result<(Vec<Snapshot>, Option<usize>)> {
     let mut ledger = ctx.load_ledger()?;
     ledger.normalize()?;
     Ok((ledger.snapshots, ledger.cursor))
+}
+
+// ───────────────────────────── diff between points in time ─────────────────────────────
+
+/// One changed path between two timeline points. `added`/`deleted` are `None` for a binary file,
+/// which is exactly how Git reports it (`-` in `--numstat`) — the distinction matters because "0
+/// lines changed" and "not a text file" would otherwise read identically.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileChange {
+    /// Git status letter: `A`dded, `M`odified, `D`eleted, `R`enamed, `C`opied, `T`ype-changed.
+    pub status: char,
+    pub path: String,
+    /// Present only for renames/copies: where the content came from.
+    pub old_path: Option<String>,
+    pub added: Option<u64>,
+    pub deleted: Option<u64>,
+}
+
+/// Which point in time a diff side refers to. The working tree is a first-class side so "what have I
+/// changed since checkpoint #5" needs no intermediate checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffSide {
+    Checkpoint(u32),
+    Working,
+}
+
+impl DiffSide {
+    /// Accepts a checkpoint id, or `working`/`now`/`wt` for the live tree.
+    pub fn parse(s: &str) -> Option<Self> {
+        let t = s.trim().to_ascii_lowercase();
+        match t.as_str() {
+            "working" | "worktree" | "wt" | "now" | "current" | "disk" => Some(Self::Working),
+            _ => t.trim_start_matches('#').parse::<u32>().ok().map(Self::Checkpoint),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Checkpoint(id) => format!("#{id}"),
+            Self::Working => "working tree".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffReport {
+    pub from: String,
+    pub to: String,
+    pub files: Vec<FileChange>,
+    /// Unified patch text, when requested. Truncated at a byte ceiling — see `patch_truncated`.
+    pub patch: Option<String>,
+    pub patch_truncated: bool,
+}
+
+impl DiffReport {
+    pub fn total_added(&self) -> u64 {
+        self.files.iter().filter_map(|f| f.added).sum()
+    }
+    pub fn total_deleted(&self) -> u64 {
+        self.files.iter().filter_map(|f| f.deleted).sum()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+}
+
+/// Resolve a diff side to a Git tree oid. `Working` writes a fresh tree object into the private
+/// store (unreferenced, reclaimed by ordinary Git maintenance) so the live worktree can be diffed
+/// with the same plumbing as any checkpoint — no special-casing downstream.
+fn side_tree(ctx: &RepoContext, ledger: &Ledger, side: &DiffSide) -> Result<String> {
+    match side {
+        DiffSide::Checkpoint(id) => {
+            let snap = ledger
+                .snapshots
+                .iter()
+                .find(|s| s.id == *id)
+                .with_context(|| format!("no checkpoint #{id} (see `aizen time list`)"))?;
+            ctx.validate_snapshot_ref(snap)?;
+            Ok(snap.tree.clone())
+        }
+        DiffSide::Working => Ok(current_tree(ctx)?.0),
+    }
+}
+
+/// Split a `-z` (NUL-delimited) plumbing stream. Git only quotes paths in the non-`-z` forms, so
+/// this is the parse that survives non-ASCII and embedded-newline paths intact.
+fn nul_fields(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Merge git's two machine-readable diff streams into one row per changed path.
+///
+/// Two calls are needed because git has no single format carrying both the status letter (with rename
+/// pairing) and the line counts: `--name-status` has the former, `--numstat` the latter. Kept pure
+/// and byte-in so the `-z` framing — the part that silently mis-parses on renames — is unit-testable
+/// without a repository.
+///
+/// Framing, both with `-z`:
+///   - `--name-status`: `<status>\0<path>\0`, or `R<score>\0<old>\0<new>\0` for renames/copies.
+///   - `--numstat`: `<add>\t<del>\t<path>\0` normally, but for a rename the trailing path is EMPTY and
+///     the pair follows as `\0<old>\0<new>\0` — so a naive one-field-per-row read desyncs the whole
+///     remaining stream.
+///
+/// A `-` count means binary; it maps to `None` rather than `0` so "no text change" stays distinct
+/// from "not text".
+fn merge_diff_streams(name_status: &[u8], numstat: &[u8]) -> Vec<FileChange> {
+    let parse_count = |v: &str| if v == "-" { None } else { v.parse::<u64>().ok() };
+
+    let mut counts: std::collections::HashMap<String, (Option<u64>, Option<u64>)> =
+        std::collections::HashMap::new();
+    let num_fields = nul_fields(numstat);
+    let mut i = 0;
+    while i < num_fields.len() {
+        let mut parts = num_fields[i].split('\t');
+        let add = parts.next().unwrap_or("");
+        let del = parts.next().unwrap_or("");
+        let inline = parts.next().unwrap_or("");
+        if !inline.is_empty() {
+            counts.insert(inline.to_string(), (parse_count(add), parse_count(del)));
+            i += 1;
+        } else if i + 2 < num_fields.len() {
+            // Rename/copy: counts row, then old path, then new path. Key on the new path, which is
+            // what `--name-status` reports as the row's path.
+            counts.insert(num_fields[i + 2].clone(), (parse_count(add), parse_count(del)));
+            i += 3;
+        } else {
+            break;
+        }
+    }
+
+    let name_fields = nul_fields(name_status);
+    let mut files = Vec::new();
+    let mut j = 0;
+    while j + 1 < name_fields.len() {
+        let status = name_fields[j].chars().next().unwrap_or('M');
+        let paired = matches!(status, 'R' | 'C');
+        let (path, old_path, step) = if paired && j + 2 < name_fields.len() {
+            (name_fields[j + 2].clone(), Some(name_fields[j + 1].clone()), 3)
+        } else {
+            (name_fields[j + 1].clone(), None, 2)
+        };
+        let (added, deleted) = counts.get(&path).copied().unwrap_or((None, None));
+        files.push(FileChange { status, path, old_path, added, deleted });
+        j += step;
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
+
+/// Diff two points in the timeline: checkpoint↔checkpoint, or checkpoint↔working tree.
+///
+/// This is the read half of the time machine. Restoring already worked, but without a diff the only
+/// way to react to a bad edit was to discard the whole tree — you could not see *which* file went
+/// wrong, so a one-line mistake cost every good change made alongside it.
+///
+/// `patch_limit` caps the unified-patch bytes; `None` means stat-only (always cheap, so it stays
+/// usable on a huge change set). `paths` narrows the diff, which is what makes a broad rewind
+/// unnecessary in the common case.
+pub fn diff(
+    from: &DiffSide,
+    to: &DiffSide,
+    paths: &[String],
+    patch_limit: Option<usize>,
+) -> Result<DiffReport> {
+    let ctx = RepoContext::current()?;
+    // Shared lease only: diffing writes no refs and mutates no worktree, but it must not race a
+    // store-exclusive GC sweep that could reap an object mid-read.
+    let _store = ctx.store_shared()?;
+    let mut ledger = ctx.load_ledger()?;
+    ledger.normalize()?;
+    let from_tree = side_tree(&ctx, &ledger, from)?;
+    let to_tree = side_tree(&ctx, &ledger, to)?;
+
+    if from_tree == to_tree {
+        return Ok(DiffReport {
+            from: from.label(),
+            to: to.label(),
+            files: Vec::new(),
+            patch: None,
+            patch_truncated: false,
+        });
+    }
+
+    let pathspec: Vec<String> = if paths.is_empty() {
+        Vec::new()
+    } else {
+        let mut v = vec!["--".to_string()];
+        v.extend(paths.iter().cloned());
+        v
+    };
+
+    // Two plumbing calls rather than one: `--name-status` carries the status letter (and rename
+    // pairing), `--numstat` carries the line counts. Git has no combined machine format that gives
+    // both, and merging them here is cheaper than making callers run git twice.
+    let mut name_args = vec![
+        "diff-tree".to_string(),
+        "-r".to_string(),
+        "-z".to_string(),
+        "--find-renames".to_string(),
+        "--no-commit-id".to_string(),
+        "--name-status".to_string(),
+        from_tree.clone(),
+        to_tree.clone(),
+    ];
+    name_args.extend(pathspec.iter().cloned());
+    let name_out = ctx.git_output(None, &name_args)?;
+    if !name_out.status.success() {
+        bail!("diff failed: {}", String::from_utf8_lossy(&name_out.stderr).trim());
+    }
+
+    let mut num_args = vec![
+        "diff-tree".to_string(),
+        "-r".to_string(),
+        "-z".to_string(),
+        "--find-renames".to_string(),
+        "--no-commit-id".to_string(),
+        "--numstat".to_string(),
+        from_tree.clone(),
+        to_tree.clone(),
+    ];
+    num_args.extend(pathspec.iter().cloned());
+    let num_out = ctx.git_output(None, &num_args)?;
+    if !num_out.status.success() {
+        bail!("diff failed: {}", String::from_utf8_lossy(&num_out.stderr).trim());
+    }
+
+    let files = merge_diff_streams(&name_out.stdout, &num_out.stdout);
+
+    let (patch, patch_truncated) = match patch_limit {
+        None => (None, false),
+        Some(limit) => {
+            let mut args = vec![
+                "diff-tree".to_string(),
+                "-r".to_string(),
+                "-p".to_string(),
+                "--find-renames".to_string(),
+                "--no-commit-id".to_string(),
+                from_tree,
+                to_tree,
+            ];
+            args.extend(pathspec.iter().cloned());
+            let out = ctx.git_output(None, &args)?;
+            if !out.status.success() {
+                bail!("diff failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            }
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            if text.len() > limit {
+                // Cut on a char boundary so multi-byte content can't produce invalid UTF-8.
+                let mut cut = limit;
+                while cut > 0 && !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                (Some(text[..cut].to_string()), true)
+            } else {
+                (Some(text), false)
+            }
+        }
+    };
+
+    Ok(DiffReport { from: from.label(), to: to.label(), files, patch, patch_truncated })
 }
 
 #[derive(Debug, Serialize)]
@@ -2064,6 +2395,142 @@ impl crate::agent::tools::Tool for CheckpointRestore {
     }
 }
 
+/// Render a diff report as compact text for a tool result / CLI. Kept pure (no git, no I/O) so the
+/// shaping is unit-testable and identical for the agent and the human CLI.
+fn format_diff(report: &DiffReport, max_rows: usize) -> String {
+    if report.is_empty() {
+        return format!(
+            "no changes between {} and {} — the trees are identical.",
+            report.from, report.to
+        );
+    }
+    let mut out = format!(
+        "{} → {}: {} file(s) changed, +{} -{}\n",
+        report.from,
+        report.to,
+        report.files.len(),
+        report.total_added(),
+        report.total_deleted()
+    );
+    let shown = report.files.len().min(max_rows);
+    for f in &report.files[..shown] {
+        let counts = match (f.added, f.deleted) {
+            (Some(a), Some(d)) => format!("+{a} -{d}"),
+            // Git reports `-` for both columns on a binary file; say so rather than printing "+0 -0",
+            // which would read as "nothing changed".
+            _ => "binary".to_string(),
+        };
+        match &f.old_path {
+            Some(old) => out.push_str(&format!("  {} {old} → {}  ({counts})\n", f.status, f.path)),
+            None => out.push_str(&format!("  {} {}  ({counts})\n", f.status, f.path)),
+        }
+    }
+    if report.files.len() > shown {
+        out.push_str(&format!("  … {} more file(s)\n", report.files.len() - shown));
+    }
+    if let Some(patch) = &report.patch {
+        out.push_str("\n");
+        out.push_str(patch);
+        if report.patch_truncated {
+            out.push_str(
+                "\n… patch truncated. Narrow it with `paths` to see the rest of a specific file.\n",
+            );
+        }
+    }
+    out
+}
+
+/// Agent-facing diff between two points in the timeline. Read-only, so it needs no approval and can
+/// run concurrently — which matters, because the model should reach for this BEFORE a rewind.
+///
+/// Without it, reacting to a bad edit meant discarding the whole tree: the model could not see which
+/// file went wrong, so one bad line cost every good change made beside it. With it, the normal move
+/// is read the diff → fix the one file, and `checkpoint_rewind` becomes the fallback it should be.
+pub struct CheckpointDiff;
+impl crate::agent::tools::Tool for CheckpointDiff {
+    fn name(&self) -> &str { "checkpoint_diff" }
+    fn description(&self) -> &str {
+        "Show what changed between two Time Machine points: checkpoint↔checkpoint, or a checkpoint↔the \
+         live working tree (`to`/`from` = \"working\"). Defaults to `from`=the last run anchor, \
+         `to`=\"working\" — i.e. \"what have my edits done so far\". Use this BEFORE `checkpoint_rewind`: \
+         a rewind throws away every change since the anchor, so read the diff first and fix the one \
+         file that is wrong when you can. Also the way to inspect a suspicious edit you did not make \
+         this turn. Set `patch=true` for the unified diff (line-level), `paths` to narrow it. Read-only."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "from": {
+                    "type": "string",
+                    "description": "checkpoint id (e.g. \"5\"), or \"working\" for the live tree. Default: this run's pre_edit anchor, else the newest checkpoint."
+                },
+                "to": {
+                    "type": "string",
+                    "description": "checkpoint id, or \"working\" for the live tree (default)."
+                },
+                "patch": {
+                    "type": "boolean",
+                    "description": "include the unified line-level diff, not just the per-file stat. Default false."
+                },
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "limit to these paths (repo-relative). Strongly recommended together with patch=true."
+                }
+            },
+            "additionalProperties": false
+        })
+    }
+    fn execute(&self, args: &serde_json::Value) -> Result<String> {
+        if !is_repo() {
+            return Ok("error: not a git repository — no timeline to diff (run `git init`)".to_string());
+        }
+        let side = |key: &str| -> Option<DiffSide> {
+            args.get(key).and_then(|v| v.as_str()).and_then(DiffSide::parse)
+        };
+        // "what have I changed" is the overwhelmingly common question, so both ends default toward it:
+        // `to` = the live tree, `from` = this run's pre-edit anchor (falling back to the newest
+        // checkpoint when there is no anchor, e.g. a fresh turn that hasn't edited yet).
+        let to = side("to").unwrap_or(DiffSide::Working);
+        let from = match side("from") {
+            Some(s) => s,
+            None => match recovery_status().pre_edit {
+                Some(id) => DiffSide::Checkpoint(id),
+                None => {
+                    let (snaps, _) = timeline()?;
+                    match snaps.last() {
+                        Some(s) => DiffSide::Checkpoint(s.id),
+                        None => return Ok(
+                            "no checkpoints yet — nothing to diff against. The runtime auto-checkpoints before the first edit."
+                                .to_string(),
+                        ),
+                    }
+                }
+            },
+        };
+        if from == to {
+            return Ok(format!(
+                "error: `from` and `to` are the same point ({}) — nothing to compare.",
+                from.label()
+            ));
+        }
+        let paths: Vec<String> = args
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        let want_patch = args.get("patch").and_then(|v| v.as_bool()).unwrap_or(false);
+        // Patch bytes are the one unbounded part of this result; cap them so a broad `patch=true`
+        // degrades to a truncated read instead of blowing the tool-result budget.
+        let limit = if want_patch { Some(24_000) } else { None };
+        match diff(&from, &to, &paths, limit) {
+            Ok(report) => Ok(format_diff(&report, 60)),
+            Err(e) => Ok(format!("error: {e:#}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2144,6 +2611,82 @@ mod tests {
         begin_agent_run();
         assert_eq!(recovery_status().pre_edit, None);
         assert_eq!(recovery_status().rewinds_used, 0);
+    }
+
+    #[test]
+    fn diff_side_parses_ids_and_working_aliases() {
+        assert_eq!(DiffSide::parse("5"), Some(DiffSide::Checkpoint(5)));
+        // The timeline prints ids as `#5`, so pasting one back must work.
+        assert_eq!(DiffSide::parse("#12"), Some(DiffSide::Checkpoint(12)));
+        for alias in ["working", "worktree", "wt", "now", "current", "disk", "WORKING"] {
+            assert_eq!(DiffSide::parse(alias), Some(DiffSide::Working), "alias {alias}");
+        }
+        assert_eq!(DiffSide::parse("nonsense"), None);
+        // `0` is not a valid checkpoint id (the ledger starts at 1) but parses as one; the ledger
+        // lookup is what rejects it, with a message naming `aizen time list`.
+        assert_eq!(DiffSide::parse("0"), Some(DiffSide::Checkpoint(0)));
+    }
+
+    #[test]
+    fn merge_diff_streams_pairs_counts_with_status() {
+        // Byte-for-byte what `git diff-tree -z --name-status` / `--numstat` emit for plain edits:
+        // status and path are separate NUL fields; numstat keeps the path in the tab-split field.
+        let name = b"M\0Cargo.lock\0M\0Cargo.toml\0";
+        let num = b"1\t1\tCargo.lock\x002\t3\tCargo.toml\0";
+        let files = merge_diff_streams(name, num);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "Cargo.lock");
+        assert_eq!((files[0].status, files[0].added, files[0].deleted), ('M', Some(1), Some(1)));
+        assert_eq!((files[1].status, files[1].added, files[1].deleted), ('M', Some(2), Some(3)));
+        assert!(files.iter().all(|f| f.old_path.is_none()));
+    }
+
+    #[test]
+    fn merge_diff_streams_handles_renames_and_binary() {
+        // Rename: name-status is `R080\0old\0new`, numstat leaves the inline path EMPTY and follows
+        // with old\0new as their own fields — the two streams disagree in shape, which is the whole
+        // reason this merge exists. Counts must key on the NEW path.
+        let name = b"R080\0old.txt\0new.txt\0";
+        let num = b"1\t1\t\0old.txt\0new.txt\0";
+        let files = merge_diff_streams(name, num);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, 'R');
+        assert_eq!(files[0].path, "new.txt");
+        assert_eq!(files[0].old_path.as_deref(), Some("old.txt"));
+        assert_eq!((files[0].added, files[0].deleted), (Some(1), Some(1)));
+
+        // Binary: git reports `-` for both counts. `None` must survive as "not text", not as 0.
+        let files = merge_diff_streams(b"M\0logo.png\0", b"-\t-\tlogo.png\0");
+        assert_eq!(files.len(), 1);
+        assert_eq!((files[0].added, files[0].deleted), (None, None));
+    }
+
+    #[test]
+    fn merge_diff_streams_survives_truncated_and_empty_input() {
+        assert!(merge_diff_streams(b"", b"").is_empty());
+        // A status with no following path must not panic or invent an entry.
+        assert!(merge_diff_streams(b"M\0", b"").is_empty());
+        // Missing numstat side → counts unknown, but the file is still reported.
+        let files = merge_diff_streams(b"A\0new.rs\0", b"");
+        assert_eq!(files.len(), 1);
+        assert_eq!((files[0].status, files[0].added), ('A', None));
+    }
+
+    #[test]
+    fn diff_report_totals_ignore_binary_files() {
+        let report = DiffReport {
+            from: "#1".into(),
+            to: "working tree".into(),
+            files: vec![
+                FileChange { status: 'M', path: "a.rs".into(), old_path: None, added: Some(3), deleted: Some(1) },
+                FileChange { status: 'M', path: "b.png".into(), old_path: None, added: None, deleted: None },
+            ],
+            patch: None,
+            patch_truncated: false,
+        };
+        assert_eq!(report.total_added(), 3);
+        assert_eq!(report.total_deleted(), 1);
+        assert!(!report.is_empty());
     }
 
     #[test]

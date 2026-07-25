@@ -468,6 +468,13 @@ pub struct AgentConfig {
     /// fatal after the HTTP client's own retries). The stored string is the goal text, re-injected
     /// each time the model tries to stop without having genuinely finished.
     pub goal: Option<String>,
+    /// MID-TURN STEERING: drain [`crate::core::steer`] at each iteration boundary and fold anything
+    /// the user typed during the run into this conversation as a `user` message. Lets "wait, also do
+    /// X" land without Esc + restart (which would discard every tool result gathered so far, and the
+    /// provider prompt cache with it). Only the top-level interactive loop sets this — sub-agents and
+    /// workflow children leave it `false` so a steer aimed at the main task can't be swallowed by a
+    /// delegated child. Default `false` (the mailbox is process-global; opting in is explicit).
+    pub enable_steering: bool,
 }
 
 impl Default for AgentConfig {
@@ -508,6 +515,7 @@ impl Default for AgentConfig {
             hill_climb_gate: 90,
             hill_climb_reminder_every: 6,
             goal: None,
+            enable_steering: false,
         }
     }
 }
@@ -734,6 +742,28 @@ where
                 iters: iter,
                 stop: StopReason::Cancelled,
             });
+        }
+
+        // STEERING: mid-turn course correction. The input thread can hand a message to the RUNNING
+        // turn instead of the post-turn queue (Alt+Enter, Ctrl-S, or a `>` prefix), so "also do X" lands
+        // without an Esc + restart. Drained HERE — the top of an iteration is the only point where
+        // history is guaranteed consistent (every assistant `tool_calls` already paired with its
+        // results), so appending a `user` message can't strand a dangling call. Only the top-level
+        // interactive loop opts in (`cfg.enable_steering`); sub-agents and workflows ignore the
+        // channel so a steer meant for the main turn can't leak into a delegated child.
+        if cfg.enable_steering {
+            let steers = crate::core::steer::drain();
+            if !steers.is_empty() {
+                if !cfg.quiet {
+                    for s in &steers {
+                        emit_trace(
+                            &crate::ui::theme::accent(format!("⤳ steering: {}", first_line_clip(s, 72)))
+                                .to_string(),
+                        );
+                    }
+                }
+                messages.push(Message::user(crate::core::steer::format_injection(&steers)));
+            }
         }
 
         // Effective request size for ALL guards this iteration: estimate (messages + tool schemas)
@@ -1308,6 +1338,40 @@ where
                     continue;
                 }
                 // Declared complete AND verified (or nothing to verify) → fall through to Done.
+            }
+
+            // STEERING GATE: a steer typed while the model was composing its FINAL answer arrived
+            // after the top-of-loop drain, so without this check it would sit in the mailbox until
+            // `disarm` re-queued it as a fresh turn — the user's correction landing one turn late,
+            // after the work it meant to redirect was already reported done. Draining here keeps the
+            // run alive for one more iteration instead. Mirrors the todo-poke/goal gates' shape:
+            // record the (premature) assistant text so history reads coherently, inject, continue.
+            if cfg.enable_steering {
+                let steers = crate::core::steer::drain();
+                if !steers.is_empty() {
+                    if !cfg.quiet {
+                        for s in &steers {
+                            emit_trace(
+                                &crate::ui::theme::accent(format!(
+                                    "⤳ steering: {}",
+                                    first_line_clip(s, 72)
+                                ))
+                                .to_string(),
+                            );
+                        }
+                    }
+                    messages.push(Message {
+                        role: "assistant".to_string(),
+                        content: Some(turn.content.clone().unwrap_or_default()),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        images: Vec::new(),
+                        cache_control: None,
+                    });
+                    messages.push(Message::user(crate::core::steer::format_injection(&steers)));
+                    iter += 1;
+                    continue;
+                }
             }
 
             // Push the final assistant text so a multi-turn caller (REPL) keeps context.
@@ -2192,6 +2256,15 @@ fn emit_trace(line: &str) {
     } else {
         eprintln!("{line}");
     }
+}
+
+/// [`emit_trace`] for tool bodies outside this module.
+///
+/// A long-running tool is the one place a *tool* legitimately needs the trace lane: `shell_run`'s
+/// slow-command note has to reach the same surface as the loop's own progress lines, or it would
+/// `println!` into a raw-mode TUI and be wiped by the next repaint.
+pub(crate) fn emit_trace_public(line: &str) {
+    emit_trace(line);
 }
 
 /// The tool-call anchor icon — the moonlight cog `⚙` (matching the mockup), or empty when icons are
@@ -3594,6 +3667,9 @@ mod tests {
             hill_climb_gate: 90,
             hill_climb_reminder_every: 6,
             goal: None, // goal mode OFF in unit tests unless a test arms it
+            // Steering OFF by default in unit tests: the mailbox is process-global, so an unrelated
+            // script must not pick up a steer a steering test left behind.
+            enable_steering: false,
         }
     }
 
@@ -5413,6 +5489,109 @@ mod tests {
             "poke lists the open item"
         );
         todo::clear();
+    }
+
+    /// Steering is a process-global mailbox (the keyboard thread has no handle on the running turn),
+    /// so these tests must not interleave with each other.
+    fn steer_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[tokio::test]
+    async fn steer_is_folded_into_the_running_turn_at_the_next_iteration() {
+        let _g = steer_guard();
+        let r = registry();
+        let c = AgentConfig { enable_steering: true, max_iters: 6, auto_extend_to: 6, ..cfg() };
+        let mut messages = vec![Message::system("sys"), Message::user("original task")];
+        // A tool turn, then a final answer. The steer is posted BEFORE the loop runs, so it is drained
+        // at the very first iteration boundary — the same path a mid-flight Alt+Enter takes.
+        crate::core::steer::arm();
+        assert!(crate::core::steer::push("also update the README"));
+        let out = run_agent_loop(
+            scripted(vec![tool_turn("echo", r#"{"text":"hi"}"#), final_turn("done")]),
+            &c,
+            &r,
+            &mut messages,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        let injected: Vec<&Message> = messages
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.content.as_deref().is_some_and(|c| c.starts_with(crate::core::steer::PREFIX))
+            })
+            .collect();
+        assert_eq!(injected.len(), 1, "the steer is injected exactly once, not re-delivered");
+        assert!(injected[0].content.as_deref().unwrap().contains("also update the README"));
+        // The ORIGINAL task survives: steering augments the run, it does not replace history.
+        assert!(messages.iter().any(|m| m.content.as_deref() == Some("original task")));
+        assert_eq!(crate::core::steer::pending(), 0, "drained");
+        let _ = crate::core::steer::disarm();
+    }
+
+    #[tokio::test]
+    async fn steer_arriving_at_the_final_answer_blocks_done_and_grants_another_turn() {
+        let _g = steer_guard();
+        let r = registry();
+        let c = AgentConfig { enable_steering: true, max_iters: 6, auto_extend_to: 6, ..cfg() };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        // The steer must land INSIDE the model call — after the top-of-loop drain, while the answer is
+        // being composed. That is the gap the Done gate exists to close: without it the mailbox would
+        // still be full at `return`, and `disarm` would defer the correction to a whole new turn,
+        // arriving after the work it meant to redirect was already reported finished. Pushing from the
+        // fake model reproduces that window exactly (pushing before the loop would be drained at the
+        // first boundary instead — that is the other test).
+        crate::core::steer::arm();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let chat = move |_m: Vec<Message>, _d: Vec<ToolDef>| {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                assert!(crate::core::steer::push("wait, use tabs not spaces"));
+                std::future::ready(Ok(final_turn("all done")))
+            } else {
+                std::future::ready(Ok(final_turn("adjusted, now really done")))
+            }
+        };
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.final_text.as_deref(), Some("adjusted, now really done"), "the extra turn ran");
+        assert!(
+            messages.iter().any(|m| {
+                m.role == "user"
+                    && m.content.as_deref().is_some_and(|c| c.contains("wait, use tabs not spaces"))
+            }),
+            "the late steer reached the model rather than being dropped"
+        );
+        // The premature final text is recorded so the injected correction reads coherently.
+        assert!(messages.iter().any(|m| m.role == "assistant" && m.content.as_deref() == Some("all done")));
+        let _ = crate::core::steer::disarm();
+    }
+
+    #[tokio::test]
+    async fn steering_is_ignored_when_disabled_so_a_steer_cannot_leak_into_a_subagent() {
+        let _g = steer_guard();
+        let r = registry();
+        // Sub-agents / workflow children keep the default (false): a steer aimed at the top-level task
+        // must not be swallowed by whatever a delegated child happens to be doing.
+        let c = cfg();
+        assert!(!c.enable_steering, "steering is opt-in — default OFF");
+        let mut messages = vec![Message::system("sys"), Message::user("child task")];
+        crate::core::steer::arm();
+        assert!(crate::core::steer::push("meant for the parent"));
+        let out = run_agent_loop(scripted(vec![final_turn("child done")]), &c, &r, &mut messages)
+            .await
+            .unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert!(
+            !messages.iter().any(|m| m.content.as_deref().is_some_and(|c| c.starts_with(crate::core::steer::PREFIX))),
+            "a child never consumes the steering mailbox"
+        );
+        assert_eq!(crate::core::steer::pending(), 1, "left intact for the parent loop");
+        let leftover = crate::core::steer::disarm();
+        assert_eq!(leftover, vec!["meant for the parent".to_string()]);
     }
 
     #[tokio::test]

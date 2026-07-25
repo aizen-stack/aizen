@@ -18,11 +18,10 @@
 //! When the TUI isn't active (the one-shot `ng chat`/`agent` subcommands, pipes, CI) every entry
 //! point degrades to a plain `print!` so nothing changes for non-interactive use.
 
-use crate::ui::splash::ACCENT;
 use crate::ui::theme;
-use console::{measure_text_width, style, Key, Term};
+use console::{style, Key, Term};
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as stdmpsc;
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -31,12 +30,6 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 mod retained;
-
-/// Footer height in rows: HUD status line + top rule + the `❯` prompt line + bottom rule.
-const FOOTER: u16 = 4;
-
-/// Max rows the live slash palette draws above the input box.
-const PALETTE_MAX: usize = 7;
 
 /// A key whose `read_key()` returned within this many ms was ALREADY waiting in the OS input buffer
 /// → it arrived as part of a burst (a paste), not a deliberate human keystroke. Used so a newline
@@ -49,13 +42,6 @@ const PASTE_COALESCE_MS: u64 = 50;
 /// mouse event; gated on !working and no open menu/overlay so it never fires mid-task or over a menu.
 const IDLE_SCREENSAVER_SECS: u64 = 15;
 
-/// Rows the palette painted last time — so a shrinking/closing palette clears its stale lines.
-static LAST_PAL: AtomicU16 = AtomicU16::new(0);
-
-/// Max rows the `/model` overlay draws above the chat sandwich (title + list + hint).
-const MODEL_MENU_MAX: usize = 14;
-/// Rows the model overlay painted last frame — shrink/clear stale lines like [`LAST_PAL`].
-static LAST_MODEL_MENU: AtomicU16 = AtomicU16::new(0);
 /// Shared list + selection while the overlay is open (owned by the menu input thread).
 static MODEL_MENU: OnceLock<Mutex<ModelMenuState>> = OnceLock::new();
 
@@ -77,10 +63,6 @@ fn model_menu_slot() -> &'static Mutex<ModelMenuState> {
     MODEL_MENU.get_or_init(|| Mutex::new(ModelMenuState::default()))
 }
 
-/// Max rows the `/sessions` overlay draws above the chat sandwich (title + list + hint).
-const SESSIONS_MENU_MAX: usize = 14;
-/// Rows the sessions overlay painted last frame — shrink/clear stale lines like [`LAST_MODEL_MENU`].
-static LAST_SESSIONS_MENU: AtomicU16 = AtomicU16::new(0);
 /// Shared list + selection while the `/sessions` overlay is open (owned by the menu input thread).
 static SESSIONS_MENU: OnceLock<Mutex<SessionsMenuState>> = OnceLock::new();
 
@@ -113,10 +95,6 @@ fn sessions_menu_slot() -> &'static Mutex<SessionsMenuState> {
     SESSIONS_MENU.get_or_init(|| Mutex::new(SessionsMenuState::default()))
 }
 
-/// Max rows the pure-print text overlay draws above the chat sandwich.
-const TEXT_OVERLAY_MAX: usize = 18;
-/// Rows the text overlay painted last frame — shrink/clear stale lines like the menu overlays.
-static LAST_TEXT_OVERLAY: AtomicU16 = AtomicU16::new(0);
 /// Captured pure-print output while the temporary text overlay is open.
 static TEXT_OVERLAY: OnceLock<Mutex<TextOverlayState>> = OnceLock::new();
 
@@ -159,7 +137,8 @@ static RETAINED_INFO_OVERLAY: AtomicBool = AtomicBool::new(false);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Whether the agent is mid-turn. Set by the REPL around a turn; read by the input thread (Esc =
-/// cancel when working, quit when idle) AND by `paint_box` (the box's working indicator).
+/// cancel when working, quit when idle) and by the ticker (it only animates while a turn runs). The
+/// footer's own working pill is driven by the render thread's `AppState`, fed via [`set_working`].
 static WORKING: AtomicBool = AtomicBool::new(false);
 
 /// Turn-scoped cancellation handle currently armed by the interactive REPL.
@@ -199,10 +178,6 @@ pub fn active_cancel_token() -> Option<crate::core::cancel::TurnCancel> {
     active_turn_cancel().lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Star frames for the animated working indicator (a lone background thread advances this while
-/// `WORKING`, so it pulses even when no token is streaming — e.g. before the first byte or during a
-/// long tool call). Moonlight silver, drawn by [`paint_box`]. Every frame is exactly one cell.
-const STAR: [&str; 6] = ["✶", "✷", "✸", "✹", "✺", "✻"];
 /// Whimsical present-tense verbs cycled (slowly, every ~3s) in the working pill — the "still
 /// thinking" flavour, Claude-Code style. Purely cosmetic: the elapsed clock + the `↑N tok` counter
 /// are the real liveness signal.
@@ -257,43 +232,22 @@ pub fn next_tip() -> &'static str {
     TIPS[i % TIPS.len()]
 }
 
-/// Rotating cursor for the per-turn working verb (advanced once per turn, so each run opens on a
-/// fresh word). Distinct from the footer's old in-place cycling: the verb is pinned at turn start and
-/// drives the animated shimmer in the footer HUD (see [`shimmer_verb`]) — so it moves while the turn
-/// runs and vanishes the instant the turn ends, never stranded as a frozen line in the scrollback.
+/// Rotating cursor for the per-turn working verb, advanced once per turn so each run opens on a fresh
+/// word. The verb is emitted into the transcript as a turn-start line; the footer's own shimmering
+/// verb is picked independently by the render thread, so this cursor only orders the transcript ones.
 static VERB_CURSOR: AtomicUsize = AtomicUsize::new(0);
-/// Index (into `VERBS`) of the verb chosen for the CURRENT turn — set by [`next_work_verb`] at turn
-/// start and read every frame by [`paint_box`] so the footer shimmer keeps showing the same word for
-/// the whole turn (rather than re-rolling on each ~9×/s repaint).
-static CURRENT_VERB: AtomicUsize = AtomicUsize::new(0);
 
-/// The next working verb (e.g. "Pondering"), advancing the rotation AND pinning it as the current
-/// turn's verb (so the animated footer line shows the same word). Emitted once per turn into the
-/// scrolling transcript by the REPL — see the turn-start line in `run_menu_sticky`.
+/// The next working verb (e.g. "Pondering"). Emitted once per turn into the transcript by the REPL —
+/// see the turn-start line in `run_menu_sticky`.
 pub fn next_work_verb() -> &'static str {
-    let i = VERB_CURSOR.fetch_add(1, Ordering::Relaxed) % VERBS.len();
-    CURRENT_VERB.store(i, Ordering::Relaxed);
-    VERBS[i]
+    VERBS[VERB_CURSOR.fetch_add(1, Ordering::Relaxed) % VERBS.len()]
 }
-
-/// The verb pinned for the current turn (the one [`next_work_verb`] last returned) — read by the
-/// footer's animated thinking line so it stays stable across repaints.
-fn current_verb() -> &'static str {
-    VERBS[CURRENT_VERB.load(Ordering::Relaxed) % VERBS.len()]
-}
-
-/// Context-window fill, in per-mille (0..=1000), for the HUD meter bar. Set by `status_text` each
-/// time the status is refreshed; read by `paint_box` to draw the coloured bar. Per-mille (not
-/// percent) so the bar has sub-1% resolution without a float in the hot paint path.
-static CTX_PERMILLE: AtomicU16 = AtomicU16::new(0);
-
-/// Live model/endpoint health for the idle footer chip (`● ready` / `● unstable` / `● down`).
-/// Polled in the background against `GET {base}/models` (see `run_menu_sticky`'s health poller).
-/// Encoding matches [`HealthKind`] so a single `AtomicU8` is enough for both backends.
-static HEALTH: AtomicU8 = AtomicU8::new(HealthKind::Unknown as u8);
 
 /// Provider reachability for the idle `●` chip. Green = answered fast; yellow = flaky/slow;
 /// red = permanent unavailability (bad key/endpoint or missing config).
+///
+/// The live value lives in the render thread's `AppState` (fed by [`set_health`]) — there is no
+/// second copy here, so the chip can never disagree with what was drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum HealthKind {
@@ -308,15 +262,6 @@ pub enum HealthKind {
 }
 
 impl HealthKind {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            0 => Self::Ok,
-            1 => Self::Unstable,
-            2 => Self::Down,
-            _ => Self::Unknown,
-        }
-    }
-
     /// Footer label. Narrow terminals get a short form so the HUD still fits.
     pub fn label(self, narrow: bool) -> &'static str {
         match (self, narrow) {
@@ -345,69 +290,29 @@ impl HealthKind {
 /// Update the context-meter fill (per-mille, clamped 0..=1000). Called from `status_text` alongside
 /// each status refresh; harmless when the TUI is inactive.
 pub fn set_ctx_permille(v: u16) {
-    let v = v.min(1000);
-    CTX_PERMILLE.store(v, Ordering::Relaxed);
     if retained::is_running() {
-        retained::set_context(v);
+        retained::set_context(v.min(1000));
     }
 }
 
 /// Push a new health reading into the idle footer chip. Harmless when the TUI is inactive.
 pub fn set_health(kind: HealthKind) {
-    HEALTH.store(kind as u8, Ordering::Relaxed);
     if retained::is_running() {
         retained::set_health(kind);
-        return;
     }
-    if !active() {
-        return;
-    }
-    // Classic path: repaint so the coloured `●` updates without waiting for the next keystroke.
-    let mut r = render().lock().unwrap();
-    let mut buf = String::new();
-    reconcile_geometry(&mut r, &mut buf);
-    paint_box(&mut buf, &r);
-    flush(&buf);
 }
 
-fn current_health() -> HealthKind {
-    HealthKind::from_u8(HEALTH.load(Ordering::Relaxed))
-}
-
-/// Current spinner frame index (advanced by the ticker thread; read by `paint_box`).
-static WORK_FRAME: AtomicUsize = AtomicUsize::new(0);
-/// Rough count of streamed OUTPUT characters this turn (÷4 ≈ tokens) — drives the live "↑N tok"
-/// counter in the working pill. Bumped by the streaming client via [`add_stream_chars`]; zeroed at
-/// each turn start (`set_working(true)`).
-static STREAM_CHARS: AtomicU64 = AtomicU64::new(0);
-/// When the current task started — drives the "· Ns" elapsed counter in the working pill. Set on
-/// `set_working(true)`, cleared on `set_working(false)`.
-static WORK_START: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 /// Guards the single ticker thread so it's spawned at most once per process.
 static TICKER_STARTED: AtomicBool = AtomicBool::new(false);
-/// Guards the resize poller (Claude-Code-style live reflow when the terminal window changes).
-static RESIZE_POLL_STARTED: AtomicBool = AtomicBool::new(false);
-/// 1-based terminal row of the footer's HUD line as of the last paint. `0` = uninitialised, so
-/// [`paint_box`] falls back to the bottom-glued anchor `rows-FOOTER+1`. The classic footer is no
-/// longer pinned by a DECSTBM scroll-region (that discarded lines scrolled off the top, so the
-/// terminal's native scrollbar had nothing to scroll). Instead the footer FLOATS directly below the
-/// content: each [`emit`] erases the old footer, prints output (whose newlines scroll the terminal
-/// naturally, pushing the top line into REAL scrollback), then advances this anchor and repaints the
-/// footer just below the new output. An in-place refresh (spinner tick / draft edit / resize) repaints
-/// at the SAME stored anchor — it must never advance, or the footer would walk down one row per tick.
-static FOOTER_TOP: AtomicU16 = AtomicU16::new(0);
 
-fn work_start_slot() -> &'static Mutex<Option<Instant>> {
-    WORK_START.get_or_init(|| Mutex::new(None))
-}
+/// Rough count of streamed OUTPUT characters this turn (÷4 ≈ tokens), zeroed at each turn start.
+/// The retained HUD currently shows the elapsed clock rather than a token tally, so nothing reads
+/// this yet; it is kept because the streaming client already feeds it per content delta and it is the
+/// only per-turn output volume signal available to a future HUD chip.
+static STREAM_CHARS: AtomicU64 = AtomicU64::new(0);
 
-/// Seconds since the current task began (0 when idle / not yet started).
-fn work_elapsed_secs() -> u64 {
-    work_start_slot().lock().unwrap().map(|t| t.elapsed().as_secs()).unwrap_or(0)
-}
-
-/// Bump the streamed-output character counter (≈ tokens ÷ 4) — called by the streaming client per
-/// content delta so the working pill shows live progress. A cheap relaxed add; harmless off-TTY.
+/// Bump the streamed-output character counter — called by the streaming client per content delta.
+/// A cheap relaxed add; harmless off-TTY.
 pub fn add_stream_chars(n: u64) {
     STREAM_CHARS.fetch_add(n, Ordering::Relaxed);
 }
@@ -427,14 +332,12 @@ pub fn assistant_stream_finish(interrupted: bool) {
     }
 }
 
-/// Estimated streamed OUTPUT tokens this turn (chars ÷ 4) for the working pill's `↑N tok`.
-fn stream_tokens() -> u64 {
-    STREAM_CHARS.load(Ordering::Relaxed) / 4
-}
-
-/// Spawn the lone animation ticker (idempotent). While the agent is working it bumps the spinner
-/// frame and repaints the box ~9×/s, so the indicator animates and the elapsed counter ticks even
-/// when no output is streaming. Idle (not working) → it just sleeps; on a pipe/CI it never spawns.
+/// Spawn the lone animation ticker (idempotent). While the agent is working it pokes the render
+/// thread ~9×/s so the spinner animates and the elapsed counter ticks even when no output is
+/// streaming. Idle (not working) → it just sleeps; on a pipe/CI it never spawns.
+///
+/// The frame counter itself lives in the render thread's `AppState` (advanced by [`retained::tick`]),
+/// so this thread only supplies the heartbeat.
 fn start_ticker() {
     if !std::io::stdout().is_terminal() {
         return; // no animation on a pipe / CI
@@ -447,53 +350,9 @@ fn start_ticker() {
         if !ACTIVE.load(Ordering::Relaxed) || !WORKING.load(Ordering::Relaxed) {
             continue;
         }
-        WORK_FRAME.fetch_add(1, Ordering::Relaxed);
         if retained::is_active() {
             retained::tick();
-            continue;
         }
-        // Repaint the classic box only. paint_box uses absolute cursor moves and never touches the
-        // output-save slot (owned by `emit`), so animating from this thread cannot disturb where the
-        // next streamed token lands. Serialized with emit/keystrokes on the render lock.
-        let r = render().lock().unwrap();
-        let mut buf = String::new();
-        paint_box(&mut buf, &r);
-        flush(&buf);
-    });
-}
-
-/// Poll terminal dimensions ~4×/s and reflow the floating footer (Claude Code–style live resize).
-/// Both width and height changes repaint immediately (even mid-turn): with no scroll-region there's
-/// no protected slot to defer for, so [`reconcile_geometry`] just records the size + re-clamps the
-/// footer anchor and [`paint_box`] redraws the footer there. The terminal reflows scrollback itself.
-fn start_resize_poller() {
-    if !std::io::stdout().is_terminal() {
-        return;
-    }
-    if RESIZE_POLL_STARTED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    std::thread::spawn(|| loop {
-        std::thread::sleep(Duration::from_millis(250));
-        if !ACTIVE.load(Ordering::Relaxed) {
-            continue;
-        }
-        if retained::is_running() {
-            continue; // crossterm resize events/autoresize are owned by the retained render loop
-        }
-        let (rows, cols) = term_size();
-        let mut r = render().lock().unwrap();
-        if rows == r.rows && cols == r.cols {
-            continue;
-        }
-        // No scroll-region to protect and no output slot to preserve, so width AND height changes are
-        // both safe to apply immediately (even mid-turn): reconcile only records dimensions + clamps
-        // the anchor, then paint_box erases and redraws the footer at the clamped anchor. The terminal
-        // reflows the scrollback history above it on its own.
-        let mut buf = String::new();
-        reconcile_geometry(&mut r, &mut buf);
-        paint_box(&mut buf, &r);
-        flush(&buf);
     });
 }
 
@@ -509,11 +368,12 @@ pub enum Submission {
     Quit,
 }
 
-/// Live render state behind the global lock. `draft`/`cursor`/`images` mirror the input thread's
-/// edit buffer so any repaint (keystroke OR agent output) draws a consistent box.
+/// Shared input state behind the global lock: the draft buffer plus which overlay is open. The input
+/// thread owns editing semantics and mutates this; [`retained_input_snapshot`] translates it into one
+/// `InputSnapshot` per frame for the render thread. Deliberately holds NO geometry — the retained
+/// backend is the only thing that paints, so it is the only authority on terminal size (see
+/// [`width`]); a second copy here could disagree with what was actually drawn.
 struct Render {
-    cols: u16,
-    rows: u16,
     draft: Vec<char>,
     cursor: usize,
     images: usize,
@@ -542,8 +402,6 @@ fn render() -> &'static Mutex<Render> {
     static R: OnceLock<Mutex<Render>> = OnceLock::new();
     R.get_or_init(|| {
         Mutex::new(Render {
-            cols: 80,
-            rows: 24,
             draft: Vec::new(),
             cursor: 0,
             images: 0,
@@ -674,14 +532,16 @@ pub fn ask_approval(prompt_line: &str) -> bool {
     }
 }
 
-/// The width (columns) the pinned box is drawn at — the canonical wrap width for streamed output so
-/// the Markdown renderer wraps to exactly the box, not to a separately-probed (possibly larger)
-/// window edge. When the TUI isn't active, falls back to the live terminal width.
+/// The width (columns) the frame is drawn at — the canonical wrap width for streamed output so the
+/// Markdown renderer wraps to exactly the transcript viewport, not to a separately-probed (possibly
+/// larger) window edge. Off-TTY / before the render thread is up, falls back to a live probe.
+///
+/// The render thread is the single source of truth here: it calls `autoresize` and stores the result,
+/// so this can never disagree with what was actually painted (the old second copy in `Render.cols`
+/// needed its own 250 ms poller to stay in step, and drifted between polls).
 pub fn width() -> usize {
     if retained::is_running() {
         retained::size().1 as usize
-    } else if active() {
-        render().lock().unwrap().cols as usize
     } else {
         term_size().1 as usize
     }
@@ -693,927 +553,40 @@ fn term_size() -> (u16, u16) {
     (r.max(8), c.max(20))
 }
 
-/// Reconcile the stored geometry against the live terminal after a possible resize. Returns whether
-/// anything changed (the caller repaints the footer afterward; `true` on any delta).
+/// Start the interactive TUI: hand the terminal to the retained full-frame backend.
 ///
-/// With the floating footer there's no scroll-region or output slot to rebuild — the content above
-/// the footer is genuine terminal scrollback and the terminal reflows it on resize by itself. So this
-/// only records the new `rows`/`cols` and re-clamps [`FOOTER_TOP`] so a shrunk window still fits the
-/// 4-row footer; the caller's [`paint_box`] then erases + redraws the footer at the clamped anchor.
-/// Emits NO ANSI (the `buf` param is retained only to keep the call sites unchanged). Safe to call
-/// mid-stream now — it moves nothing.
-fn reconcile_geometry(r: &mut Render, buf: &mut String) -> bool {
-    let (rows, cols) = term_size();
-    if rows == r.rows && cols == r.cols {
+/// Returns whether it came up. `false` means the caller must fall back to the plain line-REPL —
+/// either stdout isn't a TTY, or entering the alternate screen failed. There is no second renderer
+/// to degrade into: the retained backend is the only interactive surface, so a half-started UI is
+/// never left on screen.
+pub fn activate(intro: &str, status: &str) -> bool {
+    if !std::io::stdout().is_terminal() {
         return false;
     }
-    r.rows = rows;
-    r.cols = cols;
-    // Without a scroll-region the content above the footer is genuine terminal scrollback, and the
-    // terminal reflows IT on resize — we no longer mirror or reprint anything. Just record the new
-    // dimensions; clamp the footer anchor so a shrunk window can still fit the 4-row footer (the next
-    // `paint_box` erases + redraws it there). `buf` is kept in the signature so the 4 call sites and
-    // their flush stay unchanged; we intentionally emit no ANSI here.
-    let _ = &buf;
-    let max_top = rows.saturating_sub(FOOTER) + 1;
-    let raw = FOOTER_TOP.load(Ordering::Relaxed);
-    if raw != 0 {
-        FOOTER_TOP.store(raw.clamp(1, max_top), Ordering::Relaxed);
+    // Seed the shared input state's status BEFORE starting the render thread: every keystroke
+    // snapshot reads it, so skipping this makes the first keypress send an empty `InputSnapshot.
+    // status` and blank the HUD's left side (model · tokens · yolo).
+    {
+        let mut r = render().lock().unwrap_or_else(|e| e.into_inner());
+        r.status = status.to_string();
     }
+    if !retained::start(intro, status) {
+        return false;
+    }
+    ACTIVE.store(true, Ordering::Relaxed);
     true
 }
 
-/// Truncate a plain (un-styled) string to `max` display columns, adding an ellipsis when it would
-/// overflow. Width-aware (handles wide glyphs) so the status line can never wrap onto a second row —
-/// a wrapped status is the other way the footer "doubles".
-fn truncate_to_width(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    if measure_text_width(s) <= max {
-        return s.to_string();
-    }
-    let budget = max.saturating_sub(1); // leave a cell for the ellipsis
-    let mut out = String::new();
-    let mut w = 0usize;
-    for ch in s.chars() {
-        let cw = measure_text_width(&ch.to_string());
-        if w + cw > budget {
-            break;
-        }
-        out.push(ch);
-        w += cw;
-    }
-    out.push('…');
-    out
-}
-
-/// Style the HUD string: the whole line is muted, but the mode chip pops so the active approval mode
-/// reads at a glance (the one spot of colour in an otherwise quiet status line). Per the design,
-/// `⚡ yolo` burns warm **gold** (the reserved warm accent) while `◆ smart` stays calm **moonlight** —
-/// the colour itself signals "this mode runs hot" vs "this mode is careful". Operates on the
-/// already-truncated PLAIN string, so it never splits an ANSI escape.
-fn style_hud(s: &str) -> String {
-    // The HUD is `model  ·  🎭 Persona  ·  ✦ mode  ·  todos` — chips are separated by "  ·  ".
-    // Colour each SEGMENT on its own so persona + mode can both pop at once (the old single-split
-    // version only lit the first chip and left the rest muted). A segment's leading glyph picks its
-    // colour; everything else stays neutral moonlight-grey.
-    const SEP: &str = "  ·  ";
-    s.split(SEP)
-        .map(|seg| {
-            if seg.starts_with('⚡') {
-                theme::warn(seg).to_string() // yolo → gold (runs hot)
-            } else if seg.starts_with('✦') {
-                theme::warn(seg).bold().to_string() // ultimate → gold bold (runs hottest)
-            } else if seg.starts_with('◆') || seg.starts_with('🎭') {
-                // smart mode + persona chip → calm moonlight (careful mode / which character is live)
-                theme::accent(seg).to_string()
-            } else {
-                theme::muted(seg).to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(&theme::faint(SEP).to_string())
-}
-
-/// Number of filled cells the context meter uses on a normal-width terminal (excludes brackets).
-const CTX_BAR_CELLS: usize = 10;
-/// Narrow terminals shrink the bar so the HUD still fits without eating the model name.
-const CTX_BAR_CELLS_COMPACT: usize = 6;
-
-/// Per-frame layout derived from terminal width — rules/HUD/prompt inset and compact HUD like Claude Code.
-struct FooterLayout {
-    w: usize,
-    /// Left/right inset so rules and prompt don't hug the window edge on wide panes.
-    inset: usize,
-    /// Typing area inside the prompt row (after `❯ `).
-    inner: usize,
-    compact: bool,
-    narrow: bool,
-}
-
-fn footer_layout(cols: usize) -> FooterLayout {
-    let w = cols.max(20) as usize;
-    let inset = if w >= 100 {
-        2
-    } else if w >= 64 {
-        1
-    } else {
-        0
-    };
-    // `❯ ` = 2 cells + 1-col right breathing room + symmetric inset.
-    let inner = w.saturating_sub(inset * 2 + 3);
-    let compact = w < 72;
-    let narrow = w < 52;
-    FooterLayout { w, inset, inner, compact, narrow }
-}
-
-fn idle_placeholder(layout: &FooterLayout, queued: usize) -> String {
-    let q = if queued == 0 {
-        String::new()
-    } else if layout.narrow {
-        format!(" · +{queued} queued")
-    } else {
-        format!(" · {queued} queued")
-    };
-    if layout.narrow {
-        format!("Message · / · Esc{q}")
-    } else if layout.compact {
-        format!("Type a message · /commands{q}")
-    } else {
-        format!("Type a message  ·  / for commands  ·  Esc to exit{q}")
-    }
-}
-
-fn working_placeholder(layout: &FooterLayout, queued: usize) -> String {
-    let q = if queued == 0 {
-        String::new()
-    } else if layout.narrow {
-        format!(" · +{queued} queued")
-    } else {
-        format!(" · {queued} queued")
-    };
-    if layout.narrow {
-        format!("Queue msg · Esc stop{q}")
-    } else if layout.compact {
-        format!("Queue a message · Esc stops turn{q}")
-    } else {
-        format!("Queue a message while working  ·  Esc stops current turn{q}")
-    }
-}
-
-/// Render the context-window meter. `compact` uses a shorter bar on narrow terminals.
-fn ctx_meter(permille: u16, compact: bool) -> String {
-    let cells = if compact { CTX_BAR_CELLS_COMPACT } else { CTX_BAR_CELLS };
-    let pm = permille.min(1000);
-    let filled = (pm as usize * cells).div_ceil(1000).min(cells);
-    // A partial cell for the boundary so low fills still show a sliver of progress (▏..█ eighths).
-    let bar_color = if pm >= 900 {
-        theme::ERR // nearly full — reclaim room soon (/compact)
-    } else if pm >= 700 {
-        theme::WARN // getting tight
-    } else {
-        theme::ACCENT_DIM // plenty of headroom — quiet moonlight
-    };
-    let mut bar = String::new();
-    for i in 0..cells {
-        bar.push(if i < filled { '▓' } else { '░' });
-    }
-    let pct = (pm as f64 / 10.0).round() as u16; // per-mille → percent
-    format!(
-        "{}{}{} {}",
-        theme::faint("⟦"),
-        style(bar).color256(bar_color),
-        theme::faint("⟧"),
-        theme::muted(format!("{pct}%")),
-    )
-}
-
-/// Render the current turn's working verb (e.g. `Pondering`) with a bright moonlight band that sweeps
-/// left→right across its letters (a shimmer). Driven entirely by `WORK_FRAME` (advanced ~9×/s by the
-/// ticker) so it animates smoothly even when no token is streaming. Returns `""` when no verb is
-/// pinned. Lives in the footer HUD's working state — so it MOVES while the turn runs and VANISHES the
-/// instant the turn ends (`set_working(false)` repaints the idle `● ready` state), instead of leaving
-/// a frozen "Pondering…" line stranded in the scrollback.
-///
-/// The shimmer is a moving 3-cell-wide window: the letter at the crest renders bright `ACCENT` (bold),
-/// its neighbour a soft `ACCENT_DIM` glow, the rest a quiet `MUTED`, so a highlight glides across the
-/// word like moonlight on water — matching the palette's "holds the moon" identity without a new colour.
-fn shimmer_verb(frame: usize) -> String {
-    let verb = current_verb();
-    let chars: Vec<char> = verb.chars().collect();
-    let n = chars.len();
-    if n == 0 {
-        return String::new();
-    }
-    // The shimmer crest sweeps across [0, n + tail) so it enters, crosses, and exits the word before
-    // wrapping — a slow, continuous glide (one cell every ~2 frames ≈ 5 cells/s).
-    let span = n + 6;
-    let crest = (frame / 2) % span;
-    let mut out = String::new();
-    for (i, &c) in chars.iter().enumerate() {
-        // Distance from the crest, wrapping so the band re-enters cleanly at the left edge.
-        let d = (i as isize - crest as isize).unsigned_abs();
-        let styled = if d == 0 {
-            style(c.to_string()).color256(ACCENT).bold() // crest — brightest
-        } else if d == 1 {
-            style(c.to_string()).color256(theme::ACCENT_DIM) // shoulder — soft glow
-        } else {
-            style(c.to_string()).color256(theme::MUTED) // trough — quiet
-        };
-        out.push_str(&styled.to_string());
-    }
-    out
-}
-
-/// Visible width of the context meter for a given fill — brackets + bar + " NN%".
-fn ctx_meter_width(permille: u16, compact: bool) -> usize {
-    let cells = if compact { CTX_BAR_CELLS_COMPACT } else { CTX_BAR_CELLS };
-    let pct = (permille.min(1000) as f64 / 10.0).round() as u16;
-    // ⟦ + bar + ⟧ + space + digits + %
-    1 + cells + 1 + 1 + pct.to_string().len() + 1
-}
-
-// ── ANSI helpers (written into a String, flushed under the lock) ──────────────────────────────
-/// Reset the DECSTBM scroll region to the full screen. The floating footer no longer SETS a region,
-/// but [`activate`] still resets one defensively (a prior mode / crash could have left one set).
-fn reset_region(buf: &mut String) {
-    buf.push_str("\x1b[r");
-}
-fn goto(buf: &mut String, row: u16, col: u16) {
-    buf.push_str(&format!("\x1b[{row};{col}H"));
-}
-fn clear_line(buf: &mut String) {
-    buf.push_str("\x1b[2K");
-}
-/// Erase from the cursor to the end of the screen (`ED 0`). Used to wipe the old floating footer
-/// block before repainting it: one escape, correctly clears a footer that shrank (an overlay that
-/// closed), no per-row bookkeeping. Always preceded by `goto(FOOTER_TOP, 1)`.
-fn erase_below(buf: &mut String) {
-    buf.push_str("\x1b[0J");
-}
-/// How many visual terminal rows a printed chunk advances the cursor, at width `cols`. Strips SGR
-/// (colour never advances the cursor), splits on '\n', and for each segment adds `ceil(width/cols)`
-/// (min 1). Biased to round UP: an overcount self-heals next frame, but an undercount would leave
-/// `goto(FOOTER_TOP,1)` mid-output and `erase_below` would wipe a real line. In practice `emit` is
-/// line-buffered and its content is already wrapped to `width()`, so this equals the newline count —
-/// the width term is defensive against an unwrapped line slipping through.
-fn visual_rows_advanced(s: &str, cols: u16) -> u16 {
-    if s.is_empty() {
-        return 0;
-    }
-    let cols = cols.max(1) as usize;
-    let plain = console::strip_ansi_codes(s);
-    // A trailing '\n' means the final segment is empty (cursor moved to a fresh line) — `split` yields
-    // that empty tail, correctly counted as one advanced row below.
-    let mut rows: usize = 0;
-    for (i, seg) in plain.split('\n').enumerate() {
-        if i > 0 {
-            rows += 1; // the '\n' itself moved the cursor down one row
-        }
-        let w = measure_text_width(seg);
-        // Extra rows from wrapping a too-wide segment (0 when it fits in one row).
-        if w > cols {
-            rows += (w - 1) / cols;
-        }
-    }
-    rows.min(u16::MAX as usize) as u16
-}
-
-/// Draw the live slash palette in the rows directly above the status line (`top_row`). Filters as
-/// the user types `/…`; the top match is highlighted (Tab completes it). Rows are inside the scroll
-/// region, so the palette transiently overlays the bottom transcript lines while a command is being
-/// typed and is cleared the moment the palette shrinks or closes (tracked via `LAST_PAL`).
-fn paint_palette(buf: &mut String, r: &Render, top_row: u16, w: usize) {
-    let matches = slash_matches(&r.draft);
-    let max_above = top_row.saturating_sub(1) as usize; // never draw above row 1
-    let vis = matches.len().min(PALETTE_MAX).min(max_above); // rows actually drawn this frame
-    let prev = LAST_PAL.load(Ordering::Relaxed) as usize;
-
-    // Clear rows a previously-taller palette occupied (shrink or close).
-    for i in vis..prev {
-        if (i as u16) < top_row {
-            goto(buf, top_row - 1 - i as u16, 1);
-            clear_line(buf);
-        }
-    }
-    if vis == 0 {
-        LAST_PAL.store(0, Ordering::Relaxed);
-        return;
-    }
-    // SCROLL: the match list can exceed the visible window (19 commands, 7 rows). Slide a window of
-    // `vis` items that always contains the selection, so ↑/↓ can reach EVERY command (e.g. `/mcp`),
-    // not just the first 7. `matches[start]` sits nearest the box; higher indices climb upward.
-    let sel = r.palette_sel.min(matches.len() - 1);
-    let start = if sel < vis { 0 } else { sel - vis + 1 };
-    let more_above = start + vis < matches.len(); // higher-index items off the top
-    let more_below = start > 0; // lower-index items off the bottom (toward the input box)
-    for i in 0..vis {
-        let mi = start + i;
-        let name = matches[mi].name.as_str();
-        let desc = matches[mi].description.as_str();
-        goto(buf, top_row - 1 - i as u16, 1);
-        clear_line(buf);
-        let is_sel = mi == sel;
-        let icon = crate::ui::icons::g(crate::ui::icons::slash(name));
-        let marker = if is_sel { style("›").color256(ACCENT).bold().to_string() } else { " ".to_string() };
-        let nm = if is_sel {
-            style(format!("/{name}")).color256(ACCENT).bold().to_string()
-        } else {
-            style(format!("/{name}")).color256(ACCENT).to_string()
-        };
-        // Trim the gist so the line can't overrun the terminal width.
-        let budget = w.saturating_sub(name.len() + 8);
-        let gist: String = desc.chars().take(budget).collect();
-        let mut line = format!("  {marker} {icon}{nm}  {}", style(gist).dim());
-        // A faint `⋯` on the edge row signals there are more commands to scroll to.
-        if (i == vis - 1 && more_above) || (i == 0 && more_below) {
-            line.push_str(&format!("  {}", theme::faint("⋯")));
-        }
-        buf.push_str(&line);
-    }
-    LAST_PAL.store(vis as u16, Ordering::Relaxed);
-}
-
-/// `/model` picker stacked above the top chat rule (same scroll region as the slash palette).
-fn paint_model_menu(buf: &mut String, r: &Render, top_row: u16, w: usize) {
-    if !r.model_menu_active {
-        let prev = LAST_MODEL_MENU.load(Ordering::Relaxed) as usize;
-        for i in 0..prev {
-            if (i as u16) < top_row {
-                goto(buf, top_row - 1 - i as u16, 1);
-                clear_line(buf);
-            }
-        }
-        LAST_MODEL_MENU.store(0, Ordering::Relaxed);
-        return;
-    }
-    if r.model_menu_rows.is_empty() {
-        let rows = 3usize;
-        let prev = LAST_MODEL_MENU.load(Ordering::Relaxed) as usize;
-        for i in rows..prev {
-            if (i as u16) < top_row {
-                goto(buf, top_row - 1 - i as u16, 1);
-                clear_line(buf);
-            }
-        }
-        goto(buf, top_row - 1, 1);
-        clear_line(buf);
-        buf.push_str(&format!(
-            "  {} {}",
-            style("◎").color256(ACCENT).bold(),
-            style("model").color256(ACCENT)
-        ));
-        goto(buf, top_row - 2, 1);
-        clear_line(buf);
-        buf.push_str(&format!("  {}", theme::faint("⋯ fetching models from provider")));
-        goto(buf, top_row - 3, 1);
-        clear_line(buf);
-        buf.push_str(&theme::faint("  Esc cancel").to_string());
-        LAST_MODEL_MENU.store(rows as u16, Ordering::Relaxed);
-        return;
-    }
-    let n = r.model_menu_rows.len();
-    let list_cap = MODEL_MENU_MAX.saturating_sub(3).max(4);
-    let max_above = top_row.saturating_sub(1) as usize;
-    // Room for title + hint (2 rows); always show at least one model row when n > 0.
-    let list_room = max_above.saturating_sub(2).max(1);
-    let list_vis = n.min(list_cap).min(list_room);
-    let total_vis = list_vis + 2;
-    let prev = LAST_MODEL_MENU.load(Ordering::Relaxed) as usize;
-    for i in total_vis..prev {
-        if (i as u16) < top_row {
-            goto(buf, top_row - 1 - i as u16, 1);
-            clear_line(buf);
-        }
-    }
-    let sel = r.model_menu_sel.min(n - 1);
-    let start = if sel < list_vis { 0 } else { sel - list_vis + 1 };
-    let more_above = start + list_vis < n;
-    let more_below = start > 0;
-
-    let mut row_idx = 0u16;
-    goto(buf, top_row - 1 - row_idx, 1);
-    clear_line(buf);
-    // Truncate the PLAIN title before styling — never let a styled string reach `truncate_to_width`
-    // (it iterates raw chars and would slice an ANSI escape, bleeding colour across the layout).
-    let title_plain = truncate_to_width(&format!("model  ·  {n} available"), w.saturating_sub(4));
-    buf.push_str(&format!(
-        "  {} {}",
-        style("◎").color256(ACCENT).bold(),
-        style(title_plain).color256(ACCENT)
-    ));
-    row_idx += 1;
-
-    for i in 0..list_vis {
-        let mi = start + i;
-        let row = &r.model_menu_rows[mi];
-        goto(buf, top_row - 1 - row_idx, 1);
-        clear_line(buf);
-        let is_sel = mi == sel;
-        let edge = (i == list_vis - 1 && more_above) || (i == 0 && more_below);
-        let ctx = row.label.strip_prefix(&row.id).unwrap_or("").trim();
-
-        // Budget for content after the "  " prefix + marker + space (4 cols). Reserve room for the
-        // edge "⋯" ("  ⋯" = 3 cols) so it never gets clipped. Truncate the PLAIN id/ctx BEFORE
-        // styling — same reason as the title above — with the id taking priority over the ctx.
-        let content_budget = w.saturating_sub(4).saturating_sub(if edge { 3 } else { 0 });
-        let id_plain = truncate_to_width(&row.id, content_budget);
-        let id_w = measure_text_width(&id_plain);
-        let ctx_plain = if ctx.is_empty() {
-            String::new()
-        } else {
-            let rem = content_budget.saturating_sub(id_w + 2);
-            if rem == 0 {
-                String::new()
-            } else {
-                truncate_to_width(ctx, rem)
-            }
-        };
-
-        let marker = if is_sel {
-            style("›").color256(ACCENT).bold().to_string()
-        } else {
-            " ".to_string()
-        };
-        let id_styled = if is_sel {
-            style(&id_plain).color256(ACCENT).bold().to_string()
-        } else {
-            style(&id_plain).color256(theme::ACCENT_DIM).to_string()
-        };
-        let ctx_styled = if ctx_plain.is_empty() {
-            String::new()
-        } else {
-            format!("  {}", theme::faint(&ctx_plain))
-        };
-        let mut line = format!("  {marker} {id_styled}{ctx_styled}");
-        if edge {
-            line.push_str(&format!("  {}", theme::faint("⋯")));
-        }
-        buf.push_str(&line);
-        row_idx += 1;
-    }
-
-    goto(buf, top_row - 1 - row_idx, 1);
-    clear_line(buf);
-    let hint_plain = truncate_to_width("  ↑↓ pick · Enter set · Esc cancel", w);
-    buf.push_str(&theme::faint(hint_plain.as_str()).to_string());
-    row_idx += 1;
-
-    LAST_MODEL_MENU.store(row_idx as u16, Ordering::Relaxed);
-}
-
-/// `/sessions` picker stacked above the top chat rule (mirrors [`paint_model_menu`], but each row is
-/// a title + faint subtitle rather than an id + context). Windowing is recomputed from `top_row`
-/// every paint, so a live terminal resize reflows the list instead of losing the frame.
-fn paint_sessions_menu(buf: &mut String, r: &Render, top_row: u16, w: usize) {
-    if !r.sessions_menu_active {
-        let prev = LAST_SESSIONS_MENU.load(Ordering::Relaxed) as usize;
-        for i in 0..prev {
-            if (i as u16) < top_row {
-                goto(buf, top_row - 1 - i as u16, 1);
-                clear_line(buf);
-            }
-        }
-        LAST_SESSIONS_MENU.store(0, Ordering::Relaxed);
-        return;
-    }
-    if r.sessions_menu_rows.is_empty() {
-        let rows = 2usize;
-        let prev = LAST_SESSIONS_MENU.load(Ordering::Relaxed) as usize;
-        for i in rows..prev {
-            if (i as u16) < top_row {
-                goto(buf, top_row - 1 - i as u16, 1);
-                clear_line(buf);
-            }
-        }
-        goto(buf, top_row - 1, 1);
-        clear_line(buf);
-        buf.push_str(&format!(
-            "  {} {}",
-            style("◎").color256(ACCENT).bold(),
-            style("sessions").color256(ACCENT)
-        ));
-        goto(buf, top_row - 2, 1);
-        clear_line(buf);
-        buf.push_str(&theme::faint("  no saved sessions · Esc cancel").to_string());
-        LAST_SESSIONS_MENU.store(rows as u16, Ordering::Relaxed);
-        return;
-    }
-    let n = r.sessions_menu_rows.len();
-    let list_cap = SESSIONS_MENU_MAX.saturating_sub(3).max(4);
-    let max_above = top_row.saturating_sub(1) as usize;
-    // Room for title + hint (2 rows); always show at least one row when n > 0.
-    let list_room = max_above.saturating_sub(2).max(1);
-    let list_vis = n.min(list_cap).min(list_room);
-    let total_vis = list_vis + 2;
-    let prev = LAST_SESSIONS_MENU.load(Ordering::Relaxed) as usize;
-    for i in total_vis..prev {
-        if (i as u16) < top_row {
-            goto(buf, top_row - 1 - i as u16, 1);
-            clear_line(buf);
-        }
-    }
-    let sel = r.sessions_menu_sel.min(n - 1);
-    let start = if sel < list_vis { 0 } else { sel - list_vis + 1 };
-    let more_above = start + list_vis < n;
-    let more_below = start > 0;
-
-    let mut row_idx = 0u16;
-    goto(buf, top_row - 1 - row_idx, 1);
-    clear_line(buf);
-    buf.push_str(&format!(
-        "  {} {}",
-        style("◎").color256(ACCENT).bold(),
-        style(format!("sessions  ·  {n}")).color256(ACCENT)
-    ));
-    row_idx += 1;
-
-    for i in 0..list_vis {
-        let mi = start + i;
-        let row = &r.sessions_menu_rows[mi];
-        goto(buf, top_row - 1 - row_idx, 1);
-        clear_line(buf);
-        let is_sel = mi == sel;
-        let marker = if is_sel {
-            style("›").color256(ACCENT).bold().to_string()
-        } else {
-            " ".to_string()
-        };
-        let title_styled = if is_sel {
-            style(&row.title).color256(ACCENT).bold().to_string()
-        } else {
-            style(&row.title).color256(theme::ACCENT_DIM).to_string()
-        };
-        let sub_styled = if row.subtitle.is_empty() {
-            String::new()
-        } else {
-            format!("  {}", theme::faint(&row.subtitle))
-        };
-        let mut line = format!("  {marker} {title_styled}{sub_styled}");
-        if (i == list_vis - 1 && more_above) || (i == 0 && more_below) {
-            line.push_str(&format!("  {}", theme::faint("⋯")));
-        }
-        let budget = w.saturating_sub(4);
-        if measure_text_width(&line) > budget {
-            line = truncate_to_width(&line, budget);
-        }
-        buf.push_str(&line);
-        row_idx += 1;
-    }
-
-    goto(buf, top_row - 1 - row_idx, 1);
-    clear_line(buf);
-    let hint = if r.sessions_menu_deletable_rows > 0 {
-        "  ↑↓ pick · Enter restore · d/Del delete · Esc cancel"
-    } else {
-        "  ↑↓ pick · Enter confirm · Esc cancel"
-    };
-    buf.push_str(&theme::faint(hint).to_string());
-    row_idx += 1;
-
-    LAST_SESSIONS_MENU.store(row_idx as u16, Ordering::Relaxed);
-}
-
-/// Wrap one ANSI-free source line into terminal-width visual rows (Unicode display-width aware).
-fn text_overlay_wrap_line(line: &str, width: usize) -> Vec<String> {
-    if line.is_empty() {
-        return vec![String::new()];
-    }
-    let width = width.max(1);
-    let mut rows = Vec::new();
-    let mut row = String::new();
-    let mut used = 0usize;
-    for ch in line.chars() {
-        let cw = measure_text_width(&ch.to_string()).max(1);
-        if !row.is_empty() && used + cw > width {
-            rows.push(std::mem::take(&mut row));
-            used = 0;
-        }
-        row.push(ch);
-        used += cw;
-    }
-    if !row.is_empty() {
-        rows.push(row);
-    }
-    rows
-}
-
-fn text_overlay_visual_lines(lines: &[String], width: usize) -> Vec<String> {
-    lines.iter().flat_map(|line| text_overlay_wrap_line(line, width)).collect()
-}
-
-/// Scrollable plain-text overlay for pure-print slash output. Mirrors [`paint_model_menu`] windowing
-/// (recomputed from `top_row` each frame → live-resize reflows). Esc/q to close.
-fn paint_text_overlay(buf: &mut String, r: &Render, top_row: u16, w: usize) {
-    if !r.text_overlay_active {
-        let prev = LAST_TEXT_OVERLAY.load(Ordering::Relaxed) as usize;
-        for i in 0..prev {
-            if (i as u16) < top_row {
-                goto(buf, top_row - 1 - i as u16, 1);
-                clear_line(buf);
-            }
-        }
-        LAST_TEXT_OVERLAY.store(0, Ordering::Relaxed);
-        return;
-    }
-    let content_w = w.saturating_sub(4).max(1);
-    let visual_lines = text_overlay_visual_lines(&r.text_overlay_lines, content_w);
-    let n = visual_lines.len();
-    let max_above = top_row.saturating_sub(1) as usize;
-    // Reserve 2 rows: title + hint.
-    let list_cap = TEXT_OVERLAY_MAX.saturating_sub(2).max(4);
-    let list_room = max_above.saturating_sub(2).max(1);
-    let list_vis = if n == 0 { 0 } else { n.min(list_cap).min(list_room) };
-    let total_vis = list_vis + 2;
-    let prev = LAST_TEXT_OVERLAY.load(Ordering::Relaxed) as usize;
-    for i in total_vis..prev {
-        if (i as u16) < top_row {
-            goto(buf, top_row - 1 - i as u16, 1);
-            clear_line(buf);
-        }
-    }
-    let start = if n <= list_vis { 0 } else { r.text_overlay_scroll.min(n - list_vis) };
-    let more_above = start > 0;
-    let more_below = start + list_vis < n;
-
-    let mut row_idx = 0u16;
-    goto(buf, top_row - 1 - row_idx, 1);
-    clear_line(buf);
-    let title = if r.text_overlay_title.is_empty() { "output" } else { &r.text_overlay_title };
-    buf.push_str(&format!(
-        "  {} {}",
-        style("◎").color256(ACCENT).bold(),
-        style(format!("{title}  ·  {} lines", r.text_overlay_lines.len())).color256(ACCENT)
-    ));
-    row_idx += 1;
-
-    // Rows are painted upward from the footer, so reverse the visible slice: the first source line
-    // remains at the visual top and the last visible line sits nearest the title.
-    for i in 0..list_vis {
-        let li = start + list_vis - 1 - i;
-        goto(buf, top_row - 1 - row_idx, 1);
-        clear_line(buf);
-        let mut out = format!("  {}", visual_lines[li]);
-        if (i == 0 && more_below) || (i == list_vis - 1 && more_above) {
-            out.push_str(&format!("  {}", theme::faint("⋯")));
-        }
-        buf.push_str(&out);
-        row_idx += 1;
-    }
-
-    goto(buf, top_row - 1 - row_idx, 1);
-    clear_line(buf);
-    buf.push_str(&theme::faint("  ↑↓/PgUp/PgDn scroll · Esc/q close").to_string());
-    row_idx += 1;
-
-    LAST_TEXT_OVERLAY.store(row_idx as u16, Ordering::Relaxed);
-}
-
-/// Append the sandwich-style footer at the bottom `FOOTER` rows and leave the cursor at the input
-/// text position. The footer is four stacked rows — the HUD status line (above the box), a top rule,
-/// the moonlit `❯` prompt, and a bottom rule — so only the prompt sits between the two horizontal
-/// rules (no side borders). Pure string-building; the caller writes+flushes under the lock.
-fn paint_box(buf: &mut String, r: &Render) {
-    let layout = footer_layout(r.cols as usize);
-    let w = layout.w;
-    let inner = layout.inner;
-    let inset = layout.inset;
-    // The footer now FLOATS below the content instead of being pinned by a scroll-region. Its anchor
-    // is [`FOOTER_TOP`] (advanced only by `emit` after it prints + scrolls output into real
-    // scrollback), clamped so a 4-row footer still fits on screen. `0` = uninitialised → bottom-glued
-    // fallback (`rows-FOOTER+1`). Erase from the anchor down first so a footer that shrank (a closed
-    // overlay) leaves nothing stranded; the transcript above the anchor is untouched (it's genuine
-    // terminal scrollback now). Re-store the SAME clamped value — an in-place refresh (spinner tick,
-    // draft edit) must NOT advance the anchor, or the footer would walk down one row per repaint.
-    let max_top = r.rows.saturating_sub(FOOTER) + 1;
-    let raw = FOOTER_TOP.load(Ordering::Relaxed);
-    let top_row = if raw == 0 { max_top } else { raw.clamp(1, max_top) };
-    FOOTER_TOP.store(top_row, Ordering::Relaxed);
-    goto(buf, top_row, 1);
-    erase_below(buf);
-    let prompt_col = (inset + 1) as u16;
-
-    if r.model_menu_active {
-        paint_model_menu(buf, r, top_row, w);
-    } else if r.sessions_menu_active {
-        paint_sessions_menu(buf, r, top_row, w);
-    } else if r.text_overlay_active {
-        paint_text_overlay(buf, r, top_row, w);
-    } else {
-        // An overlay that JUST closed left its rows painted in the scroll region. Clear each overlay's
-        // own stale rows before drawing the slash palette so nothing gets stranded in scrollback.
-        paint_model_menu(buf, r, top_row, w);
-        paint_sessions_menu(buf, r, top_row, w);
-        paint_text_overlay(buf, r, top_row, w);
-        paint_palette(buf, r, top_row, w);
-    }
-
-    // row 1: HUD (above the sandwich).
-    goto(buf, top_row, 1);
-    clear_line(buf);
-    let pm = CTX_PERMILLE.load(Ordering::Relaxed);
-    let meter = ctx_meter(pm, layout.compact);
-    let meter_w = ctx_meter_width(pm, layout.compact);
-    let state = if WORKING.load(Ordering::Relaxed) {
-        let wf = WORK_FRAME.load(Ordering::Relaxed);
-        let frame = STAR[wf % STAR.len()];
-        let secs = work_elapsed_secs();
-        let tok = stream_tokens();
-        let toktail = if layout.narrow {
-            String::new()
-        } else if tok >= 1000 {
-            format!(" · ↑{:.1}K tok", tok as f64 / 1000.0)
-        } else if tok > 0 {
-            format!(" · ↑{tok} tok")
-        } else {
-            String::new()
-        };
-        let esc_hint = if layout.narrow { "" } else { " · Esc" };
-        // The whimsical verb ("Pondering") shimmers here in the HUD only while the turn runs — comfy
-        // widths only, so it never crowds the model name on tight panes. It vanishes the moment the
-        // turn ends (idle state below), rather than being stranded as a frozen line in the scrollback.
-        let verb = if layout.compact { String::new() } else { format!("{} ", shimmer_verb(wf)) };
-        format!(
-            "{} {}{}",
-            style(frame).color256(ACCENT).bold(),
-            verb,
-            theme::faint(format!("{secs}s{toktail}{esc_hint}"))
-        )
-    } else {
-        // Idle chip reflects real provider health (polled every ~60s against GET /models).
-        let h = current_health();
-        format!(
-            "{} {}",
-            style("●").color256(h.color_code()),
-            theme::faint(h.label(layout.narrow))
-        )
-    };
-    let right = if layout.narrow {
-        state.clone()
-    } else {
-        format!("{state}   {meter}")
-    };
-    let right_w = if layout.narrow {
-        measure_text_width(&state)
-    } else {
-        measure_text_width(&state) + 3 + meter_w
-    };
-    let left_pad = inset;
-    let avail = w.saturating_sub(left_pad + right_w + 2);
-    let status = truncate_to_width(&r.status, avail);
-    let status_styled = style_hud(&status);
-    let pad = w.saturating_sub(left_pad + measure_text_width(&status) + right_w).max(1);
-    buf.push_str(&format!(
-        "{}{}{}{}",
-        " ".repeat(left_pad),
-        status_styled,
-        " ".repeat(pad),
-        right
-    ));
-
-    // row 2: top rule (full width; inset is visual breathing room on the prompt row only).
-    goto(buf, top_row + 1, 1);
-    clear_line(buf);
-    buf.push_str(&theme::accent_dim("─".repeat(w)).to_string());
-
-    let imgtag = if r.images > 0 {
-        style(format!("[{}img] ", r.images)).color256(ACCENT).to_string()
-    } else {
-        String::new()
-    };
-    let cellw = |c: char| measure_text_width(&c.to_string());
-    let working = WORKING.load(Ordering::Relaxed);
-    let ph_base = if working {
-        working_placeholder(&layout, r.queued_count)
-    } else {
-        idle_placeholder(&layout, r.queued_count)
-    };
-    let (shown, caret_off) = if r.draft.is_empty() && r.images == 0 {
-        let ph: String = ph_base.chars().take(inner).collect();
-        (theme::faint(ph).italic().to_string(), 0)
-    } else if r.draft.iter().filter(|&&c| c == '\n').count() + 1 >= 5 {
-        let text: String = r.draft.iter().collect();
-        let nlines = text.lines().count().max(1);
-        let first = text.lines().find(|l| !l.trim().is_empty()).map(str::trim).unwrap_or("");
-        let head = format!("[+{nlines} lines pasted]");
-        let room = inner.saturating_sub(head.chars().count() + 3);
-        let chip = if room > 4 && !first.is_empty() {
-            let peek: String = first.chars().take(room).collect();
-            let ell = if first.chars().count() > room { "…" } else { "" };
-            format!("{head} · {peek}{ell}")
-        } else {
-            head
-        };
-        let chip: String = chip.chars().take(inner).collect();
-        let wc = measure_text_width(&chip);
-        (style(chip).color256(ACCENT).to_string(), wc)
-    } else {
-        let mut scroll = r.cursor;
-        let mut used = 0usize;
-        while scroll > 0 {
-            let cw = cellw(r.draft[scroll - 1]);
-            if used + cw > inner.saturating_sub(1) {
-                break;
-            }
-            used += cw;
-            scroll -= 1;
-        }
-        let caret_off: usize = r.draft[scroll..r.cursor].iter().map(|&c| cellw(c)).sum();
-        let mut shown = String::new();
-        let mut used_w = 0usize;
-        for &c in &r.draft[scroll..] {
-            let cw = cellw(c);
-            if used_w + cw > inner {
-                break;
-            }
-            shown.push(c);
-            used_w += cw;
-        }
-        (shown, caret_off)
-    };
-    goto(buf, top_row + 2, prompt_col);
-    clear_line(buf);
-    buf.push_str(&format!(
-        "{arrow} {imgtag}{shown}",
-        arrow = style("❯").color256(ACCENT).bold()
-    ));
-
-    goto(buf, top_row + 3, 1);
-    clear_line(buf);
-    buf.push_str(&theme::accent_dim("─".repeat(w)).to_string());
-
-    let col = inset + 2 + imgtag_visible_len(r.images) + caret_off + 1;
-    goto(buf, top_row + 2, col as u16);
-}
-
-/// Visible width of the `[Nimg] ` prefix (0 when no images) — kept in sync with `paint_box`.
-fn imgtag_visible_len(images: usize) -> usize {
-    if images > 0 {
-        format!("[{images}img] ").chars().count()
-    } else {
-        0
-    }
-}
-
-fn flush(buf: &str) {
-    let mut out = std::io::stdout();
-    let _ = out.write_all(buf.as_bytes());
-    let _ = out.flush();
-}
-
-/// Enter sticky mode: clear the screen, print `intro` into the (new) scroll region, seed the output
-/// cursor, and paint the box. No-op when stdout isn't a TTY.
-pub fn activate(intro: &str, status: &str) {
-    if !std::io::stdout().is_terminal() {
-        return;
-    }
-    // Always seed the classic shared Render status — retained repaints pull from it via
-    // `retained_input_snapshot()`. If we skip this when retained wins, the first keystroke sends an
-    // empty `InputSnapshot.status` and wipes the HUD left side (model · tokens · yolo).
-    {
-        let mut r = render().lock().unwrap();
-        r.status = status.to_string();
-    }
-    if retained::start(intro, status) {
-        ACTIVE.store(false, Ordering::Relaxed);
-        start_resize_poller();
-        return;
-    }
-    let mut r = render().lock().unwrap();
-    let (rows, cols) = term_size();
-    r.rows = rows;
-    r.cols = cols;
-    r.status = status.to_string();
-    let mut buf = String::new();
-    reset_region(&mut buf); // belt-and-braces: drop any stale DECSTBM region from a prior mode
-    buf.push_str("\x1b[2J\x1b[H"); // clear + home → cursor at row 1
-    buf.push_str(intro);
-    buf.push('\n'); // the intro splash goes into the terminal's real scrollback
-    // Anchor the footer DIRECTLY below the intro (Claude-CLI style — it floats below content, not
-    // glued to the bottom of an empty screen). After the clear+home the cursor was at row 1; the intro
-    // plus its trailing '\n' advanced it `visual_rows_advanced(intro)+1` rows, so the footer's HUD line
-    // sits at `1 + that`, clamped so a 4-row footer still fits. No scroll-region: lines scrolled off
-    // the top land in native scrollback (see [`FOOTER_TOP`]).
-    let max_top = r.rows.saturating_sub(FOOTER) + 1;
-    let intro_end = 1u32 + visual_rows_advanced(intro, r.cols) as u32 + 1;
-    FOOTER_TOP.store(intro_end.min(max_top as u32).max(1) as u16, Ordering::Relaxed);
-    LAST_PAL.store(0, Ordering::Relaxed);
-    LAST_MODEL_MENU.store(0, Ordering::Relaxed);
-    LAST_SESSIONS_MENU.store(0, Ordering::Relaxed);
-    LAST_TEXT_OVERLAY.store(0, Ordering::Relaxed);
-    paint_box(&mut buf, &r);
-    flush(&buf);
-    ACTIVE.store(true, Ordering::Relaxed);
-    start_resize_poller();
-}
-
-/// Leave sticky mode: reset the scroll region, clear the app's viewport, and return the cursor to
-/// the top-left so the shell prompt starts on a clean screen.
+/// Leave the TUI: stop the render thread (its `TerminalSession::drop` shows the cursor, disables
+/// mouse capture, and leaves the alternate screen) and put stdin back in cooked mode.
 pub fn deactivate() {
     // The crossterm input loop leaves stdin in raw mode; return it to cooked so the `bye.` line and the
     // shell prompt after us echo normally. Idempotent and safe even if the loop never enabled raw.
     restore_stdin_cooked();
-    if retained::is_running() {
-        retained::stop();
-        ACTIVE.store(false, Ordering::Relaxed);
-        return;
-    }
-    // Cleanup must be idempotent and must still run when Windows delivers CTRL_C_EVENT before the
-    // keyboard thread observes it. In that race another path may already have cleared `ACTIVE`.
+    // Idempotent, and must still run when Windows delivers CTRL_C_EVENT before the keyboard thread
+    // observes it — in that race another path may already have cleared `ACTIVE`.
     ACTIVE.store(false, Ordering::Relaxed);
-    // No scroll-region to reset and NO `\x1b[2J`: the finished session now lives in real scrollback,
-    // so wiping the viewport would throw the transcript away. Erase the floating footer where it sits,
-    // drop the cursor below it on a fresh line, and show it so the shell prompt continues cleanly.
-    let r = render().lock().unwrap();
-    let max_top = r.rows.saturating_sub(FOOTER) + 1;
-    let raw = FOOTER_TOP.load(Ordering::Relaxed);
-    let top = if raw == 0 { max_top } else { raw.clamp(1, max_top) };
-    let mut buf = String::new();
-    goto(&mut buf, top, 1);
-    buf.push_str("\x1b[0J\x1b[?25h"); // erase footer downward + ensure cursor visible
-    flush(&buf);
-    FOOTER_TOP.store(0, Ordering::Relaxed);
+    retained::stop();
 }
 
 /// Idempotent, lock-free terminal restore for the two paths that must NEVER hang: a panic unwinding
@@ -1626,12 +599,12 @@ pub fn emergency_restore() {
     // Retained backend: leave the alternate screen + show cursor without touching its runtime mutex.
     retained::emergency_restore();
     ACTIVE.store(false, Ordering::Relaxed);
-    // Classic sticky frame: reset scroll region + show cursor. Kept minimal (no full clear) so a
-    // panic message already printed stays visible above the restored prompt.
+    // Belt-and-braces for a terminal a crashed/killed child may have left in an odd state: reset any
+    // DECSTBM scroll region and force the cursor visible. Two escapes, no locks, safe from a panic
+    // hook — a terminal that was never in those modes just ignores them.
     let mut out = std::io::stdout();
     let _ = out.write_all(b"\x1b[r\x1b[?25h");
     let _ = out.flush();
-    FOOTER_TOP.store(0, Ordering::Relaxed);
     restore_stdin_cooked();
 }
 
@@ -1654,74 +627,26 @@ pub fn install_panic_hook() {
 /// Temporarily yield the terminal so a `dialoguer` slash menu can use stdin/redraw normally. The
 /// input thread is already parked (it parks itself right after sending a `Slash`).
 ///
-/// Crucially, ERASE the pinned box first: once the scroll region is reset to full screen, anything
-/// the menu prints scrolls the whole screen — and a box left on those rows scrolls UP into the
-/// transcript as a ghost (the bug where a stale input box stuck in the middle of the history). So we
-/// clear the footer rows, drop the region, and park the cursor where the box was, so the menu
-/// renders at the bottom of the existing transcript and continues it cleanly.
+/// The render thread drops the alternate screen and stops painting, but keeps folding `Command::Emit`
+/// into its block buffer — so output produced *during* the menu survives and [`resume`] redraws it.
 pub fn suspend() {
     if retained::is_running() {
         retained::suspend();
         prepare_dialoguer_session();
-        return;
     }
-    if !active() {
-        return;
-    }
-    prepare_dialoguer_session();
-    ACTIVE.store(false, Ordering::Relaxed);
-    let r = render().lock().unwrap();
-    // Erase the floating footer where it sits and leave the cursor there so the dialoguer menu renders
-    // at the bottom of the existing transcript and continues it cleanly. No region to reset.
-    let max_top = r.rows.saturating_sub(FOOTER) + 1;
-    let raw = FOOTER_TOP.load(Ordering::Relaxed);
-    let top = if raw == 0 { max_top } else { raw.clamp(1, max_top) };
-    let mut buf = String::new();
-    goto(&mut buf, top, 1);
-    erase_below(&mut buf);
-    LAST_PAL.store(0, Ordering::Relaxed);
-    LAST_MODEL_MENU.store(0, Ordering::Relaxed);
-    LAST_SESSIONS_MENU.store(0, Ordering::Relaxed);
-    LAST_TEXT_OVERLAY.store(0, Ordering::Relaxed);
-    flush(&buf);
-    FOOTER_TOP.store(0, Ordering::Relaxed);
 }
 
-/// Re-enter sticky mode after a slash menu. A `dialoguer` menu leaves the physical cursor at an
-/// unpredictable spot (often low, sometimes inside the footer zone). If we saved the output slot
-/// THERE, the next streamed token would land mid-screen and overwrite the transcript — or worse,
-/// collide with the pinned box. So we re-anchor the output slot to the BOTTOM row of the scroll
-/// region: agent output always appends there and scrolls up, exactly like the steady state. The
-/// menu's leftover lines stay above as scrollback (harmless) and scroll away as new output arrives.
+/// Re-enter the retained frame after a slash menu. The render thread re-enters the alternate screen
+/// and repaints from its own block buffer, so the menu's leftover lines are discarded with the old
+/// screen and anything emitted while suspended appears in the transcript.
 pub fn resume(status: &str) {
     {
-        let mut r = render().lock().unwrap();
+        let mut r = render().lock().unwrap_or_else(|e| e.into_inner());
         r.status = status.to_string();
     }
     if retained::is_running() {
         let _ = retained::resume(status);
-        return;
     }
-    if !std::io::stdout().is_terminal() {
-        return;
-    }
-    let mut r = render().lock().unwrap();
-    let (rows, cols) = term_size();
-    r.rows = rows;
-    r.cols = cols;
-    r.status = status.to_string();
-    let mut buf = String::new();
-    // Re-anchor the footer to the bottom (anchor 0 → paint_box uses `rows-FOOTER+1`). The menu's
-    // leftover lines stay above as real scrollback (harmless) and scroll away as new output arrives.
-    // No scroll-region, no saved output slot: the next `emit` re-anchors below its own output.
-    FOOTER_TOP.store(0, Ordering::Relaxed);
-    LAST_PAL.store(0, Ordering::Relaxed);
-    LAST_MODEL_MENU.store(0, Ordering::Relaxed);
-    LAST_SESSIONS_MENU.store(0, Ordering::Relaxed);
-    LAST_TEXT_OVERLAY.store(0, Ordering::Relaxed);
-    paint_box(&mut buf, &r);
-    flush(&buf);
-    ACTIVE.store(true, Ordering::Relaxed);
 }
 
 /// Whether an `emit` capture session is in progress. When set, `emit`/`emit_line` accumulate into
@@ -1733,8 +658,8 @@ fn emit_capture_slot() -> &'static Mutex<Vec<String>> {
     C.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Print agent output into the scroll region above the box, then repaint the box. When the TUI
-/// isn't active this is a plain `print!` so the `chat`/`agent` subcommands are unaffected.
+/// Route agent output to the retained transcript, or to plain stdout when the TUI doesn't own the
+/// screen (the `chat`/`agent` one-shots, pipes, CI).
 ///
 /// **Capture mode**: when [`emit_capture_begin`] has been called, output is accumulated into a
 /// buffer instead of being written to the terminal / transcript. [`emit_capture_take`] drains it.
@@ -1744,7 +669,7 @@ pub fn emit(s: &str) {
         // blank lines (`emit("\n")`) while removing only the line terminator added by `emit_line`.
         if !s.is_empty() {
             let body = s.strip_suffix('\n').unwrap_or(s);
-            let mut cap = emit_capture_slot().lock().unwrap();
+            let mut cap = emit_capture_slot().lock().unwrap_or_else(|e| e.into_inner());
             for line in body.split('\n') {
                 cap.push(line.to_string());
             }
@@ -1755,42 +680,12 @@ pub fn emit(s: &str) {
         // Route to the render thread even while SUSPENDED for a dialoguer menu: it folds this into
         // its block buffer (no paint yet), and `resume` redraws from that buffer. Printing straight
         // to the terminal here would be wiped by resume's clear+redraw (the "/sessions restore shows
-        // nothing" bug).
+        // nothing" bug). This is why emit routes on `is_running()`, NOT `is_active()`.
         retained::emit(s);
         return;
     }
-    if !active() {
-        print!("{s}");
-        let _ = std::io::stdout().flush();
-        return;
-    }
-    let r = render().lock().unwrap();
-    // Floating-footer emit (no scroll-region). Erase the old footer at its anchor, print the output
-    // where the footer's HUD line was so its newlines scroll the terminal NATURALLY — pushing the top
-    // line into REAL scrollback (that's what makes the native scrollbar + mouse selection work) — then
-    // reserve the footer's rows and repaint it just below the new output.
-    let max_top = r.rows.saturating_sub(FOOTER) + 1;
-    let raw = FOOTER_TOP.load(Ordering::Relaxed);
-    let footer_top = if raw == 0 { max_top } else { raw.clamp(1, max_top) };
-    let mut buf = String::new();
-    goto(&mut buf, footer_top, 1);
-    erase_below(&mut buf);
-    buf.push_str(s);
-    // Reserve the FOOTER-1 rows below the fresh output line. When the screen is full these newlines
-    // scroll the terminal (into scrollback) so the footer region is free; when it isn't, they are
-    // blank rows the footer overwrites (no visible gap). This is what forces the scroll BEFORE the
-    // footer is drawn — without it, output landing between `max_top` and the fresh line would be
-    // erased by paint_box's `erase_below`. `emit` is line-buffered + pre-wrapped, so `visual_rows_
-    // advanced` never undercounts the newline rows (it may over-count on an unwrapped wide line, which
-    // only leaves a self-healing gap — never data loss).
-    for _ in 0..FOOTER.saturating_sub(1) {
-        buf.push('\n');
-    }
-    let advanced = visual_rows_advanced(s, r.cols);
-    let new_top = (footer_top as u32 + advanced as u32).min(max_top as u32).max(1) as u16;
-    FOOTER_TOP.store(new_top, Ordering::Relaxed);
-    paint_box(&mut buf, &r); // reads FOOTER_TOP, draws the footer at `new_top`
-    flush(&buf);
+    print!("{s}");
+    let _ = std::io::stdout().flush();
 }
 
 /// `emit` a whole line.
@@ -1929,11 +824,6 @@ pub fn verify_line(cmd: &str, detail: &str) {
 
 /// Set the working flag (drives the box indicator + the input thread's Esc semantics) and repaint.
 /// Always updates the flag even when the TUI is inactive, so the input thread sees it.
-///
-/// NOTE: only [`emit`] may touch the `\x1b7`/`\x1b8` save slot — it owns "the output position". A
-/// box repaint just moves the physical cursor into the box; the next `emit` restores the saved
-/// output position first, so leaving the cursor in the box here is harmless (and overwriting the
-/// shared slot would corrupt where the next streamed token lands).
 pub fn set_working(working: bool) {
     WORKING.store(working, Ordering::Relaxed);
     if !working {
@@ -1941,42 +831,20 @@ pub fn set_working(working: bool) {
         // `disarm_cancel`; clearing here is safe because no turn is active once WORKING is false.
         *active_turn_cancel().lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
-    if retained::is_running() {
-        if working {
-            *work_start_slot().lock().unwrap() = Some(Instant::now());
-            WORK_FRAME.store(0, Ordering::Relaxed);
-            STREAM_CHARS.store(0, Ordering::Relaxed);
-            start_ticker();
-        } else {
-            *work_start_slot().lock().unwrap() = None;
-        }
-        retained::set_working(working);
-        return;
-    }
-    // Reset the elapsed-seconds clock + spinner frame at each task boundary so the counter starts at
-    // 0s and the indicator restarts cleanly. The ticker thread animates it while `working`.
+    // The elapsed clock and spinner frame live in the render thread's `AppState`: `set_working` below
+    // stamps `working_since` and zeroes `frame`, so there is nothing to reset here. What IS local is
+    // the queue depth shown in the prompt placeholder, and the per-turn token counter.
     if working {
-        *work_start_slot().lock().unwrap() = Some(Instant::now());
-        WORK_FRAME.store(0, Ordering::Relaxed);
         STREAM_CHARS.store(0, Ordering::Relaxed); // fresh token counter for this turn
         let d = SUBMISSION_DEPTH.load(Ordering::Relaxed);
-        render().lock().unwrap().queued_count = d;
+        render().lock().unwrap_or_else(|e| e.into_inner()).queued_count = d;
         start_ticker();
     } else {
-        *work_start_slot().lock().unwrap() = None;
-        render().lock().unwrap().queued_count = 0;
+        render().lock().unwrap_or_else(|e| e.into_inner()).queued_count = 0;
     }
-    if !active() {
-        return;
+    if retained::is_running() {
+        retained::set_working(working);
     }
-    let mut r = render().lock().unwrap();
-    // Turn boundary → reconcile a resized/maximised window: width so the box + streamed wrap
-    // (`width()`) track it, height so the footer anchor re-clamps to the new size. paint_box then
-    // redraws the footer at the clamped anchor.
-    let mut buf = String::new();
-    reconcile_geometry(&mut r, &mut buf);
-    paint_box(&mut buf, &r);
-    flush(&buf);
 }
 
 /// Update the status text (model · tokens · yolo) and repaint. (Does not touch the output slot —
@@ -1989,16 +857,7 @@ pub fn set_status(status: &str) {
     }
     if retained::is_running() {
         retained::set_status(status);
-        return;
     }
-    if !active() {
-        return;
-    }
-    let mut r = render().lock().unwrap();
-    let mut buf = String::new();
-    reconcile_geometry(&mut r, &mut buf);
-    paint_box(&mut buf, &r);
-    flush(&buf);
 }
 
 /// Handles to drive the REPL from the background input thread.
@@ -2110,22 +969,15 @@ fn retained_input_snapshot() -> retained::InputSnapshot {
     }
 }
 
-/// Repaint footer + overlays even when only the model menu needs a refresh.
+/// Push the current input/menu state to the render thread, even when only a menu needs a refresh.
+///
+/// The retained backend owns every pixel, so this is a pure state send: the render thread diffs and
+/// paints on its own schedule. A no-op when no session is up (one-shot `agent`/`chat`, pipes, CI) —
+/// those surfaces have no footer to refresh.
 fn repaint_force() {
     if retained::is_running() {
         retained::update_input(retained_input_snapshot());
-        return;
     }
-    if !active() && !model_menu_active() && !sessions_menu_active() && !text_overlay_active() {
-        return;
-    }
-    let mut r = render().lock().unwrap();
-    let mut buf = String::new();
-    if !WORKING.load(Ordering::Relaxed) {
-        reconcile_geometry(&mut r, &mut buf);
-    }
-    paint_box(&mut buf, &r);
-    flush(&buf);
 }
 
 /// Recall the previous history entry into the draft (↑ / Ctrl-P). Shared by the arrow keys and the
@@ -2485,6 +1337,33 @@ fn input_loop(
                         repaint();
                         continue;
                     }
+                    // Alt+Enter (or Ctrl+Enter) = STEER: hand the draft to the RUNNING turn instead of
+                    // the post-turn queue, so "wait, also do X" reaches the agent mid-flight (it folds
+                    // the message in at its next step) instead of waiting for the turn to finish. Two
+                    // chords because Windows Terminal binds Alt+Enter to fullscreen by default and
+                    // swallows it before the app sees it; Ctrl+Enter is the fallback there (and the
+                    // `>` draft prefix below covers terminals that eat both). Idle, or a mailbox that
+                    // refuses (no live turn / backlog full / oversized), falls through to the normal
+                    // Enter path below so the keystroke is never silently swallowed.
+                    if ke.code == KeyCode::Enter
+                        && (ke.modifiers.contains(KeyModifiers::ALT)
+                            || ke.modifiers.contains(KeyModifiers::CONTROL))
+                    {
+                        let line: String = render().lock().unwrap().draft.iter().collect();
+                        if crate::core::steer::push(&line) {
+                            let mut r = render().lock().unwrap();
+                            r.draft.clear();
+                            r.cursor = 0;
+                            r.palette_sel = 0;
+                            drop(r);
+                            if !line.trim().is_empty() {
+                                history.push(line.trim().to_string());
+                            }
+                            hist_idx = None;
+                            repaint();
+                            continue;
+                        }
+                    }
                     // Esc while a selection is active just clears it (does not quit / cancel turn).
                     if ke.code == KeyCode::Esc && selecting.is_some() {
                         selecting = None;
@@ -2618,6 +1497,21 @@ fn input_loop(
                 if !trimmed.is_empty() {
                     history.push(trimmed.clone());
                 }
+                // `>` PREFIX = STEER (third entry point, terminal-independent): plain Enter on
+                // `> also update the README` hands the rest to the running turn. Alt+Enter is the
+                // ergonomic path but some terminals eat it (Windows Terminal binds it to fullscreen),
+                // and Ctrl-S can be swallowed by legacy XON/XOFF flow control — a typed prefix always
+                // arrives. Refusal (idle / backlog full) falls through to the ordinary queue path with
+                // the marker stripped, so the message is delivered either way, never lost.
+                let mut line = line;
+                if let Some(rest) = trimmed.strip_prefix('>').filter(|_| images == 0) {
+                    if crate::core::steer::push(rest) {
+                        continue;
+                    }
+                    // Refused (idle, or the backlog is full) → fall through as an ordinary message
+                    // with the routing character removed, so the model never sees the `>` marker.
+                    line = rest.trim().to_string();
+                }
                 if let Some(cmd) = trimmed.strip_prefix('/').filter(|_| images == 0) {
                     let park = slash_parks_input_thread(cmd);
                     if sub_tx.send(Submission::Slash(cmd.to_string())).is_err() {
@@ -2646,6 +1540,10 @@ fn input_loop(
                 if WORKING.load(Ordering::Relaxed) {
                     request_cancel(); // cooperative: lets a running tool (e.g. a long shell) abort now
                     let _ = cancel_tx.send(()); // and wake the REPL's select! at the next yield point
+                    // Esc means "stop everything" — a steer aimed at the turn being killed is moot, and
+                    // leaving it pending would re-inject it into the NEXT turn out of context (the REPL
+                    // also flushes the submission queue for the same reason).
+                    crate::core::steer::clear();
                 } else if matches!(key, Key::CtrlC | Key::Char('\u{3}')) {
                     // Ctrl-C is THE way to quit the app (Esc no longer exits). Unconditional process
                     // exit — it must not merely clear a draft first, or some Windows terminals kill us
@@ -2866,7 +1764,6 @@ pub fn model_menu_begin() -> Option<oneshot::Receiver<Option<String>>> {
             done_tx: Some(tx),
         };
     }
-    LAST_PAL.store(0, Ordering::Relaxed);
     {
         let mut r = render().lock().unwrap();
         r.model_menu_active = true;
@@ -2939,7 +1836,6 @@ pub fn model_menu_open(
             done_tx: Some(tx),
         };
     }
-    LAST_PAL.store(0, Ordering::Relaxed);
     {
         let mut r = render().lock().unwrap();
         r.model_menu_active = true;
@@ -3006,7 +1902,6 @@ pub fn sessions_menu_open(
             done_tx: Some(tx),
         };
     }
-    LAST_PAL.store(0, Ordering::Relaxed);
     {
         let mut r = render().lock().unwrap();
         r.sessions_menu_active = true;
@@ -3134,7 +2029,6 @@ pub fn text_overlay_open(title: String, lines: Vec<String>) -> Option<oneshot::R
             done_tx: Some(tx),
         };
     }
-    LAST_PAL.store(0, Ordering::Relaxed);
     {
         let mut r = render().lock().unwrap();
         r.text_overlay_active = true;
@@ -3172,16 +2066,12 @@ fn text_overlay_finish() {
         r.text_overlay_title.clear();
         r.text_overlay_lines.clear();
     }
-    // Repaint at the floating anchor: `paint_box` erases the footer downward and its now-inactive
-    // `paint_text_overlay` branch clears the overlay rows it painted above the anchor. The transcript
-    // below/above is genuine terminal scrollback (no mirror to replay); the overlay covered cells that
-    // were already scrolled out of the live viewport, so nothing beneath it is lost.
-    if active() {
-        let r = render().lock().unwrap();
-        let mut buf = String::new();
-        paint_box(&mut buf, &r);
-        flush(&buf);
+    // Drop the overlay from the retained frame. The transcript underneath lives in `AppState.blocks`,
+    // so the render thread repaints it from its own state — nothing to replay from here.
+    if retained::is_running() {
+        retained::close_overlay();
     }
+    repaint_force();
     if let Some(tx) = tx {
         let _ = tx.send(());
     }
@@ -3379,51 +2269,37 @@ fn sessions_menu_handle_key(key: &Key) -> bool {
 }
 
 /// Handle one key while the pure-print text overlay is open. Returns true if consumed.
+///
+/// Scrolling is delegated to the render thread (`Command::Scroll`/`ScrollEnd`), which owns the
+/// overlay's offset and clamps it against the overlay's own visible height at draw time — so a
+/// PageDown past the end snaps back to the last page instead of drifting into empty space. That
+/// removes the need to re-derive the wrapped line count and page height on this thread, which is
+/// also why the row/column geometry no longer has to be mirrored into the shared state.
 fn text_overlay_handle_key(key: &Key) -> bool {
     if !text_overlay_active() {
         return false;
     }
-    let (page, visual_len) = {
-        let r = render().lock().unwrap();
-        let max_above = r.rows.saturating_sub(FOOTER) as usize;
-        let page = max_above.saturating_sub(2).min(TEXT_OVERLAY_MAX.saturating_sub(2)).max(1);
-        let content_w = footer_layout(r.cols as usize).w.saturating_sub(4).max(1);
-        (page, text_overlay_visual_lines(&r.text_overlay_lines, content_w).len())
-    };
-    let move_to = |new_scroll: usize| {
-        let max = visual_len.saturating_sub(page);
-        let scroll = new_scroll.min(max);
-        text_overlay_slot().lock().unwrap().scroll = scroll;
-        render().lock().unwrap().text_overlay_scroll = scroll;
-        repaint();
-    };
+    // Sign convention matches the informational-overlay handler in `input_loop`: a negative delta
+    // pages forward through the overlay body, positive pages back.
     match key {
         Key::ArrowUp | Key::Char('k') | Key::Char('K') => {
-            let current = text_overlay_slot().lock().unwrap().scroll;
-            move_to(current.saturating_sub(1));
+            retained::scroll(1);
             true
         }
         Key::ArrowDown | Key::Char('j') | Key::Char('J') => {
-            let current = text_overlay_slot().lock().unwrap().scroll;
-            move_to(current.saturating_add(1));
+            retained::scroll(-1);
             true
         }
         Key::PageUp => {
-            let current = text_overlay_slot().lock().unwrap().scroll;
-            move_to(current.saturating_sub(page));
+            retained::scroll(8);
             true
         }
         Key::PageDown => {
-            let current = text_overlay_slot().lock().unwrap().scroll;
-            move_to(current.saturating_add(page));
+            retained::scroll(-8);
             true
         }
-        Key::Home => {
-            move_to(0);
-            true
-        }
-        Key::End => {
-            move_to(visual_len.saturating_sub(page));
+        Key::Home | Key::End => {
+            retained::scroll_end();
             true
         }
         Key::Escape | Key::Char('q') | Key::Char('Q') | Key::Char('\u{3}') | Key::Char('\u{4}') | Key::CtrlC => {
@@ -3693,12 +2569,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn imgtag_len_matches_render() {
-        assert_eq!(imgtag_visible_len(0), 0);
-        assert_eq!(imgtag_visible_len(3), "[3img] ".chars().count());
-    }
-
-    #[test]
     fn health_kind_labels_and_colours_are_stable() {
         // Idle chip copy + palette must stay distinct so green/yellow/red keep meaning.
         assert_eq!(HealthKind::Ok.label(false), "ready");
@@ -3710,10 +2580,6 @@ mod tests {
         assert_eq!(HealthKind::Unstable.color_code(), theme::WARN);
         assert_eq!(HealthKind::Down.color_code(), theme::ERR);
         assert_eq!(HealthKind::Unknown.color_code(), theme::MUTED);
-        // Round-trip through the atomic encoding.
-        for h in [HealthKind::Ok, HealthKind::Unstable, HealthKind::Down, HealthKind::Unknown] {
-            assert_eq!(HealthKind::from_u8(h as u8), h);
-        }
     }
 
     #[test]
@@ -3725,16 +2591,6 @@ mod tests {
         assert!(ask_approval("⚙ file_edit x — approve?"), "allow-all short-circuits to true");
         reset_session_allow();
         assert!(!session_allow_all(), "reset clears it");
-    }
-
-    #[test]
-    fn elapsed_counter_is_zero_when_idle_and_frames_are_single_cell() {
-        *work_start_slot().lock().unwrap() = None;
-        assert_eq!(work_elapsed_secs(), 0, "no task started → 0s");
-        // every star frame must measure as one cell so the right-edge pill stays aligned
-        for f in STAR {
-            assert_eq!(measure_text_width(f), 1, "{f:?} must be a single cell");
-        }
     }
 
     #[test]
@@ -3755,79 +2611,6 @@ mod tests {
     }
 
     #[test]
-    fn paint_box_has_sandwich_rules_and_prompt() {
-        // Structure-only (no WORKING assertion: that atomic is shared + mutated by sibling tests in
-        // parallel, so the work-pill text is racy — the sandwich shape is what this guards).
-        let r = Render {
-            cols: 40,
-            rows: 24,
-            draft: "hello world".chars().collect(),
-            cursor: 11,
-            images: 0,
-            status: "model · 1K tok".into(),
-            palette_sel: 0,
-            model_menu_active: false,
-            model_menu_sel: 0,
-            model_menu_rows: Vec::new(),
-            sessions_menu_active: false,
-            sessions_menu_sel: 0,
-            sessions_menu_rows: Vec::new(),
-            sessions_menu_deletable_rows: 0,
-            text_overlay_active: false,
-            text_overlay_scroll: 0,
-            text_overlay_title: String::new(),
-            text_overlay_lines: Vec::new(),
-            queued_count: 0,
-        };
-        let mut buf = String::new();
-        paint_box(&mut buf, &r);
-        assert!(buf.contains('❯'), "has the moonlit prompt");
-        // Sandwich style: horizontal rules on top and bottom (the `─` character appears),
-        // but NO side borders (no `│`, `╭`, `╮`, `╰`, `╯`).
-        assert!(buf.contains('─'), "has the horizontal rules");
-        assert!(!buf.contains('│'), "no side borders");
-        assert!(!buf.contains('╭') && !buf.contains('╮'), "no rounded corners");
-        assert!(!buf.contains('╰') && !buf.contains('╯'), "no bottom corners");
-    }
-
-    #[test]
-    fn ctx_meter_fills_proportionally_and_reports_percent() {
-        // Empty session → no filled cells; the percent reads 0.
-        let empty = ctx_meter(0, false);
-        assert_eq!(empty.matches('▓').count(), 0, "0‰ → no filled cells");
-        assert_eq!(empty.matches('░').count(), CTX_BAR_CELLS, "0‰ → all empty cells");
-        assert!(empty.contains("0%"));
-        // Half full → about half the cells filled, and "50%".
-        let half = ctx_meter(500, false);
-        assert_eq!(half.matches('▓').count(), CTX_BAR_CELLS / 2, "500‰ → half filled");
-        assert!(half.contains("50%"));
-        // Full → every cell filled, "100%".
-        let full = ctx_meter(1000, false);
-        assert_eq!(full.matches('▓').count(), CTX_BAR_CELLS, "1000‰ → all filled");
-        assert!(full.contains("100%"));
-        // A non-zero-but-tiny fill still lights at least one cell (div_ceil), so progress is visible.
-        assert_eq!(ctx_meter(1, false).matches('▓').count(), 1, "any non-zero fill shows ≥1 cell");
-        // Compact bar uses fewer cells.
-        assert_eq!(ctx_meter(1000, true).matches('▓').count(), CTX_BAR_CELLS_COMPACT);
-    }
-
-    #[test]
-    fn ctx_meter_width_matches_rendered_visible_width() {
-        // The reserved width must equal the de-styled visible width for every fill, so paint_box's
-        // right-alignment math is exact (an off-by-one here wraps the HUD → the footer "doubles").
-        for pm in [0u16, 1, 99, 100, 500, 999, 1000] {
-            for compact in [false, true] {
-                let rendered = ctx_meter(pm, compact);
-                assert_eq!(
-                    measure_text_width(&rendered),
-                    ctx_meter_width(pm, compact),
-                    "meter width mismatch at {pm}‰ compact={compact}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn work_verb_rotation_advances_and_wraps() {
         // Successive pulls walk the VERBS list (modulo the shared cursor other tests may have bumped).
         let base = VERB_CURSOR.load(Ordering::Relaxed);
@@ -3835,181 +2618,6 @@ mod tests {
         let b = VERBS[(base + 1) % VERBS.len()];
         assert_eq!(next_work_verb(), a);
         assert_eq!(next_work_verb(), b);
-    }
-
-    #[test]
-    fn thinking_line_animates_and_keeps_the_verb_intact() {
-        // Pin a known verb, then render several frames. The word's letters must all survive every
-        // frame (the shimmer only re-colours them, never drops any), and successive frames must
-        // differ (the crest sweeps) so the line actually animates.
-        next_work_verb();
-        let verb = current_verb();
-        let stripped = |f: usize| console::strip_ansi_codes(&shimmer_verb(f)).to_string();
-        // Every rendered frame contains the whole verb (letters may be individually styled).
-        for f in 0..12 {
-            let vis = stripped(f);
-            assert!(
-                vis.contains(verb),
-                "frame {f} dropped the verb: {vis:?} (want {verb:?})"
-            );
-        }
-        // The shimmer moves: at least two of the first several frames must render differently.
-        let frames: Vec<String> = (0..8).map(|f| shimmer_verb(f)).collect();
-        assert!(
-            frames.iter().any(|f| f != &frames[0]),
-            "thinking line never changed across frames — no animation"
-        );
-    }
-
-    #[test]
-    fn style_hud_preserves_every_chip_and_separator() {
-        // The HUD text must survive styling verbatim (colours may be stripped under the test harness,
-        // but the glyphs/labels always remain) — persona + mode chips coexist without one clobbering
-        // the other, and the "  ·  " separators are kept so the row reads the same shape.
-        let hud = "gpt-model  ·  🎭 Sherlock  ·  ✦ ultimate";
-        let out = style_hud(hud);
-        assert!(out.contains("gpt-model"), "model label kept");
-        assert!(out.contains("🎭 Sherlock"), "persona chip kept");
-        assert!(out.contains("✦ ultimate"), "mode chip kept alongside persona");
-        assert_eq!(out.matches('·').count(), 2, "both separators kept");
-        // A plain status (no chips) is passed through unchanged in content.
-        assert!(style_hud("just-a-model").contains("just-a-model"));
-    }
-
-    /// The caret must land at the text insertion point: on a narrow terminal (cols < 64) there's no
-    /// inset, so prefix `❯ ` is 2 cells → text at col 3, and N typed chars push it to col 3+N.
-    /// On wider terminals the inset shifts everything right. Guards the off-by-one that stranded the
-    /// caret one cell left (looked stuck at the start).
-    #[test]
-    fn caret_lands_at_text_insertion_point() {
-        // Extract the column of the LAST cursor-move (`ESC[row;colH`) paint_box emits.
-        fn last_goto_col(buf: &str) -> usize {
-            let i = buf.rfind('\x1b').unwrap();
-            let esc = &buf[i + 2..]; // skip "\x1b["
-            let h = esc.find('H').unwrap();
-            esc[..h].split(';').nth(1).unwrap().parse().unwrap()
-        }
-        let mk = |draft: &str, cursor: usize| Render {
-            cols: 40,
-            rows: 24,
-            draft: draft.chars().collect(),
-            cursor,
-            images: 0,
-            status: "m".into(),
-            palette_sel: 0,
-            model_menu_active: false,
-            model_menu_sel: 0,
-            model_menu_rows: Vec::new(),
-            sessions_menu_active: false,
-            sessions_menu_sel: 0,
-            sessions_menu_rows: Vec::new(),
-            sessions_menu_deletable_rows: 0,
-            text_overlay_active: false,
-            text_overlay_scroll: 0,
-            text_overlay_title: String::new(),
-            text_overlay_lines: Vec::new(),
-            queued_count: 0,
-        };
-        let mut buf = String::new();
-        paint_box(&mut buf, &mk("", 0));
-        assert_eq!(last_goto_col(&buf), 3, "empty draft → caret at text start (col 3)");
-
-        buf.clear();
-        paint_box(&mut buf, &mk("hello", 5));
-        assert_eq!(last_goto_col(&buf), 8, "caret after 5 chars → col 8");
-
-        // Wide glyphs (CJK) are 2 cells each → the caret offset must be in CELLS, not chars.
-        buf.clear();
-        paint_box(&mut buf, &mk("你好", 2));
-        assert_eq!(last_goto_col(&buf), 7, "2 CJK chars = 4 cells → caret at col 3+4=7");
-    }
-
-    #[test]
-    fn multiline_draft_collapses_to_a_paste_chip() {
-        // A multi-line draft (a paste) must render as ONE collapsed chip — line count + a peek — not
-        // the raw lines crammed into the box. The full text is still what gets submitted.
-        WORKING.store(false, Ordering::Relaxed);
-        FOOTER_TOP.store(0, Ordering::Relaxed); // bottom-glued fallback → top = rows-FOOTER+1 = 21
-        let draft = "Trả lời tự nhiên\nKhông nhắc là AI\nCó thể pha trò\ndòng bốn\ndòng năm";
-        let r = Render {
-            cols: 60,
-            rows: 24,
-            draft: draft.chars().collect(),
-            cursor: draft.chars().count(),
-            images: 0,
-            status: "m".into(),
-            palette_sel: 0,
-            model_menu_active: false,
-            model_menu_sel: 0,
-            model_menu_rows: Vec::new(),
-            sessions_menu_active: false,
-            sessions_menu_sel: 0,
-            sessions_menu_rows: Vec::new(),
-            sessions_menu_deletable_rows: 0,
-            text_overlay_active: false,
-            text_overlay_scroll: 0,
-            text_overlay_title: String::new(),
-            text_overlay_lines: Vec::new(),
-            queued_count: 0,
-        };
-        let mut buf = String::new();
-        paint_box(&mut buf, &r);
-        assert!(buf.contains("5 lines pasted"), "chip shows the line count");
-        assert!(!buf.contains("Không nhắc là AI"), "interior lines are collapsed, not shown raw");
-        // The collapsed prompt row must still fit the width (no wrap).
-        let top = r.rows - FOOTER + 1;
-        let start = buf.find(&format!("\x1b[{};1H", top + 2)).unwrap();
-        let rest = &buf[start..];
-        let end = rest[1..].find('\x1b').map(|i| start + 1 + i).unwrap_or(buf.len());
-        assert!(measure_text_width(&buf[start..end]) <= 60, "collapsed row fits the box width");
-    }
-
-    #[test]
-    fn truncate_to_width_bounds_and_ellipsises() {
-        assert_eq!(truncate_to_width("hello", 10), "hello", "fits → untouched");
-        assert_eq!(truncate_to_width("hello", 5), "hello", "exact fit → untouched");
-        let t = truncate_to_width("hello world", 5);
-        assert!(measure_text_width(&t) <= 5, "never exceeds the budget");
-        assert!(t.ends_with('…'), "overflow gets an ellipsis");
-        assert_eq!(truncate_to_width("anything", 0), "", "zero budget → empty");
-    }
-
-    #[test]
-    fn status_line_never_exceeds_box_width() {
-        // A very long status on a narrow box must be truncated so the line can't wrap (wrap doubles
-        // the footer). Check the painted status row stays within `cols`.
-        WORKING.store(false, Ordering::Relaxed);
-        FOOTER_TOP.store(0, Ordering::Relaxed); // bottom-glued fallback → top = rows-FOOTER+1 = 21
-        let r = Render {
-            cols: 30,
-            rows: 24,
-            draft: Vec::new(),
-            cursor: 0,
-            images: 0,
-            status: "opus-4-8  ·  ~1.0K/200K tok  ·  9 turns  ·  42% ctx  ·  ⚡ yolo".into(),
-            palette_sel: 0,
-            model_menu_active: false,
-            model_menu_sel: 0,
-            model_menu_rows: Vec::new(),
-            sessions_menu_active: false,
-            sessions_menu_sel: 0,
-            sessions_menu_rows: Vec::new(),
-            sessions_menu_deletable_rows: 0,
-            text_overlay_active: false,
-            text_overlay_scroll: 0,
-            text_overlay_title: String::new(),
-            text_overlay_lines: Vec::new(),
-            queued_count: 0,
-        };
-        let mut buf = String::new();
-        paint_box(&mut buf, &r);
-        // The HUD sits on the 1st footer row (above the sandwich). Slice it out by its two bracketing
-        // cursor-moves (HUD row → top rule row).
-        let top = r.rows - FOOTER + 1;
-        let start = buf.find(&format!("\x1b[{};1H", top)).unwrap();
-        let end = buf.find(&format!("\x1b[{};1H", top + 1)).unwrap();
-        let row = &buf[start..end];
-        assert!(measure_text_width(row) <= 30, "HUD row fits the width (no wrap)");
     }
 
     #[test]
@@ -4097,46 +2705,6 @@ mod tests {
     }
 
     #[test]
-    fn footer_layout_responsive_inset_and_compact() {
-        // Narrow terminal (< 52): no inset, narrow mode.
-        let n = footer_layout(40);
-        assert_eq!(n.inset, 0);
-        assert!(n.narrow);
-        assert!(n.compact);
-        // Medium terminal (64-99): 1-cell inset, compact mode.
-        let m = footer_layout(80);
-        assert_eq!(m.inset, 1);
-        assert!(!m.narrow);
-        assert!(!m.compact); // 80 >= 72
-        // Wide terminal (>= 100): 2-cell inset.
-        let w = footer_layout(120);
-        assert_eq!(w.inset, 2);
-        assert!(!w.narrow);
-        assert!(!w.compact);
-        // Inner tracks inset: wider pane has less inner than raw (inset steals both sides).
-        assert!(w.inner < 120 - 3);
-    }
-
-    #[test]
-    fn idle_placeholder_adapts_to_width() {
-        let n = footer_layout(40);
-        let narrow_ph = idle_placeholder(&n, 0);
-        assert!(narrow_ph.contains("Esc"));
-        assert!(!narrow_ph.contains("commands")); // too verbose for narrow
-        let w = footer_layout(80);
-        let wide_ph = idle_placeholder(&w, 0);
-        assert!(wide_ph.contains("commands"));
-        assert!(wide_ph.len() > narrow_ph.len());
-    }
-
-    #[test]
-    fn text_overlay_wraps_unicode_by_display_width() {
-        assert_eq!(text_overlay_wrap_line("abcdef", 3), vec!["abc", "def"]);
-        assert_eq!(text_overlay_wrap_line("你好ab", 4), vec!["你好", "ab"]);
-        assert_eq!(text_overlay_wrap_line("", 10), vec![""]);
-    }
-
-    #[test]
     fn slash_parking_only_claims_direct_stdin_owners() {
         assert!(slash_parks_input_thread("config"));
         assert!(slash_parks_input_thread("sessions"));
@@ -4152,39 +2720,4 @@ mod tests {
         assert!(!slash_parks_input_thread("custom-command arg"));
     }
 
-    #[test]
-    fn caret_offset_with_inset_on_wide_terminal() {
-        // On a wide terminal (cols >= 100, inset = 2) the caret should be offset by the inset.
-        fn last_goto_col(buf: &str) -> usize {
-            let i = buf.rfind('\x1b').unwrap();
-            let esc = &buf[i + 2..];
-            let h = esc.find('H').unwrap();
-            esc[..h].split(';').nth(1).unwrap().parse().unwrap()
-        }
-        let r = Render {
-            cols: 120,
-            rows: 24,
-            draft: "hi".chars().collect(),
-            cursor: 2,
-            images: 0,
-            status: "m".into(),
-            palette_sel: 0,
-            model_menu_active: false,
-            model_menu_sel: 0,
-            model_menu_rows: Vec::new(),
-            sessions_menu_active: false,
-            sessions_menu_sel: 0,
-            sessions_menu_rows: Vec::new(),
-            sessions_menu_deletable_rows: 0,
-            text_overlay_active: false,
-            text_overlay_scroll: 0,
-            text_overlay_title: String::new(),
-            text_overlay_lines: Vec::new(),
-            queued_count: 0,
-        };
-        let mut buf = String::new();
-        paint_box(&mut buf, &r);
-        // inset=2, "❯ hi" → col = 2 + 2 + 2 + 1 = 7
-        assert_eq!(last_goto_col(&buf), 7, "wide terminal inset shifts the caret");
-    }
 }

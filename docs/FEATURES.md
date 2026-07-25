@@ -258,10 +258,10 @@ Internal quality gates (useful for a "trust/quality" docs section, not end-user 
 
 ## 4. The interactive TUI (detailed — primary UI surface)
 
-A **retained full-frame REPL** is preferred on an interactive TTY: one render thread owns the terminal,
+A **retained full-frame REPL** is the interactive surface on a TTY: one render thread owns the terminal,
 the input thread only emits events, transcript blocks are re-rendered from state, and resize never
-replays terminal cells. `tui_mode=auto|retained|classic` keeps the former sticky ANSI UI as an instant
-rollback and plain/non-TTY output stays raw. The input/footer remains pinned at the bottom with a HUD;
+replays terminal cells. It is the only interactive backend — if it can't come up (no TTY, or entering
+the alternate screen fails) aizen runs the plain line-REPL instead. The input/footer is pinned at the bottom with a HUD;
 PageUp/PageDown enter manual scroll and End/Home returns to live tail — and when an informational
 overlay is open those keys scroll the overlay's own content (clamped to its last page), not the
 transcript behind it. An idle resize is detected on the render thread and repaints without a keystroke.

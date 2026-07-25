@@ -454,6 +454,25 @@ enum TimeCmd {
         /// Checkpoint id (from `ng time list`).
         id: u32,
     },
+    /// Show what changed between two points in time (checkpoint ids, or `working` for the live tree).
+    ///
+    /// With one argument, diffs that checkpoint against the working tree — "what have I changed
+    /// since #5". With two, diffs the pair. Stat-only by default; `--patch` prints the hunks.
+    Diff {
+        /// From: a checkpoint id, or `working`. Defaults to the active checkpoint.
+        from: Option<String>,
+        /// To: a checkpoint id, or `working` (the default).
+        to: Option<String>,
+        /// Print the unified patch, not just the per-file stat.
+        #[arg(short, long)]
+        patch: bool,
+        /// Limit the diff to these paths.
+        #[arg(long = "path", value_name = "PATH")]
+        paths: Vec<String>,
+        /// Emit a machine-readable JSON report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Step one checkpoint back.
     Undo,
     /// Step one checkpoint forward.
@@ -558,9 +577,6 @@ enum ConfigCmd {
         /// Final-answer visuals: `auto` (when useful), `always` (substantial replies), or `off`.
         #[arg(long)]
         response_visuals: Option<String>,
-        /// Interactive terminal backend: `auto`, `retained`, or `classic`.
-        #[arg(long)]
-        tui_mode: Option<String>,
         /// Time-machine checkpoints to keep (oldest auto-pruned past this; `0` = unlimited). Default 50.
         #[arg(long)]
         timemachine_keep: Option<usize>,
@@ -1677,6 +1693,7 @@ fn run_time(cmd: TimeCmd) -> Result<()> {
             println!("{}", style("  files only — your conversation is untouched · reversible with `aizen time redo`").dim());
             Ok(())
         }
+        TimeCmd::Diff { from, to, patch, paths, json } => run_time_diff(from, to, paths, patch, json),
         TimeCmd::Undo => {
             let snap = timemachine::undo()?;
             println!("{} #{}", style("⏪ undo →").color256(splash::ACCENT), snap.id);
@@ -1732,6 +1749,112 @@ fn run_time(cmd: TimeCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Resolve the `[FROM] [TO]` positional pair into two timeline sides.
+///
+/// The defaults encode the question people actually ask. Bare `time diff` means "what have I changed
+/// since the last checkpoint" (cursor → working tree), which is the state you want before deciding
+/// whether to keep or rewind. One argument means "since THAT point" (given → working tree), because
+/// naming a single checkpoint and getting a checkpoint↔checkpoint diff against an unnamed second
+/// point would be guesswork.
+fn resolve_diff_sides(
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<(timemachine::DiffSide, timemachine::DiffSide)> {
+    use timemachine::DiffSide;
+    let parse = |s: &str| {
+        DiffSide::parse(s).with_context(|| {
+            format!("`{s}` is not a checkpoint id or `working` (try `aizen time list`)")
+        })
+    };
+    match (from, to) {
+        (None, _) => {
+            let (snaps, cursor) = timemachine::timeline()?;
+            let cur = cursor
+                .and_then(|i| snaps.get(i))
+                .map(|s| s.id)
+                .context("no checkpoints yet — nothing to diff against (`aizen time save` first)")?;
+            Ok((DiffSide::Checkpoint(cur), DiffSide::Working))
+        }
+        (Some(f), None) => Ok((parse(f)?, DiffSide::Working)),
+        (Some(f), Some(t)) => Ok((parse(f)?, parse(t)?)),
+    }
+}
+
+/// Render a diff report as display lines. Shared so `aizen time diff` (stdout) and `/diff` (the TUI,
+/// which MUST go through `tui::emit_line` or the render thread wipes the output) format identically.
+/// `narrow_hint` differs between the two because the flag spelling does: `--path p` vs `-- p`.
+fn diff_lines(report: &timemachine::DiffReport, narrow_hint: &str) -> Vec<String> {
+    if report.is_empty() {
+        return vec![style(format!("⎇ no changes between {} and {}", report.from, report.to))
+            .dim()
+            .to_string()];
+    }
+    let mut out = vec![format!(
+        "{}  {} → {}  ·  {} file(s), {}",
+        style("⎇ diff").color256(splash::ACCENT).bold(),
+        report.from,
+        report.to,
+        report.files.len(),
+        style(format!("+{} -{}", report.total_added(), report.total_deleted())).dim(),
+    )];
+    for f in &report.files {
+        // `None` counts mean git reported `-`: a binary file, not a zero-line change.
+        let churn = match (f.added, f.deleted) {
+            (Some(a), Some(d)) => format!("+{a} -{d}"),
+            _ => "binary".to_string(),
+        };
+        let path = match &f.old_path {
+            Some(old) => format!("{old} → {}", f.path),
+            None => f.path.clone(),
+        };
+        out.push(format!("  {} {path}  {}", f.status, style(churn).dim()));
+    }
+    match &report.patch {
+        Some(text) => {
+            out.push(String::new());
+            out.extend(text.lines().map(|l| l.to_string()));
+            if report.patch_truncated {
+                out.push(style(format!("… patch truncated — narrow it with {narrow_hint}")).dim().to_string());
+            }
+        }
+        None => out.push(style(format!("  --patch for the full text · {narrow_hint} to narrow it")).dim().to_string()),
+    }
+    out
+}
+
+/// `aizen time diff` — print the changes between two points in the timeline.
+fn run_time_diff(
+    from: Option<String>,
+    to: Option<String>,
+    paths: Vec<String>,
+    patch: bool,
+    json: bool,
+) -> Result<()> {
+    let report = build_time_diff(from, to, paths, patch)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    for line in diff_lines(&report, "--path <p>") {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Cap on emitted patch bytes. Generous enough for a real review, bounded so a huge rewrite cannot
+/// flood the terminal (or, for the agent tool, the tool-result budget).
+const DIFF_PATCH_LIMIT: usize = 400 * 1024;
+
+fn build_time_diff(
+    from: Option<String>,
+    to: Option<String>,
+    paths: Vec<String>,
+    patch: bool,
+) -> Result<timemachine::DiffReport> {
+    let (a, b) = resolve_diff_sides(from.as_deref(), to.as_deref())?;
+    timemachine::diff(&a, &b, &paths, patch.then_some(DIFF_PATCH_LIMIT))
 }
 
 /// Human "2m ago" from a snapshot's stored LOCAL timestamp. Pure core (`rel_time_from`) takes `now`
@@ -3453,11 +3576,11 @@ async fn first_run_onboarding() {
 /// The HUD line, per the mockup: `model  ·  ~<used>/<max> tok  ·  <n> turns  ·  <mode>` with an
 /// optional persona / todo / agents chip. The raw token + turn counts are back on the row (the
 /// mockup shows them); the graphical context meter is still fed via `tui::set_ctx_permille` and the
-/// mode/persona chips are tinted by the footer's `style_hud` pass.
+/// retained backend's footer tints the mode/persona chips as it draws the row.
 fn status_text(history: &[Message], model: &str) -> String {
     let toks = session_tokens(history);
     let (window, _) = resolve_ctx_window(model);
-    // Feed the graphical context meter (per-mille for sub-1% resolution); paint_box draws the bar.
+    // Feed the graphical context meter (per-mille for sub-1% resolution); the footer draws the bar.
     let permille = (toks as f64 / window as f64 * 1000.0).round().clamp(0.0, 1000.0) as u16;
     tui::set_ctx_permille(permille);
     // One "turn" = one user message that opened an exchange (system prompt at [0] is not a turn).
@@ -3475,7 +3598,7 @@ fn status_text(history: &[Message], model: &str) -> String {
         ""
     };
     // Active persona chip — so it's always visible WHICH character aizen is role-playing (not just a
-    // one-off "now playing" line that scrolls away). `🎭 Name`, styled by paint_box's chip pass.
+    // one-off "now playing" line that scrolls away). `🎭 Name`, styled by the footer's chip pass.
     let persona = cli_config::load()
         .persona
         .map(|p| format!("  ·  🎭 {p}"))
@@ -3531,16 +3654,20 @@ async fn run_menu_sticky() -> Result<()> {
     rebuild_system(&mut history, &model_label);
     let repo_scope = crate::core::recovery::current_repo_scope();
 
-    // Text-only splash: `activate` may pick the retained backend, whose alt-screen renderer sanitizes
-    // CSI but would pass a raw sixel DCS image through as garbage. Braille sun → pure printable text,
-    // safe for both backends. Classic-only sixel isn't worth a backend-conditional intro string.
+    // Text-only splash: the retained alt-screen renderer sanitizes CSI and would pass a raw sixel DCS
+    // image through as garbage, so the intro is a Braille sun → pure printable text.
     let intro = format!(
         "{}\n{}",
         splash::render_text_only(),
         style("Type to talk — messages queue while it works · Esc cancels a running turn · /help · /quit")
             .dim()
     );
-    tui::activate(&intro, &status_text(&history, &model_label));
+    // The retained backend is the only interactive surface. If it can't take the terminal (alt-screen
+    // refused), there is no second renderer to degrade into — hand off to the plain line-REPL rather
+    // than run this loop headless, which would queue keystrokes against a UI that never painted.
+    if !tui::activate(&intro, &status_text(&history, &model_label)) {
+        return run_menu_plain().await;
+    }
     install_exit_flush_handler(); // flush the live chat if the terminal window is closed (Windows ✕)
     crate::core::recovery::begin(repo_scope.clone(), current_session_slug());
     if let Some(offer) = crate::core::recovery::scan_stale(&repo_scope).into_iter().next() {
@@ -3711,10 +3838,17 @@ async fn run_menu_sticky() -> Result<()> {
                     // Goal mode (set by `/goal <text>`): threads the live goal into this turn so the
                     // loop runs cap-free with smart retry until the goal is declared + verified.
                     goal: crate::agent::goal::current_goal(),
+                    // Only the interactive top-level turn reads the steering mailbox — a course
+                    // correction the user typed is aimed at THIS task, not at whatever a delegated
+                    // sub-agent happens to be doing (children keep the `false` default).
+                    enable_steering: true,
                     ..AgentConfig::default()
                 };
 
                 tui::arm_cancel(turn_cancel.clone());
+                // Open the steering mailbox for this turn: Alt+Enter now hands a message to the RUNNING
+                // loop (folded in at its next step) instead of the post-turn queue.
+                crate::core::steer::arm();
                 while input.cancel.try_recv().is_ok() {} // drain any stale wake-up
                 // A quiet "here we go" line: the whimsical working verb ("✦ Pondering…") prints ONCE
                 // into the scrolling transcript at turn start, so each run opens on a fresh word —
@@ -3801,6 +3935,14 @@ async fn run_menu_sticky() -> Result<()> {
                 };
                 tui::set_working(false);
                 tui::disarm_cancel(&turn_cancel);
+                // Close the steering mailbox. Anything typed in the last instants of the turn (after
+                // the loop's final drain) comes back here rather than vanishing — re-inject it as an
+                // ordinary submission so it runs as the next turn. On Esc the `None` arm below flushes
+                // the queue, which is the right call there: stop means stop.
+                for leftover in crate::core::steer::disarm() {
+                    let _ = input.inject.send(tui::Submission::Chat(leftover, Vec::new()));
+                    tui::note_submission_enqueued();
+                }
                 crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::Finalizing);
                 // Disarm the per-turn effort override the moment the turn ends — every branch below
                 // (ok / clarify / interrupt / error) flows through here, so effort never leaks into
@@ -5069,7 +5211,15 @@ fn preprocess_input(line: &str) -> InputPre {
 /// Run a user-typed `!cmd` shell escape in the working dir, capturing stdout+stderr (lossy-decode +
 /// `chcp 65001` like `shell_run` so non-English Windows output isn't dropped), capped for display.
 fn run_shell_escape(command: &str) -> String {
-    use std::process::{Command, Stdio};
+    use std::process::Command;
+    use std::time::Duration;
+    /// A `!cmd` escape runs on the REPL's own thread, so an unbounded wait freezes the entire UI —
+    /// not one tool call. `Command::output()` has no deadline (it waits for pipe EOF, which a
+    /// grandchild outliving its wrapper never delivers), so this goes through the bounded helper.
+    /// Generous, because the user typed this command deliberately and is watching it.
+    const ESCAPE_TIMEOUT: Duration = Duration::from_secs(120);
+    const ESCAPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(format!("chcp 65001>nul & {command}"));
@@ -5079,16 +5229,17 @@ fn run_shell_escape(command: &str) -> String {
         c.arg("-c").arg(command);
         c
     };
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    match cmd.output() {
+    match core::proctree::output_bounded(&mut cmd, ESCAPE_TIMEOUT, ESCAPE_DRAIN_GRACE) {
         Ok(o) => {
-            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
-            let err = String::from_utf8_lossy(&o.stderr);
-            if !err.trim().is_empty() {
+            let mut s = o.stdout;
+            if !o.stderr.trim().is_empty() {
                 if !s.is_empty() && !s.ends_with('\n') {
                     s.push('\n');
                 }
-                s.push_str(&err);
+                s.push_str(&o.stderr);
+            }
+            if o.output_truncated {
+                s.push_str("\n…[output cut: a surviving child process still held the pipe]");
             }
             let s = s.trim_end().to_string();
             let s = if s.chars().count() > SHELL_ESCAPE_CAP {
@@ -5097,8 +5248,16 @@ fn run_shell_escape(command: &str) -> String {
             } else {
                 s
             };
+            if o.timed_out {
+                return format!(
+                    "[timed out after {}s — killed the whole process tree]\n{s}",
+                    ESCAPE_TIMEOUT.as_secs()
+                )
+                .trim_end()
+                .to_string();
+            }
             if s.is_empty() {
-                format!("(exit {}, no output)", o.status.code().unwrap_or(-1))
+                format!("(exit {}, no output)", o.code.unwrap_or(-1))
             } else {
                 s
             }
@@ -6002,6 +6161,34 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             )),
             Err(e) => tui::emit_line(&style(format!("checkpoint: {e}")).color256(crate::ui::theme::WARN).to_string()),
         },
+        // `/diff` — see what changed before deciding to rewind. Argument forms mirror the CLI:
+        // bare = active checkpoint vs disk, `#5` = that checkpoint vs disk, `#1 #2` = the pair.
+        // `-p`/`--patch` anywhere switches from stat to hunks; anything after `--` narrows to paths.
+        "diff" | "changes" => {
+            let mut sides: Vec<String> = Vec::new();
+            let mut paths: Vec<String> = Vec::new();
+            let mut patch = false;
+            let mut after_sep = false;
+            for tok in arg.split_whitespace() {
+                match tok {
+                    "--" => after_sep = true,
+                    "-p" | "--patch" => patch = true,
+                    _ if after_sep => paths.push(tok.to_string()),
+                    _ => sides.push(tok.to_string()),
+                }
+            }
+            let (from, to) = (sides.first().cloned(), sides.get(1).cloned());
+            match build_time_diff(from, to, paths, patch) {
+                // Must go through `emit_line`: raw `println!` from inside the REPL is wiped by the
+                // retained render thread's next repaint.
+                Ok(report) => {
+                    for line in diff_lines(&report, "-- <path>") {
+                        tui::emit_line(&line);
+                    }
+                }
+                Err(e) => tui::emit_line(&style(format!("diff: {e}")).color256(crate::ui::theme::WARN).to_string()),
+            }
+        }
         "undo" => match timemachine::undo() {
             Ok(s) => tui::emit_line(&format!("{} checkpoint #{}", style("⏪ rewound to").color256(splash::ACCENT), s.id)),
             Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::ui::theme::WARN).to_string()),
@@ -6578,7 +6765,7 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
         None => return config_wizard().await, // bare `ng config` → interactive setup
     };
     match cmd {
-        ConfigCmd::Set { base_url, api_key, model, context_window, compact_threshold, auto_skill_learn, memory_auto_learn, persona_evolve, price_in, price_out, icons, response_visuals, tui_mode, timemachine_keep, timemachine_max_files, timemachine_max_bytes, timemachine_max_file_bytes, auto_effort, reasoning_effort, approval, ultimate, adaptive_effort, disabled_toolsets, enabled_toolsets, subagent_model, subagent_base_url, subagent_api_key_ref, model_endpoint } => {
+        ConfigCmd::Set { base_url, api_key, model, context_window, compact_threshold, auto_skill_learn, memory_auto_learn, persona_evolve, price_in, price_out, icons, response_visuals, timemachine_keep, timemachine_max_files, timemachine_max_bytes, timemachine_max_file_bytes, auto_effort, reasoning_effort, approval, ultimate, adaptive_effort, disabled_toolsets, enabled_toolsets, subagent_model, subagent_base_url, subagent_api_key_ref, model_endpoint } => {
             if base_url.is_none()
                 && api_key.is_none()
                 && model.is_none()
@@ -6591,7 +6778,6 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                 && price_out.is_none()
                 && icons.is_none()
                 && response_visuals.is_none()
-                && tui_mode.is_none()
                 && timemachine_keep.is_none()
                 && timemachine_max_files.is_none()
                 && timemachine_max_bytes.is_none()
@@ -6661,9 +6847,6 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             }
             if let Some(v) = response_visuals {
                 cfg.response_visuals = Some(v.parse::<cli_config::ResponseVisuals>().map_err(anyhow::Error::msg)?);
-            }
-            if let Some(v) = tui_mode {
-                cfg.tui_mode = Some(v.parse::<cli_config::TuiMode>().map_err(anyhow::Error::msg)?);
             }
             if let Some(k) = timemachine_keep {
                 cfg.timemachine_keep = Some(k); // 0 = unlimited
@@ -6878,7 +7061,6 @@ fn print_config(cfg: &cli_config::CliConfig) {
     section("Display");
     row("icons", theme::accent(cfg.icons.as_deref().unwrap_or("nerd")).to_string());
     row("visuals", theme::accent(cfg.response_visuals().to_string()).to_string());
-    row("tui", theme::accent(cfg.tui_mode().to_string()).to_string());
     println!();
 }
 
@@ -6949,7 +7131,6 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
         let approval_h = cfg.persisted_approval_mode().to_string();
         let icons_h = cfg.icons.clone().unwrap_or_else(|| "nerd".into());
         let visuals_h = cfg.response_visuals().to_string();
-        let tui_h = cfg.tui_mode().to_string();
 
         let items = vec![
             format!("Connection      · api key {key_h}"),
@@ -6958,7 +7139,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             format!("Session         · compact {compact_h}"),
             format!("Reasoning       · {effort_h}"),
             format!("Approval        · {approval_h}"),
-            format!("Display         · {tui_h} · icons {icons_h} · visuals {visuals_h}"),
+            format!("Display         · icons {icons_h} · visuals {visuals_h}"),
             "Show full config".to_string(),
             "Done".to_string(),
         ];
@@ -7266,8 +7447,8 @@ fn config_edit_display(cfg: &mut cli_config::CliConfig) -> Result<()> {
         });
     }
 
-    // Retained full-frame is the only interactive UI; the classic sticky renderer is kept solely as
-    // the automatic non-TTY fallback and is no longer user-selectable. No picker row remains.
+    // The retained full-frame renderer is the only interactive UI, so there is no backend to pick:
+    // on a non-TTY (or if the alternate screen won't open) the plain line-REPL takes over on its own.
     Ok(())
 }
 

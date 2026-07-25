@@ -33,6 +33,7 @@ use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// One user-defined command parsed from a markdown file.
 #[derive(Debug, Clone, PartialEq)]
@@ -219,10 +220,22 @@ fn expand_shell(s: &str) -> Result<String> {
     Ok(out)
 }
 
+/// How long a `` !`cmd` `` expansion may take before it is killed. Custom-command expansion happens
+/// while the user waits for their `/command` to turn into a prompt, so the ceiling is deliberately
+/// tighter than `shell_run`'s: the commands allowed here are read-only ones like `git status`.
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Grace for the pipe readers after the tree is gone (see `core::proctree`).
+const CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
 /// Run a read-only shell command and capture stdout (best-effort, bounded). Mirrors `ShellRun`'s
 /// platform shell + lossy-decode so non-English Windows output isn't dropped.
+///
+/// Bounded through `proctree::output_bounded` rather than `Command::output()`: the latter waits for
+/// EOF on the pipes with no deadline, and a grandchild outliving its `cmd.exe` wrapper holds the write
+/// end open indefinitely. That hang would land on the REPL's own thread — the whole UI, not one tool
+/// call — so a `git log` on a repo with a wedged credential helper could freeze the session.
 fn run_capture(command: &str, dir: &Path) -> String {
-    use std::process::{Command, Stdio};
+    use std::process::Command;
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(format!("chcp 65001>nul & {command}"));
@@ -232,9 +245,13 @@ fn run_capture(command: &str, dir: &Path) -> String {
         c.arg("-c").arg(command);
         c
     };
-    cmd.current_dir(dir).stdout(Stdio::piped()).stderr(Stdio::null());
-    match cmd.output() {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+    cmd.current_dir(dir);
+    match crate::core::proctree::output_bounded(&mut cmd, CAPTURE_TIMEOUT, CAPTURE_DRAIN_GRACE) {
+        Ok(o) if o.timed_out => format!(
+            "[command timed out after {}s and was killed: {command}]",
+            CAPTURE_TIMEOUT.as_secs()
+        ),
+        Ok(o) => o.stdout,
         Err(e) => format!("[command failed: {e}]"),
     }
 }

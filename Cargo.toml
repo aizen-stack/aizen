@@ -1,6 +1,6 @@
 [package]
 name = "aizen"
-version = "0.4.7"
+version = "0.4.8"
 edition = "2021"
 description = "Aizen first-party agentic coding CLI — OpenAI-compatible, hermes-style provider-agnostic API client"
 license-file = "LICENSE"
@@ -45,8 +45,8 @@ console = "0.15"
 # must work on every sixel-capable platform (incl. Linux), not just Windows/macOS. Also backs the
 # clipboard image encode in `image_input`. Pure-Rust → single static binary preserved.
 png = "0.17"
-# Retained full-frame TUI. Both crates are pure Rust; the classic ANSI/console backend remains a
-# runtime fallback (`tui_mode=classic`) and the non-TTY path never initializes either backend.
+# Retained full-frame TUI — the only interactive backend (the classic ANSI/console renderer is gone).
+# Both crates are pure Rust; the non-TTY path falls back to the plain line-REPL and never starts it.
 # Ratatui owns layout/cell diffing; crossterm owns raw input, alternate-screen lifecycle, focus and
 # resize events. Keep the direct Windows binding below pinned at windows-sys 0.59.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }

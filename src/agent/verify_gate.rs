@@ -193,10 +193,22 @@ async fn run_one_verify(cwd: &Path, cmd: &VerifyCommand, timeout_secs: u64) -> O
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true); // a dropped (timed-out) future kills the child.
+    // `kill_on_drop` alone reaches only the `cmd.exe`/`sh` wrapper. The verify command is a BUILD
+    // (`cargo check`, `tsc`, `npm test`), so the surviving grandchild is a compiler holding a lock on
+    // `target/` — the next verify then blocks on that lock and times out too, and the timeouts
+    // compound instead of clearing. Containment makes the timeout actually stop the work.
+    crate::core::proctree::prepare_tokio(&mut command);
 
     let child = command.spawn().ok()?; // spawn failure (no toolchain) → silent no-op.
+    let containment = crate::core::proctree::contain_tokio(&child);
     let dur = Duration::from_secs(timeout_secs.max(1));
-    match timeout(dur, child.wait_with_output()).await {
+    // `wait_with_output` consumes the child, so the tree is killed through the containment handle
+    // rather than a `&mut Child` we no longer have.
+    let outcome = timeout(dur, child.wait_with_output()).await;
+    if outcome.is_err() {
+        crate::core::proctree::terminate_tree(&containment);
+    }
+    match outcome {
         Ok(Ok(output)) => {
             let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&output.stderr);

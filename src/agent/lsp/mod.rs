@@ -726,6 +726,19 @@ fn format_diagnostics(root: &Path, file: &Path, items: &[DiagItem]) -> String {
 mod tests {
     use super::*;
 
+    /// An absolute path spelled for the HOST platform: a drive path on Windows, POSIX elsewhere.
+    ///
+    /// Not cosmetic. `rel_display` strips the root by prefix, and a Windows literal like
+    /// `C:\p\a.rs` is ONE opaque component on Linux — nothing strips, so every formatter prints the
+    /// full path and the `a.rs`-shaped assertions below fail on the unix CI jobs while staying green
+    /// locally. Build both sides of the comparison the same way and the tests hold everywhere.
+    fn tpath(root: &str, rest: &str) -> PathBuf {
+        let mut p =
+            PathBuf::from(if cfg!(windows) { format!(r"C:\{root}") } else { format!("/{root}") });
+        p.extend(rest.split('/').filter(|s| !s.is_empty()));
+        p
+    }
+
     fn diag(sev: &'static str, line: usize, msg: &str, code: Option<&str>) -> DiagItem {
         DiagItem { line, col: 1, severity: sev, message: msg.into(), code: code.map(String::from) }
     }
@@ -788,21 +801,20 @@ mod tests {
     fn rel_display_handles_verbatim_and_drive_case() {
         // Plain prefix → strip_prefix path.
         assert_eq!(
-            rel_display(Path::new(r"C:\proj"), Path::new(r"C:\proj\src\a.rs")),
-            PathBuf::from(r"src\a.rs")
+            rel_display(&tpath("proj", ""), &tpath("proj", "src/a.rs")),
+            [ "src", "a.rs" ].iter().collect::<PathBuf>()
         );
         if cfg!(windows) {
-            // Canonicalized root (`\\?\C:\…`) vs lowercase-drive server path (`c:\…`).
+            // Canonicalized root (`\\?\C:\…`) vs lowercase-drive server path (`c:\…`). Windows-only
+            // by nature: there is no verbatim prefix or drive-letter casing to reconcile elsewhere.
             assert_eq!(
                 rel_display(Path::new(r"\\?\C:\proj"), Path::new(r"c:\proj\src\a.rs")),
                 PathBuf::from(r"src\a.rs")
             );
         }
         // Unrelated path → unchanged.
-        assert_eq!(
-            rel_display(Path::new(r"C:\proj"), Path::new(r"D:\other\b.rs")),
-            PathBuf::from(r"D:\other\b.rs")
-        );
+        let unrelated = tpath("other", "b.rs");
+        assert_eq!(rel_display(&tpath("proj", ""), &unrelated), unrelated);
     }
 
     #[test]
@@ -871,11 +883,12 @@ mod tests {
             DocSym { name: "Outer".into(), kind: "struct", line: 0, depth: 0 },
             DocSym { name: "field".into(), kind: "field", line: 1, depth: 1 },
         ];
-        let out = format_doc_symbols(Path::new(r"C:\p"), Path::new(r"C:\p\a.rs"), &syms);
+        let (root, file) = (tpath("p", ""), tpath("p", "a.rs"));
+        let out = format_doc_symbols(&root, &file, &syms);
         assert!(out.contains("2 symbol(s) in a.rs"), "{out}");
         assert!(out.contains("  struct Outer  :1"), "{out}");
         assert!(out.contains("    field field  :2"), "depth-1 gets deeper indent: {out}");
-        let empty = format_doc_symbols(Path::new(r"C:\p"), Path::new(r"C:\p\a.rs"), &[]);
+        let empty = format_doc_symbols(&root, &file, &[]);
         assert!(empty.contains("no symbols"), "{empty}");
     }
 
@@ -885,15 +898,16 @@ mod tests {
             .map(|i| WsSym {
                 name: format!("sym{i}"),
                 kind: "fn",
-                path: PathBuf::from(r"C:\p\a.rs"),
+                path: tpath("p", "a.rs"),
                 line: Some(i),
             })
             .collect();
-        let out = format_ws_symbols(Path::new(r"C:\p"), "sym", &syms, 3);
+        let root = tpath("p", "");
+        let out = format_ws_symbols(&root, "sym", &syms, 3);
         assert!(out.contains("5 symbol(s) matching 'sym'"), "{out}");
         assert!(out.contains("fn sym0  a.rs:1"), "{out}");
         assert!(out.contains("(+2 more"), "cap marker: {out}");
-        assert!(format_ws_symbols(Path::new(r"C:\p"), "zzz", &[], 3).contains("no symbols matching"));
+        assert!(format_ws_symbols(&root, "zzz", &[], 3).contains("no symbols matching"));
     }
 
     #[test]
@@ -902,11 +916,12 @@ mod tests {
             DiagItem { line: 2, col: 0, severity: "error", message: "mismatched types\nexpected u32".into(), code: Some("E0308".into()) },
             DiagItem { line: 5, col: 3, severity: "warning", message: "unused variable".into(), code: None },
         ];
-        let out = format_diagnostics(Path::new(r"C:\p"), Path::new(r"C:\p\a.rs"), &items);
+        let (root, file) = (tpath("p", ""), tpath("p", "a.rs"));
+        let out = format_diagnostics(&root, &file, &items);
         assert!(out.contains("2 diagnostic(s) for a.rs (1 error, 1 warning)"), "{out}");
         assert!(out.contains("error 3:1  mismatched types … [E0308]"), "first line only + code: {out}");
         assert!(out.contains("warning 6:4  unused variable"), "{out}");
-        assert!(format_diagnostics(Path::new(r"C:\p"), Path::new(r"C:\p\a.rs"), &[]).contains("clean"));
+        assert!(format_diagnostics(&root, &file, &[]).contains("clean"));
     }
 }
 

@@ -1,12 +1,18 @@
-//! Background process pool (the `process` tool). `shell_run` is FOREGROUND with a 120s wall-clock
-//! kill — useless for a `npm run dev`, a watcher, or a long build. `process` spawns a command in the
-//! BACKGROUND, returns a `proc_<n>` handle immediately, and lets the agent poll/log/wait/kill it
-//! later. Pure-Rust over `std::process` + drain threads (the same lossy-decode + `chcp 65001` posture
-//! as `shell_run`); NO Python reader-threads, NO docker/ssh/modal backends — local only.
+//! Background process pool (the `process` tool). `shell_run` is FOREGROUND with a wall-clock kill
+//! (120s by default) — useless for a `npm run dev`, a watcher, or a long build. `process` spawns a
+//! command in the BACKGROUND, returns a `proc_<n>` handle immediately, and lets the agent
+//! poll/log/wait/kill it later. Pure-Rust over `std::process` + drain threads (the same lossy-decode +
+//! `chcp 65001` posture as `shell_run`); NO Python reader-threads, NO docker/ssh/modal backends —
+//! local only.
 //!
 //! Safety: the command runs CONFINED to the cwd root (same `confine` jail as `shell_run`), and the
 //! hard `cmd_guard` floor is applied to `action=start` in `agent::execute_one` BEFORE approval — so a
 //! background `rm -rf /` is refused exactly like a foreground one.
+//!
+//! Lifetime: every process is spawned into a [`crate::core::proctree`] containment (Windows job
+//! object / Unix process group), so `kill` reaps the whole tree and — on Windows — an Aizen crash
+//! reaps it too, because the kernel closes the job handle. A dev server started here cannot outlive
+//! the CLI holding its port.
 
 use crate::agent::builtin::confine;
 use crate::agent::tools::{Tool, WorkspaceEffect};
@@ -64,6 +70,10 @@ struct ProcEntry {
     child: Arc<Mutex<Child>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     finished_at: Arc<Mutex<Option<Instant>>>,
+    /// Job object / process group holding the whole tree. Kept for the entry's lifetime: on Windows
+    /// this is also crash insurance — if Aizen dies without running `kill_all`, the OS closes the job
+    /// handle and the kernel reaps every descendant, so a `npm run dev` cannot outlive the CLI.
+    containment: Arc<crate::core::proctree::Containment>,
 }
 
 impl ProcEntry {
@@ -129,7 +139,12 @@ fn start(root: &PathBuf, command: &str, cwd: Option<&str>) -> Result<String> {
         c
     };
     cmd.current_dir(&dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Contain the tree at spawn. A background command is the WORST case for the orphan problem this
+    // guards: `process start` is what runs dev servers and watchers, i.e. exactly the processes that
+    // spawn real children behind the `cmd.exe`/`sh` wrapper and keep holding a port after a kill.
+    crate::core::proctree::prepare(&mut cmd);
     let mut child = cmd.spawn().with_context(|| format!("spawning background `{command}`"))?;
+    let containment = Arc::new(crate::core::proctree::contain(&child));
     let pid = child.id();
 
     let out = Arc::new(Mutex::new(RingBuf::new(OUTPUT_CAP)));
@@ -182,6 +197,7 @@ fn start(root: &PathBuf, command: &str, cwd: Option<&str>) -> Result<String> {
         child,
         stdin: Arc::new(Mutex::new(stdin)),
         finished_at,
+        containment,
     };
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), entry);
     Ok(id)
@@ -203,18 +219,15 @@ fn spawn_drain<R: std::io::Read + Send + 'static>(pipe: Option<R>, out: Arc<Mute
 }
 
 /// Best-effort kill of a process AND its children (a bg shell usually has a real child).
+///
+/// Uses the job object / process group captured at spawn rather than the old `taskkill /F /T /PID`.
+/// `taskkill /T` walks the live parent→child chain, so it only reaches descendants whose ancestors are
+/// *still running*: once the `cmd.exe` wrapper exits (or a launcher double-forks, as npm/python
+/// wrappers do), the chain is broken and the real server survives — holding its port and the pipe. The
+/// kernel's job membership has no such gap, and needs no extra process spawn to do the killing.
 fn kill_tree(entry: &ProcEntry) {
-    if cfg!(windows) {
-        // child.kill() only ends the cmd.exe wrapper; taskkill /T ends the whole tree.
-        let _ = Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &entry.pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
     let mut child = entry.child.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = child.kill();
-    let _ = child.wait();
+    crate::core::proctree::kill_tree(&mut child, &entry.containment);
     entry.done.store(true, Ordering::Relaxed);
     if entry.finished_at.lock().map(|g| g.is_none()).unwrap_or(false) {
         *entry.finished_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
@@ -250,7 +263,7 @@ impl Tool for Process {
     }
     fn description(&self) -> &str {
         "Run and manage LONG-RUNNING background commands (dev servers, watchers, long builds) that \
-         shell_run's 120s foreground limit would kill. action=start spawns a command and returns a \
+         shell_run's foreground wall-clock cap would kill. action=start spawns a command and returns a \
          proc_<n> handle immediately; then action=log/status/wait/kill/write manage it. Use shell_run \
          (not this) for quick commands that finish in seconds. Confined to the working dir."
     }

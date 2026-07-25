@@ -51,6 +51,7 @@ const BUILTINS: &[Builtin] = &[
     Builtin { name: "recover", description: "restore a crashed session safely", argument_hint: "[discard]" },
     Builtin { name: "timeline", description: "show or restore checkpoint timeline", argument_hint: "[pick]" },
     Builtin { name: "checkpoint", description: "save a code restore point", argument_hint: "[note]" },
+    Builtin { name: "diff", description: "what changed between two points in time", argument_hint: "[from] [to] [-p]" },
     Builtin { name: "compact", description: "compress context to free tokens", argument_hint: "" },
     Builtin { name: "lsp", description: "type-aware code navigation and diagnostics", argument_hint: "[on|off|status|restart]" },
     Builtin { name: "reach", description: "check web-access backend health", argument_hint: "[doctor|status]" },

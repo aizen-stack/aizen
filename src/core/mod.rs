@@ -10,6 +10,8 @@ pub mod config;
 pub mod effort;
 pub mod exec_ctx;
 pub mod net_guard;
+pub mod proctree;
+pub mod steer;
 pub mod persist;
 pub mod recovery;
 pub mod repo_lock;

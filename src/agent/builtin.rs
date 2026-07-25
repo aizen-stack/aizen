@@ -20,8 +20,53 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Hard wall-clock cap for `shell_run` (a hung command must never freeze the agent loop).
+/// Default wall-clock cap for `shell_run` (a hung command must never freeze the agent loop).
 const SHELL_TIMEOUT_SECS: u64 = 120;
+
+/// Env override for the `shell_run` cap. 120s is right for a test run and wrong for a cold
+/// `cargo build` on a big workspace — a fixed ceiling turns "slow" into "killed", and the model then
+/// retries the same command, paying the full wait twice. Clamped to a sane band so a typo cannot
+/// disable the ceiling that keeps the loop responsive.
+const SHELL_TIMEOUT_ENV: &str = "AIZEN_SHELL_TIMEOUT_SECS";
+
+/// How long to wait for the drain threads AFTER the child is gone.
+///
+/// This is the fix for a confirmed hang: on Windows `kill()` reaps only the `cmd.exe` wrapper, and a
+/// surviving grandchild still holds the inherited write end of our pipes, so `read_to_end` never sees
+/// EOF. The old code called `join()` unconditionally and could block forever — measured still blocked
+/// 12s after a kill, against a 45s sleeper. Tree-kill removes the cause; this bound means even an
+/// exotic case (a descendant we could not contain, a pipe inherited by an unrelated process) costs
+/// two seconds and a partial-output note instead of the whole session.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Resolve the `shell_run` wall-clock cap: env override (clamped 10s..=3600s) or the default.
+fn shell_timeout_secs() -> u64 {
+    std::env::var(SHELL_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.clamp(10, 3600))
+        .unwrap_or(SHELL_TIMEOUT_SECS)
+}
+
+/// How often to say which command is still running. The working pill already animates and counts
+/// elapsed seconds, so plain liveness is covered; what it cannot show is *which* command is out and
+/// how close the ceiling is — and without that a slow build and a wedged process look identical.
+const SLOW_NOTE_EVERY_SECS: u64 = 30;
+
+/// Note a still-running command into the transcript (once per [`SLOW_NOTE_EVERY_SECS`]).
+///
+/// Routed through the same trace surface the tool lines use, so it lands in the retained TUI's buffer
+/// rather than being printed over the frame.
+fn note_slow_command(command: &str, waited: u64, cap: u64) {
+    // One line, command clipped: a 300-char pipeline would wrap and push the transcript around.
+    let mut label: String = command.trim().chars().take(60).collect();
+    if command.trim().chars().count() > 60 {
+        label.push('…');
+    }
+    crate::agent::emit_trace_public(&format!(
+        "→ still running after {waited}s (cap {cap}s): {label}  ·  Esc cancels"
+    ));
+}
 
 /// Prefix a write tool returns when the target already held byte-identical content — so nothing
 /// was written to disk. The agent loop keys off this exact prefix (`turn_made_edits`) to NOT arm
@@ -94,6 +139,7 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     r.register(Box::new(crate::features::timemachine::Checkpoint));
     r.register(Box::new(crate::features::timemachine::CheckpointRewind));
     r.register(Box::new(crate::features::timemachine::CheckpointList));
+    r.register(Box::new(crate::features::timemachine::CheckpointDiff));
     r.register(Box::new(crate::features::timemachine::CheckpointRestore));
     r.register(Box::new(FileEdit::new(root.to_path_buf())));
     r.register(Box::new(MultiEdit::new(root.to_path_buf())));
@@ -2363,8 +2409,10 @@ impl Tool for ShellRun {
     fn description(&self) -> &str {
         "Run a shell command in the working directory and return its stdout/stderr + exit code. \
          Use to build, test, run tools, or manage files. For content search use search_files (not \
-         grep here); for long-running commands (dev servers, watchers) use the process tool — this \
-         has a 120s timeout. Destructive — the user is asked to confirm."
+         grep here). Wall-clock cap: 120s by default (AIZEN_SHELL_TIMEOUT_SECS overrides it, \
+         10..3600) — on timeout the whole process tree is killed. For anything that should keep \
+         running (dev servers, watchers, very long builds) use the process tool instead, which has \
+         no cap. Destructive — the user is asked to confirm."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -2414,52 +2462,91 @@ impl Tool for ShellRun {
         // command already runs non-interactively (drained pipes, wall-clock timeout), so it has no
         // legitimate use for the terminal's stdin anyway.
         cmd.current_dir(&dir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Contain the tree BEFORE anything can go wrong with it: on Windows we spawn a `cmd.exe`
+        // wrapper, so killing our direct child leaves the real work (cargo, node, a dev server)
+        // orphaned — still running, and still holding the write end of the pipes below.
+        crate::core::proctree::prepare(&mut cmd);
         let mut child = cmd.spawn().with_context(|| format!("spawning shell for `{command}`"))?;
+        let containment = crate::core::proctree::contain(&child);
 
         // Drain the pipes on threads so a chatty command can't deadlock on a full buffer,
-        // while we poll with a wall-clock timeout (kill the child if it overruns).
+        // while we poll with a wall-clock timeout (kill the tree if it overruns).
         let out_pipe = child.stdout.take();
         let err_pipe = child.stderr.take();
         let oh = std::thread::spawn(move || drain(out_pipe));
         let eh = std::thread::spawn(move || drain(err_pipe));
 
-        let timeout = Duration::from_secs(SHELL_TIMEOUT_SECS);
+        let timeout = Duration::from_secs(shell_timeout_secs());
         let start = Instant::now();
+        let mut next_note = SLOW_NOTE_EVERY_SECS;
         let mut cancelled = false;
         let status = loop {
             match child.try_wait()? {
                 Some(st) => break Some(st),
                 None => {
-                    // User pressed Esc (cooperative cancel) — kill the child now instead of blocking
+                    // User pressed Esc (cooperative cancel) — kill the tree now instead of blocking
                     // the whole turn up to the timeout. This is what makes Esc responsive during a
                     // long command (the confirmed "can't cancel while a tool runs" bug).
                     let cancel_requested = crate::core::cancel::current()
                         .or_else(crate::ui::tui::active_cancel_token)
                         .is_some_and(|token| token.is_cancelled());
                     if cancel_requested {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        crate::core::proctree::kill_tree(&mut child, &containment);
                         cancelled = true;
                         break None;
                     }
                     if start.elapsed() >= timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        crate::core::proctree::kill_tree(&mut child, &containment);
                         break None;
+                    }
+                    // Tell the user what is taking so long, once every 30s. The working pill already
+                    // animates and counts elapsed seconds, so liveness is covered — what it cannot
+                    // say is WHICH command is still out, or that a ceiling is approaching. Without
+                    // that, a 2-minute build and a wedged process look identical from the outside.
+                    let waited = start.elapsed().as_secs();
+                    if waited >= next_note {
+                        note_slow_command(command, waited, timeout.as_secs());
+                        next_note = waited + SLOW_NOTE_EVERY_SECS;
                     }
                     std::thread::sleep(Duration::from_millis(40));
                 }
             }
         };
-        let stdout = oh.join().unwrap_or_default();
-        let stderr = eh.join().unwrap_or_default();
+        // Never join a pipe reader unbounded. If containment failed (or a descendant escaped the job
+        // via its own detached wrapper) an orphan can still hold the write end, and `read_to_end`
+        // only returns on EOF = last writer closed — a wait that a wedged process never ends. A
+        // reproduction of exactly this blocked >12s on a 45s sleeper. Take whatever the readers have
+        // finished within the grace window; a lost tail beats a frozen agent.
+        let (mut stdout, out_cut) = crate::core::proctree::join_drain(oh, DRAIN_GRACE);
+        let (stderr, err_cut) = crate::core::proctree::join_drain(eh, DRAIN_GRACE);
+        if out_cut || err_cut {
+            // Say so rather than presenting a truncated log as complete — the model would otherwise
+            // reason from output it cannot tell is partial.
+            stdout.push_str(
+                "\n[output truncated: a surviving child process still held the pipe open; \
+                 the command's own result above may be incomplete]",
+            );
+        }
 
         match status {
             None if cancelled => Ok("error: command cancelled by the user (Esc)".to_string()),
             None => {
                 // Surface stderr too (the success branch already does) so a killed build's diagnostics
                 // aren't lost to the model — they're often the most useful part of a timeout.
-                let mut s = format!("error: command timed out after {SHELL_TIMEOUT_SECS}s (killed)\n{stdout}");
+                let secs = shell_timeout_secs();
+                // Report the kill's real reach. Claiming "whole tree" when containment was
+                // unavailable would hide a live orphan from the one person who could stop it.
+                let scope = if containment.is_contained() {
+                    "killed, whole process tree"
+                } else {
+                    "killed the shell only — this platform refused process containment, so a \
+                     descendant may still be running"
+                };
+                let mut s = format!(
+                    "error: command timed out after {secs}s ({scope})\n\
+                     If it needs longer, re-run it with the `process` tool (action=start) which has \
+                     no wall-clock cap, or raise AIZEN_SHELL_TIMEOUT_SECS.\n{stdout}"
+                );
                 if !stderr.trim().is_empty() {
                     s.push_str("\n[stderr]\n");
                     s.push_str(&stderr);
@@ -3626,6 +3713,53 @@ mod tests {
         let out = t.execute(&serde_json::json!({"command":"echo hello-ng"})).unwrap();
         assert!(out.contains("hello-ng"));
         assert!(out.starts_with("exit 0"));
+    }
+
+    #[test]
+    fn shell_run_timeout_returns_promptly_even_with_a_surviving_grandchild() {
+        // The end-to-end form of the hang: a command whose real work lives in a grandchild used to
+        // time out, kill only the `cmd.exe` wrapper, and then block FOREVER in `oh.join()` because
+        // the orphan still held the pipe's write end. The tool must come back on its own.
+        //
+        // Timing is the assertion. A 10s cap (the clamp floor) plus the 2s drain grace bounds the
+        // honest worst case well under the 40s the grandchild would otherwise sleep, so a regression
+        // shows up as a failure rather than a suite that never finishes.
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(SHELL_TIMEOUT_ENV, "10");
+        let command = if cfg!(windows) {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+            format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -Command Start-Sleep -Seconds 40")
+        } else {
+            "sleep 40 & wait".to_string()
+        };
+        let t = ShellRun::new(temp_root("shell-timeout"));
+        let started = Instant::now();
+        let out = t.execute(&serde_json::json!({"command": command})).unwrap();
+        let elapsed = started.elapsed();
+        std::env::remove_var(SHELL_TIMEOUT_ENV);
+
+        assert!(out.starts_with("error: command timed out"), "should report a timeout; got: {out}");
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "shell_run took {elapsed:?} for a 10s cap — it is waiting on a pipe an orphan still holds"
+        );
+    }
+
+    #[test]
+    fn shell_timeout_env_is_clamped_to_a_sane_band() {
+        // A cap that can be set to 0 (or to a week) is not a cap. The band keeps the agent loop
+        // responsive no matter what the environment says.
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(SHELL_TIMEOUT_ENV, "0");
+        assert_eq!(shell_timeout_secs(), 10, "0 clamps up to the floor");
+        std::env::set_var(SHELL_TIMEOUT_ENV, "999999");
+        assert_eq!(shell_timeout_secs(), 3600, "absurd values clamp to the ceiling");
+        std::env::set_var(SHELL_TIMEOUT_ENV, "600");
+        assert_eq!(shell_timeout_secs(), 600, "a reasonable value passes through");
+        std::env::set_var(SHELL_TIMEOUT_ENV, "not-a-number");
+        assert_eq!(shell_timeout_secs(), SHELL_TIMEOUT_SECS, "garbage falls back to the default");
+        std::env::remove_var(SHELL_TIMEOUT_ENV);
+        assert_eq!(shell_timeout_secs(), SHELL_TIMEOUT_SECS, "unset = default");
     }
 
     #[test]

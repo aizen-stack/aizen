@@ -576,9 +576,9 @@ impl Drop for TerminalSession {
 }
 
 pub(super) fn preferred() -> bool {
-    // Retained is the only interactive UI: with a TTY it always wins. The classic sticky renderer
-    // survives ONLY as the non-TTY / `NO_STICKY` fallback (piped output, CI, dumb terminals) — it is
-    // no longer user-selectable, so the `tui_mode` setting no longer gates this.
+    // Retained is the ONLY interactive UI, so this is simply "can we take the terminal at all". When
+    // it says no (piped output, CI, dumb terminals, or an explicit `NO_STICKY`) the caller runs the
+    // plain line-REPL — there is no second renderer to pick, and nothing in the config selects one.
     io::stdout().is_terminal() && !crate::core::cli_config::branded_flag("NO_STICKY")
 }
 
@@ -1366,7 +1366,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let width = area.width as usize;
     let elapsed = state.working_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
     // Right of the HUD row: working pill while the agent runs, else coloured health chip + a
-    // compact context meter `⟦▓▓░░…⟧ N%` (matches classic `ctx_meter` look). Green = OK, yellow =
+    // compact context meter `⟦▓▓░░…⟧ N%`. Green = OK, yellow =
     // slow/transient, red = permanent unavailability, muted = still checking.
     //
     // Built as spans (not a single pre-coloured string) so the bar can take its own fill colour
@@ -1480,7 +1480,18 @@ fn input_line(state: &AppState, budget: usize) -> (String, usize) {
         } else {
             String::new()
         };
-        let ph = if state.working { format!("Queue a message · Esc stops{q}") } else { format!("Type a message · / commands{q}") };
+        // Mirror the classic footer: while working, advertise Alt+Enter (steer the RUNNING turn) and
+        // count steers the loop hasn't folded in yet — a steer has no transcript line of its own
+        // until the agent picks it up, so this counter is the only "it landed" feedback.
+        let s = match crate::core::steer::pending() {
+            0 => String::new(),
+            n => format!(" · ⤳{n}"),
+        };
+        let ph = if state.working {
+            format!("Queue · Alt+↵ steers · Esc stops{q}{s}")
+        } else {
+            format!("Type a message · / commands{q}")
+        };
         return (console::truncate_str(&ph, budget, "…").into_owned(), 0);
     }
     // Only collapse to a "N lines pasted" chip for a genuinely large paste — match the classic
