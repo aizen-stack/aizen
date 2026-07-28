@@ -764,16 +764,13 @@ fn is_resumable(stop: &crate::agent::StopReason, continuations_used: u32) -> boo
 }
 
 /// Surface a continuation to the user: a sub-agent silently earning more budget would otherwise look
-/// like a hang (it runs `quiet`, so nothing else it does reaches the screen). Routed through the TUI
-/// funnel when it owns the screen — a raw `eprintln!` mid-turn corrupts the retained frame.
+/// like a hang (it runs `quiet`, so nothing else it does reaches the screen). Routed through
+/// `tui::note_line` — a raw `eprintln!` mid-turn corrupts the retained frame, and `note_line` also
+/// covers the SUSPENDED case (a dialoguer menu open mid-turn) that a bare `active()` check misses.
 fn continue_note(label: &str, n: u32, max: u32) {
     let note =
         format!("→ task({label}): step budget spent, work still open — continuing ({n}/{max})");
-    if crate::ui::tui::active() {
-        crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
-    } else {
-        eprintln!("{note}");
-    }
+    crate::ui::tui::note_line(&crate::ui::theme::faint(note).to_string());
 }
 
 impl TaskTool {

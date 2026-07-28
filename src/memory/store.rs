@@ -392,7 +392,14 @@ pub fn load_from(dir: &Path) -> Result<Vec<MemoryEntry>> {
         }
         match MemoryEntry::from_file(&path) {
             Ok(e) => out.push(e),
-            Err(e) => eprintln!("[warn] skipping unreadable memory {}: {e}", path.display()),
+            // Through the TUI funnel, never `eprintln!`: retrieval calls this on EVERY turn, so a raw
+            // print writes into the terminal behind the retained renderer's back and corrupts the
+            // frame (see `ui::tui::note_line`). One unreadable file would otherwise garble the UI
+            // once per turn, forever.
+            Err(e) => crate::ui::tui::note_line(&format!(
+                "[warn] skipping unreadable memory {}: {e}",
+                path.display()
+            )),
         }
     }
     Ok(out)

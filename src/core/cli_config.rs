@@ -681,11 +681,14 @@ pub fn load() -> CliConfig {
             use std::sync::atomic::{AtomicBool, Ordering};
             static WARNED: AtomicBool = AtomicBool::new(false);
             if !WARNED.swap(true, Ordering::Relaxed) {
-                eprintln!(
+                // Through the TUI funnel, never a raw print: `load()` runs on per-turn paths (prompt
+                // tier, toolsets, reach routing), so a raw `eprintln!` here would land inside the
+                // retained frame and corrupt it. `note_line` degrades to stderr outside the REPL.
+                crate::ui::tui::note_line(&format!(
                     "warning: {} is corrupt ({e}); using defaults. A .bak copy is kept before any \
                      re-save — run `aizen config` to repair.",
                     path.display()
-                );
+                ));
             }
             CliConfig::default()
         }

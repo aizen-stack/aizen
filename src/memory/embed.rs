@@ -237,14 +237,52 @@ pub mod model2vec {
 pub fn default_dense_embedder() -> Box<dyn Embedder> {
     match model2vec::Model2VecEmbedder::load_default() {
         Ok(e) => {
-            eprintln!("[dense] loaded {} (dim {})", e.id(), e.dim());
+            note_once(&format!("[dense] loaded {} (dim {})", e.id(), e.dim()));
             Box::new(e)
         }
         Err(err) => {
-            eprintln!("[dense] {err}; falling back to the hashing embedder");
+            note_once(&format!(
+                "[dense] {err}; falling back to the hashing embedder"
+            ));
             Box::new(HashEmbedder::default())
         }
     }
+}
+
+/// Report an embedder-backend note AT MOST ONCE per distinct message per process, through the TUI
+/// funnel.
+///
+/// Two separate bugs are being fixed here, and both matter:
+///
+/// 1. **Never print raw.** This runs deep inside retrieval, which on a `--features dense` build
+///    happens on EVERY turn (`settings().enable_dense` mirrors the cargo feature) and also from
+///    `codebase.rs`. A raw `eprintln!` writes straight into the terminal while the retained render
+///    thread believes it owns every cell, so ratatui's diff leaves the injected text embedded in
+///    later frames — that is exactly the interleaved/doubled transcript reported against 0.5.0.
+/// 2. **Say it once.** Even routed correctly, a per-turn "model not found" line is noise: the
+///    condition is static for the life of the process (a missing model dir does not appear
+///    mid-session). Keyed by message, so a genuine change of outcome still gets reported.
+#[cfg(feature = "dense")]
+fn note_once(msg: &str) {
+    if note_is_fresh(msg) {
+        crate::ui::tui::note_line(msg);
+    }
+}
+
+/// The dedupe decision behind [`note_once`], split out so it is compiled — and unit-tested — in the
+/// DEFAULT build too. The bug it guards (a per-turn note repeated forever) only reproduces on a
+/// `--features dense` build, which is exactly the configuration CI does not run tests in; keeping the
+/// registry here means the "say it once" contract is covered by the ordinary test run.
+///
+/// Returns true the first time it sees `msg` and false for every repeat, for the life of the process.
+#[allow(dead_code)] // only the `dense` cfg calls it outside tests
+fn note_is_fresh(msg: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut g = seen.lock().unwrap_or_else(|e| e.into_inner());
+    g.insert(msg.to_string())
 }
 
 #[cfg(not(feature = "dense"))]
@@ -277,5 +315,25 @@ mod tests {
         let e = HashEmbedder::new(128);
         assert_eq!(e.embed("anything at all").len(), 128);
         assert_eq!(e.dim(), 128);
+    }
+
+    #[test]
+    fn backend_note_is_reported_once_per_distinct_message() {
+        // The 0.5.0 UI report: on a `--features dense` build the "model not found" note fired from
+        // retrieval on EVERY turn. Routing it through the TUI funnel stopped it corrupting the frame;
+        // this guards the second half — it must be said ONCE, because the condition is static for the
+        // life of the process. Distinct messages are still independent, so a genuine change of outcome
+        // (fallback → loaded) is not swallowed. Unique strings keep the process-global registry from
+        // coupling this test to any other.
+        let miss = "[dense] model 'probe-a' not found; falling back";
+        let load = "[dense] loaded probe-b (dim 256)";
+        assert!(note_is_fresh(miss), "first sighting must report");
+        assert!(!note_is_fresh(miss), "repeat must be suppressed");
+        assert!(!note_is_fresh(miss), "still suppressed on later turns");
+        assert!(
+            note_is_fresh(load),
+            "a different message is independent of the suppressed one"
+        );
+        assert!(!note_is_fresh(load));
     }
 }

@@ -558,6 +558,14 @@ enum Command {
     /// Drop the current selection highlight.
     ClearSelection,
     Focus(bool),
+    /// Throw away ratatui's belief about what is on screen and repaint every cell from the block
+    /// buffer (Ctrl-L). The recovery hatch for the one failure ratatui's cell diff cannot see: text
+    /// written to the terminal by something other than the render thread (a stray `println!`, a child
+    /// process, a terminal glitch). The diff compares against its own last frame, so foreign text is
+    /// never overwritten and survives inside later frames. `terminal.clear()` resets that belief.
+    /// Not handled in `apply_command` — clearing needs the `TerminalSession`, which only the render
+    /// loop holds.
+    Redraw,
     Suspend(Sender<()>),
     Resume {
         status: String,
@@ -759,6 +767,17 @@ pub(super) fn update_input(input: InputSnapshot) {
     send(Command::Input(input));
 }
 
+/// Throw away ratatui's idea of what's on screen and repaint every cell from `AppState` (Ctrl-L).
+///
+/// The manual recovery hatch for the one failure this renderer cannot detect: something wrote to the
+/// terminal behind its back (a stray `println!` from a subsystem, a child process that printed to the
+/// inherited stdout). ratatui only repaints cells its diff believes changed, so foreign text stays
+/// wedged inside later frames. Clearing first makes the next draw unconditional. Blocks live in
+/// `AppState`, so this is a repaint, not a replay — no transcript is lost.
+pub(super) fn redraw() {
+    send(Command::Redraw);
+}
+
 pub(super) fn set_working(working: bool) {
     send(Command::Working(working));
 }
@@ -943,6 +962,9 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
     // leaks back through as ↑/↓ and the transcript stops scrolling. Re-emitting the mode setters is
     // idempotent and cheap; doing it on the true→false edge restores scroll without a per-frame cost.
     let mut was_working = false;
+    // Set by `Command::Redraw`: clear the terminal before the next draw so ratatui's cell diff starts
+    // from a blank slate instead of its stale belief about the screen.
+    let mut force_clear = false;
     loop {
         let wait = if state.working && state.focused {
             Duration::from_millis(110)
@@ -970,6 +992,10 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 };
                 let _ = ack.send(ok);
                 dirty = ok;
+            }
+            Ok(Command::Redraw) => {
+                force_clear = true;
+                dirty = true;
             }
             Ok(cmd) => {
                 apply_command(&mut state, cmd);
@@ -1017,6 +1043,10 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     let _ = ack.send(ok);
                     dirty = ok;
                 }
+                Command::Redraw => {
+                    force_clear = true;
+                    dirty = true;
+                }
                 other => {
                     apply_command(&mut state, other);
                     dirty = true;
@@ -1055,6 +1085,17 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     if screensaver_shown {
                         let _ = s.terminal.clear();
                         screensaver_shown = false;
+                    }
+                    // Ctrl-L asked for a hard redraw: something wrote to the terminal behind our back
+                    // (a stray raw print, a child process, a terminal-side glitch), so ratatui's cell
+                    // diff is comparing against a screen that no longer exists and would repaint only
+                    // the cells IT changed — leaving the foreign text embedded in later frames. Clear
+                    // wipes the real screen and drops the diff baseline, so the next `draw` repaints
+                    // every cell from `state.blocks`. Nothing is replayed: the transcript lives in
+                    // AppState, not in the terminal.
+                    if force_clear {
+                        let _ = s.terminal.clear();
+                        force_clear = false;
                     }
                     let started = Instant::now();
                     let _ = s.terminal.draw(|frame| draw(frame, &mut state));
@@ -1185,7 +1226,10 @@ fn apply_command(state: &mut AppState, cmd: Command) {
         Command::SetSelection(sel) => state.selection = Some(sel),
         Command::ClearSelection => state.selection = None,
         Command::Focus(v) => state.focused = v,
-        Command::Suspend(_) | Command::Resume { .. } | Command::Shutdown(_) => {}
+        // Lifecycle + `Redraw` carry no AppState change: they are handled by `render_loop`, which owns
+        // the `TerminalSession` (`Redraw` sets `force_clear` so the next draw is unconditional).
+        // Listed explicitly rather than via `_` so a new command can't silently become a no-op here.
+        Command::Suspend(_) | Command::Resume { .. } | Command::Shutdown(_) | Command::Redraw => {}
     }
 }
 

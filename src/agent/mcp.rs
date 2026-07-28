@@ -1701,9 +1701,14 @@ async fn build_manager(cfg: &McpConfig) -> Manager {
             generation,
         };
     }
-    eprintln!(
-        "{}",
-        console::style(format!("mcp: connecting {} server(s)…", enabled.len())).dim()
+    // Through the TUI funnel, never `eprintln!`: `discovered_tools()` runs from
+    // `default_registry_in`, which rebuilds the tool surface on EVERY turn, so a lazy reconnect can
+    // fire mid-turn. A raw print there lands in the terminal behind the retained render thread's
+    // back and gets folded into later frames as stale cells.
+    crate::ui::tui::note_line(
+        &console::style(format!("mcp: connecting {} server(s)…", enabled.len()))
+            .dim()
+            .to_string(),
     );
 
     // An overall ceiling per server so even a hang at spawn / first-run package download (which is
@@ -1727,15 +1732,15 @@ async fn build_manager(cfg: &McpConfig) -> Manager {
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok((_, Ok(h))) => servers.push(h),
-            Ok((name, Err(e))) => {
-                eprintln!(
-                    "{}",
-                    console::style(format!("mcp: server '{name}' skipped — {e:#}")).yellow()
-                )
-            }
-            Err(je) => eprintln!(
-                "{}",
-                console::style(format!("mcp: a connect task failed — {je}")).yellow()
+            Ok((name, Err(e))) => crate::ui::tui::note_line(
+                &console::style(format!("mcp: server '{name}' skipped — {e:#}"))
+                    .yellow()
+                    .to_string(),
+            ),
+            Err(je) => crate::ui::tui::note_line(
+                &console::style(format!("mcp: a connect task failed — {je}"))
+                    .yellow()
+                    .to_string(),
             ),
         }
     }
@@ -1773,7 +1778,7 @@ fn ensure_manager() {
             return;
         }
         Err(e) => {
-            eprintln!("{}", console::style(format!("mcp: {e}")).yellow());
+            crate::ui::tui::note_line(&console::style(format!("mcp: {e}")).yellow().to_string());
             let generation =
                 NEXT_MANAGER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             *guard = Some(Manager {
@@ -1873,12 +1878,14 @@ pub fn discovered_tools() -> Vec<Box<dyn Tool>> {
                     let head: String = qn.chars().take(MAX_TOOL_NAME - suffix.len()).collect();
                     let cand = format!("{head}{suffix}");
                     if !used.contains(&cand) {
-                        eprintln!(
-                            "{}",
-                            console::style(format!(
+                        // `discovered_tools` runs from `default_registry_in`, i.e. once per turn —
+                        // so this note must go through the funnel, not straight to the terminal.
+                        crate::ui::tui::note_line(
+                            &console::style(format!(
                                 "mcp: tool name '{qn}' collides — exposing as '{cand}'"
                             ))
                             .dim()
+                            .to_string(),
                         );
                         qn = cand;
                         break;

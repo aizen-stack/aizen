@@ -802,15 +802,34 @@ pub fn emit_line(s: &str) {
 // at `width()` and emitted append-only — so every surface reads identically, degrading only where
 // in-place updates are impossible (the plan simply re-prints, a too-narrow digest wraps to `└`).
 
-/// Emit a trace line the way the agent's `emit_trace` does: into the sticky/retained scroll region
-/// when the TUI owns the screen, else `eprintln!` to stderr so a one-shot `aizen agent` keeps stdout
-/// clean (only the model's final answer belongs on stdout there).
-fn emit_trace_line(s: &str) {
+/// The ONE funnel for out-of-band diagnostics — warnings, fallbacks, "skipping unreadable X" notes
+/// raised deep in a subsystem that has no idea whether a TUI owns the screen.
+///
+/// Any such note MUST come through here rather than `println!`/`eprintln!`. A raw print lands
+/// directly in the terminal while the retained render thread believes it still owns every cell;
+/// ratatui then diffs against a cell buffer that no longer matches reality and only repaints cells
+/// it thinks changed, so the injected text survives inside later frames — the character-level
+/// interleaving and doubled rows that look like "the UI is corrupted". Routing through
+/// [`emit_line`] instead makes the note a transcript block the renderer knows about.
+///
+/// Routes on `retained_running()`, not just `active()`, for the same reason [`emit`] does: while a
+/// dialoguer menu has the TUI SUSPENDED the render thread still folds emissions into its block
+/// buffer and `resume` redraws from it, so a note printed straight to the menu's screen would be
+/// wiped. Outside the REPL (one-shot `aizen agent`, pipes, CI) it degrades to `eprintln!`, keeping
+/// stdout clean for the model's answer.
+pub fn note_line(s: &str) {
     if active() || retained_running() {
         emit_line(s);
     } else {
         eprintln!("{s}");
     }
+}
+
+/// Emit a trace line the way the agent's `emit_trace` does: into the sticky/retained scroll region
+/// when the TUI owns the screen, else `eprintln!` to stderr so a one-shot `aizen agent` keeps stdout
+/// clean (only the model's final answer belongs on stdout there).
+fn emit_trace_line(s: &str) {
+    note_line(s);
 }
 
 /// Outcome of a tool call, for the digest colour. `None` while it's still running.
@@ -1111,6 +1130,22 @@ fn retained_input_snapshot() -> retained::InputSnapshot {
 fn repaint_force() {
     if retained::is_running() {
         retained::update_input(retained_input_snapshot());
+    }
+}
+
+/// Manual recovery hatch (Ctrl-L): clear the terminal and repaint the whole frame from scratch.
+///
+/// Every KNOWN raw-print path now routes through [`note_line`], but the failure mode is structural —
+/// anything that writes to the terminal behind the render thread's back (a dependency's own
+/// `eprintln!`, a child process inheriting our stdout, a stray panic message) leaves ratatui's cell
+/// buffer disagreeing with the screen, and its diff then only repaints cells it *thinks* changed, so
+/// the foreign text stays wedged in later frames. `repaint_force` cannot fix that — it just resends
+/// input state and the same stale diff applies. This drops the cached buffer entirely.
+///
+/// No-op when no retained session is up (one-shot `agent`/`chat`, pipes, CI).
+pub fn force_redraw() {
+    if retained::is_running() {
+        retained::redraw();
     }
 }
 
@@ -1798,6 +1833,17 @@ fn input_loop(
                     render().lock().unwrap().images = pending_image_count();
                     repaint();
                 }
+            }
+            Key::Char('\u{c}') => {
+                // Ctrl-L: repaint the screen from scratch, the terminal convention. This is the
+                // manual recovery hatch for a frame the renderer can no longer fix on its own —
+                // anything that wrote to the terminal behind its back (a stray print from a
+                // subsystem, a child process's output, a terminal that mangled a wide glyph) leaves
+                // ratatui's cell diff believing cells hold content they don't, so the debris
+                // survives every subsequent partial repaint. `force_redraw` clears first, making
+                // the next frame unconditional. The transcript is rebuilt from `AppState.blocks`,
+                // so nothing is lost — scroll position and draft included.
+                force_redraw();
             }
             Key::Char(c) if c.is_control() => {} // ignore stray control chars
             Key::Char(c) => {
@@ -3099,5 +3145,55 @@ mod tests {
             !keyboard_parked(),
             "resume() must hand the keyboard back, or input is dead"
         );
+    }
+
+    #[test]
+    fn ctrl_l_reaches_the_redraw_binding_and_is_not_swallowed_as_a_control_char() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        // Ctrl-L is the recovery hatch for a frame corrupted by a print that bypassed the render
+        // thread. It only works if the reader folds it to U+000C: the input loop's `Key::Char(c) if
+        // c.is_control()` arm sits right below the binding and silently eats anything that doesn't
+        // match the exact codepoint, so a wrong translation would fail *invisibly* — the key would
+        // just do nothing, with no compile error and no panic to notice.
+        let k = crossterm_to_console_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(
+            k,
+            Some(Key::Char('\u{c}')),
+            "Ctrl-L must fold to U+000C or the redraw binding is unreachable"
+        );
+        // Upper-case Ctrl-Shift-L folds to the same control code (the reader upcases first), so the
+        // hatch works regardless of caps/shift state.
+        let up = crossterm_to_console_key(KeyEvent::new(
+            KeyCode::Char('L'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(up, Some(Key::Char('\u{c}')));
+        // A bare `l` must stay a literal character — otherwise typing the letter would blank the
+        // screen.
+        assert_eq!(
+            crossterm_to_console_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+            Some(Key::Char('l'))
+        );
+    }
+
+    #[test]
+    fn force_redraw_is_a_safe_noop_without_a_retained_session() {
+        // The hatch is reachable from the input loop in every surface, including the plain REPL and
+        // one-shots where no render thread exists. It must degrade to nothing rather than panic on
+        // an absent runtime slot — a panic here would kill the process on a keystroke.
+        assert!(
+            !retained_running(),
+            "unit tests own no terminal, so no retained session should be up"
+        );
+        force_redraw();
+    }
+
+    #[test]
+    fn note_line_routes_out_of_band_warnings_without_panicking_off_tty() {
+        // `note_line` is the funnel every deep-subsystem warning now goes through (dense fallback,
+        // unreadable memory file, corrupt config, MCP connect). Those callers run on per-turn paths,
+        // so this must be safe to call from anywhere: with no TUI it degrades to stderr.
+        assert!(!active() && !retained_running());
+        note_line("[test] out-of-band warning");
     }
 }
