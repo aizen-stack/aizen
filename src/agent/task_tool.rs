@@ -658,7 +658,7 @@ impl Tool for TaskTool {
         let stop_kind = outcome.stop;
         let stop = match &stop_kind {
             crate::agent::StopReason::Done => "done",
-            crate::agent::StopReason::Divergence => "diverged (repeated itself)",
+            crate::agent::StopReason::Divergence => "stopped making progress",
             crate::agent::StopReason::MaxIters => "hit the step limit",
             crate::agent::StopReason::VerificationFailed => {
                 "failed verification after repair attempts"
@@ -736,7 +736,7 @@ fn stop_body_warning(stop: &crate::agent::StopReason) -> Option<&'static str> {
             "[UNVERIFIED — the sub-agent's own build/check never passed. The working tree may be broken; treat every claim below as unconfirmed and re-check before building on it.]",
         ),
         crate::agent::StopReason::Divergence => Some(
-            "[INCOMPLETE — the sub-agent was stopped for repeating itself without progress. The work below may be partial.]",
+            "[INCOMPLETE — the sub-agent stopped because its recent attempts added no new evidence. The work below may be partial.]",
         ),
         crate::agent::StopReason::MaxIters => Some(
             "[INCOMPLETE — the sub-agent spent every continuation budget and still hit the step limit. The work below may be partial.]",

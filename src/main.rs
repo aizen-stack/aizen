@@ -6771,9 +6771,11 @@ fn surface_abnormal_stop(outcome: &AgentOutcome) {
              carry on from here.",
             outcome.iters
         ),
+        // Both signature loops and evidence-flat exploration reach here. The final synthesis above
+        // has already returned the best answer available; this line states why tool use stopped.
         StopReason::Divergence => format!(
-            "⚠ stopped after {} steps: the same tool call was repeating without progress. The task \
-             is probably unfinished — try narrowing the next instruction.",
+            "⚠ stopped after {} steps: recent attempts added no new evidence. The answer above is the \
+             best result from the established facts; say \"continue\" to try a different approach.",
             outcome.iters
         ),
         // Both have dedicated arms in every caller (Esc / `clarify` pause), so reaching this is a
@@ -10700,7 +10702,7 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         // The final answer was already streamed to stdout during the call.
         StopReason::Done => {}
         StopReason::Divergence => eprintln!(
-            "\n[stopped after {} steps: the model repeated the same tool call without progress]",
+            "\n[stopped after {} steps: recent attempts added no new evidence; the answer above is the best result from established facts]",
             outcome.iters
         ),
         StopReason::MaxIters => eprintln!(

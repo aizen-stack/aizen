@@ -564,6 +564,25 @@ fn write_effect(root: &Path, raw: Option<&str>) -> WorkspaceEffect {
     }
 }
 
+/// The DIRECTORY a write will land in — what [`Tool::workspace_target`] hands the checkpoint gate so
+/// it looks for a repository where the change actually happens. Mirrors `confine`'s resolution
+/// (relative → `root`, absolute as-is) but stops at the parent: a not-yet-created file has no
+/// directory of its own, and the parent is what a repo lookup needs anyway. Uncanonicalized —
+/// `RepoContext::discover` runs git in it, which resolves the rest.
+fn write_target_dir(root: &Path, raw: Option<&str>) -> Option<std::path::PathBuf> {
+    let raw = raw?;
+    let path = Path::new(raw);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    if joined.is_dir() {
+        return Some(joined);
+    }
+    joined.parent().map(|p| p.to_path_buf())
+}
+
 fn move_effect(root: &Path, args: &Value) -> WorkspaceEffect {
     let from = write_effect(root, args.get("from").and_then(|v| v.as_str()));
     let to = write_effect(root, args.get("to").and_then(|v| v.as_str()));
@@ -1957,6 +1976,9 @@ impl Tool for FileEdit {
     fn workspace_effect(&self, args: &Value) -> WorkspaceEffect {
         write_effect(&self.root, args.get("path").and_then(|v| v.as_str()))
     }
+    fn workspace_target(&self, args: &Value) -> Option<std::path::PathBuf> {
+        write_target_dir(&self.root, args.get("path").and_then(|v| v.as_str()))
+    }
     fn execute(&self, args: &Value) -> Result<String> {
         let path = str_arg(args, "path")?;
         let new = str_arg(args, "new_string")?;
@@ -2060,6 +2082,9 @@ impl Tool for FileWrite {
     fn workspace_effect(&self, args: &Value) -> WorkspaceEffect {
         write_effect(&self.root, args.get("path").and_then(|v| v.as_str()))
     }
+    fn workspace_target(&self, args: &Value) -> Option<std::path::PathBuf> {
+        write_target_dir(&self.root, args.get("path").and_then(|v| v.as_str()))
+    }
     fn execute(&self, args: &Value) -> Result<String> {
         let path = str_arg(args, "path")?;
         let content = str_arg(args, "content")?;
@@ -2149,6 +2174,12 @@ impl Tool for FileMove {
     }
     fn workspace_effect(&self, args: &Value) -> WorkspaceEffect {
         move_effect(&self.root, args)
+    }
+    /// `from`, not `to`: the preimage worth capturing is the source, since a move REMOVES it and
+    /// that is the part a rewind has to put back. (When both sides live in one repo — the common
+    /// case — either would find the same work tree anyway.)
+    fn workspace_target(&self, args: &Value) -> Option<std::path::PathBuf> {
+        write_target_dir(&self.root, args.get("from").and_then(|v| v.as_str()))
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let from = str_arg(args, "from")?;
@@ -2909,6 +2940,9 @@ impl Tool for MultiEdit {
     }
     fn workspace_effect(&self, args: &Value) -> WorkspaceEffect {
         write_effect(&self.root, args.get("path").and_then(|v| v.as_str()))
+    }
+    fn workspace_target(&self, args: &Value) -> Option<std::path::PathBuf> {
+        write_target_dir(&self.root, args.get("path").and_then(|v| v.as_str()))
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let path = str_arg(args, "path")?;
@@ -4043,6 +4077,63 @@ mod tests {
         assert!(FileEdit::new(PathBuf::from(".")).is_destructive());
         assert!(ShellRun::new(PathBuf::from(".")).is_destructive());
         assert!(!FileRead::new(PathBuf::from(".")).is_destructive());
+    }
+
+    #[test]
+    fn write_tools_point_the_checkpoint_gate_at_the_target_not_the_cwd() {
+        // THE invariant behind the "run `git init`" misfire: the gate must look for a work tree
+        // where the write LANDS. A session rooted in a home directory editing a project two levels
+        // down asked about the wrong directory, found no repo, and told the user to `git init` —
+        // which, followed literally, inits the home directory. Every path-naming tool must name its
+        // own destination so the lookup happens in the project.
+        let root = temp_root("target-dir");
+        let proj = root.join("mini_project").join("web");
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+
+        // A relative path resolves under root, and the DIRECTORY (not the file) is reported.
+        let w = FileWrite::new(root.clone());
+        assert_eq!(
+            w.workspace_target(&serde_json::json!({"path":"mini_project/web/src/app.js"})),
+            Some(proj.join("src")),
+            "file_write must point at the file's parent directory"
+        );
+        // Same for a not-yet-existing file: the parent is what a repo lookup needs.
+        assert_eq!(
+            w.workspace_target(&serde_json::json!({"path":"mini_project/web/src/brand-new.js"})),
+            Some(proj.join("src"))
+        );
+        // An absolute path passes through unchanged (never re-anchored under root).
+        let outside = temp_root("target-dir-abs");
+        let abs = outside.join("x.txt");
+        assert_eq!(
+            w.workspace_target(&serde_json::json!({"path": abs.to_string_lossy()})),
+            Some(outside.clone())
+        );
+        // file_edit and multi_edit share the contract.
+        assert_eq!(
+            FileEdit::new(root.clone())
+                .workspace_target(&serde_json::json!({"path":"mini_project/web/src/app.js"})),
+            Some(proj.join("src"))
+        );
+        assert_eq!(
+            MultiEdit::new(root.clone())
+                .workspace_target(&serde_json::json!({"path":"mini_project/web/src/app.js"})),
+            Some(proj.join("src"))
+        );
+        // file_move must snapshot the SOURCE — that is the side whose content disappears.
+        assert_eq!(
+            FileMove::new(root.clone()).workspace_target(
+                &serde_json::json!({"from":"mini_project/web/src/app.js","to":"other/app.js"})
+            ),
+            Some(proj.join("src"))
+        );
+        // A malformed / absent path names no directory rather than guessing at one.
+        assert_eq!(w.workspace_target(&serde_json::json!({})), None);
+        // shell_run names no path, so it keeps the cwd-relative behavior by declining to answer.
+        assert_eq!(
+            ShellRun::new(root).workspace_target(&serde_json::json!({"command":"ls"})),
+            None
+        );
     }
 
     #[test]

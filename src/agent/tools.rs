@@ -63,6 +63,17 @@ pub trait Tool: Send + Sync {
     fn workspace_effect(&self, _args: &Value) -> WorkspaceEffect {
         WorkspaceEffect::None
     }
+    /// WHERE this call will write — an absolute directory to look for a repository in. The
+    /// checkpoint gate uses it to discover the work tree that actually owns the change, instead of
+    /// assuming the process's cwd does. Those differ constantly in practice: a session launched from
+    /// the home directory editing `Desktop/proj/src/x.js` found no repo at cwd and reported "not a
+    /// git repository (run `git init`)" — advice that, followed literally, would have turned the
+    /// user's ENTIRE HOME DIRECTORY into a repository, while the real project sat one level down
+    /// with a perfectly good `.git`. Override in every tool that names a path; the default `None`
+    /// means "no particular path" and leaves the gate on cwd.
+    fn workspace_target(&self, _args: &Value) -> Option<std::path::PathBuf> {
+        None
+    }
     /// Whether beginning this call may create a durable workspace, process, network, external-service,
     /// or delegated-agent effect whose completion would be ambiguous after a crash. Defaults to the
     /// existing safety classifications; pure reads override naturally by being non-destructive with

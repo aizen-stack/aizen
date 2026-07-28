@@ -735,16 +735,11 @@ where
     let mut recent_sigs: std::collections::VecDeque<String> =
         std::collections::VecDeque::with_capacity(SIG_RING);
     let mut nudged_sigs: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // W3/W4: hashes of every NON-failure tool-result body seen this run. Novel content = progress —
-    // the shared signal that resets the thrash streak, resets the divergence latch, and gates
-    // auto-extend. A stale re-read (already-seen bytes) is not novel, so it can't rescue a flail.
-    let mut seen_results: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    // THRASH GUARD: consecutive UNPRODUCTIVE turns (no successful edit and no novel tool output).
-    // Catches a model flailing with distinct-but-fruitless calls that dodge the divergence check
-    // (which only fires on repeated/oscillating signatures). Nudges once, then stops, so a stuck
-    // run can't burn the whole step budget.
-    let mut unproductive_streak = 0usize;
-    let mut stuck_nudged = false;
+    // EVIDENCE LEDGER: progress means learning or changing something, not merely surviving another
+    // turn. Successful results are novel by body; failures are novel by (tool, normalized class), so
+    // shuffling args cannot manufacture progress while a genuinely different failure can narrow the
+    // cause. Successful edits and completed todos are evidence too.
+    let mut stall = StallLedger::new(todo_done_count());
     let mut verify_attempts = 0usize;
     // The verify gate PASSED for the current tree state (W8). Set when a check comes back clean;
     // CLEARED by a fresh successful edit (new work must be re-verified). While false and edits
@@ -816,7 +811,7 @@ where
                 cap,
                 cfg.auto_extend_to,
                 extended,
-                unproductive_streak,
+                stall.is_stalled(),
                 !nudged_sigs.is_empty(),
             ) {
                 extended = true;
@@ -939,10 +934,9 @@ where
                         // History shrank under the anchor's feet — the next real usage report re-anchors.
                         real_anchor = None;
                         // Cleared result BODIES are gone from context, but their content hashes would
-                        // linger in seen_results and mark a legitimate RE-READ of that now-evicted content
-                        // as "not novel" → falsely unproductive → a spurious thrash stop. Drop the novelty
-                        // memory too, so re-reading evicted content counts as progress again.
-                        seen_results.clear();
+                        // linger in the success ledger and mark a legitimate RE-READ of that now-evicted
+                        // content as stale. Forget success bodies alongside the cleared history.
+                        stall.forget_successes();
                         est_now = estimate_tokens(messages) + schema_overhead;
                         budget_band_shown = None; // history shrank — re-arm the running budget signal (P-ctx1)
                         if !cfg.quiet {
@@ -994,7 +988,7 @@ where
                         context_warned = false; // history shrank — let the wrap-up nudge re-arm if it refills
                         budget_band_shown = None; // …and the running budget signal (P-ctx1)
                         real_anchor = None; // spliced history invalidates the anchor
-                        seen_results.clear(); // summarized-away results must not mark a re-read as stale
+                        stall.forget_successes(); // summarized-away results must not mark a re-read as stale
                         est_now = estimate_tokens(messages) + schema_overhead;
                         if !cfg.quiet {
                             let line =
@@ -1591,8 +1585,16 @@ where
                 // Already flagged this episode AND recurred with no productive turn clearing the
                 // latch → a genuine loop. Stop; the repeat is NOT executed/appended (return before
                 // pre-fill, so no dangling tool_calls can strand history).
+                let final_text = synthesize_final(
+                    &chat,
+                    messages,
+                    "Your recent attempts stopped producing new information. Give your best answer \
+                     now from what you already established — including the cause you identified, if \
+                     any — and say explicitly what is unverified or unfinished.",
+                )
+                .await;
                 return Ok(AgentOutcome {
-                    final_text: turn.content,
+                    final_text,
                     iters: iter + 1,
                     stop: StopReason::Divergence,
                 });
@@ -1694,57 +1696,59 @@ where
             }
         }
 
-        // PROGRESS / THRASH GUARD (W3/W4): a turn is PRODUCTIVE iff a successful edit landed OR some
-        // NON-failure result carried content not seen before this run. Failures are never progress (a
-        // fresh error string can't rescue a flail — W3); a throwaway re-read of already-seen bytes is
-        // not novel (padding can't reset the streak — W3), and a same-content re-read loop climbs to a
-        // stop (W4). A re-read that surfaces NEW bytes, or is followed by a successful edit, IS
-        // productive and resets the streak — the system-prompt-sanctioned re-read→retry recovery is
-        // never punished. Productive turns also clear nudged_sigs, ending any open divergence episode.
-        let mut new_content = false;
-        for (tc, (_, r)) in calls.iter().zip(&results) {
-            // Registry-aware: a tool that self-declares failure (W12) is never progress, even if it
-            // returned Ok(...) without the `error:`/`exit N` shape the heuristic keys on.
-            if result_is_failure(registry, &tc.function.name, r) {
-                continue; // failures are never progress
-            }
-            if seen_results.insert(hash_str(r)) {
-                new_content = true;
-            }
+        // EVIDENCE / STALL GUARD: a turn is informative when it adds facts, changes the workspace, or
+        // completes todo work. Failures are keyed by (tool, normalized error class), deliberately not
+        // by args: changing arguments cannot disguise the same failure, while a genuinely different
+        // failure class records a ruled-out cause. Repeated success bytes are likewise not new facts.
+        let mut learned = false;
+        for (tc, (_, result)) in calls.iter().zip(&results) {
+            learned |= if result_is_failure(registry, &tc.function.name, result) {
+                stall.note_failure(&tc.function.name, result)
+            } else {
+                stall.note_success(result)
+            };
         }
-        let productive = edited_this_turn || new_content;
-        if productive {
-            unproductive_streak = 0;
-            stuck_nudged = false;
-        } else if !calls.is_empty() {
-            unproductive_streak += 1;
-        }
-        // Only GENUINELY NOVEL output ends a divergence episode. A successful destructive call sets
-        // edited_this_turn=true on EVERY turn (turn_made_edits is true for any non-error destructive
-        // result), so clearing the latch on `productive` would let a repeated IDENTICAL destructive
-        // call (same signature, same body — e.g. `git commit --allow-empty`, `>> log`, a no-op
-        // file_write) re-flag as "first seen" forever and never hard-stop. Gating the clear on
-        // new_content keeps a legit poll/consume loop free (each call is novel) while a redundant
-        // repeated edit keeps its latch → the next recurrence hits the insert()==false stop.
-        if new_content {
+        // Todo completion counts as evidence only when THIS turn wrote the list. The list is
+        // process-global, so reading it unconditionally would let an unrelated writer (another REPL
+        // path, or a parallel test) hand this run progress it never made. The baseline is refreshed
+        // either way, so ambient drift can't be banked and claimed by a later `todo_write`.
+        let wrote_todos = calls.iter().any(|c| c.function.name == "todo_write");
+        let todo_progress = stall.note_todo_done(todo_done_count()) && wrote_todos;
+        let informative = edited_this_turn || learned || todo_progress;
+        stall.observe(informative);
+
+        // Only new KNOWLEDGE ends a signature-divergence episode. An edit alone cannot: a repeated
+        // identical destructive call reports success each time and must still hard-stop. Its first
+        // novel result does clear the latch; subsequent identical bodies do not.
+        if learned || todo_progress {
             nudged_sigs.clear();
         }
-        if unproductive_streak >= STUCK_STOP_STREAK {
+
+        // Stop only after a warning has already been given and another turn still adds no evidence.
+        // There is no separate hard turn-count threshold: genuine evidence resets the episode.
+        if stall.should_stop() {
+            let final_text = synthesize_final(
+                &chat,
+                messages,
+                "Your recent attempts stopped producing new information. Give your best answer now \
+                 from what you already established — including the cause you identified, if any — \
+                 and say explicitly what is unverified or unfinished.",
+            )
+            .await;
             return Ok(AgentOutcome {
-                final_text: turn.content,
+                final_text,
                 iters: iter + 1,
                 stop: StopReason::Divergence,
             });
         }
-        if unproductive_streak >= STUCK_NUDGE_STREAK && !stuck_nudged {
-            stuck_nudged = true;
+        if stall.should_nudge() {
+            stall.mark_nudged();
             push_nudge(
                 messages,
                 NUDGE_STUCK,
-                "Several turns in a row made no progress (failing, or repeating calls that return \
-                 nothing new). STOP retrying variations. Re-read the file to copy exact text, use \
-                 file_write to create or fully overwrite a file (never blank a file with shell), \
-                 verify the real state, or explain what is blocking you.",
+                "Recent turns added no new evidence (no new result, failure class, completed todo, \
+                 or successful edit). STOP retrying variations. Re-read the exact state, take a \
+                 genuinely different approach, or explain what is blocking you.",
             );
         }
 
@@ -1847,30 +1851,43 @@ where
         // ensures Done-gate continues cannot bypass the policy or fall through to synthesis early.
     }
 
-    // MAXITERS (W9): don't abandon the task with no answer. Spend ONE tool-free call for a best-
-    // effort final answer, built on a THROWAWAY clone so the real `messages` is never mutated before
-    // the call (no rollback needed, TAIL invariant intact); empty tool defs push a prose answer.
-    // Degrades to None on any chat error — never worse than the old behavior.
-    let final_text = {
-        let mut synth = messages.clone();
-        synth.push(Message::user(
-            "You have reached the step limit and cannot call any more tools. Summarize what you \
-             accomplished and give your best final answer now from what you already have; \
-             explicitly flag anything you could not verify or finish.",
-        ));
-        match chat(synth, Vec::new()).await {
-            Ok(t) => t.content.filter(|s| !s.trim().is_empty()),
-            Err(_) => None,
-        }
-    };
-    if let Some(ref s) = final_text {
-        messages.push(Message::assistant(s.clone()));
-    }
+    let final_text = synthesize_final(
+        &chat,
+        messages,
+        "You have reached the step limit and cannot call any more tools. Summarize what you \
+         accomplished and give your best final answer now from what you already have; explicitly \
+         flag anything you could not verify or finish.",
+    )
+    .await;
     Ok(AgentOutcome {
         final_text,
         iters: iter,
         stop: StopReason::MaxIters,
     })
+}
+
+/// Spend one tool-free call on a best-effort answer. The reason prompt lives only on a throwaway
+/// clone; only a non-empty answer is appended to real history, preserving tool-call pairing.
+async fn synthesize_final<F, Fut>(
+    chat: &F,
+    messages: &mut Vec<Message>,
+    why: &str,
+) -> Option<String>
+where
+    F: Fn(Vec<Message>, Vec<ToolDef>) -> Fut,
+    Fut: Future<Output = Result<ChatTurn>>,
+{
+    let mut synth = messages.clone();
+    synth.push(Message::user(why));
+    let answer = chat(synth, Vec::new())
+        .await
+        .ok()
+        .and_then(|turn| turn.content)
+        .filter(|text| !text.trim().is_empty());
+    if let Some(ref text) = answer {
+        messages.push(Message::assistant(text.clone()));
+    }
+    answer
 }
 
 /// Hard cap on concurrent tool executions in a parallel run. Conservative for a single-binary
@@ -2045,6 +2062,10 @@ async fn execute_calls(
                         Some(denied) => denied,
                         None => {
                             let effect = tool.workspace_effect(args);
+                            // WHERE the write lands (a directory), when the tool names a path. The
+                            // checkpoint gate below discovers the repository from here rather than
+                            // from cwd; see the comment at its `save_protected_change_in` call.
+                            let target_dir = tool.workspace_target(args);
                             let lease_error = if writer_lease.is_none()
                                 && (matches!(
                                     effect,
@@ -2083,19 +2104,24 @@ async fn execute_calls(
                                 Some(error)
                             } else if skip_pre_checkpoint {
                                 None
-                            } else if matches!(
-                                effect,
-                                crate::agent::tools::WorkspaceEffect::External
-                            ) {
-                                Some(
-                                    "error: protected change targets a path outside the current repository; Time Machine cannot guarantee rewind coverage. Narrow the path or run it manually with an external backup."
-                                        .to_string(),
-                                )
                             } else if cfg.auto_checkpoint
                                 && !*auto_checkpointed
-                                && effect.needs_checkpoint()
+                                && (effect.needs_checkpoint() || target_dir.is_some())
                             {
-                                match crate::features::timemachine::save_protected_change("before agent edits") {
+                                // Discover the work tree from WHERE THE WRITE LANDS, not from the
+                                // process's cwd. The two differ constantly — a session launched from
+                                // the home directory editing `Desktop/proj/src/x.js` — and asking the
+                                // wrong one produced both of this turn's failures: no repo at cwd
+                                // meant `External`, whose old arm refused the call outright with
+                                // "narrow the path" (meaningless when the sibling project IS the
+                                // target; and because the refusal was DETERMINISTIC the model
+                                // retried until the divergence guard killed the run), while the
+                                // fallback advice was to `git init` — in the user's HOME DIRECTORY,
+                                // with the real `.git` sitting one level down. Asked from the target
+                                // instead, that same write is an ordinary in-repo edit with full
+                                // rewind coverage. `None` (no path named, e.g. `shell_run`) keeps
+                                // the cwd-relative behavior.
+                                match crate::features::timemachine::save_protected_change_in("before agent edits", target_dir.as_deref()) {
                                     Ok(None) => {
                                         // Two benign shapes, two honest messages: "not a repo" and
                                         // "no git executable" behave the same (checkpoints off, the
@@ -2861,6 +2887,128 @@ fn is_two_cycle(recent: &std::collections::VecDeque<String>, s0: &str) -> bool {
     s0 == s2.as_str() && s1 == s3 && s0 != s1.as_str()
 }
 
+/// Evidence observed during one agent run. `flat` counts only consecutive turns that added no key;
+/// it is not a failure/iteration budget. A warning is required before an evidence-flat stop.
+struct StallLedger {
+    success: std::collections::HashSet<u64>,
+    failures: std::collections::HashSet<u64>,
+    flat: usize,
+    nudged: bool,
+    todo_done: usize,
+}
+
+impl StallLedger {
+    fn new(todo_done: usize) -> Self {
+        Self {
+            success: std::collections::HashSet::new(),
+            failures: std::collections::HashSet::new(),
+            flat: 0,
+            nudged: false,
+            todo_done,
+        }
+    }
+
+    fn note_success(&mut self, body: &str) -> bool {
+        self.success.insert(hash_str(body))
+    }
+
+    fn note_failure(&mut self, tool: &str, body: &str) -> bool {
+        self.failures
+            .insert(hash_str(&format!("{tool}\0{}", error_class(body))))
+    }
+
+    fn note_todo_done(&mut self, now: usize) -> bool {
+        let advanced = now > self.todo_done;
+        self.todo_done = now;
+        advanced
+    }
+
+    fn observe(&mut self, informative: bool) {
+        if informative {
+            self.flat = 0;
+            self.nudged = false;
+        } else {
+            self.flat += 1;
+        }
+    }
+
+    fn should_nudge(&self) -> bool {
+        self.flat >= FLAT_TURNS_BEFORE_NUDGE && !self.nudged
+    }
+
+    fn should_stop(&self) -> bool {
+        self.flat > FLAT_TURNS_BEFORE_NUDGE && self.nudged
+    }
+
+    fn mark_nudged(&mut self) {
+        self.nudged = true;
+    }
+
+    fn is_stalled(&self) -> bool {
+        self.flat >= FLAT_TURNS_BEFORE_NUDGE
+    }
+
+    fn forget_successes(&mut self) {
+        self.success.clear();
+    }
+}
+
+fn todo_done_count() -> usize {
+    todo::snapshot()
+        .iter()
+        .filter(|item| item.status == todo::Status::Done)
+        .count()
+}
+
+/// Collapse volatile details while preserving the actual error wording. Runs of digits, hex IDs,
+/// and path-shaped tokens vary across retries without representing a different cause.
+fn error_class(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '0'
+            && i + 2 < chars.len()
+            && matches!(chars[i + 1], 'x' | 'X')
+            && chars[i + 2].is_ascii_hexdigit()
+        {
+            out.push_str("<hex>");
+            i += 2;
+            while i < chars.len() && chars[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            continue;
+        }
+        if chars[i].is_ascii_digit() {
+            out.push('#');
+            i += 1;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            continue;
+        }
+        if path_token_start(&chars, i) {
+            out.push_str("<path>");
+            while i < chars.len() && !chars[i].is_whitespace() && !matches!(chars[i], ',' | ';') {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(chars[i].to_ascii_lowercase());
+        i += 1;
+    }
+    out
+}
+
+fn path_token_start(chars: &[char], i: usize) -> bool {
+    chars[i] == '/'
+        || chars[i] == '\\'
+        || (i + 2 < chars.len()
+            && chars[i].is_ascii_alphabetic()
+            && chars[i + 1] == ':'
+            && matches!(chars[i + 2], '/' | '\\'))
+}
+
 /// Stable in-process hash of a string (std only). Values live only within one run, so
 /// DefaultHasher's lack of cross-version stability is irrelevant; storing u64 bounds memory.
 fn hash_str(s: &str) -> u64 {
@@ -3445,7 +3593,7 @@ const NUDGE_CONTEXT: &str = "Context is nearly full";
 const NUDGE_DIVERGENCE: &str = "You repeated the same tool call(s)";
 const NUDGE_STEP_LIMIT: &str = "You are nearing the step limit";
 const NUDGE_TODO: &str = "Current task list";
-const NUDGE_STUCK: &str = "Several turns in a row made no progress";
+const NUDGE_STUCK: &str = "Recent turns added no new evidence";
 /// P0.1 incomplete-todo gate inject (user role — hard block path, not a soft system nudge).
 const TODO_POKE_PREFIX: &str = "[todo-poke]";
 /// P0.2 confidence-spike gate inject.
@@ -3533,20 +3681,19 @@ fn should_auto_extend(
     cap: usize,
     auto_extend_to: usize,
     extended: bool,
-    unproductive_streak: usize,
+    stalled: bool,
     divergence_open: bool,
 ) -> bool {
     initial_cap > 0
         && cap >= initial_cap
         && !extended
         && auto_extend_to > cap
-        && unproductive_streak < STUCK_NUDGE_STREAK
+        && !stalled
         && !divergence_open
 }
 
-/// Consecutive unproductive turns before the thrash guard nudges, then stops (see the loop).
-const STUCK_NUDGE_STREAK: usize = 3;
-const STUCK_STOP_STREAK: usize = 5;
+/// Two evidence-flat turns trigger the nudge; any evidence resets the flat episode.
+const FLAT_TURNS_BEFORE_NUDGE: usize = 2;
 
 /// Recent executed-turn signatures retained for divergence detection. The detectors inspect only
 /// the last 1 (immediate repeat, A,A) and last 3 (2-cycle, A,B,A,B); a few extra slots are cheap
@@ -4146,6 +4293,53 @@ mod tests {
         }
     }
 
+    /// Fails every call with the same template plus a varying number. The evidence classifier must
+    /// collapse these into ONE failure class — changing volatile detail is not diagnosis progress.
+    struct NumberedFailTool;
+    impl Tool for NumberedFailTool {
+        fn name(&self) -> &str {
+            "numbered_fail"
+        }
+        fn description(&self) -> &str {
+            "always fails with volatile numeric detail"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{"n":{"type":"string"}}})
+        }
+        fn execute(&self, args: &serde_json::Value) -> Result<String> {
+            let n = args.get("n").and_then(|v| v.as_str()).unwrap_or("?");
+            anyhow::bail!("cause {n} ruled out")
+        }
+    }
+
+    /// A destructive tool whose target sits OUTSIDE the current repository — the shape of a write to
+    /// a sibling project (`../aizen_web/x`) now that `builtin::confine` no longer enforces a
+    /// workspace boundary. Returns a sentinel iff the body actually ran.
+    struct ExternalWriteTool;
+    impl Tool for ExternalWriteTool {
+        fn name(&self) -> &str {
+            "external_write"
+        }
+        fn description(&self) -> &str {
+            "destructive, outside the repo"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{}})
+        }
+        fn is_destructive(&self) -> bool {
+            true
+        }
+        fn workspace_effect(
+            &self,
+            _args: &serde_json::Value,
+        ) -> crate::agent::tools::WorkspaceEffect {
+            crate::agent::tools::WorkspaceEffect::External
+        }
+        fn execute(&self, _args: &serde_json::Value) -> Result<String> {
+            Ok("wrote the sibling project".into())
+        }
+    }
+
     /// A stand-in for the real `shell_run` so the `cmd_guard` floor (keyed on the "shell_run" name)
     /// can be exercised. Returns a sentinel iff it actually ran (i.e. wasn't blocked/declined).
     struct ShellStub;
@@ -4313,6 +4507,8 @@ mod tests {
         r.register(Box::new(ConstTool));
         r.register(Box::new(SelfErrTool));
         r.register(Box::new(TickTool(std::sync::atomic::AtomicUsize::new(0))));
+        r.register(Box::new(ExternalWriteTool));
+        r.register(Box::new(NumberedFailTool));
         r
     }
 
@@ -4482,21 +4678,14 @@ mod tests {
 
     #[test]
     fn auto_extension_policy_requires_a_real_initial_cap_and_convergence() {
-        assert!(should_auto_extend(3, 3, 6, false, 0, false));
-        assert!(!should_auto_extend(0, 0, 6, false, 0, false));
-        assert!(!should_auto_extend(3, 3, 3, false, 0, false));
-        assert!(!should_auto_extend(3, 3, 6, true, 0, false));
-        assert!(!should_auto_extend(
-            3,
-            3,
-            6,
-            false,
-            STUCK_NUDGE_STREAK,
-            false
-        ));
-        assert!(!should_auto_extend(3, 3, 6, false, 0, true));
+        assert!(should_auto_extend(3, 3, 6, false, false, false));
+        assert!(!should_auto_extend(0, 0, 6, false, false, false));
+        assert!(!should_auto_extend(3, 3, 3, false, false, false));
+        assert!(!should_auto_extend(3, 3, 6, true, false, false));
+        assert!(!should_auto_extend(3, 3, 6, false, true, false));
+        assert!(!should_auto_extend(3, 3, 6, false, false, true));
         assert!(
-            !should_auto_extend(3, 6, 8, true, 0, false),
+            !should_auto_extend(3, 6, 8, true, false, false),
             "extension is one-shot"
         );
     }
@@ -4734,15 +4923,13 @@ mod tests {
             auto_extend_to: 20,
             ..cfg()
         };
+        // The LAST scripted turn is consumed by the synthesis call, not the loop.
         let turns = vec![
             tool_turn("fail", r#"{"n":"1"}"#),
             tool_turn("fail", r#"{"n":"2"}"#),
             tool_turn("fail", r#"{"n":"3"}"#),
             tool_turn("fail", r#"{"n":"4"}"#),
-            tool_turn("fail", r#"{"n":"5"}"#),
-            tool_turn("fail", r#"{"n":"6"}"#),
-            tool_turn("fail", r#"{"n":"7"}"#),
-            final_turn("should not reach"),
+            final_turn("synth-answer"),
         ];
         let out = run_agent(scripted(turns), &c, &r, "sys", "task")
             .await
@@ -4752,8 +4939,179 @@ mod tests {
             StopReason::Divergence,
             "thrash guard must stop the all-failing flail"
         );
-        // Stops on the STUCK_STOP_STREAK-th consecutive unproductive turn, not at the cap of 20.
-        assert_eq!(out.iters, STUCK_STOP_STREAK);
+        // Turn 1's failure class is evidence; turns 2-3 add none (the warning fires on 3); turn 4
+        // still adds none and stops. Far below the cap of 20 — and it stops WITH an answer.
+        assert_eq!(out.iters, 4);
+        assert_eq!(
+            out.final_text.as_deref(),
+            Some("synth-answer"),
+            "an evidence-flat stop must still deliver the model's best answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_classes_from_distinct_tools_allow_diagnosis_to_finish() {
+        // Distinct tool/class failures are new evidence. Repeating the same template with only a
+        // changed number is not; error_class deliberately collapses that volatile detail.
+        let r = registry();
+        let c = AgentConfig {
+            max_iters: 20,
+            auto_extend_to: 20,
+            ..cfg()
+        };
+        let turns = vec![
+            tool_turn("fail", r#"{"n":"1"}"#),
+            tool_turn("nope", r#"{"path":"C:\\work\\a.rs"}"#),
+            tool_turn("selferr", r#"{"i":"2"}"#),
+            tool_turn("echo", r#"{"text":"cause established"}"#),
+            final_turn("found the cause and fixed it"),
+        ];
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(
+            out.final_text.as_deref(),
+            Some("found the cause and fixed it")
+        );
+    }
+
+    #[tokio::test]
+    async fn numeric_error_variation_is_not_fake_evidence() {
+        let r = registry();
+        let c = AgentConfig {
+            max_iters: 40,
+            auto_extend_to: 40,
+            ..cfg()
+        };
+        // Same tool, same error TEMPLATE, only the number varies — `error_class` collapses these to
+        // one class, so turn 2 onward adds no evidence. This is the case a body-hash ledger would
+        // have mistaken for a diagnosis chain and rewarded with more room.
+        let mut turns: Vec<_> = (1..=4)
+            .map(|n| tool_turn("numbered_fail", &format!(r#"{{"n":"{n}"}}"#)))
+            .collect();
+        turns.push(final_turn("synth-answer"));
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(out.stop, StopReason::Divergence);
+        assert_eq!(out.iters, 4);
+        assert_eq!(out.final_text.as_deref(), Some("synth-answer"));
+    }
+
+    #[tokio::test]
+    async fn identical_error_with_shuffled_args_stops_promptly_with_answer() {
+        let r = registry();
+        let c = AgentConfig {
+            max_iters: 20,
+            auto_extend_to: 20,
+            ..cfg()
+        };
+        let mut turns: Vec<_> = (1..=4)
+            .map(|n| tool_turn("fail", &format!(r#"{{"n":"{n}"}}"#)))
+            .collect();
+        turns.push(final_turn("synth-answer"));
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(out.stop, StopReason::Divergence);
+        assert_eq!(out.iters, 4);
+        assert_eq!(out.final_text.as_deref(), Some("synth-answer"));
+    }
+
+    #[tokio::test]
+    async fn every_stop_path_yields_an_answer() {
+        // THE invariant this change exists for. Running out of budget used to synthesize an answer
+        // while being stopped by a guard returned `turn.content` — which on a tool-call turn is
+        // almost always None, so the user got "stopped after N steps" and nothing else, even when
+        // the model had just named the cause. Both Divergence routes must now reach an answer.
+        let r = registry();
+        let c = AgentConfig {
+            max_iters: 20,
+            auto_extend_to: 20,
+            ..cfg()
+        };
+
+        // Route 1: the SIGNATURE latch (mod.rs pre-execute site). Returns before executing the
+        // repeat, so the synthesis must run on a throwaway clone to keep history pairing valid.
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let same = || tool_turn("echo", r#"{"text":"x"}"#);
+        let out = run_agent_loop(
+            scripted(vec![same(), same(), same(), final_turn("synth-answer")]),
+            &c,
+            &r,
+            &mut messages,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.stop, StopReason::Divergence, "signature route");
+        assert_eq!(
+            out.final_text.as_deref(),
+            Some("synth-answer"),
+            "the signature stop must still produce the model's answer"
+        );
+        // The synthesis PROMPT stays on the clone; only the answer is appended.
+        assert!(
+            !messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|t| t.contains("stopped producing new information"))),
+            "the synthesis prompt must never enter real history"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == "assistant" && m.content.as_deref() == Some("synth-answer")),
+            "the synthesized answer is appended for the caller"
+        );
+        assert_valid_history(&messages);
+
+        // Route 2: the EVIDENCE ledger (post-execute site) — distinct args, one repeated failure.
+        let mut turns: Vec<_> = (1..=4)
+            .map(|n| tool_turn("fail", &format!(r#"{{"n":"{n}"}}"#)))
+            .collect();
+        turns.push(final_turn("ledger-answer"));
+        let mut messages2 = vec![Message::system("sys"), Message::user("task")];
+        let out2 = run_agent_loop(scripted(turns), &c, &r, &mut messages2)
+            .await
+            .unwrap();
+        assert_eq!(out2.stop, StopReason::Divergence, "evidence route");
+        assert_eq!(
+            out2.final_text.as_deref(),
+            Some("ledger-answer"),
+            "the evidence stop must still produce the model's answer"
+        );
+        assert_valid_history(&messages2);
+    }
+
+    #[tokio::test]
+    async fn successful_edit_always_counts_as_evidence() {
+        // `delete` returns the CONSTANT body "deleted", so novelty-by-body can never reset the
+        // episode — only the fact that the disk changed can. A long run of real edits must not be
+        // mistaken for a stall. (Distinct args keep the signature latch out of it.)
+        let r = registry();
+        let c = AgentConfig {
+            approval_mode: crate::core::approval::ApprovalMode::Yolo,
+            max_iters: 20,
+            auto_extend_to: 20,
+            ..cfg()
+        };
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut turns: Vec<_> = (1..=6)
+            .map(|n| tool_turn("delete", &format!(r#"{{"d":"{n}"}}"#)))
+            .collect();
+        turns.push(final_turn("all edits landed"));
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::Done,
+            "a run of real edits with a constant result body must not be stopped as a stall"
+        );
+        assert_eq!(out.final_text.as_deref(), Some("all edits landed"));
     }
 
     #[tokio::test]
@@ -4815,12 +5173,16 @@ mod tests {
             StopReason::Divergence,
             "A,B,A,B oscillation must be caught"
         );
-        // EXACTLY 6: the 2-cycle detector stops on the 6th turn. If is_two_cycle were broken, only the
-        // thrash guard would act and it would stop at 7 (streak 5) — so this pins the detector, not the
-        // fallback. (Complemented by the is_two_cycle unit test below.)
-        assert_eq!(
-            out.iters, 6,
-            "the 2-cycle detector must stop at 6, not fall through to thrash at 7"
+        // An A,B,A,B echo oscillation replays bodies it has already seen, so the EVIDENCE guard now
+        // reaches the stop first (turn 5) — one turn before the 2-cycle signature detector would fire
+        // at 6. Both are correct verdicts on this script, so pin the bound rather than which mechanism
+        // won the race: an oscillation must die quickly, not run to the cap of 30. The detector itself
+        // is pinned directly by `is_two_cycle_detects_abab_only` (pure) and by
+        // `productive_poll_loop_not_stopped` (the false-positive side).
+        assert!(
+            out.iters <= 6,
+            "an oscillation must be stopped within a few turns, got {}",
+            out.iters
         );
     }
 
@@ -4974,8 +5336,8 @@ mod tests {
     async fn legit_reread_after_failed_edit_recovers() {
         let r = registry();
         // THE hardest trap: the system-prompt-sanctioned recovery — a failed edit, then a re-read
-        // (stale bytes) to copy exact text, then a SUCCESSFUL edit. Peak streak 2 < STUCK_NUDGE_STREAK,
-        // so NO nudge and NO stop — the recovery must never be punished.
+        // (stale bytes) to copy exact text, then a SUCCESSFUL edit. The fresh failure is evidence;
+        // the stale re-read is only the first flat turn, so no nudge fires before the edit resets it.
         let c = AgentConfig {
             approval_mode: crate::core::approval::ApprovalMode::Yolo,
             max_iters: 10,
@@ -5003,8 +5365,7 @@ mod tests {
             "legit re-read→retry recovery must not be punished"
         );
         assert_eq!(out.final_text.as_deref(), Some("recovered"));
-        // Peak streak is 2 (< STUCK_NUDGE_STREAK) and no signature repeats, so NO nudge of either
-        // kind must appear — the documented "not punished" property, now asserted.
+        // No two consecutive evidence-flat turns occur, so no nudge of either kind must appear.
         assert!(
             !messages.iter().any(|m| m.role == "system"
                 && m.content.as_deref().is_some_and(|c| {
@@ -5708,6 +6069,27 @@ mod tests {
             results[1].1.contains("boom"),
             "tool error fed back, got {:?}",
             results[1].1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_outside_the_repo_runs_instead_of_being_refused() {
+        // REGRESSION: the checkpoint stage used to REFUSE any `WorkspaceEffect::External` write
+        // ("protected change targets a path outside the current repository"), which silently
+        // reinstated the workspace boundary that `builtin::confine` documents as REMOVED — so a
+        // legitimate write to a sibling project (`../aizen_web/x`) was impossible, and because the
+        // refusal was deterministic the model retried it until the divergence guard killed the turn.
+        // The body must RUN; missing rewind coverage is reported, not enforced as a veto.
+        let r = registry();
+        let c = AgentConfig {
+            approval_mode: crate::core::approval::ApprovalMode::Yolo,
+            ..cfg()
+        };
+        let results = exec(&r, &[call("1", "external_write", "{}")], &c).await;
+        assert_eq!(
+            results,
+            vec![("1".to_string(), "wrote the sibling project".to_string())],
+            "an out-of-repo write must execute, not be refused by the checkpoint stage"
         );
     }
 
@@ -6784,6 +7166,40 @@ mod tests {
         let stats3 = clear_tool_results_to_floor(&mut msgs, 1, 1024, 0, 0);
         assert_eq!(stats3, ClearStats::default());
         assert_valid_history(&msgs);
+    }
+
+    #[test]
+    fn error_class_collapses_volatile_details() {
+        assert_eq!(error_class("line 42"), error_class("line 87"));
+        assert_eq!(error_class("cause 1"), error_class("cause 2"));
+        assert_ne!(error_class("not found"), error_class("permission denied"));
+        assert_eq!(
+            error_class(r#"failed at C:\work\src\main.rs:42"#),
+            error_class("failed at /work/src/main.rs:87")
+        );
+        assert_eq!(
+            error_class("request 0xdeadbeef"),
+            error_class("request 0x1234")
+        );
+    }
+
+    #[test]
+    fn stall_ledger_counts_edits_and_todo_progress_as_evidence() {
+        let mut ledger = StallLedger::new(0);
+        let first = ledger.note_success("same");
+        ledger.observe(first);
+        ledger.observe(false);
+        ledger.observe(false);
+        assert!(ledger.should_nudge());
+        ledger.mark_nudged();
+        assert!(!ledger.should_stop());
+        ledger.observe(false);
+        assert!(ledger.should_stop());
+        ledger.observe(true);
+        assert!(!ledger.should_stop());
+        assert!(ledger.note_todo_done(1));
+        ledger.observe(true);
+        assert_eq!(ledger.flat, 0);
     }
 
     #[test]

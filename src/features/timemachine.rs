@@ -1512,6 +1512,22 @@ pub fn is_repo() -> bool {
     RepoContext::current().is_ok()
 }
 
+/// The "no work tree here" message for a tool result, NAMING the directory that was searched.
+///
+/// Without the path these messages read as a claim about the project, and the user acts on that
+/// reading: told "not a git repository — no checkpoints (run `git init`)" while their project sat in
+/// `Desktop/mini_project/aizen_web` with a perfectly good `.git`, the only sensible conclusion is
+/// that aizen is broken — the actual fact was that the SESSION's cwd was `C:\Users\admin`, a
+/// different directory entirely. Naming it makes the difference visible at a glance and stops the
+/// advice from being aimed at the wrong tree (running `git init` in a home directory is not a small
+/// mistake to talk someone into). `git init` is only suggested where it could be right.
+fn no_repo_here(consequence: &str) -> String {
+    let where_ = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "the current directory".to_string());
+    format!("error: {where_} is not inside a git repository — {consequence}")
+}
+
 /// "Checkpoints are simply off here" — either the directory isn't a repo, or there is no git
 /// executable at all. Both must degrade to no-checkpoint instead of failing the caller: the
 /// git-missing case used to propagate as a hard error, and because the protected-edit gate runs
@@ -1541,7 +1557,24 @@ pub fn preflight_protected_change() -> Result<bool> {
 /// `WorkspaceWriterLease` across this call and the subsequent tool body, closing the old
 /// preflight→save→mutation gap without acquiring a second workspace lock.
 pub fn save_protected_change(label: &str) -> Result<Option<Snapshot>> {
-    match RepoContext::current() {
+    save_protected_change_in(label, None)
+}
+
+/// As [`save_protected_change`], but discovering the repository from `start` — the directory the
+/// pending write will actually land in — instead of the process's cwd.
+///
+/// The two are different questions, and conflating them produced a wrong answer with dangerous
+/// advice: a session launched from `C:\Users\admin` editing `Desktop/mini_project/aizen_web/...`
+/// asked "is my CWD a repo?", got no, and told the user to `git init` — in their HOME DIRECTORY,
+/// while the project one level down had a perfectly good `.git`. The right question is whether the
+/// thing being changed is in a work tree, so ask git from there. `None` preserves the old
+/// cwd-relative behavior for callers with no particular path (`shell_run`, opaque effects).
+pub fn save_protected_change_in(label: &str, start: Option<&Path>) -> Result<Option<Snapshot>> {
+    let found = match start {
+        Some(dir) => RepoContext::discover(dir),
+        None => RepoContext::current(),
+    };
+    match found {
         Ok(ctx) => save_in(&ctx, label, true, None).map(Some),
         Err(e) if benign_no_checkpoint(&e) => Ok(None),
         Err(e) => Err(e),
@@ -2480,9 +2513,10 @@ impl crate::agent::tools::Tool for Checkpoint {
     }
     fn execute(&self, args: &serde_json::Value) -> Result<String> {
         if !is_repo() {
-            return Ok(
-                "error: not a git repository — checkpoints need git (run `git init`)".to_string(),
-            );
+            return Ok(no_repo_here(
+                "checkpoints need one. If the files you mean are in a project elsewhere, work from \
+                 that directory; `git init` here only helps if THIS directory is the project.",
+            ));
         }
         let label = args
             .get("label")
@@ -2547,7 +2581,7 @@ impl crate::agent::tools::Tool for CheckpointRewind {
     }
     fn execute(&self, args: &serde_json::Value) -> Result<String> {
         if !is_repo() {
-            return Ok("error: not a git repository — nothing to rewind".to_string());
+            return Ok(no_repo_here("there is nothing to rewind"));
         }
         let raw = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
         let Some(target) = RewindTarget::parse(raw) else {
@@ -2616,7 +2650,10 @@ impl crate::agent::tools::Tool for CheckpointList {
     }
     fn execute(&self, _args: &serde_json::Value) -> Result<String> {
         if !is_repo() {
-            return Ok("error: not a git repository — no checkpoints (run `git init`)".to_string());
+            return Ok(no_repo_here(
+                "there are no checkpoints here. If the project you mean is elsewhere, work from \
+                 that directory; `git init` only helps if THIS directory is meant to be the project",
+            ));
         }
         let (snaps, cursor) = timeline()?;
         if snaps.is_empty() {
@@ -2683,7 +2720,7 @@ impl crate::agent::tools::Tool for CheckpointRestore {
     }
     fn execute(&self, args: &serde_json::Value) -> Result<String> {
         if !is_repo() {
-            return Ok("error: not a git repository — nothing to restore".to_string());
+            return Ok(no_repo_here("there is nothing to restore here"));
         }
         let Some(id) = args.get("id").and_then(|v| v.as_u64()) else {
             return Ok(
@@ -2816,9 +2853,10 @@ impl crate::agent::tools::Tool for CheckpointDiff {
     }
     fn execute(&self, args: &serde_json::Value) -> Result<String> {
         if !is_repo() {
-            return Ok(
-                "error: not a git repository — no timeline to diff (run `git init`)".to_string(),
-            );
+            return Ok(no_repo_here(
+                "there is no timeline to diff. If the project you mean lives elsewhere, run this \
+                 from there; `git init` only helps if THIS directory should be a repository",
+            ));
         }
         let side = |key: &str| -> Option<DiffSide> {
             args.get(key)
