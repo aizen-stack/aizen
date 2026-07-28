@@ -15,7 +15,7 @@
 //! Output coordination: a single render `Mutex` serialises every terminal write. The agent's
 //! streaming output and tool traces go through [`emit`]/[`emit_line`] (which restore the saved output
 //! cursor, print, re-save, then repaint the box); the input thread repaints the box on each keypress.
-//! When the TUI isn't active (the one-shot `ng chat`/`agent` subcommands, pipes, CI) every entry
+//! When the TUI isn't active (the one-shot `aizen chat`/`agent` subcommands, pipes, CI) every entry
 //! point degrades to a plain `print!` so nothing changes for non-interactive use.
 
 use crate::ui::theme;

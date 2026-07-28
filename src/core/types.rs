@@ -1,6 +1,6 @@
 //! OpenAI-compatible chat-completions wire types (the hermes-style provider-agnostic format).
 //! We deliberately mirror the OpenAI `/chat/completions` schema so the CLI can point at any
-//! OpenAI-compatible endpoint (OpenAI, OpenRouter, a local model, or the NextGen gateway later).
+//! OpenAI-compatible endpoint (OpenAI, OpenRouter, a local model, or the Aizen gateway later).
 
 use serde::{Deserialize, Serialize};
 

@@ -456,7 +456,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("ng-verify-{tag}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("aizen-verify-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -588,13 +588,13 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
 
     #[test]
     fn custom_verify_requires_trust_gate() {
-        // An untrusted repo's verify.json must be INERT. Sandbox NEXTGEN_HOME so the developer's
+        // An untrusted repo's verify.json must be INERT. Sandbox AIZEN_HOME so the developer's
         // real trust store (which may trust THIS repo) can't leak into the assertion.
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let home = temp_dir("custom-untrusted-home");
-        std::env::set_var("NEXTGEN_HOME", &home);
+        std::env::set_var("AIZEN_HOME", &home);
         let d = temp_dir("custom-untrusted");
         std::fs::create_dir_all(d.join(".aizen")).unwrap();
         std::fs::write(
@@ -604,7 +604,7 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
         .unwrap();
         std::fs::write(d.join("Cargo.toml"), "[package]").unwrap();
         let cmds = detect_verify_commands(&d);
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         assert_eq!(
             cmds,
             vec![VerifyCommand::Cargo],

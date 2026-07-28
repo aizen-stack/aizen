@@ -705,18 +705,19 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-secretary-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("aizen-secretary-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // create_dir_all BEFORE any anchor/slug is computed: canonicalize() of a missing dir fails
         // and yields a different key than once it exists.
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("NEXTGEN_HOME", &dir);
-        std::env::set_var("NG_PROJECT_ROOT", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
+        std::env::set_var("AIZEN_PROJECT_ROOT", &dir);
         crate::memory::pending::clear();
         let out = f();
         crate::memory::pending::clear();
-        std::env::remove_var("NG_PROJECT_ROOT");
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_PROJECT_ROOT");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
         out
     }

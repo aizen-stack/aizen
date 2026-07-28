@@ -32,7 +32,7 @@
 //! is gated by an *enable allowlist* (`~/.aizen/agents/enabled.txt`) — see [`prompt_index`]. The
 //! allowlist gates *advertising only*; [`load`] resolves ANY installed slug, enabled or not.
 
-use crate::core::config::{nextgen_home, project_nextgen_dir, project_root};
+use crate::core::config::{aizen_home, project_aizen_dir, project_root};
 use crate::memory::frontmatter;
 use crate::skills::sanitize_name;
 use anyhow::{Context, Result};
@@ -145,7 +145,7 @@ pub fn parse_markdown(content: &str, fallback_name: &str) -> AgentDef {
 // ── path helpers + precedence ──────────────────────────────────────────────────
 
 /// The user's home dir (USERPROFILE then HOME). `~/.claude` is a SIBLING of `~/.aizen`, computed
-/// independently of `nextgen_home()` (which `AIZEN_HOME`/`NEXTGEN_HOME` can relocate). Tests pin
+/// independently of `aizen_home()` (which `AIZEN_HOME`/`AIZEN_HOME` can relocate). Tests pin
 /// USERPROFILE/HOME so `~/.claude` lands in the sandbox.
 fn user_home_dir() -> PathBuf {
     std::env::var("USERPROFILE")
@@ -162,7 +162,7 @@ pub fn claude_agents_dir() -> PathBuf {
 }
 /// `~/.aizen/agents` — the personal (HOME) agent dir; installs write here.
 pub fn agents_dir() -> PathBuf {
-    nextgen_home().join("agents")
+    aizen_home().join("agents")
 }
 /// `<repo>/.claude/agents` — ecosystem read-compat, project-local.
 pub fn project_claude_agents_dir() -> PathBuf {
@@ -170,7 +170,7 @@ pub fn project_claude_agents_dir() -> PathBuf {
 }
 /// `<repo>/.aizen/agents` — aizen-native, project-local (highest precedence).
 pub fn project_agents_dir() -> PathBuf {
-    project_nextgen_dir().join("agents")
+    project_aizen_dir().join("agents")
 }
 
 /// The four source dirs in ASCENDING precedence (later wins on a slug collision).
@@ -598,27 +598,27 @@ mod tests {
     use super::*;
 
     /// Pin EVERY home/project seam into an isolated sandbox so all four source dirs are sandboxed
-    /// (incl. `~/.claude`, which is derived from USERPROFILE/HOME, not `nextgen_home()`). Serialized
+    /// (incl. `~/.claude`, which is derived from USERPROFILE/HOME, not `aizen_home()`). Serialized
     /// with the shared env lock so it can't race other env-mutating tests.
     fn with_sandbox<T>(tag: &str, f: impl FnOnce(&Path) -> T) -> T {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let root = std::env::temp_dir().join(format!("ng-agents-{tag}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("aizen-agents-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::env::set_var("USERPROFILE", &root);
         std::env::set_var("HOME", &root);
         std::env::set_var("AIZEN_HOME", root.join(".aizen"));
-        std::env::set_var("NEXTGEN_HOME", root.join(".aizen"));
-        std::env::set_var("NG_PROJECT_ROOT", root.join("proj"));
+        std::env::set_var("AIZEN_HOME", root.join(".aizen"));
+        std::env::set_var("AIZEN_PROJECT_ROOT", root.join("proj"));
         let out = f(&root);
         for v in [
             "USERPROFILE",
             "HOME",
             "AIZEN_HOME",
-            "NEXTGEN_HOME",
-            "NG_PROJECT_ROOT",
+            "AIZEN_HOME",
+            "AIZEN_PROJECT_ROOT",
         ] {
             std::env::remove_var(v);
         }

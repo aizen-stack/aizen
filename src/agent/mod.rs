@@ -591,7 +591,7 @@ pub enum StopReason {
 
 #[derive(Debug)]
 pub struct AgentOutcome {
-    /// The model's final answer (already streamed to stdout by `ng agent`; consumed by the
+    /// The model's final answer (already streamed to stdout by `aizen agent`; consumed by the
     /// programmatic callers — `main.rs` one-shot, workflow/task sub-agent collection).
     pub final_text: Option<String>,
     pub iters: usize,
@@ -650,7 +650,7 @@ where
 
 /// Like [`run_agent_loop`] but with MID-LOOP auto-compaction: when history crosses
 /// `cfg.compact_at_pct` of the window, `summarize` (a NON-streaming model call returning the summary
-/// text) compresses older turns in place. For multi-turn callers (e.g. `ng serve`) whose sessions
+/// text) compresses older turns in place. For multi-turn callers (e.g. `aizen serve`) whose sessions
 /// can outgrow the window within a single driven turn. Compaction needs ≥2 user turns to cut, so a
 /// single-task run (one user turn) falls back to tool-result clearing + the wrap-up nudge.
 pub async fn run_agent_loop_compacting<F, Fut, S, SFut>(
@@ -3863,7 +3863,7 @@ pub fn truncate_result(s: &str, max: usize) -> String {
 
 /// Interactive approval for a destructive op. Non-TTY → safe-deny (mirrors the memory
 /// subsystem's `confirm_core`): scripts/CI never auto-run a destructive tool. EXCEPTION: under the
-/// `ng serve` daemon (non-TTY but Telegram-connected), route the approval to the owner's phone
+/// `aizen serve` daemon (non-TTY but Telegram-connected), route the approval to the owner's phone
 /// (inline ✓/✗) instead of denying — this is the unattended "approve rm -rf from your phone" path.
 fn approve(tool: &str, args: &serde_json::Value) -> bool {
     use std::io::{IsTerminal, Write};
@@ -5353,7 +5353,7 @@ mod tests {
             final_turn("recovered"),
         ]);
         // Same home-stability need as the divergence test above: the delete call's writer lease
-        // resolves its lock path through `nextgen_home()`, and a concurrent sandbox flip can fail
+        // resolves its lock path through `aizen_home()`, and a concurrent sandbox flip can fail
         // it — turning the "successful edit resets everything" step into a failure.
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
@@ -5398,7 +5398,7 @@ mod tests {
             final_turn("unreached"),
         ];
         // Serialize with home-MUTATING sandbox tests: the destructive call's writer lease resolves
-        // its lock path through `nextgen_home()` AT ACQUIRE TIME, so a concurrent sandbox flip
+        // its lock path through `aizen_home()` AT ACQUIRE TIME, so a concurrent sandbox flip
         // (AIZEN_HOME repointed / tree deleted) can fail call #1 — then the first SUCCESS lands on
         // the nudge iteration, its novel content clears the divergence latch once, and the
         // hard-stop drifts 3 → 4. The exact-iteration assertion below needs a stable home.
@@ -8132,21 +8132,21 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let root = std::env::temp_dir().join(format!("ng-tlp-{tag}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("aizen-tlp-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::env::set_var("USERPROFILE", &root);
         std::env::set_var("HOME", &root);
         std::env::set_var("AIZEN_HOME", root.join(".aizen"));
-        std::env::set_var("NEXTGEN_HOME", root.join(".aizen"));
-        std::env::set_var("NG_PROJECT_ROOT", root.join("proj"));
+        std::env::set_var("AIZEN_HOME", root.join(".aizen"));
+        std::env::set_var("AIZEN_PROJECT_ROOT", root.join("proj"));
         let out = f(&root);
         for v in [
             "USERPROFILE",
             "HOME",
             "AIZEN_HOME",
-            "NEXTGEN_HOME",
-            "NG_PROJECT_ROOT",
+            "AIZEN_HOME",
+            "AIZEN_PROJECT_ROOT",
         ] {
             std::env::remove_var(v);
         }

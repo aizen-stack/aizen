@@ -52,17 +52,15 @@ const COMMAND_COUNT: usize = 18;
 
 // ── block-art title ────────────────────────────────────────────────────────────
 
-/// 5-row block glyphs (each exactly 5 columns) for the letters in AIZEN (+ NEXTGEN legacy set).
+/// 5-row block glyphs (each exactly 5 columns) for the letters in AIZEN — the only wordmark
+/// [`push_title`] is ever called with. Anything else renders as blanks by design.
 fn glyph(c: char) -> [&'static str; 5] {
     match c {
         'A' => [" ███ ", "█   █", "█████", "█   █", "█   █"],
         'I' => ["█████", "  █  ", "  █  ", "  █  ", "█████"],
         'Z' => ["█████", "   █ ", "  █  ", " █   ", "█████"],
-        'N' => ["█   █", "██  █", "█ █ █", "█  ██", "█   █"],
         'E' => ["█████", "█    ", "████ ", "█    ", "█████"],
-        'X' => ["█   █", " █ █ ", "  █  ", " █ █ ", "█   █"],
-        'T' => ["█████", "  █  ", "  █  ", "  █  ", "  █  "],
-        'G' => [" ████", "█    ", "█  ██", "█   █", " ████"],
+        'N' => ["█   █", "██  █", "█ █ █", "█  ██", "█   █"],
         _ => ["     ", "     ", "     ", "     ", "     "],
     }
 }

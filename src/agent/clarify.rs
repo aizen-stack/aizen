@@ -3,7 +3,7 @@
 //! answers in their next message.
 //!
 //! Why a yield (not a blocking stdin read): under the sticky TUI a background thread owns stdin,
-//! so a tool that `read_line`s would fight it (and deadlock / eat keystrokes); under `ng serve`
+//! so a tool that `read_line`s would fight it (and deadlock / eat keystrokes); under `aizen serve`
 //! there is no terminal at all. So instead of READING input, the tool RECORDS the question in a
 //! process-global cell and the agent loop, on seeing it, stops with `StopReason::AwaitingInput`.
 //! Whatever input mechanism is already in play — the sticky input box, the plain REPL readline, or

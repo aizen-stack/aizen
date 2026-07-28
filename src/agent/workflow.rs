@@ -1,4 +1,4 @@
-//! `ng workflow <spec.json>` — the lean orchestration layer (fan-out + mixture-of-agents synth).
+//! `aizen workflow <spec.json>` — the lean orchestration layer (fan-out + mixture-of-agents synth).
 //!
 //! A workflow is a flat set of sub-tasks run CONCURRENTLY (each a role-scoped sub-agent reusing
 //! `run_agent`), followed by ONE synthesis pass that merges their results into a single

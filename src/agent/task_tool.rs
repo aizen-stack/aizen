@@ -869,7 +869,7 @@ impl SubagentSlot {
             return None;
         }
         let start = (std::process::id() as usize + prev) % cap;
-        let root = crate::core::config::nextgen_home()
+        let root = crate::core::config::aizen_home()
             .join("locks")
             .join("v1")
             .join("slots")
@@ -1161,8 +1161,8 @@ mod tests {
         // (Default cargo --test-threads>1 races two gate tests on the same atomic.)
         static GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // ALSO the home lock: the gate's slots are OS file locks under `nextgen_home()`, and the
-        // sandbox tests in this module repoint `NEXTGEN_HOME`/`AIZEN_HOME` at a temp dir and then
+        // ALSO the home lock: the gate's slots are OS file locks under `aizen_home()`, and the
+        // sandbox tests in this module repoint `AIZEN_HOME`/`AIZEN_HOME` at a temp dir and then
         // `remove_dir_all` it. Interleaved, this test's lock files land in a directory being deleted,
         // every `acquire_exclusive` fails, and `try_acquire` returns None for a slot that is free —
         // a flaky "slot 3" panic. Lock order is GATE→HOME here and nothing takes GATE but this test,
@@ -1596,7 +1596,7 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let sandbox = std::env::temp_dir().join(format!("ng-disp-{}", std::process::id()));
+        let sandbox = std::env::temp_dir().join(format!("aizen-disp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&sandbox);
         let agents = sandbox.join(".aizen/agents");
         std::fs::create_dir_all(&agents).unwrap();
@@ -1608,8 +1608,8 @@ mod tests {
         std::env::set_var("USERPROFILE", &sandbox);
         std::env::set_var("HOME", &sandbox);
         std::env::set_var("AIZEN_HOME", sandbox.join(".aizen"));
-        std::env::set_var("NEXTGEN_HOME", sandbox.join(".aizen"));
-        std::env::set_var("NG_PROJECT_ROOT", sandbox.join("proj"));
+        std::env::set_var("AIZEN_HOME", sandbox.join(".aizen"));
+        std::env::set_var("AIZEN_PROJECT_ROOT", sandbox.join("proj"));
 
         let t = tool(0); // parent model "m"
                          // Specialist path: a resolvable agent supersedes role, and def.model wins over the parent.
@@ -1651,8 +1651,8 @@ mod tests {
             "USERPROFILE",
             "HOME",
             "AIZEN_HOME",
-            "NEXTGEN_HOME",
-            "NG_PROJECT_ROOT",
+            "AIZEN_HOME",
+            "AIZEN_PROJECT_ROOT",
         ] {
             std::env::remove_var(v);
         }
@@ -1664,13 +1664,13 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let sandbox = std::env::temp_dir().join(format!("ng-disp-ep-{}", std::process::id()));
+        let sandbox = std::env::temp_dir().join(format!("aizen-disp-ep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&sandbox);
         std::env::set_var("USERPROFILE", &sandbox);
         std::env::set_var("HOME", &sandbox);
         std::env::set_var("AIZEN_HOME", sandbox.join(".aizen"));
-        std::env::set_var("NEXTGEN_HOME", sandbox.join(".aizen"));
-        std::env::set_var("NG_PROJECT_ROOT", sandbox.join("proj"));
+        std::env::set_var("AIZEN_HOME", sandbox.join(".aizen"));
+        std::env::set_var("AIZEN_PROJECT_ROOT", sandbox.join("proj"));
 
         // Register a model→endpoint entry: a sub-agent pinned to `other-model` runs on ITS gateway.
         crate::core::cli_config::save(&crate::core::cli_config::CliConfig {
@@ -1711,8 +1711,8 @@ mod tests {
             "USERPROFILE",
             "HOME",
             "AIZEN_HOME",
-            "NEXTGEN_HOME",
-            "NG_PROJECT_ROOT",
+            "AIZEN_HOME",
+            "AIZEN_PROJECT_ROOT",
         ] {
             std::env::remove_var(v);
         }

@@ -1,4 +1,4 @@
-//! The CLI-owned markdown memory store (source of truth) under `~/.nextgen/cli-memory/entries`.
+//! The CLI-owned markdown memory store (source of truth) under `~/.aizen/cli-memory/entries`.
 //!
 //! One fact per `*.md` file with frontmatter `name|description|type|created`.
 //! P1 scope: load/list/add/get over plain markdown. Atomic-write + locking +
@@ -884,7 +884,7 @@ pub fn reinforce(entry: &MemoryEntry, session_id: &str) -> Result<u32> {
 }
 
 /// Bi-temporal supersession: mark `entry` as no-longer-valid (`validTo`=today, `supersededBy`=
-/// `by_id`) WITHOUT deleting it — the history stays queryable via `ng memory as-of`.
+/// `by_id`) WITHOUT deleting it — the history stays queryable via `aizen memory as-of`.
 ///
 /// Edits the parsed FIELD MAP, like [`update`] and [`unsupersede`]: an earlier version re-rendered
 /// a fixed record shape here, which silently dropped every frontmatter key this build doesn't model
@@ -1274,9 +1274,9 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-scope-rt-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-scope-rt-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
 
         let w = LearnedWrite {
             name: "zone fact",
@@ -1346,7 +1346,7 @@ mod tests {
         let g = add_scoped("explicit global", "", MemoryType::User, "b", Some("global")).unwrap();
         assert!(reload(&g).scope.is_none(), "literal 'global' → None");
 
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1355,9 +1355,9 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-update-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-update-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
 
         let w = LearnedWrite {
             name: "deploy note",
@@ -1461,7 +1461,7 @@ mod tests {
             "an empty patch is a caller bug"
         );
 
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1470,9 +1470,9 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-retire-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-retire-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
 
         let id = add("obsolete fact", "", MemoryType::User, "no longer true").unwrap();
         let e = load_all()
@@ -1522,7 +1522,7 @@ mod tests {
             "purging twice is an error, not a silent no-op"
         );
 
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1534,9 +1534,9 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-unsup-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-unsup-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
 
         let w = LearnedWrite {
             name: "package manager",
@@ -1589,7 +1589,7 @@ mod tests {
         // Reviving something already live is a caller bug, not a silent no-op.
         assert!(unsupersede(&revived).is_err(), "double revive errors");
 
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1598,9 +1598,9 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-reuse-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-reuse-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
 
         let id = add(
             "reuse target",
@@ -1639,7 +1639,7 @@ mod tests {
         // original authored content survives the metadata patches
         assert_eq!(e2.body, "a fact to be reused");
 
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = fs::remove_dir_all(&dir);
     }
 }

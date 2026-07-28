@@ -49,7 +49,7 @@ pub struct Hit {
 pub enum ScopeSel {
     /// The default working view: global facts + the current project's zone.
     Current,
-    /// Everything, all zones (CLI inspection; the `NG_NO_SCOPE` kill-switch).
+    /// Everything, all zones (CLI inspection; the `AIZEN_NO_SCOPE` kill-switch).
     All,
     /// Global facts only.
     Global,
@@ -81,7 +81,7 @@ impl ScopeSel {
         }
     }
 
-    /// The production default view: `Current`, or `All` when scoping is killed via `NG_NO_SCOPE`
+    /// The production default view: `Current`, or `All` when scoping is killed via `AIZEN_NO_SCOPE`
     /// (reads collapse back to the single pre-scoping pool; writes keep tagging either way).
     pub fn default_view() -> ScopeSel {
         if config::scope_disabled() {
@@ -101,7 +101,7 @@ pub fn search_scoped(query: &str, k: usize, sel: &ScopeSel) -> Result<Vec<Hit>> 
     let mut hits = search_filtered_scoped(query, k, None, sel)?;
     // Graph EXPANSION (P5, bench-gated): pull in strong co-retrieval neighbors this lexical/dense
     // query missed, before the reuse signal is recorded — so an expanded neighbor also counts as
-    // co-fired. Default-OFF (`NG_GRAPH_EXPAND`); the recording spine below always runs.
+    // co-fired. Default-OFF (`AIZEN_GRAPH_EXPAND`); the recording spine below always runs.
     if graph::expansion_enabled() {
         expand_with_graph(&mut hits, query, k, sel);
     }
@@ -124,7 +124,7 @@ fn record_reuse(hits: &[Hit]) {
     // "Neurons that fire together wire together": one search that surfaced ≥2 facts is one co-fire
     // event. Per-day-deduped per pair inside `record_coretrieval`, so a chatty session can't inflate
     // a link. Best-effort — a graph write failure never breaks the search. Skipped when the
-    // `NG_NO_GRAPH` kill-switch is set (collapse to the pre-P5 path).
+    // `AIZEN_NO_GRAPH` kill-switch is set (collapse to the pre-P5 path).
     if hits.len() >= 2 && graph::recording_enabled() {
         let ids: Vec<&str> = hits.iter().map(|h| h.entry.id.as_str()).collect();
         let _ = graph::record_coretrieval(&ids, &today);
@@ -302,7 +302,7 @@ pub fn refresh_frozen_core() -> String {
     )
 }
 
-/// Load the user-style profile body from `~/.nextgen/cli-memory/STYLE.md`, if present.
+/// Load the user-style profile body from `~/.aizen/cli-memory/STYLE.md`, if present.
 pub fn load_style() -> Option<String> {
     let raw = std::fs::read_to_string(config::style_path()).ok()?;
     let fm = frontmatter::parse(&raw);
@@ -450,7 +450,7 @@ pub fn search_in_fuzzy(query: &str, k: usize, entries: Vec<MemoryEntry>) -> Vec<
 /// Exact BM25 (`score`, not `score_fuzzy`) is the shipped floor: it returns the same nonzero
 /// candidate SET as a token-overlap scorer (so injected-noise is unchanged) while ranking it
 /// better via IDF + length normalization. The fuzzy bridge is implemented + unit-proven but
-/// default-OFF — **measured** (W24, `ng bench memory --split all --fuzzy`) on the current bench
+/// default-OFF — **measured** (W24, `aizen bench memory --split all --fuzzy`) on the current bench
 /// corpus: recall@5 delta is +0.000 on both the literal and paraphrase tune slices (the corpus is
 /// already lexically saturated — no query in the fixture set actually has a typo to bridge), while
 /// noise_rate rises (gate 0.497→0.580) and precision@5 drops (0.503→0.420). Net loss, not a wash:
@@ -1016,7 +1016,7 @@ pub fn cmd_profile(json: bool) -> Result<()> {
 }
 
 /// Load the store (+ STYLE.md as a high-trust synthetic fact) and roll up the profile.
-/// Shared by `ng memory profile` and the `memory_profile` agent tool.
+/// Shared by `aizen memory profile` and the `memory_profile` agent tool.
 pub fn build_profile() -> Result<profile::UserProfile> {
     let mut entries = store::load_all()?;
     if let Some(style) = load_style() {
@@ -1073,7 +1073,7 @@ fn render_profile(p: &profile::UserProfile) {
 }
 
 /// Answer a natural-language question ABOUT the user (B3 dialectic). Free/local; abstains
-/// rather than guessing. Shared by `ng memory ask` and the `memory_ask` agent tool.
+/// rather than guessing. Shared by `aizen memory ask` and the `memory_ask` agent tool.
 pub fn cmd_ask(query: &str, json: bool) -> Result<()> {
     let answer = answer_about_user(query)?;
     if json {
@@ -1404,7 +1404,7 @@ pub fn cmd_purge(id: &str) -> Result<()> {
 
 /// Show the Hebbian co-retrieval neighbors of a fact (P5): the other facts most often recalled
 /// together with it, ranked by decayed edge weight. Matches `id` by id or name. Inspection-only —
-/// reads the graph, never records a co-fire (so `ng memory neighbors` can't pollute its own signal).
+/// reads the graph, never records a co-fire (so `aizen memory neighbors` can't pollute its own signal).
 pub fn cmd_neighbors(id_or_name: &str, k: usize) -> Result<()> {
     let all = store::load_all()?;
     let seed = &resolve_in(all.clone(), id_or_name)?;
@@ -1895,18 +1895,18 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-recall-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-recall-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // create_dir_all BEFORE any slug/anchor is computed: canonicalize() of a missing dir fails
         // and yields a different key than once it exists, silently splitting the zone.
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("NEXTGEN_HOME", &dir);
-        std::env::set_var("NG_PROJECT_ROOT", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
+        std::env::set_var("AIZEN_PROJECT_ROOT", &dir);
         pending::clear();
         let out = f();
         pending::clear();
-        std::env::remove_var("NG_PROJECT_ROOT");
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_PROJECT_ROOT");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
         out
     }
@@ -2105,11 +2105,11 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-remember-scope-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-remember-scope-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("NEXTGEN_HOME", &dir);
-        std::env::set_var("NG_PROJECT_ROOT", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
+        std::env::set_var("AIZEN_PROJECT_ROOT", &dir);
 
         let id = remember("the api base is internal dot example").unwrap();
         let find = |id: &str| {
@@ -2133,8 +2133,8 @@ mod tests {
             "marker stripped from the body"
         );
 
-        std::env::remove_var("NG_PROJECT_ROOT");
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_PROJECT_ROOT");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2143,13 +2143,13 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-inventory-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-inventory-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // create_dir_all BEFORE project_slug() is ever computed: canonicalize() of a missing dir
         // fails and yields a DIFFERENT slug than once it exists, which silently splits the zone.
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("NEXTGEN_HOME", &dir);
-        std::env::set_var("NG_PROJECT_ROOT", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
+        std::env::set_var("AIZEN_PROJECT_ROOT", &dir);
 
         store::add(
             "pnpm over npm",
@@ -2255,8 +2255,8 @@ mod tests {
             "purge is the one irreversible step"
         );
 
-        std::env::remove_var("NG_PROJECT_ROOT");
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_PROJECT_ROOT");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2268,11 +2268,11 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-review-discard-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-review-discard-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("NEXTGEN_HOME", &dir);
-        std::env::set_var("NG_PROJECT_ROOT", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
+        std::env::set_var("AIZEN_PROJECT_ROOT", &dir);
 
         let rdir = config::review_dir();
         let queue = |body: &str, name: &str| {
@@ -2330,8 +2330,8 @@ mod tests {
             "cleared text is still readable"
         );
 
-        std::env::remove_var("NG_PROJECT_ROOT");
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_PROJECT_ROOT");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2376,11 +2376,11 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-scope-search-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-scope-search-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("NEXTGEN_HOME", &dir);
-        std::env::set_var("NG_PROJECT_ROOT", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
+        std::env::set_var("AIZEN_PROJECT_ROOT", &dir);
         let cur = config::project_slug();
 
         store::add_scoped(
@@ -2441,8 +2441,8 @@ mod tests {
         let global_only = search_scoped("deploy", 10, &ScopeSel::Global).unwrap();
         assert!(!global_only.is_empty() && global_only.iter().all(|h| h.entry.scope.is_none()));
 
-        std::env::remove_var("NG_PROJECT_ROOT");
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_PROJECT_ROOT");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2548,9 +2548,9 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-densecache-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-densecache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
 
         let entries = vec![
             entry("a", "postgres index tuning and query plans"),
@@ -2581,7 +2581,7 @@ mod tests {
             "embedding cache persisted to disk"
         );
 
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2696,10 +2696,10 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-cat-filter-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-cat-filter-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
 
         use crate::memory::category::Category;
         // Place-anchored so neither lands in the always-on frozen core (which search excludes).
@@ -2764,7 +2764,7 @@ mod tests {
             "the bug is excluded from the decision view"
         );
 
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2775,10 +2775,10 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-scoped-dim-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-scoped-dim-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
 
         // Place-anchored so neither lands in the always-on frozen core (which search excludes).
         // The type tag no longer decides residency — TIER does — so "not `user` type" is not enough
@@ -2823,7 +2823,7 @@ mod tests {
             "stack scope excludes the tooling fact"
         );
 
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

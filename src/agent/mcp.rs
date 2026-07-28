@@ -47,7 +47,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ───────────────────────────── config ─────────────────────────────
 
-/// `~/.nextgen/mcp.json`. The `mcpServers` map mirrors the de-facto format used by Claude Desktop
+/// `~/.aizen/mcp.json`. The `mcpServers` map mirrors the de-facto format used by Claude Desktop
 /// & friends, so an existing config drops in. JSON (not TOML) → reuses `serde_json`, no new dep.
 #[derive(Debug, Deserialize, Default)]
 pub struct McpConfig {
@@ -90,16 +90,16 @@ fn default_true() -> bool {
     true
 }
 
-/// HOME MCP config (`~/.nextgen/mcp.json`) — the personal servers.
+/// HOME MCP config (`~/.aizen/mcp.json`) — the personal servers.
 pub fn config_path() -> PathBuf {
-    crate::core::config::nextgen_home().join("mcp.json")
+    crate::core::config::aizen_home().join("mcp.json")
 }
 
-/// PROJECT-local MCP config (`<repo-root>/.nextgen/mcp.json`) — servers a cloned repo ships. Loaded
+/// PROJECT-local MCP config (`<repo-root>/.aizen/mcp.json`) — servers a cloned repo ships. Loaded
 /// (merged OVER HOME, project wins by key) ONLY when the repo is TRUSTED — auto-loading a cloned
 /// repo's tool servers is a supply-chain exec surface, so it's gated behind a first-run trust prompt.
 pub fn project_config_path() -> PathBuf {
-    crate::core::config::project_nextgen_dir().join("mcp.json")
+    crate::core::config::project_aizen_dir().join("mcp.json")
 }
 
 /// Read + parse one mcp.json. `Ok(None)` when absent/empty (the common case — MCP is opt-in).
@@ -117,7 +117,7 @@ fn read_one(path: &Path) -> Result<Option<McpConfig>> {
     Ok(Some(cfg))
 }
 
-/// Load the effective MCP config: HOME servers, with the project's (`./.nextgen/mcp.json`) merged
+/// Load the effective MCP config: HOME servers, with the project's (`./.aizen/mcp.json`) merged
 /// over them when the repo is trusted (project server-defs win by key). Untrusted/absent project →
 /// HOME only (non-blocking — the trust prompt lives in the interactive entry, never here).
 pub fn load_config() -> Result<Option<McpConfig>> {
@@ -142,18 +142,18 @@ pub fn load_config() -> Result<Option<McpConfig>> {
 
 // ── project MCP trust (supply-chain gate) ─────────────────────────────────────────
 
-/// Persisted decision about which project roots may auto-load their `./.nextgen/mcp.json`.
+/// Persisted decision about which project roots may auto-load their `./.aizen/mcp.json`.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TrustStore {
     #[serde(default)]
     trusted: Vec<String>,
-    /// Roots the user declined — so we don't re-prompt every launch (they can `ng mcp trust` later).
+    /// Roots the user declined — so we don't re-prompt every launch (they can `aizen mcp trust` later).
     #[serde(default)]
     dismissed: Vec<String>,
 }
 
 fn trust_path() -> PathBuf {
-    crate::core::config::nextgen_home().join("mcp_trust.json")
+    crate::core::config::aizen_home().join("mcp_trust.json")
 }
 fn load_trust() -> TrustStore {
     std::fs::read_to_string(trust_path())
@@ -237,7 +237,7 @@ pub fn dismiss_project() -> Result<()> {
 }
 
 /// For the interactive entry: how many project MCP servers await a trust decision. `Some(n)` only
-/// when a non-empty `./.nextgen/mcp.json` exists, the repo is NOT yet trusted, and NOT dismissed.
+/// when a non-empty `./.aizen/mcp.json` exists, the repo is NOT yet trusted, and NOT dismissed.
 pub fn project_trust_prompt() -> Option<usize> {
     let cfg = read_one(&project_config_path()).ok().flatten()?;
     if cfg.servers.is_empty() {
@@ -1492,7 +1492,7 @@ fn connect_http(name: &str, cfg: &ServerConfig) -> Result<Transport> {
         .build()
         .context("building MCP HTTP client")?;
     // For an OAuth remote, load the cached token (if signed in) so requests carry a Bearer. With no
-    // token the first request 401s → `NeedsAuth` → the connect fails with a "run `ng apps login`" hint.
+    // token the first request 401s → `NeedsAuth` → the connect fails with a "run `aizen apps login`" hint.
     let oauth_enabled = cfg.auth.as_deref() == Some("oauth");
     let (oauth_key, token) = if oauth_enabled {
         (
@@ -1585,7 +1585,7 @@ async fn connect_one(name: &str, cfg: &ServerConfig) -> Result<ServerHandle> {
     })
 }
 
-/// A live capability probe of ONE configured server (for `ng apps info` / the apps detail view):
+/// A live capability probe of ONE configured server (for `aizen apps info` / the apps detail view):
 /// build transport → handshake → `tools/list`, then drop the connection (the stdio child is
 /// `kill_on_drop`). Distinct from the process-global `Manager` (which connects every server once at
 /// startup) — this targets a single key on demand and tears down immediately.
@@ -1661,7 +1661,7 @@ async fn probe_www_authenticate(url: &str) -> Option<String> {
 
 /// Interactive OAuth sign-in for one configured remote server key: probe its `401` challenge → run
 /// the full PKCE flow (browser + loopback) → cache the token → invalidate the manager so the next
-/// message reconnects WITH the bearer. Used by `ng apps login` / `ng mcp login`.
+/// message reconnects WITH the bearer. Used by `aizen apps login` / `aizen mcp login`.
 pub async fn login(key: &str) -> Result<()> {
     let cfg = load_config()?.context("no mcp.json — add an app first (`aizen apps add <name>`)")?;
     let sc = cfg
@@ -1799,7 +1799,7 @@ fn ensure_manager() {
 }
 
 /// Forget the connected servers so the NEXT registry build reconnects from the current mcp.json —
-/// the hot-reload hook after `ng apps add/remove` (no process relaunch needed). Dropping the old
+/// the hot-reload hook after `aizen apps add/remove` (no process relaunch needed). Dropping the old
 /// `Manager` kills its child processes; the next `discovered_tools()` reconnects everything.
 pub fn invalidate() {
     *MANAGER.write().unwrap() = None;
@@ -1913,7 +1913,7 @@ pub fn discovered_tools() -> Vec<Box<dyn Tool>> {
     out
 }
 
-/// A human-readable summary of connected servers + their tools, for `ng mcp` / `/mcp`.
+/// A human-readable summary of connected servers + their tools, for `aizen mcp` / `/mcp`.
 pub fn summary() -> String {
     // Surface an untrusted project mcp.json up front (it's deliberately NOT loaded yet).
     let trust_note = match project_trust_prompt() {
@@ -2246,14 +2246,14 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("ng-mcp-home-{}", std::process::id()));
-        let proj = std::env::temp_dir().join(format!("ng-mcp-proj-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("aizen-mcp-home-{}", std::process::id()));
+        let proj = std::env::temp_dir().join(format!("aizen-mcp-proj-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&proj);
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(proj.join(".nextgen")).unwrap();
-        std::env::set_var("NEXTGEN_HOME", &home);
-        std::env::set_var("NG_PROJECT_ROOT", &proj);
+        std::fs::create_dir_all(proj.join(".aizen")).unwrap();
+        std::env::set_var("AIZEN_HOME", &home);
+        std::env::set_var("AIZEN_PROJECT_ROOT", &proj);
 
         std::fs::write(
             home.join("mcp.json"),
@@ -2261,7 +2261,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            proj.join(".nextgen").join("mcp.json"),
+            proj.join(".aizen").join("mcp.json"),
             r#"{"mcpServers":{"p":{"command":"proj"},"h":{"command":"proj-override"}}}"#,
         )
         .unwrap();
@@ -2289,8 +2289,8 @@ mod tests {
         assert_eq!(project_trust_prompt(), None, "trusted → no prompt");
 
         let _ = untrust_project();
-        std::env::remove_var("NEXTGEN_HOME");
-        std::env::remove_var("NG_PROJECT_ROOT");
+        std::env::remove_var("AIZEN_HOME");
+        std::env::remove_var("AIZEN_PROJECT_ROOT");
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&proj);
     }
@@ -2610,12 +2610,12 @@ mod tests {
     #[test]
     fn load_config_absent_is_none() {
         let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir().join(format!("ng-mcp-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("aizen-mcp-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::env::set_var("NEXTGEN_HOME", &tmp);
+        std::env::set_var("AIZEN_HOME", &tmp);
         // No mcp.json in this fresh home.
         let _ = std::fs::remove_file(config_path());
         assert!(load_config().unwrap().is_none());
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
     }
 }

@@ -174,7 +174,7 @@ fn probe_raw() -> Result<RawSecret> {
 /// Where the fallback seed lives. Separate from `device.json`: that file stores HASHED ids for
 /// the human-readable history, and a hash cannot be turned back into the seed it came from.
 fn seed_path() -> PathBuf {
-    config::nextgen_home().join("device-seed")
+    config::aizen_home().join("device-seed")
 }
 
 /// Fallback probe when every platform probe fails (a locked-down registry, a container with no
@@ -207,7 +207,7 @@ fn probe_fallback() -> Result<RawSecret> {
 
 /// Path to the device history JSON file.
 fn device_json_path() -> PathBuf {
-    config::nextgen_home().join("device.json")
+    config::aizen_home().join("device.json")
 }
 
 /// Read device history from disk.

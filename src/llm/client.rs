@@ -180,7 +180,7 @@ impl CostMeter {
     }
 }
 
-/// Fetch the provider's advertised model ids (`GET {base}/models`). Used by `ng models` and to
+/// Fetch the provider's advertised model ids (`GET {base}/models`). Used by `aizen models` and to
 /// validate a freshly-set key. Returns the ids in the order the provider lists them.
 /// One model row from `GET {base}/models`, plus the context window if the provider advertises it.
 /// The bare OpenAI schema is just `id`; richer gateways (OpenRouter, LiteLLM) add a context length
@@ -666,7 +666,7 @@ pub async fn stream_chat_with_visual_contract(
 /// One non-streaming chat turn WITH tools advertised. Returns the assistant's content
 /// and/or the tool calls it wants executed. Used by the `task` sub-agent (which runs silently
 /// and returns only its final text) and the workflow fan-out; the streaming counterpart
-/// (`stream_chat_with_tools`) drives the top-level `ng agent` for live output. Both return
+/// (`stream_chat_with_tools`) drives the top-level `aizen agent` for live output. Both return
 /// `ChatTurn`, so the loop is agnostic.
 pub async fn chat_with_tools(
     client: &reqwest::Client,

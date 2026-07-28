@@ -354,7 +354,7 @@ scratch → how to do things* — is the conceptual heart of Aizen.
 
 ## 8. Storage & config map (paths)
 
-Home root: **`~/.aizen/`** (auto-migrated from legacy `~/.nextgen/`). Project-local overrides: **`./.aizen/`** (git repo root).
+Home root: **`~/.aizen/`** (override with `AIZEN_HOME`). Project-local overrides: **`./.aizen/`** (git repo root).
 
 | Path | Holds |
 |---|---|

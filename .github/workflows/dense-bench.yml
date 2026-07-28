@@ -68,7 +68,7 @@ jobs:
         env:
           # Pin the home so the model dir resolves to the one we just populated, and pick the model.
           AIZEN_HOME: /home/runner/.aizen
-          NG_EMBED_MODEL: ${{ matrix.model }}
+          AIZEN_EMBED_MODEL: ${{ matrix.model }}
         run: |
           set -euo pipefail
           echo "=== ${{ matrix.model }} — split=${{ github.event.inputs.split }} ==="

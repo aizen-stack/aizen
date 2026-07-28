@@ -3,7 +3,7 @@
 //! A structured summary of the user's working preferences, aggregated from the fact store
 //! with NO LLM. Each dimension emits a verdict + a confidence + the cited basis facts
 //! (auditable — every claim is backed by ≥1 stored fact). The consumer is the agent loop
-//! (and `ng memory profile` / the `memory_profile` tool).
+//! (and `aizen memory profile` / the `memory_profile` tool).
 //!
 //! Evidence weight per fact reuses shipped primitives:
 //!   w = source.priority()/4 · confidence · (1 + ln1p(reinforced)) · recency

@@ -85,7 +85,7 @@ pub struct Lineage {
 }
 
 impl Lineage {
-    /// The lineage for the current process state, computed once per (cwd, `NG_PROJECT_ROOT`).
+    /// The lineage for the current process state, computed once per (cwd, `AIZEN_PROJECT_ROOT`).
     ///
     /// Keyed like [`crate::core::config::project_slug`]'s cache, and for the same reason: an
     /// unkeyed one-entry cache would hand a test (or a `cd`) the lineage of whatever ran first,
@@ -94,7 +94,7 @@ impl Lineage {
         static CACHE: Lazy<Mutex<Option<(String, Lineage)>>> = Lazy::new(|| Mutex::new(None));
         let cache_key = format!(
             "{}|{}",
-            std::env::var("NG_PROJECT_ROOT").unwrap_or_default(),
+            std::env::var("AIZEN_PROJECT_ROOT").unwrap_or_default(),
             std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default()

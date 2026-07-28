@@ -1,12 +1,12 @@
-//! Daemon-free scheduled agent tasks (`ng cron`). Instead of an always-on daemon + embedded
+//! Daemon-free scheduled agent tasks (`aizen cron`). Instead of an always-on daemon + embedded
 //! scheduler (sled / tokio-cron-scheduler — which would bloat the binary and not survive reboots),
 //! `cron add` registers an OS-scheduler entry (Windows Task Scheduler / Unix crontab) that runs
-//! `ng cron run <name>` in a FRESH process at the schedule. Job specs live as JSON under
-//! `~/.nextgen/cron/`, with the model PINNED at create time (fails-closed: a renamed/removed model
+//! `aizen cron run <name>` in a FRESH process at the schedule. Job specs live as JSON under
+//! `~/.aizen/cron/`, with the model PINNED at create time (fails-closed: a renamed/removed model
 //! errors rather than silently running on the wrong one). The hard `cmd_guard` floor still protects
 //! the unattended run, so a scheduled agent can't be tricked into a catastrophic shell command.
 
-use crate::core::config::nextgen_home;
+use crate::core::config::aizen_home;
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,7 @@ struct CronJob {
 }
 
 fn cron_dir() -> PathBuf {
-    nextgen_home().join("cron")
+    aizen_home().join("cron")
 }
 fn slug(name: &str) -> String {
     crate::skills::sanitize_name(name)

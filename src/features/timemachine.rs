@@ -439,7 +439,7 @@ impl RepoContext {
         let repo_id = format!("repo-{:016x}", fnv1a64(&common_canon.to_string_lossy()));
         let worktree_id = format!("wt-{:016x}", fnv1a64(&wt_canon.to_string_lossy()));
 
-        let home = crate::core::config::nextgen_home();
+        let home = crate::core::config::aizen_home();
         let repo_store_root = home.join("timemachine").join(&repo_id);
         let store_git_dir = repo_store_root.join("store.git");
         let namespace_dir = repo_store_root.join("worktrees").join(&worktree_id);

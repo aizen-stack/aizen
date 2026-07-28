@@ -49,18 +49,15 @@ function New-TmpRepo {
 function Invoke-Aizen {
   param([string]$Repo, [string]$AizenHomeDir, [string[]]$CliArgs)
   $old = Get-Location
-  $prevA = $env:AIZEN_HOME
-  $prevN = $env:NEXTGEN_HOME
+  $prevHome = $env:AIZEN_HOME
   try {
     Set-Location $Repo
     $env:AIZEN_HOME = $AizenHomeDir
-    $env:NEXTGEN_HOME = $AizenHomeDir
     $out = & $aizen @CliArgs 2>&1 | Out-String
     return @{ Exit = $LASTEXITCODE; Out = $out }
   } finally {
     Set-Location $old
-    if ($null -eq $prevA) { Remove-Item Env:AIZEN_HOME -ErrorAction SilentlyContinue } else { $env:AIZEN_HOME = $prevA }
-    if ($null -eq $prevN) { Remove-Item Env:NEXTGEN_HOME -ErrorAction SilentlyContinue } else { $env:NEXTGEN_HOME = $prevN }
+    if ($null -eq $prevHome) { Remove-Item Env:AIZEN_HOME -ErrorAction SilentlyContinue } else { $env:AIZEN_HOME = $prevHome }
   }
 }
 
@@ -156,7 +153,6 @@ try {
     $jobs += Start-Job -ScriptBlock {
       param($az, $repo, $aizenHomeDir, $i)
       $env:AIZEN_HOME = $aizenHomeDir
-      $env:NEXTGEN_HOME = $aizenHomeDir
       $env:Path = "C:\Users\admin\.rustup\toolchains\stable-x86_64-pc-windows-gnu\bin;C:\Program Files\Git\cmd;" + $env:Path
       Set-Location $repo
       Set-Content -Path "file.txt" -Value ("c$i-" + [guid]::NewGuid().ToString("n")) -Encoding ascii -NoNewline
@@ -314,7 +310,6 @@ try {
     $jobs12 += Start-Job -ScriptBlock {
       param($az, $repo, $aizenHomeDir, $i)
       $env:AIZEN_HOME = $aizenHomeDir
-      $env:NEXTGEN_HOME = $aizenHomeDir
       $env:Path = "C:\Users\admin\.rustup\toolchains\stable-x86_64-pc-windows-gnu\bin;C:\Program Files\Git\cmd;" + $env:Path
       Set-Location $repo
       if ($i % 2 -eq 0) {

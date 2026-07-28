@@ -1,11 +1,33 @@
 # Changelog
 
-All notable changes to **Aizen** (`aizen`, alias `ng`) — the pure-Rust agentic coding CLI.
+All notable changes to **Aizen** (`aizen`) — the pure-Rust agentic coding CLI.
 
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
 ## [Unreleased]
+
+### Changed
+- **One brand, everywhere: every `NEXTGEN_*` / `NG_*` name is now `AIZEN_*`.** The rebrand had only
+  reached the paths — the environment variables, the internal API and a pile of doc comments still
+  said `nextgen`, so the CLI documented one name and read another. Renamed: `NEXTGEN_HOME` →
+  `AIZEN_HOME` (already the preferred spelling, now the only one), `NG_PROJECT_ROOT` →
+  `AIZEN_PROJECT_ROOT`, `NG_EMBED_MODEL` → `AIZEN_EMBED_MODEL`, `NG_NO_SCOPE` → `AIZEN_NO_SCOPE`,
+  `NG_NO_GRAPH` → `AIZEN_NO_GRAPH`, `NG_GRAPH_EXPAND` → `AIZEN_GRAPH_EXPAND`, `NG_MCP_REGISTRY` →
+  `AIZEN_MCP_REGISTRY`, and the per-role / per-model families `NG_<ROLE>_{MODEL,BASE_URL,API_KEY}`
+  and `NG_MODEL_<ID>_{BASE_URL,API_KEY}` → `AIZEN_*`.
+
+  **Breaking, deliberately with no alias.** A silent fallback is how a rebrand survives for years:
+  the old name keeps working, so nothing ever moves off it. If you had one of these set, rename it —
+  an unset variable falls back to the documented default rather than failing quietly.
+
+  Also gone: the `~/.nextgen` and `./.nextgen` legacy-directory fallbacks. These were never reachable
+  from a released build — the earliest tag (v0.4.0) already defaults to `.aizen` — so they were
+  migration code for a directory no shipped version ever created.
+- Internal rename with no user-visible effect: `nextgen_home()` → `aizen_home()`,
+  `project_nextgen_dir()` → `project_aizen_dir()`, and the on-disk temp/stash prefixes used during
+  atomic writes (`.ng-tmp.` / `.ng-stash.` → `.aizen-tmp.` / `.aizen-stash.`). These temp files exist
+  only between a write and its rename, so no cleanup step needs the old spelling.
 
 ## [0.5.0] — 2026-07-28
 
@@ -316,7 +338,7 @@ deps in the default build), OpenAI-compatible — point it at any `/chat/complet
   gate (`cargo check` / `tsc`).
 - **Self-learning memory brain** (the moat) — BM25 lexical floor with NFC/Vietnamese-aware
   tokenization, reuse-driven evolution, anti-bloat (dedup/supersede/decay/caps), theory-of-mind
-  profile + dialectic, and an opt-in fuzzy/dense tier (`NG_MEM_FUZZY` / `NG_MEM_DENSE`).
+  profile + dialectic, and an opt-in fuzzy/dense tier (`AIZEN_MEM_FUZZY` / `AIZEN_MEM_DENSE`).
 - **MCP client** (stdio + Streamable-HTTP) with **OAuth 2.1 (PKCE) sign-in apps** (Linear, Notion,
   Slack, Gmail, Atlassian, …) and a curated `aizen apps` catalog over the official registry.
 - **Remote control & notifications** — Telegram + Discord two-way bots (`aizen serve` /

@@ -632,7 +632,7 @@ fn clone_turns(turns: &[ChatTurn]) -> Vec<ChatTurn> {
         .collect()
 }
 
-/// `ng bench loop` entry point: run every scenario, print a report, exit non-zero if any regressed.
+/// `aizen bench loop` entry point: run every scenario, print a report, exit non-zero if any regressed.
 /// Async because `main` already drives a Tokio runtime — we run on it rather than nesting one.
 pub async fn run() -> Result<()> {
     let scens = scenarios();

@@ -19,7 +19,7 @@ use crate::core::types::Message;
 /// `~/.aizen/hostbot/` — created + hardened to 0700 on first touch. Best-effort hardening (never fails
 /// the caller); creation errors surface where the path is used to write.
 pub fn hostbot_dir() -> PathBuf {
-    let dir = config::nextgen_home().join("hostbot");
+    let dir = config::aizen_home().join("hostbot");
     let _ = std::fs::create_dir_all(&dir);
     config::harden_dir(&dir);
     dir
@@ -209,18 +209,18 @@ pub fn drop_route_sessions(platform: &str, route: &str) {
 mod tests {
     use super::*;
 
-    /// Pin `NEXTGEN_HOME` to a fresh tempdir so the store reads/writes there, not the real `~/.aizen`.
+    /// Pin `AIZEN_HOME` to a fresh tempdir so the store reads/writes there, not the real `~/.aizen`.
     /// Returns the guard dir (kept alive for the test's lifetime). Serialized via the SHARED
     /// `TEST_HOME_LOCK` — the whole crate uses it to keep `HOME`-mutating tests from racing. We set
-    /// `NEXTGEN_HOME` (not `AIZEN_HOME`) to match every other test: `nextgen_home()` gives `AIZEN_HOME`
-    /// HIGHER precedence, so a leaked `AIZEN_HOME` would override the `NEXTGEN_HOME` those tests set and
-    /// break them; `NEXTGEN_HOME` is the shared convention each test overwrites at its own start.
+    /// `AIZEN_HOME` (not `AIZEN_HOME`) to match every other test: `aizen_home()` gives `AIZEN_HOME`
+    /// HIGHER precedence, so a leaked `AIZEN_HOME` would override the `AIZEN_HOME` those tests set and
+    /// break them; `AIZEN_HOME` is the shared convention each test overwrites at its own start.
     fn with_temp_home() -> (std::sync::MutexGuard<'static, ()>, tempdir_guard::TempDir) {
         let guard = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempdir_guard::TempDir::new();
-        std::env::set_var("NEXTGEN_HOME", dir.path());
+        std::env::set_var("AIZEN_HOME", dir.path());
         (guard, dir)
     }
 

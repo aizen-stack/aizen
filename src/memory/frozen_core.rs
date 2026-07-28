@@ -506,9 +506,9 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-fc-refresh-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-fc-refresh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
         std::fs::create_dir_all(config::cli_memory_dir()).unwrap();
 
         assert!(read_active().is_empty(), "starts empty");
@@ -522,7 +522,7 @@ mod tests {
         // written under per-slug path
         assert!(active_path().exists(), "per-slug active file created");
 
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -531,9 +531,9 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-fc-iso-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-fc-iso-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
         std::fs::create_dir_all(config::cli_memory_dir()).unwrap();
 
         let a = active_path_for("repo-aaa");
@@ -550,7 +550,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&a).unwrap(), "core-A");
         assert_eq!(fs::read_to_string(&b).unwrap(), "core-B");
 
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

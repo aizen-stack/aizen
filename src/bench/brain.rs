@@ -1,4 +1,4 @@
-//! `ng bench profile` + `ng bench dialectic` — anti-oracle GOLDEN sets for the DERIVED brain
+//! `aizen bench profile` + `aizen bench dialectic` — anti-oracle GOLDEN sets for the DERIVED brain
 //! (the B2 profile rollup + the B3 dialectic Q&A). The recall bench (`bench memory`) measures a
 //! tunable retrieval metric against a baseline; these two assert deterministic CORRECTNESS, so
 //! they are golden sets: every human-labeled case MUST pass (no baseline file to drift).
@@ -255,7 +255,7 @@ fn eval_profile_case(case: &ProfileCase) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// Entry point for `ng bench profile`.
+/// Entry point for `aizen bench profile`.
 pub fn run_profile() -> Result<()> {
     let cases: Vec<ProfileCase> = parse_jsonl(PROFILE_CASES, "profile.jsonl")?;
     lint_profile(&cases)?;
@@ -351,7 +351,7 @@ fn eval_dialectic(
     Ok(())
 }
 
-/// Entry point for `ng bench dialectic`.
+/// Entry point for `aizen bench dialectic`.
 pub fn run_dialectic() -> Result<()> {
     let mems: Vec<DialecticMem> = parse_jsonl(DIALECTIC_MEMORIES, "dialectic-memories.jsonl")?;
     let queries: Vec<DialecticQuery> = parse_jsonl(DIALECTIC_QUERIES, "dialectic-queries.jsonl")?;

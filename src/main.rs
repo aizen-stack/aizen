@@ -1,8 +1,8 @@
-//! `aizen` (alias `ng`) — Aizen first-party agentic coding CLI.
+//! `aizen` — Aizen first-party agentic coding CLI.
 //!
 //! Subcommands:
-//!   ng chat    — OpenAI-compatible streaming chat (the v0 "call API like hermes" layer)
-//!   ng memory  — the standalone, best-for-CLI memory brain (see linked-riding-mochi.md)
+//!   aizen chat    — OpenAI-compatible streaming chat (the v0 "call API like hermes" layer)
+//!   aizen memory  — the standalone, best-for-CLI memory brain (see linked-riding-mochi.md)
 
 // ─── module tree ────────────────────────────────────────────────────────────
 // Domains that own a folder: the agent loop, the memory brain, personas, benches.
@@ -142,6 +142,13 @@ enum Commands {
     },
     /// Show where aizen keeps THIS project's state: root, zone slug, git executable, home dirs.
     Where,
+    /// Import a conversation recorded by another CLI (Claude Code or Codex) and resume it here.
+    /// With no path, lists every foreign transcript whose cwd belongs to this project. With a path,
+    /// loads that file directly.
+    Import {
+        /// Path to a foreign transcript (.jsonl). Omit to list candidates for this project.
+        path: Option<String>,
+    },
     /// Project zones (the slug keying memory/skills/index): report + merge legacy twins.
     Zone {
         #[command(subcommand)]
@@ -196,17 +203,17 @@ enum AppsCmd {
     },
     /// Show a connected app's config (secrets masked) + a live probe of the tools it exposes.
     Info {
-        /// The key shown by `ng apps list`.
+        /// The key shown by `aizen apps list`.
         name: String,
     },
     /// Sign in (OAuth) to a connected remote app — opens your browser (Linear/Notion/Slack/Gmail/…).
     Login {
-        /// The key shown by `ng apps list`.
+        /// The key shown by `aizen apps list`.
         name: String,
     },
     /// Disconnect an app by its mcp.json key.
     Remove {
-        /// The key shown by `ng apps list`.
+        /// The key shown by `aizen apps list`.
         name: String,
     },
 }
@@ -362,7 +369,7 @@ enum SkillCmd {
     },
     /// Install a skill from agentskill.sh by "owner/name" (or exact name) and save it locally.
     Install {
-        /// The skill id, e.g. `NousResearch/spike` (from `ng skill search`).
+        /// The skill id, e.g. `NousResearch/spike` (from `aizen skill search`).
         slug: String,
     },
 }
@@ -462,7 +469,7 @@ enum TimeCmd {
     List,
     /// Restore the working tree to checkpoint #id (auto-saves the current state first).
     Restore {
-        /// Checkpoint id (from `ng time list`).
+        /// Checkpoint id (from `aizen time list`).
         id: u32,
     },
     /// Show what changed between two points in time (checkpoint ids, or `working` for the live tree).
@@ -926,6 +933,13 @@ enum MemoryCmd {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Show every model2vec model already on this machine and which one the dense tier would pick.
+    ///
+    /// The dense tier used to look at ONE path (`~/.aizen/models/<configured name>`) and fall back
+    /// to the non-semantic hashing embedder if that exact dir was absent — even with a perfectly
+    /// usable model sitting next to it. This lists what discovery actually finds, so "why is dense
+    /// not using my model?" is answerable without a source dive.
+    ModelList,
 }
 
 #[tokio::main]
@@ -1000,6 +1014,7 @@ async fn main() -> Result<()> {
             println!("{}", where_report());
             Ok(())
         }
+        Commands::Import { path } => run_import(path).await,
         Commands::Zone { cmd } => run_zone(cmd),
         Commands::Cron { cmd } => cron::handle(cmd).await,
         Commands::Mcp { cmd } => match cmd {
@@ -1046,7 +1061,7 @@ async fn main() -> Result<()> {
     }
 }
 
-/// `ng apps …` — connect apps via the MCP registry.
+/// `aizen apps …` — connect apps via the MCP registry.
 async fn run_apps(cmd: Option<AppsCmd>) -> Result<()> {
     match cmd {
         None | Some(AppsCmd::List) => {
@@ -1128,7 +1143,7 @@ fn apps_print_list() {
             style(f.blurb).dim()
         );
     }
-    // Apps the user connected that aren't in the featured set (added via `ng apps add <name>`).
+    // Apps the user connected that aren't in the featured set (added via `aizen apps add <name>`).
     let custom: Vec<&String> = installed
         .iter()
         .filter(|k| !app_catalog::FEATURED.iter().any(|f| f.key == **k))
@@ -1360,7 +1375,7 @@ async fn apps_add(name: &str) -> Result<()> {
     crate::agent::mcp::invalidate(); // hot-reload: the next message reconnects from the new mcp.json
 
     // OAuth app → run the browser sign-in right now so it's usable immediately. A failure isn't fatal:
-    // the entry is written, the user can retry with `ng apps login <key>`.
+    // the entry is written, the user can retry with `aizen apps login <key>`.
     if matches!(choice, app_catalog::TransportChoice::OAuthRemote(_)) {
         match crate::agent::mcp::login(&key).await {
             Ok(()) => println!(
@@ -1453,7 +1468,7 @@ fn mask_secret(v: &str) -> String {
     }
 }
 
-/// `ng apps info <key>` — the detail view for ONE connected app: its mcp.json config (transport +
+/// `aizen apps info <key>` — the detail view for ONE connected app: its mcp.json config (transport +
 /// secrets MASKED) plus a LIVE probe (handshake + the tools it actually exposes, or why it failed).
 async fn apps_info(key: &str) -> Result<()> {
     let Some(entry) = app_catalog::installed_entry(key) else {
@@ -1653,7 +1668,7 @@ fn chunk_text(s: &str, max: usize) -> Vec<String> {
     out
 }
 
-/// Run the agent loop once (non-streaming, quiet) and return its final text — used by `ng serve`
+/// Run the agent loop once (non-streaming, quiet) and return its final text — used by `aizen serve`
 /// to answer a Telegram message.
 async fn run_agent_capture(
     http: &reqwest::Client,
@@ -1698,7 +1713,7 @@ async fn run_agent_capture(
         client::chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
     };
     let outcome = agent::run_agent(chat, &cfg, &registry, &system, task).await?;
-    // A `clarify` yield in a captured (non-REPL) run — e.g. `ng serve` — has no input box to loop
+    // A `clarify` yield in a captured (non-REPL) run — e.g. `aizen serve` — has no input box to loop
     // back to, so surface the question as the reply itself. Over Telegram the owner just answers
     // with their next message; for a plain capture caller it reads as the agent's question.
     if let StopReason::AwaitingInput(q) = &outcome.stop {
@@ -1736,7 +1751,7 @@ fn cap_session(history: &mut Vec<Message>, max: usize) {
     }
 }
 
-/// Run one `ng serve` turn over a PERSISTENT per-chat history, so follow-ups like "now fix it" keep
+/// Run one `aizen serve` turn over a PERSISTENT per-chat history, so follow-ups like "now fix it" keep
 /// context. Seeds the system prompt (with memory + SOUL + persona) once per session, appends the
 /// user task, drives the loop, learns passively, and bounds the history. A `clarify` yield leaves a
 /// resumable history (the owner's next message is the answer).
@@ -1818,7 +1833,7 @@ async fn run_serve_turn(
         .unwrap_or_else(|| "(the agent produced no answer)".to_string()))
 }
 
-/// `ng serve` — the long-lived daemon: one poll loop owns getUpdates, an agent runner handles one
+/// `aizen serve` — the long-lived daemon: one poll loop owns getUpdates, an agent runner handles one
 /// message at a time, and destructive-op approvals route to the phone (via the approval gate).
 async fn run_serve() -> Result<()> {
     use std::sync::Arc;
@@ -1985,17 +2000,17 @@ fn where_report() -> String {
     use std::fmt::Write as _;
     let root = crate::core::config::project_root();
     let slug = crate::core::config::project_slug();
-    let home = crate::core::config::nextgen_home();
+    let home = crate::core::config::aizen_home();
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "?".into());
     let mut s = String::new();
     let _ = writeln!(s, "project root : {}", root.display());
-    if let Ok(over) = std::env::var("NG_PROJECT_ROOT") {
+    if let Ok(over) = std::env::var("AIZEN_PROJECT_ROOT") {
         if !over.trim().is_empty() {
             let _ = writeln!(
                 s,
-                "               (root forced by NG_PROJECT_ROOT={})",
+                "               (root forced by AIZEN_PROJECT_ROOT={})",
                 over.trim()
             );
         }
@@ -2766,7 +2781,7 @@ async fn discord_setup() -> Result<()> {
     Ok(())
 }
 
-/// `ng discord serve` — the Discord bot daemon. A gateway task receives messages (heartbeating
+/// `aizen discord serve` — the Discord bot daemon. A gateway task receives messages (heartbeating
 /// independently); this loop runs the agent one message at a time (per-channel history) and replies
 /// over REST. Mirrors `run_serve` (Telegram). NOTE: destructive-op approvals are not yet routed to
 /// Discord, so edits need `/yolo`/smart approval; read/research work as-is.
@@ -2905,7 +2920,7 @@ fn telegram_disable() -> Result<()> {
     Ok(())
 }
 
-/// A NextGen "connected app" surfaced in the `/apps` hub. Telegram is two-way (a long-poll daemon +
+/// An Aizen "connected app" surfaced in the `/apps` hub. Telegram is two-way (a long-poll daemon +
 /// approval buttons); the rest are one-way outbound POST channels (see `notify.rs`). **To add a
 /// POST-style app**: add a `notify::Channel` variant — it appears here automatically. **To add a
 /// richer two-way app**: add an `Integration` variant + arms in the methods below + its `*_menu()`.
@@ -2977,7 +2992,7 @@ async fn app_catalog_menu() -> Result<()> {
     let theme = ui_theme();
     let installed = app_catalog::installed_keys();
 
-    // Rows: featured apps first, then any connected custom apps (added via `ng apps add <name>`).
+    // Rows: featured apps first, then any connected custom apps (added via `aizen apps add <name>`).
     struct Row {
         key: String,
         label: String,
@@ -3149,7 +3164,7 @@ async fn apps_manage_menu(key: &str, label: &str) -> Result<()> {
     }
 }
 
-/// `/apps → Discord` — Discord can be a two-way BOT (receives + replies, needs `ng discord serve`)
+/// `/apps → Discord` — Discord can be a two-way BOT (receives + replies, needs `aizen discord serve`)
 /// and/or a one-way notify WEBHOOK (fire-and-forget alerts). One menu offers both.
 async fn discord_app_menu() -> Result<()> {
     let theme = ui_theme();
@@ -3190,7 +3205,7 @@ async fn discord_app_menu() -> Result<()> {
     }
 }
 
-/// `/apps` — the integrations hub: NextGen's connected apps (Telegram today; Discord/Slack/webhooks
+/// `/apps` — the integrations hub: Aizen's connected apps (Telegram today; Discord/Slack/webhooks
 /// can slot in via the `Integration` enum). Lists each with a status badge, opens its sub-menu.
 async fn apps_menu() -> Result<()> {
     let theme = ui_theme();
@@ -3931,7 +3946,7 @@ async fn personas_menu(history: &mut Vec<Message>, model: &str) -> Result<()> {
     }
 }
 
-/// `/telegram` — a dedicated sub-menu for the Telegram integration (one of NextGen's connected
+/// `/telegram` — a dedicated sub-menu for the Telegram integration (one of Aizen's connected
 /// apps): set up, test, status, start the phone-control daemon, or disable.
 async fn telegram_menu() -> Result<()> {
     let theme = ui_theme();
@@ -4369,7 +4384,7 @@ async fn run_menu() -> Result<()> {
 }
 
 /// One-time prompt when a cloned repo ships project-local MCP servers (`./.aizen/mcp.json`): trust
-/// + load them, or dismiss (won't nag again — `ng mcp trust` re-enables). MCP servers can run
+/// + load them, or dismiss (won't nag again — `aizen mcp trust` re-enables). MCP servers can run
 /// commands, hence the explicit gate before auto-arming a stranger's repo.
 fn prompt_mcp_trust(server_count: usize) {
     let theme = ui_theme();
@@ -4430,7 +4445,7 @@ fn needs_onboarding() -> bool {
 
 /// First-run experience for a freshly-downloaded `ng`: a branded welcome, then the setup wizard, then
 /// an optional messaging-app connect — finally dropping into the normal chat TUI. Marks `onboarded`
-/// up front so it shows exactly once (even if the user Ctrl-C's mid-setup); `ng config` reruns setup.
+/// up front so it shows exactly once (even if the user Ctrl-C's mid-setup); `aizen config` reruns setup.
 async fn first_run_onboarding() {
     // Persist the "seen it" flag immediately so this intro never nags on a later launch.
     let mut cfg = cli_config::load();
@@ -5955,7 +5970,7 @@ fn effort_slider_flow() {
 }
 
 /// After a completed turn: passively learn durable user/project facts from the user's last message.
-/// FREE — regex extraction, no model call — through the SAME pipeline as `ng memory learn`
+/// FREE — regex extraction, no model call — through the SAME pipeline as `aizen memory learn`
 /// (sanitize-to-fact → write-time threat-scan → confidence-route → consolidate → store, with
 /// anti-bloat). Core promotion stays human-gated (`auto_confirm_core = Some(false)`): a would-be
 /// core fact is downgraded to a normal store entry and NEVER silently mutates the always-on frozen
@@ -7106,7 +7121,7 @@ fn render_transcript(msgs: &[Message]) -> String {
 
 /// Summarize older turns to free context. Thin wrapper over [`agent::compact::compact_history`] that
 /// supplies a NON-streaming summarize closure over this session's endpoint. Returns
-/// (tokens_before, tokens_after). Same core the agent loop uses, so the REPL and `ng serve` compact
+/// (tokens_before, tokens_after). Same core the agent loop uses, so the REPL and `aizen serve` compact
 /// identically.
 async fn compact_history(
     history: &mut Vec<Message>,
@@ -7286,6 +7301,7 @@ Commands:
   /telegram          Telegram integration menu (setup · test · status · start daemon · disable)
   /sessions          saved conversations — restore · save · delete (autosaves into its own file each turn; newest first, labeled by project)
   /resume [name]     reopen the last conversation FROM THIS PROJECT (or a named one); /handoff <goal> starts a fresh thread carrying only what that goal needs
+  /import            resume a conversation started in another CLI (Claude Code or Codex) — pick from transcripts whose cwd matches this project
   /where             which project/zone you're in, and which file this conversation is saved to
   /workflows         multi-agent status — live task/workflow children, sub-agent slots (also /wf)
   /agents            specialist sub-agents you can delegate to — list · set-model <name> <model> (routes model→endpoint)
@@ -7602,6 +7618,11 @@ async fn handle_slash(
         "sessions" => {
             if let Err(e) = sessions_menu(history, model_label).await {
                 eprintln!("{} {e}", style("sessions:").red());
+            }
+        }
+        "import" => {
+            if let Err(e) = import_menu(history, model_label).await {
+                eprintln!("{} {e}", style("import:").red());
             }
         }
         // One keystroke back into the last conversation. `/sessions` could already restore, but it
@@ -8097,7 +8118,7 @@ async fn handle_slash(
         "init" | "index" => {
             slash_init(arg).await;
         }
-        // A user-defined command (`~/.nextgen/commands/<name>.md`) → expand its template and run it
+        // A user-defined command (`~/.aizen/commands/<name>.md`) → expand its template and run it
         // as a normal chat turn. Falls back to "unknown" only when no command matches.
         other => match commands::find(other) {
             Some(cmd) => match commands::expand(&cmd, arg) {
@@ -8113,7 +8134,7 @@ async fn handle_slash(
 
 /// Checkpoint helpers — persist / restore the REPL conversation under ~/.aizen/sessions/.
 fn sessions_dir() -> std::path::PathBuf {
-    config::nextgen_home().join("sessions")
+    config::aizen_home().join("sessions")
 }
 fn sanitize_name(s: &str) -> String {
     let n: String = s
@@ -9084,6 +9105,203 @@ async fn sessions_menu(history: &mut Vec<Message>, model_label: &str) -> Result<
     }
 }
 
+/// `/import` — pick a conversation recorded by Claude Code or Codex (for THIS project) and resume
+/// it inside aizen. The foreign transcript is parsed into `Vec<Message>`, repaired so it satisfies
+/// `assert_valid_history`, then handed to the SAME thread-switch path `/resume` uses: refresh the
+/// prompt lanes for the current project + model, reset per-session state, and replay so the
+/// restored thread is VISIBLE rather than silently present.
+///
+/// Foreign transcripts are never autosaved back over themselves — the imported conversation becomes
+/// the live one and is autosaved under a fresh aizen slug from then on, exactly like a `/resume`
+/// of an aizen session. The source file is only ever READ.
+async fn import_menu(history: &mut Vec<Message>, model_label: &str) -> Result<()> {
+    let theme = ui_theme();
+    let pool = features::foreign_session::discover(&config::project_root());
+    if pool.is_empty() {
+        tui::emit_line(
+            &style("no Claude Code or Codex transcripts found for this project")
+                .dim()
+                .to_string(),
+        );
+        tui::emit_line(
+            &style("(they appear here once you've used `claude` or `codex` in this directory)")
+                .dim()
+                .to_string(),
+        );
+        return Ok(());
+    }
+    let items: Vec<String> = pool.iter().map(|s| s.row(fmt_session_age)).collect();
+    let prompt = format!(
+        "Import — {} foreign transcript{} for this project, newest first · pick one to resume (Esc to go back)",
+        pool.len(),
+        if pool.len() == 1 { "" } else { "s" }
+    );
+    let pick = match Select::with_theme(&theme)
+        .with_prompt(prompt)
+        .items(&items)
+        .default(0)
+        .interact_opt()?
+    {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+    let session = &pool[pick];
+    match features::foreign_session::load(session) {
+        Ok(imported) => {
+            // Drop any system lanes the source CLI's harness left in (already filtered in parse,
+            // but defend against a future schema that embeds them) before splicing aizen's own.
+            *history = imported;
+            refresh_prompt_lanes_for_thread_switch(history, model_label);
+            // Same thread-switch contract as /resume: the foreign thread's todos/cost/grants
+            // belong to it, not to whatever was live before the import.
+            reset_per_session_state();
+            set_session_slug(None); // the imported chat autosaves under a fresh aizen slug from here
+            agent::replay_transcript(history);
+            let tag = match session.cli {
+                features::foreign_session::Cli::Claude => "claude",
+                features::foreign_session::Cli::Codex => "codex",
+            };
+            tui::emit_line(
+                &style(format!(
+                    "⇲ imported “{}” from {} — {} messages, context restored",
+                    if session.first_prompt.is_empty() {
+                        "(no prompt)"
+                    } else {
+                        &session.first_prompt
+                    },
+                    tag,
+                    history.len()
+                ))
+                .color256(splash::ACCENT)
+                .to_string(),
+            );
+            tui::emit_line(
+                &style(format!("  source: {}", session.path.display()))
+                    .dim()
+                    .to_string(),
+            );
+        }
+        Err(e) => tui::emit_line(&format!("{} {e}", style("import:").red())),
+    }
+    Ok(())
+}
+
+/// `aizen import [path]` — CLI surface. No path lists every foreign transcript for this project;
+/// a path loads that file's transcript and prints a one-line summary (the CLI can't resume into a
+/// REPL, so it reports what WOULD be loaded — the actual resume happens via `/import` in the REPL).
+async fn run_import(path: Option<String>) -> Result<()> {
+    match path {
+        Some(p) => {
+            let p = std::path::PathBuf::from(&p);
+            let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+            // Detect the CLI from the file's own shape rather than the path: a Claude line has a
+            // top-level `type` that is "user"/"assistant"/"mode"/…; a Codex line has `session_meta`
+            // or `response_item`. Sniff the first parseable line.
+            let cli = sniff_cli(&bytes);
+            let sess = features::foreign_session::ForeignSession {
+                cli,
+                path: p.clone(),
+                cwd: String::new(),
+                mtime_ms: None,
+                turns: 0,
+                first_prompt: String::new(),
+            };
+            match features::foreign_session::load(&sess) {
+                Ok(msgs) => {
+                    let tag = match cli {
+                        features::foreign_session::Cli::Claude => "claude",
+                        features::foreign_session::Cli::Codex => "codex",
+                    };
+                    println!(
+                        "{}",
+                        style(format!(
+                            "⇲ {} transcript — {} messages ready to resume",
+                            tag,
+                            msgs.len()
+                        ))
+                        .color256(splash::ACCENT)
+                    );
+                    println!("  source: {}", p.display());
+                    println!(
+                        "  {}",
+                        style("open the REPL in this project and run /import to resume it").dim()
+                    );
+                    Ok(())
+                }
+                Err(e) => anyhow::bail!("import: {e}"),
+            }
+        }
+        None => {
+            let pool = features::foreign_session::discover(&config::project_root());
+            if pool.is_empty() {
+                println!(
+                    "{}",
+                    style("no Claude Code or Codex transcripts found for this project").dim()
+                );
+                println!(
+                    "{}",
+                    style(
+                        "(they appear here once you've used `claude` or `codex` in this directory)"
+                    )
+                    .dim()
+                );
+                return Ok(());
+            }
+            println!(
+                "{}",
+                style(format!(
+                    "Foreign transcripts for this project ({}), newest first:",
+                    pool.len()
+                ))
+                .color256(splash::ACCENT)
+            );
+            for s in &pool {
+                let tag = match s.cli {
+                    features::foreign_session::Cli::Claude => "claude",
+                    features::foreign_session::Cli::Codex => "codex",
+                };
+                println!(
+                    "  [{}] {:>6} · {} turns · {}",
+                    tag,
+                    fmt_session_age(s.mtime_ms),
+                    s.turns,
+                    s.path.display()
+                );
+            }
+            println!(
+                "{}",
+                style("resume one with: /import  (in the REPL)  or  aizen import <path>").dim()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Decide which CLI a transcript belongs to from its content, not its path. Falls back to Claude
+/// (the more permissive parser — it ignores unrecognized line types) when the sniff is inconclusive.
+fn sniff_cli(bytes: &[u8]) -> features::foreign_session::Cli {
+    for line in bytes.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if ty == "session_meta"
+            || ty == "response_item"
+            || ty == "event_msg"
+            || ty == "turn_context"
+        {
+            return features::foreign_session::Cli::Codex;
+        }
+        if ty == "user" || ty == "assistant" || ty == "mode" || ty == "file-history-snapshot" {
+            return features::foreign_session::Cli::Claude;
+        }
+    }
+    features::foreign_session::Cli::Claude
+}
+
 /// `/model` — fetch the provider's models, pick one (arrow-key), persist it. Also captures the
 /// context window when the provider reports it (→ a real `% context` HUD; else a name heuristic).
 async fn slash_model(model_label: &mut String) -> Result<()> {
@@ -9391,7 +9609,7 @@ fn apply_model_endpoint(cfg: &mut cli_config::CliConfig, spec: &str) -> Result<(
 async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
     let cmd = match cmd {
         Some(c) => c,
-        None => return config_wizard().await, // bare `ng config` → interactive setup
+        None => return config_wizard().await, // bare `aizen config` → interactive setup
     };
     match cmd {
         ConfigCmd::Set {
@@ -9602,7 +9820,7 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
 /// Render the saved config as a grouped, aligned "Studio" panel: a gold title rule with the file
 /// path, then sections (Endpoint / Session / Cost / Display) of `key   value` rows where the value's
 /// colour carries meaning (gold = a chosen value, green = on/ok, faint = off/unset). Shown at the end
-/// of the wizard, after `config set`, and on `ng config show`. Plain `println!` (not the sticky
+/// of the wizard, after `config set`, and on `aizen config show`. Plain `println!` (not the sticky
 /// emit): it always runs outside the pinned footer (suspended menu / one-shot CLI), and `console`
 /// auto-strips the colour under `NO_COLOR`/pipes.
 fn print_config(cfg: &cli_config::CliConfig) {
@@ -10713,7 +10931,7 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
             "\n[stopped: edits were made but verification never passed after {} steps]",
             outcome.iters
         ),
-        // One-shot `ng agent` is non-interactive: there is no next message to answer with, so
+        // One-shot `aizen agent` is non-interactive: there is no next message to answer with, so
         // surface the question and exit rather than hang. Re-run in the REPL to answer it.
         StopReason::AwaitingInput(q) => eprintln!(
             "\n[the agent needs clarification — re-run interactively (`aizen`) to answer]\n❓ {q}"
@@ -10881,7 +11099,66 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
         MemoryCmd::ModelDownload { name } => memory::model_dl::download(name.as_deref())
             .await
             .map(|_| ()),
+        MemoryCmd::ModelList => run_memory_model_list(),
     }
+}
+
+/// `aizen memory model-list` — show every model2vec model this machine already has, and which one
+/// the dense tier would pick. Exists because the old failure mode was SILENT: with no model at the
+/// configured name the loader fell back to the (non-semantic) hashing embedder, so a user who had
+/// downloaded a perfectly good model under another name had no way to see why dense wasn't working.
+fn run_memory_model_list() -> Result<()> {
+    let configured = config::embed_model_name();
+    let found = memory::embed::list_local_models();
+    let chosen = memory::embed::discover_local_model();
+    println!("configured model name: {configured}");
+    println!("(override with AIZEN_EMBED_MODEL)");
+    println!();
+    if found.is_empty() {
+        println!("no model2vec models found on this machine.");
+        println!("  looked in: {}", config::models_dir().display());
+        println!("             the Hugging Face hub cache (~/.cache/huggingface/hub, %LOCALAPPDATA%\\huggingface\\hub, $HF_HUB_CACHE)");
+        println!();
+        println!("get one with: aizen memory model-download");
+        return Ok(());
+    }
+    println!(
+        "found {} model2vec model{}:",
+        found.len(),
+        if found.len() == 1 { "" } else { "s" }
+    );
+    let chosen_dir = chosen.as_ref().map(|c| c.dir.clone());
+    for c in &found {
+        let marker = if Some(&c.dir) == chosen_dir.as_ref() {
+            "▸"
+        } else {
+            " "
+        };
+        println!("  {marker} {} [{}]  {}", c.name, c.source, c.dir.display());
+    }
+    println!();
+    match &chosen {
+        Some(c) if c.name == configured => {
+            println!("dense would load '{}' (the configured name).", c.name);
+        }
+        Some(c) => {
+            println!(
+                "dense would AUTO-DETECT '{}' from {} — '{configured}' is not present.",
+                c.name, c.source
+            );
+        }
+        None => println!("dense would fall back to the hashing embedder (not semantic)."),
+    }
+    // The weights only LOAD on a `--features dense` build; say so rather than implying the default
+    // binary will use what we just listed.
+    if cfg!(feature = "dense") {
+        println!("this build has the dense feature: the model above will be loaded.");
+    } else {
+        println!(
+            "note: this build has NO dense feature — rebuild with `--features dense` to use it."
+        );
+    }
+    Ok(())
 }
 
 fn run_persona(cmd: PersonaCmd) -> Result<()> {

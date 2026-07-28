@@ -1,6 +1,6 @@
 //! `workflow` — the model-callable fan-out primitive (deterministic orchestration IN conversation).
 //!
-//! `ng workflow` (workflow.rs) is CLI-only: the model can't invoke it, so multi-agent patterns had
+//! `aizen workflow` (workflow.rs) is CLI-only: the model can't invoke it, so multi-agent patterns had
 //! to be narrated serially through `task`. This tool exposes the same bounded fan-out with two
 //! modes, keeping control flow in CODE and content in the model (the workflows-over-agents rule):
 //!

@@ -19,7 +19,7 @@
 //!   *effective*-weight edges are dropped on write (the `caps`-style LRU, applied to edges).
 //! - **Neighbor expansion is bench-gated, default-OFF.** The recording spine ships on; using the
 //!   graph to *expand* a retrieval (pull in a strong neighbor a query missed) is opt-in via
-//!   `NG_GRAPH_EXPAND`, the same "reachable + tested, not on-by-default until a bench proves it"
+//!   `AIZEN_GRAPH_EXPAND`, the same "reachable + tested, not on-by-default until a bench proves it"
 //!   discipline as the dense/fuzzy tiers.
 //!
 //! File format — one edge per line, tab-separated, endpoints in canonical (sorted) order so a
@@ -244,17 +244,17 @@ pub fn prune(live: &HashSet<String>, today: &str) -> anyhow::Result<usize> {
 }
 
 /// Whether the co-fire RECORDING spine runs (writes to `graph.tsv`). On by default; the
-/// `NG_NO_GRAPH` kill-switch turns it (and expansion) off, collapsing retrieval to the pre-P5 path.
+/// `AIZEN_NO_GRAPH` kill-switch turns it (and expansion) off, collapsing retrieval to the pre-P5 path.
 pub fn recording_enabled() -> bool {
     !config::graph_disabled()
 }
 
 /// Whether graph-based neighbor EXPANSION is enabled in production retrieval. Default OFF — the
 /// recording spine always runs, but *using* the graph to widen a search is opt-in via
-/// `NG_GRAPH_EXPAND` (same "ship the machinery, bench before defaulting" posture as the dense
-/// tier). When off, the graph is still built (and queryable via `ng memory neighbors`), it just
+/// `AIZEN_GRAPH_EXPAND` (same "ship the machinery, bench before defaulting" posture as the dense
+/// tier). When off, the graph is still built (and queryable via `aizen memory neighbors`), it just
 /// doesn't alter live `memory_search` results. Delegates to [`config::graph_expand_enabled`] so the
-/// flag logic (incl. the `NG_NO_GRAPH` master off) lives in exactly one place.
+/// flag logic (incl. the `AIZEN_NO_GRAPH` master off) lives in exactly one place.
 pub fn expansion_enabled() -> bool {
     config::graph_expand_enabled()
 }
@@ -268,12 +268,12 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-graph-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-graph-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
         let out = f();
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
         out
     }
@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn expansion_is_off_by_default() {
         // A clean env must NOT enable expansion (default-OFF, bench-gated like dense/fuzzy).
-        std::env::remove_var("NG_GRAPH_EXPAND");
+        std::env::remove_var("AIZEN_GRAPH_EXPAND");
         assert!(!expansion_enabled());
     }
 }

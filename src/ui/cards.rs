@@ -12,7 +12,7 @@
 //! The index-picking (which card) is cheap and lives wherever the surface is triggered; the sixel
 //! ENCODE is done by the render thread, which owns the terminal and knows its pixel geometry.
 
-use crate::core::config::nextgen_home;
+use crate::core::config::aizen_home;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// One baked card: a human title (for a caption / debug) and its PNG bytes (decoded on demand).
@@ -107,7 +107,7 @@ const ALPHA_CUTOFF: u8 = 24;
 /// Where the rotation counter is persisted, so a fresh launch shows the NEXT card (not always the
 /// first). A tiny plaintext file next to the CLI config; a missing/corrupt file just starts at 0.
 fn rotation_path() -> std::path::PathBuf {
-    nextgen_home().join(".card-rotation")
+    aizen_home().join(".card-rotation")
 }
 
 /// Index of the card to show at startup, advancing the persisted rotation by one. `None` when no

@@ -1,4 +1,4 @@
-//! Pure-Rust **OAuth 2.1 (PKCE)** client for MCP remote servers — the piece that lets `ng apps`
+//! Pure-Rust **OAuth 2.1 (PKCE)** client for MCP remote servers — the piece that lets `aizen apps`
 //! sign into the apps people actually want (Linear, Notion, Slack, Gmail/Google, Atlassian, Stripe),
 //! all of which expose **OAuth-only** MCP endpoints. This closes the headline gap vs Hermes, whose
 //! "apps" feature is MCP-over-OAuth. Without it every marquee app showed "not connectable".
@@ -87,7 +87,7 @@ fn now() -> i64 {
 
 /// `~/.aizen/mcp-tokens/` — the per-server token cache directory.
 pub fn tokens_dir() -> PathBuf {
-    crate::core::config::nextgen_home().join("mcp-tokens")
+    crate::core::config::aizen_home().join("mcp-tokens")
 }
 
 /// Token-cache path for one server key (sanitized so a `/` in a key can't escape the dir).

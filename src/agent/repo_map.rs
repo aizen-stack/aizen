@@ -306,7 +306,7 @@ src/agent/mod.rs
 
     #[test]
     fn source_files_filters_by_lsp_extensions() {
-        let d = std::env::temp_dir().join(format!("ng-repomap-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("aizen-repomap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("a.rs"), "fn main() {}").unwrap();

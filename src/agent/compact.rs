@@ -1,5 +1,5 @@
 //! Conversation compaction — the shared core used both by the interactive REPL (between turns) and
-//! by the agent loop (mid-task, for multi-turn callers like `ng serve`). Older turns are summarized
+//! by the agent loop (mid-task, for multi-turn callers like `aizen serve`). Older turns are summarized
 //! into one dense `system` note; the system prompt and the last [`KEEP_TURNS`] user turns are kept
 //! verbatim. The cut is always a `user` boundary so the summarized block never ends mid-turn and the
 //! kept tail never begins with an orphan `tool` result (a dangling tool message 400s on strict

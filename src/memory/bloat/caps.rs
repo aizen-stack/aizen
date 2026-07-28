@@ -1,6 +1,6 @@
 //! Per-tier LRU caps with a recoverable archive. Bloat is bounded by ARCHIVING the
 //! least-recently-reinforced auto-learned facts once they exceed the cap — they're moved
-//! to `~/.nextgen/cli-memory/archive/`, never hard-deleted (`ng memory restore <id>`
+//! to `~/.aizen/cli-memory/archive/`, never hard-deleted (`aizen memory restore <id>`
 //! brings one back). Curated facts (manual / user-explicit / imported) are EXEMPT: a
 //! deliberately-authored fact is never auto-evicted.
 
@@ -157,12 +157,13 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-caps-test-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("aizen-caps-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
         let out = f();
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = fs::remove_dir_all(&dir);
         out
     }

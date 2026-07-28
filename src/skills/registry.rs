@@ -158,7 +158,7 @@ pub async fn fetch_body(sk: &RegistrySkill) -> Result<String> {
 }
 
 /// Search → pick the exact-slug match (else the first hit) → fetch + save locally. Returns the
-/// saved skill. Used by both the `ng skill install` CLI and the `skill_install` agent tool.
+/// saved skill. Used by both the `aizen skill install` CLI and the `skill_install` agent tool.
 pub async fn install(query: &str) -> Result<crate::skills::Skill> {
     let hits = search(query, DEFAULT_LIMIT).await?;
     if hits.is_empty() {
@@ -364,10 +364,10 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-registry-ssrf-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-registry-ssrf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
         let mut cfg = crate::core::cli_config::load();
         cfg.skill_registry = Some("http://127.0.0.1:9".to_string());
         crate::core::cli_config::save(&cfg).unwrap();
@@ -376,7 +376,7 @@ mod tests {
             .build()
             .unwrap();
         let res = rt.block_on(search("anything", 5));
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
         let err = res.expect_err("a loopback registry base must be refused");
         assert!(

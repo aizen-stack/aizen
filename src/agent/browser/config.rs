@@ -69,7 +69,7 @@ impl Default for BrowserConfig {
 }
 
 pub fn config_path() -> PathBuf {
-    crate::core::config::nextgen_home().join("browser.json")
+    crate::core::config::aizen_home().join("browser.json")
 }
 
 pub fn load() -> Result<BrowserConfig> {

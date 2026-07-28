@@ -16,11 +16,11 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-/// The official MCP Registry. Overridable via `NG_MCP_REGISTRY` (mirrors the skill registry knob).
+/// The official MCP Registry. Overridable via `AIZEN_MCP_REGISTRY` (mirrors the skill registry knob).
 pub const DEFAULT_REGISTRY: &str = "https://registry.modelcontextprotocol.io";
 
 pub fn registry_base() -> String {
-    std::env::var("NG_MCP_REGISTRY")
+    std::env::var("AIZEN_MCP_REGISTRY")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_REGISTRY.to_string())

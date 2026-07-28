@@ -258,7 +258,7 @@ mod tests {
     fn fake_git_dir(name: &str) -> (TempDir, PathBuf) {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "ng-gitx-{}-{}",
+            "aizen-gitx-{}-{}",
             std::process::id(),
             N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));

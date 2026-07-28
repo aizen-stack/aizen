@@ -78,7 +78,7 @@ struct RunManifest {
 const RUN_SCHEMA: u32 = 1;
 
 fn manifest_root() -> PathBuf {
-    crate::core::config::nextgen_home()
+    crate::core::config::aizen_home()
         .join("orchestration")
         .join("runs")
 }

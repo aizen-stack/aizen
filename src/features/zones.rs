@@ -444,14 +444,17 @@ fn unique_path(p: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    // The env-sandbox helpers mirror memory::store tests: pin AIZEN_HOME + NG_PROJECT_ROOT under
+    // The env-sandbox helpers mirror memory::store tests: pin AIZEN_HOME + AIZEN_PROJECT_ROOT under
     // a temp dir while holding the process-wide TEST_HOME_LOCK.
     fn with_sandbox<T>(f: impl FnOnce(&Path) -> T) -> T {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let sandbox =
-            std::env::temp_dir().join(format!("ng-zones-{}-{:x}", std::process::id(), rand_tag()));
+        let sandbox = std::env::temp_dir().join(format!(
+            "aizen-zones-{}-{:x}",
+            std::process::id(),
+            rand_tag()
+        ));
         let home = sandbox.join("home");
         let root = sandbox.join("proj");
         std::fs::create_dir_all(&home).unwrap();
@@ -459,10 +462,10 @@ mod tests {
         // project-slug-canonicalize flake class).
         std::fs::create_dir_all(&root).unwrap();
         std::env::set_var("AIZEN_HOME", &home);
-        std::env::set_var("NG_PROJECT_ROOT", &root);
+        std::env::set_var("AIZEN_PROJECT_ROOT", &root);
         let out = f(&root);
         std::env::remove_var("AIZEN_HOME");
-        std::env::remove_var("NG_PROJECT_ROOT");
+        std::env::remove_var("AIZEN_PROJECT_ROOT");
         let _ = std::fs::remove_dir_all(&sandbox);
         out
     }

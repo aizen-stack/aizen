@@ -3,7 +3,7 @@
 //! (`href`/`src`/`action`) and endpoints from JS (regex over quoted paths/URLs), enqueue the
 //! in-scope, unseen ones up to a depth/page cap, repeat.
 //!
-//! Shared by the `ng crawl <url>` subcommand and the `web_crawl` agent tool. The crawl makes only
+//! Shared by the `aizen crawl <url>` subcommand and the `web_crawl` agent tool. The crawl makes only
 //! GET requests; scope is restricted to the seed host (or its root domain) so it can't wander the
 //! whole web, and `max_pages` is a hard ceiling.
 

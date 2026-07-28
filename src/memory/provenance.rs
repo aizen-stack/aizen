@@ -10,9 +10,9 @@ pub enum ProvenanceKind {
     UserExplicit,
     /// Inferred from conversation by the free extractor. Lower trust.
     Inferred,
-    /// Imported from an external store (`ng memory import`). Medium trust.
+    /// Imported from an external store (`aizen memory import`). Medium trust.
     Imported,
-    /// Hand-authored via `ng memory add`. High trust (a human wrote the file).
+    /// Hand-authored via `aizen memory add`. High trust (a human wrote the file).
     Manual,
 }
 

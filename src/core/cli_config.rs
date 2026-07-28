@@ -1,4 +1,4 @@
-//! Persistent CLI endpoint config (`ng config`) — base URL / API key / default model stored at
+//! Persistent CLI endpoint config (`aizen config`) — base URL / API key / default model stored at
 //! `~/.aizen/cli-config.json`, so the network commands work without re-passing env vars.
 //!
 //! Resolution precedence for every network command: explicit `--flag` > `AIZEN_*` env var > this
@@ -7,7 +7,7 @@
 //! but the file is tightened to owner-only (0600) on Unix at write time — see `save`.
 
 use crate::core::approval::ApprovalMode;
-use crate::core::config::nextgen_home;
+use crate::core::config::aizen_home;
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -148,7 +148,7 @@ pub struct CliConfig {
     /// durable insights (the `<self>` layer). `None` ⇒ default ON. `Some(false)` ⇒ frozen character.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona_evolve: Option<bool>,
-    /// Telegram bot integration (the `ng serve` daemon + telegram_send/telegram_ask tools).
+    /// Telegram bot integration (the `aizen serve` daemon + telegram_send/telegram_ask tools).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telegram: Option<TelegramConfig>,
     /// Outbound notification channels (Discord / Slack / generic webhook) surfaced in `/apps` and
@@ -168,7 +168,7 @@ pub struct CliConfig {
     /// user sees it exactly once. `None` ⇒ never onboarded (a fresh install → show the intro).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onboarded: Option<bool>,
-    /// Skill marketplace base URL for `skill_search`/`skill_install` (and `ng skill search/install`).
+    /// Skill marketplace base URL for `skill_search`/`skill_install` (and `aizen skill search/install`).
     /// `None` ⇒ the default `https://agentskill.sh`. Override to point at a private registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_registry: Option<String>,
@@ -190,7 +190,7 @@ pub struct CliConfig {
     /// Maximum size of one file/blob in a snapshot. `None` ⇒ 512 MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timemachine_max_file_bytes: Option<u64>,
-    /// Discord two-way bot (the `ng discord serve` gateway daemon). Distinct from the one-way Discord
+    /// Discord two-way bot (the `aizen discord serve` gateway daemon). Distinct from the one-way Discord
     /// webhook under [`NotifyConfig`] — this is a full bot that receives messages and replies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discord: Option<DiscordConfig>,
@@ -288,13 +288,13 @@ pub fn resolve_role(role: &str, main: &ResolvedEndpoint) -> ResolvedEndpoint {
             })
     };
     ResolvedEndpoint {
-        model: env_nonempty(&format!("NG_{up}_MODEL"))
+        model: env_nonempty(&format!("AIZEN_{up}_MODEL"))
             .or_else(|| rc.as_ref().and_then(|r| r.model.clone()))
             .unwrap_or_else(|| main.model.clone()),
-        base_url: env_nonempty(&format!("NG_{up}_BASE_URL"))
+        base_url: env_nonempty(&format!("AIZEN_{up}_BASE_URL"))
             .or_else(|| rc.as_ref().and_then(|r| r.base_url.clone()))
             .unwrap_or_else(|| main.base_url.clone()),
-        api_key: env_nonempty(&format!("NG_{up}_API_KEY"))
+        api_key: env_nonempty(&format!("AIZEN_{up}_API_KEY"))
             .or_else(|| rc.as_ref().and_then(key_from_ref))
             .unwrap_or_else(|| main.api_key.clone()),
     }
@@ -317,7 +317,7 @@ pub struct ModelEndpoint {
 /// Resolve the full endpoint a `model` should run on: if the model-endpoint registry has an entry
 /// for it, that entry's base_url/api_key override `caller` (per field; absent fields inherit
 /// `caller`); otherwise only the model name changes and the endpoint stays `caller`. Env override:
-/// `NG_MODEL_<UPPER>_BASE_URL` / `NG_MODEL_<UPPER>_API_KEY` (the model id uppercased, non-alnum →
+/// `AIZEN_MODEL_<UPPER>_BASE_URL` / `AIZEN_MODEL_<UPPER>_API_KEY` (the model id uppercased, non-alnum →
 /// `_`) wins over the config entry, matching `resolve_role`'s env-first precedence.
 ///
 /// This is what makes "assign a model to a sub-agent" work across providers: the model carries its
@@ -328,7 +328,7 @@ pub fn endpoint_for_model(model: &str, caller: &ResolvedEndpoint) -> ResolvedEnd
         .model_endpoints
         .as_ref()
         .and_then(|list| list.iter().find(|e| e.model == model).cloned());
-    // Env key: NG_MODEL_<sanitized-upper>_{BASE_URL,API_KEY}. Sanitize so `gpt-4o` → `GPT_4O`.
+    // Env key: AIZEN_MODEL_<sanitized-upper>_{BASE_URL,API_KEY}. Sanitize so `gpt-4o` → `GPT_4O`.
     let up: String = model
         .chars()
         .map(|c| {
@@ -349,16 +349,16 @@ pub fn endpoint_for_model(model: &str, caller: &ResolvedEndpoint) -> ResolvedEnd
     };
     ResolvedEndpoint {
         model: model.to_string(),
-        base_url: env_nonempty(&format!("NG_MODEL_{up}_BASE_URL"))
+        base_url: env_nonempty(&format!("AIZEN_MODEL_{up}_BASE_URL"))
             .or_else(|| entry.as_ref().and_then(|e| e.base_url.clone()))
             .unwrap_or_else(|| caller.base_url.clone()),
-        api_key: env_nonempty(&format!("NG_MODEL_{up}_API_KEY"))
+        api_key: env_nonempty(&format!("AIZEN_MODEL_{up}_API_KEY"))
             .or_else(|| entry.as_ref().and_then(key_from_ref))
             .unwrap_or_else(|| caller.api_key.clone()),
     }
 }
 
-/// The sub-agent's default endpoint: `roles.subagent_default` (env `NG_SUBAGENT_DEFAULT_*` >
+/// The sub-agent's default endpoint: `roles.subagent_default` (env `AIZEN_SUBAGENT_DEFAULT_*` >
 /// config > `main`), THEN routed through the model-endpoint registry so even the role-default model
 /// carries its own gateway. When `subagent_default` sets only `.model`, `endpoint_for_model` finds
 /// that model's endpoint; when it sets base_url/api_key too, those are the caller `endpoint_for_model`
@@ -397,7 +397,7 @@ pub fn update_check_enabled(cfg: &CliConfig) -> bool {
 /// an explicit oracle (e.g. self-review's oracle mode) check this instead of comparing endpoints.
 pub fn role_configured(role: &str) -> bool {
     let up = role.to_ascii_uppercase();
-    if env_nonempty(&format!("NG_{up}_MODEL")).is_some() {
+    if env_nonempty(&format!("AIZEN_{up}_MODEL")).is_some() {
         return true;
     }
     let cfg = load();
@@ -663,7 +663,7 @@ pub struct NotifyConfig {
 
 /// `~/.aizen/cli-config.json`.
 pub fn config_path() -> PathBuf {
-    nextgen_home().join("cli-config.json")
+    aizen_home().join("cli-config.json")
 }
 
 /// Load the config, or an empty one if the file is missing/unreadable/corrupt (never fails). A
@@ -792,9 +792,9 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-roles-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-roles-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
         let main = ResolvedEndpoint {
             base_url: "https://main/v1".into(),
             api_key: "mk".into(),
@@ -815,7 +815,7 @@ mod tests {
                     ..Default::default()
                 }),
                 oracle: Some(RoleModelConfig {
-                    api_key_ref: Some("env:NG_TEST_ORACLE_KEY".into()),
+                    api_key_ref: Some("env:AIZEN_TEST_ORACLE_KEY".into()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -834,18 +834,18 @@ mod tests {
             role_configured("oracle"),
             "an api_key_ref alone counts as configured"
         );
-        std::env::set_var("NG_TEST_ORACLE_KEY", "ok-secret");
+        std::env::set_var("AIZEN_TEST_ORACLE_KEY", "ok-secret");
         assert_eq!(
             resolve_role("oracle", &main).api_key,
             "ok-secret",
             "env: indirection resolves"
         );
-        std::env::remove_var("NG_TEST_ORACLE_KEY");
+        std::env::remove_var("AIZEN_TEST_ORACLE_KEY");
         // Env beats config.
-        std::env::set_var("NG_SUMMARIZER_MODEL", "env-model");
+        std::env::set_var("AIZEN_SUMMARIZER_MODEL", "env-model");
         assert_eq!(resolve_role("summarizer", &main).model, "env-model");
-        std::env::remove_var("NG_SUMMARIZER_MODEL");
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_SUMMARIZER_MODEL");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -854,9 +854,9 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-mep-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-mep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
         let caller = ResolvedEndpoint {
             base_url: "https://parent/v1".into(),
             api_key: "parent-key".into(),
@@ -875,12 +875,12 @@ mod tests {
             model_endpoints: Some(vec![ModelEndpoint {
                 model: "gpt-4o".into(),
                 base_url: Some("https://openai/v1".into()),
-                api_key_ref: Some("env:NG_TEST_OAI_KEY".into()),
+                api_key_ref: Some("env:AIZEN_TEST_OAI_KEY".into()),
             }]),
             ..Default::default()
         })
         .unwrap();
-        std::env::set_var("NG_TEST_OAI_KEY", "oai-secret");
+        std::env::set_var("AIZEN_TEST_OAI_KEY", "oai-secret");
         let r = endpoint_for_model("gpt-4o", &caller);
         assert_eq!(
             (r.model.as_str(), r.base_url.as_str(), r.api_key.as_str()),
@@ -892,15 +892,15 @@ mod tests {
             endpoint_for_model("other", &caller).base_url,
             "https://parent/v1"
         );
-        std::env::remove_var("NG_TEST_OAI_KEY");
-        // Env override: NG_MODEL_<sanitized-upper>_BASE_URL beats the config entry.
-        std::env::set_var("NG_MODEL_GPT_4O_BASE_URL", "https://env-override/v1");
+        std::env::remove_var("AIZEN_TEST_OAI_KEY");
+        // Env override: AIZEN_MODEL_<sanitized-upper>_BASE_URL beats the config entry.
+        std::env::set_var("AIZEN_MODEL_GPT_4O_BASE_URL", "https://env-override/v1");
         assert_eq!(
             endpoint_for_model("gpt-4o", &caller).base_url,
             "https://env-override/v1"
         );
-        std::env::remove_var("NG_MODEL_GPT_4O_BASE_URL");
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_MODEL_GPT_4O_BASE_URL");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -909,9 +909,9 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-subep-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-subep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
         let main = ResolvedEndpoint {
             base_url: "https://parent/v1".into(),
             api_key: "parent-key".into(),
@@ -946,7 +946,7 @@ mod tests {
             ("cheap-fast", "https://cheap/v1", "cheap-literal-key"),
             "role-default model is routed through the registry to carry its own gateway"
         );
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -968,9 +968,9 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-cfg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-cfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
 
         assert!(load().base_url.is_none(), "missing file → empty config");
         save(&CliConfig {
@@ -987,7 +987,7 @@ mod tests {
         assert_eq!(got.model.as_deref(), Some("sonnet-4-6"));
         assert_eq!(got.model_context_window, Some(200_000));
 
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1040,9 +1040,9 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-approval-cfg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-approval-cfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
 
         save(&CliConfig {
             smart_approve: Some(true),
@@ -1055,7 +1055,7 @@ mod tests {
         assert!(!raw.contains("auto_approve"), "{raw}");
         assert_eq!(load().persisted_approval_mode(), ApprovalMode::Smart);
 
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

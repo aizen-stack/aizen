@@ -334,7 +334,7 @@ pub fn cleanup_stale_backups(dir: &Path, live_exe: &Path) {
 }
 
 fn cache_path() -> PathBuf {
-    crate::core::config::nextgen_home().join("update-check.json")
+    crate::core::config::aizen_home().join("update-check.json")
 }
 
 fn now_unix() -> u64 {

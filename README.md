@@ -328,8 +328,7 @@ aizen models                       # GET {base}/models, marks your default
 aizen config set --model <id>      # pick one as the default
 ```
 
-The memory brain lives under `~/.aizen/cli-memory/` (override the root with `AIZEN_HOME`; the legacy
-`NEXTGEN_HOME` is still honored, and a pre-rebrand `~/.nextgen` is auto-migrated on first run).
+The memory brain lives under `~/.aizen/cli-memory/` (override the root with `AIZEN_HOME`).
 Memory commands are fully offline — no creds needed.
 
 Retrieval is **Unicode-aware**: the lexical tokenizer NFC-normalizes before lowercasing and

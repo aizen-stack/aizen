@@ -116,6 +116,11 @@ const BUILTINS: &[Builtin] = &[
         argument_hint: "",
     },
     Builtin {
+        name: "import",
+        description: "resume a conversation started in another CLI (Claude Code / Codex)",
+        argument_hint: "",
+    },
+    Builtin {
         name: "resume",
         description: "reopen the last conversation with its context",
         argument_hint: "[name]",

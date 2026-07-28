@@ -96,7 +96,7 @@ mod tests {
     /// A hermetic temp tree with a `.git` marker at its root so the walk stops there (never climbs
     /// into the real filesystem).
     fn sandbox(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("ng-projctx-{tag}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("aizen-projctx-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".git")).unwrap();
         root

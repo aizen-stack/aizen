@@ -110,7 +110,7 @@ impl WorkspaceIdentity {
     }
 
     pub fn lock_root(&self) -> PathBuf {
-        crate::core::config::nextgen_home()
+        crate::core::config::aizen_home()
             .join("locks")
             .join(format!("v{LOCK_PROTOCOL}"))
             .join("repo")
@@ -314,7 +314,7 @@ pub fn stable_key(value: &str) -> String {
 }
 
 pub fn resource_lock(kind: &str, logical_key: &str) -> PathBuf {
-    crate::core::config::nextgen_home()
+    crate::core::config::aizen_home()
         .join("locks")
         .join(format!("v{LOCK_PROTOCOL}"))
         .join("resources")
@@ -323,7 +323,7 @@ pub fn resource_lock(kind: &str, logical_key: &str) -> PathBuf {
 }
 
 pub fn store_lock(kind: &str, logical_key: &str) -> PathBuf {
-    crate::core::config::nextgen_home()
+    crate::core::config::aizen_home()
         .join("locks")
         .join(format!("v{LOCK_PROTOCOL}"))
         .join("stores")

@@ -6,8 +6,8 @@
 //! adoption/slash-commands.md` §4.
 //!
 //! Files live as human-editable markdown:
-//! - global:  `~/.nextgen/commands/**/*.md`
-//! - project: `./.nextgen/commands/**/*.md`  (git-checked-in → team distribution for free)
+//! - global:  `~/.aizen/commands/**/*.md`
+//! - project: `./.aizen/commands/**/*.md`  (git-checked-in → team distribution for free)
 //!
 //! Project files override global on a name collision. A subdirectory namespaces the command:
 //! `commands/git/commit.md` → `/git:commit`.
@@ -51,13 +51,13 @@ pub struct CustomCommand {
     pub source: &'static str,
 }
 
-/// `~/.nextgen/commands/`.
+/// `~/.aizen/commands/`.
 fn global_dir() -> PathBuf {
-    crate::core::config::nextgen_home().join("commands")
+    crate::core::config::aizen_home().join("commands")
 }
-/// `<repo-root>/.nextgen/commands/` — repo-root-aware (R4), so it loads even from a subdir.
+/// `<repo-root>/.aizen/commands/` — repo-root-aware (R4), so it loads even from a subdir.
 fn project_dir() -> PathBuf {
-    crate::core::config::project_nextgen_dir().join("commands")
+    crate::core::config::project_aizen_dir().join("commands")
 }
 
 /// All custom commands, project entries overriding global ones of the same name. Sorted by name.

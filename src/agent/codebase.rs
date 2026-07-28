@@ -89,7 +89,6 @@ static SKIP_DIRS: &[&str] = &[
     "logs",
     // Never index the CLI's own home/state dir if it happens to sit inside the repo.
     ".aizen",
-    ".nextgen",
 ];
 
 /// Extensions we treat as indexable source / config / docs. Extension-driven allow-list keeps data
@@ -2449,7 +2448,7 @@ mod tests {
     //
     // These pin BOTH the home seam (where the index file lands) and the project-root seam (what the
     // walk indexes) into an isolated temp dir, serialized on the shared env lock. `build_index`
-    // resolves the root from `project_root()` (→ `NG_PROJECT_ROOT`) and writes to
+    // resolves the root from `project_root()` (→ `AIZEN_PROJECT_ROOT`) and writes to
     // `codebase_index_path()` (→ `AIZEN_HOME`), so pinning both fully sandboxes a real scan.
 
     use std::path::Path;
@@ -2459,24 +2458,27 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let base =
-            std::env::temp_dir().join(format!("ng-cb-{tag}-{}-{}", std::process::id(), now_unix()));
+        let base = std::env::temp_dir().join(format!(
+            "aizen-cb-{tag}-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
         let _ = std::fs::remove_dir_all(&base);
         let proj = base.join("proj");
         std::fs::create_dir_all(&proj).unwrap();
         std::env::set_var("USERPROFILE", &base);
         std::env::set_var("HOME", &base);
         std::env::set_var("AIZEN_HOME", base.join(".aizen"));
-        std::env::set_var("NEXTGEN_HOME", base.join(".aizen"));
-        std::env::set_var("NG_PROJECT_ROOT", &proj);
+        std::env::set_var("AIZEN_HOME", base.join(".aizen"));
+        std::env::set_var("AIZEN_PROJECT_ROOT", &proj);
         // Kill the project-slug cache so a prior test's slug can't bleed through.
         let out = f(&proj);
         for v in [
             "USERPROFILE",
             "HOME",
             "AIZEN_HOME",
-            "NEXTGEN_HOME",
-            "NG_PROJECT_ROOT",
+            "AIZEN_HOME",
+            "AIZEN_PROJECT_ROOT",
         ] {
             std::env::remove_var(v);
         }

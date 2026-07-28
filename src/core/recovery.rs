@@ -92,7 +92,7 @@ pub fn current_repo_scope() -> String {
 }
 
 fn recovery_root() -> PathBuf {
-    crate::core::config::nextgen_home().join("recovery")
+    crate::core::config::aizen_home().join("recovery")
 }
 
 fn lease_dir(run_id: &str) -> PathBuf {

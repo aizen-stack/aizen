@@ -601,18 +601,19 @@ fn confirm_core(fact: &str, opts: &LearnOptions) -> bool {
 mod tests {
     use super::*;
 
-    // ingest() touches process-global state (NEXTGEN_HOME → the store dir), so these tests
+    // ingest() touches process-global state (AIZEN_HOME → the store dir), so these tests
     // serialize on the shared home-lock and point HOME at a temp dir.
     fn with_temp_home<T>(tag: &str, f: impl FnOnce() -> T) -> T {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-learn-test-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("aizen-learn-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
         let out = f();
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
         out
     }
@@ -967,11 +968,11 @@ mod tests {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-ingest-zone-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-ingest-zone-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("NEXTGEN_HOME", &dir);
-        std::env::set_var("NG_PROJECT_ROOT", &dir); // a stable, isolated zone for this test
+        std::env::set_var("AIZEN_HOME", &dir);
+        std::env::set_var("AIZEN_PROJECT_ROOT", &dir); // a stable, isolated zone for this test
         crate::memory::session_mem::clear_process_session_mem();
 
         // Explicit user fact → durable global.
@@ -1020,7 +1021,7 @@ mod tests {
             .anchor
             .as_deref()
             .expect("place fact carries an anchor");
-        // The anchor is the directory this was learned in (NG_PROJECT_ROOT above), normalized.
+        // The anchor is the directory this was learned in (AIZEN_PROJECT_ROOT above), normalized.
         // Prefix-matching is what makes it fire again here, so assert that rather than a slug.
         assert!(
             crate::memory::path_scope::is_ancestor(anchor, &config::current_anchor()),
@@ -1028,8 +1029,8 @@ mod tests {
             config::current_anchor()
         );
 
-        std::env::remove_var("NG_PROJECT_ROOT");
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_PROJECT_ROOT");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
         crate::memory::session_mem::clear_process_session_mem();
     }

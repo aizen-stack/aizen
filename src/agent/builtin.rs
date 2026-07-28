@@ -84,7 +84,7 @@ const FILE_READ_MAX_BYTES: usize = 200_000;
 /// index consults it to hide any skill whose `requires:` tool is absent from this build/session
 /// (e.g. `browser_*` when `--features browser` is off, or MCP tools when no server is configured).
 /// `None` until published → the filter is a no-op (show all), so the unit tests and the offline
-/// `ng skill` path are unaffected.
+/// `aizen skill` path are unaffected.
 static ACTIVE_TOOL_NAMES: Lazy<Mutex<Option<HashSet<String>>>> = Lazy::new(|| Mutex::new(None));
 
 /// Publish the live tool surface (idempotent). ONLY the top-level registry calls this — never the
@@ -212,7 +212,7 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
             root.to_path_buf(),
         )));
     }
-    // User-configurable MCP servers (`~/.nextgen/mcp.json`) — each remote tool wrapped as
+    // User-configurable MCP servers (`~/.aizen/mcp.json`) — each remote tool wrapped as
     // `mcp_<server>_<tool>`. Empty (zero cost) when MCP is unconfigured. Top-level only, like
     // todo/process: sub-agents share the same live connections via the global manager but don't
     // need the surface advertised to them.
@@ -2290,7 +2290,7 @@ pub(crate) fn atomic_write(target: &Path, content: &[u8]) -> std::io::Result<()>
         .unwrap_or_else(|| Path::new("."));
     let fname = target.file_name().and_then(|n| n.to_str()).unwrap_or("out");
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(".{fname}.ng-tmp.{}.{n}", std::process::id()));
+    let tmp = parent.join(format!(".{fname}.aizen-tmp.{}.{n}", std::process::id()));
 
     // Write + fsync, then CLOSE the temp handle before renaming (Windows won't replace the
     // destination while a handle to the source is open). Any error aborts before the rename, so the
@@ -2329,7 +2329,7 @@ fn stash_path(p: &Path) -> PathBuf {
         .unwrap_or_else(|| Path::new("."));
     let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("dst");
     let n = STASH_COUNTER.fetch_add(1, Ordering::Relaxed);
-    parent.join(format!(".{fname}.ng-stash.{}.{n}", std::process::id()))
+    parent.join(format!(".{fname}.aizen-stash.{}.{n}", std::process::id()))
 }
 
 /// Rename `src` → `dst`, falling back to copy-then-delete when they live on different filesystems
@@ -3428,7 +3428,8 @@ mod tests {
     use super::*;
 
     fn temp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ng-agent-tool-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("aizen-agent-tool-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.canonicalize().unwrap()
@@ -4595,7 +4596,7 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains(".ng-tmp."))
+            .filter(|e| e.file_name().to_string_lossy().contains(".aizen-tmp."))
             .collect();
         assert!(leftovers.is_empty(), "temp file leaked: {leftovers:?}");
     }
@@ -4639,7 +4640,7 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| {
                 let n = e.file_name().to_string_lossy().into_owned();
-                n.contains(".ng-tmp.") || n.contains(".ng-stash.")
+                n.contains(".aizen-tmp.") || n.contains(".aizen-stash.")
             })
             .collect();
         assert!(leftovers.is_empty(), "staging file leaked: {leftovers:?}");
@@ -4648,7 +4649,7 @@ mod tests {
     #[test]
     fn file_move_overwrite_leaves_no_stash_behind() {
         // The overwrite path stashes the old destination out of the way, moves, then deletes the
-        // stash. On success no `.ng-stash.` sibling may survive.
+        // stash. On success no `.aizen-stash.` sibling may survive.
         let root = temp_root("fmv-stash");
         std::fs::write(root.join("a.txt"), "A\n").unwrap();
         std::fs::write(root.join("b.txt"), "B\n").unwrap();
@@ -4660,7 +4661,7 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains(".ng-stash."))
+            .filter(|e| e.file_name().to_string_lossy().contains(".aizen-stash."))
             .collect();
         assert!(leftovers.is_empty(), "stash file leaked: {leftovers:?}");
     }
@@ -4788,12 +4789,12 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-persona-tool-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-persona-tool-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
 
         let t = PersonaCreate;
-        assert!(t.is_destructive(), "writes to ~/.nextgen → approval-gated");
+        assert!(t.is_destructive(), "writes to ~/.aizen → approval-gated");
 
         // default activate=true → minted AND becomes active
         let out = t
@@ -4829,7 +4830,7 @@ mod tests {
         // missing required body → error (no half-formed card)
         assert!(t.execute(&serde_json::json!({"name":"Empty"})).is_err());
 
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

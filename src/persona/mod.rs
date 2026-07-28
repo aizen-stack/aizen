@@ -7,7 +7,7 @@
 //! - **user_memory** (frozen core) = *who the USER is*.
 //! - **skills** = *how to do things*.
 //!
-//! A persona is a human-editable markdown "character card" under `~/.nextgen/personas/<name>.md`:
+//! A persona is a human-editable markdown "character card" under `~/.aizen/personas/<name>.md`:
 //! ```text
 //! ---
 //! name: Aria
@@ -19,13 +19,13 @@
 //! The ACTIVE persona (config `persona = "<name>"`) is rendered into a `<persona>` block, and its
 //! accumulated `<self>` experience deepens across sessions (Generative-Agents pattern: a memory
 //! stream of episodes → periodic reflection into higher-level insights). Self-memory lives in a
-//! sibling `~/.nextgen/personas/<slug>.self/` directory, so each character grows independently.
+//! sibling `~/.aizen/personas/<slug>.self/` directory, so each character grows independently.
 
 pub mod reflect;
 pub mod self_mem;
 pub mod soul;
 
-use crate::core::config::nextgen_home;
+use crate::core::config::aizen_home;
 use crate::memory::frontmatter;
 use crate::memory::learning::sanitize_facts::threat_scan;
 use crate::skills::sanitize_name; // shared slug rule
@@ -51,17 +51,17 @@ pub struct Persona {
     pub body: String,
 }
 
-/// `~/.nextgen/personas/` — the personal (HOME) persona dir; `ng persona new` writes here.
+/// `~/.aizen/personas/` — the personal (HOME) persona dir; `aizen persona new` writes here.
 pub fn personas_dir() -> PathBuf {
-    nextgen_home().join("personas")
+    aizen_home().join("personas")
 }
 
-/// `<repo-root>/.nextgen/personas/` — personas a cloned repo ships. Read ONLY when the repo is
+/// `<repo-root>/.aizen/personas/` — personas a cloned repo ships. Read ONLY when the repo is
 /// trusted (`aizen mcp trust` — the same supply-chain gate as project mcp.json/verify.json), and
 /// NEVER over a HOME persona of the same name: a persona is injected identity, so a cloned repo
 /// silently replacing the user's active character would be a supply-chain prompt injection.
 pub fn project_personas_dir() -> PathBuf {
-    crate::core::config::project_nextgen_dir().join("personas")
+    crate::core::config::project_aizen_dir().join("personas")
 }
 
 fn path_for(name: &str) -> PathBuf {
@@ -291,13 +291,13 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-persona-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-persona-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
-        std::env::set_var("NG_PROJECT_ROOT", &dir); // isolate project-local discovery from the real repo
+        std::env::set_var("AIZEN_HOME", &dir);
+        std::env::set_var("AIZEN_PROJECT_ROOT", &dir); // isolate project-local discovery from the real repo
         let out = f();
-        std::env::remove_var("NEXTGEN_HOME");
-        std::env::remove_var("NG_PROJECT_ROOT");
+        std::env::remove_var("AIZEN_HOME");
+        std::env::remove_var("AIZEN_PROJECT_ROOT");
         let _ = std::fs::remove_dir_all(&dir);
         out
     }

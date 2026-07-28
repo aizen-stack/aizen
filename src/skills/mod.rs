@@ -26,7 +26,7 @@
 
 pub mod registry;
 
-use crate::core::config::nextgen_home;
+use crate::core::config::aizen_home;
 use crate::memory::frontmatter;
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
@@ -81,9 +81,9 @@ fn parse_list(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// `~/.aizen/skills/` — the personal GLOBAL skill dir; `skill_save`/`ng skill add` write here.
+/// `~/.aizen/skills/` — the personal GLOBAL skill dir; `skill_save`/`aizen skill add` write here.
 pub fn skills_dir() -> PathBuf {
-    nextgen_home().join("skills")
+    aizen_home().join("skills")
 }
 
 /// `~/.aizen/skills/p/<project-slug>/` — the current workspace's zone. Auto-learned skills land
@@ -99,7 +99,7 @@ pub fn project_zone_dir() -> PathBuf {
 /// `<repo-root>/.aizen/skills/` — skills a cloned repo ships, merged OVER the HOME ones (repo
 /// wins on a same-name collision). Repo-root-aware (R4).
 pub fn project_skills_dir() -> PathBuf {
-    crate::core::config::project_nextgen_dir().join("skills")
+    crate::core::config::project_aizen_dir().join("skills")
 }
 
 /// File-safe slug for a skill name (lowercase alnum + `-`/`_`; collapses the rest to `-`).
@@ -164,7 +164,7 @@ fn os_matches(platforms: &[String]) -> bool {
 }
 
 /// Are all the skill's `requires:` tools present in the live tool surface? Empty = yes. When the
-/// surface hasn't been published (tests / offline `ng skill`), don't filter (`None` → show).
+/// surface hasn't been published (tests / offline `aizen skill`), don't filter (`None` → show).
 fn requires_satisfied(requires: &[String]) -> bool {
     if requires.is_empty() {
         return true;
@@ -249,7 +249,7 @@ pub fn load(name: &str) -> Option<Skill> {
 }
 
 /// Every skill in OTHER workspaces' zones, as `(zone-slug, skill)` — inspection/cleanup only
-/// (`ng skill list --all-zones`); never enters the index or `load()`.
+/// (`aizen skill list --all-zones`); never enters the index or `load()`.
 pub fn list_other_zones() -> Vec<(String, Skill)> {
     let mut out = Vec::new();
     let base = skills_dir().join("p");
@@ -594,7 +594,7 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-skill-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-skill-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // MUST exist before the first `project_slug()` call: that slug hashes `canonicalize(root)`,
         // which FAILS on a missing dir and falls back to the plain path — a different string, so a
@@ -603,13 +603,13 @@ mod tests {
         // as the single-entry slug cache is evicted by another test, which is how the zone test
         // failed only in a full run.
         let _ = std::fs::create_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
         // Pin the project root into the same isolated temp dir so project-local skill discovery
-        // doesn't pick up the real repo's `.nextgen/skills/` and skew these HOME-only assertions.
-        std::env::set_var("NG_PROJECT_ROOT", &dir);
+        // doesn't pick up the real repo's `.aizen/skills/` and skew these HOME-only assertions.
+        std::env::set_var("AIZEN_PROJECT_ROOT", &dir);
         let out = f();
-        std::env::remove_var("NEXTGEN_HOME");
-        std::env::remove_var("NG_PROJECT_ROOT");
+        std::env::remove_var("AIZEN_HOME");
+        std::env::remove_var("AIZEN_PROJECT_ROOT");
         let _ = std::fs::remove_dir_all(&dir);
         out
     }
@@ -701,9 +701,9 @@ mod tests {
 
             // repoint the workspace → the zone (and its skill) disappears from view
             let other =
-                std::env::temp_dir().join(format!("ng-skill-otherzone-{}", std::process::id()));
+                std::env::temp_dir().join(format!("aizen-skill-otherzone-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&other);
-            std::env::set_var("NG_PROJECT_ROOT", &other);
+            std::env::set_var("AIZEN_PROJECT_ROOT", &other);
             assert!(
                 load("zoned-deploy").is_none(),
                 "another workspace never sees the zone"

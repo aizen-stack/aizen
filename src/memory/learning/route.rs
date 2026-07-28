@@ -2,7 +2,7 @@
 //! of four destinations by confidence + whether it's a style fact:
 //!
 //! - `Drop`        — below the floor; not worth persisting.
-//! - `Review`      — mid-confidence; lands in the review queue for a human (`ng memory review`).
+//! - `Review`      — mid-confidence; lands in the review queue for a human (`aizen memory review`).
 //! - `Store`       — high-confidence; written to the live long-tail store automatically.
 //! - `CorePromote` — a high-confidence STYLE fact; eligible for the always-on core,
 //!                   but ONLY after confirmation (auto-learned facts never silently

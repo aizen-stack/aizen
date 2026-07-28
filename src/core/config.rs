@@ -2,7 +2,7 @@
 //!
 //! Memory is the CLI's OWN, under `~/.aizen/cli-memory/` — no byte-for-byte
 //! interop requirement with the VS Code extension (owner decision 2026-06-20).
-//! The home root is `~/.aizen` (renamed from the pre-rebrand `~/.nextgen`, which is
+//! The home root is `~/.aizen` (renamed from the pre-rebrand `~/.aizen`, which is
 //! auto-migrated on first run so an upgrading user keeps all their data).
 
 use std::path::{Path, PathBuf};
@@ -13,12 +13,12 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 pub(crate) static TEST_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Resolve the home root: `AIZEN_HOME` (legacy `NEXTGEN_HOME`) else `USERPROFILE`/`HOME`/cwd +
-/// `/.aizen`. When no env override is set, a pre-rebrand `~/.nextgen` is migrated to `~/.aizen`
+/// Resolve the home root: `AIZEN_HOME` (legacy `AIZEN_HOME`) else `USERPROFILE`/`HOME`/cwd +
+/// `/.aizen`. When no env override is set, a pre-rebrand `~/.aizen` is migrated to `~/.aizen`
 /// on first use (atomic same-parent rename) so memory/personas/soul/config carry over. The fn
-/// name stays `nextgen_home` (internal; called everywhere) — only the path + brand changed.
-pub fn nextgen_home() -> PathBuf {
-    for var in ["AIZEN_HOME", "NEXTGEN_HOME"] {
+/// name stays `aizen_home` (internal; called everywhere) — only the path + brand changed.
+pub fn aizen_home() -> PathBuf {
+    for var in ["AIZEN_HOME", "AIZEN_HOME"] {
         if let Ok(v) = std::env::var(var) {
             let v = v.trim();
             if !v.is_empty() {
@@ -34,29 +34,22 @@ pub fn nextgen_home() -> PathBuf {
     resolve_default_home(Path::new(&home))
 }
 
-/// Prefer `~/.aizen`; if it doesn't exist yet but a legacy `~/.nextgen` does, migrate it (rename).
-/// If the rename is blocked (e.g. a locked file), keep using the legacy dir so data is never lost.
+/// The home data root: always `<base>/.aizen`.
+///
+/// There is deliberately NO legacy-name fallback here. The pre-rebrand `.aizen` root predates
+/// this repository: the earliest tag (v0.4.0) already defaults to `.aizen`, so no released build
+/// ever created a `.aizen` home, and a migration branch for a directory nothing ever wrote is
+/// dead weight that keeps the old brand alive in every path decision.
 fn resolve_default_home(base: &Path) -> PathBuf {
-    let aizen = base.join(".aizen");
-    if aizen.exists() {
-        return aizen;
-    }
-    let legacy = base.join(".nextgen");
-    if legacy.is_dir() {
-        if std::fs::rename(&legacy, &aizen).is_ok() {
-            return aizen;
-        }
-        return legacy; // couldn't migrate → keep the user's existing data dir
-    }
-    aizen
+    base.join(".aizen")
 }
 
-/// The project root for PROJECT-LOCAL customization (`./.nextgen/`): the git repo top-level if we're
-/// in one, else the current dir. Repo-root-aware so launching `ng` from a SUBDIR still finds the
-/// repo's `.nextgen/` (R4 — fixes the cwd-relative footgun). `NG_PROJECT_ROOT` overrides (tests + an
+/// The project root for PROJECT-LOCAL customization (`./.aizen/`): the git repo top-level if we're
+/// in one, else the current dir. Repo-root-aware so launching `aizen` from a SUBDIR still finds the
+/// repo's `.aizen/` (R4 — fixes the cwd-relative footgun). `AIZEN_PROJECT_ROOT` overrides (tests + an
 /// escape hatch). Shell-out to git keeps the pure-static posture (no git2/gix).
 pub fn project_root() -> PathBuf {
-    if let Ok(v) = std::env::var("NG_PROJECT_ROOT") {
+    if let Ok(v) = std::env::var("AIZEN_PROJECT_ROOT") {
         let v = v.trim();
         if !v.is_empty() {
             return PathBuf::from(v);
@@ -113,12 +106,15 @@ pub fn project_root() -> PathBuf {
         .unwrap_or_else(|| cwd.clone())
 }
 
-/// Workspace-scoping kill-switch: `NG_NO_SCOPE=1` collapses memory back to one global pool
+/// Workspace-scoping kill-switch: `AIZEN_NO_SCOPE=1` collapses memory back to one global pool
 /// (every scope filter passes everything). Escape hatch, not a config field — scoping is the
 /// intended default and this exists only to debug/compare.
 pub fn scope_disabled() -> bool {
     matches!(
-        std::env::var("NG_NO_SCOPE").ok().as_deref().map(str::trim),
+        std::env::var("AIZEN_NO_SCOPE")
+            .ok()
+            .as_deref()
+            .map(str::trim),
         Some("1") | Some("true") | Some("yes") | Some("on")
     )
 }
@@ -132,19 +128,19 @@ fn env_flag(name: &str) -> bool {
     )
 }
 
-/// Hebbian co-retrieval graph kill-switch. `NG_NO_GRAPH=1` turns OFF both edge *recording*
+/// Hebbian co-retrieval graph kill-switch. `AIZEN_NO_GRAPH=1` turns OFF both edge *recording*
 /// (retrieval writes nothing to `graph.tsv`) and edge *reading* (neighbor expansion is skipped),
 /// collapsing retrieval to the pre-P5 lexical/salience path. Escape hatch for debugging/benching.
 pub fn graph_disabled() -> bool {
-    env_flag("NG_NO_GRAPH")
+    env_flag("AIZEN_NO_GRAPH")
 }
 
-/// Opt-IN switch for graph neighbor-expansion in PRODUCTION retrieval. `NG_GRAPH_EXPAND=1` lets a
+/// Opt-IN switch for graph neighbor-expansion in PRODUCTION retrieval. `AIZEN_GRAPH_EXPAND=1` lets a
 /// strong lexical hit pull in its most-associated neighbors (spreading activation). Default OFF —
 /// same posture as the dense/fuzzy moat tiers: the edge graph is always *recorded* (cheap, builds
 /// the corpus), but *reading* it into results waits until the bench proves net recall value.
 pub fn graph_expand_enabled() -> bool {
-    !graph_disabled() && env_flag("NG_GRAPH_EXPAND")
+    !graph_disabled() && env_flag("AIZEN_GRAPH_EXPAND")
 }
 
 /// FNV-1a 64-bit — tiny local hash for the project-slug stable key (core must not depend on
@@ -185,7 +181,7 @@ fn slug_fragment(name: &str) -> String {
 /// `canonicalize` fallback, which let *whether git happened to spawn* (PATH luck) pick the key:
 /// the same repo silently forked into twin memory/skills/index zones. A moved or re-cloned
 /// checkout is now an explicit `aizen zone migrate`, never an implicit re-key. Cached per
-/// (`NG_PROJECT_ROOT` env, cwd) so tests that repoint `NG_PROJECT_ROOT` are never served a
+/// (`AIZEN_PROJECT_ROOT` env, cwd) so tests that repoint `AIZEN_PROJECT_ROOT` are never served a
 /// stale slug.
 pub fn project_slug() -> String {
     identity().2
@@ -198,7 +194,7 @@ pub fn project_key() -> String {
     identity().1
 }
 
-/// `(root, key, slug)` for the current workspace, computed ONCE per (`NG_PROJECT_ROOT`, cwd).
+/// `(root, key, slug)` for the current workspace, computed ONCE per (`AIZEN_PROJECT_ROOT`, cwd).
 ///
 /// The three are derived from the same `project_root()` call by construction, so a caller can never
 /// see a key and a slug that disagree. Sharing the cache also matters for cost: `project_root()` may
@@ -209,7 +205,7 @@ fn identity() -> (PathBuf, String, String) {
         std::sync::Mutex::new(None);
     let cache_key = format!(
         "{}|{}",
-        std::env::var("NG_PROJECT_ROOT").unwrap_or_default(),
+        std::env::var("AIZEN_PROJECT_ROOT").unwrap_or_default(),
         std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_default()
@@ -362,19 +358,10 @@ pub fn current_subpath() -> Option<String> {
 }
 
 /// The project-local customization dir a cloned repo ships (skills / mcp.json / personas /
-/// commands), merged OVER the home dir by each resolver. Prefers `<root>/.aizen`; falls back to a
-/// legacy `<root>/.nextgen` when only that exists (so repos predating the rebrand still work).
-pub fn project_nextgen_dir() -> PathBuf {
-    let root = project_root();
-    let aizen = root.join(".aizen");
-    if aizen.exists() {
-        return aizen;
-    }
-    let legacy = root.join(".nextgen");
-    if legacy.exists() {
-        return legacy;
-    }
-    aizen // default to the new name
+/// commands), merged OVER the home dir by each resolver: always `<root>/.aizen`. Like
+/// [`resolve_default_home`], this carries no legacy-name fallback — one name, everywhere.
+pub fn project_aizen_dir() -> PathBuf {
+    project_root().join(".aizen")
 }
 
 /// Tighten a freshly-written secret-bearing file to owner-only (0600) on Unix; a no-op on Windows
@@ -443,7 +430,7 @@ pub fn harden_dir(_path: &Path) {}
 
 /// The CLI-owned memory directory. The markdown files here are the source of truth.
 pub fn cli_memory_dir() -> PathBuf {
-    nextgen_home().join("cli-memory")
+    aizen_home().join("cli-memory")
 }
 
 /// Long-tail entry store (one fact per `*.md`).
@@ -512,7 +499,7 @@ pub fn legacy_core_next_path() -> PathBuf {
     cli_memory_dir().join("core.next.md")
 }
 
-/// Mid-confidence learned candidates land here for `ng memory review` (P3).
+/// Mid-confidence learned candidates land here for `aizen memory review` (P3).
 pub fn review_dir() -> PathBuf {
     cli_memory_dir().join("review")
 }
@@ -538,19 +525,19 @@ pub fn graph_path() -> PathBuf {
 /// so other Aizen tooling can reuse a downloaded model. Consumed by the `dense` feature build.
 #[allow(dead_code)] // used by `--features dense` (model2vec loader); inert in the default build
 pub fn models_dir() -> PathBuf {
-    nextgen_home().join("models")
+    aizen_home().join("models")
 }
 
 /// The dense embedding model name (a subdir of `models_dir()`), overridable via env.
 #[allow(dead_code)] // used by `--features dense` (model2vec loader); inert in the default build
 pub fn embed_model_name() -> String {
-    std::env::var("NG_EMBED_MODEL")
+    std::env::var("AIZEN_EMBED_MODEL")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         // potion-base-8M (English static, ~30MB) — the P6 CI bench (dense-bench.yml) measured it
         // LIFTING paraphrase recall@5 more than the ~18x-larger multilingual model (+0.231 vs
-        // +0.154) on the bilingual En-Vi fixtures, so it's the default. `NG_EMBED_MODEL` overrides.
+        // +0.154) on the bilingual En-Vi fixtures, so it's the default. `AIZEN_EMBED_MODEL` overrides.
         .unwrap_or_else(|| "potion-base-8M".to_string())
 }
 
@@ -688,7 +675,7 @@ mod tests {
 
     #[test]
     fn workspace_key_never_carries_the_verbatim_spelling() {
-        let dir = std::env::temp_dir().join(format!("ng-wskey-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-wskey-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let canon = std::fs::canonicalize(&dir).expect("canonicalize temp dir");
         let key = workspace_key(&dir);
@@ -709,7 +696,7 @@ mod tests {
 
     #[test]
     fn legacy_candidates_cover_url_root_and_subdir_launch_eras() {
-        let base = std::env::temp_dir().join(format!("ng-legacy-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("aizen-legacy-{}", std::process::id()));
         let root = base.join("repo");
         let cwd = root.join("src").join("agent");
         let _ = std::fs::create_dir_all(&cwd);
@@ -748,11 +735,11 @@ mod tests {
 
     #[test]
     fn project_slug_is_stable_and_follows_ng_project_root() {
-        // NG_PROJECT_ROOT is process-global env → serialize with every other home-mutating test.
+        // AIZEN_PROJECT_ROOT is process-global env → serialize with every other home-mutating test.
         let _g = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-slug-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-slug-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        std::env::set_var("NG_PROJECT_ROOT", &dir);
+        std::env::set_var("AIZEN_PROJECT_ROOT", &dir);
         let a = project_slug();
         let b = project_slug();
         assert_eq!(a, b, "same workspace → same slug (cached)");
@@ -760,11 +747,11 @@ mod tests {
         assert_eq!(hex.len(), 8, "hex8 suffix: {a}");
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
         // repointing the root env gives a DIFFERENT zone (the cache can't serve stale)
-        let dir2 = std::env::temp_dir().join(format!("ng-slug2-{}", std::process::id()));
+        let dir2 = std::env::temp_dir().join(format!("aizen-slug2-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir2);
-        std::env::set_var("NG_PROJECT_ROOT", &dir2);
+        std::env::set_var("AIZEN_PROJECT_ROOT", &dir2);
         assert_ne!(project_slug(), a, "different root → different slug");
-        std::env::remove_var("NG_PROJECT_ROOT");
+        std::env::remove_var("AIZEN_PROJECT_ROOT");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
     }

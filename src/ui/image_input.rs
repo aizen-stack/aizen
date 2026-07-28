@@ -8,7 +8,7 @@
 //!     cross-platform, no clipboard.
 //!  2. **Clipboard image** — press Ctrl-O to grab a copied screenshot (Win+Shift+S / "Copy image").
 //!     DESKTOP-ONLY (Windows/macOS via `arboard`): on Linux `arboard` needs X11/Wayland libs at
-//!     runtime, which would break the headless static binary `ng serve` ships as — so it's
+//!     runtime, which would break the headless static binary `aizen serve` ships as — so it's
 //!     `cfg`-gated and a no-op stub elsewhere.
 
 use anyhow::{Context, Result};
@@ -248,7 +248,7 @@ mod tests {
 
     fn temp_png(tag: &str) -> std::path::PathBuf {
         // A minimal valid PNG (header + bytes good enough for the magic-byte sniff).
-        let p = std::env::temp_dir().join(format!("ng-img-{tag}-{}.png", std::process::id()));
+        let p = std::env::temp_dir().join(format!("aizen-img-{tag}-{}.png", std::process::id()));
         let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
         bytes.extend_from_slice(b"rest-of-a-tiny-png");
         std::fs::write(&p, bytes).unwrap();
@@ -262,7 +262,7 @@ mod tests {
         assert!(url.starts_with("data:image/png;base64,"));
         std::fs::remove_file(&p).ok();
         // a non-image file is rejected
-        let txt = std::env::temp_dir().join(format!("ng-not-img-{}.png", std::process::id()));
+        let txt = std::env::temp_dir().join(format!("aizen-not-img-{}.png", std::process::id()));
         std::fs::write(&txt, b"i am plain text").unwrap();
         assert!(
             image_file_to_data_url(txt.to_str().unwrap()).is_err(),

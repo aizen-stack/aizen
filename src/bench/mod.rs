@@ -1,4 +1,4 @@
-//! `ng bench memory` — anti-oracle recall bench.
+//! `aizen bench memory` — anti-oracle recall bench.
 //!
 //! Discipline (the repo burned itself twice on corrupt oracles): acceptable sets are
 //! HUMAN-LABELED, a reachability lint fails hard if an acceptable id doesn't exist in
@@ -202,7 +202,7 @@ fn print_metrics(label: &str, m: &BenchMetrics) {
     );
 }
 
-/// Entry point for `ng bench memory`.
+/// Entry point for `aizen bench memory`.
 pub fn run(split: &str, update_baseline: bool, hybrid: bool, fuzzy: bool) -> Result<()> {
     let corpus = corpus()?;
     let gate: Vec<FixQuery> = parse_jsonl(Q_GATE, "queries.gate.jsonl")?;
@@ -424,7 +424,7 @@ fn evolved_rank(
     scored.into_iter().take(k).map(|(id, _)| id).collect()
 }
 
-/// `ng bench memory --evolution`. A 6-session reuse simulation: signal facts (genuinely-useful
+/// `aizen bench memory --evolution`. A 6-session reuse simulation: signal facts (genuinely-useful
 /// answers, reused every session) vs distractors (short/dense → higher RAW BM25, never reused).
 /// At session 0 ranking is pure BM25 so distractors fill the top-5 and recall starts low; each
 /// session the signals are reinforced (salience ↑, kept fresh) while unused distractors age-decay

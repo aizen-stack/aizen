@@ -1,7 +1,7 @@
 //! SOUL — the agent's durable operating-identity slot (`<agent_identity>`).
 //!
 //! Distinct from the other identity layers (the repo's anti-overlap discipline):
-//! - **`<agent_identity>`** (this file, `~/.nextgen/SOUL.md`) = who the AGENT is *operationally*,
+//! - **`<agent_identity>`** (this file, `~/.aizen/SOUL.md`) = who the AGENT is *operationally*,
 //!   across EVERY persona and project — durable values/policies the operator sets once (e.g.
 //!   "always run tests before claiming done", "reply in Vietnamese", "never push without asking").
 //! - **`<persona>`** = a swappable costume (character voice) — `crate::persona`.
@@ -14,7 +14,7 @@
 //! `<agent_identity>` tag) and secret/injection-scanned (the shipped `threat_scan`, per line). Any
 //! tripped line drops the WHOLE block — fail-closed, a poisoned identity is never injected.
 
-use crate::core::config::nextgen_home;
+use crate::core::config::aizen_home;
 use crate::memory::learning::sanitize_facts::threat_scan;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -23,9 +23,9 @@ use std::path::PathBuf;
 /// prefix beside persona + user_memory + skills and must not crowd them or bust the prefix cache.
 const SOUL_MAX_TOKENS: usize = 400;
 
-/// `~/.nextgen/SOUL.md` (HOME only).
+/// `~/.aizen/SOUL.md` (HOME only).
 pub fn soul_path() -> PathBuf {
-    nextgen_home().join("SOUL.md")
+    aizen_home().join("SOUL.md")
 }
 
 /// Whether a non-empty SOUL.md exists (cheap gate for menus/HUD; no sanitize/scan).
@@ -35,7 +35,7 @@ pub fn exists() -> bool {
         .unwrap_or(false)
 }
 
-/// The raw SOUL.md text (for `ng soul show`/editing), or `None` if absent/empty.
+/// The raw SOUL.md text (for `aizen soul show`/editing), or `None` if absent/empty.
 pub fn read_raw() -> Option<String> {
     let s = std::fs::read_to_string(soul_path()).ok()?;
     if s.trim().is_empty() {
@@ -45,12 +45,12 @@ pub fn read_raw() -> Option<String> {
     }
 }
 
-/// Write SOUL.md (creates `~/.nextgen/`). Empty body errors (use `clear` to remove).
+/// Write SOUL.md (creates `~/.aizen/`). Empty body errors (use `clear` to remove).
 pub fn write(body: &str) -> Result<PathBuf> {
     if body.trim().is_empty() {
         anyhow::bail!("the SOUL body is empty (use `aizen soul clear` to remove it)");
     }
-    let dir = nextgen_home();
+    let dir = aizen_home();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = soul_path();
     std::fs::write(&path, format!("{}\n", body.trim()))
@@ -134,11 +134,11 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ng-soul-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aizen-soul-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("AIZEN_HOME", &dir);
         let out = f();
-        std::env::remove_var("NEXTGEN_HOME");
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
         out
     }
