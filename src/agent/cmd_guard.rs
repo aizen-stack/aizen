@@ -49,25 +49,50 @@ static BLOCKLIST: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         // quotes before rm sees them) can't smuggle a root target past the floor. NON-root paths
         // (`/etc`, `/home/u/tmp`) have a non-slash/non-dot char after the leading slash, so the run
         // stops and the trailing `(\s|$)` fails → they correctly stay `Ask`.
-        (r"(?i)\brm\s+(-{1,2}[a-z-]+\s+)*(-[a-z]*[rf][a-z]*|--recursive|--force|--no-preserve-root)(\s+-{1,2}[a-z-]+)*\s+(/+(\.+/*)*|/\*|~|\$HOME|\$\{HOME\})(\s|$)",
-            "recursive delete of a filesystem root"),
-        (r"(?i)\brm\b[^\n|;&]*\b--no-preserve-root\b", "rm --no-preserve-root"),
+        (
+            r"(?i)\brm\s+(-{1,2}[a-z-]+\s+)*(-[a-z]*[rf][a-z]*|--recursive|--force|--no-preserve-root)(\s+-{1,2}[a-z-]+)*\s+(/+(\.+/*)*|/\*|~|\$HOME|\$\{HOME\})(\s|$)",
+            "recursive delete of a filesystem root",
+        ),
+        (
+            r"(?i)\brm\b[^\n|;&]*\b--no-preserve-root\b",
+            "rm --no-preserve-root",
+        ),
         // Filesystem creation over a whole device.
         (r"(?i)\bmkfs(\.[a-z0-9]+)?\b", "mkfs (formats a filesystem)"),
         // Raw block-device writes (dd of=/dev/sdX, or a redirect onto a raw disk).
-        (r"(?i)\bdd\b[^\n]*\bof=\s*/dev/(sd|nvme|hd|disk|vd)[a-z0-9]*", "dd onto a raw block device"),
-        (r"(?i)>\s*/dev/(sd|nvme|hd|disk|vd)[a-z0-9]*", "redirect onto a raw block device"),
+        (
+            r"(?i)\bdd\b[^\n]*\bof=\s*/dev/(sd|nvme|hd|disk|vd)[a-z0-9]*",
+            "dd onto a raw block device",
+        ),
+        (
+            r"(?i)>\s*/dev/(sd|nvme|hd|disk|vd)[a-z0-9]*",
+            "redirect onto a raw block device",
+        ),
         // Classic fork bomb :(){ :|:& };:  (tolerant of spacing).
-        (r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", "fork bomb"),
+        (
+            r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",
+            "fork bomb",
+        ),
         // Pipe-the-internet-into-a-shell.
-        (r"(?i)\b(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(sh|bash|zsh|python3?|perl)\b",
-            "pipe a remote script straight into a shell"),
+        (
+            r"(?i)\b(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(sh|bash|zsh|python3?|perl)\b",
+            "pipe a remote script straight into a shell",
+        ),
         // World-writable recursive chmod from a root.
-        (r"(?i)\bchmod\s+(-[a-z]*\s+)*-?R[a-z]*\s+0*777\s+(/+(\.+/*)*|/\*|~)(\s|$)", "recursive chmod 777 on a root"),
+        (
+            r"(?i)\bchmod\s+(-[a-z]*\s+)*-?R[a-z]*\s+0*777\s+(/+(\.+/*)*|/\*|~)(\s|$)",
+            "recursive chmod 777 on a root",
+        ),
         // Windows: format a drive, or recursive force-delete of a drive root.
         (r"(?i)\bformat\s+[a-z]:", "format a Windows drive"),
-        (r"(?i)\b(del|erase)\s+(/[a-z]\s+)*[a-z]:\\?(\s|\*|$)", "force-delete a Windows drive root"),
-        (r"(?i)\b(rd|rmdir)\s+(/[a-z]\s+)*[a-z]:\\?(\s|$)", "recursive remove of a Windows drive root"),
+        (
+            r"(?i)\b(del|erase)\s+(/[a-z]\s+)*[a-z]:\\?(\s|\*|$)",
+            "force-delete a Windows drive root",
+        ),
+        (
+            r"(?i)\b(rd|rmdir)\s+(/[a-z]\s+)*[a-z]:\\?(\s|$)",
+            "recursive remove of a Windows drive root",
+        ),
         // PowerShell recursive force-delete of a drive/home root (`Remove-Item` + its `ri` alias). PS
         // spells the flags separately, so require BOTH a recurse flag (`-r…`/`-Recurse`) AND a force flag
         // (`-fo…`/`-Force`) — matched in EITHER order — plus a ROOT target (a bare drive `C:` / `C:\`, `~`,
@@ -75,39 +100,80 @@ static BLOCKLIST: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         // C:\Users\me\build`) has a non-terminal path after the drive → the trailing anchor fails → stays
         // Ask. `[^;|&\n]*` keeps each run inside one segment so it can't span a chain. (`-fo…` starts at
         // `-fo`, never `-f`, so `-Filter`/`-fi…` is not mistaken for `-Force`.)
-        (r"(?i)\b(remove-item|ri)\b[^;|&\n]*\s-r[a-z]*\b[^;|&\n]*\s-fo[a-z]*\b[^;|&\n]*\s([a-z]:\\?|~|\$home|\$env:userprofile|\$env:systemdrive)(\s|\*|$)",
-            "recursive force-delete of a drive/home root"),
-        (r"(?i)\b(remove-item|ri)\b[^;|&\n]*\s-fo[a-z]*\b[^;|&\n]*\s-r[a-z]*\b[^;|&\n]*\s([a-z]:\\?|~|\$home|\$env:userprofile|\$env:systemdrive)(\s|\*|$)",
-            "recursive force-delete of a drive/home root"),
+        (
+            r"(?i)\b(remove-item|ri)\b[^;|&\n]*\s-r[a-z]*\b[^;|&\n]*\s-fo[a-z]*\b[^;|&\n]*\s([a-z]:\\?|~|\$home|\$env:userprofile|\$env:systemdrive)(\s|\*|$)",
+            "recursive force-delete of a drive/home root",
+        ),
+        (
+            r"(?i)\b(remove-item|ri)\b[^;|&\n]*\s-fo[a-z]*\b[^;|&\n]*\s-r[a-z]*\b[^;|&\n]*\s([a-z]:\\?|~|\$home|\$env:userprofile|\$env:systemdrive)(\s|\*|$)",
+            "recursive force-delete of a drive/home root",
+        ),
         // git-bash on Windows: `rm -rf C:\` / `rm -rf C:` wipes a whole drive — the POSIX-root pattern
         // above only covers `/`. Bare drive or drive-root only; a subdir (`C:/Users/..`) stays Ask.
-        (r"(?i)\brm\s+(-{1,2}[a-z-]+\s+)*(-[a-z]*[rf][a-z]*|--recursive|--force)(\s+-{1,2}[a-z-]+)*\s+[a-z]:[\\/]?(\s|\*|$)",
-            "recursive delete of a Windows drive root"),
+        (
+            r"(?i)\brm\s+(-{1,2}[a-z-]+\s+)*(-[a-z]*[rf][a-z]*|--recursive|--force)(\s+-{1,2}[a-z-]+)*\s+[a-z]:[\\/]?(\s|\*|$)",
+            "recursive delete of a Windows drive root",
+        ),
         // Overwrite the master boot record / wipe with zeros from /dev/zero onto a device.
-        (r"(?i)\bdd\b[^\n]*\bif=\s*/dev/(zero|random|urandom)[^\n]*\bof=\s*/dev/", "wipe a raw device"),
+        (
+            r"(?i)\bdd\b[^\n]*\bif=\s*/dev/(zero|random|urandom)[^\n]*\bof=\s*/dev/",
+            "wipe a raw device",
+        ),
         // ── shell file-blanking (data-loss anti-pattern) ────────────────────────────────
         // Blanking a file to "rewrite it from scratch" is the exact move that destroys a file and
         // then fails: `type NUL > f`, `echo. > f`, `copy nul f`, `cp /dev/null f`, `truncate -s 0 f`.
         // There is a first-class tool (`file_write`) for create/overwrite, so these have no
         // legitimate use in a coding workspace — refuse and point at it. NOTE: `echo text > f`
         // (real content) does NOT match; only the empty-source spellings do.
-        (r"(?i)\btype\s+nul\s*>", "shell file-blanking — use the file_write tool to create/overwrite files"),
-        (r"(?i)\bcopy\s+(/[a-z]+\s+)*nul\s+[^\s>]", "shell file-blanking — use the file_write tool to create/overwrite files"),
-        (r"(?i)\becho\s*\.?\s*>\s*[^>\s]", "shell file-blanking — use the file_write tool to create/overwrite files"),
-        (r"(?i)\bcat\s+/dev/null\s*>", "shell file-blanking — use the file_write tool to create/overwrite files"),
-        (r"(?i)\bcp\s+/dev/null\s+[^\s>]", "shell file-blanking — use the file_write tool to create/overwrite files"),
-        (r#"(?i)\bprintf\s+(''|"")\s*>"#, "shell file-blanking — use the file_write tool to create/overwrite files"),
-        (r"(?i)\btruncate\s+-s\s*0\b", "shell file-blanking — use the file_write tool to create/overwrite files"),
+        (
+            r"(?i)\btype\s+nul\s*>",
+            "shell file-blanking — use the file_write tool to create/overwrite files",
+        ),
+        (
+            r"(?i)\bcopy\s+(/[a-z]+\s+)*nul\s+[^\s>]",
+            "shell file-blanking — use the file_write tool to create/overwrite files",
+        ),
+        (
+            r"(?i)\becho\s*\.?\s*>\s*[^>\s]",
+            "shell file-blanking — use the file_write tool to create/overwrite files",
+        ),
+        (
+            r"(?i)\bcat\s+/dev/null\s*>",
+            "shell file-blanking — use the file_write tool to create/overwrite files",
+        ),
+        (
+            r"(?i)\bcp\s+/dev/null\s+[^\s>]",
+            "shell file-blanking — use the file_write tool to create/overwrite files",
+        ),
+        (
+            r#"(?i)\bprintf\s+(''|"")\s*>"#,
+            "shell file-blanking — use the file_write tool to create/overwrite files",
+        ),
+        (
+            r"(?i)\btruncate\s+-s\s*0\b",
+            "shell file-blanking — use the file_write tool to create/overwrite files",
+        ),
         // PowerShell / bash blanking cousins. `Clear-Content f` and `Set-Content f $null` (or `… ''`/`""`)
         // empty a file in place; a bare `> f` or `: > f` truncates with NO producing command. A real write
         // (`Set-Content f 'text'`, `echo x > f`) keeps its content and is NOT matched: the bare-redirect
         // pattern only fires when the `>` sits at a segment start (after `^` or `; | &`, optionally a no-op
         // `:`), so a `>` that follows a real command is left alone. `>>` (append) never matches.
-        (r"(?i)\bclear-content\b", "shell file-blanking — use the file_write tool to create/overwrite files"),
-        (r#"(?i)\bset-content\b[^;|&\n]*\s(\$null|''|"")\s*($|[;|&])"#, "shell file-blanking — use the file_write tool to create/overwrite files"),
-        (r"(?i)(^|[;|&])\s*:?\s*>\s*[^>\s]", "shell file-blanking — use the file_write tool to create/overwrite files"),
+        (
+            r"(?i)\bclear-content\b",
+            "shell file-blanking — use the file_write tool to create/overwrite files",
+        ),
+        (
+            r#"(?i)\bset-content\b[^;|&\n]*\s(\$null|''|"")\s*($|[;|&])"#,
+            "shell file-blanking — use the file_write tool to create/overwrite files",
+        ),
+        (
+            r"(?i)(^|[;|&])\s*:?\s*>\s*[^>\s]",
+            "shell file-blanking — use the file_write tool to create/overwrite files",
+        ),
     ];
-    pats.iter().map(|(p, r)| (Regex::new(p).unwrap(), *r)).collect()
+    pats.iter()
+        .map(|(p, r)| (Regex::new(p).unwrap(), *r))
+        .collect()
 });
 
 // ── read-only allowlist (for the `smart` tier) ──────────────────────────────
@@ -115,18 +181,37 @@ static BLOCKLIST: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
 // pipes/chains) leads with one of these AND the command has no output redirection. Anything else
 // (writes, installs, network, deletes, unknown programs) → `Ask`.
 static READONLY_PROGS: &[&str] = &[
-    "ls", "dir", "pwd", "cd", "echo", "cat", "type", "head", "tail", "wc", "nl",
-    "rg", "grep", "egrep", "fgrep", "find", "fd", "tree", "stat", "file", "du", "df",
-    "which", "where", "whereis", "whoami", "hostname", "uname", "date", "env", "printenv",
-    "ps", "top", "uptime", "id", "groups", "less", "more", "diff", "cmp", "sort", "uniq",
-    "basename", "dirname", "realpath", "readlink", "true", "false", "test",
+    "ls", "dir", "pwd", "cd", "echo", "cat", "type", "head", "tail", "wc", "nl", "rg", "grep",
+    "egrep", "fgrep", "find", "fd", "tree", "stat", "file", "du", "df", "which", "where",
+    "whereis", "whoami", "hostname", "uname", "date", "env", "printenv", "ps", "top", "uptime",
+    "id", "groups", "less", "more", "diff", "cmp", "sort", "uniq", "basename", "dirname",
+    "realpath", "readlink", "true", "false", "test",
 ];
 // Subcommand-gated programs: read-only ONLY for these subcommands (e.g. `git status`, not `git push`).
 static READONLY_SUBCMDS: &[(&str, &[&str])] = &[
-    ("git", &["status", "diff", "log", "show", "branch", "remote", "rev-parse", "describe", "blame", "ls-files", "shortlog", "tag"]),
+    (
+        "git",
+        &[
+            "status",
+            "diff",
+            "log",
+            "show",
+            "branch",
+            "remote",
+            "rev-parse",
+            "describe",
+            "blame",
+            "ls-files",
+            "shortlog",
+            "tag",
+        ],
+    ),
     ("cargo", &["check", "tree", "metadata", "fmt", "clippy"]),
     ("npm", &["test", "list", "ls", "outdated", "view", "audit"]),
-    ("docker", &["ps", "images", "version", "info", "inspect", "logs"]),
+    (
+        "docker",
+        &["ps", "images", "version", "info", "inspect", "logs"],
+    ),
     ("kubectl", &["get", "describe", "logs", "version"]),
 ];
 
@@ -144,28 +229,57 @@ static GIT_CAUTION: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
     let pats: &[(&str, &str)] = &[
         // Force-push (short `-f`, long `--force`, and the safer-but-still-rewriting `--force-with-lease`)
         // — rewrites a published branch's history, can clobber a teammate's commits.
-        (r"(?i)\bgit\s+push\b[^\n]*\s(--force\b|--force-with-lease\b|-f\b)", "git push --force rewrites published history (can clobber remote commits)"),
+        (
+            r"(?i)\bgit\s+push\b[^\n]*\s(--force\b|--force-with-lease\b|-f\b)",
+            "git push --force rewrites published history (can clobber remote commits)",
+        ),
         // Push straight to main/master (by branch name or the `HEAD:main` refspec) — bypasses the
         // branch-first workflow. `origin main`, `origin HEAD:main`, `origin master` all match.
-        (r"(?i)\bgit\s+push\b[^\n]*\s(main|master)\b", "git push to main/master — push to a feature branch first unless you meant this"),
-        (r"(?i)\bgit\s+push\b[^\n]*\bHEAD:(main|master)\b", "git push to main/master — push to a feature branch first unless you meant this"),
+        (
+            r"(?i)\bgit\s+push\b[^\n]*\s(main|master)\b",
+            "git push to main/master — push to a feature branch first unless you meant this",
+        ),
+        (
+            r"(?i)\bgit\s+push\b[^\n]*\bHEAD:(main|master)\b",
+            "git push to main/master — push to a feature branch first unless you meant this",
+        ),
         // Hard reset — discards ALL uncommitted work in the tree AND moves the branch pointer.
-        (r"(?i)\bgit\s+reset\b[^\n]*\s--hard\b", "git reset --hard discards all uncommitted changes in the working tree"),
+        (
+            r"(?i)\bgit\s+reset\b[^\n]*\s--hard\b",
+            "git reset --hard discards all uncommitted changes in the working tree",
+        ),
         // clean -f/-d/-x — permanently deletes untracked (and with -x, ignored) files; no undo.
-        (r"(?i)\bgit\s+clean\b[^\n]*\s-[a-z]*[fdx]", "git clean deletes untracked files permanently (no recycle bin)"),
+        (
+            r"(?i)\bgit\s+clean\b[^\n]*\s-[a-z]*[fdx]",
+            "git clean deletes untracked files permanently (no recycle bin)",
+        ),
         // Force-delete a branch (may drop unmerged commits). The `-D` is case-SENSITIVE (scoped
         // `(?-i:…)`): uppercase `-D` force-deletes, lowercase `-d` is a safe delete that refuses on
         // unmerged commits — only the former is a caution. `git branch --delete --force` also matches.
-        (r"(?i)\bgit\s+branch\b[^\n]*\s(?-i:-D)\b", "git branch -D force-deletes a branch (may drop unmerged commits)"),
-        (r"(?i)\bgit\s+branch\b[^\n]*\s--delete\b[^\n]*\s--force\b", "git branch --delete --force force-deletes a branch"),
+        (
+            r"(?i)\bgit\s+branch\b[^\n]*\s(?-i:-D)\b",
+            "git branch -D force-deletes a branch (may drop unmerged commits)",
+        ),
+        (
+            r"(?i)\bgit\s+branch\b[^\n]*\s--delete\b[^\n]*\s--force\b",
+            "git branch --delete --force force-deletes a branch",
+        ),
         // checkout/restore that overwrites working-tree files from the index/HEAD, discarding edits.
-        (r"(?i)\bgit\s+checkout\b[^\n]*\s--\s", "git checkout -- discards uncommitted changes to those files"),
+        (
+            r"(?i)\bgit\s+checkout\b[^\n]*\s--\s",
+            "git checkout -- discards uncommitted changes to those files",
+        ),
         // `git restore <path>` / `restore .` / `restore --source …` overwrites the working tree,
         // discarding edits. The Rust `regex` crate has no lookahead, so the `--staged` exclusion (a
         // no-data-loss unstage) is handled in `git_caution` rather than inline here.
-        (r"(?i)\bgit\s+restore\b[^\n]*\s(\.|--\s|-s\b|--source)", "git restore discards uncommitted changes to those files"),
+        (
+            r"(?i)\bgit\s+restore\b[^\n]*\s(\.|--\s|-s\b|--source)",
+            "git restore discards uncommitted changes to those files",
+        ),
     ];
-    pats.iter().map(|(p, r)| (Regex::new(p).unwrap(), *r)).collect()
+    pats.iter()
+        .map(|(p, r)| (Regex::new(p).unwrap(), *r))
+        .collect()
 });
 
 /// Scan for a git caution op; returns the reason for the first match. `None` if the command is not a
@@ -174,9 +288,8 @@ fn git_caution(norm: &str) -> Option<&'static str> {
     // `git restore --staged <path>` only unstages (no working-tree data loss), so it must NOT be a
     // caution — but the restore pattern can't express that exclusion (no lookahead in `regex`). Skip
     // it here. A `--staged --worktree` combo DOES touch the tree, so only exclude the staged-only form.
-    let restore_staged_only = norm.contains("git restore")
-        && norm.contains("--staged")
-        && !norm.contains("--worktree");
+    let restore_staged_only =
+        norm.contains("git restore") && norm.contains("--staged") && !norm.contains("--worktree");
     GIT_CAUTION
         .iter()
         .find(|(re, r)| re.is_match(norm) && !(restore_staged_only && r.starts_with("git restore")))
@@ -273,7 +386,9 @@ fn segment_is_readonly(seg: &str) -> bool {
 /// Strip a path prefix and a `.exe` suffix from a program token → the bare name, lowercased.
 fn program_name(tok: &str) -> String {
     let base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
-    base.trim_end_matches(".exe").trim_end_matches(".EXE").to_ascii_lowercase()
+    base.trim_end_matches(".exe")
+        .trim_end_matches(".EXE")
+        .to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -383,7 +498,7 @@ mod tests {
         assert!(!blocked("Remove-Item build -Recurse -Force"));
         assert!(!blocked("Remove-Item old.txt"));
         assert!(!blocked("rm -rf C:/Users/me/project")); // drive subdir, not the root
-        // Set-Content writing REAL content (incl. code that mentions $null / "") must not block.
+                                                         // Set-Content writing REAL content (incl. code that mentions $null / "") must not block.
         assert!(!blocked("Set-Content app.js 'console.log(1)'"));
         assert!(!blocked("Set-Content script.ps1 'if ($x -eq $null) {}'"));
         assert!(!blocked("Set-Content s.ps1 'let a = \"\"'"));
@@ -427,10 +542,10 @@ mod tests {
         assert!(!blocked("start index.html"));
         assert!(!blocked("start https://example.com"));
         assert!(!blocked("cmd /C start index.html"));
-        assert!(!blocked("open index.html"));           // macOS
-        assert!(!blocked("xdg-open index.html"));        // Linux
-        assert!(!blocked("explorer.exe index.html"));    // Windows file explorer
-        // …and they are not misread as a redirect/blank either.
+        assert!(!blocked("open index.html")); // macOS
+        assert!(!blocked("xdg-open index.html")); // Linux
+        assert!(!blocked("explorer.exe index.html")); // Windows file explorer
+                                                      // …and they are not misread as a redirect/blank either.
         assert_eq!(classify("start index.html"), Verdict::Ask);
     }
 

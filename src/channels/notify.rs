@@ -80,7 +80,9 @@ impl Channel {
                 "Discord → Server Settings → Integrations → Webhooks → New Webhook → Copy URL"
             }
             Channel::Slack => "Slack → api.slack.com/apps → Incoming Webhooks → Add → Copy the URL",
-            Channel::Webhook => "Any endpoint that accepts a JSON POST — we send {\"text\": \"…\"}.",
+            Channel::Webhook => {
+                "Any endpoint that accepts a JSON POST — we send {\"text\": \"…\"}."
+            }
         }
     }
 
@@ -151,7 +153,11 @@ pub fn is_configured(ch: Channel) -> bool {
 /// Channels that currently have a URL.
 pub fn configured_channels() -> Vec<Channel> {
     let cfg = cli_config::load();
-    Channel::ALL.iter().copied().filter(|c| channel_url(*c, &cfg).is_some()).collect()
+    Channel::ALL
+        .iter()
+        .copied()
+        .filter(|c| channel_url(*c, &cfg).is_some())
+        .collect()
 }
 
 /// True if any outbound channel is configured (decides whether to advertise the `notify` tool).
@@ -169,11 +175,25 @@ async fn post(ch: Channel, url: &str, body: Value, auth: Option<(String, String)
     if let Some((name, value)) = auth {
         req = req.header(name, value);
     }
-    let resp = req.send().await.with_context(|| format!("{} POST failed", ch.label()))?;
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("{} POST failed", ch.label()))?;
     let status = resp.status();
     if !status.is_success() {
-        let snippet: String = resp.text().await.unwrap_or_default().chars().take(200).collect();
-        bail!("{} returned HTTP {} — {}", ch.label(), status.as_u16(), snippet.trim());
+        let snippet: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        bail!(
+            "{} returned HTTP {} — {}",
+            ch.label(),
+            status.as_u16(),
+            snippet.trim()
+        );
     }
     Ok(())
 }
@@ -181,9 +201,13 @@ async fn post(ch: Channel, url: &str, body: Value, auth: Option<(String, String)
 /// Send `text` to one channel using the current config. Errors if that channel isn't configured.
 pub async fn send_to(ch: Channel, text: &str) -> Result<()> {
     let cfg = cli_config::load();
-    let url =
-        channel_url(ch, &cfg).with_context(|| format!("{} not configured (set it in /apps)", ch.label()))?;
-    let auth = if ch == Channel::Webhook { webhook_auth(&cfg) } else { None };
+    let url = channel_url(ch, &cfg)
+        .with_context(|| format!("{} not configured (set it in /apps)", ch.label()))?;
+    let auth = if ch == Channel::Webhook {
+        webhook_auth(&cfg)
+    } else {
+        None
+    };
     post(ch, &url, ch.payload(text), auth).await
 }
 
@@ -230,7 +254,10 @@ impl Tool for Notify {
         true
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let text = args.get("text").and_then(|v| v.as_str()).context("missing required string arg 'text'")?;
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .context("missing required string arg 'text'")?;
         let results = block(async { anyhow::Ok(broadcast(text).await) })?;
         if results.is_empty() {
             return Ok("error: no notification channels configured (add one in /apps)".to_string());
@@ -262,7 +289,10 @@ mod tests {
     use super::*;
 
     fn cfg_with(n: NotifyConfig) -> CliConfig {
-        CliConfig { notify: Some(n), ..Default::default() }
+        CliConfig {
+            notify: Some(n),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -281,7 +311,11 @@ mod tests {
         let long = "x".repeat(5000);
         let p = Channel::Discord.payload(&long);
         let content = p["content"].as_str().unwrap();
-        assert_eq!(content.chars().count(), DISCORD_MAX, "Discord content must be ≤ 2000 chars");
+        assert_eq!(
+            content.chars().count(),
+            DISCORD_MAX,
+            "Discord content must be ≤ 2000 chars"
+        );
         assert!(content.ends_with('…'));
     }
 
@@ -313,8 +347,15 @@ mod tests {
     #[test]
     fn set_channel_url_round_trips() {
         let mut n = NotifyConfig::default();
-        set_channel_url(&mut n, Channel::Slack, Some("https://hooks.slack.com/x".into()));
-        assert_eq!(n.slack_webhook.as_deref(), Some("https://hooks.slack.com/x"));
+        set_channel_url(
+            &mut n,
+            Channel::Slack,
+            Some("https://hooks.slack.com/x".into()),
+        );
+        assert_eq!(
+            n.slack_webhook.as_deref(),
+            Some("https://hooks.slack.com/x")
+        );
         set_channel_url(&mut n, Channel::Slack, None);
         assert_eq!(n.slack_webhook, None);
     }
@@ -325,9 +366,18 @@ mod tests {
             webhook_auth: Some("Authorization: Bearer tok123".into()),
             ..Default::default()
         });
-        assert_eq!(webhook_auth(&cfg), Some(("Authorization".into(), "Bearer tok123".into())));
+        assert_eq!(
+            webhook_auth(&cfg),
+            Some(("Authorization".into(), "Bearer tok123".into()))
+        );
         // malformed / empty → None
-        assert_eq!(webhook_auth(&cfg_with(NotifyConfig { webhook_auth: Some("no-colon".into()), ..Default::default() })), None);
+        assert_eq!(
+            webhook_auth(&cfg_with(NotifyConfig {
+                webhook_auth: Some("no-colon".into()),
+                ..Default::default()
+            })),
+            None
+        );
         assert_eq!(webhook_auth(&CliConfig::default()), None);
     }
 

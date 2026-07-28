@@ -83,7 +83,10 @@ impl RepoTxnLock {
         let start = Instant::now();
         loop {
             if cancel.is_some_and(crate::core::cancel::TurnCancel::is_cancelled) {
-                anyhow::bail!("cancelled while waiting for lock {}; nothing was changed", path.display());
+                anyhow::bail!(
+                    "cancelled while waiting for lock {}; nothing was changed",
+                    path.display()
+                );
             }
             match try_lock(&file, mode) {
                 Ok(true) => return Ok(Self { file, mode }),
@@ -91,7 +94,12 @@ impl RepoTxnLock {
                     std::thread::sleep(Duration::from_millis(25));
                 }
                 Ok(false) => {
-                    return Err(LockBusy { path: path.to_path_buf(), mode, timeout }.into());
+                    return Err(LockBusy {
+                        path: path.to_path_buf(),
+                        mode,
+                        timeout,
+                    }
+                    .into());
                 }
                 Err(e) => return Err(e).with_context(|| format!("locking {}", path.display())),
             }
@@ -114,12 +122,18 @@ fn try_lock(file: &File, mode: LockMode) -> std::io::Result<bool> {
     use std::mem::zeroed;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
-    use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
     use windows_sys::Win32::System::IO::OVERLAPPED;
 
     let mut overlapped: OVERLAPPED = unsafe { zeroed() };
     let flags = LOCKFILE_FAIL_IMMEDIATELY
-        | if mode == LockMode::Exclusive { LOCKFILE_EXCLUSIVE_LOCK } else { 0 };
+        | if mode == LockMode::Exclusive {
+            LOCKFILE_EXCLUSIVE_LOCK
+        } else {
+            0
+        };
     let ok = unsafe {
         LockFileEx(
             file.as_raw_handle(),
@@ -149,15 +163,7 @@ fn unlock(file: &File) -> std::io::Result<()> {
     use windows_sys::Win32::System::IO::OVERLAPPED;
 
     let mut overlapped: OVERLAPPED = unsafe { zeroed() };
-    let ok = unsafe {
-        UnlockFileEx(
-            file.as_raw_handle(),
-            0,
-            u32::MAX,
-            u32::MAX,
-            &mut overlapped,
-        )
-    };
+    let ok = unsafe { UnlockFileEx(file.as_raw_handle(), 0, u32::MAX, u32::MAX, &mut overlapped) };
     if ok == 0 {
         Err(std::io::Error::last_os_error())
     } else {

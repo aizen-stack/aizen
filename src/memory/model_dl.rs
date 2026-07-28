@@ -29,7 +29,9 @@ const MAX_FILE_BYTES: u64 = 700 * 1024 * 1024;
 /// `models_dir()/<name>/`. Skips files already present so a re-run only fetches what's missing
 /// (resumable at file granularity). Returns the resolved model dir.
 pub async fn download(name: Option<&str>) -> Result<std::path::PathBuf> {
-    let name = name.map(str::to_string).unwrap_or_else(config::embed_model_name);
+    let name = name
+        .map(str::to_string)
+        .unwrap_or_else(config::embed_model_name);
     if name.trim().is_empty() {
         bail!("empty model name");
     }
@@ -54,7 +56,9 @@ pub async fn download(name: Option<&str>) -> Result<std::path::PathBuf> {
         }
         let url =
             format!("https://huggingface.co/minishlab/{name}/resolve/main/{file}?download=true");
-        fetch_to_file(&client, &url, &dest).await.with_context(|| format!("downloading {file}"))?;
+        fetch_to_file(&client, &url, &dest)
+            .await
+            .with_context(|| format!("downloading {file}"))?;
     }
     println!("Model '{name}' ready. Enable the dense tier with a `--features dense` build.");
     Ok(dir)
@@ -63,7 +67,11 @@ pub async fn download(name: Option<&str>) -> Result<std::path::PathBuf> {
 /// Stream one URL to `dest`, via a `.part` temp renamed on success (an interrupted download never
 /// leaves a truncated file that `exists()` would treat as complete).
 async fn fetch_to_file(client: &reqwest::Client, url: &str, dest: &std::path::Path) -> Result<()> {
-    let resp = client.get(url).send().await.with_context(|| format!("GET {url}"))?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
     if !resp.status().is_success() {
         bail!("HTTP {} from {url}", resp.status().as_u16());
     }
@@ -86,7 +94,9 @@ async fn fetch_to_file(client: &reqwest::Client, url: &str, dest: &std::path::Pa
             let _ = tokio::fs::remove_file(&part).await;
             bail!("file exceeded {MAX_FILE_BYTES} bytes mid-stream");
         }
-        file.write_all(&chunk).await.context("writing chunk to disk")?;
+        file.write_all(&chunk)
+            .await
+            .context("writing chunk to disk")?;
     }
     file.flush().await.context("flushing file")?;
     drop(file);

@@ -17,7 +17,9 @@ const BLACK_CUTOFF: f32 = 22.0;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let input = args.next().expect("usage: gen_moon_sixel <input.png> [target_width]");
+    let input = args
+        .next()
+        .expect("usage: gen_moon_sixel <input.png> [target_width]");
     let target_w: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(760);
 
     // ── Decode the PNG (expand palette/low-bit, strip 16-bit down to 8) ──────
@@ -45,8 +47,14 @@ fn main() {
         let (l, a) = match ch {
             1 => (buf[i] as f32, 255.0),
             2 => (buf[i] as f32, buf[i + 1] as f32),
-            3 => (0.299 * buf[i] as f32 + 0.587 * buf[i + 1] as f32 + 0.114 * buf[i + 2] as f32, 255.0),
-            _ => (0.299 * buf[i] as f32 + 0.587 * buf[i + 1] as f32 + 0.114 * buf[i + 2] as f32, buf[i + 3] as f32),
+            3 => (
+                0.299 * buf[i] as f32 + 0.587 * buf[i + 1] as f32 + 0.114 * buf[i + 2] as f32,
+                255.0,
+            ),
+            _ => (
+                0.299 * buf[i] as f32 + 0.587 * buf[i + 1] as f32 + 0.114 * buf[i + 2] as f32,
+                buf[i + 3] as f32,
+            ),
         };
         (l, a / 255.0)
     };
@@ -74,7 +82,9 @@ fn main() {
                 0
             } else {
                 // Map [cutoff,255] → 1..=LEVELS with a mild gamma lift so faint dots survive.
-                let t = ((lum - BLACK_CUTOFF) / (255.0 - BLACK_CUTOFF)).clamp(0.0, 1.0).powf(0.82);
+                let t = ((lum - BLACK_CUTOFF) / (255.0 - BLACK_CUTOFF))
+                    .clamp(0.0, 1.0)
+                    .powf(0.82);
                 ((t * LEVELS as f32).ceil() as usize).clamp(1, LEVELS) as u8
             };
         }
@@ -83,7 +93,7 @@ fn main() {
     // ── Emit sixel ───────────────────────────────────────────────────────────
     let mut s = String::from("\x1bP0;1;0q"); // P2=1 ⇒ 0-bits stay transparent
     s.push_str(&format!("\"1;1;{target_w};{target_h}")); // 1:1 pixel aspect + image size
-    // Register LEVELS silver-tinted greys (sixel RGB is 0..100). Brightest ≈ moonlight #d2d4d9.
+                                                         // Register LEVELS silver-tinted greys (sixel RGB is 0..100). Brightest ≈ moonlight #d2d4d9.
     for lvl in 1..=LEVELS {
         let t = lvl as f32 / LEVELS as f32;
         let r = (82.0 * t + 4.0).round() as u32;

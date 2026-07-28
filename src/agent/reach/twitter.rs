@@ -15,11 +15,16 @@ use anyhow::{bail, Result};
 /// legacy `/statuses/<id>`), on twitter.com / x.com / mobile hosts.
 pub(crate) fn tweet_id(url: &reqwest::Url) -> Option<String> {
     let host = url.host_str().unwrap_or("").to_ascii_lowercase();
-    let host = host.trim_start_matches("www.").trim_start_matches("mobile.");
+    let host = host
+        .trim_start_matches("www.")
+        .trim_start_matches("mobile.");
     if !matches!(host, "twitter.com" | "x.com") {
         return None;
     }
-    let segs: Vec<&str> = url.path_segments().map(|s| s.filter(|p| !p.is_empty()).collect()).unwrap_or_default();
+    let segs: Vec<&str> = url
+        .path_segments()
+        .map(|s| s.filter(|p| !p.is_empty()).collect())
+        .unwrap_or_default();
     let id = match segs.as_slice() {
         // "/i/web/status/<id>" — the canonical share-link shape from the official apps — must be
         // matched BEFORE the generic "/<user>/status/<id>" arms ("i" is a reserved prefix, not a user).
@@ -58,7 +63,11 @@ pub(crate) async fn read(id: &str) -> Result<String> {
 async fn read_fxtwitter(c: &reqwest::Client, id: &str) -> Result<String> {
     let v = http::get_json(c, &format!("https://api.fxtwitter.com/status/{id}"), &[]).await?;
     if v["code"].as_u64() != Some(200) {
-        bail!("fxtwitter code {}: {}", v["code"], v["message"].as_str().unwrap_or(""));
+        bail!(
+            "fxtwitter code {}: {}",
+            v["code"],
+            v["message"].as_str().unwrap_or("")
+        );
     }
     Ok(render_fxtweet(&v["tweet"]))
 }
@@ -78,7 +87,10 @@ pub(crate) fn render_fxtweet(t: &serde_json::Value) -> String {
         t["likes"].as_u64().unwrap_or(0),
         t["retweets"].as_u64().unwrap_or(0),
         t["replies"].as_u64().unwrap_or(0),
-        t["views"].as_u64().map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
+        t["views"]
+            .as_u64()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into()),
     ));
     if let Some(photos) = t["media"]["photos"].as_array() {
         for p in photos {
@@ -107,13 +119,20 @@ pub(crate) fn render_fxtweet(t: &serde_json::Value) -> String {
 }
 
 async fn read_syndication(c: &reqwest::Client, id: &str) -> Result<String> {
-    let url = format!("https://cdn.syndication.twimg.com/tweet-result?id={id}&token={}&lang=en", syndication_token(id));
+    let url = format!(
+        "https://cdn.syndication.twimg.com/tweet-result?id={id}&token={}&lang=en",
+        syndication_token(id)
+    );
     let f = http::get(c, &url, &[("Accept", "application/json".to_string())]).await?;
     if f.status == 404 {
         bail!("tweet {id} not found (deleted or never existed)");
     }
     if !f.is_success() || f.body.is_empty() {
-        bail!("syndication CDN returned HTTP {} ({} bytes)", f.status, f.body.len());
+        bail!(
+            "syndication CDN returned HTTP {} ({} bytes)",
+            f.status,
+            f.body.len()
+        );
     }
     let v: serde_json::Value = serde_json::from_slice(&f.body)?;
     match v["__typename"].as_str() {
@@ -192,7 +211,9 @@ pub(crate) async fn probe_fxtwitter() -> super::Probe {
         Err(e) => return super::Probe::Fail(e.to_string()),
     };
     match read_fxtwitter(&c, "20").await {
-        Ok(_) => super::Probe::Ok("single-tweet reads OK (fxtwitter; no search/timelines keyless)".into()),
+        Ok(_) => super::Probe::Ok(
+            "single-tweet reads OK (fxtwitter; no search/timelines keyless)".into(),
+        ),
         Err(e) => super::Probe::Fail(http::snippet(&e.to_string())),
     }
 }
@@ -218,14 +239,41 @@ mod tests {
 
     #[test]
     fn extracts_tweet_ids() {
-        assert_eq!(tweet_id(&u("https://twitter.com/jack/status/20")).as_deref(), Some("20"));
-        assert_eq!(tweet_id(&u("https://x.com/jack/status/20?s=46")).as_deref(), Some("20"));
-        assert_eq!(tweet_id(&u("https://x.com/i/status/1585841080431321088")).as_deref(), Some("1585841080431321088"));
-        assert_eq!(tweet_id(&u("https://twitter.com/i/web/status/1585841080431321088")).as_deref(), Some("1585841080431321088"), "canonical share-link shape");
-        assert_eq!(tweet_id(&u("https://mobile.twitter.com/a/statuses/99")).as_deref(), Some("99"));
-        assert_eq!(tweet_id(&u("https://x.com/jack/status/20/photo/1")).as_deref(), Some("20"));
-        assert_eq!(tweet_id(&u("https://x.com/jack")), None, "profile URL is not a tweet");
-        assert_eq!(tweet_id(&u("https://example.com/a/status/20")), None, "wrong host");
+        assert_eq!(
+            tweet_id(&u("https://twitter.com/jack/status/20")).as_deref(),
+            Some("20")
+        );
+        assert_eq!(
+            tweet_id(&u("https://x.com/jack/status/20?s=46")).as_deref(),
+            Some("20")
+        );
+        assert_eq!(
+            tweet_id(&u("https://x.com/i/status/1585841080431321088")).as_deref(),
+            Some("1585841080431321088")
+        );
+        assert_eq!(
+            tweet_id(&u("https://twitter.com/i/web/status/1585841080431321088")).as_deref(),
+            Some("1585841080431321088"),
+            "canonical share-link shape"
+        );
+        assert_eq!(
+            tweet_id(&u("https://mobile.twitter.com/a/statuses/99")).as_deref(),
+            Some("99")
+        );
+        assert_eq!(
+            tweet_id(&u("https://x.com/jack/status/20/photo/1")).as_deref(),
+            Some("20")
+        );
+        assert_eq!(
+            tweet_id(&u("https://x.com/jack")),
+            None,
+            "profile URL is not a tweet"
+        );
+        assert_eq!(
+            tweet_id(&u("https://example.com/a/status/20")),
+            None,
+            "wrong host"
+        );
     }
 
     #[test]
@@ -237,7 +285,11 @@ mod tests {
             assert_eq!(t, syndication_token(id), "deterministic for {id}");
         }
         // Classic derivation for id 20 starts "6dq" (cross-checked against the JS formula).
-        assert!(syndication_token("20").starts_with("6dq"), "got {}", syndication_token("20"));
+        assert!(
+            syndication_token("20").starts_with("6dq"),
+            "got {}",
+            syndication_token("20")
+        );
     }
 
     #[test]

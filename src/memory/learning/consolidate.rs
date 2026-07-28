@@ -32,7 +32,11 @@ pub fn best_match(candidate_tokens: &[String], existing: &[MemoryEntry]) -> Opti
 
 /// Decide ADD vs REINFORCE for `candidate_tokens` against the current store.
 /// Picks the single best lexical match; reinforces if it clears `dedup_threshold`.
-pub fn decide(candidate_tokens: &[String], existing: &[MemoryEntry], dedup_threshold: f64) -> MemOp {
+pub fn decide(
+    candidate_tokens: &[String],
+    existing: &[MemoryEntry],
+    dedup_threshold: f64,
+) -> MemOp {
     let mut best: Option<(&str, f64)> = None;
     for e in existing {
         let s = lexical_score_tokens(candidate_tokens, &e.tokens);
@@ -67,7 +71,12 @@ mod tests {
     fn near_duplicate_reinforces() {
         let existing = vec![entry("prefers-pnpm", "prefers pnpm over npm")];
         let op = decide(&tokenize("prefers pnpm over npm"), &existing, 0.82);
-        assert_eq!(op, MemOp::Reinforce { id: "prefers-pnpm".into() });
+        assert_eq!(
+            op,
+            MemOp::Reinforce {
+                id: "prefers-pnpm".into()
+            }
+        );
     }
 
     #[test]
@@ -80,9 +89,17 @@ mod tests {
     #[test]
     fn reworded_restatement_reinforces() {
         // the default 0.78 threshold absorbs a reworded restatement of the same fact…
-        let existing = vec![entry("prefers-pnpm", "prefers pnpm over npm for everything")];
+        let existing = vec![entry(
+            "prefers-pnpm",
+            "prefers pnpm over npm for everything",
+        )];
         let op = decide(&tokenize("prefers pnpm over npm"), &existing, 0.78);
-        assert_eq!(op, MemOp::Reinforce { id: "prefers-pnpm".into() });
+        assert_eq!(
+            op,
+            MemOp::Reinforce {
+                id: "prefers-pnpm".into()
+            }
+        );
     }
 
     #[test]

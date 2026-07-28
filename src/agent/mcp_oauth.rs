@@ -94,7 +94,13 @@ pub fn tokens_dir() -> PathBuf {
 pub fn token_path(key: &str) -> PathBuf {
     let safe: String = key
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     tokens_dir().join(format!("{safe}.json"))
 }
@@ -189,11 +195,18 @@ fn http_client() -> Result<reqwest::Client> {
 }
 
 async fn fetch_json(client: &reqwest::Client, url: &str) -> Result<Value> {
-    let resp = client.get(url).header(reqwest::header::ACCEPT, "application/json").send().await.with_context(|| format!("GET {url}"))?;
+    let resp = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
     if !resp.status().is_success() {
         bail!("{url} → HTTP {}", resp.status().as_u16());
     }
-    resp.json::<Value>().await.with_context(|| format!("parsing JSON from {url}"))
+    resp.json::<Value>()
+        .await
+        .with_context(|| format!("parsing JSON from {url}"))
 }
 
 /// The `scheme://host[:port]` origin of a URL.
@@ -235,7 +248,9 @@ fn prm_candidates(server_url: &str, www_authenticate: Option<&str>) -> Vec<Strin
         if let Ok(u) = url::Url::parse(server_url) {
             let path = u.path().trim_end_matches('/');
             if !path.is_empty() {
-                v.push(format!("{origin}/.well-known/oauth-protected-resource{path}"));
+                v.push(format!(
+                    "{origin}/.well-known/oauth-protected-resource{path}"
+                ));
             }
         }
         v.push(format!("{origin}/.well-known/oauth-protected-resource"));
@@ -246,21 +261,35 @@ fn prm_candidates(server_url: &str, www_authenticate: Option<&str>) -> Vec<Strin
 /// Candidate AS-metadata URLs for an issuer (RFC 8414: well-known is inserted between host and path).
 fn as_metadata_candidates(issuer: &str) -> Vec<String> {
     let mut v = Vec::new();
-    let Ok(origin) = origin_of(issuer) else { return v };
-    let path = url::Url::parse(issuer).ok().map(|u| u.path().trim_end_matches('/').to_string()).unwrap_or_default();
+    let Ok(origin) = origin_of(issuer) else {
+        return v;
+    };
+    let path = url::Url::parse(issuer)
+        .ok()
+        .map(|u| u.path().trim_end_matches('/').to_string())
+        .unwrap_or_default();
     if path.is_empty() {
         v.push(format!("{origin}/.well-known/oauth-authorization-server"));
         v.push(format!("{origin}/.well-known/openid-configuration"));
     } else {
-        v.push(format!("{origin}/.well-known/oauth-authorization-server{path}"));
-        v.push(format!("{origin}{path}/.well-known/oauth-authorization-server"));
+        v.push(format!(
+            "{origin}/.well-known/oauth-authorization-server{path}"
+        ));
+        v.push(format!(
+            "{origin}{path}/.well-known/oauth-authorization-server"
+        ));
         v.push(format!("{origin}/.well-known/openid-configuration{path}"));
         v.push(format!("{origin}{path}/.well-known/openid-configuration"));
     }
     v
 }
 
-async fn discover(client: &reqwest::Client, server_url: &str, www_authenticate: Option<&str>, cfg: &OAuthConfig) -> Result<AuthMeta> {
+async fn discover(
+    client: &reqwest::Client,
+    server_url: &str,
+    www_authenticate: Option<&str>,
+    cfg: &OAuthConfig,
+) -> Result<AuthMeta> {
     // 1. Resolve the authorization-server issuer + canonical resource.
     let (issuer, resource, mut scopes) = if let Some(asrv) = &cfg.authorization_server {
         (asrv.clone(), server_url.to_string(), Vec::new())
@@ -275,7 +304,11 @@ async fn discover(client: &reqwest::Client, server_url: &str, www_authenticate: 
                     .and_then(|s| s.as_str())
                     .map(|s| s.to_string());
                 if let Some(issuer) = issuer {
-                    let resource = meta.get("resource").and_then(|r| r.as_str()).unwrap_or(server_url).to_string();
+                    let resource = meta
+                        .get("resource")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or(server_url)
+                        .to_string();
                     let scopes = string_list(meta.get("scopes_supported"));
                     found = Some((issuer, resource, scopes));
                     break;
@@ -284,14 +317,23 @@ async fn discover(client: &reqwest::Client, server_url: &str, www_authenticate: 
         }
         // Fallback: some servers don't publish protected-resource metadata — treat the server origin
         // as the issuer and discover AS metadata there directly.
-        found.unwrap_or_else(|| (origin_of(server_url).unwrap_or_else(|_| server_url.to_string()), server_url.to_string(), Vec::new()))
+        found.unwrap_or_else(|| {
+            (
+                origin_of(server_url).unwrap_or_else(|_| server_url.to_string()),
+                server_url.to_string(),
+                Vec::new(),
+            )
+        })
     };
 
     // 2. Fetch the authorization-server metadata.
     let mut meta_json: Option<Value> = None;
     for url in as_metadata_candidates(&issuer) {
         if let Ok(m) = fetch_json(client, &url).await {
-            if m.get("authorization_endpoint").and_then(|v| v.as_str()).is_some() {
+            if m.get("authorization_endpoint")
+                .and_then(|v| v.as_str())
+                .is_some()
+            {
                 meta_json = Some(m);
                 break;
             }
@@ -301,25 +343,51 @@ async fn discover(client: &reqwest::Client, server_url: &str, www_authenticate: 
         format!("couldn't discover OAuth metadata for authorization server '{issuer}' (no /.well-known/oauth-authorization-server)")
     })?;
 
-    let authorization_endpoint =
-        meta.get("authorization_endpoint").and_then(|v| v.as_str()).context("AS metadata missing authorization_endpoint")?.to_string();
-    let token_endpoint =
-        meta.get("token_endpoint").and_then(|v| v.as_str()).context("AS metadata missing token_endpoint")?.to_string();
-    let registration_endpoint = meta.get("registration_endpoint").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let authorization_endpoint = meta
+        .get("authorization_endpoint")
+        .and_then(|v| v.as_str())
+        .context("AS metadata missing authorization_endpoint")?
+        .to_string();
+    let token_endpoint = meta
+        .get("token_endpoint")
+        .and_then(|v| v.as_str())
+        .context("AS metadata missing token_endpoint")?
+        .to_string();
+    let registration_endpoint = meta
+        .get("registration_endpoint")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     if scopes.is_empty() {
         scopes = string_list(meta.get("scopes_supported"));
     }
 
-    Ok(AuthMeta { authorization_endpoint, token_endpoint, registration_endpoint, scopes_supported: scopes, resource })
+    Ok(AuthMeta {
+        authorization_endpoint,
+        token_endpoint,
+        registration_endpoint,
+        scopes_supported: scopes,
+        resource,
+    })
 }
 
 fn string_list(v: Option<&Value>) -> Vec<String> {
-    v.and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect()).unwrap_or_default()
+    v.and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ───────────────────────────── dynamic client registration (RFC 7591) ─────────────────────────────
 
-async fn register_client(client: &reqwest::Client, reg_endpoint: &str, redirect_uri: &str, scopes: &[String]) -> Result<(String, Option<String>)> {
+async fn register_client(
+    client: &reqwest::Client,
+    reg_endpoint: &str,
+    redirect_uri: &str,
+    scopes: &[String],
+) -> Result<(String, Option<String>)> {
     let body = json!({
         "client_name": "Aizen CLI",
         "redirect_uris": [redirect_uri],
@@ -328,15 +396,37 @@ async fn register_client(client: &reqwest::Client, reg_endpoint: &str, redirect_
         "token_endpoint_auth_method": "none",
         "scope": scopes.join(" "),
     });
-    let resp = client.post(reg_endpoint).json(&body).send().await.with_context(|| format!("POST {reg_endpoint}"))?;
+    let resp = client
+        .post(reg_endpoint)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {reg_endpoint}"))?;
     let status = resp.status();
-    let v: Value = resp.json().await.context("parsing client-registration response")?;
+    let v: Value = resp
+        .json()
+        .await
+        .context("parsing client-registration response")?;
     if !status.is_success() {
-        let err = v.get("error_description").or_else(|| v.get("error")).and_then(|e| e.as_str()).unwrap_or("unknown error");
-        bail!("dynamic client registration → HTTP {}: {err}", status.as_u16());
+        let err = v
+            .get("error_description")
+            .or_else(|| v.get("error"))
+            .and_then(|e| e.as_str())
+            .unwrap_or("unknown error");
+        bail!(
+            "dynamic client registration → HTTP {}: {err}",
+            status.as_u16()
+        );
     }
-    let client_id = v.get("client_id").and_then(|x| x.as_str()).context("registration response missing client_id")?.to_string();
-    let client_secret = v.get("client_secret").and_then(|x| x.as_str()).map(|s| s.to_string());
+    let client_id = v
+        .get("client_id")
+        .and_then(|x| x.as_str())
+        .context("registration response missing client_id")?
+        .to_string();
+    let client_secret = v
+        .get("client_secret")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
     Ok((client_id, client_secret))
 }
 
@@ -349,20 +439,48 @@ struct RawToken {
 }
 
 fn parse_token_response(v: &Value) -> Result<RawToken> {
-    let access_token = v.get("access_token").and_then(|x| x.as_str()).context("token response missing access_token")?.to_string();
-    let refresh_token = v.get("refresh_token").and_then(|x| x.as_str()).map(|s| s.to_string());
-    let expires_in = v.get("expires_in").and_then(|x| x.as_i64().or_else(|| x.as_str().and_then(|s| s.parse().ok())));
-    Ok(RawToken { access_token, refresh_token, expires_in })
+    let access_token = v
+        .get("access_token")
+        .and_then(|x| x.as_str())
+        .context("token response missing access_token")?
+        .to_string();
+    let refresh_token = v
+        .get("refresh_token")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let expires_in = v.get("expires_in").and_then(|x| {
+        x.as_i64()
+            .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+    });
+    Ok(RawToken {
+        access_token,
+        refresh_token,
+        expires_in,
+    })
 }
 
-async fn post_token(client: &reqwest::Client, token_endpoint: &str, form: &[(&str, &str)]) -> Result<RawToken> {
-    let resp = client.post(token_endpoint).form(form).send().await.with_context(|| format!("POST {token_endpoint}"))?;
+async fn post_token(
+    client: &reqwest::Client,
+    token_endpoint: &str,
+    form: &[(&str, &str)],
+) -> Result<RawToken> {
+    let resp = client
+        .post(token_endpoint)
+        .form(form)
+        .send()
+        .await
+        .with_context(|| format!("POST {token_endpoint}"))?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         let detail = serde_json::from_str::<Value>(&body)
             .ok()
-            .and_then(|v| v.get("error_description").or_else(|| v.get("error")).and_then(|e| e.as_str()).map(|s| s.to_string()))
+            .and_then(|v| {
+                v.get("error_description")
+                    .or_else(|| v.get("error"))
+                    .and_then(|e| e.as_str())
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_else(|| body.chars().take(200).collect());
         bail!("token endpoint → HTTP {}: {detail}", status.as_u16());
     }
@@ -375,7 +493,9 @@ async fn post_token(client: &reqwest::Client, token_endpoint: &str, form: &[(&st
 /// Open the user's default browser at `url` (best effort — also printed so they can click it).
 fn open_browser(url: &str) {
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -404,12 +524,18 @@ async fn wait_for_code(listener: tokio::net::TcpListener, expected_state: &str) 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            bail!("timed out after {}s waiting for the sign-in redirect", AUTH_TIMEOUT.as_secs());
+            bail!(
+                "timed out after {}s waiting for the sign-in redirect",
+                AUTH_TIMEOUT.as_secs()
+            );
         }
         let (mut sock, _) = match tokio::time::timeout(remaining, listener.accept()).await {
             Ok(Ok(pair)) => pair,
             Ok(Err(e)) => bail!("loopback accept failed: {e}"),
-            Err(_) => bail!("timed out after {}s waiting for the sign-in redirect", AUTH_TIMEOUT.as_secs()),
+            Err(_) => bail!(
+                "timed out after {}s waiting for the sign-in redirect",
+                AUTH_TIMEOUT.as_secs()
+            ),
         };
         // Accumulate across reads until we have at least the request line (CRLF). A single read() is
         // NOT guaranteed to deliver the whole line — when the auth server appends a long
@@ -418,7 +544,8 @@ async fn wait_for_code(listener: tokio::net::TcpListener, expected_state: &str) 
         let mut data: Vec<u8> = Vec::with_capacity(8192);
         let mut tmp = [0u8; 4096];
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), sock.read(&mut tmp)).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), sock.read(&mut tmp)).await
+            {
                 Ok(Ok(0)) => break, // EOF
                 Ok(Ok(m)) => {
                     data.extend_from_slice(&tmp[..m]);
@@ -431,7 +558,11 @@ async fn wait_for_code(listener: tokio::net::TcpListener, expected_state: &str) 
             }
         }
         let req = String::from_utf8_lossy(&data);
-        let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("/");
+        let path = req
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("/");
         let parsed = url::Url::parse(&format!("http://127.0.0.1{path}")).ok();
         let (mut code, mut state, mut err) = (None, None, None);
         if let Some(u) = &parsed {
@@ -449,14 +580,26 @@ async fn wait_for_code(listener: tokio::net::TcpListener, expected_state: &str) 
             continue;
         }
         if let Some(e) = err {
-            respond(&mut sock, &format!("Authorization failed: {e}. You can close this tab.")).await;
+            respond(
+                &mut sock,
+                &format!("Authorization failed: {e}. You can close this tab."),
+            )
+            .await;
             bail!("authorization server returned error: {e}");
         }
         if state.as_deref() != Some(expected_state) {
-            respond(&mut sock, "State mismatch — sign-in aborted (possible CSRF).").await;
+            respond(
+                &mut sock,
+                "State mismatch — sign-in aborted (possible CSRF).",
+            )
+            .await;
             bail!("OAuth state mismatch (possible CSRF) — aborted");
         }
-        respond(&mut sock, "Signed in. You can close this tab and return to Aizen.").await;
+        respond(
+            &mut sock,
+            "Signed in. You can close this tab and return to Aizen.",
+        )
+        .await;
         return Ok(code.unwrap());
     }
 }
@@ -466,16 +609,27 @@ async fn wait_for_code(listener: tokio::net::TcpListener, expected_state: &str) 
 /// Run the full interactive OAuth sign-in for one server key and cache the token. `server_url` is the
 /// MCP endpoint; `www_authenticate` is its `401` challenge if the caller already has it (else None →
 /// discovery falls back to the well-known location).
-pub async fn authorize(key: &str, server_url: &str, cfg: &OAuthConfig, www_authenticate: Option<String>) -> Result<TokenSet> {
+pub async fn authorize(
+    key: &str,
+    server_url: &str,
+    cfg: &OAuthConfig,
+    www_authenticate: Option<String>,
+) -> Result<TokenSet> {
     let client = http_client()?;
     let meta = discover(&client, server_url, www_authenticate.as_deref(), cfg).await?;
 
     // Bind the loopback FIRST so we register the exact redirect URI the AS will see.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("binding loopback callback port")?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("binding loopback callback port")?;
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
-    let scopes = if !cfg.scopes.is_empty() { cfg.scopes.clone() } else { meta.scopes_supported.clone() };
+    let scopes = if !cfg.scopes.is_empty() {
+        cfg.scopes.clone()
+    } else {
+        meta.scopes_supported.clone()
+    };
 
     // Resolve the client id: a pinned one (Google/Atlassian) or dynamic registration.
     let (client_id, client_secret) = match &cfg.client_id {
@@ -491,7 +645,8 @@ pub async fn authorize(key: &str, server_url: &str, cfg: &OAuthConfig, www_authe
     let (verifier, challenge) = pkce()?;
     let state = rand_b64url(24)?;
 
-    let mut au = url::Url::parse(&meta.authorization_endpoint).context("bad authorization_endpoint")?;
+    let mut au =
+        url::Url::parse(&meta.authorization_endpoint).context("bad authorization_endpoint")?;
     {
         let mut q = au.query_pairs_mut();
         q.append_pair("response_type", "code");
@@ -509,7 +664,11 @@ pub async fn authorize(key: &str, server_url: &str, cfg: &OAuthConfig, www_authe
     }
     let auth_url = au.to_string();
 
-    eprintln!("{}", console::style("Opening your browser to sign in… (if it doesn't open, paste this URL):").dim());
+    eprintln!(
+        "{}",
+        console::style("Opening your browser to sign in… (if it doesn't open, paste this URL):")
+            .dim()
+    );
     eprintln!("{}", console::style(&auth_url).cyan());
     open_browser(&auth_url);
 
@@ -529,7 +688,9 @@ pub async fn authorize(key: &str, server_url: &str, cfg: &OAuthConfig, www_authe
     if let Some(sec) = &client_secret {
         form.push(("client_secret", sec));
     }
-    let raw = post_token(&client, &meta.token_endpoint, &form).await.context("exchanging authorization code for a token")?;
+    let raw = post_token(&client, &meta.token_endpoint, &form)
+        .await
+        .context("exchanging authorization code for a token")?;
 
     let token = TokenSet {
         access_token: raw.access_token,
@@ -548,12 +709,18 @@ pub async fn authorize(key: &str, server_url: &str, cfg: &OAuthConfig, www_authe
 /// Refresh an expired/invalid access token using the cached refresh token; persist + return the new
 /// set. The refresh token is preserved if the server doesn't rotate it.
 pub async fn refresh(key: &str, t: &TokenSet) -> Result<TokenSet> {
-    let rt = t.refresh_token.clone().context("no refresh token — run `aizen apps login` again")?;
+    let rt = t
+        .refresh_token
+        .clone()
+        .context("no refresh token — run `aizen apps login` again")?;
     let client = http_client()?;
     let scope = t.scope.clone().unwrap_or_default();
     let resource = t.resource.clone().unwrap_or_default();
-    let mut form: Vec<(&str, &str)> =
-        vec![("grant_type", "refresh_token"), ("refresh_token", &rt), ("client_id", &t.client_id)];
+    let mut form: Vec<(&str, &str)> = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &rt),
+        ("client_id", &t.client_id),
+    ];
     if !scope.is_empty() {
         form.push(("scope", &scope));
     }
@@ -563,7 +730,9 @@ pub async fn refresh(key: &str, t: &TokenSet) -> Result<TokenSet> {
     if let Some(sec) = &t.client_secret {
         form.push(("client_secret", sec));
     }
-    let raw = post_token(&client, &t.token_endpoint, &form).await.context("refreshing the OAuth token")?;
+    let raw = post_token(&client, &t.token_endpoint, &form)
+        .await
+        .context("refreshing the OAuth token")?;
     let token = TokenSet {
         access_token: raw.access_token,
         refresh_token: raw.refresh_token.or_else(|| t.refresh_token.clone()),
@@ -607,7 +776,11 @@ mod tests {
     fn pkce_generates_distinct_in_range_verifiers() {
         let (v1, c1) = pkce().unwrap();
         let (v2, _) = pkce().unwrap();
-        assert!(v1.len() >= 43 && v1.len() <= 128, "verifier length {} out of PKCE range", v1.len());
+        assert!(
+            v1.len() >= 43 && v1.len() <= 128,
+            "verifier length {} out of PKCE range",
+            v1.len()
+        );
         assert_ne!(v1, v2, "two verifiers must differ (CSPRNG)");
         // challenge is deterministic from the verifier
         assert_eq!(c1, b64url(&sha256(v1.as_bytes())));
@@ -616,33 +789,61 @@ mod tests {
     #[test]
     fn parse_resource_metadata_extracts_quoted_url() {
         let h = r#"Bearer error="invalid_token", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource""#;
-        assert_eq!(parse_resource_metadata(h).as_deref(), Some("https://mcp.example.com/.well-known/oauth-protected-resource"));
-        assert_eq!(parse_resource_metadata("Bearer realm=\"x\"").as_deref(), None);
+        assert_eq!(
+            parse_resource_metadata(h).as_deref(),
+            Some("https://mcp.example.com/.well-known/oauth-protected-resource")
+        );
+        assert_eq!(
+            parse_resource_metadata("Bearer realm=\"x\"").as_deref(),
+            None
+        );
     }
 
     #[test]
     fn prm_candidates_use_header_then_wellknown_with_path() {
-        let c = prm_candidates("https://mcp.linear.app/sse", Some(r#"Bearer resource_metadata="https://h/x""#));
+        let c = prm_candidates(
+            "https://mcp.linear.app/sse",
+            Some(r#"Bearer resource_metadata="https://h/x""#),
+        );
         assert_eq!(c[0], "https://h/x", "WWW-Authenticate value is tried first");
-        assert!(c.iter().any(|u| u == "https://mcp.linear.app/.well-known/oauth-protected-resource/sse"));
-        assert!(c.iter().any(|u| u == "https://mcp.linear.app/.well-known/oauth-protected-resource"));
+        assert!(c
+            .iter()
+            .any(|u| u == "https://mcp.linear.app/.well-known/oauth-protected-resource/sse"));
+        assert!(c
+            .iter()
+            .any(|u| u == "https://mcp.linear.app/.well-known/oauth-protected-resource"));
     }
 
     #[test]
     fn as_metadata_candidates_handle_root_and_path_issuers() {
         let root = as_metadata_candidates("https://auth.example.com");
-        assert_eq!(root[0], "https://auth.example.com/.well-known/oauth-authorization-server");
-        assert!(root.iter().any(|u| u == "https://auth.example.com/.well-known/openid-configuration"));
+        assert_eq!(
+            root[0],
+            "https://auth.example.com/.well-known/oauth-authorization-server"
+        );
+        assert!(root
+            .iter()
+            .any(|u| u == "https://auth.example.com/.well-known/openid-configuration"));
 
         let pathed = as_metadata_candidates("https://auth.example.com/tenant1");
-        assert!(pathed.iter().any(|u| u == "https://auth.example.com/.well-known/oauth-authorization-server/tenant1"));
-        assert!(pathed.iter().any(|u| u == "https://auth.example.com/tenant1/.well-known/oauth-authorization-server"));
+        assert!(pathed.iter().any(
+            |u| u == "https://auth.example.com/.well-known/oauth-authorization-server/tenant1"
+        ));
+        assert!(pathed.iter().any(
+            |u| u == "https://auth.example.com/tenant1/.well-known/oauth-authorization-server"
+        ));
     }
 
     #[test]
     fn origin_of_strips_path_keeps_port() {
-        assert_eq!(origin_of("https://mcp.notion.com/v1/mcp").unwrap(), "https://mcp.notion.com");
-        assert_eq!(origin_of("http://127.0.0.1:8080/mcp").unwrap(), "http://127.0.0.1:8080");
+        assert_eq!(
+            origin_of("https://mcp.notion.com/v1/mcp").unwrap(),
+            "https://mcp.notion.com"
+        );
+        assert_eq!(
+            origin_of("http://127.0.0.1:8080/mcp").unwrap(),
+            "http://127.0.0.1:8080"
+        );
     }
 
     #[test]
@@ -658,10 +859,23 @@ mod tests {
             resource: None,
         };
         assert!(!base.is_expired(), "an hour out → live");
-        let soon = TokenSet { expires_at: Some(now() + 30), ..base.clone() };
-        assert!(soon.is_expired(), "inside the {}s margin → treat as expired", EXPIRY_MARGIN_SECS);
-        let never = TokenSet { expires_at: None, ..base };
-        assert!(!never.is_expired(), "no stated expiry → not proactively expired");
+        let soon = TokenSet {
+            expires_at: Some(now() + 30),
+            ..base.clone()
+        };
+        assert!(
+            soon.is_expired(),
+            "inside the {}s margin → treat as expired",
+            EXPIRY_MARGIN_SECS
+        );
+        let never = TokenSet {
+            expires_at: None,
+            ..base
+        };
+        assert!(
+            !never.is_expired(),
+            "no stated expiry → not proactively expired"
+        );
     }
 
     #[test]

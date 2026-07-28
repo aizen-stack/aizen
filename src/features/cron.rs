@@ -71,7 +71,11 @@ fn task_name(name: &str) -> String {
 
 pub async fn handle(cmd: CronCmd) -> Result<()> {
     match cmd {
-        CronCmd::Add { name, schedule, task } => add(&name, &schedule, &task),
+        CronCmd::Add {
+            name,
+            schedule,
+            task,
+        } => add(&name, &schedule, &task),
         CronCmd::List => list(),
         CronCmd::Remove { name } => remove(&name),
         CronCmd::Run { name } => run(&name).await,
@@ -106,7 +110,9 @@ fn add(name: &str, schedule: &str, task: &str) -> Result<()> {
     println!(
         "scheduled '{name}' ({schedule}) → runs: {} cron run {name}\n  model: {}\n  spec:  {}",
         exe,
-        job.model.as_deref().unwrap_or("(config default at run time)"),
+        job.model
+            .as_deref()
+            .unwrap_or("(config default at run time)"),
         spec_path(name).display()
     );
     Ok(())
@@ -179,7 +185,11 @@ async fn run(name: &str) -> Result<()> {
         Ok(out) => format!("\n===== {stamp} =====\n{out}\n"),
         Err(e) => format!("\n===== {stamp} (ERROR) =====\n{e}\n"),
     };
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path(name)) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path(name))
+    {
         use std::io::Write;
         let _ = f.write_all(entry.as_bytes());
     }
@@ -208,7 +218,9 @@ fn parse_schedule(s: &str) -> Result<Sched> {
         return Ok(Sched::Hourly);
     }
     if let Some(rest) = s.strip_prefix("daily@") {
-        let (h, m) = rest.split_once(':').context("daily schedule must be daily@HH:MM")?;
+        let (h, m) = rest
+            .split_once(':')
+            .context("daily schedule must be daily@HH:MM")?;
         let h: u8 = h.parse().context("bad hour")?;
         let m: u8 = m.parse().context("bad minute")?;
         if h > 23 || m > 59 {
@@ -259,25 +271,52 @@ fn unregister_os(task: &str) -> Result<()> {
         }
         Ok(())
     } else {
-        rewrite_crontab(|lines| lines.into_iter().filter(|l| !l.contains(&marker(task))).collect())
+        rewrite_crontab(|lines| {
+            lines
+                .into_iter()
+                .filter(|l| !l.contains(&marker(task)))
+                .collect()
+        })
     }
 }
 
 fn register_windows(task: &str, sched: &Sched, exe: &str, name: &str) -> Result<()> {
     // The command schtasks runs. Inner quotes around the exe path are escaped for the /TR arg.
     let tr = format!("\\\"{exe}\\\" cron run {name}");
-    let mut args: Vec<String> = vec!["/Create".into(), "/TN".into(), task.into(), "/TR".into(), tr, "/F".into()];
+    let mut args: Vec<String> = vec![
+        "/Create".into(),
+        "/TN".into(),
+        task.into(),
+        "/TR".into(),
+        tr,
+        "/F".into(),
+    ];
     match sched {
         Sched::DailyAt(h, m) => {
-            args.extend(["/SC".into(), "DAILY".into(), "/ST".into(), format!("{h:02}:{m:02}")]);
+            args.extend([
+                "/SC".into(),
+                "DAILY".into(),
+                "/ST".into(),
+                format!("{h:02}:{m:02}"),
+            ]);
         }
         Sched::Hourly => args.extend(["/SC".into(), "HOURLY".into()]),
-        Sched::EveryMinutes(n) => args.extend(["/SC".into(), "MINUTE".into(), "/MO".into(), n.to_string()]),
-        Sched::EveryHours(n) => args.extend(["/SC".into(), "HOURLY".into(), "/MO".into(), n.to_string()]),
+        Sched::EveryMinutes(n) => {
+            args.extend(["/SC".into(), "MINUTE".into(), "/MO".into(), n.to_string()])
+        }
+        Sched::EveryHours(n) => {
+            args.extend(["/SC".into(), "HOURLY".into(), "/MO".into(), n.to_string()])
+        }
     }
-    let out = std::process::Command::new("schtasks").args(&args).output().context("running schtasks /Create")?;
+    let out = std::process::Command::new("schtasks")
+        .args(&args)
+        .output()
+        .context("running schtasks /Create")?;
     if !out.status.success() {
-        bail!("schtasks /Create failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "schtasks /Create failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -319,7 +358,11 @@ fn rewrite_crontab(f: impl FnOnce(Vec<String>) -> Vec<String>) -> Result<()> {
         .stdin(std::process::Stdio::piped())
         .spawn()
         .context("running crontab -")?;
-    child.stdin.as_mut().context("crontab stdin")?.write_all(body.as_bytes())?;
+    child
+        .stdin
+        .as_mut()
+        .context("crontab stdin")?
+        .write_all(body.as_bytes())?;
     let status = child.wait().context("waiting for crontab")?;
     if !status.success() {
         bail!("crontab update failed");
@@ -343,9 +386,18 @@ mod tests {
     #[test]
     fn parses_known_schedules() {
         assert!(matches!(parse_schedule("hourly").unwrap(), Sched::Hourly));
-        assert!(matches!(parse_schedule("daily@09:30").unwrap(), Sched::DailyAt(9, 30)));
-        assert!(matches!(parse_schedule("15m").unwrap(), Sched::EveryMinutes(15)));
-        assert!(matches!(parse_schedule("6h").unwrap(), Sched::EveryHours(6)));
+        assert!(matches!(
+            parse_schedule("daily@09:30").unwrap(),
+            Sched::DailyAt(9, 30)
+        ));
+        assert!(matches!(
+            parse_schedule("15m").unwrap(),
+            Sched::EveryMinutes(15)
+        ));
+        assert!(matches!(
+            parse_schedule("6h").unwrap(),
+            Sched::EveryHours(6)
+        ));
     }
 
     #[test]

@@ -130,7 +130,11 @@ pub fn parse_markdown(content: &str, fallback_name: &str) -> AgentDef {
         emoji: fm.get("emoji").unwrap_or("").trim().to_string(),
         vibe: fm.get("vibe").unwrap_or("").trim().to_string(),
         tools: fm.get("tools").map(parse_list).unwrap_or_default(),
-        model: fm.get("model").map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        model: fm
+            .get("model")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         body: fm.body,
         division: None,
         source: AgentSource::AizenHome, // overwritten by the walk (never observed otherwise)
@@ -189,7 +193,13 @@ fn read_dir_agents(root: &Path, source: AgentSource) -> Vec<AgentDef> {
     out
 }
 
-fn walk_agents(dir: &Path, root: &Path, source: AgentSource, depth: usize, out: &mut Vec<AgentDef>) {
+fn walk_agents(
+    dir: &Path,
+    root: &Path,
+    source: AgentSource,
+    depth: usize,
+    out: &mut Vec<AgentDef>,
+) {
     if depth > WALK_DEPTH_CAP {
         return;
     }
@@ -209,11 +219,19 @@ fn walk_agents(dir: &Path, root: &Path, source: AgentSource, depth: usize, out: 
         let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if is_dir {
             walk_agents(&p, root, source, depth + 1, out);
-        } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("md")) {
+        } else if p
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x.eq_ignore_ascii_case("md"))
+        {
             let Ok(content) = std::fs::read_to_string(&p) else {
                 continue;
             };
-            let stem = p.file_stem().and_then(|x| x.to_str()).unwrap_or("agent").to_string();
+            let stem = p
+                .file_stem()
+                .and_then(|x| x.to_str())
+                .unwrap_or("agent")
+                .to_string();
             let mut def = parse_markdown(&content, &stem);
             def.source = source;
             def.division = division_of(root, &p);
@@ -300,7 +318,11 @@ fn dir_has_md(dir: &Path, depth: usize) -> bool {
             if dir_has_md(&p, depth + 1) {
                 return true;
             }
-        } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("md")) {
+        } else if p
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x.eq_ignore_ascii_case("md"))
+        {
             return true;
         }
     }
@@ -329,7 +351,10 @@ pub fn source_counts() -> Vec<(AgentSource, PathBuf, usize)> {
 pub fn looks_like_agent(content: &str) -> bool {
     let fm = frontmatter::parse(content);
     fm.had_frontmatter
-        && fm.get("name").map(|n| !n.trim().is_empty()).unwrap_or(false)
+        && fm
+            .get("name")
+            .map(|n| !n.trim().is_empty())
+            .unwrap_or(false)
         && !fm.body.trim().is_empty()
 }
 
@@ -407,8 +432,8 @@ pub fn delete_home(slug: &str) -> Result<bool> {
 pub fn set_model(slug: &str, model: Option<&str>) -> Result<PathBuf> {
     let def = load(slug).with_context(|| format!("no agent named '{slug}'"))?;
     let path = def.source_path.clone();
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let fm = frontmatter::parse(&raw);
     if !fm.had_frontmatter {
         anyhow::bail!(
@@ -429,7 +454,15 @@ pub fn set_model(slug: &str, model: Option<&str>) -> Result<PathBuf> {
     let out = frontmatter::serialize(
         &fields,
         &fm.body,
-        &["name", "description", "color", "emoji", "vibe", "tools", "model"],
+        &[
+            "name",
+            "description",
+            "color",
+            "emoji",
+            "vibe",
+            "tools",
+            "model",
+        ],
     );
     std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
@@ -517,12 +550,14 @@ pub fn prompt_index() -> Option<String> {
     if all.is_empty() {
         return None;
     }
-    let header = "Specialist sub-agents you can delegate to via task(agent=\"<slug>\", prompt=...). \
+    let header =
+        "Specialist sub-agents you can delegate to via task(agent=\"<slug>\", prompt=...). \
                   Pick the best-matching specialist for a self-contained sub-task.";
 
     if let Some(enabled) = enabled_set() {
         if !enabled.is_empty() {
-            let chosen: Vec<&AgentDef> = all.iter().filter(|d| enabled.contains(&d.slug())).collect();
+            let chosen: Vec<&AgentDef> =
+                all.iter().filter(|d| enabled.contains(&d.slug())).collect();
             if !chosen.is_empty() {
                 let total = chosen.len();
                 let capped = total.min(INDEX_MAX_LINES);
@@ -538,7 +573,10 @@ pub fn prompt_index() -> Option<String> {
                     s.push_str(&format!("- {}: {}\n", d.slug(), desc.replace('\n', " ")));
                 }
                 if total > capped {
-                    s.push_str(&format!("- (+{} more — see `aizen agents list`)\n", total - capped));
+                    s.push_str(&format!(
+                        "- (+{} more — see `aizen agents list`)\n",
+                        total - capped
+                    ));
                 }
                 return Some(s.trim_end().to_string());
             }
@@ -563,7 +601,9 @@ mod tests {
     /// (incl. `~/.claude`, which is derived from USERPROFILE/HOME, not `nextgen_home()`). Serialized
     /// with the shared env lock so it can't race other env-mutating tests.
     fn with_sandbox<T>(tag: &str, f: impl FnOnce(&Path) -> T) -> T {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("ng-agents-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
@@ -573,7 +613,13 @@ mod tests {
         std::env::set_var("NEXTGEN_HOME", root.join(".aizen"));
         std::env::set_var("NG_PROJECT_ROOT", root.join("proj"));
         let out = f(&root);
-        for v in ["USERPROFILE", "HOME", "AIZEN_HOME", "NEXTGEN_HOME", "NG_PROJECT_ROOT"] {
+        for v in [
+            "USERPROFILE",
+            "HOME",
+            "AIZEN_HOME",
+            "NEXTGEN_HOME",
+            "NG_PROJECT_ROOT",
+        ] {
             std::env::remove_var(v);
         }
         let _ = std::fs::remove_dir_all(&root);
@@ -606,21 +652,34 @@ mod tests {
 
         let min = parse_markdown("---\nname: Plain\n---\njust a body", "fb");
         assert_eq!(min.name, "Plain");
-        assert!(min.tools.is_empty(), "no tools: ⇒ empty (default coder scope)");
+        assert!(
+            min.tools.is_empty(),
+            "no tools: ⇒ empty (default coder scope)"
+        );
         assert!(min.model.is_none());
 
         let noname = parse_markdown("no frontmatter at all", "the-stem");
-        assert_eq!(noname.name, "the-stem", "falls back to the stem when no name:");
+        assert_eq!(
+            noname.name, "the-stem",
+            "falls back to the stem when no name:"
+        );
     }
 
     #[test]
     fn title_case_name_resolves_by_slug() {
         with_sandbox("title", |root| {
-            write_file(&root.join(".aizen/agents"), "code-reviewer.md", &card("Code Reviewer", "d", "b"));
+            write_file(
+                &root.join(".aizen/agents"),
+                "code-reviewer.md",
+                &card("Code Reviewer", "d", "b"),
+            );
             let d = load("code-reviewer").expect("loads by normalized slug");
             assert_eq!(d.name, "Code Reviewer");
             assert_eq!(d.slug(), "code-reviewer");
-            assert!(load("Code Reviewer").is_some(), "loads by the raw Title Case too");
+            assert!(
+                load("Code Reviewer").is_some(),
+                "loads by the raw Title Case too"
+            );
         });
     }
 
@@ -628,16 +687,31 @@ mod tests {
     fn recursive_division_discovery() {
         with_sandbox("division", |root| {
             let base = root.join(".aizen/agents");
-            write_file(&base, "engineering/rust-pro.md", &card("Rust Pro", "d", "b"));
+            write_file(
+                &base,
+                "engineering/rust-pro.md",
+                &card("Rust Pro", "d", "b"),
+            );
             write_file(&base, "root-level.md", &card("Root Level", "d", "b"));
             // namespaced under a repo dir: division is still the IMMEDIATE parent, not the repo.
-            write_file(&base, "agency-agents/security/auditor.md", &card("Auditor", "d", "b"));
+            write_file(
+                &base,
+                "agency-agents/security/auditor.md",
+                &card("Auditor", "d", "b"),
+            );
             let rust = load("rust-pro").unwrap();
             assert_eq!(rust.division.as_deref(), Some("engineering"));
             let root_lvl = load("root-level").unwrap();
-            assert_eq!(root_lvl.division, None, "a file at the root has no division");
+            assert_eq!(
+                root_lvl.division, None,
+                "a file at the root has no division"
+            );
             let auditor = load("auditor").unwrap();
-            assert_eq!(auditor.division.as_deref(), Some("security"), "repo prefix doesn't become the division");
+            assert_eq!(
+                auditor.division.as_deref(),
+                Some("security"),
+                "repo prefix doesn't become the division"
+            );
         });
     }
 
@@ -649,16 +723,27 @@ mod tests {
             write_file(&base, "notes.txt", &card("Notes", "d", "b"));
             write_file(&base, "real.md", &card("Real", "d", "b"));
             let slugs: Vec<String> = list().iter().map(AgentDef::slug).collect();
-            assert_eq!(slugs, vec!["real"], "only the .md outside a dot-dir is discovered");
+            assert_eq!(
+                slugs,
+                vec!["real"],
+                "only the .md outside a dot-dir is discovered"
+            );
         });
     }
 
     #[test]
     fn claude_compat_discovery() {
         with_sandbox("claude", |root| {
-            write_file(&root.join(".claude/agents"), "from-claude.md", &card("From Claude", "d", "b"));
+            write_file(
+                &root.join(".claude/agents"),
+                "from-claude.md",
+                &card("From Claude", "d", "b"),
+            );
             assert!(has_any());
-            assert!(load("from-claude").is_some(), "~/.claude/agents is read for compat");
+            assert!(
+                load("from-claude").is_some(),
+                "~/.claude/agents is read for compat"
+            );
             assert_eq!(load("from-claude").unwrap().source, AgentSource::ClaudeHome);
         });
     }
@@ -667,14 +752,24 @@ mod tests {
     fn any_enabled_requires_an_installed_pinned_agent() {
         with_sandbox("anyenabled", |root| {
             assert!(!any_enabled(), "no agents at all");
-            write_file(&root.join(".aizen/agents"), "helper.md", &card("Helper", "d", "b"));
-            assert!(!any_enabled(), "installed but never pinned must NOT count (the over-trigger)");
+            write_file(
+                &root.join(".aizen/agents"),
+                "helper.md",
+                &card("Helper", "d", "b"),
+            );
+            assert!(
+                !any_enabled(),
+                "installed but never pinned must NOT count (the over-trigger)"
+            );
             set_enabled("helper", true).unwrap();
             assert!(any_enabled(), "pinned + installed counts");
             set_enabled("helper", false).unwrap();
             assert!(!any_enabled(), "unpinning turns it back off");
             set_enabled("ghost-agent", true).unwrap();
-            assert!(!any_enabled(), "a stale allowlist slug (no such agent) doesn't count");
+            assert!(
+                !any_enabled(),
+                "a stale allowlist slug (no such agent) doesn't count"
+            );
         });
     }
 
@@ -688,7 +783,10 @@ mod tests {
             );
             set_enabled("sneaky", true).unwrap();
             let idx = prompt_index().unwrap();
-            assert!(!idx.contains("</agents>"), "a crafted description can't close the system block: {idx}");
+            assert!(
+                !idx.contains("</agents>"),
+                "a crafted description can't close the system block: {idx}"
+            );
             assert!(idx.contains("sneaky"), "the agent still lists: {idx}");
         });
     }
@@ -696,36 +794,85 @@ mod tests {
     #[test]
     fn project_wins_over_home() {
         with_sandbox("projwins", |root| {
-            write_file(&root.join(".aizen/agents"), "dup.md", &card("Dup", "home version", "home"));
-            write_file(&root.join("proj/.aizen/agents"), "dup.md", &card("Dup", "project version", "proj"));
+            write_file(
+                &root.join(".aizen/agents"),
+                "dup.md",
+                &card("Dup", "home version", "home"),
+            );
+            write_file(
+                &root.join("proj/.aizen/agents"),
+                "dup.md",
+                &card("Dup", "project version", "proj"),
+            );
             let d = load("dup").unwrap();
             assert_eq!(d.description, "project version", "project beats HOME");
             assert_eq!(d.source, AgentSource::AizenProject);
-            assert_eq!(list().iter().filter(|d| d.slug() == "dup").count(), 1, "no duplicate in list");
+            assert_eq!(
+                list().iter().filter(|d| d.slug() == "dup").count(),
+                1,
+                "no duplicate in list"
+            );
         });
     }
 
     #[test]
     fn aizen_wins_over_claude() {
         with_sandbox("aizenwins", |root| {
-            write_file(&root.join(".claude/agents"), "dup.md", &card("Dup", "claude version", "c"));
-            write_file(&root.join(".aizen/agents"), "dup.md", &card("Dup", "aizen version", "a"));
-            assert_eq!(load("dup").unwrap().description, "aizen version", "aizen-native beats claude-compat");
+            write_file(
+                &root.join(".claude/agents"),
+                "dup.md",
+                &card("Dup", "claude version", "c"),
+            );
+            write_file(
+                &root.join(".aizen/agents"),
+                "dup.md",
+                &card("Dup", "aizen version", "a"),
+            );
+            assert_eq!(
+                load("dup").unwrap().description,
+                "aizen version",
+                "aizen-native beats claude-compat"
+            );
         });
     }
 
     #[test]
     fn full_four_dir_precedence_list_and_load_agree() {
         with_sandbox("fourdir", |root| {
-            write_file(&root.join(".claude/agents"), "x.md", &card("X", "claude-home", "1"));
-            write_file(&root.join(".aizen/agents"), "x.md", &card("X", "aizen-home", "2"));
-            write_file(&root.join("proj/.claude/agents"), "x.md", &card("X", "claude-proj", "3"));
-            write_file(&root.join("proj/.aizen/agents"), "x.md", &card("X", "aizen-proj", "4"));
+            write_file(
+                &root.join(".claude/agents"),
+                "x.md",
+                &card("X", "claude-home", "1"),
+            );
+            write_file(
+                &root.join(".aizen/agents"),
+                "x.md",
+                &card("X", "aizen-home", "2"),
+            );
+            write_file(
+                &root.join("proj/.claude/agents"),
+                "x.md",
+                &card("X", "claude-proj", "3"),
+            );
+            write_file(
+                &root.join("proj/.aizen/agents"),
+                "x.md",
+                &card("X", "aizen-proj", "4"),
+            );
             let from_list = list().into_iter().find(|d| d.slug() == "x").unwrap();
             let from_load = load("x").unwrap();
-            assert_eq!(from_list.description, "aizen-proj", "highest precedence wins in list");
-            assert_eq!(from_load.description, "aizen-proj", "highest precedence wins in load");
-            assert_eq!(from_list, from_load, "list and load pick the identical winner");
+            assert_eq!(
+                from_list.description, "aizen-proj",
+                "highest precedence wins in list"
+            );
+            assert_eq!(
+                from_load.description, "aizen-proj",
+                "highest precedence wins in load"
+            );
+            assert_eq!(
+                from_list, from_load,
+                "list and load pick the identical winner"
+            );
         });
     }
 
@@ -734,11 +881,18 @@ mod tests {
         with_sandbox("hasany", |root| {
             assert!(!has_any());
             assert!(prompt_index().is_none(), "no agents ⇒ no index block");
-            write_file(&root.join(".aizen/agents"), "deep/nested/spec.md", &card("Spec", "d", "b"));
+            write_file(
+                &root.join(".aizen/agents"),
+                "deep/nested/spec.md",
+                &card("Spec", "d", "b"),
+            );
             assert!(has_any(), "recursive discovery finds a nested agent");
             // Not enabled, but still resolvable for dispatch.
             assert!(enabled_set().is_none(), "no allowlist file yet");
-            assert!(load("spec").is_some(), "dispatch resolves a non-enabled agent");
+            assert!(
+                load("spec").is_some(),
+                "dispatch resolves a non-enabled agent"
+            );
         });
     }
 
@@ -748,20 +902,40 @@ mod tests {
             write_file(&root.join(".aizen/agents"), "a.md", &card("Aye", "d", "b"));
             write_file(&root.join(".aizen/agents"), "b.md", &card("Bee", "d", "b"));
             let idx = prompt_index().unwrap();
-            assert!(idx.contains("2 specialist sub-agents are installed"), "hint with count: {idx}");
-            assert!(idx.contains("task(agent="), "tells the model how to dispatch");
-            assert!(!idx.contains("- aye:"), "uncurated ⇒ does NOT list every agent");
+            assert!(
+                idx.contains("2 specialist sub-agents are installed"),
+                "hint with count: {idx}"
+            );
+            assert!(
+                idx.contains("task(agent="),
+                "tells the model how to dispatch"
+            );
+            assert!(
+                !idx.contains("- aye:"),
+                "uncurated ⇒ does NOT list every agent"
+            );
         });
     }
 
     #[test]
     fn index_lists_enabled_subset_only() {
         with_sandbox("subset", |root| {
-            write_file(&root.join(".aizen/agents"), "keep.md", &card("Keep", "the kept one", "b"));
-            write_file(&root.join(".aizen/agents"), "hide.md", &card("Hide", "the hidden one", "b"));
+            write_file(
+                &root.join(".aizen/agents"),
+                "keep.md",
+                &card("Keep", "the kept one", "b"),
+            );
+            write_file(
+                &root.join(".aizen/agents"),
+                "hide.md",
+                &card("Hide", "the hidden one", "b"),
+            );
             set_enabled("keep", true).unwrap();
             let idx = prompt_index().unwrap();
-            assert!(idx.contains("- keep: the kept one"), "enabled agent is advertised: {idx}");
+            assert!(
+                idx.contains("- keep: the kept one"),
+                "enabled agent is advertised: {idx}"
+            );
             assert!(!idx.contains("- hide:"), "disabled agent is NOT advertised");
             // round-trip the allowlist
             assert!(enabled_set().unwrap().contains("keep"));
@@ -776,17 +950,28 @@ mod tests {
             let base = root.join(".aizen/agents");
             for i in 0..(INDEX_MAX_LINES + 5) {
                 let long_desc = "x".repeat(INDEX_DESC_CHARS + 50);
-                write_file(&base, &format!("agent-{i:02}.md"), &card(&format!("Agent {i:02}"), &long_desc, "b"));
+                write_file(
+                    &base,
+                    &format!("agent-{i:02}.md"),
+                    &card(&format!("Agent {i:02}"), &long_desc, "b"),
+                );
             }
             set_all_enabled(true).unwrap();
             let idx = prompt_index().unwrap();
             let listed = idx.lines().filter(|l| l.starts_with("- agent-")).count();
             assert_eq!(listed, INDEX_MAX_LINES, "capped at INDEX_MAX_LINES");
-            assert!(idx.contains("+5 more"), "the overflow is disclosed, never silently dropped: {idx}");
+            assert!(
+                idx.contains("+5 more"),
+                "the overflow is disclosed, never silently dropped: {idx}"
+            );
             // desc clipped to INDEX_DESC_CHARS
             let sample = idx.lines().find(|l| l.starts_with("- agent-00:")).unwrap();
             let desc = sample.splitn(2, ": ").nth(1).unwrap();
-            assert!(desc.len() <= INDEX_DESC_CHARS, "desc clipped: {} chars", desc.len());
+            assert!(
+                desc.len() <= INDEX_DESC_CHARS,
+                "desc clipped: {} chars",
+                desc.len()
+            );
         });
     }
 
@@ -794,19 +979,39 @@ mod tests {
     fn looks_like_agent_filters_non_agents() {
         assert!(looks_like_agent("---\nname: Real\n---\nbody here"));
         assert!(!looks_like_agent("# Just a README\n\nno frontmatter"));
-        assert!(!looks_like_agent("---\nname: NoBody\n---\n   "), "empty body rejected");
-        assert!(!looks_like_agent("---\ndescription: no name field\n---\nbody"), "missing name rejected");
+        assert!(
+            !looks_like_agent("---\nname: NoBody\n---\n   "),
+            "empty body rejected"
+        );
+        assert!(
+            !looks_like_agent("---\ndescription: no name field\n---\nbody"),
+            "missing name rejected"
+        );
     }
 
     #[test]
     fn delete_home_is_home_tree_only() {
         with_sandbox("delhome", |root| {
-            write_file(&root.join(".aizen/agents"), "home-one.md", &card("Home One", "d", "b"));
-            write_file(&root.join("proj/.aizen/agents"), "proj-one.md", &card("Proj One", "d", "b"));
+            write_file(
+                &root.join(".aizen/agents"),
+                "home-one.md",
+                &card("Home One", "d", "b"),
+            );
+            write_file(
+                &root.join("proj/.aizen/agents"),
+                "proj-one.md",
+                &card("Proj One", "d", "b"),
+            );
             assert!(delete_home("home-one").unwrap(), "removes a HOME agent");
             assert!(load("home-one").is_none());
-            assert!(!delete_home("proj-one").unwrap(), "refuses to touch a project agent");
-            assert!(load("proj-one").is_some(), "project agent survives delete_home");
+            assert!(
+                !delete_home("proj-one").unwrap(),
+                "refuses to touch a project agent"
+            );
+            assert!(
+                load("proj-one").is_some(),
+                "project agent survives delete_home"
+            );
             assert!(!delete_home("missing").unwrap(), "no-op on a missing slug");
         });
     }
@@ -834,8 +1039,15 @@ mod tests {
             // Re-pin overwrites the existing model (not a duplicate field).
             set_model("rev", Some("claude-opus-4-8")).unwrap();
             let raw = std::fs::read_to_string(&path).unwrap();
-            assert_eq!(raw.matches("model:").count(), 1, "single model field, overwritten");
-            assert_eq!(load("rev").unwrap().model.as_deref(), Some("claude-opus-4-8"));
+            assert_eq!(
+                raw.matches("model:").count(),
+                1,
+                "single model field, overwritten"
+            );
+            assert_eq!(
+                load("rev").unwrap().model.as_deref(),
+                Some("claude-opus-4-8")
+            );
 
             // Clear the pin → field removed, card still valid.
             set_model("rev", None).unwrap();
@@ -851,12 +1063,25 @@ mod tests {
     fn source_counts_reports_each_dir() {
         with_sandbox("counts", |root| {
             write_file(&root.join(".aizen/agents"), "a.md", &card("A", "d", "b"));
-            write_file(&root.join(".aizen/agents"), "sub/b.md", &card("B", "d", "b"));
+            write_file(
+                &root.join(".aizen/agents"),
+                "sub/b.md",
+                &card("B", "d", "b"),
+            );
             write_file(&root.join(".claude/agents"), "c.md", &card("C", "d", "b"));
             let counts = source_counts();
-            let aizen_home = counts.iter().find(|(s, ..)| *s == AgentSource::AizenHome).unwrap();
-            let claude_home = counts.iter().find(|(s, ..)| *s == AgentSource::ClaudeHome).unwrap();
-            assert_eq!(aizen_home.2, 2, "two agents in ~/.aizen/agents (incl. nested)");
+            let aizen_home = counts
+                .iter()
+                .find(|(s, ..)| *s == AgentSource::AizenHome)
+                .unwrap();
+            let claude_home = counts
+                .iter()
+                .find(|(s, ..)| *s == AgentSource::ClaudeHome)
+                .unwrap();
+            assert_eq!(
+                aizen_home.2, 2,
+                "two agents in ~/.aizen/agents (incl. nested)"
+            );
             assert_eq!(claude_home.2, 1);
         });
     }

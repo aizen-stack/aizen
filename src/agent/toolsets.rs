@@ -22,7 +22,7 @@ pub const CATALOG: &[ToolsetInfo] = &[
     ToolsetInfo {
         id: "memory",
         label: "memory",
-        blurb: "recall facts, profile, dialectic Q&A",
+        blurb: "list/recall facts, profile, Q&A, save/edit/forget",
     },
     ToolsetInfo {
         id: "file",
@@ -97,17 +97,15 @@ pub fn classify_tool(name: &str) -> Option<&'static str> {
         return Some("mcp");
     }
     match name {
-        "memory_search" | "memory_profile" | "memory_ask" => Some("memory"),
-        "file_read"
-        | "file_glob"
-        | "search_files"
-        | "file_edit"
-        | "multi_edit"
-        | "file_write"
+        "memory_search" | "memory_list" | "memory_profile" | "memory_ask" | "memory_save"
+        | "memory_update" | "memory_forget" => Some("memory"),
+        "file_read" | "file_glob" | "search_files" | "file_edit" | "multi_edit" | "file_write"
         | "file_move" => Some("file"),
         "shell_run" | "process" => Some("terminal"),
         "web_search" | "web_fetch" | "web_crawl" => Some("web"),
-        "skill_load" | "skill_save" | "skill_refine" | "skill_search" | "skill_install" => Some("skills"),
+        "skill_load" | "skill_save" | "skill_refine" | "skill_search" | "skill_install" => {
+            Some("skills")
+        }
         "task" | "workflow" => Some("delegation"),
         "todo_write" => Some("todo"),
         "clarify" => Some("clarify"),
@@ -125,10 +123,7 @@ pub fn classify_tool(name: &str) -> Option<&'static str> {
         | "symbol_replace"
         | "symbol_insert"
         | "repo_map" => Some("lsp"),
-        "browser_navigate"
-        | "browser_snapshot"
-        | "browser_click"
-        | "browser_type"
+        "browser_navigate" | "browser_snapshot" | "browser_click" | "browser_type"
         | "browser_eval" => Some("browser"),
         _ => None,
     }
@@ -168,7 +163,8 @@ pub fn apply_toolset_filter(registry: &mut ToolRegistry) {
 pub fn format_status(registry: &ToolRegistry) -> String {
     let cfg = cli_config::load();
     let names = registry.names();
-    let mut by_ts: std::collections::BTreeMap<&str, Vec<String>> = std::collections::BTreeMap::new();
+    let mut by_ts: std::collections::BTreeMap<&str, Vec<String>> =
+        std::collections::BTreeMap::new();
     let mut other: Vec<String> = Vec::new();
     for n in &names {
         match classify_tool(n) {
@@ -177,7 +173,10 @@ pub fn format_status(registry: &ToolRegistry) -> String {
         }
     }
     let mut out = String::new();
-    out.push_str(&format!("{} tool(s) advertised this session\n", names.len()));
+    out.push_str(&format!(
+        "{} tool(s) advertised this session\n",
+        names.len()
+    ));
     for info in CATALOG {
         let allowed = toolset_allowed(info.id, &cfg);
         let count = by_ts.get(info.id).map(|v| v.len()).unwrap_or(0);
@@ -199,7 +198,10 @@ pub fn format_status(registry: &ToolRegistry) -> String {
         } else {
             "disabled in config".to_string()
         };
-        out.push_str(&format!("  {mark} {} — {}  [{state}]\n", info.id, info.blurb));
+        out.push_str(&format!(
+            "  {mark} {} — {}  [{state}]\n",
+            info.id, info.blurb
+        ));
     }
     if !other.is_empty() {
         out.push_str(&format!("  ? unclassified: {}\n", other.join(", ")));
@@ -211,10 +213,15 @@ pub fn format_status(registry: &ToolRegistry) -> String {
     }
     if let Some(ref en) = cfg.enabled_toolsets {
         if !en.is_empty() {
-            out.push_str(&format!("enabled_toolsets (whitelist): {}\n", en.join(", ")));
+            out.push_str(&format!(
+                "enabled_toolsets (whitelist): {}\n",
+                en.join(", ")
+            ));
         }
     }
-    out.push_str("\nconfig: `aizen config set --disabled-toolsets web,browser` or /tools in the REPL\n");
+    out.push_str(
+        "\nconfig: `aizen config set --disabled-toolsets web,browser` or /tools in the REPL\n",
+    );
     out.push_str("apps: connect more tools via /apps (MCP) — bundle `mcp`\n");
     out.trim_end().to_string()
 }
@@ -238,7 +245,9 @@ pub fn format_config_status() -> String {
             out.push_str(&format!("whitelist: {}\n", en.join(", ")));
         }
     }
-    out.push_str("\nMore tools: /apps (MCP). Shrink schema: config set --disabled-toolsets web,browser\n");
+    out.push_str(
+        "\nMore tools: /apps (MCP). Shrink schema: config set --disabled-toolsets web,browser\n",
+    );
     out.trim_end().to_string()
 }
 

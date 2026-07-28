@@ -13,17 +13,39 @@ use anyhow::{bail, Result};
 /// What a github.com / raw.githubusercontent.com URL points at.
 #[derive(Debug, PartialEq)]
 pub(crate) enum GhTarget {
-    Repo { owner: String, repo: String },
-    Blob { owner: String, repo: String, rest: String },       // "<ref>/<path>"
-    Tree { owner: String, repo: String, rest: String },       // "<ref>[/<path>]" ("" = default branch root)
-    Issue { owner: String, repo: String, number: u64 },
-    Raw { owner: String, repo: String, rest: String },        // raw.githubusercontent.com/<o>/<r>/<ref>/<path>
+    Repo {
+        owner: String,
+        repo: String,
+    },
+    Blob {
+        owner: String,
+        repo: String,
+        rest: String,
+    }, // "<ref>/<path>"
+    Tree {
+        owner: String,
+        repo: String,
+        rest: String,
+    }, // "<ref>[/<path>]" ("" = default branch root)
+    Issue {
+        owner: String,
+        repo: String,
+        number: u64,
+    },
+    Raw {
+        owner: String,
+        repo: String,
+        rest: String,
+    }, // raw.githubusercontent.com/<o>/<r>/<ref>/<path>
     Other,
 }
 
 pub(crate) fn classify(url: &reqwest::Url) -> GhTarget {
     let host = url.host_str().unwrap_or("").to_ascii_lowercase();
-    let segs: Vec<&str> = url.path_segments().map(|s| s.filter(|p| !p.is_empty()).collect()).unwrap_or_default();
+    let segs: Vec<&str> = url
+        .path_segments()
+        .map(|s| s.filter(|p| !p.is_empty()).collect())
+        .unwrap_or_default();
     if host == "raw.githubusercontent.com" {
         if segs.len() >= 3 {
             return GhTarget::Raw {
@@ -38,18 +60,31 @@ pub(crate) fn classify(url: &reqwest::Url) -> GhTarget {
         return GhTarget::Other;
     }
     match segs.as_slice() {
-        [owner, repo] => GhTarget::Repo { owner: owner.to_string(), repo: repo.to_string() },
-        [owner, repo, "blob", rest @ ..] if !rest.is_empty() => {
-            GhTarget::Blob { owner: owner.to_string(), repo: repo.to_string(), rest: rest.join("/") }
-        }
-        [owner, repo, "raw", rest @ ..] if !rest.is_empty() => {
-            GhTarget::Blob { owner: owner.to_string(), repo: repo.to_string(), rest: rest.join("/") }
-        }
-        [owner, repo, "tree", rest @ ..] => {
-            GhTarget::Tree { owner: owner.to_string(), repo: repo.to_string(), rest: rest.join("/") }
-        }
+        [owner, repo] => GhTarget::Repo {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        },
+        [owner, repo, "blob", rest @ ..] if !rest.is_empty() => GhTarget::Blob {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            rest: rest.join("/"),
+        },
+        [owner, repo, "raw", rest @ ..] if !rest.is_empty() => GhTarget::Blob {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            rest: rest.join("/"),
+        },
+        [owner, repo, "tree", rest @ ..] => GhTarget::Tree {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            rest: rest.join("/"),
+        },
         [owner, repo, kind, num] if *kind == "issues" || *kind == "pull" => match num.parse() {
-            Ok(n) => GhTarget::Issue { owner: owner.to_string(), repo: repo.to_string(), number: n },
+            Ok(n) => GhTarget::Issue {
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                number: n,
+            },
             Err(_) => GhTarget::Other,
         },
         _ => GhTarget::Other,
@@ -79,7 +114,11 @@ pub(crate) async fn read(url: &reqwest::Url, target: GhTarget) -> Result<String>
             read_raw(&c, owner, repo, rest).await
         }
         GhTarget::Tree { owner, repo, rest } => read_tree(&c, owner, repo, rest).await,
-        GhTarget::Issue { owner, repo, number } => read_issue(&c, owner, repo, *number).await,
+        GhTarget::Issue {
+            owner,
+            repo,
+            number,
+        } => read_issue(&c, owner, repo, *number).await,
         GhTarget::Other => bail!("not an API-mappable GitHub URL"),
     };
     match out {
@@ -99,14 +138,21 @@ pub(crate) async fn read(url: &reqwest::Url, target: GhTarget) -> Result<String>
 fn rate_limit_hint(e: anyhow::Error) -> anyhow::Error {
     let msg = e.to_string();
     if msg.contains("403") || msg.contains("429") {
-        anyhow::anyhow!("{msg} — unauthenticated GitHub API is 60 req/h per IP; set GITHUB_TOKEN for 5000/h")
+        anyhow::anyhow!(
+            "{msg} — unauthenticated GitHub API is 60 req/h per IP; set GITHUB_TOKEN for 5000/h"
+        )
     } else {
         e
     }
 }
 
 async fn read_repo(c: &reqwest::Client, owner: &str, repo: &str) -> Result<String> {
-    let v = http::get_json(c, &format!("https://api.github.com/repos/{owner}/{repo}"), &api_headers()).await?;
+    let v = http::get_json(
+        c,
+        &format!("https://api.github.com/repos/{owner}/{repo}"),
+        &api_headers(),
+    )
+    .await?;
     super::note_ok("github", "api");
     let mut s = format!(
         "[github repo {owner}/{repo}]\n{} ★{} forks:{} lang:{} license:{} updated:{}\n{}\n",
@@ -132,10 +178,18 @@ async fn read_repo(c: &reqwest::Client, owner: &str, repo: &str) -> Result<Strin
             *v = "application/vnd.github.raw+json".to_string();
         }
     }
-    let readme = http::get(c, &format!("https://api.github.com/repos/{owner}/{repo}/readme"), &readme_headers).await;
+    let readme = http::get(
+        c,
+        &format!("https://api.github.com/repos/{owner}/{repo}/readme"),
+        &readme_headers,
+    )
+    .await;
     if let Ok(f) = readme {
         if f.is_success() {
-            s.push_str(&format!("\n── README ──\n{}", truncate_chars(&f.text(), 12_000)));
+            s.push_str(&format!(
+                "\n── README ──\n{}",
+                truncate_chars(&f.text(), 12_000)
+            ));
         }
     }
     Ok(s.trim_end().to_string())
@@ -148,7 +202,10 @@ async fn read_raw(c: &reqwest::Client, owner: &str, repo: &str, rest: &str) -> R
         bail!("HTTP {} fetching {url}", f.status);
     }
     super::note_ok("github", "raw");
-    Ok(format!("[github raw {owner}/{repo}/{rest}]\n{}", truncate_chars(&f.text(), crate::agent::web_tools::FETCH_CAP)))
+    Ok(format!(
+        "[github raw {owner}/{repo}/{rest}]\n{}",
+        truncate_chars(&f.text(), crate::agent::web_tools::FETCH_CAP)
+    ))
 }
 
 async fn read_tree(c: &reqwest::Client, owner: &str, repo: &str, rest: &str) -> Result<String> {
@@ -166,15 +223,27 @@ async fn read_tree(c: &reqwest::Client, owner: &str, repo: &str, rest: &str) -> 
     super::note_ok("github", "api");
     let entries = v.as_array().cloned().unwrap_or_default();
     if entries.is_empty() {
-        return Ok(format!("[github tree {owner}/{repo}/{rest}]\n(empty directory)"));
+        return Ok(format!(
+            "[github tree {owner}/{repo}/{rest}]\n(empty directory)"
+        ));
     }
-    let mut s = format!("[github tree {owner}/{repo}/{rest}] {} entries:\n", entries.len());
+    let mut s = format!(
+        "[github tree {owner}/{repo}/{rest}] {} entries:\n",
+        entries.len()
+    );
     for e in entries.iter().take(200) {
         s.push_str(&format!(
             "{:>9}  {}{}\n",
-            e["size"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+            e["size"]
+                .as_u64()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".into()),
             e["name"].as_str().unwrap_or("?"),
-            if e["type"].as_str() == Some("dir") { "/" } else { "" }
+            if e["type"].as_str() == Some("dir") {
+                "/"
+            } else {
+                ""
+            }
         ));
     }
     if entries.len() > 200 {
@@ -184,9 +253,18 @@ async fn read_tree(c: &reqwest::Client, owner: &str, repo: &str, rest: &str) -> 
 }
 
 async fn read_issue(c: &reqwest::Client, owner: &str, repo: &str, number: u64) -> Result<String> {
-    let v = http::get_json(c, &format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}"), &api_headers()).await?;
+    let v = http::get_json(
+        c,
+        &format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}"),
+        &api_headers(),
+    )
+    .await?;
     super::note_ok("github", "api");
-    let kind = if v.get("pull_request").is_some() { "PR" } else { "issue" };
+    let kind = if v.get("pull_request").is_some() {
+        "PR"
+    } else {
+        "issue"
+    };
     let mut s = format!(
         "[github {kind} {owner}/{repo}#{number}] {} ({}) by {} — {} comments\n{}\n",
         v["title"].as_str().unwrap_or("(untitled)"),
@@ -197,7 +275,9 @@ async fn read_issue(c: &reqwest::Client, owner: &str, repo: &str, number: u64) -
     );
     // Top comments (one extra call, capped) — best-effort.
     if v["comments"].as_u64().unwrap_or(0) > 0 {
-        let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments?per_page=10");
+        let url = format!(
+            "https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments?per_page=10"
+        );
         if let Ok(cs) = http::get_json(c, &url, &api_headers()).await {
             for cm in cs.as_array().cloned().unwrap_or_default() {
                 s.push_str(&format!(
@@ -215,7 +295,12 @@ async fn read_issue(c: &reqwest::Client, owner: &str, repo: &str, number: u64) -
 #[allow(dead_code)]
 async fn read_html(c: &reqwest::Client, url: &str) -> Result<String> {
     let f = http::get(c, url, &[]).await?;
-    Ok(format!("[{} {}]\n{}", f.status, url, truncate_chars(&html_to_text(&f.text()), crate::agent::web_tools::FETCH_CAP)))
+    Ok(format!(
+        "[{} {}]\n{}",
+        f.status,
+        url,
+        truncate_chars(&html_to_text(&f.text()), crate::agent::web_tools::FETCH_CAP)
+    ))
 }
 
 // ── doctor probes ───────────────────────────────────────────────────────────
@@ -236,7 +321,9 @@ pub(crate) async fn probe_api() -> super::Probe {
                 format!("API OK — {remaining}/{limit} req/h unauth (set GITHUB_TOKEN for 5000/h)")
             };
             if remaining == 0 {
-                super::Probe::Warn(format!("{msg} — quota exhausted, raw/html fallbacks still work"))
+                super::Probe::Warn(format!(
+                    "{msg} — quota exhausted, raw/html fallbacks still work"
+                ))
             } else {
                 super::Probe::Ok(msg)
             }
@@ -250,7 +337,13 @@ pub(crate) async fn probe_raw() -> super::Probe {
         Ok(c) => c,
         Err(e) => return super::Probe::Fail(e.to_string()),
     };
-    match http::get(&c, "https://raw.githubusercontent.com/octocat/Hello-World/master/README", &[]).await {
+    match http::get(
+        &c,
+        "https://raw.githubusercontent.com/octocat/Hello-World/master/README",
+        &[],
+    )
+    .await
+    {
         Ok(f) if f.is_success() => super::Probe::Ok("raw file reads OK (unmetered)".into()),
         Ok(f) => super::Probe::Fail(format!("HTTP {}", f.status)),
         Err(e) => super::Probe::Fail(http::snippet(&e.to_string())),
@@ -269,32 +362,68 @@ mod tests {
     fn classifies_github_url_shapes() {
         assert_eq!(
             classify(&u("https://github.com/rust-lang/rust")),
-            GhTarget::Repo { owner: "rust-lang".into(), repo: "rust".into() }
+            GhTarget::Repo {
+                owner: "rust-lang".into(),
+                repo: "rust".into()
+            }
         );
         assert_eq!(
-            classify(&u("https://github.com/rust-lang/rust/blob/master/README.md")),
-            GhTarget::Blob { owner: "rust-lang".into(), repo: "rust".into(), rest: "master/README.md".into() }
+            classify(&u(
+                "https://github.com/rust-lang/rust/blob/master/README.md"
+            )),
+            GhTarget::Blob {
+                owner: "rust-lang".into(),
+                repo: "rust".into(),
+                rest: "master/README.md".into()
+            }
         );
         assert_eq!(
-            classify(&u("https://github.com/tokio-rs/tokio/tree/master/tokio/src")),
-            GhTarget::Tree { owner: "tokio-rs".into(), repo: "tokio".into(), rest: "master/tokio/src".into() }
+            classify(&u(
+                "https://github.com/tokio-rs/tokio/tree/master/tokio/src"
+            )),
+            GhTarget::Tree {
+                owner: "tokio-rs".into(),
+                repo: "tokio".into(),
+                rest: "master/tokio/src".into()
+            }
         );
         assert_eq!(
             classify(&u("https://github.com/serde-rs/serde/issues/1234")),
-            GhTarget::Issue { owner: "serde-rs".into(), repo: "serde".into(), number: 1234 }
+            GhTarget::Issue {
+                owner: "serde-rs".into(),
+                repo: "serde".into(),
+                number: 1234
+            }
         );
         assert_eq!(
             classify(&u("https://github.com/serde-rs/serde/pull/99")),
-            GhTarget::Issue { owner: "serde-rs".into(), repo: "serde".into(), number: 99 }
+            GhTarget::Issue {
+                owner: "serde-rs".into(),
+                repo: "serde".into(),
+                number: 99
+            }
         );
         assert_eq!(
             classify(&u("https://raw.githubusercontent.com/o/r/main/src/lib.rs")),
-            GhTarget::Raw { owner: "o".into(), repo: "r".into(), rest: "main/src/lib.rs".into() }
+            GhTarget::Raw {
+                owner: "o".into(),
+                repo: "r".into(),
+                rest: "main/src/lib.rs".into()
+            }
         );
         // Non-mappable shapes stay Other (and route falls back to the web chain).
-        assert_eq!(classify(&u("https://github.com/rust-lang")), GhTarget::Other);
-        assert_eq!(classify(&u("https://github.com/rust-lang/rust/actions")), GhTarget::Other);
-        assert_eq!(classify(&u("https://github.com/o/r/issues/notanumber")), GhTarget::Other);
+        assert_eq!(
+            classify(&u("https://github.com/rust-lang")),
+            GhTarget::Other
+        );
+        assert_eq!(
+            classify(&u("https://github.com/rust-lang/rust/actions")),
+            GhTarget::Other
+        );
+        assert_eq!(
+            classify(&u("https://github.com/o/r/issues/notanumber")),
+            GhTarget::Other
+        );
         assert_eq!(classify(&u("https://gitlab.com/o/r")), GhTarget::Other);
     }
 

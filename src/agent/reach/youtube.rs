@@ -27,19 +27,31 @@ const TRANSCRIPT_CAP: usize = 16_000;
 pub(crate) fn video_id(url: &reqwest::Url) -> Option<String> {
     let host = url.host_str().unwrap_or("").to_ascii_lowercase();
     let host = host.strip_prefix("www.").unwrap_or(&host);
-    let segs: Vec<&str> = url.path_segments().map(|s| s.filter(|p| !p.is_empty()).collect()).unwrap_or_default();
+    let segs: Vec<&str> = url
+        .path_segments()
+        .map(|s| s.filter(|p| !p.is_empty()).collect())
+        .unwrap_or_default();
     let id = match host {
         "youtu.be" => segs.first().map(|s| s.to_string()),
         "youtube.com" | "m.youtube.com" | "music.youtube.com" => match segs.as_slice() {
-            ["watch", ..] => url.query_pairs().find(|(k, _)| k == "v").map(|(_, v)| v.into_owned()),
-            ["shorts", id, ..] | ["embed", id, ..] | ["live", id, ..] | ["v", id, ..] => Some(id.to_string()),
+            ["watch", ..] => url
+                .query_pairs()
+                .find(|(k, _)| k == "v")
+                .map(|(_, v)| v.into_owned()),
+            ["shorts", id, ..] | ["embed", id, ..] | ["live", id, ..] | ["v", id, ..] => {
+                Some(id.to_string())
+            }
             _ => None,
         },
         _ => None,
     };
     // Canonical ids are 11 chars of [A-Za-z0-9_-]; refuse anything else (it would be interpolated
     // into request bodies/URLs).
-    id.filter(|s| s.len() == 11 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+    id.filter(|s| {
+        s.len() == 11
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    })
 }
 
 pub(crate) async fn read(vid: &str) -> Result<String> {
@@ -52,7 +64,10 @@ pub(crate) async fn read(vid: &str) -> Result<String> {
                 .await
                 .with_context(|| format!("innertube failed ({e}); oembed fallback also failed"))?;
             super::note_ok("youtube", "oembed");
-            Ok(format!("{meta}\n(transcript unavailable: {})", http::snippet(&e.to_string())))
+            Ok(format!(
+                "{meta}\n(transcript unavailable: {})",
+                http::snippet(&e.to_string())
+            ))
         }
     }
 }
@@ -66,11 +81,16 @@ async fn read_innertube(c: &reqwest::Client, vid: &str) -> Result<String> {
     if !f.is_success() {
         bail!("InnerTube player returned HTTP {}", f.status);
     }
-    let v: serde_json::Value = serde_json::from_slice(&f.body).context("parsing InnerTube player JSON")?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&f.body).context("parsing InnerTube player JSON")?;
 
-    let playable = v["playabilityStatus"]["status"].as_str().unwrap_or("UNKNOWN");
+    let playable = v["playabilityStatus"]["status"]
+        .as_str()
+        .unwrap_or("UNKNOWN");
     if playable != "OK" {
-        let reason = v["playabilityStatus"]["reason"].as_str().unwrap_or("(no reason given)");
+        let reason = v["playabilityStatus"]["reason"]
+            .as_str()
+            .unwrap_or("(no reason given)");
         bail!("video not playable ({playable}): {reason}");
     }
     let mut out = render_details(&v["videoDetails"], vid);
@@ -82,7 +102,11 @@ async fn read_innertube(c: &reqwest::Client, vid: &str) -> Result<String> {
             crate::core::net_guard::guard_url_async(&base_url).await?;
             let track = http::get(c, &base_url, &[]).await?;
             if !track.is_success() || track.body.is_empty() {
-                bail!("caption track fetch failed (HTTP {}, {} bytes) — possibly a PO-token demand", track.status, track.body.len());
+                bail!(
+                    "caption track fetch failed (HTTP {}, {} bytes) — possibly a PO-token demand",
+                    track.status,
+                    track.body.len()
+                );
             }
             let text = timedtext_to_text(&track.text());
             if text.trim().is_empty() {
@@ -101,7 +125,10 @@ async fn read_innertube(c: &reqwest::Client, vid: &str) -> Result<String> {
 }
 
 fn render_details(d: &serde_json::Value, vid: &str) -> String {
-    let secs = d["lengthSeconds"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let secs = d["lengthSeconds"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
     let mut s = format!(
         "[youtube {vid}] {}\nby {} · {}m{}s · {} views\n",
         d["title"].as_str().unwrap_or("(unknown title)"),
@@ -124,7 +151,10 @@ pub(crate) fn pick_track(tracks: &serde_json::Value) -> Option<(String, String, 
     let tracks = tracks.as_array()?;
     let score = |t: &serde_json::Value| -> u8 {
         let asr = t["kind"].as_str() == Some("asr");
-        let en = t["languageCode"].as_str().map(|l| l.starts_with("en")).unwrap_or(false);
+        let en = t["languageCode"]
+            .as_str()
+            .map(|l| l.starts_with("en"))
+            .unwrap_or(false);
         match (asr, en) {
             (false, true) => 0,
             (false, false) => 1,
@@ -132,7 +162,10 @@ pub(crate) fn pick_track(tracks: &serde_json::Value) -> Option<(String, String, 
             (true, false) => 3,
         }
     };
-    let best = tracks.iter().filter(|t| t["baseUrl"].as_str().is_some()).min_by_key(|t| score(t))?;
+    let best = tracks
+        .iter()
+        .filter(|t| t["baseUrl"].as_str().is_some())
+        .min_by_key(|t| score(t))?;
     Some((
         best["baseUrl"].as_str().unwrap().to_string(),
         best["languageCode"].as_str().unwrap_or("?").to_string(),
@@ -148,7 +181,10 @@ pub(crate) fn timedtext_to_text(xml: &str) -> String {
     let mut out = String::new();
     for cap in P.captures_iter(xml) {
         let inner = TAG.replace_all(&cap[1], "");
-        let line = decode_entities(&inner).split_whitespace().collect::<Vec<_>>().join(" ");
+        let line = decode_entities(&inner)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         if !line.is_empty() {
             out.push_str(&line);
             out.push('\n');
@@ -158,7 +194,9 @@ pub(crate) fn timedtext_to_text(xml: &str) -> String {
 }
 
 async fn read_oembed(c: &reqwest::Client, vid: &str) -> Result<String> {
-    let url = format!("https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={vid}&format=json");
+    let url = format!(
+        "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={vid}&format=json"
+    );
     let v = http::get_json(c, &url, &[]).await?;
     Ok(format!(
         "[youtube {vid}] {}\nby {} ({})",
@@ -192,7 +230,9 @@ pub(crate) async fn probe_innertube() -> super::Probe {
                     v["playabilityStatus"]["status"].as_str().unwrap_or("?")
                 ));
             }
-            if pick_track(&v["captions"]["playerCaptionsTracklistRenderer"]["captionTracks"]).is_some() {
+            if pick_track(&v["captions"]["playerCaptionsTracklistRenderer"]["captionTracks"])
+                .is_some()
+            {
                 super::Probe::Ok("metadata + transcripts OK (InnerTube, keyless)".into())
             } else {
                 super::Probe::Warn("metadata OK but no caption tracks on the probe video — transcripts may be gated".into())
@@ -236,8 +276,16 @@ mod tests {
             assert_eq!(video_id(&u(url)).as_deref(), Some("dQw4w9WgXcQ"), "{url}");
         }
         assert_eq!(video_id(&u("https://www.youtube.com/@SomeChannel")), None);
-        assert_eq!(video_id(&u("https://www.youtube.com/watch?v=short")), None, "malformed id refused");
-        assert_eq!(video_id(&u("https://example.com/watch?v=dQw4w9WgXcQ")), None, "wrong host");
+        assert_eq!(
+            video_id(&u("https://www.youtube.com/watch?v=short")),
+            None,
+            "malformed id refused"
+        );
+        assert_eq!(
+            video_id(&u("https://example.com/watch?v=dQw4w9WgXcQ")),
+            None,
+            "wrong host"
+        );
     }
 
     #[test]

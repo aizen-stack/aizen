@@ -59,7 +59,12 @@ struct BrowserSession {
 
 impl BrowserSession {
     fn new() -> Self {
-        Self { client: None, needs_reconnect: false, epoch: 0, last_used: std::time::Instant::now() }
+        Self {
+            client: None,
+            needs_reconnect: false,
+            epoch: 0,
+            last_used: std::time::Instant::now(),
+        }
     }
 }
 
@@ -103,7 +108,10 @@ fn session_handle(id: &ConversationId) -> SessionHandle {
 /// Release one conversation's browser state (drops its websocket + `@ref`s + pinned profile). Called
 /// on `/new`, session deletion, and hostbot route removal so a retired conversation frees its socket.
 pub fn release(id: &ConversationId) {
-    SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(id);
     PINNED.write().unwrap_or_else(|e| e.into_inner()).remove(id);
 }
 
@@ -131,7 +139,10 @@ impl CdpClient {
         let id = self.next_id;
         self.next_id += 1;
         let msg = json!({"id": id, "method": method, "params": params});
-        self.ws.send(WsMessage::Text(msg.to_string())).await.context("CDP send")?;
+        self.ws
+            .send(WsMessage::Text(msg.to_string()))
+            .await
+            .context("CDP send")?;
         let read = async {
             loop {
                 match self.ws.next().await {
@@ -142,7 +153,10 @@ impl CdpClient {
                         };
                         if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
                             if let Some(err) = v.get("error") {
-                                let m = err.get("message").and_then(|m| m.as_str()).unwrap_or("CDP error");
+                                let m = err
+                                    .get("message")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("CDP error");
                                 bail!("CDP {method} error: {m}");
                             }
                             return Ok(v.get("result").cloned().unwrap_or(Value::Null));
@@ -165,7 +179,9 @@ impl CdpClient {
         let backend = *self.refs.get(&r).ok_or_else(|| {
             anyhow!("unknown @ref @{r} — call browser_snapshot first (refs reset every snapshot)")
         })?;
-        let resolved = self.call("DOM.resolveNode", json!({"backendNodeId": backend})).await?;
+        let resolved = self
+            .call("DOM.resolveNode", json!({"backendNodeId": backend}))
+            .await?;
         resolved
             .get("object")
             .and_then(|o| o.get("objectId"))
@@ -185,7 +201,9 @@ async fn discover_ws_url(profile_name: &str, profile: &config::BrowserProfile) -
         format!("http://{endpoint}")
     };
     let url = format!("{base}/json");
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
     let mut rb = client.get(&url);
     if let Some(var) = profile.auth_env.as_deref() {
         let value = std::env::var(var).with_context(|| {
@@ -200,8 +218,13 @@ async fn discover_ws_url(profile_name: &str, profile: &config::BrowserProfile) -
             config::config_path().display()
         )
     })?;
-    let targets: Value = resp.json().await.context("parsing the CDP /json target list")?;
-    let arr = targets.as_array().context("CDP /json did not return a list")?;
+    let targets: Value = resp
+        .json()
+        .await
+        .context("parsing the CDP /json target list")?;
+    let arr = targets
+        .as_array()
+        .context("CDP /json did not return a list")?;
     let page = arr
         .iter()
         .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
@@ -230,7 +253,9 @@ async fn connect(profile_name: String, profile: config::BrowserProfile) -> Resul
     .context("browser target is already owned by another Aizen process")?;
     let ws = ws_connect_with_auth(&profile_name, &profile, &ws_url)
         .await
-        .with_context(|| format!("connecting browser profile '{profile_name}' to its CDP websocket"))?;
+        .with_context(|| {
+            format!("connecting browser profile '{profile_name}' to its CDP websocket")
+        })?;
     let mut c = CdpClient {
         ws,
         next_id: 1,
@@ -270,11 +295,15 @@ async fn ws_connect_with_auth(
             Ok(ws)
         }
         Some(value) => {
-            let mut request = ws_url.into_client_request().context("building CDP websocket upgrade request")?;
+            let mut request = ws_url
+                .into_client_request()
+                .context("building CDP websocket upgrade request")?;
             let header_value = value
                 .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
                 .context("browser auth_env value is not a valid HTTP header")?;
-            request.headers_mut().insert(reqwest::header::AUTHORIZATION.as_str(), header_value);
+            request
+                .headers_mut()
+                .insert(reqwest::header::AUTHORIZATION.as_str(), header_value);
             let (ws, _) = tokio_tungstenite::connect_async(request).await?;
             Ok(ws)
         }
@@ -300,7 +329,10 @@ async fn with_cdp<T>(
     sess.last_used = std::time::Instant::now();
 
     // A profile switch, or a prior op that left the socket mid-exchange, forces a fresh connect.
-    let profile_switched = sess.client.as_ref().is_some_and(|c| c.profile != profile_name);
+    let profile_switched = sess
+        .client
+        .as_ref()
+        .is_some_and(|c| c.profile != profile_name);
     if profile_switched || sess.needs_reconnect {
         sess.client = None;
         sess.needs_reconnect = false;
@@ -337,14 +369,20 @@ async fn with_cdp<T>(
 
 fn connection_error(e: &anyhow::Error) -> bool {
     let m = e.to_string();
-    m.contains("closed") || m.contains("read error") || m.contains("CDP send") || m.contains("timed out")
+    m.contains("closed")
+        || m.contains("read error")
+        || m.contains("CDP send")
+        || m.contains("timed out")
 }
 
 /// Pin a profile for the ACTIVE conversation (by the URL being navigated to) and return the resolved
 /// target. Per-conversation so two chats can drive different profiles at once.
 fn target_for_url(url: &str) -> Result<(String, config::BrowserProfile)> {
     let target = config::resolve_for_url(&config::load()?, url)?;
-    PINNED.write().unwrap_or_else(|e| e.into_inner()).insert(crate::core::convo::active(), target.0.clone());
+    PINNED
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(crate::core::convo::active(), target.0.clone());
     Ok(target)
 }
 
@@ -373,17 +411,36 @@ fn parse_ref(v: &Value) -> Result<u32> {
     if let Some(n) = v.as_u64() {
         return u32::try_from(n).map_err(|_| anyhow!("ref out of range"));
     }
-    let s = v.as_str().context("'ref' must be a number or \"@N\" string")?;
-    s.trim().trim_start_matches('@').parse::<u32>().with_context(|| format!("bad ref '{s}'"))
+    let s = v
+        .as_str()
+        .context("'ref' must be a number or \"@N\" string")?;
+    s.trim()
+        .trim_start_matches('@')
+        .parse::<u32>()
+        .with_context(|| format!("bad ref '{s}'"))
 }
 
 /// Roles worth surfacing even without an accessible name (interactive controls).
 fn is_interactive_role(role: &str) -> bool {
     matches!(
         role,
-        "button" | "link" | "textbox" | "searchbox" | "checkbox" | "radio" | "combobox" | "listbox"
-            | "option" | "menuitem" | "menuitemcheckbox" | "menuitemradio" | "tab" | "switch" | "slider"
-            | "spinbutton" | "textfield"
+        "button"
+            | "link"
+            | "textbox"
+            | "searchbox"
+            | "checkbox"
+            | "radio"
+            | "combobox"
+            | "listbox"
+            | "option"
+            | "menuitem"
+            | "menuitemcheckbox"
+            | "menuitemradio"
+            | "tab"
+            | "switch"
+            | "slider"
+            | "spinbutton"
+            | "textfield"
     )
 }
 
@@ -394,11 +451,24 @@ fn render_ax_tree(nodes: &[Value], refs: &mut HashMap<u32, i64>, max: usize) -> 
     let mut out = String::new();
     let mut n: u32 = 0;
     for node in nodes {
-        if node.get("ignored").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if node
+            .get("ignored")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             continue;
         }
-        let role = node.get("role").and_then(|r| r.get("value")).and_then(|v| v.as_str()).unwrap_or("");
-        let name = node.get("name").and_then(|r| r.get("value")).and_then(|v| v.as_str()).unwrap_or("").trim();
+        let role = node
+            .get("role")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let name = node
+            .get("name")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if role.is_empty() {
             continue;
         }
@@ -419,12 +489,15 @@ fn render_ax_tree(nodes: &[Value], refs: &mut HashMap<u32, i64>, max: usize) -> 
             out.push_str(&format!("[@{n}] {role} \"{name_disp}\"\n"));
         }
         if n as usize >= max {
-            out.push_str(&format!("… (truncated at {max} nodes — interact via @ref, or browser_eval for more)\n"));
+            out.push_str(&format!(
+                "… (truncated at {max} nodes — interact via @ref, or browser_eval for more)\n"
+            ));
             break;
         }
     }
     if n == 0 {
-        return "(no accessible elements found — the page may be blank or still loading)".to_string();
+        return "(no accessible elements found — the page may be blank or still loading)"
+            .to_string();
     }
     out.trim_end().to_string()
 }
@@ -451,32 +524,57 @@ impl Tool for BrowserNavigate {
         false
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let url = args.get("url").and_then(|v| v.as_str()).context("missing 'url'")?.to_string();
+        let url = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .context("missing 'url'")?
+            .to_string();
         let (profile_name, profile) = target_for_url(&url)?;
-        block(with_cdp(profile_name, profile, false, |c| Box::pin({
-            let url = url.clone();
-            async move {
-            c.call("Page.navigate", json!({"url": url})).await?;
-            // Poll readyState rather than racing a load event (simpler + robust across CDP versions).
-            let deadline = OP_TIMEOUT;
-            let start = tokio::time::Instant::now();
-            loop {
-                let r = c
-                    .call("Runtime.evaluate", json!({"expression":"document.readyState","returnByValue":true}))
-                    .await?;
-                let state = r.get("result").and_then(|x| x.get("value")).and_then(|v| v.as_str()).unwrap_or("");
-                if state == "complete" || state == "interactive" || start.elapsed() > deadline {
-                    break;
+        block(with_cdp(profile_name, profile, false, |c| {
+            Box::pin({
+                let url = url.clone();
+                async move {
+                    c.call("Page.navigate", json!({"url": url})).await?;
+                    // Poll readyState rather than racing a load event (simpler + robust across CDP versions).
+                    let deadline = OP_TIMEOUT;
+                    let start = tokio::time::Instant::now();
+                    loop {
+                        let r = c
+                            .call(
+                                "Runtime.evaluate",
+                                json!({"expression":"document.readyState","returnByValue":true}),
+                            )
+                            .await?;
+                        let state = r
+                            .get("result")
+                            .and_then(|x| x.get("value"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if state == "complete"
+                            || state == "interactive"
+                            || start.elapsed() > deadline
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    }
+                    let t = c
+                        .call(
+                            "Runtime.evaluate",
+                            json!({"expression":"document.title","returnByValue":true}),
+                        )
+                        .await?;
+                    let title = t
+                        .get("result")
+                        .and_then(|x| x.get("value"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    Ok(format!(
+                        "navigated — title: \"{title}\" (call browser_snapshot to see elements)"
+                    ))
                 }
-                tokio::time::sleep(Duration::from_millis(150)).await;
-            }
-            let t = c
-                .call("Runtime.evaluate", json!({"expression":"document.title","returnByValue":true}))
-                .await?;
-            let title = t.get("result").and_then(|x| x.get("value")).and_then(|v| v.as_str()).unwrap_or("");
-            Ok(format!("navigated — title: \"{title}\" (call browser_snapshot to see elements)"))
-            }
-        })))
+            })
+        }))
     }
 }
 
@@ -501,11 +599,17 @@ impl Tool for BrowserSnapshot {
     }
     fn execute(&self, _args: &Value) -> Result<String> {
         let (profile_name, profile) = pinned_target()?;
-        block(with_cdp(profile_name, profile, true, |c| Box::pin(async move {
-            let tree = c.call("Accessibility.getFullAXTree", json!({})).await?;
-            let nodes = tree.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
-            Ok(render_ax_tree(&nodes, &mut c.refs, SNAPSHOT_MAX_NODES))
-        })))
+        block(with_cdp(profile_name, profile, true, |c| {
+            Box::pin(async move {
+                let tree = c.call("Accessibility.getFullAXTree", json!({})).await?;
+                let nodes = tree
+                    .get("nodes")
+                    .and_then(|n| n.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                Ok(render_ax_tree(&nodes, &mut c.refs, SNAPSHOT_MAX_NODES))
+            })
+        }))
     }
 }
 
@@ -530,15 +634,17 @@ impl Tool for BrowserClick {
     fn execute(&self, args: &Value) -> Result<String> {
         let r = parse_ref(args.get("ref").context("missing 'ref'")?)?;
         let (profile_name, profile) = pinned_target()?;
-        block(with_cdp(profile_name, profile, false, |c| Box::pin(async move {
-            let object_id = c.object_for_ref(r).await?;
-            c.call(
+        block(with_cdp(profile_name, profile, false, |c| {
+            Box::pin(async move {
+                let object_id = c.object_for_ref(r).await?;
+                c.call(
                 "Runtime.callFunctionOn",
                 json!({"objectId": object_id, "functionDeclaration": "function(){ this.scrollIntoView({block:'center'}); this.click(); }"}),
             )
             .await?;
-            Ok(format!("clicked @{r} (browser_snapshot to see the result)"))
-        })))
+                Ok(format!("clicked @{r} (browser_snapshot to see the result)"))
+            })
+        }))
     }
 }
 
@@ -562,13 +668,18 @@ impl Tool for BrowserType {
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let r = parse_ref(args.get("ref").context("missing 'ref'")?)?;
-        let text = args.get("text").and_then(|v| v.as_str()).context("missing 'text'")?.to_string();
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .context("missing 'text'")?
+            .to_string();
         let (profile_name, profile) = pinned_target()?;
-        block(with_cdp(profile_name, profile, false, |c| Box::pin({
-            let text = text.clone();
-            async move {
-            let object_id = c.object_for_ref(r).await?;
-            c.call(
+        block(with_cdp(profile_name, profile, false, |c| {
+            Box::pin({
+                let text = text.clone();
+                async move {
+                    let object_id = c.object_for_ref(r).await?;
+                    c.call(
                 "Runtime.callFunctionOn",
                 json!({
                     "objectId": object_id,
@@ -577,9 +688,10 @@ impl Tool for BrowserType {
                 }),
             )
             .await?;
-            Ok(format!("typed into @{r}"))
-            }
-        })))
+                    Ok(format!("typed into @{r}"))
+                }
+            })
+        }))
     }
 }
 
@@ -603,35 +715,46 @@ impl Tool for BrowserEval {
         false
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let expr = args.get("expression").and_then(|v| v.as_str()).context("missing 'expression'")?.to_string();
+        let expr = args
+            .get("expression")
+            .and_then(|v| v.as_str())
+            .context("missing 'expression'")?
+            .to_string();
         let (profile_name, profile) = pinned_target()?;
-        block(with_cdp(profile_name, profile, false, |c| Box::pin({
-            let expr = expr.clone();
-            async move {
-            let r = c
+        block(with_cdp(profile_name, profile, false, |c| {
+            Box::pin({
+                let expr = expr.clone();
+                async move {
+                    let r = c
                 .call(
                     "Runtime.evaluate",
                     json!({"expression": expr, "returnByValue": true, "awaitPromise": true}),
                 )
                 .await?;
-            if let Some(ex) = r.get("exceptionDetails") {
-                let txt = ex.get("exception").and_then(|e| e.get("description")).and_then(|v| v.as_str())
-                    .or_else(|| ex.get("text").and_then(|v| v.as_str()))
-                    .unwrap_or("JS exception");
-                return Ok(format!("error: {txt}"));
-            }
-            let result = r.get("result").cloned().unwrap_or(Value::Null);
-            // returnByValue → a `value`; else fall back to the type/description.
-            if let Some(v) = result.get("value") {
-                Ok(serde_json::to_string(v).unwrap_or_else(|_| v.to_string()))
-            } else {
-                let desc = result.get("description").and_then(|v| v.as_str())
-                    .or_else(|| result.get("type").and_then(|v| v.as_str()))
-                    .unwrap_or("undefined");
-                Ok(desc.to_string())
-            }
-            }
-        })))
+                    if let Some(ex) = r.get("exceptionDetails") {
+                        let txt = ex
+                            .get("exception")
+                            .and_then(|e| e.get("description"))
+                            .and_then(|v| v.as_str())
+                            .or_else(|| ex.get("text").and_then(|v| v.as_str()))
+                            .unwrap_or("JS exception");
+                        return Ok(format!("error: {txt}"));
+                    }
+                    let result = r.get("result").cloned().unwrap_or(Value::Null);
+                    // returnByValue → a `value`; else fall back to the type/description.
+                    if let Some(v) = result.get("value") {
+                        Ok(serde_json::to_string(v).unwrap_or_else(|_| v.to_string()))
+                    } else {
+                        let desc = result
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| result.get("type").and_then(|v| v.as_str()))
+                            .unwrap_or("undefined");
+                        Ok(desc.to_string())
+                    }
+                }
+            })
+        }))
     }
 }
 
@@ -644,7 +767,11 @@ pub fn status() -> String {
     };
     // Report only the ACTIVE conversation's pin + session — never another chat's state.
     let id = crate::core::convo::active();
-    let pinned = PINNED.read().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
+    let pinned = PINNED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .cloned();
     let mut out = format!(
         "browser config: {} · default={} · convo={} · pinned={}\n",
         config::config_path().display(),
@@ -654,7 +781,11 @@ pub fn status() -> String {
     );
     // Look up (without creating) this conversation's session handle, then read its liveness without
     // blocking on an in-flight op.
-    let handle = SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
+    let handle = SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .cloned();
     let (session, endpoint): (&str, String) = match handle {
         Some(h) => match h.try_lock() {
             Ok(g) => g
@@ -667,14 +798,25 @@ pub fn status() -> String {
         None => ("disconnected", "-".to_string()),
     };
     let live = SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).len();
-    out.push_str(&format!("session: {session} · endpoint {endpoint} · {live} live session(s)\n"));
+    out.push_str(&format!(
+        "session: {session} · endpoint {endpoint} · {live} live session(s)\n"
+    ));
     for (name, p) in &cfg.profiles {
         let auth = p
             .auth_env
             .as_deref()
-            .map(|v| if std::env::var_os(v).is_some() { format!("auth-env {v}=set") } else { format!("auth-env {v}=missing") })
+            .map(|v| {
+                if std::env::var_os(v).is_some() {
+                    format!("auth-env {v}=set")
+                } else {
+                    format!("auth-env {v}=missing")
+                }
+            })
             .unwrap_or_else(|| "no auth".to_string());
-        out.push_str(&format!("● {name} · {} · {} · {auth}\n", p.provider, p.endpoint));
+        out.push_str(&format!(
+            "● {name} · {} · {} · {auth}\n",
+            p.provider, p.endpoint
+        ));
     }
     for (host, profile) in &cfg.routes {
         out.push_str(&format!("  route {host} → {profile}\n"));
@@ -701,7 +843,11 @@ pub async fn doctor() -> String {
             Err(e) => out.push_str(&format!("○ {name} · unavailable · {e}\n")),
         }
     }
-    if out.is_empty() { "no browser profiles configured".to_string() } else { out.trim_end().to_string() }
+    if out.is_empty() {
+        "no browser profiles configured".to_string()
+    } else {
+        out.trim_end().to_string()
+    }
 }
 
 /// Register the browser tools into a registry (top-level only). Called from `default_registry_in`
@@ -739,9 +885,15 @@ mod tests {
         let mut refs = HashMap::new();
         let out = render_ax_tree(&nodes, &mut refs, 200);
         assert!(out.contains("[@1] button \"Submit\""));
-        assert!(out.contains("[@2] textbox"), "interactive unnamed control is kept: {out}");
+        assert!(
+            out.contains("[@2] textbox"),
+            "interactive unnamed control is kept: {out}"
+        );
         assert!(out.contains("[@3] heading \"Welcome\""));
-        assert!(!out.contains("generic"), "unnamed non-interactive node is skipped");
+        assert!(
+            !out.contains("generic"),
+            "unnamed non-interactive node is skipped"
+        );
         // refs map the rendered order to the right backend node ids
         assert_eq!(refs.get(&1), Some(&11));
         assert_eq!(refs.get(&2), Some(&14));
@@ -768,8 +920,11 @@ mod tests {
 
     #[test]
     fn browser_status_never_prints_credential_values() {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let root = std::env::temp_dir().join(format!("aizen-browser-status-{}", std::process::id()));
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("aizen-browser-status-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::env::set_var("AIZEN_HOME", &root);
@@ -797,11 +952,20 @@ mod tests {
         release(&b);
         let ha = session_handle(&a);
         let hb = session_handle(&b);
-        assert!(!Arc::ptr_eq(&ha, &hb), "distinct conversations must not share a session");
-        assert!(Arc::ptr_eq(&ha, &session_handle(&a)), "same conversation reuses its handle");
+        assert!(
+            !Arc::ptr_eq(&ha, &hb),
+            "distinct conversations must not share a session"
+        );
+        assert!(
+            Arc::ptr_eq(&ha, &session_handle(&a)),
+            "same conversation reuses its handle"
+        );
         // Release drops the mapping; the next lookup is a fresh handle.
         release(&a);
-        assert!(!Arc::ptr_eq(&ha, &session_handle(&a)), "release retires the old session");
+        assert!(
+            !Arc::ptr_eq(&ha, &session_handle(&a)),
+            "release retires the old session"
+        );
         release(&a);
         release(&b);
     }
@@ -811,11 +975,23 @@ mod tests {
         // A profile pinned under one conversation is invisible to another (no cross-chat bleed).
         let a = ConversationId::new("test-pin-a");
         let b = ConversationId::new("test-pin-b");
-        PINNED.write().unwrap().insert(a.clone(), "profile-a".to_string());
-        assert_eq!(PINNED.read().unwrap().get(&a).map(String::as_str), Some("profile-a"));
-        assert!(PINNED.read().unwrap().get(&b).is_none(), "b never sees a's pin");
+        PINNED
+            .write()
+            .unwrap()
+            .insert(a.clone(), "profile-a".to_string());
+        assert_eq!(
+            PINNED.read().unwrap().get(&a).map(String::as_str),
+            Some("profile-a")
+        );
+        assert!(
+            PINNED.read().unwrap().get(&b).is_none(),
+            "b never sees a's pin"
+        );
         release(&a);
-        assert!(PINNED.read().unwrap().get(&a).is_none(), "release clears the pin too");
+        assert!(
+            PINNED.read().unwrap().get(&a).is_none(),
+            "release clears the pin too"
+        );
         release(&b);
     }
 }

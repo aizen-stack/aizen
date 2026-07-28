@@ -56,7 +56,10 @@ impl Spinner {
             let _ = write!(out, "\r");
             let _ = out.flush();
         });
-        Self { stop, handle: Some(handle) }
+        Self {
+            stop,
+            handle: Some(handle),
+        }
     }
 
     /// Stop the spinner and clear its line (idempotent; also runs on drop). Kept as an explicit

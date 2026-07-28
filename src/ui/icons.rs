@@ -123,12 +123,12 @@ pub fn slash(name: &str) -> &'static str {
         "telegram" => pick("📱", "\u{f2c6}"), // telegram
         "save" => pick("💾", "\u{f0c7}"),     // save
         "load" => pick("📂", "\u{f07c}"),     // folder-open
-        "sessions" => pick("🗂", "\u{f187}"), // archive
-        "compact" => pick("🗜", "\u{f066}"),  // compress
+        "sessions" => pick("🗂", "\u{f187}"),  // archive
+        "compact" => pick("🗜", "\u{f066}"),   // compress
         "clear" => pick("🧹", "\u{f021}"),    // refresh
         "tokens" => pick("📊", "\u{f080}"),   // bar-chart
         "cost" => pick("💰", "\u{f155}"),     // dollar
-        "approval" => pick("🛡", "\u{f132}"), // shield
+        "approval" => pick("🛡", "\u{f132}"),  // shield
         "yolo" => pick("⚡", "\u{f0e7}"),     // legacy alias / HUD
         "smart" => pick("◆", "\u{f132}"),     // legacy alias / HUD
         "quit" => pick("🚪", "\u{f08b}"),     // sign-out

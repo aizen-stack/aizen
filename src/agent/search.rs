@@ -37,11 +37,17 @@ const SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) fn decode_text(bytes: &[u8]) -> Option<String> {
     // BOM-based detection (unambiguous).
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        let u16s: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let u16s: Vec<u16> = rest
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
         return Some(String::from_utf16_lossy(&u16s));
     }
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
-        let u16s: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        let u16s: Vec<u16> = rest
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
         return Some(String::from_utf16_lossy(&u16s));
     }
     let head = &bytes[..bytes.len().min(BINARY_SNIFF)];
@@ -58,11 +64,17 @@ pub(crate) fn decode_text(bytes: &[u8]) -> Option<String> {
     let odd_nul = head.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
     let even_nul = head.iter().step_by(2).filter(|&&b| b == 0).count();
     if odd_nul * 10 >= half * 8 {
-        let u16s: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let u16s: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
         return Some(String::from_utf16_lossy(&u16s));
     }
     if even_nul * 10 >= half * 8 {
-        let u16s: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        let u16s: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
         return Some(String::from_utf16_lossy(&u16s));
     }
     None // genuine binary
@@ -104,10 +116,18 @@ impl Tool for SearchFiles {
         })
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let pattern = args.get("pattern").and_then(|v| v.as_str()).context("missing `pattern`")?;
-        let ignore_case = args.get("ignore_case").and_then(|v| v.as_bool()).unwrap_or(false);
-        let max_results =
-            args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_MAX_RESULTS as u64) as usize;
+        let pattern = args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .context("missing `pattern`")?;
+        let ignore_case = args
+            .get("ignore_case")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let max_results = args
+            .get("max_results")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_MAX_RESULTS as u64) as usize;
         let re = RegexBuilder::new(pattern)
             .case_insensitive(ignore_case)
             .build()
@@ -118,17 +138,25 @@ impl Tool for SearchFiles {
             None => self.root.clone(),
         };
 
-        let show_hidden = args.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false);
+        let show_hidden = args
+            .get("hidden")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let mut wb = WalkBuilder::new(&search_root);
         wb.git_global(false); // honor the repo's .gitignore, not the dev's global one (reproducible)
         if show_hidden {
             // Opt-in "see everything": stop honoring .gitignore / hidden-file rules so the walk
             // reaches dotfiles and ignored paths too (the user asked for nothing to be skipped).
-            wb.hidden(false).git_ignore(false).git_exclude(false).ignore(false).parents(false);
+            wb.hidden(false)
+                .git_ignore(false)
+                .git_exclude(false)
+                .ignore(false)
+                .parents(false);
         }
         if let Some(glob) = args.get("glob").and_then(|v| v.as_str()) {
             let mut ob = OverrideBuilder::new(&search_root);
-            ob.add(glob).with_context(|| format!("invalid glob `{glob}`"))?;
+            ob.add(glob)
+                .with_context(|| format!("invalid glob `{glob}`"))?;
             wb.overrides(ob.build().context("building glob filter")?);
         }
 
@@ -175,7 +203,11 @@ impl Tool for SearchFiles {
                     Some(t) => t,
                     None => return WalkState::Continue, // binary
                 };
-                let rel = dent.path().strip_prefix(&self.root).unwrap_or(dent.path()).to_path_buf();
+                let rel = dent
+                    .path()
+                    .strip_prefix(&self.root)
+                    .unwrap_or(dent.path())
+                    .to_path_buf();
                 let mut this_file = false;
                 for (i, line) in text.lines().enumerate() {
                     if re.is_match(line) {
@@ -221,13 +253,17 @@ impl Tool for SearchFiles {
             }
             return Ok(msg);
         }
-        let lines: Vec<String> =
-            results.iter().map(|(rel, n, shown)| format!("{}:{}: {}", rel.display(), n, shown)).collect();
+        let lines: Vec<String> = results
+            .iter()
+            .map(|(rel, n, shown)| format!("{}:{}: {}", rel.display(), n, shown))
+            .collect();
         let mut out = format!("{} match(es) in {files_hit} file(s):", lines.len());
         out.push('\n');
         out.push_str(&lines.join("\n"));
         if truncated.load(Ordering::Relaxed) {
-            out.push_str(&format!("\n…[capped at {max_results} matches — narrow the pattern or set path/glob]"));
+            out.push_str(&format!(
+                "\n…[capped at {max_results} matches — narrow the pattern or set path/glob]"
+            ));
         }
         if budget_hit.load(Ordering::Relaxed) {
             out.push_str("\n…[search budget reached before the whole tree was scanned — narrow with path/glob]");
@@ -257,7 +293,10 @@ mod tests {
         let out = t
             .execute(&serde_json::json!({"pattern": "canonical content search", "glob": "*.rs"}))
             .unwrap();
-        assert!(out.contains("search.rs:"), "should locate this file; got:\n{out}");
+        assert!(
+            out.contains("search.rs:"),
+            "should locate this file; got:\n{out}"
+        );
         assert!(out.contains("match(es)"));
     }
 
@@ -267,7 +306,9 @@ mod tests {
         // Build the needle at runtime so its literal can't appear contiguously in this source file
         // (a fixed literal would match its own test line — the walker really does find everything).
         let needle = format!("{}{}{}", "zNoMatch", "Tok", "42xQ");
-        let out = t.execute(&serde_json::json!({ "pattern": needle })).unwrap();
+        let out = t
+            .execute(&serde_json::json!({ "pattern": needle }))
+            .unwrap();
         assert!(out.starts_with("no matches"), "got: {out}");
     }
 
@@ -338,7 +379,9 @@ mod tests {
         }
         std::fs::write(root.join("cfg.ts"), &bytes).unwrap();
         let t = SearchFiles::new(root);
-        let out = t.execute(&serde_json::json!({"pattern": "secret"})).unwrap();
+        let out = t
+            .execute(&serde_json::json!({"pattern": "secret"}))
+            .unwrap();
         assert!(out.contains("cfg.ts"), "utf-16 file searched: {out}");
     }
 

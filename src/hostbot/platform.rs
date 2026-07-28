@@ -23,7 +23,11 @@ pub struct Outbound {
 impl Outbound {
     pub fn plain(text: impl Into<String>) -> Self {
         let text = text.into();
-        Self { fallback: text.clone(), text, rich: false }
+        Self {
+            fallback: text.clone(),
+            text,
+            rich: false,
+        }
     }
 }
 
@@ -78,7 +82,12 @@ pub trait Platform: Send + Sync + 'static {
     }
 
     /// Send a rendered piece. Rich platforms override this to select parse mode + fail-open fallback.
-    async fn send_outbound(&self, route: &str, chat: Self::Chat, outbound: &Outbound) -> Result<()> {
+    async fn send_outbound(
+        &self,
+        route: &str,
+        chat: Self::Chat,
+        outbound: &Outbound,
+    ) -> Result<()> {
         self.send(route, chat, &outbound.text).await
     }
 
@@ -116,7 +125,12 @@ pub trait Platform: Send + Sync + 'static {
         false
     }
     /// Validate `token`, persist + hot-spawn a new bot on `route`=`name`. Returns its @username.
-    async fn add_bot(&self, _name: &str, _token: &str, _tx: &Sender<Inbound<Self::Chat>>) -> Result<String> {
+    async fn add_bot(
+        &self,
+        _name: &str,
+        _token: &str,
+        _tx: &Sender<Inbound<Self::Chat>>,
+    ) -> Result<String> {
         bail!("hosting extra bots is only supported on Telegram")
     }
     /// Stop + forget a hosted bot.

@@ -53,7 +53,10 @@ mod tests {
 
     #[test]
     fn parse_falls_back_to_inferred() {
-        assert_eq!(ProvenanceKind::parse("user-explicit"), ProvenanceKind::UserExplicit);
+        assert_eq!(
+            ProvenanceKind::parse("user-explicit"),
+            ProvenanceKind::UserExplicit
+        );
         assert_eq!(ProvenanceKind::parse("nonsense"), ProvenanceKind::Inferred);
         assert_eq!(ProvenanceKind::parse(""), ProvenanceKind::Inferred);
     }

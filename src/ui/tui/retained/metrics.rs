@@ -19,7 +19,8 @@ pub(super) struct FrameMetrics {
 impl FrameMetrics {
     pub fn record(&mut self, elapsed: Duration, row_hashes: Vec<u64>, resized: bool) {
         self.frames = self.frames.saturating_add(1);
-        self.render_us.push_back(elapsed.as_micros().min(u64::MAX as u128) as u64);
+        self.render_us
+            .push_back(elapsed.as_micros().min(u64::MAX as u128) as u64);
         while self.render_us.len() > WINDOW {
             self.render_us.pop_front();
         }
@@ -86,16 +87,32 @@ mod tests {
     #[test]
     fn resize_is_not_counted_as_reflow() {
         let mut m = FrameMetrics::default();
-        m.record(Duration::from_millis(1), hash_rows(&["a".into(), "b".into()]), false);
-        m.record(Duration::from_millis(2), hash_rows(&vec!["x".to_string(); 20]), true);
+        m.record(
+            Duration::from_millis(1),
+            hash_rows(&["a".into(), "b".into()]),
+            false,
+        );
+        m.record(
+            Duration::from_millis(2),
+            hash_rows(&vec!["x".to_string(); 20]),
+            true,
+        );
         assert_eq!(m.mass_reflows, 0);
     }
 
     #[test]
     fn large_unexplained_change_is_counted() {
         let mut m = FrameMetrics::default();
-        m.record(Duration::from_millis(1), hash_rows(&vec!["a".into(); 10]), false);
-        m.record(Duration::from_millis(1), hash_rows(&vec!["b".into(); 10]), false);
+        m.record(
+            Duration::from_millis(1),
+            hash_rows(&vec!["a".into(); 10]),
+            false,
+        );
+        m.record(
+            Duration::from_millis(1),
+            hash_rows(&vec!["b".into(); 10]),
+            false,
+        );
         assert_eq!(m.mass_reflows, 1);
     }
 }

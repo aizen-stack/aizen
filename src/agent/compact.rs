@@ -24,6 +24,13 @@ pub const KEEP_TURNS: usize = 3;
 /// though the old boundary note itself is summarized away into the new one.
 pub const COMPACT_MARKER_PREFIX: &str = "[Earlier conversation auto-compacted";
 
+/// Stable prefix of the `/handoff` seed note — the distilled context carried into a fresh thread.
+/// Byte-identical to the text every historical handoff already wrote, so saved sessions get the
+/// same treatment retroactively. Like the compaction marker it is conversation CONTENT, not prompt
+/// prefix: [`leading_system_count`] stops at it, so lane rewrites (`/config`, `/model`, resume)
+/// splice around it instead of overwriting it, and a later compaction may fold it into its summary.
+pub const HANDOFF_MARKER_PREFIX: &str = "[handoff context from the previous session]";
+
 /// The summarization instruction. Centralized here so the REPL and the loop produce identical
 /// summaries. Mirrors the original `compact_history` prompt.
 const SUMMARIZE_SYS: &str = "You compress a coding-assistant conversation to conserve context. \
@@ -48,7 +55,9 @@ pub fn handoff_prompt(history: &[Message], goal: &str) -> Vec<Message> {
     let transcript = render_transcript(history.get(lead..).unwrap_or_default());
     vec![
         Message::system(HANDOFF_SYS),
-        Message::user(format!("NEW GOAL:\n{goal}\n\nPrior conversation:\n\n{transcript}")),
+        Message::user(format!(
+            "NEW GOAL:\n{goal}\n\nPrior conversation:\n\n{transcript}"
+        )),
     ]
 }
 
@@ -58,7 +67,11 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     if chars.len() <= max {
         s.to_string()
     } else {
-        format!("{}… [+{} chars]", chars[..max].iter().collect::<String>(), chars.len() - max)
+        format!(
+            "{}… [+{} chars]",
+            chars[..max].iter().collect::<String>(),
+            chars.len() - max
+        )
     }
 }
 
@@ -77,13 +90,25 @@ pub fn render_transcript(msgs: &[Message]) -> String {
                 let calls: Vec<String> = m
                     .tool_calls
                     .iter()
-                    .map(|c| format!("{}({})", c.function.name, truncate_chars(&c.function.arguments, 160)))
+                    .map(|c| {
+                        format!(
+                            "{}({})",
+                            c.function.name,
+                            truncate_chars(&c.function.arguments, 160)
+                        )
+                    })
                     .collect();
                 out.push_str(&format!("Assistant→tools: {}\n", calls.join(", ")));
             }
             "assistant" => out.push_str(&format!("Assistant: {body}\n")),
             "tool" => out.push_str(&format!("Tool result: {}\n", truncate_chars(body, 600))),
-            "system" => out.push_str(&format!("Note: {}\n", truncate_chars(body, 600))),
+            // A `system` message inside the conversation body is never chatter: it's a prior
+            // compaction boundary or a `/handoff` seed — i.e. context that ALREADY survived one
+            // distillation. Both are foldable into the next summary, so truncating them at the
+            // tool-result budget silently dropped the densest text in the transcript. Give them
+            // room (~600 tokens) so a chain of compactions/handoffs doesn't erode the original
+            // decisions one 600-char cut at a time.
+            "system" => out.push_str(&format!("Note: {}\n", truncate_chars(body, 2400))),
             other => out.push_str(&format!("{other}: {body}\n")),
         }
     }
@@ -137,15 +162,18 @@ pub fn context_touchpoints(history: &[Message]) -> Touchpoints {
 }
 
 /// Number of leading `system` messages that form the prompt prefix (stable lane + optional dynamic
-/// lane). Compaction/session caps must preserve all of them. The compaction boundary marker is ALSO
-/// a leading `system` message but is conversation content (a lossy summary), NOT prompt prefix — it
-/// must be foldable into the next compaction, so the count stops at it.
+/// lane). Compaction/session caps must preserve all of them. The compaction boundary marker and the
+/// handoff seed are ALSO leading `system` messages but are conversation content (a lossy summary /
+/// carried-over context), NOT prompt prefix — they must survive lane rewrites and stay foldable
+/// into the next compaction, so the count stops at either.
 pub fn leading_system_count(history: &[Message]) -> usize {
     history
         .iter()
         .take_while(|m| {
             m.role == "system"
-                && !m.content.as_deref().is_some_and(|c| c.starts_with(COMPACT_MARKER_PREFIX))
+                && !m.content.as_deref().is_some_and(|c| {
+                    c.starts_with(COMPACT_MARKER_PREFIX) || c.starts_with(HANDOFF_MARKER_PREFIX)
+                })
         })
         .count()
 }
@@ -183,7 +211,12 @@ pub fn plan_compact_cut(history: &[Message], keep_turns: usize) -> Option<usize>
 pub fn compaction_count(history: &[Message]) -> usize {
     history
         .iter()
-        .find(|m| m.role == "system" && m.content.as_deref().is_some_and(|c| c.starts_with(COMPACT_MARKER_PREFIX)))
+        .find(|m| {
+            m.role == "system"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with(COMPACT_MARKER_PREFIX))
+        })
         .and_then(|m| parse_marker_seq(m.content.as_deref().unwrap_or("")))
         .unwrap_or(0)
 }
@@ -192,7 +225,10 @@ pub fn compaction_count(history: &[Message]) -> usize {
 fn parse_marker_seq(marker: &str) -> Option<usize> {
     let first = marker.lines().next().unwrap_or("");
     let hash = first.rfind('#')?;
-    let digits: String = first[hash + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = first[hash + 1..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     digits.parse().ok()
 }
 
@@ -252,7 +288,9 @@ where
         Message::system(SUMMARIZE_SYS),
         Message::user(format!("Conversation to summarize:\n\n{transcript}")),
     ];
-    let summary = summarize(prompt).await.map_err(|e| anyhow!("summarization call failed: {e}"))?;
+    let summary = summarize(prompt)
+        .await
+        .map_err(|e| anyhow!("summarization call failed: {e}"))?;
     if summary.trim().is_empty() {
         anyhow::bail!("the model returned an empty summary");
     }
@@ -275,12 +313,22 @@ mod tests {
         ];
         let p = handoff_prompt(&history, "now optimize the lexer");
         assert_eq!(p.len(), 2);
-        assert!(p[0].content.as_deref().unwrap().contains("ONLY the context relevant"));
+        assert!(p[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("ONLY the context relevant"));
         let usr = p[1].content.as_deref().unwrap();
         assert!(usr.contains("NEW GOAL:\nnow optimize the lexer"), "{usr}");
         assert!(usr.contains("src/parse.rs"), "transcript present");
-        assert!(!usr.contains("STABLE SYSTEM"), "stable system prompt never leaks into the extraction");
-        assert!(!usr.contains("DYNAMIC SYSTEM"), "dynamic system prompt never leaks into the extraction");
+        assert!(
+            !usr.contains("STABLE SYSTEM"),
+            "stable system prompt never leaks into the extraction"
+        );
+        assert!(
+            !usr.contains("DYNAMIC SYSTEM"),
+            "dynamic system prompt never leaks into the extraction"
+        );
     }
 
     fn user(s: &str) -> Message {
@@ -300,14 +348,21 @@ mod tests {
     fn plan_cut_needs_two_turns_and_lands_on_user() {
         // too short
         assert_eq!(plan_compact_cut(&[Message::system("s")], KEEP_TURNS), None);
-        assert_eq!(plan_compact_cut(&[Message::system("s"), user("u")], KEEP_TURNS), None);
+        assert_eq!(
+            plan_compact_cut(&[Message::system("s"), user("u")], KEEP_TURNS),
+            None
+        );
         // 4 user turns, keep last 2 → cut at the 3rd user message; it's a `user` index.
         let h = vec![
             Message::system("s"),
-            user("u1"), asst("a1"),
-            user("u2"), asst("a2"),
-            user("u3"), asst("a3"),
-            user("u4"), asst("a4"),
+            user("u1"),
+            asst("a1"),
+            user("u2"),
+            asst("a2"),
+            user("u3"),
+            asst("a3"),
+            user("u4"),
+            asst("a4"),
         ];
         let cut = plan_compact_cut(&h, 2).expect("should compact");
         assert_eq!(h[cut].role, "user", "cut must land on a user boundary");
@@ -322,7 +377,10 @@ mod tests {
             Message::assistant_tool_calls(vec![ToolCall {
                 id: "1".into(),
                 kind: "function".into(),
-                function: FunctionCall { name: "echo".into(), arguments: "{}".into() },
+                function: FunctionCall {
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                },
             }]),
             Message::tool_result("1", "big result"),
             user("u2"),
@@ -330,27 +388,49 @@ mod tests {
         ];
         let cut = 4; // index of u2
         splice_compacted(&mut h, cut, "DENSE_SUMMARY");
-        assert_eq!(h[0].content.as_deref(), Some("SYS"), "system prompt preserved at [0]");
-        assert!(h[1].content.as_deref().unwrap().contains("DENSE_SUMMARY"), "summary note inserted");
+        assert_eq!(
+            h[0].content.as_deref(),
+            Some("SYS"),
+            "system prompt preserved at [0]"
+        );
+        assert!(
+            h[1].content.as_deref().unwrap().contains("DENSE_SUMMARY"),
+            "summary note inserted"
+        );
         assert_eq!(h[1].role, "system");
-        assert_eq!(h[2].content.as_deref(), Some("u2"), "verbatim tail begins at the cut (a user msg)");
+        assert_eq!(
+            h[2].content.as_deref(),
+            Some("u2"),
+            "verbatim tail begins at the cut (a user msg)"
+        );
         // No orphan tool result survived the cut.
-        assert!(!h[2..].iter().any(|m| m.role == "tool"), "no dangling tool result in the tail");
+        assert!(
+            !h[2..].iter().any(|m| m.role == "tool"),
+            "no dangling tool result in the tail"
+        );
     }
 
     #[tokio::test]
     async fn compact_history_uses_injected_summarizer() {
         let mut h = vec![
             Message::system("SYS"),
-            user("u1"), asst("a1"),
-            user("u2"), asst("a2"),
-            user("u3"), asst("a3"),
+            user("u1"),
+            asst("a1"),
+            user("u2"),
+            asst("a2"),
+            user("u3"),
+            asst("a3"),
         ];
         let before_len = h.len();
         let (b, a) = compact_history(&mut h, |_msgs| async { Ok("SUMMARY_OK".to_string()) }, 1)
             .await
             .expect("compaction should succeed");
-        assert!(h.len() < before_len, "history shrank: {} → {}", before_len, h.len());
+        assert!(
+            h.len() < before_len,
+            "history shrank: {} → {}",
+            before_len,
+            h.len()
+        );
         assert_eq!(h[0].content.as_deref(), Some("SYS"));
         assert!(h[1].content.as_deref().unwrap().contains("SUMMARY_OK"));
         assert!(b > 0 && a > 0);
@@ -366,8 +446,10 @@ mod tests {
         let cap = captured.clone();
         let mut h = vec![
             Message::system("SYS"),
-            user("u1"), asst("a1"),
-            user("u2"), asst("a2"),
+            user("u1"),
+            asst("a1"),
+            user("u2"),
+            asst("a2"),
         ];
         compact_history(
             &mut h,
@@ -380,8 +462,14 @@ mod tests {
         .await
         .expect("compaction should succeed");
         let sys = captured.lock().unwrap().to_ascii_uppercase();
-        assert!(sys.contains("REFLECTION"), "summarizer instruction must request a reflection section: {sys}");
-        assert!(sys.contains("FAILED"), "…and specifically failed approaches: {sys}");
+        assert!(
+            sys.contains("REFLECTION"),
+            "summarizer instruction must request a reflection section: {sys}"
+        );
+        assert!(
+            sys.contains("FAILED"),
+            "…and specifically failed approaches: {sys}"
+        );
     }
 
     #[tokio::test]
@@ -396,18 +484,26 @@ mod tests {
         // P-ctx3: a fresh history has zero compactions; the marker is detectable by prefix; and the
         // count accumulates across successive compactions even though each old boundary note is
         // folded into the next summary.
-        let base = || vec![
-            Message::system("SYS"),
-            user("u1"), asst("a1"),
-            user("u2"), asst("a2"),
-            user("u3"), asst("a3"),
-        ];
+        let base = || {
+            vec![
+                Message::system("SYS"),
+                user("u1"),
+                asst("a1"),
+                user("u2"),
+                asst("a2"),
+                user("u3"),
+                asst("a3"),
+            ]
+        };
         let mut h = base();
         assert_eq!(compaction_count(&h), 0, "no boundary yet");
         splice_compacted(&mut h, 3, "SUMMARY_1");
         assert_eq!(compaction_count(&h), 1, "first compaction → #1");
         assert!(
-            h[1].content.as_deref().unwrap().starts_with(COMPACT_MARKER_PREFIX),
+            h[1].content
+                .as_deref()
+                .unwrap()
+                .starts_with(COMPACT_MARKER_PREFIX),
             "boundary note detectable by prefix"
         );
         // Grow the tail and compact again: the prior #1 boundary sits before the new cut, so it is
@@ -418,11 +514,21 @@ mod tests {
         h.push(asst("a5"));
         let cut = plan_compact_cut(&h, 1).expect("compactable");
         splice_compacted(&mut h, cut, "SUMMARY_2");
-        assert_eq!(compaction_count(&h), 2, "count accumulates to #2 across compactions");
+        assert_eq!(
+            compaction_count(&h),
+            2,
+            "count accumulates to #2 across compactions"
+        );
         // Exactly one boundary note survives (the newest); the old one was folded in.
-        let markers = h.iter().filter(|m| {
-            m.role == "system" && m.content.as_deref().is_some_and(|c| c.starts_with(COMPACT_MARKER_PREFIX))
-        }).count();
+        let markers = h
+            .iter()
+            .filter(|m| {
+                m.role == "system"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with(COMPACT_MARKER_PREFIX))
+            })
+            .count();
         assert_eq!(markers, 1, "only the newest boundary note remains");
     }
 
@@ -438,7 +544,10 @@ mod tests {
         Message::assistant_tool_calls(vec![ToolCall {
             id: "x".into(),
             kind: "function".into(),
-            function: FunctionCall { name: name.into(), arguments: args.into() },
+            function: FunctionCall {
+                name: name.into(),
+                arguments: args.into(),
+            },
         }])
     }
 
@@ -449,7 +558,10 @@ mod tests {
             user("do the thing"),
             tool_call("file_read", r#"{"path":"src/main.rs"}"#),
             tool_call("skill_load", r#"{"name":"deep-research"}"#),
-            tool_call("file_edit", r#"{"path":"src/main.rs","old_string":"a","new_string":"b"}"#),
+            tool_call(
+                "file_edit",
+                r#"{"path":"src/main.rs","old_string":"a","new_string":"b"}"#,
+            ),
             tool_call("file_write", r#"{"path":"src/new.rs","content":"x"}"#),
             tool_call("multi_edit", r#"{"path":"src/ui/tui.rs","edits":[]}"#),
             tool_call("skill_load", r#"{"name":"deep-research"}"#),
@@ -474,10 +586,15 @@ mod tests {
     async fn compact_history_rejects_empty_summary() {
         let mut h = vec![
             Message::system("SYS"),
-            user("u1"), asst("a1"),
-            user("u2"), asst("a2"),
+            user("u1"),
+            asst("a1"),
+            user("u2"),
+            asst("a2"),
         ];
         let r = compact_history(&mut h, |_m| async { Ok("   ".to_string()) }, 1).await;
-        assert!(r.is_err(), "an empty summary is rejected (don't destroy history for nothing)");
+        assert!(
+            r.is_err(),
+            "an empty summary is rejected (don't destroy history for nothing)"
+        );
     }
 }

@@ -42,7 +42,11 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// Hash the normalized text's character 5-grams. Short text → one shingle of the whole.
 fn shingles(text: &str) -> Vec<u64> {
-    let norm: String = text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    let norm: String = text
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let chars: Vec<char> = norm.chars().collect();
     let mut out = Vec::new();
     if chars.len() < SHINGLE_K {
@@ -99,20 +103,38 @@ mod tests {
 
     #[test]
     fn identical_text_is_dup() {
-        assert!(is_near_duplicate("prefers pnpm over npm", "prefers pnpm over npm", 0.8));
-        assert!((similarity(&signature("abc def ghij"), &signature("abc def ghij")) - 1.0).abs() < 1e-9);
+        assert!(is_near_duplicate(
+            "prefers pnpm over npm",
+            "prefers pnpm over npm",
+            0.8
+        ));
+        assert!(
+            (similarity(&signature("abc def ghij"), &signature("abc def ghij")) - 1.0).abs() < 1e-9
+        );
     }
 
     #[test]
     fn minor_edits_stay_dup() {
         // typo / punctuation / casing — token dedup might miss these, MinHash catches them
-        assert!(is_near_duplicate("prefers pnpm over npm", "Prefers pnpm over npm.", 0.7));
+        assert!(is_near_duplicate(
+            "prefers pnpm over npm",
+            "Prefers pnpm over npm.",
+            0.7
+        ));
     }
 
     #[test]
     fn different_facts_not_dup() {
-        assert!(!is_near_duplicate("prefers pnpm over npm", "deploys on fridays only", 0.7));
-        assert!(!is_near_duplicate("reply in vietnamese", "use tabs not spaces", 0.7));
+        assert!(!is_near_duplicate(
+            "prefers pnpm over npm",
+            "deploys on fridays only",
+            0.7
+        ));
+        assert!(!is_near_duplicate(
+            "reply in vietnamese",
+            "use tabs not spaces",
+            0.7
+        ));
     }
 
     #[test]

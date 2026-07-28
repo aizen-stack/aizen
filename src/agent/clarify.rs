@@ -139,18 +139,26 @@ mod tests {
 
     #[test]
     fn build_renders_question_and_numbered_options() {
-        let (display, ack) =
-            build("Which file?", &["src/a.rs".to_string(), "src/b.rs".to_string()]);
+        let (display, ack) = build(
+            "Which file?",
+            &["src/a.rs".to_string(), "src/b.rs".to_string()],
+        );
         assert_eq!(display, "Which file?\n  1. src/a.rs\n  2. src/b.rs");
         assert!(ack.contains("Which file?"));
         assert!(ack.contains("Suggested answers: src/a.rs / src/b.rs."));
-        assert!(ack.contains("STOP now"), "the model must be told to wait, not re-ask: {ack}");
+        assert!(
+            ack.contains("STOP now"),
+            "the model must be told to wait, not re-ask: {ack}"
+        );
     }
 
     #[test]
     fn build_without_options_is_just_the_question() {
         let (display, ack) = build("  Proceed?  ", &[]);
-        assert_eq!(display, "Proceed?", "whitespace trimmed, no options appended");
+        assert_eq!(
+            display, "Proceed?",
+            "whitespace trimmed, no options appended"
+        );
         assert!(!ack.contains("Suggested answers"));
     }
 
@@ -165,20 +173,32 @@ mod tests {
         let pending = take_pending().expect("a question must be pending after execute");
         assert!(pending.starts_with("A or B?"));
         assert!(pending.contains("1. A") && pending.contains("2. B"));
-        assert!(take_pending().is_none(), "take must drain — a second take yields nothing");
+        assert!(
+            take_pending().is_none(),
+            "take must drain — a second take yields nothing"
+        );
     }
 
     #[test]
     fn execute_rejects_empty_or_missing_question() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert!(Clarify.execute(&json!({})).is_err(), "missing question");
-        assert!(Clarify.execute(&json!({"question": "   "})).is_err(), "blank question");
+        assert!(
+            Clarify.execute(&json!({"question": "   "})).is_err(),
+            "blank question"
+        );
         let _ = take_pending();
     }
 
     #[test]
     fn flags_are_nondestructive_and_serial() {
-        assert!(!Clarify.is_destructive(), "asking a question changes nothing");
-        assert!(!Clarify.is_concurrency_safe(), "global side effect → must run serially");
+        assert!(
+            !Clarify.is_destructive(),
+            "asking a question changes nothing"
+        );
+        assert!(
+            !Clarify.is_concurrency_safe(),
+            "global side effect → must run serially"
+        );
     }
 }

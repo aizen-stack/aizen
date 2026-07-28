@@ -138,7 +138,11 @@ impl EmbeddingCache {
             .ok()
             .and_then(|s| serde_json::from_str::<HashMap<u64, Vec<f32>>>(&s).ok())
             .unwrap_or_default();
-        EmbeddingCache { embedder_id: embedder_id.to_string(), map, dirty: false }
+        EmbeddingCache {
+            embedder_id: embedder_id.to_string(),
+            map,
+            dirty: false,
+        }
     }
 
     /// Embedding for `text`, computing+caching on miss.

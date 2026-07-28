@@ -70,11 +70,18 @@ impl Tool for RepoMap {
             .and_then(|v| v.as_u64())
             .map(|n| (n as usize).clamp(1, 50))
             .unwrap_or(25);
-        let scope_root = match args.get("scope").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+        let scope_root = match args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(scope) => {
                 let p = self.root.join(scope);
                 if !p.is_dir() {
-                    return Ok(format!("error: scope '{scope}' is not a directory under the project root"));
+                    return Ok(format!(
+                        "error: scope '{scope}' is not a directory under the project root"
+                    ));
                 }
                 p
             }
@@ -97,8 +104,16 @@ impl Tool for RepoMap {
         let mut ranked: Vec<(PathBuf, u32, u64)> = files
             .into_iter()
             .map(|p| {
-                let rel = p.strip_prefix(&self.root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
-                let c = churn.as_ref().and_then(|m| m.get(rel.as_str())).copied().unwrap_or(0);
+                let rel = p
+                    .strip_prefix(&self.root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let c = churn
+                    .as_ref()
+                    .and_then(|m| m.get(rel.as_str()))
+                    .copied()
+                    .unwrap_or(0);
                 let mtime = if use_mtime {
                     p.metadata()
                         .and_then(|m| m.modified())
@@ -116,12 +131,27 @@ impl Tool for RepoMap {
         ranked.truncate(max_files);
 
         // 3) Symbol skeletons for the top files (bounded; fail-soft per file).
-        let by = if churn.is_some() { "git churn" } else { "recency" };
-        let mut out = format!("repo map (top {} of {total} source files by {by}; symbols from LSP)\n", ranked.len());
+        let by = if churn.is_some() {
+            "git churn"
+        } else {
+            "recency"
+        };
+        let mut out = format!(
+            "repo map (top {} of {total} source files by {by}; symbols from LSP)\n",
+            ranked.len()
+        );
         let deadline = Instant::now() + std::time::Duration::from_secs(SYMBOL_DEADLINE_SECS);
         for (i, (path, churn_n, _)) in ranked.iter().enumerate() {
-            let rel = path.strip_prefix(&self.root).unwrap_or(path).to_string_lossy().replace('\\', "/");
-            let churn_tag = if *churn_n > 0 { format!("  churn:{churn_n}") } else { String::new() };
+            let rel = path
+                .strip_prefix(&self.root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let churn_tag = if *churn_n > 0 {
+                format!("  churn:{churn_n}")
+            } else {
+                String::new()
+            };
             out.push_str(&format!("{rel}{churn_tag}\n"));
             if i < MAX_SYMBOL_FILES && Instant::now() < deadline {
                 if let Ok(syms) = crate::agent::lsp::LSP.document_symbols_items(path) {
@@ -151,8 +181,15 @@ fn source_files(root: &Path) -> Vec<PathBuf> {
         if !p.is_file() {
             continue;
         }
-        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-        if discovery::SERVERS.iter().any(|s| s.extensions.contains(&ext.as_str())) {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if discovery::SERVERS
+            .iter()
+            .any(|s| s.extensions.contains(&ext.as_str()))
+        {
             out.push(p.to_path_buf());
         }
     }
@@ -167,8 +204,17 @@ fn source_files(root: &Path) -> Vec<PathBuf> {
 /// never match the real UTF-8 path the walker produced — so those files silently rank churn:0. With
 /// quotePath off, git prints the raw UTF-8 path and the map keys line up.
 fn git_churn(root: &Path) -> Option<HashMap<String, u32>> {
-    let out = std::process::Command::new("git")
-        .args(["-c", "core.quotePath=false", "log", "--name-only", "--pretty=format:", "-n", CHURN_COMMITS])
+    let out = crate::core::gitx::command()
+        .ok()?
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "log",
+            "--name-only",
+            "--pretty=format:",
+            "-n",
+            CHURN_COMMITS,
+        ])
         .current_dir(root)
         .output()
         .ok()?;
@@ -230,16 +276,31 @@ src/agent/mod.rs
     fn symbol_line_is_compact_and_capped() {
         use crate::agent::lsp::server::DocSym;
         let syms: Vec<DocSym> = (0..30)
-            .map(|i| DocSym { name: format!("f{i}"), kind: "function", line: i + 1, depth: 0 })
+            .map(|i| DocSym {
+                name: format!("f{i}"),
+                kind: "function",
+                line: i + 1,
+                depth: 0,
+            })
             .collect();
         let line = render_symbol_line(&syms);
         assert!(line.starts_with("f0:1  f1:2"), "{line}");
         assert!(!line.contains("f20"), "capped at {MAX_SYMS_PER_FILE}");
         // Non-fn kinds keep their kind prefix.
-        let one = vec![DocSym { name: "Config".into(), kind: "struct", line: 7, depth: 0 }];
+        let one = vec![DocSym {
+            name: "Config".into(),
+            kind: "struct",
+            line: 7,
+            depth: 0,
+        }];
         assert_eq!(render_symbol_line(&one), "struct Config:7");
         // Deep symbols are skipped.
-        let deep = vec![DocSym { name: "inner".into(), kind: "function", line: 9, depth: 2 }];
+        let deep = vec![DocSym {
+            name: "inner".into(),
+            kind: "function",
+            line: 9,
+            depth: 2,
+        }];
         assert_eq!(render_symbol_line(&deep), "");
     }
 
@@ -253,10 +314,18 @@ src/agent/mod.rs
         std::fs::write(d.join("c.txt"), "not source").unwrap();
         std::fs::write(d.join("d.exe"), [0u8; 4]).unwrap();
         let files = source_files(&d);
-        let names: Vec<String> =
-            files.iter().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string())).collect();
-        assert!(names.contains(&"a.rs".to_string()) && names.contains(&"b.py".to_string()), "{names:?}");
-        assert!(!names.iter().any(|n| n == "c.txt" || n == "d.exe"), "{names:?}");
+        let names: Vec<String> = files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(
+            names.contains(&"a.rs".to_string()) && names.contains(&"b.py".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "c.txt" || n == "d.exe"),
+            "{names:?}"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 }

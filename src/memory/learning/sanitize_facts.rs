@@ -18,19 +18,29 @@ pub struct ThreatVerdict {
 }
 impl ThreatVerdict {
     fn ok() -> Self {
-        ThreatVerdict { rejected: false, reason: None }
+        ThreatVerdict {
+            rejected: false,
+            reason: None,
+        }
     }
     fn reject(reason: &str) -> Self {
-        ThreatVerdict { rejected: true, reason: Some(reason.to_string()) }
+        ThreatVerdict {
+            rejected: true,
+            reason: Some(reason.to_string()),
+        }
     }
 }
 
 // ── secret material ───────────────────────────────────────────────────────
-static RE_OPENAI_KEY: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\b(sk|pk|rk)-[a-z0-9_\-]{16,}").unwrap());
+static RE_OPENAI_KEY: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\b(sk|pk|rk)-[a-z0-9_\-]{16,}").unwrap());
 static RE_NG_TOKEN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bng_[A-Za-z0-9_\-]{12,}").unwrap());
 static RE_AWS_KEY: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap());
-static RE_JWT: Lazy<Regex> = Lazy::new(|| Regex::new(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]+").unwrap());
-static RE_PEM: Lazy<Regex> = Lazy::new(|| Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----").unwrap());
+static RE_JWT: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]+").unwrap()
+});
+static RE_PEM: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----").unwrap());
 static RE_KV_SECRET: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token|client[_-]?secret|bearer)\b\s*[:=]\s*\S{4,}")
         .unwrap()
@@ -46,9 +56,12 @@ static RE_ROLEPLAY: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\b(you are now|from now on you|act as|pretend (to be|you are|that)|you must (now|always)|new instructions?)\b")
         .unwrap()
 });
-static RE_SYSPROMPT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\b(system|developer)\s+(prompt|message|instruction)\b").unwrap());
-static RE_ROLE_PREFIX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?im)^\s*(system|assistant|user)\s*:").unwrap());
-static RE_TAG_BREAKOUT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)</?\s*(memory|system|instructions?|prompt)\b").unwrap());
+static RE_SYSPROMPT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\b(system|developer)\s+(prompt|message|instruction)\b").unwrap());
+static RE_ROLE_PREFIX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?im)^\s*(system|assistant|user)\s*:").unwrap());
+static RE_TAG_BREAKOUT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)</?\s*(memory|system|instructions?|prompt)\b").unwrap());
 
 /// Scan a (already-sanitized) fact for secrets and injection attempts.
 pub fn threat_scan(fact: &str) -> ThreatVerdict {
@@ -142,7 +155,10 @@ mod tests {
 
     #[test]
     fn sanitize_cleans_and_filters() {
-        assert_eq!(sanitize_to_fact("  - prefers   pnpm  ").as_deref(), Some("prefers pnpm"));
+        assert_eq!(
+            sanitize_to_fact("  - prefers   pnpm  ").as_deref(),
+            Some("prefers pnpm")
+        );
         assert_eq!(sanitize_to_fact("   "), None);
         assert_eq!(sanitize_to_fact("the a of"), None); // all stopwords
     }

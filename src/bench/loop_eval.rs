@@ -28,10 +28,16 @@ use std::sync::Mutex;
 /// A scripted fake model: pops the next turn each call; empties → a final "stop". Ignores the
 /// messages it's handed (a fixture emits a fixed sequence), which is the whole point — the SCENARIO
 /// is the script, and the loop's own nudges can't derail a deterministic replay.
-fn scripted(turns: Vec<ChatTurn>) -> impl Fn(Vec<Message>, Vec<ToolDef>) -> std::future::Ready<Result<ChatTurn>> {
+fn scripted(
+    turns: Vec<ChatTurn>,
+) -> impl Fn(Vec<Message>, Vec<ToolDef>) -> std::future::Ready<Result<ChatTurn>> {
     let q = Mutex::new(VecDeque::from(turns));
     move |_m, _d| {
-        let next = q.lock().unwrap_or_else(|e| e.into_inner()).pop_front().unwrap_or_else(|| final_turn("stop"));
+        let next = q
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+            .unwrap_or_else(|| final_turn("stop"));
         std::future::ready(Ok(next))
     }
 }
@@ -42,7 +48,10 @@ fn tool_turn(name: &str, args: &str) -> ChatTurn {
         tool_calls: vec![ToolCall {
             id: format!("call_{name}"),
             kind: "function".into(),
-            function: FunctionCall { name: name.into(), arguments: args.into() },
+            function: FunctionCall {
+                name: name.into(),
+                arguments: args.into(),
+            },
         }],
         finish_reason: Some("stop".into()),
         usage: None,
@@ -71,7 +80,10 @@ fn multi_tool_turn(calls: &[(&str, &str)]) -> ChatTurn {
             .map(|(i, (name, args))| ToolCall {
                 id: format!("call_{name}_{i}"),
                 kind: "function".into(),
-                function: FunctionCall { name: (*name).into(), arguments: (*args).into() },
+                function: FunctionCall {
+                    name: (*name).into(),
+                    arguments: (*args).into(),
+                },
             })
             .collect(),
         finish_reason: Some("stop".into()),
@@ -96,7 +108,11 @@ impl Tool for Echo {
         serde_json::json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]})
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        Ok(args.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string())
+        Ok(args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string())
     }
 }
 
@@ -209,11 +225,20 @@ fn scenarios() -> Vec<Scenario> {
 
     let mut out = vec![
         // ── quick answer: no tools, straight to a final answer ──
-        scen("answer-immediately", "answer", vec![final_turn("42")], StopReason::Done, Some(1)),
+        scen(
+            "answer-immediately",
+            "answer",
+            vec![final_turn("42")],
+            StopReason::Done,
+            Some(1),
+        ),
         scen(
             "answer-after-one-read",
             "answer",
-            vec![tool_turn("echo", r#"{"text":"looked it up"}"#), final_turn("here is the answer")],
+            vec![
+                tool_turn("echo", r#"{"text":"looked it up"}"#),
+                final_turn("here is the answer"),
+            ],
             StopReason::Done,
             Some(2),
         ),
@@ -427,10 +452,7 @@ fn scenarios() -> Vec<Scenario> {
     out.push(Scenario {
         name: "no_poke_without_todos",
         shape: "persist",
-        turns: vec![
-            tool_turn("echo", r#"{"text":"edit"}"#),
-            final_turn("done"),
-        ],
+        turns: vec![tool_turn("echo", r#"{"text":"edit"}"#), final_turn("done")],
         expect_stop: StopReason::Done,
         max_iters: Some(2),
         seed_todos: Some(vec![]),
@@ -557,10 +579,7 @@ async fn run_scenario(s: &Scenario) -> (bool, usize, StopReason) {
     }
 
     // Capture messages for expect_msg_contains via run_agent_loop on a local buffer.
-    let mut messages = vec![
-        Message::system("sys"),
-        Message::user(s.user_task),
-    ];
+    let mut messages = vec![Message::system("sys"), Message::user(s.user_task)];
     let outcome = crate::agent::run_agent_loop(
         scripted(clone_turns(&s.turns)),
         &cfg,
@@ -574,14 +593,16 @@ async fn run_scenario(s: &Scenario) -> (bool, usize, StopReason) {
     let iters_ok = s.max_iters.is_none_or(|m| outcome.iters <= m);
     let msg_ok = match s.expect_msg_contains {
         None => true,
-        Some(needle) => messages.iter().any(|m| {
-            m.content.as_deref().is_some_and(|c| c.contains(needle))
-        }),
+        Some(needle) => messages
+            .iter()
+            .any(|m| m.content.as_deref().is_some_and(|c| c.contains(needle))),
     };
     // no_poke_without_todos: assert absence of poke when expect_msg is None and poke was enabled.
     let no_spurious_poke = if s.name == "no_poke_without_todos" {
         !messages.iter().any(|m| {
-            m.content.as_deref().is_some_and(|c| c.starts_with("[todo-poke]"))
+            m.content
+                .as_deref()
+                .is_some_and(|c| c.starts_with("[todo-poke]"))
         })
     } else {
         true

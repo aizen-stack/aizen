@@ -40,7 +40,11 @@ struct RingBuf {
 }
 impl RingBuf {
     fn new(cap: usize) -> Self {
-        RingBuf { bytes: Vec::new(), cap, dropped: false }
+        RingBuf {
+            bytes: Vec::new(),
+            cap,
+            dropped: false,
+        }
     }
     fn push(&mut self, data: &[u8]) {
         self.bytes.extend_from_slice(data);
@@ -138,12 +142,17 @@ fn start(root: &PathBuf, command: &str, cwd: Option<&str>) -> Result<String> {
         c.arg("-c").arg(command);
         c
     };
-    cmd.current_dir(&dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.current_dir(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     // Contain the tree at spawn. A background command is the WORST case for the orphan problem this
     // guards: `process start` is what runs dev servers and watchers, i.e. exactly the processes that
     // spawn real children behind the `cmd.exe`/`sh` wrapper and keep holding a port after a kill.
     crate::core::proctree::prepare(&mut cmd);
-    let mut child = cmd.spawn().with_context(|| format!("spawning background `{command}`"))?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawning background `{command}`"))?;
     let containment = Arc::new(crate::core::proctree::contain(&child));
     let pid = child.id();
 
@@ -172,7 +181,8 @@ fn start(root: &PathBuf, command: &str, cwd: Option<&str>) -> Result<String> {
             let st = { child.lock().unwrap_or_else(|e| e.into_inner()).try_wait() };
             match st {
                 Ok(Some(status)) => {
-                    *exit.lock().unwrap_or_else(|e| e.into_inner()) = Some(status.code().unwrap_or(-1));
+                    *exit.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(status.code().unwrap_or(-1));
                     *finished_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
                     done.store(true, Ordering::Relaxed);
                     break;
@@ -199,7 +209,10 @@ fn start(root: &PathBuf, command: &str, cwd: Option<&str>) -> Result<String> {
         finished_at,
         containment,
     };
-    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), entry);
+    REGISTRY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.clone(), entry);
     Ok(id)
 }
 
@@ -211,7 +224,10 @@ fn spawn_drain<R: std::io::Read + Send + 'static>(pipe: Option<R>, out: Arc<Mute
             loop {
                 match p.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => out.lock().unwrap_or_else(|e| e.into_inner()).push(&buf[..n]),
+                    Ok(n) => out
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(&buf[..n]),
                 }
             }
         });
@@ -229,7 +245,12 @@ fn kill_tree(entry: &ProcEntry) {
     let mut child = entry.child.lock().unwrap_or_else(|e| e.into_inner());
     crate::core::proctree::kill_tree(&mut child, &entry.containment);
     entry.done.store(true, Ordering::Relaxed);
-    if entry.finished_at.lock().map(|g| g.is_none()).unwrap_or(false) {
+    if entry
+        .finished_at
+        .lock()
+        .map(|g| g.is_none())
+        .unwrap_or(false)
+    {
         *entry.finished_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     }
 }
@@ -296,13 +317,24 @@ impl Tool for Process {
         }
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let action = args.get("action").and_then(|v| v.as_str()).context("missing `action`")?;
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .context("missing `action`")?;
         match action {
             "start" => {
-                let command = args.get("command").and_then(|v| v.as_str()).context("start needs `command`")?;
+                let command = args
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .context("start needs `command`")?;
                 let cwd = args.get("cwd").and_then(|v| v.as_str());
                 let id = start(&self.root, command, cwd)?;
-                let pid = REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).get(&id).map(|e| e.pid).unwrap_or(0);
+                let pid = REGISTRY
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&id)
+                    .map(|e| e.pid)
+                    .unwrap_or(0);
                 Ok(format!(
                     "{id} started (pid {pid}): {command}\nIt runs in the background. Read output with \
                      process(action=log, id={id}); stop it with process(action=kill, id={id})."
@@ -328,25 +360,48 @@ impl Tool for Process {
                 Ok(s.trim_end().to_string())
             }
             "log" => {
-                let id = args.get("id").and_then(|v| v.as_str()).context("log needs `id`")?;
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .context("log needs `id`")?;
                 let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-                let e = reg.get(id).with_context(|| format!("no such process '{id}'"))?;
+                let e = reg
+                    .get(id)
+                    .with_context(|| format!("no such process '{id}'"))?;
                 let out = e.out.lock().unwrap_or_else(|e| e.into_inner()).text();
                 Ok(format!("{id} [{}]\n{}", e.status_label(), out.trim_end()))
             }
             "status" => {
-                let id = args.get("id").and_then(|v| v.as_str()).context("status needs `id`")?;
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .context("status needs `id`")?;
                 let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-                let e = reg.get(id).with_context(|| format!("no such process '{id}'"))?;
-                Ok(format!("{id}: {} (elapsed {})", e.status_label(), elapsed_label(e.started.elapsed())))
+                let e = reg
+                    .get(id)
+                    .with_context(|| format!("no such process '{id}'"))?;
+                Ok(format!(
+                    "{id}: {} (elapsed {})",
+                    e.status_label(),
+                    elapsed_label(e.started.elapsed())
+                ))
             }
             "wait" => {
-                let id = args.get("id").and_then(|v| v.as_str()).context("wait needs `id`")?.to_string();
-                let timeout = args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(30);
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .context("wait needs `id`")?
+                    .to_string();
+                let timeout = args
+                    .get("timeout_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(30);
                 // Snapshot the done-flag handle, then poll WITHOUT holding the registry lock.
                 let done = {
                     let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-                    let e = reg.get(&id).with_context(|| format!("no such process '{id}'"))?;
+                    let e = reg
+                        .get(&id)
+                        .with_context(|| format!("no such process '{id}'"))?;
                     Arc::clone(&e.done)
                 };
                 let start = Instant::now();
@@ -354,7 +409,9 @@ impl Tool for Process {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-                let e = reg.get(&id).with_context(|| format!("no such process '{id}'"))?;
+                let e = reg
+                    .get(&id)
+                    .with_context(|| format!("no such process '{id}'"))?;
                 let out = e.out.lock().unwrap_or_else(|e| e.into_inner()).text();
                 if done.load(Ordering::Relaxed) {
                     Ok(format!("{id} {}\n{}", e.status_label(), out.trim_end()))
@@ -366,23 +423,39 @@ impl Tool for Process {
                 }
             }
             "kill" => {
-                let id = args.get("id").and_then(|v| v.as_str()).context("kill needs `id`")?;
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .context("kill needs `id`")?;
                 let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-                let e = reg.get(id).with_context(|| format!("no such process '{id}'"))?;
+                let e = reg
+                    .get(id)
+                    .with_context(|| format!("no such process '{id}'"))?;
                 kill_tree(e);
                 Ok(format!("{id} killed"))
             }
             "write" => {
-                let id = args.get("id").and_then(|v| v.as_str()).context("write needs `id`")?;
-                let mut input = args.get("input").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .context("write needs `id`")?;
+                let mut input = args
+                    .get("input")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if args.get("enter").and_then(|v| v.as_bool()).unwrap_or(true) {
                     input.push('\n');
                 }
                 let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-                let e = reg.get(id).with_context(|| format!("no such process '{id}'"))?;
+                let e = reg
+                    .get(id)
+                    .with_context(|| format!("no such process '{id}'"))?;
                 let mut guard = e.stdin.lock().unwrap_or_else(|e| e.into_inner());
                 let stdin = guard.as_mut().context("process stdin is closed")?;
-                stdin.write_all(input.as_bytes()).context("writing to process stdin")?;
+                stdin
+                    .write_all(input.as_bytes())
+                    .context("writing to process stdin")?;
                 stdin.flush().ok();
                 Ok(format!("wrote {} bytes to {id} stdin", input.len()))
             }
@@ -403,15 +476,26 @@ mod tests {
     fn start_log_wait_lifecycle() {
         let t = Process::new(root());
         // A short command that prints + exits.
-        let cmd = if cfg!(windows) { "echo hello-bg" } else { "echo hello-bg" };
-        let started = t.execute(&serde_json::json!({"action":"start","command":cmd})).unwrap();
+        let cmd = if cfg!(windows) {
+            "echo hello-bg"
+        } else {
+            "echo hello-bg"
+        };
+        let started = t
+            .execute(&serde_json::json!({"action":"start","command":cmd}))
+            .unwrap();
         let id = started.split_whitespace().next().unwrap().to_string();
         assert!(id.starts_with("proc_"));
 
         // Wait for it to finish, then the log must contain the output.
-        let waited = t.execute(&serde_json::json!({"action":"wait","id":id,"timeout_secs":10})).unwrap();
+        let waited = t
+            .execute(&serde_json::json!({"action":"wait","id":id,"timeout_secs":10}))
+            .unwrap();
         assert!(waited.contains("hello-bg"), "got: {waited}");
-        assert!(waited.contains("exited("), "should be exited; got: {waited}");
+        assert!(
+            waited.contains("exited("),
+            "should be exited; got: {waited}"
+        );
 
         let listed = t.execute(&serde_json::json!({"action":"list"})).unwrap();
         assert!(listed.contains(&id));
@@ -424,7 +508,9 @@ mod tests {
     #[test]
     fn unknown_id_errors() {
         let t = Process::new(root());
-        assert!(t.execute(&serde_json::json!({"action":"log","id":"proc_999999"})).is_err());
+        assert!(t
+            .execute(&serde_json::json!({"action":"log","id":"proc_999999"}))
+            .is_err());
         assert!(t.execute(&serde_json::json!({"action":"status"})).is_err()); // missing id
         assert!(t.execute(&serde_json::json!({"action":"bogus"})).is_err());
     }

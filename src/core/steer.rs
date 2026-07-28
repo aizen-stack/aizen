@@ -114,7 +114,11 @@ pub fn format_injection(steers: &[String]) -> String {
     let body = if steers.len() == 1 {
         steers[0].clone()
     } else {
-        steers.iter().map(|s| format!("- {s}")).collect::<Vec<_>>().join("\n")
+        steers
+            .iter()
+            .map(|s| format!("- {s}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     format!(
         "{PREFIX} The user sent this WHILE you were working — read it as a course correction to the \
@@ -136,7 +140,9 @@ mod tests {
     /// The mailbox is process-global, so these tests must not interleave.
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+        LOCK.get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     fn reset() {
@@ -148,7 +154,10 @@ mod tests {
     fn push_is_refused_until_armed() {
         let _g = guard();
         reset();
-        assert!(!push("do it differently"), "no live turn → caller must queue instead");
+        assert!(
+            !push("do it differently"),
+            "no live turn → caller must queue instead"
+        );
         assert_eq!(pending(), 0);
         arm();
         assert!(push("do it differently"));
@@ -164,9 +173,16 @@ mod tests {
         assert!(push("first"));
         assert!(push("second"));
         let got = drain();
-        assert_eq!(got, vec!["first".to_string(), "second".to_string()], "FIFO order preserved");
+        assert_eq!(
+            got,
+            vec!["first".to_string(), "second".to_string()],
+            "FIFO order preserved"
+        );
         assert_eq!(pending(), 0);
-        assert!(drain().is_empty(), "a second drain sees nothing — no double delivery");
+        assert!(
+            drain().is_empty(),
+            "a second drain sees nothing — no double delivery"
+        );
         reset();
     }
 
@@ -180,7 +196,10 @@ mod tests {
         assert_eq!(leftover, vec!["typed just as the turn ended".to_string()]);
         assert!(!is_armed());
         assert_eq!(pending(), 0);
-        assert!(!push("too late"), "a closed mailbox refuses, so the REPL queues it");
+        assert!(
+            !push("too late"),
+            "a closed mailbox refuses, so the REPL queues it"
+        );
         reset();
     }
 
@@ -193,9 +212,15 @@ mod tests {
         let huge = "x".repeat(MAX_CHARS + 1);
         assert!(!push(&huge), "oversized paste belongs in its own turn");
         for i in 0..MAX_PENDING {
-            assert!(push(&format!("steer {i}")), "backlog up to the cap is accepted");
+            assert!(
+                push(&format!("steer {i}")),
+                "backlog up to the cap is accepted"
+            );
         }
-        assert!(!push("one too many"), "past the cap the caller falls back to the queue");
+        assert!(
+            !push("one too many"),
+            "past the cap the caller falls back to the queue"
+        );
         assert_eq!(pending(), MAX_PENDING);
         reset();
     }
@@ -209,18 +234,30 @@ mod tests {
         clear();
         assert_eq!(pending(), 0);
         assert!(drain().is_empty());
-        assert!(is_armed(), "Esc clears the backlog but the turn slot stays as the REPL left it");
+        assert!(
+            is_armed(),
+            "Esc clears the backlog but the turn slot stays as the REPL left it"
+        );
         reset();
     }
 
     #[test]
     fn injection_text_is_prefixed_and_lists_every_steer() {
-        let steers = vec!["also update the README".to_string(), "skip the benchmark".to_string()];
+        let steers = vec![
+            "also update the README".to_string(),
+            "skip the benchmark".to_string(),
+        ];
         let msg = format_injection(&steers);
-        assert!(msg.starts_with(PREFIX), "prefix is what the loop + gates key off");
+        assert!(
+            msg.starts_with(PREFIX),
+            "prefix is what the loop + gates key off"
+        );
         assert!(msg.contains("also update the README"));
         assert!(msg.contains("skip the benchmark"));
-        assert!(msg.contains("- also update"), "multiple steers render as a list");
+        assert!(
+            msg.contains("- also update"),
+            "multiple steers render as a list"
+        );
         // Single steer stays inline (no stray bullet for a one-line correction).
         let one = format_injection(&["just one".to_string()]);
         assert!(one.contains("just one") && !one.contains("- just one"));

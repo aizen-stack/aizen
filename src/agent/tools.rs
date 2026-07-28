@@ -127,7 +127,10 @@ impl ToolRegistry {
 
     /// Look up a tool by exact name.
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.iter().find(|t| t.name() == name).map(|a| a.as_ref())
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|a| a.as_ref())
     }
 
     /// Look up a tool by exact name as an owned handle — for moving into a `spawn_blocking`
@@ -170,10 +173,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bridge_works_inside_spawn_blocking() {
         // On a spawn_blocking thread…
-        let via_blocking =
-            tokio::task::spawn_blocking(|| block_for_tool(async { Ok::<_, anyhow::Error>(41 + 1) }))
-                .await
-                .expect("spawn_blocking join");
+        let via_blocking = tokio::task::spawn_blocking(|| {
+            block_for_tool(async { Ok::<_, anyhow::Error>(41 + 1) })
+        })
+        .await
+        .expect("spawn_blocking join");
         assert_eq!(via_blocking.unwrap(), 42);
         // …and on a worker thread (the classic serial path).
         let on_worker = block_for_tool(async { Ok::<_, anyhow::Error>("ok") });

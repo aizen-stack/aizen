@@ -147,7 +147,13 @@ pub(crate) async fn web_multi(queries: &[String], limit: usize) -> Result<String
         if !errors.is_empty() && per_query_lists.is_empty() {
             bail!("all fan-out queries failed — {}", errors.join("; "));
         }
-        return Ok(format!("(no results for any of: {})", uniq.iter().map(|q| format!("'{}'", q.trim())).collect::<Vec<_>>().join(", ")));
+        return Ok(format!(
+            "(no results for any of: {})",
+            uniq.iter()
+                .map(|q| format!("'{}'", q.trim()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     let merged = interleave(per_query_lists);
     let diversified = dedup_and_diversify(merged, limit);
@@ -159,7 +165,8 @@ pub(crate) async fn web_multi(queries: &[String], limit: usize) -> Result<String
 /// it. Preserves each list's internal (relevance) order.
 fn interleave(lists: Vec<Vec<SearchResult>>) -> Vec<SearchResult> {
     let max_len = lists.iter().map(|l| l.len()).max().unwrap_or(0);
-    let mut cursors: Vec<std::vec::IntoIter<SearchResult>> = lists.into_iter().map(|l| l.into_iter()).collect();
+    let mut cursors: Vec<std::vec::IntoIter<SearchResult>> =
+        lists.into_iter().map(|l| l.into_iter()).collect();
     let mut out = Vec::new();
     for _ in 0..max_len {
         for cur in cursors.iter_mut() {
@@ -180,7 +187,8 @@ pub(crate) fn dedup_and_diversify(results: Vec<SearchResult>, limit: usize) -> V
     // when that's all there is, while a 10-result request spreads across ≥2 hosts.
     let per_host_cap = (limit / 2).max(1);
     let mut seen_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut host_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut host_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut out = Vec::with_capacity(limit);
     // Two passes: first honoring the per-host cap (diversity), then a fill pass that relaxes the cap
     // if we're still short (better to return same-host extras than fewer results than asked).
@@ -200,7 +208,11 @@ pub(crate) fn dedup_and_diversify(results: Vec<SearchResult>, limit: usize) -> V
             }
             seen_urls.insert(canon);
             *host_counts.entry(host).or_insert(0) += 1;
-            out.push(SearchResult { title: r.title.clone(), url: r.url.clone(), snippet: r.snippet.clone() });
+            out.push(SearchResult {
+                title: r.title.clone(),
+                url: r.url.clone(),
+                snippet: r.snippet.clone(),
+            });
         }
         if out.len() >= limit {
             break;
@@ -215,7 +227,11 @@ pub(crate) fn dedup_and_diversify(results: Vec<SearchResult>, limit: usize) -> V
 fn canonical_url(url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(u) => {
-            let host = u.host_str().unwrap_or("").trim_start_matches("www.").to_ascii_lowercase();
+            let host = u
+                .host_str()
+                .unwrap_or("")
+                .trim_start_matches("www.")
+                .to_ascii_lowercase();
             let path = u.path().trim_end_matches('/');
             format!("{}://{}{}", u.scheme().to_ascii_lowercase(), host, path)
         }
@@ -229,7 +245,10 @@ fn canonical_url(url: &str) -> String {
 fn host_of(url: &str) -> String {
     reqwest::Url::parse(url)
         .ok()
-        .and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()))
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| h.trim_start_matches("www.").to_ascii_lowercase())
+        })
         .unwrap_or_default()
 }
 
@@ -240,7 +259,12 @@ fn host_of(url: &str) -> String {
 /// anomaly wall (HTTP 202) blocked keyless requests too often to depend on. POST JSON to
 /// `https://api.tavily.com/search` with a bearer key; response shape:
 /// `{ "results": [ { "title", "url", "content", "score" }, … ] }`.
-async fn tavily(c: &reqwest::Client, query: &str, limit: usize, key: &str) -> Result<Vec<SearchResult>> {
+async fn tavily(
+    c: &reqwest::Client,
+    query: &str,
+    limit: usize,
+    key: &str,
+) -> Result<Vec<SearchResult>> {
     let body = serde_json::json!({
         "query": query,
         "max_results": limit,
@@ -249,13 +273,20 @@ async fn tavily(c: &reqwest::Client, query: &str, limit: usize, key: &str) -> Re
     let headers = [("Authorization", format!("Bearer {key}"))];
     let f = http::post_json(c, "https://api.tavily.com/search", &headers, &body).await?;
     if f.status == 401 || f.status == 403 {
-        bail!("Tavily rejected the key (HTTP {}) — check AIZEN_TAVILY_API_KEY / TAVILY_API_KEY", f.status);
+        bail!(
+            "Tavily rejected the key (HTTP {}) — check AIZEN_TAVILY_API_KEY / TAVILY_API_KEY",
+            f.status
+        );
     }
     if f.status == 429 {
         bail!("Tavily rate limit (HTTP 429) — the free tier's monthly quota may be exhausted");
     }
     if !f.is_success() {
-        bail!("Tavily returned HTTP {}: {}", f.status, http::snippet(&f.text()));
+        bail!(
+            "Tavily returned HTTP {}: {}",
+            f.status,
+            http::snippet(&f.text())
+        );
     }
     let v: serde_json::Value =
         serde_json::from_slice(&f.body).context("parsing Tavily JSON response")?;
@@ -279,7 +310,9 @@ async fn tavily(c: &reqwest::Client, query: &str, limit: usize, key: &str) -> Re
 
 pub(crate) async fn probe_tavily() -> super::Probe {
     let Some(key) = super::tavily_key() else {
-        return super::Probe::Off("needs a (free) Tavily key — set AIZEN_TAVILY_API_KEY or TAVILY_API_KEY".into());
+        return super::Probe::Off(
+            "needs a (free) Tavily key — set AIZEN_TAVILY_API_KEY or TAVILY_API_KEY".into(),
+        );
     };
     let c = match http::client() {
         Ok(c) => c,
@@ -294,7 +327,12 @@ pub(crate) async fn probe_tavily() -> super::Probe {
 
 // ── Jina search (keyed only) ────────────────────────────────────────────────
 
-async fn jina_search(c: &reqwest::Client, query: &str, limit: usize, key: &str) -> Result<Vec<SearchResult>> {
+async fn jina_search(
+    c: &reqwest::Client,
+    query: &str,
+    limit: usize,
+    key: &str,
+) -> Result<Vec<SearchResult>> {
     let url = format!("https://s.jina.ai/?q={}", urlencode(query));
     let headers = [
         ("Authorization", format!("Bearer {key}")),
@@ -318,7 +356,9 @@ pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             b' ' => out.push_str("%20"),
             _ => out.push_str(&format!("%{b:02X}")),
         }
@@ -381,7 +421,10 @@ pub(crate) async fn github(query: &str, limit: usize) -> Result<String> {
 /// Hacker News search via Algolia (rock-solid, 10k req/h).
 pub(crate) async fn hackernews(query: &str, limit: usize) -> Result<String> {
     let c = http::client()?;
-    let url = format!("https://hn.algolia.com/api/v1/search?query={}&hitsPerPage={limit}", urlencode(query));
+    let url = format!(
+        "https://hn.algolia.com/api/v1/search?query={}&hitsPerPage={limit}",
+        urlencode(query)
+    );
     let v = http::get_json(&c, &url, &[])
         .await
         .inspect_err(|e| super::note_err("hackernews", "algolia", &e.to_string()))?;
@@ -431,9 +474,15 @@ pub(crate) async fn stackoverflow(query: &str, limit: usize) -> Result<String> {
         .map(|q| SearchResult {
             title: format!(
                 "{} (score {}, {})",
-                crate::agent::web_tools::decode_entities(q["title"].as_str().unwrap_or("(untitled)")),
+                crate::agent::web_tools::decode_entities(
+                    q["title"].as_str().unwrap_or("(untitled)")
+                ),
                 q["score"].as_i64().unwrap_or(0),
-                if q["is_answered"].as_bool().unwrap_or(false) { "answered" } else { "unanswered" }
+                if q["is_answered"].as_bool().unwrap_or(false) {
+                    "answered"
+                } else {
+                    "unanswered"
+                }
             ),
             url: q["link"].as_str().unwrap_or("").to_string(),
             snippet: String::new(),
@@ -454,14 +503,25 @@ pub(crate) async fn wikipedia(query: &str, limit: usize) -> Result<String> {
         .inspect_err(|e| super::note_err("wikipedia", "rest", &e.to_string()))?;
     super::note_ok("wikipedia", "rest");
     // opensearch returns [query, [titles], [descriptions], [urls]]
-    let titles = v.get(1).and_then(|t| t.as_array()).cloned().unwrap_or_default();
-    let urls = v.get(3).and_then(|u| u.as_array()).cloned().unwrap_or_default();
+    let titles = v
+        .get(1)
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let urls = v
+        .get(3)
+        .and_then(|u| u.as_array())
+        .cloned()
+        .unwrap_or_default();
     if titles.is_empty() {
         return Ok(format!("(no Wikipedia articles match '{query}')"));
     }
     let results: Vec<SearchResult> = titles
         .iter()
-        .zip(urls.iter().chain(std::iter::repeat(&serde_json::Value::Null)))
+        .zip(
+            urls.iter()
+                .chain(std::iter::repeat(&serde_json::Value::Null)),
+        )
         .take(limit)
         .map(|(t, u)| SearchResult {
             title: t.as_str().unwrap_or("(untitled)").to_string(),
@@ -515,8 +575,16 @@ mod tests {
     #[test]
     fn render_numbers_results() {
         let rs = vec![
-            SearchResult { title: "T1".into(), url: "https://a".into(), snippet: "s1".into() },
-            SearchResult { title: "T2".into(), url: "https://b".into(), snippet: String::new() },
+            SearchResult {
+                title: "T1".into(),
+                url: "https://a".into(),
+                snippet: "s1".into(),
+            },
+            SearchResult {
+                title: "T2".into(),
+                url: "https://b".into(),
+                snippet: String::new(),
+            },
         ];
         let out = render_results(&rs);
         assert!(out.starts_with("1. T1"));
@@ -529,7 +597,11 @@ mod tests {
     #[test]
     fn interleave_round_robins_across_queries() {
         fn r(u: &str) -> SearchResult {
-            SearchResult { title: u.into(), url: u.into(), snippet: String::new() }
+            SearchResult {
+                title: u.into(),
+                url: u.into(),
+                snippet: String::new(),
+            }
         }
         let a = vec![r("a1"), r("a2")];
         let b = vec![r("b1")];
@@ -545,49 +617,93 @@ mod tests {
     #[test]
     fn dedup_and_diversify_drops_duplicate_urls() {
         fn r(u: &str) -> SearchResult {
-            SearchResult { title: u.into(), url: u.into(), snippet: String::new() }
+            SearchResult {
+                title: u.into(),
+                url: u.into(),
+                snippet: String::new(),
+            }
         }
-        let results = vec![r("https://a.com/x"), r("https://a.com/x"), r("https://a.com/x/"), r("https://b.com/y")];
+        let results = vec![
+            r("https://a.com/x"),
+            r("https://a.com/x"),
+            r("https://a.com/x/"),
+            r("https://b.com/y"),
+        ];
         let out = dedup_and_diversify(results, 10);
         // "https://a.com/x" and "https://a.com/x/" canonicalize the same (trailing slash dropped).
-        assert_eq!(out.len(), 2, "exact + trailing-slash duplicates collapse to one");
+        assert_eq!(
+            out.len(),
+            2,
+            "exact + trailing-slash duplicates collapse to one"
+        );
     }
 
     #[test]
     fn dedup_and_diversify_caps_per_host_when_alternatives_exist() {
         fn r(u: &str) -> SearchResult {
-            SearchResult { title: u.into(), url: u.into(), snippet: String::new() }
+            SearchResult {
+                title: u.into(),
+                url: u.into(),
+                snippet: String::new(),
+            }
         }
         // 4 from the same host, 4 from distinct hosts — asking for 6 should prefer spreading across
         // hosts rather than returning 6 from the one dominant host.
-        let mut results = vec![r("https://a.com/1"), r("https://a.com/2"), r("https://a.com/3"), r("https://a.com/4")];
+        let mut results = vec![
+            r("https://a.com/1"),
+            r("https://a.com/2"),
+            r("https://a.com/3"),
+            r("https://a.com/4"),
+        ];
         for h in ["b", "c", "d", "e"] {
             results.push(r(&format!("https://{h}.com/1")));
         }
         let out = dedup_and_diversify(results, 6);
         assert_eq!(out.len(), 6);
         let a_count = out.iter().filter(|r| r.url.contains("a.com")).count();
-        assert!(a_count <= 3, "per-host cap (limit/2) should curb a.com's dominance, got {a_count}");
-        let distinct_hosts: std::collections::HashSet<&str> =
-            out.iter().filter_map(|r| r.url.split("://").nth(1)?.split('/').next()).collect();
-        assert!(distinct_hosts.len() >= 4, "diversity should span multiple hosts, got {distinct_hosts:?}");
+        assert!(
+            a_count <= 3,
+            "per-host cap (limit/2) should curb a.com's dominance, got {a_count}"
+        );
+        let distinct_hosts: std::collections::HashSet<&str> = out
+            .iter()
+            .filter_map(|r| r.url.split("://").nth(1)?.split('/').next())
+            .collect();
+        assert!(
+            distinct_hosts.len() >= 4,
+            "diversity should span multiple hosts, got {distinct_hosts:?}"
+        );
     }
 
     #[test]
     fn dedup_and_diversify_relaxes_cap_to_fill_when_no_alternatives() {
         fn r(u: &str) -> SearchResult {
-            SearchResult { title: u.into(), url: u.into(), snippet: String::new() }
+            SearchResult {
+                title: u.into(),
+                url: u.into(),
+                snippet: String::new(),
+            }
         }
         // All 5 results are the SAME host — the per-host cap must relax rather than return fewer
         // than requested when there's nothing else to diversify with.
         let results: Vec<_> = (1..=5).map(|i| r(&format!("https://a.com/{i}"))).collect();
         let out = dedup_and_diversify(results, 5);
-        assert_eq!(out.len(), 5, "same-host fill pass must not starve the result count");
+        assert_eq!(
+            out.len(),
+            5,
+            "same-host fill pass must not starve the result count"
+        );
     }
 
     #[test]
     fn canonical_url_normalizes_www_trailing_slash_and_query() {
-        assert_eq!(canonical_url("https://www.example.com/path/"), canonical_url("https://example.com/path"));
-        assert_eq!(canonical_url("https://example.com/path?utm=x"), canonical_url("https://example.com/path"));
+        assert_eq!(
+            canonical_url("https://www.example.com/path/"),
+            canonical_url("https://example.com/path")
+        );
+        assert_eq!(
+            canonical_url("https://example.com/path?utm=x"),
+            canonical_url("https://example.com/path")
+        );
     }
 }

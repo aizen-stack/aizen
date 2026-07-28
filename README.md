@@ -85,7 +85,7 @@ https://github.com/user-attachments/assets/45bbdfc8-09a3-4995-870f-eb92452743c9
 | **Remote control** | `aizen serve` (Telegram) / `aizen discord serve` — full `/` command menu, multi-bot hosting from one daemon, per-chat context, phone approvals, systemd self-host. |
 | **Extensibility** | **MCP** servers (stdio/HTTP, OAuth 2.1 sign-in for Linear/Notion/Slack/Gmail/Atlassian) · custom markdown **slash-command macros** · outbound notify channels. |
 | **Web + browser** | `web_search` / `web_fetch` / `web_crawl` (katana-style crawler, SSRF-guarded) and opt-in **CDP browser tools** that drive a real Chrome/Edge — all pure-Rust, no headless engine bundled. |
-| **Safety + recovery** | Workspace confinement · hard command floor · owner-only secret files · crash-recoverable Git checkpoints (`/timeline` · `/checkpoint`) · per-turn MCP schema pinning · per-conversation browser isolation. |
+| **Safety + recovery** | Workspace confinement · hard command floor · owner-only secret files · crash-recoverable Git checkpoints (`/timemachine` · `/checkpoint`) · per-turn MCP schema pinning · per-conversation browser isolation. |
 
 ## 60-second start
 
@@ -128,6 +128,11 @@ on Windows or `$AIZEN_INSTALL` on Unix. The Windows `.exe` is unsigned — if Sm
 | macOS Apple Silicon | `aizen-<ver>-macos-aarch64` |
 
 On Linux/macOS: `chmod +x aizen-* && ./aizen-…`.
+
+**Upgrading** — `aizen update` (or `/update` in the REPL) lists every published version with the one
+you're running marked, and installs whichever you pick — newer or older, so the same command is the
+rollback. The session you run it from keeps the version it started with; the new one takes effect in
+the next terminal you open.
 
 **Or build from source** (any platform with a Rust toolchain):
 
@@ -199,7 +204,8 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | `/sessions` | saved conversations — restore · save · delete (the chat also auto-saves as `last`) |
 | `/compact` | summarize older turns now to free context |
 | `/approval [ask|smart|yolo]` | one approval setting: ask every time, auto-run read-only shell, or pre-authorize tools after the hard safety floor |
-| `/timeline` · `/checkpoint [note]` | inspect or create crash-recoverable, worktree-scoped Git checkpoints; CLI recovery diagnostics: `aizen time doctor` |
+| `/timemachine` · `/checkpoint [note]` | `/timemachine` lists every crash-recoverable, worktree-scoped Git checkpoint and jumps back to the code **and** chat of the one you pick (one gesture, reversible); `/checkpoint` saves one now. CLI recovery diagnostics: `aizen time doctor` |
+| `/update` | list every published version (the one you're running is marked) and install whichever you pick — newer or older, so the same command is the rollback |
 | `/cost` | session token usage + a $ estimate (real provider usage when reported; set rates via `aizen config set --price-in/--price-out`) |
 | `/clear` | fresh conversation · `/tokens` usage · `/quit` exit |
 

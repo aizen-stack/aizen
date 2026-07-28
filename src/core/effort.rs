@@ -81,8 +81,41 @@ const LOW_PHRASES: &[&str] = &[
     "quick answer",
 ];
 
-// Single tokens use word-boundary matching (`adjust` must not fire `just`).
-const LOW_WORDS: &[&str] = &["quick", "quickly", "briefly", "fast", "simple", "just"];
+// WEAK "keep it light" tokens: single words that only SOMETIMES mean "spend less thought". Unlike
+// `LOW_PHRASES` (which are unambiguous requests about the ANSWER), each of these is routinely a
+// discourse particle or a property of the CODE rather than an instruction about effort — "just
+// refactor X", "make it fast", "a simple wrapper", "quick question: why does this crash". So a hit
+// here does NOT short-circuit to `Low`; it only wins when the complexity heuristic finds nothing
+// hard (see `classify_effort_with`). `just` and `simple` are deliberately absent: as bare tokens they
+// carry no signal about effort at all.
+//
+// Word-boundary matched, so `adjust` cannot fire `just`-style false positives.
+const LOW_WORDS: &[&str] = &["quick", "quickly", "briefly", "fast"];
+
+// Untranslated failure nouns. These survive in every language's bug report ("sửa cái bug này",
+// "crash beim Start"), so they are the one difficulty signal that keeps working when the rest of the
+// English-only lists go quiet. Each is worth a point AND suppresses the short-message penalty: a
+// three-word crash report is a hard task stated briefly, not a trivial one.
+// Boundary-matched, so each inflection needs its own entry (`fail` does not match `failing`).
+const DIFFICULTY_NOUNS: &[&str] = &[
+    "bug",
+    "crash",
+    "crashes",
+    "panic",
+    "deadlock",
+    "race",
+    "leak",
+    "regression",
+    "hang",
+    "hangs",
+    "timeout",
+    "segfault",
+    "fail",
+    "fails",
+    "failing",
+    "failure",
+    "broken",
+];
 
 // Bare "think"/"consider"/"reason" (without a hard/deeply qualifier) → a gentle nudge to `medium`.
 const MEDIUM_WORDS: &[&str] = &["think", "consider", "reason"];
@@ -144,31 +177,55 @@ pub fn classify_effort_with(prompt: &str, adaptive: bool) -> Option<Effort> {
     if HIGH_PHRASES.iter().any(|k| p.contains(k)) {
         return Some(Effort::High);
     }
-    if LOW_PHRASES.iter().any(|k| p.contains(k)) || LOW_WORDS.iter().any(|w| contains_word(&p, w)) {
+    // Strong low phrases are explicit output/effort requests ("in one line", "don't overthink") —
+    // respect them immediately. Bare tokens are weaker: "quick question" can introduce a hard bug,
+    // and "make it fast" describes the code, not the thinking budget. Let real complexity outrank
+    // those tokens; use Low only when the heuristic has no contrary signal.
+    if LOW_PHRASES.iter().any(|k| p.contains(k)) {
         return Some(Effort::Low);
     }
+    let weak_low = LOW_WORDS.iter().any(|w| contains_word(&p, w));
     if MEDIUM_WORDS.iter().any(|w| contains_word(&p, w)) {
         return Some(Effort::Medium);
     }
 
-    // 2) complexity heuristic — only the extremes; the middle band stays `None` (defer/omit).
-    complexity_effort(&p, adaptive)
+    // 2) complexity heuristic — only the extremes; the middle band stays `None` (defer/omit). A weak
+    // "keep it light" token is one point of evidence here, not a verdict: it can tip a turn that
+    // looks easy down to `low`, but it cannot outvote a fence, a heavy verb, or a failure noun.
+    complexity_effort(&p, adaptive, weak_low)
 }
 
 /// PURE. Score the turn's shape; only the extremes yield an opinion (precision-first, like
 /// `memory::learning::extract_free` — "better to miss than persist noise"). Expects a
 /// pre-lowercased string. `allow_high_tiers` lets a very high score climb to `Xhigh` (P3); otherwise
 /// the heuristic caps at `High` (never `Xhigh`/`Max` — those stay keyword/ultimate-only, so the
-/// heuristic can't silently burn the top of the budget).
-fn complexity_effort(p: &str, allow_high_tiers: bool) -> Option<Effort> {
+/// heuristic can't silently burn the top of the budget). `weak_low` is a single point AGAINST
+/// difficulty, contributed by an ambiguous "keep it light" token — enough to settle an otherwise
+/// featureless turn, never enough to overrule a fence, a heavy verb, or a failure noun.
+///
+/// The scoring is deliberately language-blind about DIFFICULTY: the heavy-verb and multi-file lists
+/// only fire on English, so for any other language the live signals are the untranslated failure
+/// nouns, a code fence, `@file` count, and length. That is why a short message loses its penalty as
+/// soon as ANY difficulty signal appears — with the English lists silent, mis-scoring a hard request
+/// as trivial is the failure mode to avoid, and `None` (defer to the configured default) is always
+/// the safer miss than `Low`.
+fn complexity_effort(p: &str, allow_high_tiers: bool, weak_low: bool) -> Option<Effort> {
     let words = p.split_whitespace().count();
     let has_fence = p.contains("```");
     let heavy = HEAVY_VERBS.iter().filter(|v| contains_word(p, v)).count() as i32;
+    let difficult = DIFFICULTY_NOUNS
+        .iter()
+        .filter(|n| contains_word(p, n))
+        .count() as i32;
     let multi_file = MULTIFILE_HINTS.iter().any(|h| p.contains(h)) || p.matches('@').count() >= 2;
 
     let mut score = 0i32;
+    // A short message is only cheap when it has no sign of a hard problem. "fix this crash" is
+    // brief but difficult; do not let the brevity prior erase the difficulty signal.
     if words <= 8 {
-        score -= 1;
+        if heavy == 0 && difficult == 0 && !has_fence && !multi_file {
+            score -= 1;
+        }
     } else if words >= 60 {
         score += 2;
     } else if words >= 25 {
@@ -178,8 +235,12 @@ fn complexity_effort(p: &str, allow_high_tiers: bool) -> Option<Effort> {
         score += 2;
     }
     score += heavy.min(2);
+    score += difficult.min(2);
     if multi_file {
         score += 2;
+    }
+    if weak_low {
+        score -= 1;
     }
 
     if allow_high_tiers && score >= 5 {
@@ -201,21 +262,39 @@ mod tests {
     fn keyword_beats_complexity_and_ladder_order() {
         // `ultrathink` now maps to the xhigh rung (not high):
         assert_eq!(classify_effort("ultrathink this"), Some(Effort::Xhigh));
-        assert_eq!(classify_effort("just give me a quick answer"), Some(Effort::Low));
+        assert_eq!(
+            classify_effort("just give me a quick answer"),
+            Some(Effort::Low)
+        );
         // HIGH phrase beats a LOW token in the same turn:
-        assert_eq!(classify_effort("quick, but think hard about it"), Some(Effort::High));
+        assert_eq!(
+            classify_effort("quick, but think hard about it"),
+            Some(Effort::High)
+        );
         // bare "think" ⇒ medium:
-        assert_eq!(classify_effort("think about this API shape"), Some(Effort::Medium));
+        assert_eq!(
+            classify_effort("think about this API shape"),
+            Some(Effort::Medium)
+        );
     }
 
     #[test]
     fn top_of_ladder_max_and_xhigh() {
         // explicit "max effort" ⇒ Max, and it beats a lower keyword in the same turn:
-        assert_eq!(classify_effort("max effort please, think hard"), Some(Effort::Max));
-        assert_eq!(classify_effort("give this maximum effort"), Some(Effort::Max));
+        assert_eq!(
+            classify_effort("max effort please, think hard"),
+            Some(Effort::Max)
+        );
+        assert_eq!(
+            classify_effort("give this maximum effort"),
+            Some(Effort::Max)
+        );
         // megathink ⇒ Xhigh; "think hard" (no ultra prefix) stays High (not swallowed):
         assert_eq!(classify_effort("megathink the design"), Some(Effort::Xhigh));
-        assert_eq!(classify_effort("think hard about the design"), Some(Effort::High));
+        assert_eq!(
+            classify_effort("think hard about the design"),
+            Some(Effort::High)
+        );
     }
 
     #[test]
@@ -254,5 +333,54 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn weak_low_token_cannot_veto_real_difficulty() {
+        // "just"/"simple" are gone from LOW_WORDS entirely: as bare tokens they say nothing about
+        // effort, and treating them as a verdict pinned the hardest turns to the cheapest rung.
+        assert_eq!(
+            classify_effort("just refactor the auth module across every file"),
+            Some(Effort::High),
+            "a heavy verb + multi-file scope must outrank an ambiguous discourse particle"
+        );
+        // A surviving weak token ("quick") still cannot erase a failure noun; the turn defers rather
+        // than dropping to Low, because "cheap" is the expensive guess to get wrong.
+        assert_eq!(
+            classify_effort("quick question: why does the parse test fail?"),
+            None,
+            "politeness formula + a real failure ⇒ defer to the configured default, never Low"
+        );
+    }
+
+    #[test]
+    fn weak_low_still_decides_a_featureless_turn() {
+        // Nothing hard anywhere, plus an explicit "keep it light" token ⇒ Low is the right call.
+        assert_eq!(
+            classify_effort("make the header font fast to load"),
+            Some(Effort::Low)
+        );
+        // And an unambiguous LOW_PHRASE keeps its immediate short-circuit, difficulty or not.
+        assert_eq!(
+            classify_effort("in one line, why did the build fail?"),
+            Some(Effort::Low),
+            "an explicit request about the ANSWER is the user's call and is honoured verbatim"
+        );
+    }
+
+    #[test]
+    fn short_message_with_a_failure_noun_is_not_treated_as_trivial() {
+        // The brevity prior (words <= 8 ⇒ -1) is what routed every terse bug report to `low`. A
+        // failure noun now suppresses it, so these defer instead of being downgraded. This is the
+        // path that matters when the English verb lists are silent (non-English requests): length
+        // is the only other signal, and it must not be allowed to mean "easy" on its own.
+        assert_eq!(classify_effort("fix this crash"), None);
+        assert_eq!(classify_effort("the parse test is failing"), None);
+        // Genuinely trivial and short ⇒ still Low; the penalty is intact where it belongs.
+        assert_eq!(
+            classify_effort("fix the typo in the README"),
+            Some(Effort::Low)
+        );
+        assert_eq!(classify_effort("what is a closure"), Some(Effort::Low));
     }
 }

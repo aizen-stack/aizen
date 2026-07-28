@@ -33,14 +33,14 @@ use async_lsp::lsp_types::{
     ClientCapabilities, Diagnostic, DiagnosticClientCapabilities, DiagnosticSeverity,
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentDiagnosticParams,
     DocumentDiagnosticReport, DocumentDiagnosticReportResult, DocumentSymbol,
-    DocumentSymbolClientCapabilities, DocumentSymbolParams, DocumentSymbolResponse,
-    Hover, HoverContents, HoverParams, InitializeParams, InitializedParams, Location, MarkedString,
-    NumberOrString, OneOf, PartialResultParams,
-    Position, PublishDiagnosticsClientCapabilities, Range, ReferenceContext, ReferenceParams,
-    ServerCapabilities, SymbolKind, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
-    VersionedTextDocumentIdentifier, WindowClientCapabilities, WorkDoneProgress,
-    WorkDoneProgressParams, WorkspaceFolder, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    DocumentSymbolClientCapabilities, DocumentSymbolParams, DocumentSymbolResponse, Hover,
+    HoverContents, HoverParams, InitializeParams, InitializedParams, Location, MarkedString,
+    NumberOrString, OneOf, PartialResultParams, Position, PublishDiagnosticsClientCapabilities,
+    Range, ReferenceContext, ReferenceParams, ServerCapabilities, SymbolKind,
+    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
+    WindowClientCapabilities, WorkDoneProgress, WorkDoneProgressParams, WorkspaceFolder,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use async_lsp::panic::CatchUnwindLayer;
 use async_lsp::router::Router;
@@ -177,7 +177,11 @@ impl ClientState {
         diags: Arc<StdMutex<HashMap<String, PushDiags>>>,
         diag_seq: Arc<AtomicU64>,
     ) -> Router<Self> {
-        let mut router = Router::new(ClientState { indexed, diags, diag_seq });
+        let mut router = Router::new(ClientState {
+            indexed,
+            diags,
+            diag_seq,
+        });
         router
             .notification::<Progress>(|this, prog| {
                 if matches!(&prog.token, NumberOrString::String(s) if RA_INDEXING_TOKENS.contains(&s.as_str()))
@@ -261,10 +265,14 @@ impl LspServer {
         init_timeout: Duration,
     ) -> Result<Self> {
         let indexed = Arc::new(AtomicBool::new(false));
-        let diags: Arc<StdMutex<HashMap<String, PushDiags>>> = Arc::new(StdMutex::new(HashMap::new()));
+        let diags: Arc<StdMutex<HashMap<String, PushDiags>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
         let diag_seq = Arc::new(AtomicU64::new(0));
-        let router =
-            ClientState::new_router(Arc::clone(&indexed), Arc::clone(&diags), Arc::clone(&diag_seq));
+        let router = ClientState::new_router(
+            Arc::clone(&indexed),
+            Arc::clone(&diags),
+            Arc::clone(&diag_seq),
+        );
         // A panic inside any handler becomes an error response instead of killing the MainLoop.
         let service = CatchUnwindLayer::default().layer(router);
         let (mainloop, socket) = MainLoop::new_client(move |_server| service);
@@ -279,9 +287,15 @@ impl LspServer {
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — no console flash
 
-        let mut child = cmd.spawn().with_context(|| format!("spawning language server {}", bin.display()))?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("spawning language server {}", bin.display()))?;
         let stdout = child.stdout.take().context("child has no stdout")?.compat();
-        let stdin = child.stdin.take().context("child has no stdin")?.compat_write();
+        let stdin = child
+            .stdin
+            .take()
+            .context("child has no stdin")?
+            .compat_write();
 
         // Node servers are `.cmd` shims: the direct child is cmd.exe and the real node.exe is a
         // grandchild `kill_on_drop` can't reach. A kill-on-close Job Object reaps the whole tree;
@@ -320,10 +334,14 @@ impl LspServer {
     }
 
     async fn initialize(&self, root: &Path, init_timeout: Duration) -> Result<ServerCapabilities> {
-        let root_uri = Url::from_file_path(root).map_err(|()| anyhow!("non-absolute root: {}", root.display()))?;
+        let root_uri = Url::from_file_path(root)
+            .map_err(|()| anyhow!("non-absolute root: {}", root.display()))?;
         let mut sock = self.socket.clone();
         let params = InitializeParams {
-            workspace_folders: Some(vec![WorkspaceFolder { uri: root_uri, name: "root".into() }]),
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root_uri,
+                name: "root".into(),
+            }]),
             capabilities: ClientCapabilities {
                 window: Some(WindowClientCapabilities {
                     work_done_progress: Some(true),
@@ -349,7 +367,8 @@ impl LspServer {
             .await
             .map_err(|_| anyhow!("lsp initialize timed out after {init_timeout:?}"))?
             .map_err(|e| anyhow!("lsp initialize failed: {e}"))?;
-        sock.initialized(InitializedParams {}).map_err(|e| anyhow!("lsp initialized notify failed: {e}"))?;
+        sock.initialized(InitializedParams {})
+            .map_err(|e| anyhow!("lsp initialized notify failed: {e}"))?;
         Ok(init.capabilities)
     }
 
@@ -378,7 +397,8 @@ impl LspServer {
         // Absolutize: callers may hand a cwd-relative path; `Url::from_file_path` needs absolute
         // (canonicalize also verifies existence — it only succeeds for real files).
         let file = &file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
-        let url = Url::from_file_path(file).map_err(|()| anyhow!("non-absolute path: {}", file.display()))?;
+        let url = Url::from_file_path(file)
+            .map_err(|()| anyhow!("non-absolute path: {}", file.display()))?;
         let key = uri::normalize_uri(url.as_str());
         let text = tokio::fs::read_to_string(file)
             .await
@@ -397,7 +417,13 @@ impl LspServer {
                     },
                 })
                 .map_err(|e| anyhow!("didOpen failed: {e}"))?;
-                opened.insert(key, OpenDoc { version: 1, fingerprint });
+                opened.insert(
+                    key,
+                    OpenDoc {
+                        version: 1,
+                        fingerprint,
+                    },
+                );
                 Ok((url, true))
             }
             Some(doc) if doc.fingerprint != fingerprint => {
@@ -446,10 +472,14 @@ impl LspServer {
         let mut sock = self.socket.clone();
         let params = ReferenceParams {
             text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: chosen.uri.clone() },
+                text_document: TextDocumentIdentifier {
+                    uri: chosen.uri.clone(),
+                },
                 position: chosen.range.start,
             },
-            context: ReferenceContext { include_declaration: include_decl },
+            context: ReferenceContext {
+                include_declaration: include_decl,
+            },
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
@@ -467,14 +497,22 @@ impl LspServer {
         let mut outline_cache: HashMap<Url, Option<DocumentSymbolResponse>> = HashMap::new();
         let mut hits = Vec::with_capacity(locs.len());
         for loc in locs {
-            let Ok(p) = uri::uri_to_path(loc.uri.as_str()) else { continue };
+            let Ok(p) = uri::uri_to_path(loc.uri.as_str()) else {
+                continue;
+            };
             let line = loc.range.start.line as usize;
             let col = loc.range.start.character as usize;
             let snippet = read_line_snippet(&p, line).await;
             let enclosing = self
                 .enclosing_sym_cached(&loc.uri, loc.range.start, &mut outline_cache)
                 .await;
-            hits.push(RefHit { path: p, line, col, snippet, enclosing });
+            hits.push(RefHit {
+                path: p,
+                line,
+                col,
+                snippet,
+                enclosing,
+            });
         }
         Ok(hits)
     }
@@ -523,7 +561,11 @@ impl LspServer {
     /// Resolve a symbol BY NAME to its definition, returning the definition's source text inline.
     /// The full item range comes from the file's document outline (the `workspace/symbol` range may
     /// cover only the name); falls back to a fixed window when the outline can't say.
-    pub async fn definition_by_name(&self, file_hint: Option<&Path>, symbol: &str) -> Result<DefHit> {
+    pub async fn definition_by_name(
+        &self,
+        file_hint: Option<&Path>,
+        symbol: &str,
+    ) -> Result<DefHit> {
         let chosen = self.find_symbol(symbol, file_hint).await?;
         let target = uri::uri_to_path(chosen.uri.as_str())?;
         self.ensure_open(&target).await?;
@@ -532,7 +574,10 @@ impl LspServer {
         let start = chosen.range.start;
         let (first, last) = match full_range {
             Some(r) => (r.start.line as usize, r.end.line as usize),
-            None => (start.line as usize, start.line as usize + DEF_FALLBACK_LINES - 1),
+            None => (
+                start.line as usize,
+                start.line as usize + DEF_FALLBACK_LINES - 1,
+            ),
         };
         let text = tokio::fs::read_to_string(&target)
             .await
@@ -559,7 +604,9 @@ impl LspServer {
         let resp: Option<Hover> = sock
             .hover(HoverParams {
                 text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri: chosen.uri.clone() },
+                    text_document: TextDocumentIdentifier {
+                        uri: chosen.uri.clone(),
+                    },
                     position: chosen.range.start,
                 },
                 work_done_progress_params: WorkDoneProgressParams::default(),
@@ -580,7 +627,9 @@ impl LspServer {
         let mut sock = self.socket.clone();
         let resp = sock
             .document_symbol(DocumentSymbolParams {
-                text_document: TextDocumentIdentifier { uri: chosen.uri.clone() },
+                text_document: TextDocumentIdentifier {
+                    uri: chosen.uri.clone(),
+                },
                 work_done_progress_params: WorkDoneProgressParams::default(),
                 partial_result_params: PartialResultParams::default(),
             })
@@ -590,7 +639,9 @@ impl LspServer {
             DocumentSymbolResponse::Nested(v) => find_enclosing(&v, chosen.range.start),
             DocumentSymbolResponse::Flat(v) => v
                 .into_iter()
-                .find(|si| si.name == chosen.name && range_contains(&si.location.range, chosen.range.start))
+                .find(|si| {
+                    si.name == chosen.name && range_contains(&si.location.range, chosen.range.start)
+                })
                 .map(|si| si.location.range),
         }
     }
@@ -634,10 +685,7 @@ impl LspServer {
         let target = uri::uri_to_path(chosen.uri.as_str())?;
         self.ensure_open(&target).await?;
         let full_range = self.outline_range_at(&chosen).await.unwrap_or(chosen.range);
-        let kind = self
-            .outline_kind_at(&chosen)
-            .await
-            .unwrap_or("symbol");
+        let kind = self.outline_kind_at(&chosen).await.unwrap_or("symbol");
         let text = tokio::fs::read_to_string(&target)
             .await
             .with_context(|| format!("reading {}", target.display()))?;
@@ -660,7 +708,14 @@ impl LspServer {
         file_hint: Option<&Path>,
         symbol: &str,
         new_body: &str,
-    ) -> Result<(PathBuf, usize, usize, String, String, crate::core::persist::FileFingerprint)> {
+    ) -> Result<(
+        PathBuf,
+        usize,
+        usize,
+        String,
+        String,
+        crate::core::persist::FileFingerprint,
+    )> {
         let body = self.symbol_body(file_hint, symbol).await?;
         let content = tokio::fs::read_to_string(&body.path)
             .await
@@ -673,7 +728,14 @@ impl LspServer {
         }
         let base_fingerprint = crate::core::persist::FileFingerprint::for_bytes(content.as_bytes());
         let new_text = replace_line_span(&content, body.start_line, body.end_line, new_body);
-        Ok((body.path, body.start_line, body.end_line, body.text, new_text, base_fingerprint))
+        Ok((
+            body.path,
+            body.start_line,
+            body.end_line,
+            body.text,
+            new_text,
+            base_fingerprint,
+        ))
     }
 
     /// Insert `text` immediately before or after a named symbol's full range.
@@ -683,7 +745,12 @@ impl LspServer {
         symbol: &str,
         where_: InsertWhere,
         text: &str,
-    ) -> Result<(PathBuf, usize, String, crate::core::persist::FileFingerprint)> {
+    ) -> Result<(
+        PathBuf,
+        usize,
+        String,
+        crate::core::persist::FileFingerprint,
+    )> {
         let body = self.symbol_body(file_hint, symbol).await?;
         let content = tokio::fs::read_to_string(&body.path)
             .await
@@ -695,13 +762,8 @@ impl LspServer {
             );
         }
         let base_fingerprint = crate::core::persist::FileFingerprint::for_bytes(content.as_bytes());
-        let new_text = insert_relative_line_span(
-            &content,
-            body.start_line,
-            body.end_line,
-            where_,
-            text,
-        );
+        let new_text =
+            insert_relative_line_span(&content, body.start_line, body.end_line, where_, text);
         let at = match where_ {
             InsertWhere::Before => body.start_line,
             InsertWhere::After => body.end_line.saturating_add(1),
@@ -714,7 +776,9 @@ impl LspServer {
         let mut sock = self.socket.clone();
         let resp = sock
             .document_symbol(DocumentSymbolParams {
-                text_document: TextDocumentIdentifier { uri: chosen.uri.clone() },
+                text_document: TextDocumentIdentifier {
+                    uri: chosen.uri.clone(),
+                },
                 work_done_progress_params: WorkDoneProgressParams::default(),
                 partial_result_params: PartialResultParams::default(),
             })
@@ -724,7 +788,9 @@ impl LspServer {
             DocumentSymbolResponse::Nested(v) => find_enclosing_kind(&v, chosen.range.start),
             DocumentSymbolResponse::Flat(v) => v
                 .into_iter()
-                .find(|si| si.name == chosen.name && range_contains(&si.location.range, chosen.range.start))
+                .find(|si| {
+                    si.name == chosen.name && range_contains(&si.location.range, chosen.range.start)
+                })
                 .map(|si| kind_label(si.kind)),
         }
     }
@@ -737,14 +803,16 @@ impl LspServer {
         Ok(cands
             .into_iter()
             .filter_map(|c| {
-                let path = uri::uri_to_path(c.uri.as_str()).unwrap_or_else(|_| PathBuf::from(c.uri.as_str()));
+                let path = uri::uri_to_path(c.uri.as_str())
+                    .unwrap_or_else(|_| PathBuf::from(c.uri.as_str()));
                 let line = c.range.map(|r| r.start.line as usize);
-                seen.insert(format!("{}\0{}\0{:?}", c.name, path.display(), line)).then_some(WsSym {
-                    name: c.name,
-                    kind: kind_label(c.kind),
-                    path,
-                    line,
-                })
+                seen.insert(format!("{}\0{}\0{:?}", c.name, path.display(), line))
+                    .then_some(WsSym {
+                        name: c.name,
+                        kind: kind_label(c.kind),
+                        path,
+                        line,
+                    })
             })
             .collect())
     }
@@ -759,7 +827,11 @@ impl LspServer {
     /// [`diagnostics`](Self::diagnostics) with a caller-chosen push-settle deadline: the tool path
     /// keeps the patient 8s; the post-edit feedback fold uses a tight budget (its whole fold is
     /// hard-capped) so an edit result is never held hostage by a slow re-analysis.
-    pub async fn diagnostics_bounded(&self, file: &Path, settle: Duration) -> Result<Vec<DiagItem>> {
+    pub async fn diagnostics_bounded(
+        &self,
+        file: &Path,
+        settle: Duration,
+    ) -> Result<Vec<DiagItem>> {
         let (url, refreshed) = self.ensure_open(file).await?;
         let key = uri::normalize_uri(url.as_str());
 
@@ -775,9 +847,16 @@ impl LspServer {
                 })
                 .await;
             // Advertised-but-failing pull falls through to the push path rather than erroring.
-            if let Ok(DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(full))) = pulled {
-                let mut items: Vec<DiagItem> =
-                    full.full_document_diagnostic_report.items.iter().map(to_diag_item).collect();
+            if let Ok(DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+                full,
+            ))) = pulled
+            {
+                let mut items: Vec<DiagItem> = full
+                    .full_document_diagnostic_report
+                    .items
+                    .iter()
+                    .map(to_diag_item)
+                    .collect();
                 items.sort_by_key(|d| (d.line, d.col));
                 return Ok(items);
             }
@@ -799,7 +878,8 @@ impl LspServer {
             }
             let quiet = last_change.elapsed() >= Duration::from_millis(400);
             let got_update = now_seq != start_seq;
-            let existing_is_current = !refreshed && last_change.elapsed() >= Duration::from_millis(600);
+            let existing_is_current =
+                !refreshed && last_change.elapsed() >= Duration::from_millis(600);
             if (got_update && quiet) || existing_is_current || Instant::now() >= deadline {
                 let mut items: Vec<DiagItem> = self
                     .diags
@@ -815,7 +895,11 @@ impl LspServer {
     }
 
     fn push_seq(&self, key: &str) -> Option<u64> {
-        self.diags.lock().unwrap_or_else(|e| e.into_inner()).get(key).map(|p| p.seq)
+        self.diags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map(|p| p.seq)
     }
 
     /// `workspace/symbol` with a settle loop: while the server is still warming up, an empty result
@@ -827,7 +911,10 @@ impl LspServer {
         loop {
             let mut sock = self.socket.clone();
             let resp = sock
-                .symbol(WorkspaceSymbolParams { query: query.to_string(), ..Default::default() })
+                .symbol(WorkspaceSymbolParams {
+                    query: query.to_string(),
+                    ..Default::default()
+                })
                 .await
                 .map_err(|e| anyhow!("workspace/symbol failed: {e}"))?;
             let cands = flatten_symbols(resp);
@@ -848,7 +935,11 @@ impl LspServer {
         pick_symbol(cands, symbol, file_hint).ok_or_else(|| {
             anyhow!(
                 "no symbol named '{symbol}' found in the project{}",
-                if self.is_indexed() { "" } else { " (server may still be indexing — try again)" }
+                if self.is_indexed() {
+                    ""
+                } else {
+                    " (server may still be indexing — try again)"
+                }
             )
         })
     }
@@ -909,7 +1000,11 @@ fn kind_label(kind: SymbolKind) -> &'static str {
         (SymbolKind::OPERATOR, "op"),
         (SymbolKind::TYPE_PARAMETER, "typeparam"),
     ];
-    LABELS.iter().find(|(k, _)| *k == kind).map(|(_, l)| *l).unwrap_or("sym")
+    LABELS
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map(|(_, l)| *l)
+        .unwrap_or("sym")
 }
 
 /// Short label for a diagnostic severity (also a struct-of-consts).
@@ -940,8 +1035,8 @@ fn to_diag_item(d: &Diagnostic) -> DiagItem {
 fn range_contains(range: &Range, pos: Position) -> bool {
     let after_start = pos.line > range.start.line
         || (pos.line == range.start.line && pos.character >= range.start.character);
-    let before_end =
-        pos.line < range.end.line || (pos.line == range.end.line && pos.character <= range.end.character);
+    let before_end = pos.line < range.end.line
+        || (pos.line == range.end.line && pos.character <= range.end.character);
     after_start && before_end
 }
 
@@ -1077,7 +1172,10 @@ fn insert_relative_line_span(
     } else {
         text.lines().map(|s| s.to_string()).collect()
     };
-    let mut owned: Vec<String> = lines[..insert_at].iter().map(|s| (*s).to_string()).collect();
+    let mut owned: Vec<String> = lines[..insert_at]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     owned.extend(new_lines);
     owned.extend(lines[insert_at..].iter().map(|s| (*s).to_string()));
     join_lines(&owned, crlf, had_trailing_nl)
@@ -1137,8 +1235,17 @@ fn flatten_hover(contents: &HoverContents) -> String {
 /// VCS / build dirs; depth + directory caps keep it cheap even on big trees).
 fn find_source_file(root: &Path, extensions: &[&str]) -> Option<PathBuf> {
     const SKIP_DIRS: &[&str] = &[
-        "node_modules", ".git", "target", "dist", "build", "out", ".next", ".venv", "venv",
-        "__pycache__", ".tox",
+        "node_modules",
+        ".git",
+        "target",
+        "dist",
+        "build",
+        "out",
+        ".next",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".tox",
     ];
     const MAX_DEPTH: usize = 4;
     const MAX_DIRS: usize = 300;
@@ -1149,7 +1256,9 @@ fn find_source_file(root: &Path, extensions: &[&str]) -> Option<PathBuf> {
         if visited > MAX_DIRS {
             return None;
         }
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
@@ -1161,7 +1270,8 @@ fn find_source_file(root: &Path, extensions: &[&str]) -> Option<PathBuf> {
             } else if path.is_dir() && depth < MAX_DEPTH {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if !SKIP_DIRS.iter().any(|s| name.eq_ignore_ascii_case(s)) && !name.starts_with('.') {
+                if !SKIP_DIRS.iter().any(|s| name.eq_ignore_ascii_case(s)) && !name.starts_with('.')
+                {
                     queue.push_back((path, depth + 1));
                 }
             }
@@ -1189,8 +1299,20 @@ fn flatten_symbols(resp: Option<WorkspaceSymbolResponse>) -> Vec<SymCand> {
             .map(|ws| {
                 let container = ws.container_name;
                 match ws.location {
-                    OneOf::Left(loc) => SymCand { name: ws.name, kind: ws.kind, uri: loc.uri, range: Some(loc.range), container },
-                    OneOf::Right(wsl) => SymCand { name: ws.name, kind: ws.kind, uri: wsl.uri, range: None, container },
+                    OneOf::Left(loc) => SymCand {
+                        name: ws.name,
+                        kind: ws.kind,
+                        uri: loc.uri,
+                        range: Some(loc.range),
+                        container,
+                    },
+                    OneOf::Right(wsl) => SymCand {
+                        name: ws.name,
+                        kind: ws.kind,
+                        uri: wsl.uri,
+                        range: None,
+                        container,
+                    },
                 }
             })
             .collect(),
@@ -1209,18 +1331,34 @@ fn flatten_symbols(resp: Option<WorkspaceSymbolResponse>) -> Vec<SymCand> {
 /// A bare `symbol` (no `/`) behaves exactly as before. When a server omits `container_name` the
 /// container filter simply finds nothing and falls through to the file-hint / first-match path.
 fn pick_symbol(candidates: Vec<SymCand>, symbol: &str, file_hint: Option<&Path>) -> Option<SymHit> {
-    let usable: Vec<SymCand> = candidates.into_iter().filter(|c| c.range.is_some()).collect();
+    let usable: Vec<SymCand> = candidates
+        .into_iter()
+        .filter(|c| c.range.is_some())
+        .collect();
     if usable.is_empty() {
         return None;
     }
     // Split a `Container/leaf` path: the leaf is the last segment, the container is the segment
     // before it (deeper ancestors are ignored — servers report at most the immediate container).
     let (container, leaf) = match symbol.rsplit_once('/') {
-        Some((c, l)) => (c.rsplit('/').next().map(str::trim).filter(|s| !s.is_empty()), l.trim()),
+        Some((c, l)) => (
+            c.rsplit('/')
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+            l.trim(),
+        ),
         None => (None, symbol),
     };
-    let hint = file_hint.and_then(|p| p.file_name()).and_then(|s| s.to_str()).map(|s| s.to_string());
-    let to_hit = |c: &SymCand| SymHit { name: c.name.clone(), uri: c.uri.clone(), range: c.range.unwrap() };
+    let hint = file_hint
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string());
+    let to_hit = |c: &SymCand| SymHit {
+        name: c.name.clone(),
+        uri: c.uri.clone(),
+        range: c.range.unwrap(),
+    };
     let (exact, rest): (Vec<_>, Vec<_>) = usable.into_iter().partition(|c| c.name == leaf);
     if exact.is_empty() {
         return rest.first().map(to_hit);
@@ -1234,11 +1372,20 @@ fn pick_symbol(candidates: Vec<SymCand>, symbol: &str, file_hint: Option<&Path>)
                 .filter(|c| {
                     c.container
                         .as_deref()
-                        .map(|cn| cn.rsplit(&['/', ':', '.'][..]).next().unwrap_or(cn).eq_ignore_ascii_case(want))
+                        .map(|cn| {
+                            cn.rsplit(&['/', ':', '.'][..])
+                                .next()
+                                .unwrap_or(cn)
+                                .eq_ignore_ascii_case(want)
+                        })
                         .unwrap_or(false)
                 })
                 .collect();
-            if matched.is_empty() { exact.iter().collect() } else { matched }
+            if matched.is_empty() {
+                exact.iter().collect()
+            } else {
+                matched
+            }
         }
         None => exact.iter().collect(),
     };
@@ -1253,7 +1400,11 @@ fn pick_symbol(candidates: Vec<SymCand>, symbol: &str, file_hint: Option<&Path>)
 /// Best-effort: read line `line0` (0-based) of `path`, trimmed and length-capped. Empty on error.
 async fn read_line_snippet(path: &Path, line0: usize) -> String {
     match tokio::fs::read_to_string(path).await {
-        Ok(text) => text.lines().nth(line0).map(|l| l.trim().chars().take(200).collect()).unwrap_or_default(),
+        Ok(text) => text
+            .lines()
+            .nth(line0)
+            .map(|l| l.trim().chars().take(200).collect())
+            .unwrap_or_default(),
         Err(_) => String::new(),
     }
 }
@@ -1263,15 +1414,26 @@ mod tests {
     use super::*;
 
     fn pos(line: u32, ch: u32) -> Position {
-        Position { line, character: ch }
+        Position {
+            line,
+            character: ch,
+        }
     }
 
     fn range(l1: u32, c1: u32, l2: u32, c2: u32) -> Range {
-        Range { start: pos(l1, c1), end: pos(l2, c2) }
+        Range {
+            start: pos(l1, c1),
+            end: pos(l2, c2),
+        }
     }
 
     #[allow(deprecated)] // DocumentSymbol has a deprecated `deprecated` field we must fill
-    fn doc_sym(name: &str, full: Range, sel: Range, children: Vec<DocumentSymbol>) -> DocumentSymbol {
+    fn doc_sym(
+        name: &str,
+        full: Range,
+        sel: Range,
+        children: Vec<DocumentSymbol>,
+    ) -> DocumentSymbol {
         DocumentSymbol {
             name: name.to_string(),
             detail: None,
@@ -1280,7 +1442,11 @@ mod tests {
             deprecated: None,
             range: full,
             selection_range: sel,
-            children: if children.is_empty() { None } else { Some(children) },
+            children: if children.is_empty() {
+                None
+            } else {
+                Some(children)
+            },
         }
     }
 
@@ -1322,7 +1488,11 @@ mod tests {
             cand("run", "file:///a/bar.rs", Some("Bar")),
         ];
         let hit = pick_symbol(cands, "run", Some(Path::new("bar.rs"))).unwrap();
-        assert!(hit.uri.as_str().ends_with("bar.rs"), "file hint still wins: {}", hit.uri);
+        assert!(
+            hit.uri.as_str().ends_with("bar.rs"),
+            "file hint still wins: {}",
+            hit.uri
+        );
     }
 
     #[test]
@@ -1376,16 +1546,30 @@ mod tests {
         let mut out = Vec::new();
         collect_outline(&[parent], 0, &mut out);
         assert_eq!(out.len(), 2);
-        assert_eq!((out[0].name.as_str(), out[0].depth, out[0].line), ("parent", 0, 0));
-        assert_eq!((out[1].name.as_str(), out[1].depth, out[1].line), ("child", 1, 2));
+        assert_eq!(
+            (out[0].name.as_str(), out[0].depth, out[0].line),
+            ("parent", 0, 0)
+        );
+        assert_eq!(
+            (out[1].name.as_str(), out[1].depth, out[1].line),
+            ("child", 1, 2)
+        );
     }
 
     #[test]
     fn line_slicing_caps() {
         let text = "a\nb\nc\nd\ne";
         assert_eq!(slice_lines(text, 1, 3, 100), ("b\nc\nd".to_string(), false));
-        assert_eq!(slice_lines(text, 1, 4, 2), ("b\nc".to_string(), true), "cap cuts");
-        assert_eq!(slice_lines(text, 4, 9, 100), ("e".to_string(), false), "EOF-tolerant");
+        assert_eq!(
+            slice_lines(text, 1, 4, 2),
+            ("b\nc".to_string(), true),
+            "cap cuts"
+        );
+        assert_eq!(
+            slice_lines(text, 4, 9, 100),
+            ("e".to_string(), false),
+            "EOF-tolerant"
+        );
     }
 
     #[test]
@@ -1436,7 +1620,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
         std::fs::write(root.join("node_modules/pkg/index.ts"), "x").unwrap();
-        assert!(find_source_file(&root, &["ts"]).is_none(), "node_modules is skipped");
+        assert!(
+            find_source_file(&root, &["ts"]).is_none(),
+            "node_modules is skipped"
+        );
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/app.ts"), "export const x = 1;").unwrap();
         let found = find_source_file(&root, &["ts"]).expect("finds src/app.ts");

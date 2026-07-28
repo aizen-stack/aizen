@@ -11,34 +11,34 @@
 //! (no live calls). Production passes a closure over `client::chat_with_tools`.
 
 pub mod app_catalog;
-pub mod toolsets;
 #[cfg(feature = "browser")]
 pub mod browser;
 pub mod builtin;
 pub mod clarify;
-pub mod codebase;
 pub mod cmd_guard;
-pub mod goal;
+pub mod codebase;
 pub mod compact;
+pub mod goal;
 pub mod lsp;
 pub mod mcp;
 pub mod mcp_oauth;
+pub mod orchestration;
 pub mod process;
 pub mod project_context;
 pub mod reach;
 pub mod repo_map;
 pub mod search;
-pub mod orchestration;
 pub mod task_tool;
 pub mod todo;
 pub mod tools;
+pub mod toolsets;
 pub mod verify_gate;
 pub mod web_tools;
 pub mod workflow;
 pub mod workflow_tool;
 
-use crate::llm::client::ChatTurn;
 use crate::core::types::{Message, ToolCall, ToolDef};
+use crate::llm::client::ChatTurn;
 use anyhow::Result;
 use console::style;
 use std::future::Future;
@@ -65,7 +65,8 @@ mod obf {
 /// once into a cached `String` (was a plaintext `include_str!` const).
 pub fn system_base() -> &'static str {
     static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    CELL.get_or_init(|| obf::decode(obf::SYSTEM_BASE_OBF)).as_str()
+    CELL.get_or_init(|| obf::decode(obf::SYSTEM_BASE_OBF))
+        .as_str()
 }
 
 /// The STRICT-tier base prompt for small/local models (numbered imperative rules, explicit output
@@ -73,7 +74,8 @@ pub fn system_base() -> &'static str {
 /// [`prompt_tier_for`]; ~half the tokens of the full prompt. Obfuscated like [`system_base`].
 pub fn system_base_strict() -> &'static str {
     static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    CELL.get_or_init(|| obf::decode(obf::SYSTEM_BASE_STRICT_OBF)).as_str()
+    CELL.get_or_init(|| obf::decode(obf::SYSTEM_BASE_STRICT_OBF))
+        .as_str()
 }
 
 /// Which base prompt a model gets. One prompt cannot serve both Claude and a 7B local model —
@@ -89,7 +91,10 @@ pub enum PromptTier {
 /// suffixes go strict. UNKNOWN ⇒ Full (the safe default: a strong model on strict prose loses
 /// more than a weak one on full prose).
 pub fn prompt_tier_for(model: &str, override_tier: Option<&str>) -> PromptTier {
-    match override_tier.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+    match override_tier
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
         Some("strict") => return PromptTier::Strict,
         Some("full") => return PromptTier::Full,
         _ => {}
@@ -97,17 +102,26 @@ pub fn prompt_tier_for(model: &str, override_tier: Option<&str>) -> PromptTier {
     let m = model.to_ascii_lowercase();
     // Small/local families + the "mini"/"nano" tier markers, matched as whole tokens so e.g.
     // "geminia" or "granite-cloud-ultra" never false-positives on a substring.
-    const STRICT_FAMILIES: &[&str] = &["qwen", "llama", "gemma", "phi", "granite", "smollm", "mini", "nano"];
-    if STRICT_FAMILIES.iter().any(|k| crate::llm::client::contains_word(&m, k)) {
+    const STRICT_FAMILIES: &[&str] = &[
+        "qwen", "llama", "gemma", "phi", "granite", "smollm", "mini", "nano",
+    ];
+    if STRICT_FAMILIES
+        .iter()
+        .any(|k| crate::llm::client::contains_word(&m, k))
+    {
         return PromptTier::Strict;
     }
     if m.contains("mistral-small") {
         return PromptTier::Strict;
     }
     // Explicit parameter-count suffixes (whole tokens): anything ≤32B gets the strict tier.
-    const SMALL_SIZES: &[&str] =
-        &["1b", "2b", "3b", "4b", "7b", "8b", "9b", "12b", "13b", "14b", "24b", "27b", "30b", "32b"];
-    if SMALL_SIZES.iter().any(|k| crate::llm::client::contains_word(&m, k)) {
+    const SMALL_SIZES: &[&str] = &[
+        "1b", "2b", "3b", "4b", "7b", "8b", "9b", "12b", "13b", "14b", "24b", "27b", "30b", "32b",
+    ];
+    if SMALL_SIZES
+        .iter()
+        .any(|k| crate::llm::client::contains_word(&m, k))
+    {
         return PromptTier::Strict;
     }
     PromptTier::Full
@@ -161,13 +175,18 @@ pub fn build_system_prompt_bundle(
 ) -> PromptBundle {
     // Tier is a pure function of (model, config): fixed within a session, so the prefix stays
     // byte-stable; every model switch already rebuilds the system prompt.
-    let base = match prompt_tier_for(model, crate::core::cli_config::load().prompt_tier.as_deref()) {
+    let base = match prompt_tier_for(
+        model,
+        crate::core::cli_config::load().prompt_tier.as_deref(),
+    ) {
         PromptTier::Strict => system_base_strict(),
         PromptTier::Full => system_base(),
     };
     let mut stable = String::from(base.trim_end());
     stable.push_str("\n\n<environment>\n");
-    stable.push_str(&format!("cwd: {cwd}\nos: {os}\ndate: {date}\nmodel: {model}\n"));
+    stable.push_str(&format!(
+        "cwd: {cwd}\nos: {os}\ndate: {date}\nmodel: {model}\n"
+    ));
     stable.push_str("</environment>\n");
 
     let mut dynamic = String::new();
@@ -220,13 +239,18 @@ pub fn build_subagent_base_prompt(
     model: &str,
     include_project_context: bool,
 ) -> String {
-    let base = match prompt_tier_for(model, crate::core::cli_config::load().prompt_tier.as_deref()) {
+    let base = match prompt_tier_for(
+        model,
+        crate::core::cli_config::load().prompt_tier.as_deref(),
+    ) {
         PromptTier::Strict => system_base_strict(),
         PromptTier::Full => system_base(),
     };
     let mut s = String::from(base.trim_end());
     s.push_str("\n\n<environment>\n");
-    s.push_str(&format!("cwd: {cwd}\nos: {os}\ndate: {date}\nmodel: {model}\n"));
+    s.push_str(&format!(
+        "cwd: {cwd}\nos: {os}\ndate: {date}\nmodel: {model}\n"
+    ));
     s.push_str("</environment>\n");
     if let Some(idx) = crate::skills::prompt_index() {
         s.push_str("\n<skills>\n");
@@ -317,7 +341,9 @@ pub fn build_top_level_system_prompt_bundle(
         bundle.dynamic.push_str(&idx);
         bundle.dynamic.push_str("\n</agents>\n");
     }
-    if let Some(block) = response_visuals_prompt_block(crate::core::cli_config::load().response_visuals()) {
+    if let Some(block) =
+        response_visuals_prompt_block(crate::core::cli_config::load().response_visuals())
+    {
         bundle.dynamic.push('\n');
         bundle.dynamic.push_str(&block);
     }
@@ -460,6 +486,14 @@ pub struct AgentConfig {
     pub hill_climb_gate: u8,
     /// Re-nudge to re-measure every N iters while hill-climb mode is on. `0` = reframe only.
     pub hill_climb_reminder_every: usize,
+    /// How many times an ORDINARY (non-goal-mode) turn retries a TRANSIENT model-call failure
+    /// (429/5xx/transport/timeout) with backoff before giving up. Permanent 4xx is never retried here.
+    ///
+    /// `0` at the top level, deliberately: the REPL surfaces the error to a user who is right there
+    /// and can re-ask, and a silent retry would just look like a hang. DELEGATED loops set it > 0 —
+    /// nobody is watching a sub-agent, and one transient blip used to discard every step it had
+    /// completed and come back as a bare "sub-agent (coder) failed".
+    pub max_transient_retries: usize,
     /// GOAL MODE (`/goal <text>`). `Some(goal)` makes the loop run until the goal is genuinely
     /// finished — the iteration cap is bypassed (stop only on Esc or a verified completion), and
     /// transient API failures (429/5xx/timeouts/empty-200) auto-retry with backoff instead of
@@ -475,6 +509,18 @@ pub struct AgentConfig {
     /// workflow children leave it `false` so a steer aimed at the main task can't be swallowed by a
     /// delegated child. Default `false` (the mailbox is process-global; opting in is explicit).
     pub enable_steering: bool,
+    /// MID-TURN PERSISTENCE hook, called at each iteration boundary with the conversation so far.
+    ///
+    /// The loop borrows `messages` mutably for the whole turn, so nothing outside it can observe
+    /// progress — which meant a terminal closed mid-turn persisted the user's question and lost every
+    /// assistant reply and tool result the turn had already produced. Called at the same boundary
+    /// steering drains, the only point where history is guaranteed coherent (no assistant `tool_calls`
+    /// awaiting their results), so the observer never sees a shape a strict gateway would reject.
+    ///
+    /// A plain `fn` pointer, not a closure: `AgentConfig` derives `Clone + Debug` and is threaded
+    /// through every sub-agent spawn, so a boxed `dyn Fn` would cost both derives. `None` ⇒ no
+    /// observer (sub-agents and workflow children: their transcripts aren't the user's session).
+    pub on_progress: Option<fn(&[Message])>,
 }
 
 impl Default for AgentConfig {
@@ -514,8 +560,10 @@ impl Default for AgentConfig {
             enable_hill_climb: true,
             hill_climb_gate: 90,
             hill_climb_reminder_every: 6,
+            max_transient_retries: 0, // top level: the user sees the error and can re-ask
             goal: None,
             enable_steering: false,
+            on_progress: None,
         }
     }
 }
@@ -589,7 +637,15 @@ where
     Fut: Future<Output = Result<ChatTurn>>,
 {
     let no_summarizer: Option<NoSummarizer> = None;
-    run_agent_loop_inner(chat, no_summarizer, None::<NoSummarizer>, cfg, registry, messages).await
+    run_agent_loop_inner(
+        chat,
+        no_summarizer,
+        None::<NoSummarizer>,
+        cfg,
+        registry,
+        messages,
+    )
+    .await
 }
 
 /// Like [`run_agent_loop`] but with MID-LOOP auto-compaction: when history crosses
@@ -610,7 +666,15 @@ where
     S: Fn(Vec<Message>) -> SFut,
     SFut: Future<Output = Result<String>>,
 {
-    run_agent_loop_inner(chat, Some(summarize), None::<NoSummarizer>, cfg, registry, messages).await
+    run_agent_loop_inner(
+        chat,
+        Some(summarize),
+        None::<NoSummarizer>,
+        cfg,
+        registry,
+        messages,
+    )
+    .await
 }
 
 /// The full-featured entry point: compaction PLUS an optional ORACLE — a (usually stronger) model
@@ -651,6 +715,9 @@ where
     O: Fn(Vec<Message>) -> OFut,
     OFut: Future<Output = Result<String>>,
 {
+    // Capture the real request before verify/todo/goal gates can append synthetic user turns. Prefix
+    // stripping keeps automatic memory/codebase retrieval out of the review contract.
+    let mut review_request = capture_review_request(messages);
     // Run-scoped Time Machine anchors (pre_edit / last_good / rewind budget). Must reset every loop
     // entry so a prior task's safety net cannot be restored into this task by accident.
     crate::features::timemachine::begin_agent_run();
@@ -732,16 +799,36 @@ where
     // completion (→ Done, via the goal gate + verify gate). Ordinary turns keep `iter < cap`.
     let goal_mode = cfg.goal.is_some();
 
-    while goal_mode || iter < cap {
-        // COOPERATIVE CANCEL: every top-level turn owns one token and delegated children inherit it.
-        // Unrelated turns therefore cannot cancel one another, while task/workflow fan-out still stops
-        // at the next loop/tool boundary and releases its slots promptly.
+    loop {
+        // COOPERATIVE CANCEL wins before any cap bookkeeping. Goal mode bypasses the cap exactly as
+        // before; ordinary runs get one convergent extension at this single boundary, regardless of
+        // whether the previous iteration reached it through a tool path or a Done-gate `continue`.
         if cfg.cancel.is_cancelled() {
             return Ok(AgentOutcome {
                 final_text: None,
                 iters: iter,
                 stop: StopReason::Cancelled,
             });
+        }
+        if !goal_mode && iter >= cap {
+            if should_auto_extend(
+                cfg.max_iters,
+                cap,
+                cfg.auto_extend_to,
+                extended,
+                unproductive_streak,
+                !nudged_sigs.is_empty(),
+            ) {
+                extended = true;
+                cap = cfg.auto_extend_to;
+                push_nudge(
+                    messages,
+                    NUDGE_STEP_LIMIT,
+                    "You are nearing the step limit. Finish the task now, or stop and state what is blocking you.",
+                );
+            } else {
+                break;
+            }
         }
 
         // STEERING: mid-turn course correction. The input thread can hand a message to the RUNNING
@@ -757,8 +844,11 @@ where
                 if !cfg.quiet {
                     for s in &steers {
                         emit_trace(
-                            &crate::ui::theme::accent(format!("⤳ steering: {}", first_line_clip(s, 72)))
-                                .to_string(),
+                            &crate::ui::theme::accent(format!(
+                                "⤳ steering: {}",
+                                first_line_clip(s, 72)
+                            ))
+                            .to_string(),
                         );
                     }
                 }
@@ -766,11 +856,23 @@ where
             }
         }
 
+        // PUBLISH the in-flight transcript for crash/close safety. Same boundary as the steering
+        // drain, for the same reason: this is the only point where history is guaranteed coherent
+        // (every assistant `tool_calls` already paired with its results), so a snapshot taken here is
+        // always a transcript that can be reloaded. The REPL owns `messages` mutably for the whole
+        // turn, so without this hook a terminal closed mid-turn persisted the user's question and
+        // discarded every reply and tool result the turn had already produced.
+        if let Some(publish) = cfg.on_progress {
+            publish(messages);
+        }
+
         // Effective request size for ALL guards this iteration: estimate (messages + tool schemas)
         // corrected by the provider's last real usage report when we have one. Recomputed after any
         // guard mutates history.
-        let mut est_now =
-            effective_tokens(estimate_tokens(messages) + schema_overhead, real_anchor.as_ref());
+        let mut est_now = effective_tokens(
+            estimate_tokens(messages) + schema_overhead,
+            real_anchor.as_ref(),
+        );
 
         // TOOL-RESULT CLEARING (cheap, deterministic — runs BEFORE the model call): once history
         // crosses `clear_at_pct` of the window, batch-evict stale tool-result bodies DOWN TO
@@ -786,7 +888,13 @@ where
             && est_now * 100 >= cfg.context_window * cfg.clear_at_pct as usize
         {
             let pct = est_now * 100 / cfg.context_window;
-            if clearing_due(pct, iter, last_clear, cfg.clear_step_pct, cfg.clear_cooldown_iters) {
+            if clearing_due(
+                pct,
+                iter,
+                last_clear,
+                cfg.clear_step_pct,
+                cfg.clear_cooldown_iters,
+            ) {
                 // SAVE-BEFORE-CLEAR (P-ctx2): the first eviction of a run is the moment stale
                 // tool-result bodies leave context for good — the single biggest source of "it
                 // forgot the workaround we found" complaints. So the FIRST time we're due to clear,
@@ -809,49 +917,49 @@ where
                     // Skip the eviction this pass; do NOT arm the cadence, so the next iteration is
                     // still "due" and actually clears — now that the model has had a turn to save.
                 } else {
-                // The floor measures history in RAW estimate units (chars/4), but `est_now` — which
-                // armed this pass — is anchor-corrected. With an active anchor, effective = raw + K
-                // for a constant offset K (= real-minus-estimate at anchor time), so a target
-                // expressed in window units must be shifted into raw space by that same K; otherwise
-                // raw is already below the window target and the eviction loop no-ops every cadence
-                // step (common once the provider reports more tokens than chars/4 — code, Vietnamese).
-                // No anchor ⇒ est_now == raw ⇒ offset 0 ⇒ identical to the plain window target.
-                let raw_now = estimate_tokens(messages) + schema_overhead;
-                let anchor_offset = est_now.saturating_sub(raw_now);
-                let target = (cfg.context_window * cfg.clear_target_pct as usize / 100)
-                    .saturating_sub(anchor_offset);
-                let stats = clear_tool_results_to_floor(
-                    messages,
-                    cfg.keep_recent_tool_results,
-                    cfg.clear_tool_result_min_chars,
-                    target,
-                    schema_overhead,
-                );
-                if stats.cleared + stats.failures_trimmed > 0 {
-                    // History shrank under the anchor's feet — the next real usage report re-anchors.
-                    real_anchor = None;
-                    // Cleared result BODIES are gone from context, but their content hashes would
-                    // linger in seen_results and mark a legitimate RE-READ of that now-evicted content
-                    // as "not novel" → falsely unproductive → a spurious thrash stop. Drop the novelty
-                    // memory too, so re-reading evicted content counts as progress again.
-                    seen_results.clear();
-                    est_now = estimate_tokens(messages) + schema_overhead;
-                    budget_band_shown = None; // history shrank — re-arm the running budget signal (P-ctx1)
-                    if !cfg.quiet {
-                        let line = format!(
+                    // The floor measures history in RAW estimate units (chars/4), but `est_now` — which
+                    // armed this pass — is anchor-corrected. With an active anchor, effective = raw + K
+                    // for a constant offset K (= real-minus-estimate at anchor time), so a target
+                    // expressed in window units must be shifted into raw space by that same K; otherwise
+                    // raw is already below the window target and the eviction loop no-ops every cadence
+                    // step (common once the provider reports more tokens than chars/4 — code, Vietnamese).
+                    // No anchor ⇒ est_now == raw ⇒ offset 0 ⇒ identical to the plain window target.
+                    let raw_now = estimate_tokens(messages) + schema_overhead;
+                    let anchor_offset = est_now.saturating_sub(raw_now);
+                    let target = (cfg.context_window * cfg.clear_target_pct as usize / 100)
+                        .saturating_sub(anchor_offset);
+                    let stats = clear_tool_results_to_floor(
+                        messages,
+                        cfg.keep_recent_tool_results,
+                        cfg.clear_tool_result_min_chars,
+                        target,
+                        schema_overhead,
+                    );
+                    if stats.cleared + stats.failures_trimmed > 0 {
+                        // History shrank under the anchor's feet — the next real usage report re-anchors.
+                        real_anchor = None;
+                        // Cleared result BODIES are gone from context, but their content hashes would
+                        // linger in seen_results and mark a legitimate RE-READ of that now-evicted content
+                        // as "not novel" → falsely unproductive → a spurious thrash stop. Drop the novelty
+                        // memory too, so re-reading evicted content counts as progress again.
+                        seen_results.clear();
+                        est_now = estimate_tokens(messages) + schema_overhead;
+                        budget_band_shown = None; // history shrank — re-arm the running budget signal (P-ctx1)
+                        if !cfg.quiet {
+                            let line = format!(
                             "→ context: cleared ~{} chars ({} result(s), {} failure(s) trimmed)",
                             stats.chars_reclaimed, stats.cleared, stats.failures_trimmed
                         );
-                        if crate::ui::tui::active() {
-                            crate::ui::tui::emit_line(&line);
-                        } else {
-                            eprintln!("{line}");
+                            if crate::ui::tui::active() {
+                                crate::ui::tui::emit_line(&line);
+                            } else {
+                                eprintln!("{line}");
+                            }
                         }
                     }
-                }
-                // Arm the cadence even when nothing was clearable — re-scanning the same
-                // un-clearable history every iteration buys nothing.
-                last_clear = Some((est_now * 100 / cfg.context_window, iter));
+                    // Arm the cadence even when nothing was clearable — re-scanning the same
+                    // un-clearable history every iteration buys nothing.
+                    last_clear = Some((est_now * 100 / cfg.context_window, iter));
                 }
             }
         }
@@ -873,8 +981,13 @@ where
                 // this the condition stays true and re-splices (cache-busting) every turn. Re-arm only
                 // on `clear_step_pct` growth or after `clear_cooldown_iters` iters (same knobs as
                 // clearing — one cadence policy for both history-shrinking guards).
-                if clearing_due(pct, iter, last_compact, cfg.clear_step_pct, cfg.clear_cooldown_iters)
-                {
+                if clearing_due(
+                    pct,
+                    iter,
+                    last_compact,
+                    cfg.clear_step_pct,
+                    cfg.clear_cooldown_iters,
+                ) {
                     if let Ok((before, after)) =
                         compact::compact_history(messages, summarize, compact::KEEP_TURNS).await
                     {
@@ -884,7 +997,8 @@ where
                         seen_results.clear(); // summarized-away results must not mark a re-read as stale
                         est_now = estimate_tokens(messages) + schema_overhead;
                         if !cfg.quiet {
-                            let line = format!("→ context: auto-compacted ~{before} → ~{after} tok");
+                            let line =
+                                format!("→ context: auto-compacted ~{before} → ~{after} tok");
                             if crate::ui::tui::active() {
                                 crate::ui::tui::emit_line(&line);
                             } else {
@@ -913,7 +1027,11 @@ where
             if let Some(band) = budget_band(est_now, cfg.context_window) {
                 if budget_band_shown != Some(band) {
                     budget_band_shown = Some(band);
-                    push_nudge(messages, NUDGE_BUDGET, &budget_nudge_text(est_now, cfg.context_window));
+                    push_nudge(
+                        messages,
+                        NUDGE_BUDGET,
+                        &budget_nudge_text(est_now, cfg.context_window),
+                    );
                 }
             }
         }
@@ -962,19 +1080,28 @@ where
             let mut attempt: u32 = 0;
             let mut permanent_tries: u32 = 0;
             loop {
-                match crate::core::cancel::race(&cfg.cancel, chat(messages.clone(), defs.clone())).await {
+                match crate::core::cancel::race(&cfg.cancel, chat(messages.clone(), defs.clone()))
+                    .await
+                {
                     None => {
                         if nudge_pushed {
                             messages.pop();
                         }
-                        return Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::Cancelled });
+                        return Ok(AgentOutcome {
+                            final_text: None,
+                            iters: iter,
+                            stop: StopReason::Cancelled,
+                        });
                     }
                     Some(Ok(t)) => {
                         // EMPTY-200: a 200 with neither content nor a tool call, and no completion
                         // claimed this turn, is a silent provider failure — not a real "done". Retry
                         // it with backoff rather than feeding an empty turn into the done cascade.
                         let empty_200 = t.tool_calls.is_empty()
-                            && t.content.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true)
+                            && t.content
+                                .as_deref()
+                                .map(|s| s.trim().is_empty())
+                                .unwrap_or(true)
                             && !goal::is_pending();
                         if empty_200 {
                             let delay = crate::llm::client::goal_backoff_ms(attempt);
@@ -984,64 +1111,116 @@ where
                                 if nudge_pushed {
                                     messages.pop();
                                 }
-                                return Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::Cancelled });
+                                return Ok(AgentOutcome {
+                                    final_text: None,
+                                    iters: iter,
+                                    stop: StopReason::Cancelled,
+                                });
                             }
                             continue;
                         }
                         break t;
                     }
-                    Some(Err(e)) => {
-                        match crate::llm::client::classify_api_error(&e) {
-                            crate::llm::client::ApiErrorKind::Permanent => {
-                                permanent_tries += 1;
-                                if permanent_tries > GOAL_PERMANENT_RETRIES {
-                                    if nudge_pushed {
-                                        messages.pop();
-                                    }
-                                    return Err(e);
+                    Some(Err(e)) => match crate::llm::client::classify_api_error(&e) {
+                        crate::llm::client::ApiErrorKind::Permanent => {
+                            permanent_tries += 1;
+                            if permanent_tries > GOAL_PERMANENT_RETRIES {
+                                if nudge_pushed {
+                                    messages.pop();
                                 }
-                                let delay = crate::llm::client::goal_backoff_ms(attempt);
-                                attempt += 1;
-                                goal_retry_line(
+                                return Err(e);
+                            }
+                            let delay = crate::llm::client::goal_backoff_ms(attempt);
+                            attempt += 1;
+                            goal_retry_line(
                                     &format!("client error; retry {permanent_tries}/{GOAL_PERMANENT_RETRIES}"),
                                     delay,
                                 );
-                                if goal_sleep_or_cancel(&cfg.cancel, delay).await {
-                                    if nudge_pushed {
-                                        messages.pop();
-                                    }
-                                    return Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::Cancelled });
+                            if goal_sleep_or_cancel(&cfg.cancel, delay).await {
+                                if nudge_pushed {
+                                    messages.pop();
                                 }
-                            }
-                            crate::llm::client::ApiErrorKind::Transient => {
-                                let delay = crate::llm::client::goal_backoff_ms(attempt);
-                                attempt += 1;
-                                goal_retry_line(&format!("API error; retry #{attempt}"), delay);
-                                if goal_sleep_or_cancel(&cfg.cancel, delay).await {
-                                    if nudge_pushed {
-                                        messages.pop();
-                                    }
-                                    return Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::Cancelled });
-                                }
+                                return Ok(AgentOutcome {
+                                    final_text: None,
+                                    iters: iter,
+                                    stop: StopReason::Cancelled,
+                                });
                             }
                         }
-                    }
+                        crate::llm::client::ApiErrorKind::Transient => {
+                            let delay = crate::llm::client::goal_backoff_ms(attempt);
+                            attempt += 1;
+                            goal_retry_line(&format!("API error; retry #{attempt}"), delay);
+                            if goal_sleep_or_cancel(&cfg.cancel, delay).await {
+                                if nudge_pushed {
+                                    messages.pop();
+                                }
+                                return Ok(AgentOutcome {
+                                    final_text: None,
+                                    iters: iter,
+                                    stop: StopReason::Cancelled,
+                                });
+                            }
+                        }
+                    },
                 }
             }
         } else {
-            match crate::core::cancel::race(&cfg.cancel, chat(messages.clone(), defs.clone())).await {
-                None => {
-                    if nudge_pushed {
-                        messages.pop();
+            // ORDINARY TURNS: a bounded TRANSIENT retry, then fatal. `max_transient_retries` is 0 at
+            // the top level (unchanged behavior: the REPL shows the error and the user is right there
+            // to re-ask), but non-zero for a delegated sub-agent — nobody is watching that loop, and
+            // one 429/5xx mid-run used to throw away every step of work it had already done and
+            // surface as a bare "sub-agent failed". Permanent 4xx never retries here: it can't fix
+            // itself and burning backoff on it only delays the report.
+            let mut attempt: u32 = 0;
+            loop {
+                match crate::core::cancel::race(&cfg.cancel, chat(messages.clone(), defs.clone()))
+                    .await
+                {
+                    None => {
+                        if nudge_pushed {
+                            messages.pop();
+                        }
+                        return Ok(AgentOutcome {
+                            final_text: None,
+                            iters: iter,
+                            stop: StopReason::Cancelled,
+                        });
                     }
-                    return Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::Cancelled });
-                }
-                Some(Ok(t)) => t,
-                Some(Err(e)) => {
-                    if nudge_pushed {
-                        messages.pop();
+                    Some(Ok(t)) => break t,
+                    Some(Err(e)) => {
+                        let transient = matches!(
+                            crate::llm::client::classify_api_error(&e),
+                            crate::llm::client::ApiErrorKind::Transient
+                        );
+                        if !transient || attempt as usize >= cfg.max_transient_retries {
+                            if nudge_pushed {
+                                messages.pop();
+                            }
+                            return Err(e);
+                        }
+                        let delay = crate::llm::client::goal_backoff_ms(attempt);
+                        attempt += 1;
+                        if !cfg.quiet {
+                            goal_retry_line(
+                                &format!(
+                                    "API error; retry {attempt}/{}",
+                                    cfg.max_transient_retries
+                                ),
+                                delay,
+                            );
+                        }
+                        if goal_sleep_or_cancel(&cfg.cancel, delay).await {
+                            if nudge_pushed {
+                                messages.pop();
+                            }
+                            return Ok(AgentOutcome {
+                                final_text: None,
+                                iters: iter,
+                                stop: StopReason::Cancelled,
+                            });
+                        }
                     }
-                    return Err(e);
                 }
             }
         };
@@ -1053,7 +1232,10 @@ where
         if let Some(p) = turn.usage.as_ref().and_then(|u| u.prompt_tokens) {
             let real = p as usize;
             if accept_anchor(real, est_now) {
-                real_anchor = Some(RealAnchor { tokens: real, est_at: est_now });
+                real_anchor = Some(RealAnchor {
+                    tokens: real,
+                    est_at: est_now,
+                });
             }
         }
 
@@ -1186,7 +1368,7 @@ where
                     // note (so the user sees the cleanup suggestions) but does NOT hold Done — the
                     // model isn't forced to churn on style. LGTM / no-diff falls straight through.
                     Some(o) => {
-                        if let Some(review) = oracle_review(o, messages).await {
+                        if let Some(review) = oracle_review(o, &review_request).await {
                             if review.blocking {
                                 // Record the premature "done" so the review turn reads coherently,
                                 // then hand back a fix-or-rebut turn (the verify step gates Done).
@@ -1349,6 +1531,9 @@ where
             if cfg.enable_steering {
                 let steers = crate::core::steer::drain();
                 if !steers.is_empty() {
+                    let injected = crate::core::steer::format_injection(&steers);
+                    review_request.push_str("\n\nSteering requirements:\n");
+                    review_request.push_str(&injected);
                     if !cfg.quiet {
                         for s in &steers {
                             emit_trace(
@@ -1437,7 +1622,10 @@ where
         });
         let base = messages.len();
         for tc in &calls {
-            messages.push(Message::tool_result(tc.id.clone(), INTERRUPTED_TOOL_PLACEHOLDER.to_string()));
+            messages.push(Message::tool_result(
+                tc.id.clone(),
+                INTERRUPTED_TOOL_PLACEHOLDER.to_string(),
+            ));
         }
 
         // EXECUTE the call(s): barrier-partitioned — consecutive read-only calls run concurrently
@@ -1490,6 +1678,11 @@ where
                     Err(e) if e.to_string().contains("not a git repository") => {
                         if !cfg.quiet {
                             emit_trace("  └ checkpoint unavailable: not a git repository");
+                        }
+                    }
+                    Err(e) if crate::core::gitx::is_git_missing(&e) => {
+                        if !cfg.quiet {
+                            emit_trace("  └ checkpoint unavailable: git executable not found (edits proceed without checkpoints)");
                         }
                     }
                     Err(e) => {
@@ -1650,24 +1843,8 @@ where
             }
         }
 
-        // CONVERGENCE (W10): near the cap, grant the extended cap ONLY when converging — the last
-        // turn made progress (streak below the stuck threshold) and no divergence episode is open. A
-        // wandering/diverging run falls through to the graceful MaxIters synthesis instead of being
-        // rewarded with a bigger budget.
-        if iter >= cap
-            && !extended
-            && cfg.auto_extend_to > cap
-            && unproductive_streak < STUCK_NUDGE_STREAK
-            && nudged_sigs.is_empty()
-        {
-            extended = true;
-            cap = cfg.auto_extend_to;
-            push_nudge(
-                messages,
-                NUDGE_STEP_LIMIT,
-                "You are nearing the step limit. Finish the task now, or stop and state what is blocking you.",
-            );
-        }
+        // The loop-boundary check above owns extension decisions. Keeping it out of the tool path
+        // ensures Done-gate continues cannot bypass the policy or fall through to synthesis early.
     }
 
     // MAXITERS (W9): don't abandon the task with no answer. Spend ONE tool-free call for a best-
@@ -1689,7 +1866,11 @@ where
     if let Some(ref s) = final_text {
         messages.push(Message::assistant(s.clone()));
     }
-    Ok(AgentOutcome { final_text, iters: iter, stop: StopReason::MaxIters })
+    Ok(AgentOutcome {
+        final_text,
+        iters: iter,
+        stop: StopReason::MaxIters,
+    })
 }
 
 /// Hard cap on concurrent tool executions in a parallel run. Conservative for a single-binary
@@ -1725,7 +1906,11 @@ async fn execute_calls(
     auto_checkpointed: &mut bool,
     writer_lease: &mut Option<crate::core::workspace_txn::WorkspaceWriterLease>,
 ) -> Vec<(String, String)> {
-    debug_assert_eq!(sink.len(), calls.len(), "one pre-filled placeholder per call");
+    debug_assert_eq!(
+        sink.len(),
+        calls.len(),
+        "one pre-filled placeholder per call"
+    );
     // Eager starts from the streaming path, keyed by position — adopted instead of re-spawned.
     // Their bodies ran quiet; the executor emits the trace at adoption and the result marker at
     // landing so the UX is indistinguishable from a normal run.
@@ -1735,8 +1920,10 @@ async fn execute_calls(
     let mut eager: std::collections::HashMap<usize, tokio::task::JoinHandle<String>> =
         eager.into_iter().collect();
     // Parse every call's arguments ONCE — used for the safety partition, the gate, and the body.
-    let parsed: Vec<Result<serde_json::Value, String>> =
-        calls.iter().map(|tc| parse_call_args(&tc.function.arguments)).collect();
+    let parsed: Vec<Result<serde_json::Value, String>> = calls
+        .iter()
+        .map(|tc| parse_call_args(&tc.function.arguments))
+        .collect();
     let safe: Vec<bool> = calls
         .iter()
         .zip(&parsed)
@@ -1759,7 +1946,12 @@ async fn execute_calls(
     while i < n {
         if cancelled || cfg.cancel.is_cancelled() {
             cancelled = true;
-            land(i, "error: cancelled by user".to_string(), &mut results, sink);
+            land(
+                i,
+                "error: cancelled by user".to_string(),
+                &mut results,
+                sink,
+            );
             i += 1;
             continue;
         }
@@ -1778,26 +1970,33 @@ async fn execute_calls(
                         if let Some(h) = eager.remove(&k) {
                             adopted.insert(k);
                             if !cfg.quiet {
-                                if let (Some(tool), Ok(args)) = (registry.get(&calls[k].function.name), &parsed[k]) {
+                                if let (Some(tool), Ok(args)) =
+                                    (registry.get(&calls[k].function.name), &parsed[k])
+                                {
                                     adopted_seq.insert(k, emit_tool_call(tool.name(), args));
                                 }
                             }
                             return (k, h);
                         }
-                        let tool = registry.get_arc(&calls[k].function.name).expect("safe ⇒ known");
+                        let tool = registry
+                            .get_arc(&calls[k].function.name)
+                            .expect("safe ⇒ known");
                         let args = parsed[k].clone().expect("safe ⇒ parsed");
                         let quiet = cfg.quiet;
                         let max = cfg.max_tool_result_chars;
                         let max_fetch = cfg.max_fetch_result_chars;
                         let cancel = cfg.cancel.clone();
                         let exec_ctx = cfg.exec_ctx.clone();
-                        (k, tokio::task::spawn_blocking(move || {
-                            crate::core::cancel::with_current(cancel, || {
-                                crate::core::exec_ctx::with_current(exec_ctx, || {
-                                    run_tool_body(tool, &args, quiet, max, max_fetch)
+                        (
+                            k,
+                            tokio::task::spawn_blocking(move || {
+                                crate::core::cancel::with_current(cancel, || {
+                                    crate::core::exec_ctx::with_current(exec_ctx, || {
+                                        run_tool_body(tool, &args, quiet, max, max_fetch)
+                                    })
                                 })
-                            })
-                        }))
+                            }),
+                        )
                     })
                     .collect();
                 for (k, h) in handles {
@@ -1827,7 +2026,12 @@ async fn execute_calls(
             // Fill any slots of the run skipped by a mid-run cancel.
             for k in i..j {
                 if results[k].is_none() {
-                    land(k, "error: cancelled by user".to_string(), &mut results, sink);
+                    land(
+                        k,
+                        "error: cancelled by user".to_string(),
+                        &mut results,
+                        sink,
+                    );
                 }
             }
             i = j;
@@ -1851,9 +2055,13 @@ async fn execute_calls(
                                 let cwd = std::env::current_dir()
                                     .and_then(|p| p.canonicalize())
                                     .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                                // 15s, not 5: transient contention (another aizen instance, an
+                                // autosave, the parallel test suite) must WAIT, not fail the edit
+                                // with a lease error the user can't act on. Esc still interrupts —
+                                // the cancel token is threaded into the wait loop.
                                 match crate::core::workspace_txn::WorkspaceWriterLease::acquire(
                                     &cwd,
-                                    std::time::Duration::from_secs(5),
+                                    std::time::Duration::from_secs(15),
                                     Some(&cfg.cancel),
                                     tool.name(),
                                 ) {
@@ -1875,7 +2083,10 @@ async fn execute_calls(
                                 Some(error)
                             } else if skip_pre_checkpoint {
                                 None
-                            } else if matches!(effect, crate::agent::tools::WorkspaceEffect::External) {
+                            } else if matches!(
+                                effect,
+                                crate::agent::tools::WorkspaceEffect::External
+                            ) {
                                 Some(
                                     "error: protected change targets a path outside the current repository; Time Machine cannot guarantee rewind coverage. Narrow the path or run it manually with an external backup."
                                         .to_string(),
@@ -1886,8 +2097,16 @@ async fn execute_calls(
                             {
                                 match crate::features::timemachine::save_protected_change("before agent edits") {
                                     Ok(None) => {
+                                        // Two benign shapes, two honest messages: "not a repo" and
+                                        // "no git executable" behave the same (checkpoints off, the
+                                        // edit proceeds) but must never be conflated in what the
+                                        // user reads — the latter is fixable by installing git.
                                         if !cfg.quiet {
-                                            emit_trace("→ checkpoint unavailable: not a git repository");
+                                            if crate::core::gitx::git_exe().is_none() {
+                                                emit_trace("→ checkpoint off: git executable not found — edits proceed without checkpoints");
+                                            } else {
+                                                emit_trace("→ checkpoint unavailable: not a git repository");
+                                            }
                                         }
                                         None
                                     }
@@ -1927,7 +2146,7 @@ async fn execute_calls(
                                     })
                                 })
                                 .await
-                                    .unwrap_or_else(|_| "error: tool thread panicked".to_string())
+                                .unwrap_or_else(|_| "error: tool thread panicked".to_string())
                             }
                         }
                     },
@@ -1941,7 +2160,12 @@ async fn execute_calls(
     calls
         .iter()
         .zip(results)
-        .map(|(tc, r)| (tc.id.clone(), r.unwrap_or_else(|| INTERRUPTED_TOOL_PLACEHOLDER.to_string())))
+        .map(|(tc, r)| {
+            (
+                tc.id.clone(),
+                r.unwrap_or_else(|| INTERRUPTED_TOOL_PLACEHOLDER.to_string()),
+            )
+        })
         .collect()
 }
 
@@ -1955,8 +2179,11 @@ fn turn_made_edits(
     results: &[(String, String)],
 ) -> bool {
     calls.iter().zip(results).any(|(tc, (_, result))| {
-        let Some(t) = registry.get(&tc.function.name) else { return false };
-        let args = parse_call_args(&tc.function.arguments).unwrap_or_else(|_| serde_json::json!({}));
+        let Some(t) = registry.get(&tc.function.name) else {
+            return false;
+        };
+        let args =
+            parse_call_args(&tc.function.arguments).unwrap_or_else(|_| serde_json::json!({}));
         if !t.workspace_effect(&args).needs_checkpoint() || result.starts_with("error:") {
             return false; // no workspace mutation effect, or a denied/errored op.
         }
@@ -1996,10 +2223,13 @@ pub fn eager_starter<'a>(
         if barrier_hit.load(Relaxed) {
             return None;
         }
-        let ok = parse_call_args(&tc.function.arguments).ok().and_then(|args| {
-            let tool = registry.get_arc(&tc.function.name)?;
-            (!tool.is_destructive() && tool.is_concurrency_safe_for(&args)).then_some((tool, args))
-        });
+        let ok = parse_call_args(&tc.function.arguments)
+            .ok()
+            .and_then(|args| {
+                let tool = registry.get_arc(&tc.function.name)?;
+                (!tool.is_destructive() && tool.is_concurrency_safe_for(&args))
+                    .then_some((tool, args))
+            });
         let Some((tool, args)) = ok else {
             // First unsafe/unknown/unparseable call = the barrier: nothing after it starts early.
             barrier_hit.store(true, Relaxed);
@@ -2031,7 +2261,11 @@ fn parse_call_args(raw: &str) -> Result<serde_json::Value, String> {
 /// the loop's own future (never inside `spawn_blocking`): the approval prompt runs via
 /// `block_in_place`, which keeps the future busy — the REPL's `select!` cannot drop it mid-prompt
 /// and orphan the pending approval (byte-identical semantics to the old serial path).
-fn gate_and_approve(tool: &dyn tools::Tool, args: &serde_json::Value, cfg: &AgentConfig) -> Option<String> {
+fn gate_and_approve(
+    tool: &dyn tools::Tool,
+    args: &serde_json::Value,
+    cfg: &AgentConfig,
+) -> Option<String> {
     // Shell commands pass the hard safety floor FIRST — before any `/yolo` bypass. A categorically
     // catastrophic command (rm -rf /, mkfs, dd to a raw device, fork bomb, curl|sh) is refused with
     // no override; `smart` mode may auto-clear a read-only command past the approval prompt.
@@ -2051,7 +2285,10 @@ fn gate_and_approve(tool: &dyn tools::Tool, args: &serde_json::Value, cfg: &Agen
                 let line = format!(
                     "{} {}",
                     style("⛔ blocked").red().bold(),
-                    style(format!("{reason} — refused (hard safety floor, not overridable)")).dim()
+                    style(format!(
+                        "{reason} — refused (hard safety floor, not overridable)"
+                    ))
+                    .dim()
                 );
                 if crate::ui::tui::active() {
                     crate::ui::tui::emit_line(&line);
@@ -2063,9 +2300,7 @@ fn gate_and_approve(tool: &dyn tools::Tool, args: &serde_json::Value, cfg: &Agen
                      unconditionally (even under /yolo). Choose a narrower, safer command."
                 ));
             }
-            cmd_guard::Verdict::Allow => {
-                smart_allow = cfg.approval_mode.approves_readonly_shell()
-            },
+            cmd_guard::Verdict::Allow => smart_allow = cfg.approval_mode.approves_readonly_shell(),
             cmd_guard::Verdict::Caution(reason) => {
                 // A risky-but-legit git op (force-push, reset --hard, push to main, …). Surface the
                 // specific reason, then ALWAYS fall through to the approval prompt — `smart` must not
@@ -2111,7 +2346,11 @@ fn run_tool_body(
     }
     // Open the tool-call line (mockup shape: `⚙ <name>   <target>`, digest filled in on completion).
     // The `seq` ties the result back to this same line so retained updates it in place.
-    let seq = if !quiet { emit_tool_call(tool.name(), args) } else { 0 };
+    let seq = if !quiet {
+        emit_tool_call(tool.name(), args)
+    } else {
+        0
+    };
     let started = std::time::Instant::now();
     let out = match tool.execute(args) {
         Ok(out) => out,
@@ -2139,7 +2378,10 @@ fn run_tool_body(
 /// matching region instead of a blind head+tail. Edit/shell/memory tools are excluded (their
 /// output is positional or already digested).
 fn is_relevance_truncatable(name: &str) -> bool {
-    matches!(name, "file_read" | "web_fetch" | "web_crawl" | "search_files")
+    matches!(
+        name,
+        "file_read" | "web_fetch" | "web_crawl" | "search_files"
+    )
 }
 
 /// Pull the relevance-signal string from a call's args: the query/pattern/topic fields these tools
@@ -2169,7 +2411,11 @@ fn tool_call_line(name: &str, args: &serde_json::Value) -> String {
     let icon = tool_icon();
     let target = tool_target(name, args);
     if target.is_empty() {
-        format!("{} {}", crate::ui::theme::accent(icon), crate::ui::theme::accent(name))
+        format!(
+            "{} {}",
+            crate::ui::theme::accent(icon),
+            crate::ui::theme::accent(name)
+        )
     } else {
         format!(
             "{} {}   {}",
@@ -2212,7 +2458,11 @@ pub fn replay_transcript(msgs: &[crate::core::types::Message]) {
                 let echo = if body.is_empty() { "(image)" } else { body };
                 // Tint the whole echo line (not just the `❯`) so a restored user turn reads as
                 // clearly the user's voice — matching the live turn's accent-bold echo.
-                emit_trace(&format!("{} {}", crate::ui::theme::accent("❯"), crate::ui::theme::accent(echo)));
+                emit_trace(&format!(
+                    "{} {}",
+                    crate::ui::theme::accent("❯"),
+                    crate::ui::theme::accent(echo)
+                ));
             }
             "assistant" => {
                 let body = m.content.as_deref().unwrap_or("").trim();
@@ -2223,8 +2473,8 @@ pub fn replay_transcript(msgs: &[crate::core::types::Message]) {
                     crate::ui::tui::emit(&rendered);
                 }
                 for c in &m.tool_calls {
-                    let args: serde_json::Value =
-                        serde_json::from_str(&c.function.arguments).unwrap_or(serde_json::json!({}));
+                    let args: serde_json::Value = serde_json::from_str(&c.function.arguments)
+                        .unwrap_or(serde_json::json!({}));
                     call_seq.insert(c.id.clone(), emit_tool_call(&c.function.name, &args));
                 }
             }
@@ -2289,18 +2539,32 @@ fn tool_target(name: &str, args: &serde_json::Value) -> String {
         }
         "file_write" | "write_file" | "file_edit" | "edit_file" | "apply_patch" | "multi_edit"
         | "symbol_replace" | "symbol_insert" => base(
-            field("path").or_else(|| field("file")).or_else(|| field("symbol")).unwrap_or(""),
+            field("path")
+                .or_else(|| field("file"))
+                .or_else(|| field("symbol"))
+                .unwrap_or(""),
         ),
         "file_read" | "read_file" => base(field("path").or_else(|| field("file")).unwrap_or("")),
-        "file_move" | "move_file" | "rename_file" | "file_rename" => base(field("from").unwrap_or("")),
-        "file_glob" => first_line_clip(field("pattern").or_else(|| field("glob")).unwrap_or(""), 40),
-        "search_files" => first_line_clip(field("query").or_else(|| field("pattern")).unwrap_or(""), 40),
+        "file_move" | "move_file" | "rename_file" | "file_rename" => {
+            base(field("from").unwrap_or(""))
+        }
+        "file_glob" => {
+            first_line_clip(field("pattern").or_else(|| field("glob")).unwrap_or(""), 40)
+        }
+        "search_files" => first_line_clip(
+            field("query").or_else(|| field("pattern")).unwrap_or(""),
+            40,
+        ),
         "web_fetch" | "web_crawl" => url_host(field("url").unwrap_or("")),
-        "find_symbols" | "lsp_query" => first_line_clip(field("query").or_else(|| field("name")).unwrap_or(""), 40),
+        "find_symbols" | "lsp_query" => {
+            first_line_clip(field("query").or_else(|| field("name")).unwrap_or(""), 40)
+        }
         "memory_search" => first_line_clip(field("query").or_else(|| field("q")).unwrap_or(""), 40),
         "skill_load" => field("name").unwrap_or("").to_string(),
         "todo_write" => String::new(),
-        "clarify" | "memory_ask" | "telegram_ask" => first_line_clip(field("question").unwrap_or(""), 40),
+        "clarify" | "memory_ask" | "telegram_ask" => {
+            first_line_clip(field("question").unwrap_or(""), 40)
+        }
         n if n.ends_with("_search") || n == "search" => {
             first_line_clip(field("query").or_else(|| field("q")).unwrap_or(""), 40)
         }
@@ -2427,13 +2691,19 @@ fn emit_edit_diff(path: &str, out: &str) {
 fn summarize_result(name: &str, out: &str) -> (bool, String) {
     let trimmed = out.trim_start();
     if let Some(reason) = trimmed.strip_prefix("error:") {
-        return (false, format!("error: {}", first_line_clip(reason.trim(), 60)));
+        return (
+            false,
+            format!("error: {}", first_line_clip(reason.trim(), 60)),
+        );
     }
     let first = out.lines().next().unwrap_or("");
     match name {
         "shell_run" | "bash" | "powershell" | "shell" => {
             let code = trimmed.strip_prefix("exit ").and_then(|rest| {
-                let tok: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+                let tok: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '-')
+                    .collect();
                 tok.parse::<i32>().ok()
             });
             match code {
@@ -2451,7 +2721,10 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
             }
         }
         "file_edit" | "edit_file" | "apply_patch" | "symbol_replace" | "symbol_insert" => {
-            if first.starts_with("created") || first.starts_with("inserted") || first.starts_with("replaced") {
+            if first.starts_with("created")
+                || first.starts_with("inserted")
+                || first.starts_with("replaced")
+            {
                 (true, first.chars().take(80).collect())
             } else {
                 let (a, d) = count_diff(out);
@@ -2464,7 +2737,11 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
         }
         "file_write" | "write_file" => {
             // out first line = "created <path> (N line(s))" | "overwrote <path> (N line(s))"
-            let verb = if first.starts_with("overwrote") { "overwrote" } else { "created" };
+            let verb = if first.starts_with("overwrote") {
+                "overwrote"
+            } else {
+                "created"
+            };
             let path = first.split_whitespace().nth(1).unwrap_or("");
             (true, format!("{verb} {path}"))
         }
@@ -2477,14 +2754,23 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
             if trimmed.starts_with("(no memory") {
                 (true, "0 memories".to_string())
             } else {
-                (true, format!("{} memories", out.lines().filter(|l| l.starts_with('[')).count()))
+                (
+                    true,
+                    format!(
+                        "{} memories",
+                        out.lines().filter(|l| l.starts_with('[')).count()
+                    ),
+                )
             }
         }
         "web_search" => {
             if trimmed.starts_with("(no results") {
                 (true, "0 results".to_string())
             } else {
-                let n = out.lines().filter(|l| l.trim_start().starts_with(|c: char| c.is_ascii_digit())).count();
+                let n = out
+                    .lines()
+                    .filter(|l| l.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                    .count();
                 (true, format!("{n} results"))
             }
         }
@@ -2519,7 +2805,13 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
 fn turn_signature(calls: &[ToolCall]) -> String {
     let mut sigs: Vec<String> = calls
         .iter()
-        .map(|c| format!("{}({})", c.function.name, canonical_args(&c.function.arguments)))
+        .map(|c| {
+            format!(
+                "{}({})",
+                c.function.name,
+                canonical_args(&c.function.arguments)
+            )
+        })
         .collect();
     sigs.sort();
     sigs.join("|")
@@ -2532,12 +2824,17 @@ fn canonical_json(v: &serde_json::Value) -> String {
         serde_json::Value::Object(m) => {
             let mut e: Vec<(&String, &serde_json::Value)> = m.iter().collect();
             e.sort_by(|a, b| a.0.cmp(b.0));
-            let body: Vec<String> =
-                e.iter().map(|(k, val)| format!("{k}:{}", canonical_json(val))).collect();
+            let body: Vec<String> = e
+                .iter()
+                .map(|(k, val)| format!("{k}:{}", canonical_json(val)))
+                .collect();
             format!("{{{}}}", body.join(","))
         }
         serde_json::Value::Array(a) => {
-            format!("[{}]", a.iter().map(canonical_json).collect::<Vec<_>>().join(","))
+            format!(
+                "[{}]",
+                a.iter().map(canonical_json).collect::<Vec<_>>().join(",")
+            )
         }
         other => other.to_string(),
     }
@@ -2607,7 +2904,9 @@ static SCHEMA_OVERHEAD_TOK: std::sync::atomic::AtomicUsize = std::sync::atomic::
 /// Per-request tool-schema cost: the serialized JSON length / 4. Computed once per loop run (the
 /// defs don't change mid-run) and published to a process-global for the HUD.
 pub fn estimate_defs_tokens(defs: &[ToolDef]) -> usize {
-    let tok = serde_json::to_string(defs).map(|s| s.len() / 4).unwrap_or(0);
+    let tok = serde_json::to_string(defs)
+        .map(|s| s.len() / 4)
+        .unwrap_or(0);
     SCHEMA_OVERHEAD_TOK.store(tok, std::sync::atomic::Ordering::Relaxed);
     tok
 }
@@ -2693,7 +2992,10 @@ fn is_failure_result(content: &str) -> bool {
     }
     // shell_run convention: results start "exit N\n…" (builtin.rs) — nonzero N is a failure.
     if let Some(rest) = content.strip_prefix("exit ") {
-        let code: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+        let code: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '-')
+            .collect();
         return code.parse::<i64>().map(|n| n != 0).unwrap_or(false);
     }
     false
@@ -2718,8 +3020,12 @@ pub fn clear_tool_results_to_floor(
     schema_overhead: usize,
 ) -> ClearStats {
     let mut stats = ClearStats::default();
-    let tool_idxs: Vec<usize> =
-        messages.iter().enumerate().filter(|(_, m)| m.role == "tool").map(|(i, _)| i).collect();
+    let tool_idxs: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "tool")
+        .map(|(i, _)| i)
+        .collect();
     if tool_idxs.len() <= keep_recent {
         return stats; // nothing older than the recent window
     }
@@ -2754,14 +3060,22 @@ pub fn clear_tool_results_to_floor(
                     && !b.ends_with(FAILED_TOOL_TRIM_SUFFIX) =>
             {
                 let first: String = b.lines().next().unwrap_or("").chars().take(160).collect();
-                (b.chars().count(), format!("{first}{FAILED_TOOL_TRIM_SUFFIX}"))
+                (
+                    b.chars().count(),
+                    format!("{first}{FAILED_TOOL_TRIM_SUFFIX}"),
+                )
             }
             _ => continue,
         };
         est = est.saturating_sub(estimate_message_tokens(&messages[i]));
         messages[i].content = Some(trimmed);
         est += estimate_message_tokens(&messages[i]);
-        stats.chars_reclaimed += len.saturating_sub(messages[i].content.as_deref().map_or(0, |c| c.chars().count()));
+        stats.chars_reclaimed += len.saturating_sub(
+            messages[i]
+                .content
+                .as_deref()
+                .map_or(0, |c| c.chars().count()),
+        );
         stats.failures_trimmed += 1;
     }
     stats
@@ -2770,7 +3084,13 @@ pub fn clear_tool_results_to_floor(
 /// Is a clearing pass due? First crossing always fires; after that, only `step_pct` points of
 /// growth past the last fire OR `cooldown_iters` iterations re-arm it — the cadence that keeps
 /// mutations infrequent (cache-friendly) instead of a per-turn trickle.
-fn clearing_due(pct: usize, iter: usize, last: Option<(usize, usize)>, step_pct: u8, cooldown_iters: usize) -> bool {
+fn clearing_due(
+    pct: usize,
+    iter: usize,
+    last: Option<(usize, usize)>,
+    step_pct: u8,
+    cooldown_iters: usize,
+) -> bool {
     match last {
         None => true,
         Some((p0, i0)) => pct >= p0 + step_pct as usize || iter >= i0 + cooldown_iters,
@@ -2863,6 +3183,49 @@ fn review_is_blocking(review: &str) -> bool {
     review.to_ascii_uppercase().contains("[BLOCKING]")
 }
 
+fn clean_review_user_text(content: &str) -> &str {
+    let mut current = content;
+    loop {
+        let next = codebase::strip_retrieval_prefix(crate::memory::strip_recall_prefix(current));
+        if next == current {
+            return current;
+        }
+        current = next;
+    }
+}
+
+/// Capture the newest real user request. A terse clarification answer is joined to the preceding user
+/// request when it immediately follows a `clarify` tool result, so "option 2" remains reviewable.
+fn capture_review_request(messages: &[Message]) -> String {
+    let Some((idx, current)) = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, m)| m.role == "user")
+        .and_then(|(i, m)| m.content.as_deref().map(|c| (i, c)))
+    else {
+        return String::new();
+    };
+    let current = clean_review_user_text(current).trim();
+    let follows_clarify =
+        idx > 0 && messages[idx - 1].role == "tool" && messages[idx - 1].tool_call_id.is_some();
+    if follows_clarify {
+        if let Some(previous) = messages[..idx.saturating_sub(1)]
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .and_then(|m| m.content.as_deref())
+        {
+            return format!(
+                "{}\n\nClarification answer:\n{}",
+                clean_review_user_text(previous).trim(),
+                current
+            );
+        }
+    }
+    current.to_string()
+}
+
 /// Ask the oracle (a usually-stronger model) to review the working-tree diff against the original
 /// request. `None` ⇒ nothing actionable (no git / empty diff / LGTM / call failed) — the loop
 /// falls through to Done without burning a turn.
@@ -2872,20 +3235,13 @@ fn review_is_blocking(review: &str) -> bool {
 /// nice-to-have). This mirrors the SOTA pattern (Claude Code's `/code-review`): the verify step —
 /// not the raw candidate list — is what gates Done, so a pile of style nits can't force a fix turn
 /// while a genuine bug always does.
-async fn oracle_review<O, OFut>(oracle: &O, messages: &[Message]) -> Option<ReviewOutcome>
+async fn oracle_review<O, OFut>(oracle: &O, review_request: &str) -> Option<ReviewOutcome>
 where
     O: Fn(Vec<Message>) -> OFut,
     OFut: Future<Output = Result<String>>,
 {
     let diff = git_diff_capped()?;
-    let task: String = messages
-        .iter()
-        .find(|m| m.role == "user")
-        .and_then(|m| m.content.as_deref())
-        .unwrap_or("")
-        .chars()
-        .take(2_000)
-        .collect();
+    let task: String = review_request.chars().take(2_000).collect();
     let sys = Message::system(
         "You are a rigorous senior code reviewer. Review the DIFF against the ORIGINAL REQUEST in \
          two steps. STEP 1 — find candidate problems. STEP 2 — VERIFY each against how the code \
@@ -2904,24 +3260,180 @@ where
             }
             // A finding is BLOCKING iff any line is tagged [BLOCKING] (case-insensitive). An
             // all-advisory review is surfaced but must not gate Done.
-            Some(ReviewOutcome { findings: t.to_string(), blocking: review_is_blocking(t) })
+            Some(ReviewOutcome {
+                findings: t.to_string(),
+                blocking: review_is_blocking(t),
+            })
         }
         Err(_) => None, // best-effort: a failing oracle never blocks Done
     }
 }
 
-/// The working-tree `git diff`, capped at 12k chars. `None` when not a repo / git missing / clean.
+/// Complete, bounded, redacted working-tree review bundle. Includes staged, unstaged, deleted,
+/// renamed, and safe untracked files without mutating the index.
 fn git_diff_capped() -> Option<String> {
-    let out = std::process::Command::new("git").args(["diff"]).output().ok()?;
-    if !out.status.success() {
-        return None;
+    const CAP: usize = 12_000;
+    let cwd = std::env::current_dir().ok()?;
+    let root_text = run_git_bounded(&cwd, &["rev-parse", "--show-toplevel"])?;
+    let root = std::path::PathBuf::from(root_text.trim())
+        .canonicalize()
+        .ok()?;
+    let has_head = run_git_bounded(&root, &["rev-parse", "--verify", "HEAD"]).is_some();
+
+    let mut tracked = std::collections::BTreeSet::new();
+    if has_head {
+        add_nul_paths(
+            &mut tracked,
+            &run_git_bounded(&root, &["diff", "--name-only", "-z", "HEAD", "--"])?,
+        );
+    } else {
+        if let Some(s) = run_git_bounded(&root, &["diff", "--cached", "--name-only", "-z", "--"]) {
+            add_nul_paths(&mut tracked, &s);
+        }
+        if let Some(s) = run_git_bounded(&root, &["diff", "--name-only", "-z", "--"]) {
+            add_nul_paths(&mut tracked, &s);
+        }
     }
-    let s = String::from_utf8_lossy(&out.stdout);
-    let t = s.trim();
-    if t.is_empty() {
-        return None;
+    let mut untracked = std::collections::BTreeSet::new();
+    add_nul_paths(
+        &mut untracked,
+        &run_git_bounded(&root, &["ls-files", "--others", "--exclude-standard", "-z"])
+            .unwrap_or_default(),
+    );
+
+    let mut bundle = String::new();
+    for rel in tracked {
+        if bundle.chars().count() >= CAP {
+            break;
+        }
+        let rel_path = std::path::Path::new(&rel);
+        if let Some(kind) = codebase::review_sensitivity(rel_path) {
+            append_review_section(
+                &mut bundle,
+                CAP,
+                &format!("\n--- {rel} [{kind}: content omitted] ---\n"),
+            );
+            continue;
+        }
+        let patch = if has_head {
+            run_git_bounded_args(
+                &root,
+                &["diff", "--no-ext-diff", "HEAD", "--"],
+                Some(rel_path),
+            )
+            .unwrap_or_default()
+        } else {
+            let cached = run_git_bounded_args(
+                &root,
+                &["diff", "--cached", "--no-ext-diff", "--"],
+                Some(rel_path),
+            )
+            .unwrap_or_default();
+            let work =
+                run_git_bounded_args(&root, &["diff", "--no-ext-diff", "--"], Some(rel_path))
+                    .unwrap_or_default();
+            format!("{cached}{work}")
+        };
+        if !patch.trim().is_empty() {
+            append_review_section(&mut bundle, CAP, &codebase::redact_for_review(&patch));
+        }
     }
-    Some(t.chars().take(12_000).collect())
+
+    for rel in untracked {
+        if bundle.chars().count() >= CAP {
+            break;
+        }
+        let rel_path = std::path::Path::new(&rel);
+        if let Some(kind) = codebase::review_sensitivity(rel_path) {
+            append_review_section(
+                &mut bundle,
+                CAP,
+                &format!("\n--- {rel} [untracked {kind}: content omitted] ---\n"),
+            );
+            continue;
+        }
+        let candidate = root.join(rel_path);
+        let Ok(canon) = candidate.canonicalize() else {
+            continue;
+        };
+        if !canon.starts_with(&root) || !canon.is_file() {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&canon) else {
+            continue;
+        };
+        if meta.len() > codebase::review_file_limit() {
+            append_review_section(
+                &mut bundle,
+                CAP,
+                &format!("\n--- {rel} [untracked oversized: content omitted] ---\n"),
+            );
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&canon) else {
+            continue;
+        };
+        if bytes.contains(&0) {
+            append_review_section(
+                &mut bundle,
+                CAP,
+                &format!("\n--- {rel} [untracked binary: content omitted] ---\n"),
+            );
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            append_review_section(
+                &mut bundle,
+                CAP,
+                &format!("\n--- {rel} [untracked binary: content omitted] ---\n"),
+            );
+            continue;
+        };
+        let section = format!(
+            "\n--- {rel} [untracked file] ---\n{}\n",
+            codebase::redact_for_review(text)
+        );
+        append_review_section(&mut bundle, CAP, &section);
+    }
+
+    let trimmed = bundle.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn add_nul_paths(out: &mut std::collections::BTreeSet<String>, raw: &str) {
+    out.extend(
+        raw.split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    );
+}
+
+fn append_review_section(out: &mut String, cap: usize, section: &str) {
+    let remaining = cap.saturating_sub(out.chars().count());
+    out.extend(section.chars().take(remaining));
+}
+
+fn run_git_bounded(root: &std::path::Path, args: &[&str]) -> Option<String> {
+    run_git_bounded_args(root, args, None)
+}
+
+fn run_git_bounded_args(
+    root: &std::path::Path,
+    args: &[&str],
+    path: Option<&std::path::Path>,
+) -> Option<String> {
+    let mut cmd = crate::core::gitx::command().ok()?;
+    cmd.current_dir(root).args(args);
+    if let Some(path) = path {
+        cmd.arg(path);
+    }
+    let out = crate::core::proctree::output_bounded(
+        &mut cmd,
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(2),
+    )
+    .ok()?;
+    (out.code == Some(0) && !out.timed_out).then_some(out.stdout)
 }
 
 // ── mid-loop nudges (collapsed, never accreted) ─────────────────────────────────────────────────
@@ -2999,7 +3511,11 @@ fn budget_band(est: usize, window: usize) -> Option<u8> {
 /// out.` Kept terse; the leading `NUDGE_BUDGET` prefix lets `push_nudge` collapse the prior one.
 fn budget_nudge_text(est: usize, window: usize) -> String {
     let remaining = window.saturating_sub(est);
-    let pct_left = if window > 0 { remaining * 100 / window } else { 0 };
+    let pct_left = if window > 0 {
+        remaining * 100 / window
+    } else {
+        0
+    };
     format!(
         "{NUDGE_BUDGET} ~{}/{} tokens used (~{} remaining, {}% left). Spend it deliberately — do \
          not re-read files you already have, and wrap up before it runs out.",
@@ -3008,6 +3524,24 @@ fn budget_nudge_text(est: usize, window: usize) -> String {
         fmt_tok(remaining as u64),
         pct_left,
     )
+}
+
+/// Decide whether a bounded ordinary run earns its one convergence extension.
+/// `divergence_open` is passed explicitly so callers cannot accidentally invert the latch.
+fn should_auto_extend(
+    initial_cap: usize,
+    cap: usize,
+    auto_extend_to: usize,
+    extended: bool,
+    unproductive_streak: usize,
+    divergence_open: bool,
+) -> bool {
+    initial_cap > 0
+        && cap >= initial_cap
+        && !extended
+        && auto_extend_to > cap
+        && unproductive_streak < STUCK_NUDGE_STREAK
+        && !divergence_open
 }
 
 /// Consecutive unproductive turns before the thrash guard nudges, then stops (see the loop).
@@ -3026,12 +3560,18 @@ const SIG_RING: usize = 6;
 /// orphaned by construction. The new nudge is always the TAIL message, preserving the caller's
 /// error-rollback contract (`messages.pop()` removes exactly the nudge).
 fn push_nudge(messages: &mut Vec<Message>, kind_prefix: &str, text: &str) {
-    debug_assert!(text.starts_with(kind_prefix), "kind prefix must identify its own nudge text");
+    debug_assert!(
+        text.starts_with(kind_prefix),
+        "kind prefix must identify its own nudge text"
+    );
     let mut i = messages.len();
     while i > 1 {
         i -= 1;
         if messages[i].role == "system"
-            && messages[i].content.as_deref().is_some_and(|c| c.starts_with(kind_prefix))
+            && messages[i]
+                .content
+                .as_deref()
+                .is_some_and(|c| c.starts_with(kind_prefix))
         {
             messages.remove(i);
         }
@@ -3090,7 +3630,10 @@ pub fn truncate_relevant(s: &str, max: usize, keywords: &[String]) -> String {
     // rewards a line matching MANY distinct keywords over one matching a single term many times.
     let score_line = |line: &str| -> u32 {
         let low = line.to_ascii_lowercase();
-        keywords.iter().map(|k| (low.matches(k.as_str()).count().min(3)) as u32).sum()
+        keywords
+            .iter()
+            .map(|k| (low.matches(k.as_str()).count().min(3)) as u32)
+            .sum()
     };
     let scores: Vec<u32> = lines.iter().map(|l| score_line(l)).collect();
     if scores.iter().all(|&x| x == 0) {
@@ -3104,16 +3647,29 @@ pub fn truncate_relevant(s: &str, max: usize, keywords: &[String]) -> String {
 
     // Find the contiguous line-run maximizing total score under body_budget chars (greedy window
     // grown around the single best line — O(lines), good enough and stable).
-    let peak = scores.iter().enumerate().max_by_key(|(_, &sc)| sc).map(|(i, _)| i).unwrap_or(0);
+    let peak = scores
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, &sc)| sc)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
     let (mut lo, mut hi) = (peak, peak);
     let mut win_chars = lines[peak].chars().count();
     // Expand outward toward whichever neighbor has the higher score, staying under budget.
     loop {
         let up = lo.checked_sub(1);
-        let down = if hi + 1 < lines.len() { Some(hi + 1) } else { None };
+        let down = if hi + 1 < lines.len() {
+            Some(hi + 1)
+        } else {
+            None
+        };
         let cand = match (up, down) {
             (Some(u), Some(d)) => {
-                if scores[u] >= scores[d] { Some((u, true)) } else { Some((d, false)) }
+                if scores[u] >= scores[d] {
+                    Some((u, true))
+                } else {
+                    Some((d, false))
+                }
             }
             (Some(u), None) => Some((u, true)),
             (None, Some(d)) => Some((d, false)),
@@ -3125,11 +3681,17 @@ pub fn truncate_relevant(s: &str, max: usize, keywords: &[String]) -> String {
             break;
         }
         win_chars += add;
-        if is_up { lo = idx } else { hi = idx }
+        if is_up {
+            lo = idx
+        } else {
+            hi = idx
+        }
     }
     let window: String = lines[lo..=hi].join("\n");
     let omitted = n.saturating_sub(head.chars().count() + window.chars().count());
-    format!("{head}\n…[{omitted} chars elided — kept the region most relevant to the query]…\n{window}")
+    format!(
+        "{head}\n…[{omitted} chars elided — kept the region most relevant to the query]…\n{window}"
+    )
 }
 
 /// Truncate a tool result to `max` chars, head+tail, marking the elision.
@@ -3174,17 +3736,22 @@ fn approve(tool: &str, args: &serde_json::Value) -> bool {
         let prompt = format!(
             "{}  {}",
             tool_call_line(tool, args),
-            style("— approve? [y]es · [n]o · [a]llow all this session").color256(crate::ui::theme::WARN)
+            style("— approve? [y]es · [n]o · [a]llow all this session")
+                .color256(crate::ui::theme::WARN)
         );
         return tokio::task::block_in_place(|| crate::ui::tui::ask_approval(&prompt));
     }
     if !std::io::stdin().is_terminal() {
-        if crate::hostbot::platforms::telegram::daemon_is_active() && crate::hostbot::platforms::telegram::is_configured() {
+        if crate::hostbot::platforms::telegram::daemon_is_active()
+            && crate::hostbot::platforms::telegram::is_configured()
+        {
             let prompt = format!("{tool} {}", compact_args(args));
             // Bridge to the async approval on the current (multi-thread) runtime; the serve poll
             // loop runs on another worker and delivers the callback.
             if let Some(v) = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(crate::hostbot::platforms::telegram::request_approval(&prompt))
+                tokio::runtime::Handle::current().block_on(
+                    crate::hostbot::platforms::telegram::request_approval(&prompt),
+                )
             }) {
                 return v;
             }
@@ -3227,8 +3794,12 @@ fn tool_action(name: &str, args: &serde_json::Value) -> Option<String> {
             let cmd = field("command").or_else(|| field("cmd")).unwrap_or("");
             format!("Run {}", shell_target(cmd))
         }
-        "file_write" | "write_file" => format!("Write {}", base(field("path").or_else(|| field("file")).unwrap_or(""))),
-        "file_edit" | "edit_file" | "apply_patch" | "multi_edit" | "symbol_replace" | "symbol_insert" => {
+        "file_write" | "write_file" => format!(
+            "Write {}",
+            base(field("path").or_else(|| field("file")).unwrap_or(""))
+        ),
+        "file_edit" | "edit_file" | "apply_patch" | "multi_edit" | "symbol_replace"
+        | "symbol_insert" => {
             format!(
                 "Edit {}",
                 base(
@@ -3239,24 +3810,52 @@ fn tool_action(name: &str, args: &serde_json::Value) -> Option<String> {
                 )
             )
         }
-        "file_read" | "read_file" => format!("Read {}", base(field("path").or_else(|| field("file")).unwrap_or(""))),
+        "file_read" | "read_file" => format!(
+            "Read {}",
+            base(field("path").or_else(|| field("file")).unwrap_or(""))
+        ),
         "file_move" | "move_file" | "rename_file" | "file_rename" => {
             format!("Move {}", base(field("from").unwrap_or("")))
         }
-        "file_glob" => format!("Find files {}", first_line_clip(field("pattern").or_else(|| field("glob")).unwrap_or(""), 48)),
-        "search_files" => format!("Search {}", first_line_clip(field("query").or_else(|| field("pattern")).unwrap_or(""), 48)),
+        "file_glob" => format!(
+            "Find files {}",
+            first_line_clip(field("pattern").or_else(|| field("glob")).unwrap_or(""), 48)
+        ),
+        "search_files" => format!(
+            "Search {}",
+            first_line_clip(
+                field("query").or_else(|| field("pattern")).unwrap_or(""),
+                48
+            )
+        ),
         "web_fetch" => format!("Fetch {}", url_host(field("url").unwrap_or(""))),
         "web_crawl" => format!("Crawl {}", url_host(field("url").unwrap_or(""))),
-        "find_symbols" | "lsp_query" => format!("Look up {}", first_line_clip(field("query").or_else(|| field("name")).unwrap_or(""), 48)),
-        "memory_search" => format!("Recall {}", first_line_clip(field("query").or_else(|| field("q")).unwrap_or(""), 48)),
+        "find_symbols" | "lsp_query" => format!(
+            "Look up {}",
+            first_line_clip(field("query").or_else(|| field("name")).unwrap_or(""), 48)
+        ),
+        "memory_search" => format!(
+            "Recall {}",
+            first_line_clip(field("query").or_else(|| field("q")).unwrap_or(""), 48)
+        ),
         "skill_load" => format!("Load skill {}", field("name").unwrap_or("")),
         "todo_write" => {
-            let n = args.get("todos").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            let n = args
+                .get("todos")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
             format!("Plan · {n} step{}", if n == 1 { "" } else { "s" })
         }
-        "clarify" | "memory_ask" | "telegram_ask" => format!("Ask · {}", first_line_clip(field("question").unwrap_or(""), 48)),
+        "clarify" | "memory_ask" | "telegram_ask" => format!(
+            "Ask · {}",
+            first_line_clip(field("question").unwrap_or(""), 48)
+        ),
         n if n.ends_with("_search") || n == "search" => {
-            format!("Search the web · {}", first_line_clip(field("query").or_else(|| field("q")).unwrap_or(""), 44))
+            format!(
+                "Search the web · {}",
+                first_line_clip(field("query").or_else(|| field("q")).unwrap_or(""), 44)
+            )
         }
         _ => return None,
     })
@@ -3273,7 +3872,11 @@ fn basename(p: &str) -> &str {
 fn url_host(u: &str) -> String {
     let after = u.split("://").nth(1).unwrap_or(u);
     let host = after.split(['/', '?', '#']).next().unwrap_or(after);
-    if host.is_empty() { first_line_clip(u, 40) } else { host.to_string() }
+    if host.is_empty() {
+        first_line_clip(u, 40)
+    } else {
+        host.to_string()
+    }
 }
 
 /// Pull a readable target out of a shell command: prefer an explicit `-File <script>` (PowerShell)
@@ -3292,7 +3895,12 @@ fn shell_target(cmd: &str) -> String {
         let clean = t.trim_matches('"').trim_matches('\'');
         let looks_pathy = clean.starts_with("./")
             || clean.starts_with(".\\")
-            || (clean.contains('.') && clean.rsplit('.').next().map(|e| e.len() <= 4 && e.chars().all(|c| c.is_ascii_alphanumeric())).unwrap_or(false));
+            || (clean.contains('.')
+                && clean
+                    .rsplit('.')
+                    .next()
+                    .map(|e| e.len() <= 4 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+                    .unwrap_or(false));
         if looks_pathy && !clean.starts_with('-') {
             return basename(clean).to_string();
         }
@@ -3308,9 +3916,9 @@ fn tool_trace(name: &str, args: &serde_json::Value) -> String {
     let salient = match name {
         "shell_run" | "bash" | "powershell" | "shell" => field("command").or_else(|| field("cmd")),
         "file_edit" | "multi_edit" | "edit_file" | "file_write" | "write_file" | "apply_patch"
-        | "symbol_replace" | "symbol_insert" => {
-            field("path").or_else(|| field("file")).or_else(|| field("symbol"))
-        }
+        | "symbol_replace" | "symbol_insert" => field("path")
+            .or_else(|| field("file"))
+            .or_else(|| field("symbol")),
         "file_move" | "move_file" | "rename_file" | "file_rename" => field("from"),
         "file_read" | "read_file" => field("path").or_else(|| field("file")),
         "find_symbols" | "lsp_query" => field("query").or_else(|| field("name")),
@@ -3354,7 +3962,10 @@ mod tests {
         // after (a basename here), no English verb and no parenthesised footnote.
         let line = tool_call_line("file_read", &serde_json::json!({"path": "src/main.rs"}));
         let plain = console::strip_ansi_codes(&line).to_string();
-        assert!(plain.contains("file_read"), "raw tool name shown: {plain:?}");
+        assert!(
+            plain.contains("file_read"),
+            "raw tool name shown: {plain:?}"
+        );
         assert!(plain.contains("main.rs"), "salient target shown: {plain:?}");
         assert!(!plain.contains("Read "), "no English verb: {plain:?}");
     }
@@ -3370,32 +3981,80 @@ mod tests {
     #[test]
     fn tool_action_maps_common_tools_to_english_verbs() {
         let action = |n: &str, a: serde_json::Value| tool_action(n, &a).unwrap();
-        assert_eq!(action("file_write", serde_json::json!({"path": "C:\\Users\\admin\\scan.ps1"})), "Write scan.ps1");
-        assert_eq!(action("file_read", serde_json::json!({"path": "/tmp/foo/bar.rs"})), "Read bar.rs");
         assert_eq!(
-            action("shell_run", serde_json::json!({"command": "powershell -NoProfile -File C:\\Users\\admin\\scan.ps1"})),
+            action(
+                "file_write",
+                serde_json::json!({"path": "C:\\Users\\admin\\scan.ps1"})
+            ),
+            "Write scan.ps1"
+        );
+        assert_eq!(
+            action("file_read", serde_json::json!({"path": "/tmp/foo/bar.rs"})),
+            "Read bar.rs"
+        );
+        assert_eq!(
+            action(
+                "shell_run",
+                serde_json::json!({"command": "powershell -NoProfile -File C:\\Users\\admin\\scan.ps1"})
+            ),
             "Run scan.ps1"
         );
-        assert_eq!(action("skill_load", serde_json::json!({"name": "scan-windows"})), "Load skill scan-windows");
-        assert_eq!(action("todo_write", serde_json::json!({"todos": [{}, {}, {}]})), "Plan · 3 steps");
-        assert_eq!(action("todo_write", serde_json::json!({"todos": [{}]})), "Plan · 1 step");
-        assert_eq!(action("web_fetch", serde_json::json!({"url": "https://docs.rs/tokio/index.html"})), "Fetch docs.rs");
+        assert_eq!(
+            action("skill_load", serde_json::json!({"name": "scan-windows"})),
+            "Load skill scan-windows"
+        );
+        assert_eq!(
+            action("todo_write", serde_json::json!({"todos": [{}, {}, {}]})),
+            "Plan · 3 steps"
+        );
+        assert_eq!(
+            action("todo_write", serde_json::json!({"todos": [{}]})),
+            "Plan · 1 step"
+        );
+        assert_eq!(
+            action(
+                "web_fetch",
+                serde_json::json!({"url": "https://docs.rs/tokio/index.html"})
+            ),
+            "Fetch docs.rs"
+        );
         // an unmapped tool has no natural verb
         assert!(tool_action("mystery_tool", &serde_json::json!({})).is_none());
     }
 
     #[test]
     fn summarize_result_reads_signal_from_each_tool() {
-        assert_eq!(summarize_result("file_read", "l1\nl2\nl3"), (true, "read 3 lines".to_string()));
-        assert_eq!(summarize_result("shell_run", "exit 0\nok"), (true, "exit 0".to_string()));
-        assert_eq!(summarize_result("shell_run", "exit 2\nboom"), (false, "exit 2".to_string()));
-        assert_eq!(summarize_result("file_glob", "a.rs\nb.rs"), (true, "2 files".to_string()));
-        assert_eq!(summarize_result("file_glob", "(no files match 'x')"), (true, "0 files".to_string()));
+        assert_eq!(
+            summarize_result("file_read", "l1\nl2\nl3"),
+            (true, "read 3 lines".to_string())
+        );
+        assert_eq!(
+            summarize_result("shell_run", "exit 0\nok"),
+            (true, "exit 0".to_string())
+        );
+        assert_eq!(
+            summarize_result("shell_run", "exit 2\nboom"),
+            (false, "exit 2".to_string())
+        );
+        assert_eq!(
+            summarize_result("file_glob", "a.rs\nb.rs"),
+            (true, "2 files".to_string())
+        );
+        assert_eq!(
+            summarize_result("file_glob", "(no files match 'x')"),
+            (true, "0 files".to_string())
+        );
         // an edit result → target + counts derived from the embedded unified diff
         let edit = "edited src/x.rs (1 replacement(s))\n a\n-old\n+new\n b";
         let (ok, s) = summarize_result("file_edit", edit);
-        assert!(ok && s.starts_with("edited src/x.rs") && s.contains("+1"), "{s:?}");
-        assert_eq!(summarize_result("file_edit", "created src/n.rs"), (true, "created src/n.rs".to_string()));
+        assert!(
+            ok && s.starts_with("edited src/x.rs") && s.contains("+1"),
+            "{s:?}"
+        );
+        assert_eq!(
+            summarize_result("file_edit", "created src/n.rs"),
+            (true, "created src/n.rs".to_string())
+        );
         // a tool with no special arm reuses its own header (sans a trailing ':')
         assert_eq!(
             summarize_result("search_files", "7 match(es) in 2 file(s):\nsrc/a.rs:3: hit"),
@@ -3409,12 +4068,19 @@ mod tests {
     #[test]
     fn count_diff_counts_only_column0_markers() {
         let out = "edited x (1)\n a\n-gone\n+added\n+also\n…(3 more lines added)\n b";
-        assert_eq!(count_diff(out), (2, 1), "two '+' lines, one '-'; '…' and ' ' ignored");
+        assert_eq!(
+            count_diff(out),
+            (2, 1),
+            "two '+' lines, one '-'; '…' and ' ' ignored"
+        );
     }
 
     #[test]
     fn edit_target_labels_create_vs_edit() {
-        assert_eq!(edit_target("edited src/x.rs (1 replacement(s))"), "edited src/x.rs");
+        assert_eq!(
+            edit_target("edited src/x.rs (1 replacement(s))"),
+            "edited src/x.rs"
+        );
         assert_eq!(edit_target("created src/n.rs"), "created src/n.rs");
     }
 
@@ -3431,7 +4097,11 @@ mod tests {
             serde_json::json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]})
         }
         fn execute(&self, args: &serde_json::Value) -> Result<String> {
-            Ok(args.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            Ok(args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string())
         }
     }
 
@@ -3465,7 +4135,10 @@ mod tests {
         fn is_destructive(&self) -> bool {
             true
         }
-        fn workspace_effect(&self, _args: &serde_json::Value) -> crate::agent::tools::WorkspaceEffect {
+        fn workspace_effect(
+            &self,
+            _args: &serde_json::Value,
+        ) -> crate::agent::tools::WorkspaceEffect {
             crate::agent::tools::WorkspaceEffect::Paths
         }
         fn execute(&self, _args: &serde_json::Value) -> Result<String> {
@@ -3547,7 +4220,10 @@ mod tests {
             serde_json::json!({"type":"object","properties":{}})
         }
         fn execute(&self, _args: &serde_json::Value) -> Result<String> {
-            Ok((0..500).map(|i| format!("line {i} of filler text")).collect::<Vec<_>>().join("\n"))
+            Ok((0..500)
+                .map(|i| format!("line {i} of filler text"))
+                .collect::<Vec<_>>()
+                .join("\n"))
         }
     }
 
@@ -3578,7 +4254,10 @@ mod tests {
             tool_calls: vec![ToolCall {
                 id: format!("call_{name}"),
                 kind: "function".into(),
-                function: FunctionCall { name: name.into(), arguments: args.into() },
+                function: FunctionCall {
+                    name: name.into(),
+                    arguments: args.into(),
+                },
             }],
             finish_reason: Some("stop".into()), // deliberately NOT "tool_calls" — must still detect
             usage: None,
@@ -3604,7 +4283,10 @@ mod tests {
                 .map(|(i, (name, args))| ToolCall {
                     id: format!("call_{name}_{i}"),
                     kind: "function".into(),
-                    function: FunctionCall { name: (*name).into(), arguments: (*args).into() },
+                    function: FunctionCall {
+                        name: (*name).into(),
+                        arguments: (*args).into(),
+                    },
                 })
                 .collect(),
             finish_reason: Some("stop".into()),
@@ -3613,7 +4295,14 @@ mod tests {
         }
     }
     fn call(id: &str, name: &str, args: &str) -> ToolCall {
-        ToolCall { id: id.into(), kind: "function".into(), function: FunctionCall { name: name.into(), arguments: args.into() } }
+        ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: args.into(),
+            },
+        }
     }
 
     fn registry() -> ToolRegistry {
@@ -3666,18 +4355,28 @@ mod tests {
             enable_hill_climb: false,
             hill_climb_gate: 90,
             hill_climb_reminder_every: 6,
+            // Mirrors the production top-level default: a chat error is fatal unless a test opts in
+            // (the delegated-loop tests set it explicitly).
+            max_transient_retries: 0,
             goal: None, // goal mode OFF in unit tests unless a test arms it
             // Steering OFF by default in unit tests: the mailbox is process-global, so an unrelated
             // script must not pick up a steer a steering test left behind.
             enable_steering: false,
+            on_progress: None, // no live-history publishing in unit tests
         }
     }
 
     /// A scripted fake model: pops the next turn; empties → a final "stop".
-    fn scripted(turns: Vec<ChatTurn>) -> impl Fn(Vec<Message>, Vec<ToolDef>) -> std::future::Ready<Result<ChatTurn>> {
+    fn scripted(
+        turns: Vec<ChatTurn>,
+    ) -> impl Fn(Vec<Message>, Vec<ToolDef>) -> std::future::Ready<Result<ChatTurn>> {
         let q = Mutex::new(VecDeque::from(turns));
         move |_m, _d| {
-            let next = q.lock().unwrap().pop_front().unwrap_or_else(|| final_turn("stop"));
+            let next = q
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| final_turn("stop"));
             std::future::ready(Ok(next))
         }
     }
@@ -3696,7 +4395,13 @@ mod tests {
             return denied;
         }
         crate::core::cancel::with_current(cfg.cancel.clone(), || {
-            run_tool_body(tool, &args, cfg.quiet, cfg.max_tool_result_chars, cfg.max_fetch_result_chars)
+            run_tool_body(
+                tool,
+                &args,
+                cfg.quiet,
+                cfg.max_tool_result_chars,
+                cfg.max_fetch_result_chars,
+            )
         })
     }
 
@@ -3708,10 +4413,23 @@ mod tests {
             .collect();
         let mut checkpointed = false;
         let mut writer_lease = None;
-        let results = execute_calls(r, calls, c, &mut sink, Vec::new(), &mut checkpointed, &mut writer_lease).await;
+        let results = execute_calls(
+            r,
+            calls,
+            c,
+            &mut sink,
+            Vec::new(),
+            &mut checkpointed,
+            &mut writer_lease,
+        )
+        .await;
         // The sink must mirror the returned results (the loop relies on it).
         for (k, (_, out)) in results.iter().enumerate() {
-            assert_eq!(sink[k].content.as_deref(), Some(out.as_str()), "sink[{k}] mirrors the result");
+            assert_eq!(
+                sink[k].content.as_deref(),
+                Some(out.as_str()),
+                "sink[{k}] mirrors the result"
+            );
         }
         results
     }
@@ -3724,8 +4442,12 @@ mod tests {
         r.register(Box::new(ShellStub));
         let mut c = cfg();
         c.approval_mode = crate::core::approval::ApprovalMode::Yolo; // yolo
-        let out = execute_one_for_test(&r, &call("1", "shell_run", r#"{"command":"rm -rf /"}"#), &c);
-        assert!(out.contains("blocked by the hard safety floor"), "got: {out}");
+        let out =
+            execute_one_for_test(&r, &call("1", "shell_run", r#"{"command":"rm -rf /"}"#), &c);
+        assert!(
+            out.contains("blocked by the hard safety floor"),
+            "got: {out}"
+        );
         assert!(!out.contains("RAN"), "the command must NOT have executed");
     }
 
@@ -3747,16 +4469,82 @@ mod tests {
         r.register(Box::new(ShellStub));
         let mut c = cfg();
         c.approval_mode = crate::core::approval::ApprovalMode::Smart; // not yolo
-        let out = execute_one_for_test(&r, &call("1", "shell_run", r#"{"command":"rm -rf node_modules"}"#), &c);
-        assert!(!out.contains("RAN"), "a write must not auto-run under smart; got: {out}");
+        let out = execute_one_for_test(
+            &r,
+            &call("1", "shell_run", r#"{"command":"rm -rf node_modules"}"#),
+            &c,
+        );
+        assert!(
+            !out.contains("RAN"),
+            "a write must not auto-run under smart; got: {out}"
+        );
+    }
+
+    #[test]
+    fn auto_extension_policy_requires_a_real_initial_cap_and_convergence() {
+        assert!(should_auto_extend(3, 3, 6, false, 0, false));
+        assert!(!should_auto_extend(0, 0, 6, false, 0, false));
+        assert!(!should_auto_extend(3, 3, 3, false, 0, false));
+        assert!(!should_auto_extend(3, 3, 6, true, 0, false));
+        assert!(!should_auto_extend(
+            3,
+            3,
+            6,
+            false,
+            STUCK_NUDGE_STREAK,
+            false
+        ));
+        assert!(!should_auto_extend(3, 3, 6, false, 0, true));
+        assert!(
+            !should_auto_extend(3, 6, 8, true, 0, false),
+            "extension is one-shot"
+        );
+    }
+
+    #[tokio::test]
+    async fn done_gate_at_initial_cap_can_reach_final_answer_after_extension() {
+        let r = registry();
+        // Two gate-only iterations reach the initial cap without traversing the tool path. The
+        // boundary must still grant the extension before the third model call.
+        let c = AgentConfig {
+            max_iters: 2,
+            auto_extend_to: 4,
+            enable_steering: false,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let out = run_agent_loop(
+            scripted(vec![
+                tool_turn("echo", r#"{"text":"first"}"#),
+                tool_turn("echo", r#"{"text":"second"}"#),
+                final_turn("done after extension"),
+            ]),
+            &c,
+            &r,
+            &mut messages,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.final_text.as_deref(), Some("done after extension"));
+        assert!(messages.iter().any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|s| s.starts_with(NUDGE_STEP_LIMIT))));
     }
 
     #[tokio::test]
     async fn final_answer_immediately_is_done() {
         let r = registry();
-        let out = run_agent(scripted(vec![final_turn("hello")]), &cfg(), &r, "sys", "task")
-            .await
-            .unwrap();
+        let out = run_agent(
+            scripted(vec![final_turn("hello")]),
+            &cfg(),
+            &r,
+            "sys",
+            "task",
+        )
+        .await
+        .unwrap();
         assert_eq!(out.stop, StopReason::Done);
         assert_eq!(out.final_text.as_deref(), Some("hello"));
         assert_eq!(out.iters, 1);
@@ -3770,8 +4558,20 @@ mod tests {
         let r1 = registry();
         let r2 = registry();
         let (cancelled, live) = tokio::join!(
-            run_agent(scripted(vec![final_turn("should-not-run")]), &cancelled_cfg, &r1, "sys", "task"),
-            run_agent(scripted(vec![final_turn("still-runs")]), &live_cfg, &r2, "sys", "task"),
+            run_agent(
+                scripted(vec![final_turn("should-not-run")]),
+                &cancelled_cfg,
+                &r1,
+                "sys",
+                "task"
+            ),
+            run_agent(
+                scripted(vec![final_turn("still-runs")]),
+                &live_cfg,
+                &r2,
+                "sys",
+                "task"
+            ),
         );
         let cancelled = cancelled.unwrap();
         let live = live.unwrap();
@@ -3785,7 +4585,10 @@ mod tests {
     async fn detects_tools_despite_finish_reason_stop_then_finishes() {
         let r = registry();
         let out = run_agent(
-            scripted(vec![tool_turn("echo", r#"{"text":"hi"}"#), final_turn("done")]),
+            scripted(vec![
+                tool_turn("echo", r#"{"text":"hi"}"#),
+                final_turn("done"),
+            ]),
             &cfg(),
             &r,
             "sys",
@@ -3803,9 +4606,15 @@ mod tests {
         let r = registry();
         // 3 identical: turn1 exec, turn2 nudge (self-resolve), turn3 still identical → diverge.
         let same = || tool_turn("echo", r#"{"text":"x"}"#);
-        let out = run_agent(scripted(vec![same(), same(), same()]), &cfg(), &r, "sys", "task")
-            .await
-            .unwrap();
+        let out = run_agent(
+            scripted(vec![same(), same(), same()]),
+            &cfg(),
+            &r,
+            "sys",
+            "task",
+        )
+        .await
+        .unwrap();
         assert_eq!(out.stop, StopReason::Divergence);
     }
 
@@ -3907,7 +4716,9 @@ mod tests {
             tool_turn("echo", r#"{"text":"5"}"#),
             tool_turn("echo", r#"{"text":"6"}"#),
         ];
-        let out = run_agent(scripted(turns), &cfg(), &r, "sys", "task").await.unwrap();
+        let out = run_agent(scripted(turns), &cfg(), &r, "sys", "task")
+            .await
+            .unwrap();
         assert_eq!(out.stop, StopReason::MaxIters);
         assert_eq!(out.iters, 5);
     }
@@ -3918,7 +4729,11 @@ mod tests {
         // Every turn calls the always-failing `fail` tool with DIFFERENT args, so the identical-
         // signature Divergence check never trips — the thrash guard (all-fail, no-edit streak) must
         // still stop the flail well before the (raised) step cap.
-        let c = AgentConfig { max_iters: 20, auto_extend_to: 20, ..cfg() };
+        let c = AgentConfig {
+            max_iters: 20,
+            auto_extend_to: 20,
+            ..cfg()
+        };
         let turns = vec![
             tool_turn("fail", r#"{"n":"1"}"#),
             tool_turn("fail", r#"{"n":"2"}"#),
@@ -3929,8 +4744,14 @@ mod tests {
             tool_turn("fail", r#"{"n":"7"}"#),
             final_turn("should not reach"),
         ];
-        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
-        assert_eq!(out.stop, StopReason::Divergence, "thrash guard must stop the all-failing flail");
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::Divergence,
+            "thrash guard must stop the all-failing flail"
+        );
         // Stops on the STUCK_STOP_STREAK-th consecutive unproductive turn, not at the cap of 20.
         assert_eq!(out.iters, STUCK_STOP_STREAK);
     }
@@ -3954,9 +4775,14 @@ mod tests {
             tool_turn("echo", r#"{"text":"3"}"#),
             final_turn("done"),
         ];
-        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
         assert_eq!(out.stop, StopReason::Done);
-        assert!(out.iters > 2, "auto-extend should let it run past the initial cap");
+        assert!(
+            out.iters > 2,
+            "auto-extend should let it run past the initial cap"
+        );
     }
 
     // ── P1 anti-loop overhaul (W1/W2/W3/W4/W6/W9/W10) ─────────────────────────
@@ -3966,7 +4792,11 @@ mod tests {
         let r = registry();
         // A,B,A,B,… never converging. The old single-slot last_sig ran to MaxIters (consecutive
         // signatures always differ); the ring's 2-cycle detector must stop it within a few turns.
-        let c = AgentConfig { max_iters: 30, auto_extend_to: 30, ..cfg() };
+        let c = AgentConfig {
+            max_iters: 30,
+            auto_extend_to: 30,
+            ..cfg()
+        };
         let turns = vec![
             tool_turn("echo", r#"{"text":"a"}"#),
             tool_turn("echo", r#"{"text":"b"}"#),
@@ -3977,12 +4807,21 @@ mod tests {
             tool_turn("echo", r#"{"text":"a"}"#),
             final_turn("unreached"),
         ];
-        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
-        assert_eq!(out.stop, StopReason::Divergence, "A,B,A,B oscillation must be caught");
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::Divergence,
+            "A,B,A,B oscillation must be caught"
+        );
         // EXACTLY 6: the 2-cycle detector stops on the 6th turn. If is_two_cycle were broken, only the
         // thrash guard would act and it would stop at 7 (streak 5) — so this pins the detector, not the
         // fallback. (Complemented by the is_two_cycle unit test below.)
-        assert_eq!(out.iters, 6, "the 2-cycle detector must stop at 6, not fall through to thrash at 7");
+        assert_eq!(
+            out.iters, 6,
+            "the 2-cycle detector must stop at 6, not fall through to thrash at 7"
+        );
     }
 
     #[test]
@@ -4009,7 +4848,11 @@ mod tests {
         // A,B,A,B of two fixed-arg calls that each return NEW content every time (a legit poll/consume
         // loop). The 2-cycle detector must NOT hard-stop it: the novel content clears the latch each
         // time, so it runs to completion. (Regression test for the false-positive the review found.)
-        let c = AgentConfig { max_iters: 8, auto_extend_to: 8, ..cfg() };
+        let c = AgentConfig {
+            max_iters: 8,
+            auto_extend_to: 8,
+            ..cfg()
+        };
         let turns = vec![
             tool_turn("tick", r#"{"s":"a"}"#),
             tool_turn("tick", r#"{"s":"b"}"#),
@@ -4019,8 +4862,14 @@ mod tests {
             tool_turn("tick", r#"{"s":"b"}"#),
             final_turn("done polling"),
         ];
-        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
-        assert_eq!(out.stop, StopReason::Done, "a productive poll loop must not be flagged as divergence");
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::Done,
+            "a productive poll loop must not be flagged as divergence"
+        );
         assert_eq!(out.final_text.as_deref(), Some("done polling"));
     }
 
@@ -4029,10 +4878,18 @@ mod tests {
         // W2: reformatted-JSON whitespace and key reordering must NOT dodge the signature.
         let a = vec![call("1", "echo", r#"{"text":"x"}"#)];
         let b = vec![call("1", "echo", r#"{  "text" :   "x"  }"#)];
-        assert_eq!(turn_signature(&a), turn_signature(&b), "whitespace must not change the signature");
+        assert_eq!(
+            turn_signature(&a),
+            turn_signature(&b),
+            "whitespace must not change the signature"
+        );
         let c = vec![call("1", "t", r#"{"b":1,"a":2}"#)];
         let d = vec![call("1", "t", r#"{"a":2,"b":1}"#)];
-        assert_eq!(turn_signature(&c), turn_signature(&d), "key order must not change the signature");
+        assert_eq!(
+            turn_signature(&c),
+            turn_signature(&d),
+            "key order must not change the signature"
+        );
     }
 
     #[test]
@@ -4040,7 +4897,11 @@ mod tests {
         // W2 guardrail: a DIFFERENT read window is different work and must stay a distinct signature —
         // legit sequential paging must never be collapsed into a divergence.
         let p1 = vec![call("1", "file_read", r#"{"path":"X","start":1,"end":50}"#)];
-        let p2 = vec![call("1", "file_read", r#"{"path":"X","start":51,"end":100}"#)];
+        let p2 = vec![call(
+            "1",
+            "file_read",
+            r#"{"path":"X","start":51,"end":100}"#,
+        )];
         assert_ne!(
             turn_signature(&p1),
             turn_signature(&p2),
@@ -4054,7 +4915,11 @@ mod tests {
         // Every turn pads a failing call with a throwaway echo of CONSTANT bytes. The old guard reset
         // on the one non-failure result and never stopped; now the stale echo is not novel, so the
         // unproductive streak climbs to a stop.
-        let c = AgentConfig { max_iters: 20, auto_extend_to: 20, ..cfg() };
+        let c = AgentConfig {
+            max_iters: 20,
+            auto_extend_to: 20,
+            ..cfg()
+        };
         let turns = vec![
             multi_tool_turn(&[("fail", r#"{"n":"1"}"#), ("echo", r#"{"text":"same"}"#)]),
             multi_tool_turn(&[("fail", r#"{"n":"2"}"#), ("echo", r#"{"text":"same"}"#)]),
@@ -4065,8 +4930,14 @@ mod tests {
             multi_tool_turn(&[("fail", r#"{"n":"7"}"#), ("echo", r#"{"text":"same"}"#)]),
             final_turn("unreached"),
         ];
-        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
-        assert_eq!(out.stop, StopReason::Divergence, "a padded flail must still stop");
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::Divergence,
+            "a padded flail must still stop"
+        );
     }
 
     #[tokio::test]
@@ -4074,7 +4945,11 @@ mod tests {
         let r = registry();
         // Distinct args (no divergence) but the tool returns CONSTANT bytes — novel only once, then
         // the streak climbs to a stop. A successful-but-useless loop must terminate, not run to cap.
-        let c = AgentConfig { max_iters: 20, auto_extend_to: 20, ..cfg() };
+        let c = AgentConfig {
+            max_iters: 20,
+            auto_extend_to: 20,
+            ..cfg()
+        };
         let turns = vec![
             tool_turn("konst", r#"{"i":"1"}"#),
             tool_turn("konst", r#"{"i":"2"}"#),
@@ -4085,8 +4960,14 @@ mod tests {
             tool_turn("konst", r#"{"i":"7"}"#),
             final_turn("unreached"),
         ];
-        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
-        assert_eq!(out.stop, StopReason::Divergence, "a useless successful re-read loop must stop");
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::Divergence,
+            "a useless successful re-read loop must stop"
+        );
     }
 
     #[tokio::test]
@@ -4095,17 +4976,32 @@ mod tests {
         // THE hardest trap: the system-prompt-sanctioned recovery — a failed edit, then a re-read
         // (stale bytes) to copy exact text, then a SUCCESSFUL edit. Peak streak 2 < STUCK_NUDGE_STREAK,
         // so NO nudge and NO stop — the recovery must never be punished.
-        let c = AgentConfig { approval_mode: crate::core::approval::ApprovalMode::Yolo, max_iters: 10, auto_extend_to: 10, ..cfg() };
+        let c = AgentConfig {
+            approval_mode: crate::core::approval::ApprovalMode::Yolo,
+            max_iters: 10,
+            auto_extend_to: 10,
+            ..cfg()
+        };
         let mut messages = vec![Message::system("sys"), Message::user("task")];
         let chat = scripted(vec![
             tool_turn("echo", r#"{"text":"filecontent"}"#), // seed: read the file
-            tool_turn("fail", r#"{}"#),                      // failed edit
-            tool_turn("echo", r#"{"text":"filecontent"}"#),  // re-read to copy exact text (stale bytes)
-            tool_turn("delete", r#"{"x":"1"}"#),             // successful edit → resets everything
+            tool_turn("fail", r#"{}"#),                     // failed edit
+            tool_turn("echo", r#"{"text":"filecontent"}"#), // re-read to copy exact text (stale bytes)
+            tool_turn("delete", r#"{"x":"1"}"#),            // successful edit → resets everything
             final_turn("recovered"),
         ]);
+        // Same home-stability need as the divergence test above: the delete call's writer lease
+        // resolves its lock path through `nextgen_home()`, and a concurrent sandbox flip can fail
+        // it — turning the "successful edit resets everything" step into a failure.
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
-        assert_eq!(out.stop, StopReason::Done, "legit re-read→retry recovery must not be punished");
+        assert_eq!(
+            out.stop,
+            StopReason::Done,
+            "legit re-read→retry recovery must not be punished"
+        );
         assert_eq!(out.final_text.as_deref(), Some("recovered"));
         // Peak streak is 2 (< STUCK_NUDGE_STREAK) and no signature repeats, so NO nudge of either
         // kind must appear — the documented "not punished" property, now asserted.
@@ -4126,7 +5022,12 @@ mod tests {
         // run to the extended cap re-executing the side effect. Regression guard: a successful edit is
         // "productive" for the thrash streak but must NOT clear the divergence latch (only novel
         // content does), or the insert()==false hard-stop becomes unreachable.
-        let c = AgentConfig { approval_mode: crate::core::approval::ApprovalMode::Yolo, max_iters: 4, auto_extend_to: 20, ..cfg() };
+        let c = AgentConfig {
+            approval_mode: crate::core::approval::ApprovalMode::Yolo,
+            max_iters: 4,
+            auto_extend_to: 20,
+            ..cfg()
+        };
         let turns = vec![
             tool_turn("delete", r#"{}"#),
             tool_turn("delete", r#"{}"#),
@@ -4135,22 +5036,51 @@ mod tests {
             tool_turn("delete", r#"{}"#),
             final_turn("unreached"),
         ];
-        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
-        assert_eq!(out.stop, StopReason::Divergence, "a repeated identical destructive call must stop");
-        assert_eq!(out.iters, 3, "must hard-stop by the 3rd identical call, not run to the extended cap");
+        // Serialize with home-MUTATING sandbox tests: the destructive call's writer lease resolves
+        // its lock path through `nextgen_home()` AT ACQUIRE TIME, so a concurrent sandbox flip
+        // (AIZEN_HOME repointed / tree deleted) can fail call #1 — then the first SUCCESS lands on
+        // the nudge iteration, its novel content clears the divergence latch once, and the
+        // hard-stop drifts 3 → 4. The exact-iteration assertion below needs a stable home.
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::Divergence,
+            "a repeated identical destructive call must stop"
+        );
+        assert_eq!(
+            out.iters, 3,
+            "must hard-stop by the 3rd identical call, not run to the extended cap"
+        );
     }
 
     #[test]
     fn auto_checkpoint_defaults_on_and_off_in_tests() {
         // W15: production defaults the auto-checkpoint latch ON, but the unit-test cfg() forces it
         // OFF (the test cwd is a real git repo — a checkpoint per destructive test would pollute it).
-        assert!(AgentConfig::default().auto_checkpoint, "production default must be ON");
-        assert!(!cfg().auto_checkpoint, "test cfg must force it OFF to avoid repo pollution");
+        assert!(
+            AgentConfig::default().auto_checkpoint,
+            "production default must be ON"
+        );
+        assert!(
+            !cfg().auto_checkpoint,
+            "test cfg must force it OFF to avoid repo pollution"
+        );
         // The per-edit-turn checkpoint (Cline-style: a restore point after EACH editing turn, not
         // just once before the first) is gated behind the SAME latch, so it also defaults ON in
         // production and OFF in tests — a per-edit checkpoint would pollute the real test repo.
-        assert!(AgentConfig::default().checkpoint_each_edit, "per-edit checkpoint default must be ON");
-        assert!(!cfg().checkpoint_each_edit, "test cfg must force per-edit checkpoint OFF");
+        assert!(
+            AgentConfig::default().checkpoint_each_edit,
+            "per-edit checkpoint default must be ON"
+        );
+        assert!(
+            !cfg().checkpoint_each_edit,
+            "test cfg must force per-edit checkpoint OFF"
+        );
     }
 
     #[tokio::test]
@@ -4158,7 +5088,12 @@ mod tests {
         let r = registry();
         // A big task that lands many DISTINCT successful edits must never be flagged: each edit is
         // productive (streak pinned 0) and distinct args keep signatures distinct (no divergence).
-        let c = AgentConfig { approval_mode: crate::core::approval::ApprovalMode::Yolo, max_iters: 30, auto_extend_to: 30, ..cfg() };
+        let c = AgentConfig {
+            approval_mode: crate::core::approval::ApprovalMode::Yolo,
+            max_iters: 30,
+            auto_extend_to: 30,
+            ..cfg()
+        };
         let turns = vec![
             tool_turn("delete", r#"{"d":"1"}"#),
             tool_turn("delete", r#"{"d":"2"}"#),
@@ -4170,8 +5105,14 @@ mod tests {
             tool_turn("delete", r#"{"d":"8"}"#),
             final_turn("all done"),
         ];
-        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
-        assert_eq!(out.stop, StopReason::Done, "a legit many-edit task must complete");
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::Done,
+            "a legit many-edit task must complete"
+        );
         assert_eq!(out.final_text.as_deref(), Some("all done"));
     }
 
@@ -4181,7 +5122,11 @@ mod tests {
         // W6: a repeated call, then genuine progress (clears the nudge memory), then the SAME call
         // repeats again — it must earn a FRESH nudge and recover. The old run-global latch would have
         // hard-stopped Divergence at the later repeat.
-        let c = AgentConfig { max_iters: 12, auto_extend_to: 12, ..cfg() };
+        let c = AgentConfig {
+            max_iters: 12,
+            auto_extend_to: 12,
+            ..cfg()
+        };
         let turns = vec![
             tool_turn("echo", r#"{"text":"x"}"#),
             tool_turn("echo", r#"{"text":"x"}"#), // immediate repeat → nudge
@@ -4190,8 +5135,14 @@ mod tests {
             tool_turn("echo", r#"{"text":"x"}"#), // repeat again → FRESH nudge (not a hard stop)
             final_turn("recovered"),
         ];
-        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
-        assert_eq!(out.stop, StopReason::Done, "a repeat after real progress gets a fresh nudge, not a stop");
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::Done,
+            "a repeat after real progress gets a fresh nudge, not a stop"
+        );
         assert_eq!(out.final_text.as_deref(), Some("recovered"));
     }
 
@@ -4200,24 +5151,38 @@ mod tests {
         let r = registry();
         // W9: 3 productive echoes exhaust the cap; the tool-free synthesis call then produces a final
         // answer where the old code returned None.
-        let c = AgentConfig { max_iters: 3, auto_extend_to: 3, ..cfg() };
+        let c = AgentConfig {
+            max_iters: 3,
+            auto_extend_to: 3,
+            ..cfg()
+        };
         let turns = vec![
             tool_turn("echo", r#"{"text":"1"}"#),
             tool_turn("echo", r#"{"text":"2"}"#),
             tool_turn("echo", r#"{"text":"3"}"#),
             final_turn("synth-answer"), // consumed by the synthesis call
         ];
-        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
         assert_eq!(out.stop, StopReason::MaxIters);
         assert_eq!(out.iters, 3);
-        assert_eq!(out.final_text.as_deref(), Some("synth-answer"), "MaxIters must synthesize an answer");
+        assert_eq!(
+            out.final_text.as_deref(),
+            Some("synth-answer"),
+            "MaxIters must synthesize an answer"
+        );
     }
 
     #[tokio::test]
     async fn maxiters_synthesis_degrades_to_none_on_error() {
         let r = registry();
         // If the synthesis call itself errors, MaxIters degrades to final_text None without panicking.
-        let c = AgentConfig { max_iters: 3, auto_extend_to: 3, ..cfg() };
+        let c = AgentConfig {
+            max_iters: 3,
+            auto_extend_to: 3,
+            ..cfg()
+        };
         let calls = Mutex::new(0usize);
         let chat = move |msgs: Vec<Message>, _defs: Vec<ToolDef>| {
             let is_synth = msgs
@@ -4235,13 +5200,20 @@ mod tests {
         };
         let out = run_agent(chat, &c, &r, "sys", "task").await.unwrap();
         assert_eq!(out.stop, StopReason::MaxIters);
-        assert_eq!(out.final_text, None, "a failed synthesis degrades cleanly to None");
+        assert_eq!(
+            out.final_text, None,
+            "a failed synthesis degrades cleanly to None"
+        );
     }
 
     #[tokio::test]
     async fn maxiters_synthesis_uses_throwaway_clone_and_empty_defs() {
         let r = registry();
-        let c = AgentConfig { max_iters: 2, auto_extend_to: 2, ..cfg() };
+        let c = AgentConfig {
+            max_iters: 2,
+            auto_extend_to: 2,
+            ..cfg()
+        };
         let mut messages = vec![Message::system("sys"), Message::user("task")];
         let saw_synth = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let defs_empty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4268,17 +5240,28 @@ mod tests {
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
         use std::sync::atomic::Ordering::Relaxed;
         assert_eq!(out.stop, StopReason::MaxIters);
-        assert!(saw_synth.load(Relaxed), "the synthesis call must fire on MaxIters");
-        assert!(defs_empty.load(Relaxed), "synthesis must pass EMPTY tool defs (tool-free)");
+        assert!(
+            saw_synth.load(Relaxed),
+            "the synthesis call must fire on MaxIters"
+        );
+        assert!(
+            defs_empty.load(Relaxed),
+            "synthesis must pass EMPTY tool defs (tool-free)"
+        );
         assert_eq!(out.final_text.as_deref(), Some("final answer"));
         // Throwaway-clone invariant (#3): the synthesis PROMPT must not leak into real history…
         assert!(
-            !messages.iter().any(|m| m.content.as_deref().is_some_and(|c| c.contains("reached the step limit"))),
+            !messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|c| c.contains("reached the step limit"))),
             "the synthesis prompt must live only on the throwaway clone, never real messages"
         );
         // …but the synthesized ANSWER is appended so multi-turn callers keep it.
         assert!(
-            messages.iter().any(|m| m.role == "assistant" && m.content.as_deref() == Some("final answer")),
+            messages
+                .iter()
+                .any(|m| m.role == "assistant" && m.content.as_deref() == Some("final answer")),
             "the synthesized answer must be appended for the caller"
         );
     }
@@ -4288,15 +5271,25 @@ mod tests {
         let r = registry();
         // W10: a wandering run (unproductive at the cap) must NOT be granted the extension — it
         // proceeds to the MaxIters synthesis at the base cap instead of getting a bigger budget.
-        let c = AgentConfig { max_iters: 3, auto_extend_to: 6, ..cfg() };
+        let c = AgentConfig {
+            max_iters: 3,
+            auto_extend_to: 6,
+            ..cfg()
+        };
         let turns = vec![
             tool_turn("fail", r#"{"n":"1"}"#),
             tool_turn("fail", r#"{"n":"2"}"#),
             tool_turn("fail", r#"{"n":"3"}"#),
             final_turn("final"),
         ];
-        let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
-        assert_eq!(out.stop, StopReason::MaxIters, "a wanderer must hit MaxIters, not get extended");
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::MaxIters,
+            "a wanderer must hit MaxIters, not get extended"
+        );
         assert_eq!(out.iters, 3, "the extension to 6 must be denied");
     }
 
@@ -4325,9 +5318,16 @@ mod tests {
         assert_eq!(out.stop, StopReason::Done);
         let warnings = messages
             .iter()
-            .filter(|m| m.content.as_deref().is_some_and(|c| c.contains("Context is nearly full")))
+            .filter(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains("Context is nearly full"))
+            })
             .count();
-        assert_eq!(warnings, 1, "the budget nudge must fire exactly once, not per-iteration");
+        assert_eq!(
+            warnings, 1,
+            "the budget nudge must fire exactly once, not per-iteration"
+        );
     }
 
     #[tokio::test]
@@ -4344,10 +5344,16 @@ mod tests {
             ..Default::default()
         };
         let mut messages = vec![Message::system("sys"), Message::user("x".repeat(5000))];
-        let chat = scripted(vec![tool_turn("echo", r#"{"text":"a"}"#), final_turn("done")]);
+        let chat = scripted(vec![
+            tool_turn("echo", r#"{"text":"a"}"#),
+            final_turn("done"),
+        ]);
         run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
         assert!(
-            !messages.iter().any(|m| m.content.as_deref().is_some_and(|c| c.contains("Context is nearly full"))),
+            !messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|c| c.contains("Context is nearly full"))),
             "guard must stay silent when context_window is 0"
         );
     }
@@ -4358,7 +5364,10 @@ mod tests {
         // half-full window must trip it; set it to 0 and even a full window must not.
         let r = registry();
         let mk = |pct: u8| AgentConfig {
-            max_iters: 5, auto_extend_to: 5, quiet: true, context_window: 100,
+            max_iters: 5,
+            auto_extend_to: 5,
+            quiet: true,
+            context_window: 100,
             context_guard_pct: pct,
             clear_at_pct: 0,
             compact_at_pct: 0,
@@ -4370,16 +5379,43 @@ mod tests {
         // ~260 chars ≈ 65 tok → past 50% but under 90% of the 100-tok window.
         let hist = || vec![Message::system("sys"), Message::user("x".repeat(260))];
         let fired = |msgs: &[Message]| {
-            msgs.iter().any(|m| m.content.as_deref().is_some_and(|c| c.contains("Context is nearly full")))
+            msgs.iter().any(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains("Context is nearly full"))
+            })
         };
 
         let mut m50 = hist();
-        run_agent_loop(scripted(vec![tool_turn("echo", r#"{"text":"a"}"#), final_turn("done")]), &mk(50), &r, &mut m50).await.unwrap();
+        run_agent_loop(
+            scripted(vec![
+                tool_turn("echo", r#"{"text":"a"}"#),
+                final_turn("done"),
+            ]),
+            &mk(50),
+            &r,
+            &mut m50,
+        )
+        .await
+        .unwrap();
         assert!(fired(&m50), "guard at 50% must trip on a ~65% window");
 
         let mut m0 = hist();
-        run_agent_loop(scripted(vec![tool_turn("echo", r#"{"text":"a"}"#), final_turn("done")]), &mk(0), &r, &mut m0).await.unwrap();
-        assert!(!fired(&m0), "context_guard_pct=0 disables the wrap-up guard");
+        run_agent_loop(
+            scripted(vec![
+                tool_turn("echo", r#"{"text":"a"}"#),
+                final_turn("done"),
+            ]),
+            &mk(0),
+            &r,
+            &mut m0,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !fired(&m0),
+            "context_guard_pct=0 disables the wrap-up guard"
+        );
     }
 
     #[test]
@@ -4392,7 +5428,10 @@ mod tests {
         m.content = None;
         m.tool_calls = vec![call("a", "file_edit", &big_args)];
         let tok = estimate_message_tokens(&m);
-        assert!(tok >= 1000, "4000-char arguments must dominate the estimate, got {tok}");
+        assert!(
+            tok >= 1000,
+            "4000-char arguments must dominate the estimate, got {tok}"
+        );
         // Content-only messages count content/4 plus the flat envelope.
         let plain = Message::user("abcd".repeat(100)); // 400 chars → 100 tok
         assert_eq!(estimate_message_tokens(&plain), 100 + MSG_OVERHEAD_TOK);
@@ -4402,45 +5441,106 @@ mod tests {
     fn defs_overhead_is_deterministic_and_published() {
         let r = registry();
         let tok = estimate_defs_tokens(&r.defs());
-        assert!(tok > 0, "two registered tools must have a nonzero schema cost");
-        assert_eq!(estimate_defs_tokens(&r.defs()), tok, "same defs → same estimate");
-        assert!(schema_overhead_tokens() > 0, "the loop-published global must be readable");
+        assert!(
+            tok > 0,
+            "two registered tools must have a nonzero schema cost"
+        );
+        assert_eq!(
+            estimate_defs_tokens(&r.defs()),
+            tok,
+            "same defs → same estimate"
+        );
+        assert!(
+            schema_overhead_tokens() > 0,
+            "the loop-published global must be readable"
+        );
     }
 
     #[test]
     fn effective_tokens_prefers_anchor_and_tracks_growth() {
-        assert_eq!(effective_tokens(500, None), 500, "no anchor → plain estimate");
-        let a = RealAnchor { tokens: 900, est_at: 300 };
-        assert_eq!(effective_tokens(300, Some(&a)), 900, "at the anchor point → the real number");
-        assert_eq!(effective_tokens(350, Some(&a)), 950, "growth rides on the real base");
-        assert_eq!(effective_tokens(250, Some(&a)), 900, "never below the real base (saturating)");
+        assert_eq!(
+            effective_tokens(500, None),
+            500,
+            "no anchor → plain estimate"
+        );
+        let a = RealAnchor {
+            tokens: 900,
+            est_at: 300,
+        };
+        assert_eq!(
+            effective_tokens(300, Some(&a)),
+            900,
+            "at the anchor point → the real number"
+        );
+        assert_eq!(
+            effective_tokens(350, Some(&a)),
+            950,
+            "growth rides on the real base"
+        );
+        assert_eq!(
+            effective_tokens(250, Some(&a)),
+            900,
+            "never below the real base (saturating)"
+        );
     }
 
     #[test]
     fn prompt_tier_heuristic_and_override() {
         // Small/local families and size suffixes → strict.
-        assert_eq!(prompt_tier_for("qwen2.5-coder-7b", None), PromptTier::Strict);
-        assert_eq!(prompt_tier_for("Llama-3.3-70B-Instruct", None), PromptTier::Strict, "llama family is strict");
-        assert_eq!(prompt_tier_for("gpt-4o-mini", None), PromptTier::Strict, "mini tier is strict");
-        assert_eq!(prompt_tier_for("mistral-small-latest", None), PromptTier::Strict);
-        assert_eq!(prompt_tier_for("some-model-14b", None), PromptTier::Strict, "size suffix");
+        assert_eq!(
+            prompt_tier_for("qwen2.5-coder-7b", None),
+            PromptTier::Strict
+        );
+        assert_eq!(
+            prompt_tier_for("Llama-3.3-70B-Instruct", None),
+            PromptTier::Strict,
+            "llama family is strict"
+        );
+        assert_eq!(
+            prompt_tier_for("gpt-4o-mini", None),
+            PromptTier::Strict,
+            "mini tier is strict"
+        );
+        assert_eq!(
+            prompt_tier_for("mistral-small-latest", None),
+            PromptTier::Strict
+        );
+        assert_eq!(
+            prompt_tier_for("some-model-14b", None),
+            PromptTier::Strict,
+            "size suffix"
+        );
         // Frontier / unknown → full (the safe default).
         assert_eq!(prompt_tier_for("claude-sonnet-4-6", None), PromptTier::Full);
         assert_eq!(prompt_tier_for("gpt-4o", None), PromptTier::Full);
-        assert_eq!(prompt_tier_for("totally-unknown-model", None), PromptTier::Full);
+        assert_eq!(
+            prompt_tier_for("totally-unknown-model", None),
+            PromptTier::Full
+        );
         // Whole-token matching: substrings never false-positive.
         assert_eq!(prompt_tier_for("geminiacs-pro", None), PromptTier::Full);
-        assert_eq!(prompt_tier_for("nanotech-writer-xl", None), PromptTier::Full);
+        assert_eq!(
+            prompt_tier_for("nanotech-writer-xl", None),
+            PromptTier::Full
+        );
         // Config override beats the heuristic, both ways.
-        assert_eq!(prompt_tier_for("gpt-4o", Some("strict")), PromptTier::Strict);
-        assert_eq!(prompt_tier_for("qwen2.5-coder-7b", Some("full")), PromptTier::Full);
+        assert_eq!(
+            prompt_tier_for("gpt-4o", Some("strict")),
+            PromptTier::Strict
+        );
+        assert_eq!(
+            prompt_tier_for("qwen2.5-coder-7b", Some("full")),
+            PromptTier::Full
+        );
     }
 
     #[test]
     fn system_prompt_is_byte_stable_per_tier() {
         // build_system_prompt reads global HOME state (skills/persona/config) — serialize with the
         // other sandboxing tests or a concurrent skill-write makes the two builds differ.
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Same inputs → identical bytes (the prefix-cache invariant), on both tiers.
         let a = build_system_prompt("/w", "linux", "2026-07-05", "gpt-4o", None);
         let b = build_system_prompt("/w", "linux", "2026-07-05", "gpt-4o", None);
@@ -4448,7 +5548,10 @@ mod tests {
         let s1 = build_system_prompt("/w", "linux", "2026-07-05", "qwen2.5-coder-7b", None);
         let s2 = build_system_prompt("/w", "linux", "2026-07-05", "qwen2.5-coder-7b", None);
         assert_eq!(s1, s2, "strict tier must be deterministic");
-        assert!(s1.starts_with(system_base_strict().trim_end()), "strict base leads the strict prompt");
+        assert!(
+            s1.starts_with(system_base_strict().trim_end()),
+            "strict base leads the strict prompt"
+        );
         assert!(s1.contains("OUTPUT CONTRACT"));
     }
 
@@ -4458,10 +5561,16 @@ mod tests {
         // decode) or drop the branding. Cheap guard so obfuscation can't silently break the prompt.
         let base = system_base();
         assert!(!base.is_empty(), "base prompt decoded empty");
-        assert!(base.to_lowercase().contains("aizen"), "decoded base prompt mentions aizen");
+        assert!(
+            base.to_lowercase().contains("aizen"),
+            "decoded base prompt mentions aizen"
+        );
         let strict = system_base_strict();
         assert!(!strict.is_empty(), "strict prompt decoded empty");
-        assert!(strict.contains("OUTPUT CONTRACT"), "strict prompt keeps its contract section");
+        assert!(
+            strict.contains("OUTPUT CONTRACT"),
+            "strict prompt keeps its contract section"
+        );
     }
 
     #[test]
@@ -4475,7 +5584,10 @@ mod tests {
         assert!(accept_anchor(100, 100));
         assert!(accept_anchor(25, 100), "est/4 boundary is accepted");
         assert!(accept_anchor(400, 100), "est*4 boundary is accepted");
-        assert!(!accept_anchor(24, 100), "below est/4 → cumulative-gateway garbage");
+        assert!(
+            !accept_anchor(24, 100),
+            "below est/4 → cumulative-gateway garbage"
+        );
         assert!(!accept_anchor(401, 100), "above est*4 → garbage");
     }
 
@@ -4496,8 +5608,10 @@ mod tests {
         let mut messages = vec![Message::system("sys"), Message::user("x".repeat(1200))];
         // …but the provider reports the request REALLY was 950 prompt tokens (code-heavy tokenization).
         let mut anchored = tool_turn("echo", r#"{"text":"a"}"#);
-        anchored.usage =
-            Some(crate::core::types::Usage { prompt_tokens: Some(950), ..Default::default() });
+        anchored.usage = Some(crate::core::types::Usage {
+            prompt_tokens: Some(950),
+            ..Default::default()
+        });
         let chat = scripted(vec![anchored, final_turn("done")]);
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
         assert_eq!(out.stop, StopReason::Done);
@@ -4511,7 +5625,11 @@ mod tests {
     async fn compacting_loop_summarizes_older_turns_when_over_threshold() {
         let r = registry();
         // window 100 tok, compact at 80% — the bulky multi-turn history below blows past it.
-        let c = AgentConfig { context_window: 100, compact_at_pct: 80, ..cfg() };
+        let c = AgentConfig {
+            context_window: 100,
+            compact_at_pct: 80,
+            ..cfg()
+        };
         let mut messages = vec![
             Message::system("sys"),
             Message::user(format!("u1 {}", "x".repeat(200))),
@@ -4521,18 +5639,34 @@ mod tests {
             Message::user(format!("u3 {}", "z".repeat(200))),
         ];
         let summarize = |_msgs: Vec<Message>| async { Ok("DENSE_SUMMARY_OK".to_string()) };
-        let out = run_agent_loop_compacting(scripted(vec![final_turn("done")]), summarize, &c, &r, &mut messages)
-            .await
-            .unwrap();
+        let out = run_agent_loop_compacting(
+            scripted(vec![final_turn("done")]),
+            summarize,
+            &c,
+            &r,
+            &mut messages,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.stop, StopReason::Done);
-        assert_eq!(messages[0].content.as_deref(), Some("sys"), "system prompt preserved at [0]");
+        assert_eq!(
+            messages[0].content.as_deref(),
+            Some("sys"),
+            "system prompt preserved at [0]"
+        );
         assert!(
-            messages.iter().any(|m| m.content.as_deref().is_some_and(|x| x.contains("DENSE_SUMMARY_OK"))),
+            messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|x| x.contains("DENSE_SUMMARY_OK"))),
             "older turns were summarized into the injected compaction note"
         );
         // The bulky first turn was folded into the summary (no longer present verbatim).
         assert!(
-            !messages.iter().any(|m| m.content.as_deref().is_some_and(|x| x.contains(&"x".repeat(200)))),
+            !messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|x| x.contains(&"x".repeat(200)))),
             "the oldest bulky turn was compacted away"
         );
     }
@@ -4548,11 +5682,14 @@ mod tests {
             call("3", "echo", r#"{"text":"third"}"#),
         ];
         let results = exec(&r, &calls, &cfg()).await;
-        assert_eq!(results, vec![
-            ("1".to_string(), "first".to_string()),
-            ("2".to_string(), "second".to_string()),
-            ("3".to_string(), "third".to_string()),
-        ]);
+        assert_eq!(
+            results,
+            vec![
+                ("1".to_string(), "first".to_string()),
+                ("2".to_string(), "second".to_string()),
+                ("3".to_string(), "third".to_string()),
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4560,11 +5697,18 @@ mod tests {
         // echo + fail are both read-only/safe → concurrent; one tool's error must not drop its
         // sibling's result (fail-soft, no sibling abort).
         let r = registry();
-        let calls = vec![call("1", "echo", r#"{"text":"ok"}"#), call("2", "fail", "{}")];
+        let calls = vec![
+            call("1", "echo", r#"{"text":"ok"}"#),
+            call("2", "fail", "{}"),
+        ];
         let results = exec(&r, &calls, &cfg()).await;
         assert_eq!(results[0], ("1".to_string(), "ok".to_string()));
         assert_eq!(results[1].0, "2");
-        assert!(results[1].1.contains("boom"), "tool error fed back, got {:?}", results[1].1);
+        assert!(
+            results[1].1.contains("boom"),
+            "tool error fed back, got {:?}",
+            results[1].1
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4573,11 +5717,18 @@ mod tests {
         // BEFORE it still executes concurrently-eligible; order kept.
         // non-TTY test env → delete safe-denied.
         let r = registry();
-        let calls = vec![call("1", "echo", r#"{"text":"x"}"#), call("2", "delete", "{}")];
+        let calls = vec![
+            call("1", "echo", r#"{"text":"x"}"#),
+            call("2", "delete", "{}"),
+        ];
         let results = exec(&r, &calls, &cfg()).await;
         assert_eq!(results.len(), 2);
         assert_eq!(results[0], ("1".to_string(), "x".to_string()));
-        assert!(results[1].1.contains("declined"), "destructive denied non-TTY, got {:?}", results[1].1);
+        assert!(
+            results[1].1.contains("declined"),
+            "destructive denied non-TTY, got {:?}",
+            results[1].1
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4608,46 +5759,92 @@ mod tests {
         // enable_self_review + an edit → the first "done" is intercepted by ONE review turn
         // (nudge mode — no oracle), the second "done" is accepted.
         let r = registry();
-        let c = AgentConfig { enable_self_review: true, approval_mode: crate::core::approval::ApprovalMode::Yolo, ..cfg() };
+        let c = AgentConfig {
+            enable_self_review: true,
+            approval_mode: crate::core::approval::ApprovalMode::Yolo,
+            ..cfg()
+        };
         let mut messages = vec![Message::system("sys"), Message::user("edit something")];
         let chat = scripted(vec![
             tool_turn("delete", "{}"), // a successful destructive op arms made_any_edits
             final_turn("first done"),  // intercepted by the self-review nudge
             final_turn("second done"), // accepted
         ]);
+        // Home-stability: a lease failure on the delete call would leave made_any_edits false and
+        // the property under test (exactly one review turn) silently unexercised.
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
         assert_eq!(out.stop, StopReason::Done);
         assert_eq!(out.final_text.as_deref(), Some("second done"));
         let reviews = messages
             .iter()
-            .filter(|m| m.role == "user" && m.content.as_deref().is_some_and(|c| c.starts_with("[self-review]")))
+            .filter(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with("[self-review]"))
+            })
             .count();
         assert_eq!(reviews, 1, "exactly one review turn, never a loop");
         assert_valid_history(&messages);
     }
 
     #[test]
+    fn review_request_uses_newest_real_turn_and_strips_injected_prefixes() {
+        let messages = vec![
+            Message::user("old request"),
+            Message::tool_result("clarify-1", "question"),
+            Message::user(
+                "<codebase_context>\nretrieved source\n</codebase_context>\n\nRecalled memory\n\noption 2",
+            ),
+        ];
+        let request = capture_review_request(&messages);
+        assert!(request.contains("old request"));
+        assert!(request.contains("option 2"));
+        assert!(!request.contains("retrieved source"));
+        assert!(!request.contains("Recalled memory"));
+    }
+
+    #[test]
     fn review_blocking_classification() {
         // A [BLOCKING] tag anywhere → gates Done; an all-[ADVISORY] review does not.
-        assert!(review_is_blocking("[BLOCKING] src/a.rs:10 off-by-one in the loop bound"));
         assert!(review_is_blocking(
-            "[ADVISORY] rename foo\n[BLOCKING] src/b.rs:3 missed the null check"
-        ), "one blocking line among advisories still gates");
+            "[BLOCKING] src/a.rs:10 off-by-one in the loop bound"
+        ));
+        assert!(
+            review_is_blocking(
+                "[ADVISORY] rename foo\n[BLOCKING] src/b.rs:3 missed the null check"
+            ),
+            "one blocking line among advisories still gates"
+        );
         assert!(review_is_blocking("[blocking] lowercase tag still counts"));
-        assert!(!review_is_blocking("[ADVISORY] tidy the imports\n[ADVISORY] add a doc comment"));
+        assert!(!review_is_blocking(
+            "[ADVISORY] tidy the imports\n[ADVISORY] add a doc comment"
+        ));
         assert!(!review_is_blocking("looks fine, just nits"));
     }
 
     #[tokio::test]
     async fn self_review_skipped_without_edits() {
         let r = registry();
-        let c = AgentConfig { enable_self_review: true, ..cfg() };
+        let c = AgentConfig {
+            enable_self_review: true,
+            ..cfg()
+        };
         let mut messages = vec![Message::system("sys"), Message::user("just a question")];
-        let chat = scripted(vec![tool_turn("echo", r#"{"text":"look"}"#), final_turn("answer")]);
+        let chat = scripted(vec![
+            tool_turn("echo", r#"{"text":"look"}"#),
+            final_turn("answer"),
+        ]);
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
         assert_eq!(out.final_text.as_deref(), Some("answer"));
         assert!(
-            !messages.iter().any(|m| m.content.as_deref().is_some_and(|c| c.starts_with("[self-review]"))),
+            !messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|c| c.starts_with("[self-review]"))),
             "read-only runs never pay the review turn"
         );
     }
@@ -4655,7 +5852,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn execute_calls_adopts_eager_handles_by_position() {
         let r = registry();
-        let calls = vec![call("1", "echo", r#"{"text":"fresh"}"#), call("2", "echo", r#"{"text":"normal"}"#)];
+        let calls = vec![
+            call("1", "echo", r#"{"text":"fresh"}"#),
+            call("2", "echo", r#"{"text":"normal"}"#),
+        ];
         // Position 0 was eagerly started (with a distinguishable payload) — adoption must use it,
         // never re-run the tool.
         let h = tokio::task::spawn_blocking(|| "EAGER_RESULT".to_string());
@@ -4665,10 +5865,23 @@ mod tests {
             .collect();
         let mut checkpointed = false;
         let mut writer_lease = None;
-        let results = execute_calls(&r, &calls, &cfg(), &mut sink, vec![(0, h)], &mut checkpointed, &mut writer_lease).await;
+        let results = execute_calls(
+            &r,
+            &calls,
+            &cfg(),
+            &mut sink,
+            vec![(0, h)],
+            &mut checkpointed,
+            &mut writer_lease,
+        )
+        .await;
         assert_eq!(results[0].1, "EAGER_RESULT", "adopted, not re-executed");
         assert_eq!(results[1].1, "normal", "non-eager sibling runs normally");
-        assert_eq!(sink[0].content.as_deref(), Some("EAGER_RESULT"), "sink mirrors the adopted result");
+        assert_eq!(
+            sink[0].content.as_deref(),
+            Some("EAGER_RESULT"),
+            "sink mirrors the adopted result"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4681,9 +5894,15 @@ mod tests {
         assert!(h.is_some(), "read-only call starts eagerly");
         assert_eq!(h.unwrap().await.unwrap(), "a", "the eager body really ran");
         // Destructive call → None AND trips the barrier…
-        assert!(starter(1, &call("2", "delete", "{}")).is_none(), "writes never start early");
+        assert!(
+            starter(1, &call("2", "delete", "{}")).is_none(),
+            "writes never start early"
+        );
         // …so a safe call AFTER it must not start either (prefix rule = barrier semantics).
-        assert!(starter(2, &call("3", "echo", r#"{"text":"b"}"#)).is_none(), "post-barrier calls wait");
+        assert!(
+            starter(2, &call("3", "echo", r#"{"text":"b"}"#)).is_none(),
+            "post-barrier calls wait"
+        );
     }
 
     /// Records event order across threads for the barrier-semantics + drop tests.
@@ -4710,7 +5929,10 @@ mod tests {
             !self.destructive
         }
         fn execute(&self, _args: &serde_json::Value) -> Result<String> {
-            self.log.lock().unwrap().push(format!("{}:start", self.name));
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:start", self.name));
             std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
             self.log.lock().unwrap().push(format!("{}:end", self.name));
             Ok(format!("{} done", self.name))
@@ -4724,10 +5946,30 @@ mod tests {
         // post-write state.
         let log = std::sync::Arc::new(Mutex::new(Vec::new()));
         let mut r = ToolRegistry::new();
-        r.register(Box::new(RecordingTool { name: "read_a", destructive: false, log: log.clone(), delay_ms: 20 }));
-        r.register(Box::new(RecordingTool { name: "read_b", destructive: false, log: log.clone(), delay_ms: 5 }));
-        r.register(Box::new(RecordingTool { name: "write_w", destructive: true, log: log.clone(), delay_ms: 5 }));
-        r.register(Box::new(RecordingTool { name: "read_c", destructive: false, log: log.clone(), delay_ms: 5 }));
+        r.register(Box::new(RecordingTool {
+            name: "read_a",
+            destructive: false,
+            log: log.clone(),
+            delay_ms: 20,
+        }));
+        r.register(Box::new(RecordingTool {
+            name: "read_b",
+            destructive: false,
+            log: log.clone(),
+            delay_ms: 5,
+        }));
+        r.register(Box::new(RecordingTool {
+            name: "write_w",
+            destructive: true,
+            log: log.clone(),
+            delay_ms: 5,
+        }));
+        r.register(Box::new(RecordingTool {
+            name: "read_c",
+            destructive: false,
+            log: log.clone(),
+            delay_ms: 5,
+        }));
         let mut c = cfg();
         c.approval_mode = crate::core::approval::ApprovalMode::Yolo; // clear the write barrier without a prompt
         let calls = vec![
@@ -4737,9 +5979,17 @@ mod tests {
             call("4", "read_c", "{}"),
         ];
         let results = exec(&r, &calls, &c).await;
-        assert!(results.iter().all(|(_, out)| out.contains("done")), "{results:?}");
+        assert!(
+            results.iter().all(|(_, out)| out.contains("done")),
+            "{results:?}"
+        );
         let events = log.lock().unwrap().clone();
-        let pos = |e: &str| events.iter().position(|x| x == e).unwrap_or_else(|| panic!("missing {e} in {events:?}"));
+        let pos = |e: &str| {
+            events
+                .iter()
+                .position(|x| x == e)
+                .unwrap_or_else(|| panic!("missing {e} in {events:?}"))
+        };
         assert!(pos("read_a:end") < pos("write_w:start"), "{events:?}");
         assert!(pos("read_b:end") < pos("write_w:start"), "{events:?}");
         assert!(pos("write_w:end") < pos("read_c:start"), "{events:?}");
@@ -4752,7 +6002,12 @@ mod tests {
         // work never completed. Strict gateways 400 on anything less.
         let log = std::sync::Arc::new(Mutex::new(Vec::new()));
         let mut r = ToolRegistry::new();
-        r.register(Box::new(RecordingTool { name: "slow_read", destructive: false, log, delay_ms: 400 }));
+        r.register(Box::new(RecordingTool {
+            name: "slow_read",
+            destructive: false,
+            log,
+            delay_ms: 400,
+        }));
         let c = cfg();
         let mut messages = vec![Message::system("sys"), Message::user("task")];
         {
@@ -4768,7 +6023,10 @@ mod tests {
         }
         assert_valid_history(&messages);
         let last = messages.last().unwrap();
-        assert_eq!(last.role, "tool", "history ends in the placeholder tool result");
+        assert_eq!(
+            last.role, "tool",
+            "history ends in the placeholder tool result"
+        );
         assert_eq!(last.content.as_deref(), Some(INTERRUPTED_TOOL_PLACEHOLDER));
     }
 
@@ -4790,9 +6048,15 @@ mod tests {
             usage: None,
             eager: Vec::new(),
         };
-        let out = run_agent(scripted(vec![multi, final_turn("done")]), &cfg(), &r, "sys", "task")
-            .await
-            .unwrap();
+        let out = run_agent(
+            scripted(vec![multi, final_turn("done")]),
+            &cfg(),
+            &r,
+            "sys",
+            "task",
+        )
+        .await
+        .unwrap();
         assert_eq!(out.stop, StopReason::Done);
         assert_eq!(out.final_text.as_deref(), Some("done"));
     }
@@ -4803,19 +6067,39 @@ mod tests {
         // read-only turn, an unknown tool, or a denied/errored destructive op must NOT arm.
         let r = registry();
         let res = |id: &str, s: &str| vec![(id.to_string(), s.to_string())];
-        assert!(turn_made_edits(&r, &[call("1", "delete", "{}")], &res("1", "deleted")));
+        assert!(turn_made_edits(
+            &r,
+            &[call("1", "delete", "{}")],
+            &res("1", "deleted")
+        ));
         assert!(
-            !turn_made_edits(&r, &[call("1", "delete", "{}")], &res("1", "error: the user declined this action")),
+            !turn_made_edits(
+                &r,
+                &[call("1", "delete", "{}")],
+                &res("1", "error: the user declined this action")
+            ),
             "a denied/errored destructive op must not arm the gate"
         );
-        assert!(!turn_made_edits(&r, &[call("1", "echo", "{}")], &res("1", "hi")), "read-only never arms");
-        assert!(!turn_made_edits(&r, &[call("1", "nope", "{}")], &res("1", "error: unknown")), "unknown never arms");
+        assert!(
+            !turn_made_edits(&r, &[call("1", "echo", "{}")], &res("1", "hi")),
+            "read-only never arms"
+        );
+        assert!(
+            !turn_made_edits(&r, &[call("1", "nope", "{}")], &res("1", "error: unknown")),
+            "unknown never arms"
+        );
         // mixed: one denied destructive + one successful destructive → arms
         let calls = vec![call("1", "delete", "{}"), call("2", "delete", "{}")];
-        let results = vec![("1".to_string(), "error: declined".to_string()), ("2".to_string(), "deleted".to_string())];
+        let results = vec![
+            ("1".to_string(), "error: declined".to_string()),
+            ("2".to_string(), "deleted".to_string()),
+        ];
         assert!(turn_made_edits(&r, &calls, &results));
         // W16: a write tool that no-op'd (identical content) wrote nothing → must not arm the gate.
-        let noop = format!("{}: f.txt already holds this exact content", crate::agent::builtin::NOOP_WRITE_PREFIX);
+        let noop = format!(
+            "{}: f.txt already holds this exact content",
+            crate::agent::builtin::NOOP_WRITE_PREFIX
+        );
         assert!(
             !turn_made_edits(&r, &[call("1", "delete", "{}")], &res("1", &noop)),
             "a no-op write must not arm the verify gate"
@@ -4848,9 +6132,16 @@ mod tests {
         // Gate ENABLED, but the run only reads → made_any_edits stays false → gate never fires (so
         // no `cargo check` subprocess), and the loop reports Done normally.
         let r = registry();
-        let c = AgentConfig { enable_verify_gate: true, quiet: true, ..cfg() };
+        let c = AgentConfig {
+            enable_verify_gate: true,
+            quiet: true,
+            ..cfg()
+        };
         let out = run_agent(
-            scripted(vec![tool_turn("echo", r#"{"text":"hi"}"#), final_turn("done")]),
+            scripted(vec![
+                tool_turn("echo", r#"{"text":"hi"}"#),
+                final_turn("done"),
+            ]),
             &c,
             &r,
             "sys",
@@ -4872,15 +6163,27 @@ mod tests {
     fn empty_turn() -> ChatTurn {
         // An HTTP-200 with neither content nor a tool call — this provider's most common silent
         // failure. Goal mode must retry it, ordinary mode feeds it to the done cascade.
-        ChatTurn { content: None, tool_calls: vec![], finish_reason: Some("stop".into()), usage: None, eager: Vec::new() }
+        ChatTurn {
+            content: None,
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            eager: Vec::new(),
+        }
     }
 
     /// Like `scripted`, but each queued item is a full `Result` so a test can script `chat()` ERRORS
     /// (goal mode's retry classifies these); exhausting the queue yields a final `Ok("stop")`.
-    fn scripted_results(items: Vec<Result<ChatTurn>>) -> impl Fn(Vec<Message>, Vec<ToolDef>) -> std::future::Ready<Result<ChatTurn>> {
+    fn scripted_results(
+        items: Vec<Result<ChatTurn>>,
+    ) -> impl Fn(Vec<Message>, Vec<ToolDef>) -> std::future::Ready<Result<ChatTurn>> {
         let q = Mutex::new(VecDeque::from(items));
         move |_m, _d| {
-            let next = q.lock().unwrap().pop_front().unwrap_or_else(|| Ok(final_turn("stop")));
+            let next = q
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(final_turn("stop")));
             std::future::ready(next)
         }
     }
@@ -4895,10 +6198,16 @@ mod tests {
 
     #[tokio::test]
     async fn goal_gate_pokes_premature_stop_then_done_after_complete() {
-        let _g = crate::agent::goal::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::agent::goal::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::agent::goal::clear();
         let r = goal_registry();
-        let c = AgentConfig { goal: Some("add a --version flag".into()), quiet: true, ..cfg() };
+        let c = AgentConfig {
+            goal: Some("add a --version flag".into()),
+            quiet: true,
+            ..cfg()
+        };
         let mut messages = vec![Message::system("sys"), Message::user("task")];
         // 1) model stops WITHOUT declaring → must be poked, not Done. 2) it calls goal_complete
         // (records PENDING). 3) it stops → gate drains PENDING → Done.
@@ -4908,10 +6217,19 @@ mod tests {
             final_turn("all done"),
         ]);
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
-        assert_eq!(out.stop, StopReason::Done, "reaches Done only after declared + (no-op) verify");
+        assert_eq!(
+            out.stop,
+            StopReason::Done,
+            "reaches Done only after declared + (no-op) verify"
+        );
         let pokes = messages
             .iter()
-            .filter(|m| m.role == "user" && m.content.as_deref().is_some_and(|c| c.starts_with(GOAL_POKE_PREFIX)))
+            .filter(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with(GOAL_POKE_PREFIX))
+            })
             .count();
         assert_eq!(pokes, 1, "the one premature stop was poked exactly once");
         assert!(
@@ -4923,10 +6241,16 @@ mod tests {
 
     #[tokio::test]
     async fn goal_mode_retries_empty_200_instead_of_treating_it_as_done() {
-        let _g = crate::agent::goal::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::agent::goal::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::agent::goal::clear();
         let r = goal_registry();
-        let c = AgentConfig { goal: Some("do the thing".into()), quiet: true, ..cfg() };
+        let c = AgentConfig {
+            goal: Some("do the thing".into()),
+            quiet: true,
+            ..cfg()
+        };
         let mut messages = vec![Message::system("sys"), Message::user("task")];
         // An empty-200 FIRST: if it were fed to the done cascade the goal gate would poke (take_pending
         // is None). Instead it must be retried silently — so we expect ZERO `[goal]` pokes and a
@@ -4938,53 +6262,99 @@ mod tests {
         ]);
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
         assert_eq!(out.stop, StopReason::Done);
-        assert_eq!(out.final_text.as_deref(), Some("done"), "returns the real turn, not the empty one");
+        assert_eq!(
+            out.final_text.as_deref(),
+            Some("done"),
+            "returns the real turn, not the empty one"
+        );
         let pokes = messages
             .iter()
-            .filter(|m| m.role == "user" && m.content.as_deref().is_some_and(|c| c.starts_with(GOAL_POKE_PREFIX)))
+            .filter(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with(GOAL_POKE_PREFIX))
+            })
             .count();
-        assert_eq!(pokes, 0, "empty-200 was retried, never poked as a premature stop");
+        assert_eq!(
+            pokes, 0,
+            "empty-200 was retried, never poked as a premature stop"
+        );
         crate::agent::goal::clear();
     }
 
     #[tokio::test]
     async fn goal_mode_retries_transient_chat_error_then_succeeds() {
-        let _g = crate::agent::goal::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::agent::goal::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::agent::goal::clear();
         let r = goal_registry();
-        let c = AgentConfig { goal: Some("keep going".into()), quiet: true, ..cfg() };
+        let c = AgentConfig {
+            goal: Some("keep going".into()),
+            quiet: true,
+            ..cfg()
+        };
         let mut messages = vec![Message::system("sys"), Message::user("task")];
         // A 5xx (transient) then the real work — goal mode must survive it (ordinary mode would return
         // Err here, see `normal_mode_chat_error_is_fatal`).
         let chat = scripted_results(vec![
-            Err(anyhow::anyhow!("upstream returned HTTP 503 Service Unavailable: overloaded")),
-            Ok(tool_turn("goal_complete", r#"{"summary":"done despite the blip"}"#)),
+            Err(anyhow::anyhow!(
+                "upstream returned HTTP 503 Service Unavailable: overloaded"
+            )),
+            Ok(tool_turn(
+                "goal_complete",
+                r#"{"summary":"done despite the blip"}"#,
+            )),
             Ok(final_turn("finished")),
         ]);
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
-        assert_eq!(out.stop, StopReason::Done, "a transient error is retried, not fatal");
+        assert_eq!(
+            out.stop,
+            StopReason::Done,
+            "a transient error is retried, not fatal"
+        );
         crate::agent::goal::clear();
     }
 
     #[tokio::test]
     async fn goal_mode_gives_up_after_bounded_permanent_retries() {
-        let _g = crate::agent::goal::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::agent::goal::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::agent::goal::clear();
         let r = goal_registry();
-        let c = AgentConfig { goal: Some("nope".into()), quiet: true, ..cfg() };
+        let c = AgentConfig {
+            goal: Some("nope".into()),
+            quiet: true,
+            ..cfg()
+        };
         let mut messages = vec![Message::system("sys"), Message::user("task")];
         // A permanent 401 on every call: goal mode retries a small bounded number of times then
         // SURFACES the error (it can't be fixed by retrying) — the "retry a few times then stop"
         // product decision. Contrast with the transient case above which retries indefinitely.
         let chat = scripted_results(vec![
-            Err(anyhow::anyhow!("upstream returned HTTP 401 Unauthorized: bad key")),
-            Err(anyhow::anyhow!("upstream returned HTTP 401 Unauthorized: bad key")),
-            Err(anyhow::anyhow!("upstream returned HTTP 401 Unauthorized: bad key")),
-            Err(anyhow::anyhow!("upstream returned HTTP 401 Unauthorized: bad key")),
-            Err(anyhow::anyhow!("upstream returned HTTP 401 Unauthorized: bad key")),
+            Err(anyhow::anyhow!(
+                "upstream returned HTTP 401 Unauthorized: bad key"
+            )),
+            Err(anyhow::anyhow!(
+                "upstream returned HTTP 401 Unauthorized: bad key"
+            )),
+            Err(anyhow::anyhow!(
+                "upstream returned HTTP 401 Unauthorized: bad key"
+            )),
+            Err(anyhow::anyhow!(
+                "upstream returned HTTP 401 Unauthorized: bad key"
+            )),
+            Err(anyhow::anyhow!(
+                "upstream returned HTTP 401 Unauthorized: bad key"
+            )),
         ]);
         let res = run_agent_loop(chat, &c, &r, &mut messages).await;
-        assert!(res.is_err(), "a permanent client error stops the run after the bounded retries");
+        assert!(
+            res.is_err(),
+            "a permanent client error stops the run after the bounded retries"
+        );
         crate::agent::goal::clear();
     }
 
@@ -4995,22 +6365,125 @@ mod tests {
         let r = registry();
         let c = cfg(); // goal: None
         let mut messages = vec![Message::system("sys"), Message::user("task")];
-        let chat = scripted_results(vec![Err(anyhow::anyhow!("upstream returned HTTP 503: overloaded"))]);
+        let chat = scripted_results(vec![Err(anyhow::anyhow!(
+            "upstream returned HTTP 503: overloaded"
+        ))]);
         let res = run_agent_loop(chat, &c, &r, &mut messages).await;
         assert!(res.is_err(), "ordinary turns keep the fatal-on-error path");
+        assert_eq!(
+            c.max_transient_retries, 0,
+            "the top-level default is what keeps it fatal"
+        );
+        assert_eq!(
+            AgentConfig::default().max_transient_retries,
+            0,
+            "production top-level config agrees with the test cfg"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_loop_absorbs_bounded_transient_errors_but_not_permanent_ones() {
+        // A DELEGATED loop (task/workflow child) sets max_transient_retries > 0: nobody is watching
+        // it, so one 429/5xx must not discard the steps it already completed. Goal mode is OFF here —
+        // this is the ordinary path, proving the retry is driven by the budget, not by `cfg.goal`.
+        let r = registry();
+        let c = AgentConfig {
+            max_transient_retries: 4,
+            quiet: true,
+            ..cfg()
+        };
+
+        // Two transient blips then real work → survives, and the work still lands.
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let chat = scripted_results(vec![
+            Err(anyhow::anyhow!(
+                "upstream returned HTTP 503 Service Unavailable: overloaded"
+            )),
+            Err(anyhow::anyhow!("request failed after retries")),
+            Ok(final_turn("survived the blips")),
+        ]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.final_text.as_deref(), Some("survived the blips"));
+
+        // A PERMANENT 4xx is NOT retried even with budget left — retrying can't fix a bad key, and
+        // burning backoff on it only delays the report. One call, then the error.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let counting = move |_m: Vec<Message>, _d: Vec<ToolDef>| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Err(anyhow::anyhow!(
+                "upstream returned HTTP 401 Unauthorized: bad key"
+            )))
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        assert!(run_agent_loop(counting, &c, &r, &mut messages)
+            .await
+            .is_err());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "permanent → no retry"
+        );
+
+        // The budget is a CEILING: transient errors past it are still fatal (no infinite retry — that
+        // is goal mode's contract, not a sub-agent's).
+        let c2 = AgentConfig {
+            max_transient_retries: 1,
+            quiet: true,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let chat = scripted_results(vec![
+            Err(anyhow::anyhow!("upstream returned HTTP 503: overloaded")),
+            Err(anyhow::anyhow!("upstream returned HTTP 503: overloaded")),
+            Ok(final_turn("never reached")),
+        ]);
+        assert!(
+            run_agent_loop(chat, &c2, &r, &mut messages).await.is_err(),
+            "one retry allowed, the second failure is fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn esc_during_a_delegated_transient_retry_returns_cancelled() {
+        // Esc must escape the new retry backoff cleanly (Cancelled, not a swallowed error).
+        let r = registry();
+        let c = AgentConfig {
+            max_transient_retries: 4,
+            quiet: true,
+            ..cfg()
+        };
+        c.cancel.cancel();
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let chat = scripted_results(vec![Err(anyhow::anyhow!(
+            "upstream returned HTTP 503: overloaded"
+        ))]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Cancelled);
     }
 
     #[tokio::test]
     async fn goal_mode_esc_during_retry_returns_cancelled() {
-        let _g = crate::agent::goal::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::agent::goal::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::agent::goal::clear();
         let r = goal_registry();
-        let c = AgentConfig { goal: Some("interrupt me".into()), quiet: true, ..cfg() };
+        let c = AgentConfig {
+            goal: Some("interrupt me".into()),
+            quiet: true,
+            ..cfg()
+        };
         c.cancel.cancel(); // Esc already pressed → the retry loop's `cancel::race` must bail cleanly.
         let mut messages = vec![Message::system("sys"), Message::user("task")];
         let chat = scripted(vec![empty_turn(), final_turn("never reached")]);
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
-        assert_eq!(out.stop, StopReason::Cancelled, "Esc exits goal mode as Cancelled, not Done");
+        assert_eq!(
+            out.stop,
+            StopReason::Cancelled,
+            "Esc exits goal mode as Cancelled, not Done"
+        );
         crate::agent::goal::clear();
     }
 
@@ -5029,7 +6502,10 @@ mod tests {
         let k = relevance_keywords("How does the RetryPolicy backoff work?");
         assert!(k.contains(&"retrypolicy".to_string()));
         assert!(k.contains(&"backoff".to_string()));
-        assert!(!k.iter().any(|t| t.chars().count() < 3), "short tokens dropped");
+        assert!(
+            !k.iter().any(|t| t.chars().count() < 3),
+            "short tokens dropped"
+        );
         // URL stopwords are filtered so a url source doesn't dilute scoring.
         let ku = relevance_keywords("https://docs.rs/tokio/latest/tokio/task");
         assert!(!ku.contains(&"https".to_string()) && !ku.contains(&"www".to_string()));
@@ -5040,13 +6516,21 @@ mod tests {
     fn truncate_relevant_keeps_the_matching_region() {
         // A long doc where the ONLY mention of the query term is in the MIDDLE — blind head+tail
         // would drop it; relevance truncation must keep it.
-        let mut lines: Vec<String> = (0..200).map(|i| format!("filler line number {i} lorem ipsum")).collect();
+        let mut lines: Vec<String> = (0..200)
+            .map(|i| format!("filler line number {i} lorem ipsum"))
+            .collect();
         lines[100] = "the CriticalSetting flag toggles the special behavior here".to_string();
         let doc = lines.join("\n");
         let kw = relevance_keywords("CriticalSetting");
         let out = truncate_relevant(&doc, 400, &kw);
-        assert!(out.contains("CriticalSetting"), "the matching region must survive: {out}");
-        assert!(out.chars().count() <= 400 + 120, "stays near the budget (+markers)");
+        assert!(
+            out.contains("CriticalSetting"),
+            "the matching region must survive: {out}"
+        );
+        assert!(
+            out.chars().count() <= 400 + 120,
+            "stays near the budget (+markers)"
+        );
     }
 
     #[test]
@@ -5056,7 +6540,10 @@ mod tests {
         let kw = relevance_keywords("nonexistentzzz");
         let rel = truncate_relevant(&s, 120, &kw);
         let plain = truncate_result(&s, 120);
-        assert_eq!(rel, plain, "no signal must degrade to the exact old behavior");
+        assert_eq!(
+            rel, plain,
+            "no signal must degrade to the exact old behavior"
+        );
     }
 
     #[test]
@@ -5073,18 +6560,30 @@ mod tests {
         let long_tool = std::sync::Arc::new(LongReadTool) as std::sync::Arc<dyn Tool>;
         let small_budget = 200usize;
         let large_budget = 6000usize;
-        let out = run_tool_body(long_tool, &serde_json::json!({}), true, small_budget, large_budget);
+        let out = run_tool_body(
+            long_tool,
+            &serde_json::json!({}),
+            true,
+            small_budget,
+            large_budget,
+        );
         assert!(
             out.chars().count() > small_budget,
             "file_read output should use the larger fetch budget, not the small default: got {} chars",
             out.chars().count()
         );
-        assert!(out.chars().count() <= large_budget + 200, "still bounded by the larger budget");
+        assert!(
+            out.chars().count() <= large_budget + 200,
+            "still bounded by the larger budget"
+        );
 
         // A non-truncatable tool (positional output) stays at the SMALL budget regardless.
         let konst_out = "x".repeat(1000);
         let plain = truncate_result(&konst_out, small_budget);
-        assert!(plain.chars().count() <= small_budget + 40, "non-fetch tools keep the small budget");
+        assert!(
+            plain.chars().count() <= small_budget + 40,
+            "non-fetch tools keep the small budget"
+        );
     }
 
     #[test]
@@ -5093,7 +6592,10 @@ mod tests {
         assert_eq!(relevance_query_from_args(&a), "RetryPolicy");
         let u = serde_json::json!({"url": "https://x.com/tokio"});
         assert_eq!(relevance_query_from_args(&u), "https://x.com/tokio");
-        assert_eq!(relevance_query_from_args(&serde_json::json!({"other": 1})), "");
+        assert_eq!(
+            relevance_query_from_args(&serde_json::json!({"other": 1})),
+            ""
+        );
     }
 
     #[test]
@@ -5101,8 +6603,14 @@ mod tests {
         assert!(is_relevance_truncatable("file_read"));
         assert!(is_relevance_truncatable("web_fetch"));
         assert!(is_relevance_truncatable("search_files"));
-        assert!(!is_relevance_truncatable("file_edit"), "edit output is positional");
-        assert!(!is_relevance_truncatable("shell_run"), "shell log is positional");
+        assert!(
+            !is_relevance_truncatable("file_edit"),
+            "edit output is positional"
+        );
+        assert!(
+            !is_relevance_truncatable("shell_run"),
+            "shell log is positional"
+        );
     }
 
     #[test]
@@ -5119,8 +6627,14 @@ mod tests {
                 declared.insert(tc.id.as_str());
             }
             if m.role == "tool" {
-                let id = m.tool_call_id.as_deref().expect("tool message carries tool_call_id");
-                assert!(declared.contains(id), "tool result '{id}' has no preceding assistant tool_call");
+                let id = m
+                    .tool_call_id
+                    .as_deref()
+                    .expect("tool message carries tool_call_id");
+                assert!(
+                    declared.contains(id),
+                    "tool result '{id}' has no preceding assistant tool_call"
+                );
             }
         }
     }
@@ -5138,12 +6652,27 @@ mod tests {
         ];
         // target 0 → clear everything clearable.
         let stats = clear_tool_results_to_floor(&mut msgs, 1, 1024, 0, 0);
-        assert!(stats.chars_reclaimed > 1900, "reclaimed most of the 2000-char body: {stats:?}");
+        assert!(
+            stats.chars_reclaimed > 1900,
+            "reclaimed most of the 2000-char body: {stats:?}"
+        );
         assert_eq!(stats.cleared, 1);
         assert_eq!(stats.failures_trimmed, 0);
-        assert_eq!(msgs[3].content.as_deref(), Some(CLEARED_TOOL_PLACEHOLDER), "old result cleared");
-        assert_eq!(msgs[3].tool_call_id.as_deref(), Some("1"), "tool_call_id preserved (no orphan)");
-        assert_eq!(msgs[5].content.as_deref(), Some(big.as_str()), "recent result kept verbatim");
+        assert_eq!(
+            msgs[3].content.as_deref(),
+            Some(CLEARED_TOOL_PLACEHOLDER),
+            "old result cleared"
+        );
+        assert_eq!(
+            msgs[3].tool_call_id.as_deref(),
+            Some("1"),
+            "tool_call_id preserved (no orphan)"
+        );
+        assert_eq!(
+            msgs[5].content.as_deref(),
+            Some(big.as_str()),
+            "recent result kept verbatim"
+        );
         // Non-tool messages are never touched.
         assert_eq!(msgs[0].content.as_deref(), Some("sys"));
         assert_eq!(msgs[1].content.as_deref(), Some("task"));
@@ -5160,7 +6689,11 @@ mod tests {
         ];
         let first = clear_tool_results_to_floor(&mut msgs, 1, 1024, 0, 0);
         assert!(first.chars_reclaimed > 0);
-        assert_eq!(msgs[1].content.as_deref(), Some("tiny"), "small result untouched");
+        assert_eq!(
+            msgs[1].content.as_deref(),
+            Some("tiny"),
+            "small result untouched"
+        );
         // Running again reclaims nothing (cleared bodies are shorter than min_chars).
         let second = clear_tool_results_to_floor(&mut msgs, 1, 1024, 0, 0);
         assert_eq!(second, ClearStats::default(), "idempotent — no re-clearing");
@@ -5168,7 +6701,10 @@ mod tests {
 
     #[test]
     fn clear_to_floor_noop_when_within_keep_window() {
-        let mut msgs = vec![Message::system("sys"), Message::tool_result("1", "x".repeat(2000))];
+        let mut msgs = vec![
+            Message::system("sys"),
+            Message::tool_result("1", "x".repeat(2000)),
+        ];
         let stats = clear_tool_results_to_floor(&mut msgs, 8, 1024, 0, 0);
         assert_eq!(stats, ClearStats::default(), "fewer tools than keep_recent");
         assert_eq!(msgs[1].content.as_deref().map(|c| c.len()), Some(2000));
@@ -5194,8 +6730,15 @@ mod tests {
         let start = msgs.iter().map(estimate_message_tokens).sum::<usize>();
         let target = start - 1200; // one ~1000-tok eviction is not enough, two overshoot past it
         let stats = clear_tool_results_to_floor(&mut msgs, 1, 1024, target, 0);
-        assert_eq!(stats.cleared, 2, "oldest-first until ≤ target, then stop: {stats:?}");
-        assert_eq!(msgs[4].content.as_deref().map(|c| c.len()), Some(4000), "third success untouched");
+        assert_eq!(
+            stats.cleared, 2,
+            "oldest-first until ≤ target, then stop: {stats:?}"
+        );
+        assert_eq!(
+            msgs[4].content.as_deref().map(|c| c.len()),
+            Some(4000),
+            "third success untouched"
+        );
         assert_valid_history(&msgs);
     }
 
@@ -5220,14 +6763,20 @@ mod tests {
         let start = msgs.iter().map(estimate_message_tokens).sum::<usize>();
         let stats = clear_tool_results_to_floor(&mut msgs, 1, 1024, start - 500, 0);
         assert_eq!(stats.cleared, 1, "{stats:?}");
-        assert_eq!(stats.failures_trimmed, 0, "failures survive pass 1 untouched");
+        assert_eq!(
+            stats.failures_trimmed, 0,
+            "failures survive pass 1 untouched"
+        );
         assert_eq!(msgs[2].content.as_deref(), Some(fail_body.as_str()));
         assert_eq!(msgs[4].content.as_deref(), Some(exit_fail.as_str()));
         // Target 0: now failures must be TRIMMED (first line + sentinel), never blanked.
         let stats2 = clear_tool_results_to_floor(&mut msgs, 1, 1024, 0, 0);
         assert_eq!(stats2.failures_trimmed, 2, "{stats2:?}");
         let t1 = msgs[2].content.as_deref().unwrap();
-        assert!(t1.starts_with("error: build failed"), "first line survives: {t1}");
+        assert!(
+            t1.starts_with("error: build failed"),
+            "first line survives: {t1}"
+        );
         assert!(t1.ends_with(FAILED_TOOL_TRIM_SUFFIX));
         let t3 = msgs[4].content.as_deref().unwrap();
         assert!(t3.starts_with("exit 1"), "exit code survives: {t3}");
@@ -5253,11 +6802,23 @@ mod tests {
         // though its Ok body has no `error:`/`exit N` shape; a tool returning None defers to it.
         let r = registry();
         let err_body = "{\"isError\":true,\"detail\":\"x\"}";
-        assert!(result_is_failure(&r, "selferr", err_body), "self-declared failure must count");
-        assert!(!result_is_failure(&r, "selferr", "{\"isError\":false}"), "self-declared OK must not");
+        assert!(
+            result_is_failure(&r, "selferr", err_body),
+            "self-declared failure must count"
+        );
+        assert!(
+            !result_is_failure(&r, "selferr", "{\"isError\":false}"),
+            "self-declared OK must not"
+        );
         // A tool that doesn't override (echo → None) falls back to the heuristic.
-        assert!(result_is_failure(&r, "echo", "error: boom"), "None defers to heuristic (error:)");
-        assert!(!result_is_failure(&r, "echo", "plain contents"), "None defers to heuristic (ok)");
+        assert!(
+            result_is_failure(&r, "echo", "error: boom"),
+            "None defers to heuristic (error:)"
+        );
+        assert!(
+            !result_is_failure(&r, "echo", "plain contents"),
+            "None defers to heuristic (ok)"
+        );
         // Unknown tool → pure heuristic.
         assert!(result_is_failure(&r, "ghost", "exit 3\n"));
     }
@@ -5265,29 +6826,70 @@ mod tests {
     #[test]
     fn push_nudge_collapses_same_kind_keeps_others() {
         let mut msgs = vec![Message::system("sys prompt"), Message::user("task")];
-        push_nudge(&mut msgs, NUDGE_DIVERGENCE, "You repeated the same tool call(s) — v1");
+        push_nudge(
+            &mut msgs,
+            NUDGE_DIVERGENCE,
+            "You repeated the same tool call(s) — v1",
+        );
         msgs.push(Message::user("more work"));
-        push_nudge(&mut msgs, NUDGE_DIVERGENCE, "You repeated the same tool call(s) — v2");
+        push_nudge(
+            &mut msgs,
+            NUDGE_DIVERGENCE,
+            "You repeated the same tool call(s) — v2",
+        );
         let divergence = msgs
             .iter()
-            .filter(|m| m.role == "system" && m.content.as_deref().is_some_and(|c| c.starts_with(NUDGE_DIVERGENCE)))
+            .filter(|m| {
+                m.role == "system"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with(NUDGE_DIVERGENCE))
+            })
             .count();
         assert_eq!(divergence, 1, "same-kind nudges collapse to the newest");
-        assert!(msgs.last().unwrap().content.as_deref().unwrap().ends_with("v2"), "newest wins, at the tail");
-        assert_eq!(msgs[0].content.as_deref(), Some("sys prompt"), "system prompt never touched");
+        assert!(
+            msgs.last()
+                .unwrap()
+                .content
+                .as_deref()
+                .unwrap()
+                .ends_with("v2"),
+            "newest wins, at the tail"
+        );
+        assert_eq!(
+            msgs[0].content.as_deref(),
+            Some("sys prompt"),
+            "system prompt never touched"
+        );
         // A DIFFERENT kind is additive, and doesn't disturb the existing one.
         push_nudge(&mut msgs, NUDGE_CONTEXT, "Context is nearly full — wrap up");
-        assert!(msgs.iter().any(|m| m.content.as_deref().is_some_and(|c| c.starts_with(NUDGE_DIVERGENCE))));
-        assert!(msgs.iter().any(|m| m.content.as_deref().is_some_and(|c| c.starts_with(NUDGE_CONTEXT))));
+        assert!(msgs.iter().any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|c| c.starts_with(NUDGE_DIVERGENCE))));
+        assert!(msgs.iter().any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|c| c.starts_with(NUDGE_CONTEXT))));
     }
 
     #[test]
     fn push_nudge_never_touches_index_zero_even_if_matching() {
         // Pathological: a system PROMPT that happens to start with a nudge prefix must survive.
-        let mut msgs = vec![Message::system("Context is nearly full — just kidding, SYSTEM PROMPT")];
-        push_nudge(&mut msgs, NUDGE_CONTEXT, "Context is nearly full (~90%) — wrap up");
+        let mut msgs = vec![Message::system(
+            "Context is nearly full — just kidding, SYSTEM PROMPT",
+        )];
+        push_nudge(
+            &mut msgs,
+            NUDGE_CONTEXT,
+            "Context is nearly full (~90%) — wrap up",
+        );
         assert_eq!(msgs.len(), 2);
-        assert!(msgs[0].content.as_deref().unwrap().contains("SYSTEM PROMPT"));
+        assert!(msgs[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("SYSTEM PROMPT"));
     }
 
     #[test]
@@ -5308,12 +6910,21 @@ mod tests {
         // Must start with NUDGE_BUDGET so push_nudge collapses the prior one, and carry the honest
         // remaining figure the model plans against.
         let t = budget_nudge_text(150_000, 200_000);
-        assert!(t.starts_with(NUDGE_BUDGET), "prefix drives push_nudge collapse: {t}");
-        assert!(t.contains("50.0K remaining"), "remaining = window - est: {t}");
+        assert!(
+            t.starts_with(NUDGE_BUDGET),
+            "prefix drives push_nudge collapse: {t}"
+        );
+        assert!(
+            t.contains("50.0K remaining"),
+            "remaining = window - est: {t}"
+        );
         assert!(t.contains("25% left"), "pct left: {t}");
         // Over-budget never underflows the remaining figure.
         let over = budget_nudge_text(210_000, 200_000);
-        assert!(over.contains("0 remaining") && over.contains("0% left"), "saturating: {over}");
+        assert!(
+            over.contains("0 remaining") && over.contains("0% left"),
+            "saturating: {over}"
+        );
     }
 
     #[tokio::test]
@@ -5335,9 +6946,17 @@ mod tests {
         let _ = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
         let budget_msgs = messages
             .iter()
-            .filter(|m| m.role == "system" && m.content.as_deref().is_some_and(|c| c.starts_with(NUDGE_BUDGET)))
+            .filter(|m| {
+                m.role == "system"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with(NUDGE_BUDGET))
+            })
             .count();
-        assert_eq!(budget_msgs, 1, "the running budget nudge collapses to a single message");
+        assert_eq!(
+            budget_msgs, 1,
+            "the running budget nudge collapses to a single message"
+        );
     }
 
     #[tokio::test]
@@ -5362,21 +6981,40 @@ mod tests {
             .map(|_| tool_turn("echo", &format!(r#"{{"text":"{big}"}}"#)))
             .collect();
         let mut messages = vec![Message::system("sys"), Message::user("task")];
-        let _ = run_agent_loop(scripted(turns), &c, &r, &mut messages).await.unwrap();
+        let _ = run_agent_loop(scripted(turns), &c, &r, &mut messages)
+            .await
+            .unwrap();
         let warned = messages.iter().any(|m| {
-            m.role == "system" && m.content.as_deref().is_some_and(|c| c.starts_with(NUDGE_SAVE_BEFORE_CLEAR))
+            m.role == "system"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with(NUDGE_SAVE_BEFORE_CLEAR))
         });
-        assert!(warned, "the save-before-clear warning must be injected before eviction");
+        assert!(
+            warned,
+            "the save-before-clear warning must be injected before eviction"
+        );
         let evicted = messages
             .iter()
             .any(|m| m.role == "tool" && m.content.as_deref() == Some(CLEARED_TOOL_PLACEHOLDER));
-        assert!(evicted, "clearing must still happen (a later turn) — the warning only defers, not disables");
+        assert!(
+            evicted,
+            "clearing must still happen (a later turn) — the warning only defers, not disables"
+        );
         // And the warning is one-shot: exactly one such system message.
         let warn_count = messages
             .iter()
-            .filter(|m| m.role == "system" && m.content.as_deref().is_some_and(|c| c.starts_with(NUDGE_SAVE_BEFORE_CLEAR)))
+            .filter(|m| {
+                m.role == "system"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with(NUDGE_SAVE_BEFORE_CLEAR))
+            })
             .count();
-        assert_eq!(warn_count, 1, "the save-before-clear warning fires at most once per run");
+        assert_eq!(
+            warn_count, 1,
+            "the save-before-clear warning fires at most once per run"
+        );
     }
 
     #[tokio::test]
@@ -5396,9 +7034,17 @@ mod tests {
         }
         let nudges = messages
             .iter()
-            .filter(|m| m.role == "system" && m.content.as_deref().is_some_and(|c| c.starts_with(NUDGE_DIVERGENCE)))
+            .filter(|m| {
+                m.role == "system"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with(NUDGE_DIVERGENCE))
+            })
             .count();
-        assert_eq!(nudges, 1, "two invocations, ONE divergence nudge (collapsed, not accreted)");
+        assert_eq!(
+            nudges, 1,
+            "two invocations, ONE divergence nudge (collapsed, not accreted)"
+        );
         assert_valid_history(&messages);
     }
 
@@ -5411,7 +7057,10 @@ mod tests {
             todo::Todo::new("run the tests", todo::Status::Pending),
         ]);
         let r = registry();
-        let c = AgentConfig { todo_reminder_every: 2, ..cfg() };
+        let c = AgentConfig {
+            todo_reminder_every: 2,
+            ..cfg()
+        };
         let mut messages = vec![Message::system("sys"), Message::user("long task")];
         // 5 distinct tool turns → reminders due after iters 2 and 4 — but COLLAPSED to one message.
         let chat = scripted(vec![
@@ -5425,7 +7074,12 @@ mod tests {
         assert_eq!(out.stop, StopReason::Done);
         let reminders: Vec<&Message> = messages
             .iter()
-            .filter(|m| m.role == "system" && m.content.as_deref().is_some_and(|c| c.starts_with(NUDGE_TODO)))
+            .filter(|m| {
+                m.role == "system"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with(NUDGE_TODO))
+            })
             .collect();
         assert_eq!(reminders.len(), 1, "recitations are replaced, not accreted");
         let body = reminders[0].content.as_deref().unwrap();
@@ -5445,7 +7099,10 @@ mod tests {
         ]);
         run_agent_loop(chat2, &c, &r, &mut messages2).await.unwrap();
         assert!(
-            !messages2.iter().any(|m| m.content.as_deref().is_some_and(|c| c.starts_with(NUDGE_TODO))),
+            !messages2.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|c| c.starts_with(NUDGE_TODO))),
             "no todos → no recitation"
         );
     }
@@ -5478,13 +7135,23 @@ mod tests {
         assert_eq!(out.stop, StopReason::Done);
         let pokes = messages
             .iter()
-            .filter(|m| m.role == "user" && m.content.as_deref().is_some_and(|c| c.starts_with(TODO_POKE_PREFIX)))
+            .filter(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with(TODO_POKE_PREFIX))
+            })
             .count();
-        assert_eq!(pokes, 2, "exactly max_todo_poke_attempts pokes, then Done: {pokes}");
+        assert_eq!(
+            pokes, 2,
+            "exactly max_todo_poke_attempts pokes, then Done: {pokes}"
+        );
         assert!(
             messages.iter().any(|m| {
                 m.role == "user"
-                    && m.content.as_deref().is_some_and(|c| c.contains("[ ] still-open"))
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("[ ] still-open"))
             }),
             "poke lists the open item"
         );
@@ -5495,21 +7162,31 @@ mod tests {
     /// so these tests must not interleave with each other.
     fn steer_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     #[tokio::test]
     async fn steer_is_folded_into_the_running_turn_at_the_next_iteration() {
         let _g = steer_guard();
         let r = registry();
-        let c = AgentConfig { enable_steering: true, max_iters: 6, auto_extend_to: 6, ..cfg() };
+        let c = AgentConfig {
+            enable_steering: true,
+            max_iters: 6,
+            auto_extend_to: 6,
+            ..cfg()
+        };
         let mut messages = vec![Message::system("sys"), Message::user("original task")];
         // A tool turn, then a final answer. The steer is posted BEFORE the loop runs, so it is drained
         // at the very first iteration boundary — the same path a mid-flight Alt+Enter takes.
         crate::core::steer::arm();
         assert!(crate::core::steer::push("also update the README"));
         let out = run_agent_loop(
-            scripted(vec![tool_turn("echo", r#"{"text":"hi"}"#), final_turn("done")]),
+            scripted(vec![
+                tool_turn("echo", r#"{"text":"hi"}"#),
+                final_turn("done"),
+            ]),
             &c,
             &r,
             &mut messages,
@@ -5521,13 +7198,25 @@ mod tests {
             .iter()
             .filter(|m| {
                 m.role == "user"
-                    && m.content.as_deref().is_some_and(|c| c.starts_with(crate::core::steer::PREFIX))
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with(crate::core::steer::PREFIX))
             })
             .collect();
-        assert_eq!(injected.len(), 1, "the steer is injected exactly once, not re-delivered");
-        assert!(injected[0].content.as_deref().unwrap().contains("also update the README"));
+        assert_eq!(
+            injected.len(),
+            1,
+            "the steer is injected exactly once, not re-delivered"
+        );
+        assert!(injected[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("also update the README"));
         // The ORIGINAL task survives: steering augments the run, it does not replace history.
-        assert!(messages.iter().any(|m| m.content.as_deref() == Some("original task")));
+        assert!(messages
+            .iter()
+            .any(|m| m.content.as_deref() == Some("original task")));
         assert_eq!(crate::core::steer::pending(), 0, "drained");
         let _ = crate::core::steer::disarm();
     }
@@ -5536,7 +7225,12 @@ mod tests {
     async fn steer_arriving_at_the_final_answer_blocks_done_and_grants_another_turn() {
         let _g = steer_guard();
         let r = registry();
-        let c = AgentConfig { enable_steering: true, max_iters: 6, auto_extend_to: 6, ..cfg() };
+        let c = AgentConfig {
+            enable_steering: true,
+            max_iters: 6,
+            auto_extend_to: 6,
+            ..cfg()
+        };
         let mut messages = vec![Message::system("sys"), Message::user("task")];
         // The steer must land INSIDE the model call — after the top-of-loop drain, while the answer is
         // being composed. That is the gap the Done gate exists to close: without it the mailbox would
@@ -5557,16 +7251,24 @@ mod tests {
         };
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
         assert_eq!(out.stop, StopReason::Done);
-        assert_eq!(out.final_text.as_deref(), Some("adjusted, now really done"), "the extra turn ran");
+        assert_eq!(
+            out.final_text.as_deref(),
+            Some("adjusted, now really done"),
+            "the extra turn ran"
+        );
         assert!(
             messages.iter().any(|m| {
                 m.role == "user"
-                    && m.content.as_deref().is_some_and(|c| c.contains("wait, use tabs not spaces"))
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("wait, use tabs not spaces"))
             }),
             "the late steer reached the model rather than being dropped"
         );
         // The premature final text is recorded so the injected correction reads coherently.
-        assert!(messages.iter().any(|m| m.role == "assistant" && m.content.as_deref() == Some("all done")));
+        assert!(messages
+            .iter()
+            .any(|m| m.role == "assistant" && m.content.as_deref() == Some("all done")));
         let _ = crate::core::steer::disarm();
     }
 
@@ -5581,15 +7283,27 @@ mod tests {
         let mut messages = vec![Message::system("sys"), Message::user("child task")];
         crate::core::steer::arm();
         assert!(crate::core::steer::push("meant for the parent"));
-        let out = run_agent_loop(scripted(vec![final_turn("child done")]), &c, &r, &mut messages)
-            .await
-            .unwrap();
+        let out = run_agent_loop(
+            scripted(vec![final_turn("child done")]),
+            &c,
+            &r,
+            &mut messages,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.stop, StopReason::Done);
         assert!(
-            !messages.iter().any(|m| m.content.as_deref().is_some_and(|c| c.starts_with(crate::core::steer::PREFIX))),
+            !messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|c| c.starts_with(crate::core::steer::PREFIX))),
             "a child never consumes the steering mailbox"
         );
-        assert_eq!(crate::core::steer::pending(), 1, "left intact for the parent loop");
+        assert_eq!(
+            crate::core::steer::pending(),
+            1,
+            "left intact for the parent loop"
+        );
         let leftover = crate::core::steer::disarm();
         assert_eq!(leftover, vec!["meant for the parent".to_string()]);
     }
@@ -5605,13 +7319,21 @@ mod tests {
             ..cfg()
         };
         let mut messages = vec![Message::system("sys"), Message::user("task")];
-        let out = run_agent_loop(scripted(vec![final_turn("all good")]), &c, &r, &mut messages)
-            .await
-            .unwrap();
+        let out = run_agent_loop(
+            scripted(vec![final_turn("all good")]),
+            &c,
+            &r,
+            &mut messages,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.stop, StopReason::Done);
         assert_eq!(out.iters, 1);
         assert!(
-            !messages.iter().any(|m| m.content.as_deref().is_some_and(|c| c.starts_with(TODO_POKE_PREFIX))),
+            !messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|c| c.starts_with(TODO_POKE_PREFIX))),
             "no poke when all todos done"
         );
         todo::clear();
@@ -5646,9 +7368,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out2.stop, StopReason::Done);
-        assert!(
-            !messages2.iter().any(|m| m.content.as_deref().is_some_and(|c| c.starts_with(TODO_POKE_PREFIX)))
-        );
+        assert!(!messages2.iter().any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|c| c.starts_with(TODO_POKE_PREFIX))));
     }
 
     #[tokio::test]
@@ -5684,7 +7407,10 @@ mod tests {
         let gates = messages
             .iter()
             .filter(|m| {
-                m.role == "user" && m.content.as_deref().is_some_and(|c| c.starts_with(CONFIDENCE_GATE_PREFIX))
+                m.role == "user"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with(CONFIDENCE_GATE_PREFIX))
             })
             .count();
         assert_eq!(gates, 1, "confidence gate fires exactly once");
@@ -5728,7 +7454,10 @@ mod tests {
         assert_eq!(out.stop, StopReason::Done);
         assert!(
             !messages.iter().any(|m| {
-                m.role == "user" && m.content.as_deref().is_some_and(|c| c.starts_with(CONFIDENCE_GATE_PREFIX))
+                m.role == "user"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with(CONFIDENCE_GATE_PREFIX))
             }),
             "stepwise rises must not arm the gate"
         );
@@ -5744,11 +7473,12 @@ mod tests {
             final_turn("done"),
         ]);
         run_agent_loop(chat2, &c, &r, &mut messages2).await.unwrap();
-        assert!(
-            !messages2.iter().any(|m| {
-                m.role == "user" && m.content.as_deref().is_some_and(|c| c.starts_with(CONFIDENCE_GATE_PREFIX))
-            })
-        );
+        assert!(!messages2.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with(CONFIDENCE_GATE_PREFIX))
+        }));
         todo::clear();
     }
 
@@ -5774,7 +7504,10 @@ mod tests {
         assert_eq!(out.stop, StopReason::Done);
         assert!(
             messages.iter().any(|m| {
-                m.role == "system" && m.content.as_deref().is_some_and(|c| c.starts_with(NUDGE_HILL_CLIMB))
+                m.role == "system"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with(NUDGE_HILL_CLIMB))
             }),
             "hill-climb reframe must inject after first tool turn"
         );
@@ -5857,7 +7590,10 @@ mod tests {
     #[test]
     fn system_prompt_static_prefix_and_blocks() {
         let p1 = build_system_prompt("/a", "linux", "2026-06-20", "m", Some("- terse"));
-        assert!(p1.starts_with(system_base().trim_end()), "static base must lead the prompt");
+        assert!(
+            p1.starts_with(system_base().trim_end()),
+            "static base must lead the prompt"
+        );
         assert!(p1.contains("cwd: /a"));
         // check the INJECTED block (the base prose also mentions <user_memory>).
         assert!(p1.contains("\n<user_memory>\n") && p1.contains("- terse"));
@@ -5876,8 +7612,14 @@ mod tests {
         // every time a fact is learned. Only the dynamic lane may differ.
         let a = build_system_prompt_bundle("/w", "linux", "2026-07-20", "m", Some("- fact one"));
         let b = build_system_prompt_bundle("/w", "linux", "2026-07-20", "m", Some("- fact two"));
-        assert_eq!(a.stable, b.stable, "stable lane must not change when only memory changes");
-        assert_ne!(a.dynamic, b.dynamic, "the differing memory lands in the dynamic lane");
+        assert_eq!(
+            a.stable, b.stable,
+            "stable lane must not change when only memory changes"
+        );
+        assert_ne!(
+            a.dynamic, b.dynamic,
+            "the differing memory lands in the dynamic lane"
+        );
         assert!(a.dynamic.contains("fact one") && b.dynamic.contains("fact two"));
         // The environment (cwd/os/date/model) is what the stable lane carries.
         assert!(a.stable.contains("cwd: /w") && a.stable.contains("model: m"));
@@ -5887,7 +7629,9 @@ mod tests {
     async fn clarify_yields_awaiting_input_with_valid_history() {
         // The load-bearing wiring: a `clarify` call PAUSES the loop — it returns AwaitingInput
         // carrying the question, having left a valid (resumable) history ending in the tool result.
-        let _g = crate::agent::clarify::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::agent::clarify::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _ = crate::agent::clarify::take_pending(); // clear any leftover from another test
         let mut r = ToolRegistry::new();
         r.register(Box::new(crate::agent::clarify::Clarify));
@@ -5906,32 +7650,72 @@ mod tests {
         match out.stop {
             StopReason::AwaitingInput(q) => {
                 assert!(q.starts_with("A or B?"), "carries the question: {q}");
-                assert!(q.contains("1. A") && q.contains("2. B"), "carries the options: {q}");
+                assert!(
+                    q.contains("1. A") && q.contains("2. B"),
+                    "carries the options: {q}"
+                );
             }
             other => panic!("expected AwaitingInput, got {other:?}"),
         }
         // Resumable: last message is the clarify tool result (the user's next turn continues from
         // here), and the loop drained the pending cell.
-        assert_eq!(messages.last().unwrap().role, "tool", "history ends in the tool result");
-        assert!(crate::agent::clarify::take_pending().is_none(), "loop drained the pending cell");
+        assert_eq!(
+            messages.last().unwrap().role,
+            "tool",
+            "history ends in the tool result"
+        );
+        assert!(
+            crate::agent::clarify::take_pending().is_none(),
+            "loop drained the pending cell"
+        );
     }
 
     #[test]
     fn signature_is_order_insensitive() {
         let a = vec![
-            ToolCall { id: "1".into(), kind: "function".into(), function: FunctionCall { name: "x".into(), arguments: "{}".into() } },
-            ToolCall { id: "2".into(), kind: "function".into(), function: FunctionCall { name: "y".into(), arguments: "{}".into() } },
+            ToolCall {
+                id: "1".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "x".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            ToolCall {
+                id: "2".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "y".into(),
+                    arguments: "{}".into(),
+                },
+            },
         ];
         let b = vec![
-            ToolCall { id: "3".into(), kind: "function".into(), function: FunctionCall { name: "y".into(), arguments: "{}".into() } },
-            ToolCall { id: "4".into(), kind: "function".into(), function: FunctionCall { name: "x".into(), arguments: "{}".into() } },
+            ToolCall {
+                id: "3".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "y".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            ToolCall {
+                id: "4".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "x".into(),
+                    arguments: "{}".into(),
+                },
+            },
         ];
         assert_eq!(turn_signature(&a), turn_signature(&b));
     }
 
     /// Pin all four agent source dirs into an isolated sandbox so `<agents>` discovery is deterministic.
     fn with_agent_sandbox<T>(tag: &str, f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("ng-tlp-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
@@ -5941,7 +7725,13 @@ mod tests {
         std::env::set_var("NEXTGEN_HOME", root.join(".aizen"));
         std::env::set_var("NG_PROJECT_ROOT", root.join("proj"));
         let out = f(&root);
-        for v in ["USERPROFILE", "HOME", "AIZEN_HOME", "NEXTGEN_HOME", "NG_PROJECT_ROOT"] {
+        for v in [
+            "USERPROFILE",
+            "HOME",
+            "AIZEN_HOME",
+            "NEXTGEN_HOME",
+            "NG_PROJECT_ROOT",
+        ] {
             std::env::remove_var(v);
         }
         let _ = std::fs::remove_dir_all(&root);
@@ -5966,19 +7756,27 @@ mod tests {
 
     #[test]
     fn visual_contract_is_top_level_only_and_mode_specific() {
-        let auto = response_visuals_prompt_block(crate::core::cli_config::ResponseVisuals::Auto).unwrap();
+        let auto =
+            response_visuals_prompt_block(crate::core::cli_config::ResponseVisuals::Auto).unwrap();
         assert!(auto.contains("mode=\"auto\""));
         assert!(auto.contains("Skip it for yes/no"));
         assert!(auto.contains("fenced `diagram`"));
         assert!(auto.contains("Never emit Mermaid"));
 
-        let always = response_visuals_prompt_block(crate::core::cli_config::ResponseVisuals::Always).unwrap();
+        let always =
+            response_visuals_prompt_block(crate::core::cli_config::ResponseVisuals::Always)
+                .unwrap();
         assert!(always.contains("at least ONE meaningful compact visual"));
         assert!(always.contains("exact JSON/code"));
-        assert!(response_visuals_prompt_block(crate::core::cli_config::ResponseVisuals::Off).is_none());
+        assert!(
+            response_visuals_prompt_block(crate::core::cli_config::ResponseVisuals::Off).is_none()
+        );
 
         let sub = build_subagent_base_prompt("/w", "linux", "2026-06-20", "m", false);
-        assert!(!sub.contains("<response_visuals"), "sub-agents must not pay the visual contract tax");
+        assert!(
+            !sub.contains("<response_visuals"),
+            "sub-agents must not pay the visual contract tax"
+        );
     }
 
     #[test]
@@ -5991,14 +7789,27 @@ mod tests {
             .unwrap();
             let dir = root.join(".aizen/agents");
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("code-reviewer.md"), "---\nname: Code Reviewer\ndescription: reviews diffs\n---\nbody").unwrap();
+            std::fs::write(
+                dir.join("code-reviewer.md"),
+                "---\nname: Code Reviewer\ndescription: reviews diffs\n---\nbody",
+            )
+            .unwrap();
             let top = build_top_level_system_prompt("/w", "linux", "2026-06-20", "m", None);
             assert!(top.contains("<agents>"), "installed agent ⇒ index present");
-            assert!(top.contains("task(agent="), "tells the model how to dispatch");
-            assert!(top.starts_with(system_base().trim_end()), "static base prefix is preserved");
+            assert!(
+                top.contains("task(agent="),
+                "tells the model how to dispatch"
+            );
+            assert!(
+                top.starts_with(system_base().trim_end()),
+                "static base prefix is preserved"
+            );
             // The block is a pure SUFFIX: stripping it yields exactly the base prompt.
             let base = build_system_prompt("/w", "linux", "2026-06-20", "m", None);
-            assert!(top.starts_with(&base), "agents block is appended after the unchanged base");
+            assert!(
+                top.starts_with(&base),
+                "agents block is appended after the unchanged base"
+            );
         });
     }
 }

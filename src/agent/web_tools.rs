@@ -76,7 +76,10 @@ impl Tool for WebFetch {
         true // read-only network fetch — the concurrent batch is the whole point (see module note)
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let url = args.get("url").and_then(|v| v.as_str()).context("missing required string arg 'url'")?;
+        let url = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .context("missing required string arg 'url'")?;
         let url = url.to_string();
         // Scheme validation + the SSRF floor live inside `read_url` (single entry for every caller).
         block(crate::agent::reach::route::read_url(&url))
@@ -108,8 +111,13 @@ fn extract_queries(args: &Value) -> Vec<String> {
         match args.get(k) {
             Some(Value::String(s)) if !s.trim().is_empty() => return vec![s.trim().to_string()],
             Some(Value::Array(a)) => {
-                let list: Vec<String> =
-                    a.iter().filter_map(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
+                let list: Vec<String> = a
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
                 if !list.is_empty() {
                     return list;
                 }
@@ -165,12 +173,27 @@ impl Tool for WebSearch {
         if queries.is_empty() {
             anyhow::bail!("missing required string arg 'query' (the text to search for)");
         }
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5).clamp(1, 10) as usize;
-        let site = args.get("site").and_then(|v| v.as_str()).map(str::to_string);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5)
+            .clamp(1, 10) as usize;
+        let site = args
+            .get("site")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         if queries.len() == 1 {
-            block(crate::agent::reach::route::search(&queries[0], limit, site.as_deref()))
+            block(crate::agent::reach::route::search(
+                &queries[0],
+                limit,
+                site.as_deref(),
+            ))
         } else {
-            block(crate::agent::reach::route::search_multi(&queries, limit, site.as_deref()))
+            block(crate::agent::reach::route::search_multi(
+                &queries,
+                limit,
+                site.as_deref(),
+            ))
         }
     }
 }
@@ -204,11 +227,22 @@ impl Tool for WebCrawl {
         true // read-only network fetch — the concurrent batch is the whole point (see module note)
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let url = args.get("url").and_then(|v| v.as_str()).context("missing required string arg 'url'")?;
+        let url = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .context("missing required string arg 'url'")?;
         // SSRF floor on the seed (followed links are vetted per-fetch inside crawl).
         crate::core::net_guard::guard_url(url)?;
-        let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(1).clamp(0, 3) as usize;
-        let max_pages = args.get("max_pages").and_then(|v| v.as_u64()).unwrap_or(40).clamp(1, 200) as usize;
+        let depth = args
+            .get("depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .clamp(0, 3) as usize;
+        let max_pages = args
+            .get("max_pages")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(40)
+            .clamp(1, 200) as usize;
         let scope = match args.get("scope").and_then(|v| v.as_str()) {
             Some(s) => crate::features::crawl::Scope::parse(s)?,
             None => crate::features::crawl::Scope::Strict,
@@ -228,7 +262,11 @@ impl Tool for WebCrawl {
         if report.found.is_empty() {
             return Ok(format!("(crawl of {url} found no URLs)"));
         }
-        let mut s = format!("crawled {} page(s) → {} URL(s):\n", report.pages_fetched, report.found.len());
+        let mut s = format!(
+            "crawled {} page(s) → {} URL(s):\n",
+            report.pages_fetched,
+            report.found.len()
+        );
         for f in &report.found {
             s.push_str(&format!("{} [{}]\n", f.url, f.via.tag()));
         }
@@ -242,8 +280,9 @@ impl Tool for WebCrawl {
 /// entities, collapse runs of spaces (keeping line breaks).
 pub(crate) fn html_to_text(html: &str) -> String {
     // No backreference (`\1`) — the `regex` crate doesn't support them; spell both out.
-    static SCRIPT: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"(?is)<script[^>]*>.*?</\s*script\s*>|<style[^>]*>.*?</\s*style\s*>").unwrap());
+    static SCRIPT: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?is)<script[^>]*>.*?</\s*script\s*>|<style[^>]*>.*?</\s*style\s*>").unwrap()
+    });
     static TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)<[^>]+>").unwrap());
     static SPACES: Lazy<Regex> = Lazy::new(|| Regex::new(r"[ \t\r\x0c]+").unwrap());
     static NEWLINES: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
@@ -257,7 +296,10 @@ pub(crate) fn html_to_text(html: &str) -> String {
 /// Strip tags + decode entities + collapse whitespace in a small HTML fragment (anchor inner text).
 pub(crate) fn strip_tags(s: &str) -> String {
     static TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)<[^>]+>").unwrap());
-    decode_entities(&TAG.replace_all(s, "")).split_whitespace().collect::<Vec<_>>().join(" ")
+    decode_entities(&TAG.replace_all(s, ""))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Decode the handful of HTML entities that actually show up in titles/snippets. `&amp;` is
@@ -294,7 +336,10 @@ mod tests {
         assert!(text.contains("Hello & welcome <3"));
         assert!(!text.contains("alert"), "script body removed");
         assert!(!text.contains("color:red"), "style body removed");
-        assert!(!text.contains('<') || text.contains("<3"), "tags stripped (entity-decoded < kept)");
+        assert!(
+            !text.contains('<') || text.contains("<3"),
+            "tags stripped (entity-decoded < kept)"
+        );
     }
 
     #[test]
@@ -329,7 +374,10 @@ mod tests {
     #[test]
     fn web_search_schema_offers_fan_out_queries() {
         let p = WebSearch.parameters();
-        assert_eq!(p["properties"]["queries"]["type"], "array", "fan-out param present");
+        assert_eq!(
+            p["properties"]["queries"]["type"], "array",
+            "fan-out param present"
+        );
     }
 
     #[test]
@@ -341,7 +389,10 @@ mod tests {
         let required = p.get("required").and_then(|r| r.as_array());
         match required {
             None => {} // no required list at all — fine
-            Some(list) => assert!(!list.iter().any(|v| v == "query"), "'query' must not be schema-required: {list:?}"),
+            Some(list) => assert!(
+                !list.iter().any(|v| v == "query"),
+                "'query' must not be schema-required: {list:?}"
+            ),
         }
         // execute() must still reject a call with neither field.
         assert!(WebSearch.execute(&serde_json::json!({"limit": 3})).is_err());
@@ -350,7 +401,10 @@ mod tests {
     #[test]
     fn extract_queries_handles_single_list_and_aliases() {
         // Single string.
-        assert_eq!(extract_queries(&serde_json::json!({"query": "rust async"})), vec!["rust async"]);
+        assert_eq!(
+            extract_queries(&serde_json::json!({"query": "rust async"})),
+            vec!["rust async"]
+        );
         // Fan-out list (the W20 path).
         assert_eq!(
             extract_queries(&serde_json::json!({"queries": ["tokio runtime", "async-std", "  "]})),

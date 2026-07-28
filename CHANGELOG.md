@@ -7,6 +7,121 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-28
+
+Memory stops being a write-only pile: facts are placed on a tier/anchor axis, recall itself into the
+turn, fade instead of accumulating, and every destructive step has a reverse gear. Also the first
+in-place upgrade path — `aizen update` / `/update` — so a release no longer means re-running the
+installer.
+
+Cut from `feature/memory-tiers`. Contains everything in 0.4.9 (which soaked on its own branch and was
+never merged to `main`).
+
+### Added
+- **`aizen update` and `/update` — see every published version and install the one you pick.** One
+  flag-free command: the picker lists the releases with the running build marked `● installed now`,
+  and newer / older / pre-release spelled out on each row, so upgrading and rolling back a bad
+  release are the same gesture. The new binary lands on disk immediately while **the session you ran
+  it from keeps working on the old one** — the running executable is renamed aside and the download
+  takes its place, so nothing is swapped out from under a live process; the new version takes effect
+  in the next terminal. Startup does a silent check (cached 24h, `AIZEN_NO_UPDATE_CHECK=1` or
+  `update_check: false` to switch off) and mentions a newer version in one dim line.
+- **`aizen memory health`** — per-week table over `stats.jsonl` (store growth, saturation, how much
+  injected memory actually got used, contradictions found) plus a verdict, and an explicit refusal to
+  conclude anything from under four weeks of data.
+- **`aizen memory doctor`** — the tier/anchor axis fails quietly by construction: an unanchored place
+  fact, an anchor whose directory is gone, or a `supersededBy` naming a purged id all look healthy in
+  `memory list` and just subtract from recall. `doctor` names them.
+- **`aizen memory reconcile`** (dry-run by default) and **`memory list --superseded`** — the
+  graveyard is now browsable, with what replaced each row and the revive command spelled out.
+- **`aizen memory revive <id>`** — clears both halves of a supersession (the retired side's pointer
+  *and* any live fact's forward `supersedes:` claim), since either one alone keeps the fact hidden.
+
+### Changed
+- **`/timemachine` is one command instead of four.** Typing it opens the checkpoint list — `▸` marks
+  where you are, each row carries the id, how long ago, the label, and whether picking it rewinds
+  `code + chat` or `code only` — and picking a row puts you back in that code and that conversation
+  in one gesture. The `pick`/`restore`/`menu` arguments and the Files / Task / Both sub-menu are
+  gone: what a checkpoint restores is a property of the checkpoint, not a question to answer twice.
+  Still reversible (the pre-restore tree is auto-snapshotted and the live chat is saved to its own
+  session file first), Esc still leaves without touching anything, and `/timeline` · `/tm` remain as
+  aliases. `aizen time …` on the CLI is unchanged.
+- **Memory places facts on a tier/anchor axis** instead of one hashed scope slug: `tier` says what a
+  fact is *about* (the person, this machine, a directory tree) and `anchor` says where a place fact
+  *applies* (a normalized absolute path, matched segment-safe, nearest ancestor wins). The read
+  predicate reads the same axis, so "true here" is decided one way in one place, and an unresolvable
+  orphan fails closed rather than leaking into every directory.
+- **Relevant facts arrive in the turn without the model calling a tool for them.** Labelled by axis
+  (about you / this machine / here) behind a relevance gate, budget-packed, and skipped entirely when
+  the selection hasn't changed — a second copy of a fact already in the transcript is just a rival
+  claim with nothing marking which is newer. Being *shown* a fact earns nothing; only reporting it as
+  used does.
+- **Reinforcement saturates instead of growing without bound.** Strength is keyed to confirmations on
+  a capped ladder, the idle clock reads *last used* rather than any bookkeeping rewrite, and a fact
+  the user typed by hand keeps a floor under its salience instead of being permanently halved for
+  never having been searched for.
+- **Faded facts are set aside, not deleted** — and the first sweep on any store only *previews* what
+  it would move. An upgrade that quietly starts relocating someone's facts on the strength of a
+  brand-new formula isn't something they can consent to afterwards.
+- **Per-partition memory caps** are bucketed by tier/anchor. Every fact written on the new axis
+  carries no scope slug, so a scope-keyed bucket had put the whole store in one pool — one chatty
+  project evicting every other project's facts is exactly what per-zone caps exist to prevent.
+
+### Fixed
+- **Four hard-delete windows on user data closed.** Persona self-memory pruning, `memory review
+  --clear`, and skill writes all moved to archive-or-atomic-write; a crash mid-write could previously
+  truncate a skill to zero bytes on any `skill_load`.
+- **Retiring a fact no longer drops frontmatter keys this build doesn't model** — supersession
+  rebuilt a fixed record shape, so anything unrecognized was silently lost. It edits the field map
+  now, like updates do.
+- **Restoring an archived fact keeps its id**, and errors asking for `--as <new-id>` on collision
+  instead of silently landing as `<id>-2`: a fact that answers searches while being invisible to
+  every pointer aimed at it.
+- Contradictions phrased in different words are caught by a batched pass off the hot path (at most
+  one model call, at most 12 pairs) with asymmetric rails: nothing destructive below a confidence
+  floor, and a fact confirmed twice by the user goes to review at *any* confidence rather than being
+  overruled automatically. Same-chain ties break on recency, and the survivor re-anchors to the
+  common ancestor so resolving *content* never quietly narrows *where* a fact applies.
+
+## [0.4.9] — 2026-07-26
+
+Version-only release cut from `release/v0.4.9`: the 0.4.8 tag had already been published from the
+pre-identity-work tree, so the work listed under 0.4.8 below actually shipped as the 0.4.9 binary. It
+soaked on its own branch and reaches `main` as part of 0.5.0.
+
+## [0.4.8] — 2026-07-26
+
+### Fixed
+- **A project's memory, skills and index no longer fork in two depending on whether `git` was on
+  PATH** — the zone key was hashed from the git remote URL when git could be found and from the raw
+  path when it couldn't, so the same checkout answered to two different zones from one launch to the
+  next and half the user's memory went missing without a word. The key is now the normalized
+  canonical project path only; the remote URL is informational. `aizen zone migrate` shows what a
+  legacy zone holds (dry-run by default) and merges it on `--apply`, including saved conversations,
+  which are keyed by provenance inside each file and so were invisible to a per-directory sweep.
+- **A missing `git` no longer blocks editing** — `git` not being on PATH was treated as a hard
+  checkpoint failure, which refused every edit rather than degrading. It is now benign: checkpoints
+  switch off with one warning and work continues. `git` is resolved once through a central resolver
+  (`AIZEN_GIT`, then PATH, then the usual install locations) so a GUI-installed git is found even
+  when the shell can't see it.
+- **`/resume` no longer grafts one project's context onto another** — sessions live in one flat pool,
+  so restoring offered whichever conversation was written last, from any project, and replayed its
+  stale system lane into the current one. Session files now record their origin (project key/root/
+  slug, model, created/updated); the startup hint and bare `/resume` prefer this project's newest
+  conversation and label a cross-project offer with `from <dir>`; restoring rebuilds both prompt
+  lanes for the current project. `/handoff` rotates to a fresh file instead of overwriting the
+  conversation it summarized.
+- **The `/sessions` picker says what each row is** — turn count, age, origin project and a `● current`
+  marker, newest first, with a confirmation before overwriting another conversation's file and
+  `(unreadable)` for a corrupt one instead of a plausible-looking empty row.
+- **A failing autosave is no longer silent** — it warns once per failure streak and reports recovery,
+  so a conversation that is not reaching disk says so.
+
+### Added
+- `aizen where` and `/where` — print the project root, zone slug, resolved `git`, and the paths
+  backing memory, skills, the codebase index and sessions, so which zone is in effect is checkable
+  rather than inferred.
+
 ### Changed
 - **Telegram replies are now native, compact HTML instead of raw Markdown** — headings, emphasis,
   inline/fenced code, safe links, lists and quotes use Telegram's supported formatting; Markdown

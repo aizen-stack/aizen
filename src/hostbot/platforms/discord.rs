@@ -75,7 +75,13 @@ impl Client {
             .context("discord sendMessage")?;
         if !resp.status().is_success() {
             let s = resp.status();
-            let b: String = resp.text().await.unwrap_or_default().chars().take(200).collect();
+            let b: String = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect();
             bail!("discord send failed: HTTP {} {}", s.as_u16(), b.trim());
         }
         Ok(())
@@ -84,13 +90,24 @@ impl Client {
     /// `GET /users/@me` → the bot's username (validates the token; used by `aizen discord test`).
     pub async fn get_me(&self) -> Result<String> {
         let url = format!("{API_BASE}/users/@me");
-        let resp =
-            self.http.get(&url).header("Authorization", self.auth()).send().await.context("discord getMe")?;
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", self.auth())
+            .send()
+            .await
+            .context("discord getMe")?;
         if !resp.status().is_success() {
-            bail!("discord rejected the token (HTTP {})", resp.status().as_u16());
+            bail!(
+                "discord rejected the token (HTTP {})",
+                resp.status().as_u16()
+            );
         }
         let v: Value = resp.json().await.context("parsing /users/@me")?;
-        Ok(v.get("username").and_then(|u| u.as_str()).unwrap_or("?").to_string())
+        Ok(v.get("username")
+            .and_then(|u| u.as_str())
+            .unwrap_or("?")
+            .to_string())
     }
 }
 
@@ -170,8 +187,9 @@ pub async fn run_gateway(token: String, cfg: DiscordConfig, tx: mpsc::Sender<Inc
 }
 
 async fn gateway_once(token: &str, cfg: &DiscordConfig, tx: &mpsc::Sender<Incoming>) -> Result<()> {
-    let (mut ws, _) =
-        tokio_tungstenite::connect_async(GATEWAY_URL).await.context("connecting to discord gateway")?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(GATEWAY_URL)
+        .await
+        .context("connecting to discord gateway")?;
 
     // 1) HELLO → heartbeat_interval (ms). Read frames until we get it — under a hard timeout so a
     // gateway that completes the WS upgrade but never sends HELLO (broken proxy / misbehaving edge)
@@ -179,7 +197,11 @@ async fn gateway_once(token: &str, cfg: &DiscordConfig, tx: &mpsc::Sender<Incomi
     let mut interval_ms = 41_250u64;
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let frame = ws.next().await.context("gateway closed before HELLO")?.context("gateway read")?;
+            let frame = ws
+                .next()
+                .await
+                .context("gateway closed before HELLO")?
+                .context("gateway read")?;
             if let WsMessage::Text(t) = frame {
                 if let Ok(v) = serde_json::from_str::<Value>(t.as_str()) {
                     if v.get("op").and_then(|o| o.as_u64()) == Some(OP_HELLO) {
@@ -207,7 +229,9 @@ async fn gateway_once(token: &str, cfg: &DiscordConfig, tx: &mpsc::Sender<Incomi
             "properties": {"os": std::env::consts::OS, "browser": "aizen", "device": "aizen"}
         }
     });
-    ws.send(WsMessage::text(identify.to_string())).await.context("sending IDENTIFY")?;
+    ws.send(WsMessage::text(identify.to_string()))
+        .await
+        .context("sending IDENTIFY")?;
 
     // 3) heartbeat + dispatch loop. Replies go via REST elsewhere, so this loop only beats + reads.
     let mut hb = tokio::time::interval(Duration::from_millis(interval_ms.max(1000)));
@@ -279,7 +303,11 @@ async fn gateway_once(token: &str, cfg: &DiscordConfig, tx: &mpsc::Sender<Incomi
 /// empty content. Discord ids are snowflake STRINGS in JSON → parsed to `u64`.
 fn parse_message_create(d: Option<&Value>) -> Option<Incoming> {
     let d = d?;
-    if d.get("author").and_then(|a| a.get("bot")).and_then(|b| b.as_bool()).unwrap_or(false) {
+    if d.get("author")
+        .and_then(|a| a.get("bot"))
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false)
+    {
         return None;
     }
     let channel_id = d.get("channel_id")?.as_str()?.parse().ok()?;
@@ -288,7 +316,11 @@ fn parse_message_create(d: Option<&Value>) -> Option<Incoming> {
     if content.is_empty() {
         return None;
     }
-    Some(Incoming { channel_id, user_id, content })
+    Some(Incoming {
+        channel_id,
+        user_id,
+        content,
+    })
 }
 
 // ── DiscordPlatform (the `Platform` impl) ──────────────────────────────────────────
@@ -342,7 +374,11 @@ impl Platform for DiscordPlatform {
         let bridge = tokio::spawn(async move {
             while let Some(inc) = grx.recv().await {
                 let _ = tx
-                    .send(Inbound { route: "default".to_string(), chat: inc.channel_id, text: inc.content })
+                    .send(Inbound {
+                        route: "default".to_string(),
+                        chat: inc.channel_id,
+                        text: inc.content,
+                    })
                     .await;
             }
         });
@@ -355,7 +391,10 @@ impl Platform for DiscordPlatform {
 
     fn render_reply(&self, raw: &str) -> Vec<Outbound> {
         let shown = crate::ui::markdown::render_plain_blocks(raw);
-        chunk_plain(&shown, MESSAGE_MAX).into_iter().map(Outbound::plain).collect()
+        chunk_plain(&shown, MESSAGE_MAX)
+            .into_iter()
+            .map(Outbound::plain)
+            .collect()
     }
 
     async fn send(&self, _route: &str, chat: u64, text: &str) -> Result<()> {
@@ -370,7 +409,9 @@ impl Platform for DiscordPlatform {
 }
 
 fn chunk_plain(s: &str, max: usize) -> Vec<String> {
-    if s.encode_utf16().count() <= max { return vec![s.to_string()]; }
+    if s.encode_utf16().count() <= max {
+        return vec![s.to_string()];
+    }
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut units = 0usize;
@@ -383,7 +424,9 @@ fn chunk_plain(s: &str, max: usize) -> Vec<String> {
         cur.push(ch);
         units += u;
     }
-    if !cur.is_empty() { out.push(cur); }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
     out
 }
 
@@ -393,37 +436,69 @@ mod tests {
 
     #[test]
     fn intents_include_message_content() {
-        assert_eq!(INTENTS & (1 << 15), 1 << 15, "MESSAGE_CONTENT must be requested");
-        assert_eq!(INTENTS & (1 << 9), 1 << 9, "GUILD_MESSAGES must be requested");
+        assert_eq!(
+            INTENTS & (1 << 15),
+            1 << 15,
+            "MESSAGE_CONTENT must be requested"
+        );
+        assert_eq!(
+            INTENTS & (1 << 9),
+            1 << 9,
+            "GUILD_MESSAGES must be requested"
+        );
     }
 
     #[test]
     fn gateway_opcodes_match_discord_v10() {
         // The loop's zombie detection + control-frame handling depend on these exact opcode numbers.
         assert_eq!((OP_DISPATCH, OP_HEARTBEAT, OP_IDENTIFY), (0, 1, 2));
-        assert_eq!((OP_RECONNECT, OP_INVALID_SESSION, OP_HELLO, OP_HEARTBEAT_ACK), (7, 9, 10, 11));
+        assert_eq!(
+            (OP_RECONNECT, OP_INVALID_SESSION, OP_HELLO, OP_HEARTBEAT_ACK),
+            (7, 9, 10, 11)
+        );
     }
 
     #[test]
     fn allowlist_denies_empty_and_unlisted() {
         let mut cfg = DiscordConfig::default();
-        assert!(!is_allowed(&cfg, 100, 7), "empty channel list denies everyone");
+        assert!(
+            !is_allowed(&cfg, 100, 7),
+            "empty channel list denies everyone"
+        );
         cfg.allowed_channel_ids = vec![100, 200];
-        assert!(is_allowed(&cfg, 100, 7), "listed channel, no user restriction → allowed");
+        assert!(
+            is_allowed(&cfg, 100, 7),
+            "listed channel, no user restriction → allowed"
+        );
         assert!(!is_allowed(&cfg, 300, 7), "unlisted channel → denied");
         cfg.allowed_user_ids = vec![7];
-        assert!(is_allowed(&cfg, 100, 7), "listed channel + listed user → allowed");
-        assert!(!is_allowed(&cfg, 100, 8), "listed channel but unlisted user → denied");
+        assert!(
+            is_allowed(&cfg, 100, 7),
+            "listed channel + listed user → allowed"
+        );
+        assert!(
+            !is_allowed(&cfg, 100, 8),
+            "listed channel but unlisted user → denied"
+        );
     }
 
     #[test]
     fn parse_skips_bots_and_empty_parses_snowflakes() {
         let bot = json!({"channel_id":"1","author":{"id":"2","bot":true},"content":"hi"});
-        assert!(parse_message_create(Some(&bot)).is_none(), "bot author skipped");
+        assert!(
+            parse_message_create(Some(&bot)).is_none(),
+            "bot author skipped"
+        );
         let empty = json!({"channel_id":"1","author":{"id":"2"},"content":"   "});
-        assert!(parse_message_create(Some(&empty)).is_none(), "empty content skipped");
+        assert!(
+            parse_message_create(Some(&empty)).is_none(),
+            "empty content skipped"
+        );
         let ok = json!({"channel_id":"123","author":{"id":"456"},"content":"hello"});
         let inc = parse_message_create(Some(&ok)).expect("valid message parses");
-        assert_eq!((inc.channel_id, inc.user_id, inc.content.as_str()), (123, 456, "hello"));
+        assert_eq!(
+            (inc.channel_id, inc.user_id, inc.content.as_str()),
+            (123, 456, "hello")
+        );
     }
 }

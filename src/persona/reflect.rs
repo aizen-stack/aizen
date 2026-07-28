@@ -18,7 +18,11 @@ pub struct Insight {
 
 /// Build the `(system, user)` reflection prompt for `persona_name`/`role` over formative `episodes`
 /// (chronological). The model is asked to return strict JSON; the body is intentionally compact.
-pub fn build_reflection_prompt(persona_name: &str, role: &str, episodes: &[String]) -> (String, String) {
+pub fn build_reflection_prompt(
+    persona_name: &str,
+    role: &str,
+    episodes: &[String],
+) -> (String, String) {
     let who = if role.trim().is_empty() {
         persona_name.to_string()
     } else {
@@ -66,14 +70,23 @@ pub fn parse_insights(json: &str) -> Vec<Insight> {
     let mut out: Vec<Insight> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for item in arr {
-        let text = item.get("text").and_then(|t| t.as_str()).unwrap_or("").trim().to_string();
+        let text = item
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if text.is_empty() {
             continue;
         }
         if looks_like_task_trivia(&text) {
             continue;
         }
-        let norm = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        let norm = text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
         if seen.contains(&norm) {
             continue;
         }
@@ -97,9 +110,27 @@ pub fn parse_insights(json: &str) -> Vec<Insight> {
 fn looks_like_task_trivia(text: &str) -> bool {
     let t = text.to_lowercase();
     const MARKERS: &[&str] = &[
-        ".rs", ".ts", ".js", ".py", ".go", ".tsx", ".jsx", "cargo ", "npm ", "git commit",
-        "pull request", "stack trace", "compile error", "type error", "line ", "fn ", "function ",
-        "bug in", "fixed the", "patched ", "src/",
+        ".rs",
+        ".ts",
+        ".js",
+        ".py",
+        ".go",
+        ".tsx",
+        ".jsx",
+        "cargo ",
+        "npm ",
+        "git commit",
+        "pull request",
+        "stack trace",
+        "compile error",
+        "type error",
+        "line ",
+        "fn ",
+        "function ",
+        "bug in",
+        "fixed the",
+        "patched ",
+        "src/",
     ];
     // Only reject when it looks *dominantly* like task trivia AND lacks relationship language.
     let hit = MARKERS.iter().any(|m| t.contains(m));
@@ -107,8 +138,23 @@ fn looks_like_task_trivia(text: &str) -> bool {
         return false;
     }
     const REL: &[&str] = &[
-        "user", "prefer", "style", "tone", "language", "relationship", "trust", "always", "never",
-        "with me", "when we", "they like", "they want", "tôi", "bạn", "anh", "em",
+        "user",
+        "prefer",
+        "style",
+        "tone",
+        "language",
+        "relationship",
+        "trust",
+        "always",
+        "never",
+        "with me",
+        "when we",
+        "they like",
+        "they want",
+        "tôi",
+        "bạn",
+        "anh",
+        "em",
     ];
     !REL.iter().any(|r| t.contains(r))
 }
@@ -119,7 +165,8 @@ mod tests {
 
     #[test]
     fn prompt_includes_role_and_numbered_episodes() {
-        let (sys, usr) = build_reflection_prompt("Aria", "a mentor", &["did x".into(), "did y".into()]);
+        let (sys, usr) =
+            build_reflection_prompt("Aria", "a mentor", &["did x".into(), "did y".into()]);
         assert!(sys.contains("You are Aria, a mentor."));
         assert!(sys.contains("insights"));
         assert!(sys.contains("NEVER write insights about a specific bug"));

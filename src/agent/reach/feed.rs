@@ -39,8 +39,13 @@ pub(crate) fn looks_like_feed_url(url: &reqwest::Url) -> bool {
 /// Does this BODY look like a feed? Cheap sniff over the first chunk (UTF-8 BOM tolerated —
 /// plenty of real feeds ship one).
 pub(crate) fn sniff(body: &str) -> bool {
-    let head: String =
-        body.trim_start_matches('\u{feff}').trim_start().chars().take(600).collect::<String>().to_ascii_lowercase();
+    let head: String = body
+        .trim_start_matches('\u{feff}')
+        .trim_start()
+        .chars()
+        .take(600)
+        .collect::<String>()
+        .to_ascii_lowercase();
     (head.starts_with("<?xml") || head.starts_with("<rss") || head.starts_with("<feed"))
         && (head.contains("<rss") || head.contains("<feed") || head.contains("<rdf:rdf"))
 }
@@ -78,7 +83,16 @@ pub(crate) fn render(xml: &str, url: &str) -> Result<String> {
         bail!("no items found in feed {url} (unsupported dialect?)");
     }
     let shown = items.len().min(MAX_ITEMS);
-    let mut s = format!("[feed {url}] {} — {} item(s){}:\n", feed_title, items.len(), if items.len() > shown { format!(" (showing {shown})") } else { String::new() });
+    let mut s = format!(
+        "[feed {url}] {} — {} item(s){}:\n",
+        feed_title,
+        items.len(),
+        if items.len() > shown {
+            format!(" (showing {shown})")
+        } else {
+            String::new()
+        }
+    );
     for it in items.iter().take(MAX_ITEMS) {
         s.push_str(&format!("\n• {}", it.title));
         if !it.date.is_empty() {
@@ -98,15 +112,22 @@ pub(crate) fn render(xml: &str, url: &str) -> Result<String> {
 /// Best-effort RSS2/Atom/RDF item extraction. Regexes over well-formed-enough XML — the same
 /// tradeoff as `html_to_text` (good enough to feed prose to the model, not a validator).
 pub(crate) fn parse(xml: &str) -> (String, Vec<FeedItem>) {
-    static ITEM: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<(?:item|entry)\b[^>]*>(.*?)</(?:item|entry)>").unwrap());
-    static TITLE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<title[^>]*>(.*?)</title>").unwrap());
+    static ITEM: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?is)<(?:item|entry)\b[^>]*>(.*?)</(?:item|entry)>").unwrap());
+    static TITLE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?is)<title[^>]*>(.*?)</title>").unwrap());
     static LINK_HREF: Lazy<Regex> =
         Lazy::new(|| Regex::new(r#"(?is)<link[^>]*href\s*=\s*"([^"]+)"[^>]*/?>"#).unwrap());
-    static LINK_TEXT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<link[^>]*>([^<]+)</link>").unwrap());
-    static DATE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"(?is)<(?:pubDate|updated|published|dc:date)[^>]*>(.*?)</(?:pubDate|updated|published|dc:date)>").unwrap());
+    static LINK_TEXT: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?is)<link[^>]*>([^<]+)</link>").unwrap());
+    static DATE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?is)<(?:pubDate|updated|published|dc:date)[^>]*>(.*?)</(?:pubDate|updated|published|dc:date)>").unwrap()
+    });
     static SUMMARY: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"(?is)<(?:description|summary|content)\b[^>]*>(.*?)</(?:description|summary|content)>").unwrap()
+        Regex::new(
+            r"(?is)<(?:description|summary|content)\b[^>]*>(.*?)</(?:description|summary|content)>",
+        )
+        .unwrap()
     });
 
     // Feed-level title = the first <title> BEFORE the first item block.
@@ -121,7 +142,10 @@ pub(crate) fn parse(xml: &str) -> (String, Vec<FeedItem>) {
         .captures_iter(xml)
         .map(|c| {
             let block = &c[1];
-            let title = TITLE.captures(block).map(|c| clean_text(&c[1])).unwrap_or_else(|| "(untitled)".into());
+            let title = TITLE
+                .captures(block)
+                .map(|c| clean_text(&c[1]))
+                .unwrap_or_else(|| "(untitled)".into());
             // Atom prefers the alternate/href link; RSS uses text content.
             let link = LINK_HREF
                 .captures_iter(block)
@@ -129,12 +153,20 @@ pub(crate) fn parse(xml: &str) -> (String, Vec<FeedItem>) {
                 .find(|_| true)
                 .or_else(|| LINK_TEXT.captures(block).map(|c| c[1].trim().to_string()))
                 .unwrap_or_default();
-            let date = DATE.captures(block).map(|c| clean_text(&c[1])).unwrap_or_default();
+            let date = DATE
+                .captures(block)
+                .map(|c| clean_text(&c[1]))
+                .unwrap_or_default();
             let summary = SUMMARY
                 .captures(block)
                 .map(|c| truncate_chars(&clean_text(&c[1]), ITEM_SUMMARY_CAP))
                 .unwrap_or_default();
-            FeedItem { title, link, date, summary }
+            FeedItem {
+                title,
+                link,
+                date,
+                summary,
+            }
         })
         .collect();
     (feed_title, items)
@@ -143,7 +175,10 @@ pub(crate) fn parse(xml: &str) -> (String, Vec<FeedItem>) {
 /// CDATA unwrap → entity decode → tag strip → whitespace collapse.
 fn clean_text(s: &str) -> String {
     let s = s.trim();
-    let s = s.strip_prefix("<![CDATA[").and_then(|x| x.strip_suffix("]]>")).unwrap_or(s);
+    let s = s
+        .strip_prefix("<![CDATA[")
+        .and_then(|x| x.strip_suffix("]]>"))
+        .unwrap_or(s);
     // Double-decode handles feeds that ship entity-encoded HTML in descriptions (`&lt;p&gt;…`).
     let decoded = decode_entities(&decode_entities(s));
     strip_tags(&decoded)
@@ -185,10 +220,16 @@ mod tests {
         let (title, items) = parse(RSS);
         assert_eq!(title, "Example Blog");
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0].title, "First post", "CDATA unwrapped, inner tags stripped");
+        assert_eq!(
+            items[0].title, "First post",
+            "CDATA unwrapped, inner tags stripped"
+        );
         assert_eq!(items[0].link, "https://blog.example.com/1");
         assert!(items[0].date.contains("2026"));
-        assert_eq!(items[0].summary, "Hello & welcome", "entity-encoded HTML decoded then stripped");
+        assert_eq!(
+            items[0].summary, "Hello & welcome",
+            "entity-encoded HTML decoded then stripped"
+        );
         assert_eq!(items[1].summary, "");
     }
 
@@ -218,7 +259,9 @@ mod tests {
         assert!(!sniff("<!DOCTYPE html><html><head></head></html>"));
         assert!(!sniff("plain text"));
         // XML that is not a feed (e.g. an SVG) is not sniffed as one.
-        assert!(!sniff(r#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"></svg>"#));
+        assert!(!sniff(
+            r#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"></svg>"#
+        ));
     }
 
     #[test]
@@ -232,7 +275,9 @@ mod tests {
         ] {
             assert!(looks_like_feed_url(&reqwest::Url::parse(s).unwrap()), "{s}");
         }
-        assert!(!looks_like_feed_url(&reqwest::Url::parse("https://example.com/article").unwrap()));
+        assert!(!looks_like_feed_url(
+            &reqwest::Url::parse("https://example.com/article").unwrap()
+        ));
     }
 
     #[test]

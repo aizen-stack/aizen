@@ -77,12 +77,18 @@ struct ActiveLease {
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub fn current_repo_scope() -> String {
     let root = crate::core::config::project_root();
-    fs::canonicalize(&root).unwrap_or(root).display().to_string()
+    fs::canonicalize(&root)
+        .unwrap_or(root)
+        .display()
+        .to_string()
 }
 
 fn recovery_root() -> PathBuf {
@@ -119,7 +125,10 @@ pub fn begin(repo_scope: impl Into<String>, session_name: Option<String>) {
     let dir = lease_dir(&run_id);
     let _ = fs::create_dir_all(&dir);
     crate::core::config::harden_dir(&dir);
-    let lock = match crate::core::repo_lock::RepoTxnLock::acquire(&lock_path(&dir), Duration::from_secs(1)) {
+    let lock = match crate::core::repo_lock::RepoTxnLock::acquire(
+        &lock_path(&dir),
+        Duration::from_secs(1),
+    ) {
         Ok(l) => l,
         Err(_) => return,
     };
@@ -142,7 +151,11 @@ pub fn begin(repo_scope: impl Into<String>, session_name: Option<String>) {
     if write_manifest(&dir, &manifest).is_err() {
         return;
     }
-    *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(ActiveLease { dir, manifest, _lock: lock });
+    *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(ActiveLease {
+        dir,
+        manifest,
+        _lock: lock,
+    });
 }
 
 fn write_manifest(dir: &Path, manifest: &RecoveryManifest) -> Result<()> {
@@ -160,7 +173,9 @@ pub fn checkpoint_history(
     phase: RecoveryPhase,
 ) -> Result<()> {
     let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(active) = guard.as_mut() else { return Ok(()) };
+    let Some(active) = guard.as_mut() else {
+        return Ok(());
+    };
     let old = active.manifest.clone();
     let generation = old.sidecar_generation.saturating_add(1);
     let hist_path = history_path(&active.dir, generation);
@@ -255,7 +270,9 @@ pub fn clear() {
 /// Scan for stale recovery leases from previous processes in exactly this repository/worktree.
 pub fn scan_stale(repo_scope: &str) -> Vec<RecoveryOffer> {
     let root = recovery_root();
-    let Ok(rd) = fs::read_dir(&root) else { return Vec::new() };
+    let Ok(rd) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for entry in rd.flatten() {
         let path = entry.path();
@@ -267,7 +284,10 @@ pub fn scan_stale(repo_scope: &str) -> Vec<RecoveryOffer> {
                 continue;
             }
         }
-        let Ok(_lock) = crate::core::repo_lock::RepoTxnLock::acquire(&lock_path(&path), Duration::from_millis(50)) else {
+        let Ok(_lock) = crate::core::repo_lock::RepoTxnLock::acquire(
+            &lock_path(&path),
+            Duration::from_millis(50),
+        ) else {
             continue;
         };
         let Ok(raw) = fs::read_to_string(manifest_path(&path)) else {
@@ -303,7 +323,12 @@ pub fn scan_stale(repo_scope: &str) -> Vec<RecoveryOffer> {
         let pending_draft = fs::read_to_string(draft_path(&path, manifest.sidecar_generation))
             .ok()
             .filter(|s| !s.trim().is_empty());
-        out.push(RecoveryOffer { path, manifest, history, pending_draft });
+        out.push(RecoveryOffer {
+            path,
+            manifest,
+            history,
+            pending_draft,
+        });
     }
     out.sort_by_key(|o| std::cmp::Reverse(o.manifest.updated_unix));
     out
@@ -350,7 +375,9 @@ pub fn discard(offer: &RecoveryOffer) -> Result<()> {
     let raw = fs::read_to_string(manifest_path(&offer.path))
         .with_context(|| format!("reading recovery offer {}", offer.path.display()))?;
     let current: RecoveryManifest = serde_json::from_str(&raw).context("parsing recovery offer")?;
-    if current.run_id != offer.manifest.run_id || current.updated_unix != offer.manifest.updated_unix {
+    if current.run_id != offer.manifest.run_id
+        || current.updated_unix != offer.manifest.updated_unix
+    {
         anyhow::bail!("recovery offer changed before it could be discarded; rescan and retry");
     }
     consume_dir(&offer.path)
@@ -370,7 +397,8 @@ fn read_authoritative_history(path: &Path, manifest: &RecoveryManifest) -> Resul
 fn consume_dir(path: &Path) -> Result<()> {
     let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("offer");
     let consumed = recovery_root().join(format!("consumed-{stem}-{}", now_unix()));
-    fs::rename(path, &consumed).with_context(|| format!("consuming recovery lease {}", path.display()))?;
+    fs::rename(path, &consumed)
+        .with_context(|| format!("consuming recovery lease {}", path.display()))?;
     let _ = fs::remove_dir_all(consumed);
     Ok(())
 }
@@ -378,9 +406,21 @@ fn consume_dir(path: &Path) -> Result<()> {
 /// Human-readable banner for a recovery offer. Draft contents are deliberately not echoed.
 pub fn format_offer(offer: &RecoveryOffer) -> String {
     let phase = offer.manifest.phase.as_str();
-    let draft = offer.pending_draft.as_ref().map(|_| " · draft saved").unwrap_or_default();
-    let ckpt = offer.manifest.checkpoint_id.map(|id| format!(" · checkpoint #{id}")).unwrap_or_default();
-    let effects = if offer.manifest.side_effects_possible { " · side effects possible" } else { "" };
+    let draft = offer
+        .pending_draft
+        .as_ref()
+        .map(|_| " · draft saved")
+        .unwrap_or_default();
+    let ckpt = offer
+        .manifest
+        .checkpoint_id
+        .map(|id| format!(" · checkpoint #{id}"))
+        .unwrap_or_default();
+    let effects = if offer.manifest.side_effects_possible {
+        " · side effects possible"
+    } else {
+        ""
+    };
     format!(
         "recoverable session · phase={phase} · {} msgs{ckpt}{effects}{draft}",
         offer.history.len()
@@ -418,7 +458,9 @@ mod tests {
 
     #[test]
     fn stale_offer_is_repo_scoped_and_requires_complete_generation() {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("aizen-recovery-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         std::env::set_var("AIZEN_HOME", &root);
@@ -431,8 +473,14 @@ mod tests {
             &serde_json::to_vec(&vec![Message::system("s")]).unwrap(),
         )
         .unwrap();
-        assert!(scan_stale("repo-a").is_empty(), "truncated generation is never offered");
-        assert!(scan_stale("repo-b").is_empty(), "foreign repository lease is invisible");
+        assert!(
+            scan_stale("repo-a").is_empty(),
+            "truncated generation is never offered"
+        );
+        assert!(
+            scan_stale("repo-b").is_empty(),
+            "foreign repository lease is invisible"
+        );
         std::env::remove_var("AIZEN_HOME");
         let _ = fs::remove_dir_all(&root);
     }

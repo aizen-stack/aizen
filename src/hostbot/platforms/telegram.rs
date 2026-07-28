@@ -102,12 +102,24 @@ impl Client {
             .await
             .map_err(|e| {
                 // reqwest errors can include the request URL, and Telegram embeds the bot token there.
-                let kind = if e.is_timeout() { "timeout" } else if e.is_connect() { "connection" } else { "transport" };
+                let kind = if e.is_timeout() {
+                    "timeout"
+                } else if e.is_connect() {
+                    "connection"
+                } else {
+                    "transport"
+                };
                 anyhow::anyhow!("telegram {method} request failed ({kind})")
             })?;
-        let v: Value = resp.json().await.with_context(|| format!("parsing {method} response"))?;
+        let v: Value = resp
+            .json()
+            .await
+            .with_context(|| format!("parsing {method} response"))?;
         if !v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
-            let desc = v.get("description").and_then(|d| d.as_str()).unwrap_or("unknown error");
+            let desc = v
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("unknown error");
             bail!("telegram {method} failed: {desc}");
         }
         let result = v.get("result").cloned().unwrap_or(Value::Null);
@@ -152,9 +164,16 @@ impl Client {
     }
 
     /// Send a message with a single inline-keyboard row of (label, callback_data) buttons.
-    pub async fn send_keyboard(&self, chat_id: i64, text: &str, buttons: &[(&str, String)]) -> Result<Message> {
-        let row: Vec<Value> =
-            buttons.iter().map(|(label, data)| json!({"text": label, "callback_data": data})).collect();
+    pub async fn send_keyboard(
+        &self,
+        chat_id: i64,
+        text: &str,
+        buttons: &[(&str, String)],
+    ) -> Result<Message> {
+        let row: Vec<Value> = buttons
+            .iter()
+            .map(|(label, data)| json!({"text": label, "callback_data": data}))
+            .collect();
         self.call(
             "sendMessage",
             json!({"chat_id": chat_id, "text": text, "reply_markup": {"inline_keyboard": [row]}}),
@@ -164,27 +183,41 @@ impl Client {
 
     pub async fn answer_callback(&self, callback_id: &str, text: &str) -> Result<()> {
         let _: Value = self
-            .call("answerCallbackQuery", json!({"callback_query_id": callback_id, "text": text}))
+            .call(
+                "answerCallbackQuery",
+                json!({"callback_query_id": callback_id, "text": text}),
+            )
             .await?;
         Ok(())
     }
 
     pub async fn edit_text(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
         let _: Value = self
-            .call("editMessageText", json!({"chat_id": chat_id, "message_id": message_id, "text": text}))
+            .call(
+                "editMessageText",
+                json!({"chat_id": chat_id, "message_id": message_id, "text": text}),
+            )
             .await?;
         Ok(())
     }
 
     pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
-        let _: Value = self.call("deleteMessage", json!({"chat_id": chat_id, "message_id": message_id})).await?;
+        let _: Value = self
+            .call(
+                "deleteMessage",
+                json!({"chat_id": chat_id, "message_id": message_id}),
+            )
+            .await?;
         Ok(())
     }
 
     /// `getMe` — used by `aizen telegram test` to validate the token.
     pub async fn get_me(&self) -> Result<String> {
         let v: Value = self.call("getMe", json!({})).await?;
-        Ok(v.get("username").and_then(|u| u.as_str()).unwrap_or("?").to_string())
+        Ok(v.get("username")
+            .and_then(|u| u.as_str())
+            .unwrap_or("?")
+            .to_string())
     }
 
     /// Register the bot's slash-command menu (the "/" button in the Telegram app) so the daemon's
@@ -192,9 +225,13 @@ impl Client {
     /// `(command, description)`; Telegram requires lowercase names, 1–32 chars, `[a-z0-9_]`.
     /// Non-fatal at the call site: a failure just means no menu, not a broken daemon.
     pub async fn set_my_commands(&self, cmds: &[(&str, &str)]) -> Result<()> {
-        let commands: Vec<Value> =
-            cmds.iter().map(|(c, d)| json!({"command": c, "description": d})).collect();
-        let _: Value = self.call("setMyCommands", json!({"commands": commands})).await?;
+        let commands: Vec<Value> = cmds
+            .iter()
+            .map(|(c, d)| json!({"command": c, "description": d}))
+            .collect();
+        let _: Value = self
+            .call("setMyCommands", json!({"commands": commands}))
+            .await?;
         Ok(())
     }
 }
@@ -231,7 +268,8 @@ pub fn is_allowed(cfg: &TelegramConfig, chat_id: i64) -> bool {
 
 // ── approval registry (daemon path) ──────────────────────────────────────────────
 
-static PENDING: Lazy<Mutex<HashMap<String, oneshot::Sender<bool>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static PENDING: Lazy<Mutex<HashMap<String, oneshot::Sender<bool>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 static DAEMON_ACTIVE: AtomicBool = AtomicBool::new(false);
 static APPROVAL_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -259,7 +297,11 @@ pub fn daemon_is_active() -> bool {
     DAEMON_ACTIVE.load(Ordering::SeqCst)
 }
 fn next_approval_id() -> String {
-    format!("{}-{}", std::process::id(), APPROVAL_SEQ.fetch_add(1, Ordering::SeqCst))
+    format!(
+        "{}-{}",
+        std::process::id(),
+        APPROVAL_SEQ.fetch_add(1, Ordering::SeqCst)
+    )
 }
 
 /// Called by the serve poll loop when a callback arrives → resolve a pending approval.
@@ -299,7 +341,10 @@ pub async fn request_approval(prompt: &str) -> Option<bool> {
     };
     let id = next_approval_id();
     let text = format!("🔐 Approve this action?\n\n{prompt}");
-    let buttons = [("✅ Approve", format!("ng/appr/{id}/y")), ("❌ Deny", format!("ng/appr/{id}/n"))];
+    let buttons = [
+        ("✅ Approve", format!("ng/appr/{id}/y")),
+        ("❌ Deny", format!("ng/appr/{id}/n")),
+    ];
     let msg = client.send_keyboard(chat, &text, &buttons).await.ok()?;
 
     let approved = if daemon_is_active() {
@@ -312,8 +357,14 @@ pub async fn request_approval(prompt: &str) -> Option<bool> {
         self_poll_for_approval(&client, &id).await
     };
 
-    let verdict = if approved { "✅ Approved" } else { "❌ Denied / timed out" };
-    let _ = client.edit_text(chat, msg.message_id, &format!("{text}\n\n{verdict}")).await;
+    let verdict = if approved {
+        "✅ Approved"
+    } else {
+        "❌ Denied / timed out"
+    };
+    let _ = client
+        .edit_text(chat, msg.message_id, &format!("{text}\n\n{verdict}"))
+        .await;
     Some(approved)
 }
 
@@ -351,7 +402,9 @@ async fn self_poll_for_approval(client: &Client, id: &str) -> bool {
             if let Some(cb) = u.callback_query {
                 if let Some((cid, approved)) = cb.data.as_deref().and_then(parse_callback) {
                     if cid == id {
-                        let _ = client.answer_callback(&cb.id, if approved { "Approved" } else { "Denied" }).await;
+                        let _ = client
+                            .answer_callback(&cb.id, if approved { "Approved" } else { "Denied" })
+                            .await;
                         return approved;
                     }
                 }
@@ -394,9 +447,13 @@ impl Tool for TelegramSend {
         true
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let text = args.get("text").and_then(|v| v.as_str()).context("missing required string arg 'text'")?;
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .context("missing required string arg 'text'")?;
         block(async {
-            let (client, cfg) = configured().context("telegram not configured (run `aizen telegram setup`)")?;
+            let (client, cfg) =
+                configured().context("telegram not configured (run `aizen telegram setup`)")?;
             let chat = first_chat(&cfg).context("no allowed_chat_ids configured")?;
             client.send_message(chat, text).await?;
             anyhow::Ok(())
@@ -430,7 +487,10 @@ impl Tool for TelegramAsk {
         true
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let q = args.get("question").and_then(|v| v.as_str()).context("missing required string arg 'question'")?;
+        let q = args
+            .get("question")
+            .and_then(|v| v.as_str())
+            .context("missing required string arg 'question'")?;
         match block(async { anyhow::Ok(request_approval(q).await) })? {
             Some(true) => Ok("approved".to_string()),
             Some(false) => Ok("denied (or timed out)".to_string()),
@@ -571,10 +631,24 @@ async fn spawn_bot(
             return "busy".to_string();
         }
     };
-    let poll = spawn_bot_poll(name.clone(), client.clone(), allowed.clone(), pairing, tx.clone(), poll_lock);
+    let poll = spawn_bot_poll(
+        name.clone(),
+        client.clone(),
+        allowed.clone(),
+        pairing,
+        tx.clone(),
+        poll_lock,
+    );
     bots.lock().unwrap().insert(
         name.clone(),
-        BotHandle { client, token, username: username.clone(), allowed, persona, poll },
+        BotHandle {
+            client,
+            token,
+            username: username.clone(),
+            allowed,
+            persona,
+            poll,
+        },
     );
     username
 }
@@ -624,7 +698,13 @@ fn spawn_bot_poll(
                     let Some(text) = msg.text else { continue };
                     let chat = msg.chat.id;
                     if allowed.lock().unwrap().contains(&chat) {
-                        let _ = tx.send(Inbound { route: name.clone(), chat, text }).await;
+                        let _ = tx
+                            .send(Inbound {
+                                route: name.clone(),
+                                chat,
+                                text,
+                            })
+                            .await;
                         continue;
                     }
                     // Not (yet) an allowed chat → pairing path, if this bot is still pairing.
@@ -632,14 +712,20 @@ fn spawn_bot_poll(
                         if tokio::time::Instant::now() >= deadline {
                             pairing = None;
                             let _ = client
-                                .send_message(chat, "Pairing window closed — restart `aizen serve` to pair.")
+                                .send_message(
+                                    chat,
+                                    "Pairing window closed — restart `aizen serve` to pair.",
+                                )
                                 .await;
                         } else if text.trim() == code {
                             allowed.lock().unwrap().push(chat);
                             persist_owner(chat);
                             pairing = None;
                             let _ = client
-                                .send_message(chat, "✅ Paired — you're the owner. Send /help to begin.")
+                                .send_message(
+                                    chat,
+                                    "✅ Paired — you're the owner. Send /help to begin.",
+                                )
                                 .await;
                         } else {
                             let _ = client
@@ -681,12 +767,16 @@ async fn do_add_bot(
     token: &str,
 ) -> Result<String> {
     if name == "default" {
-        bail!("\"default\" is the primary bot — manage it on the host with `aizen telegram setup`.");
+        bail!(
+            "\"default\" is the primary bot — manage it on the host with `aizen telegram setup`."
+        );
     }
     {
         let b = bots.lock().unwrap();
         if b.contains_key(name) {
-            bail!("a bot named \"{name}\" is already running — pick another name or remove it first.");
+            bail!(
+                "a bot named \"{name}\" is already running — pick another name or remove it first."
+            );
         }
         if b.values().any(|h| h.token == token) {
             bail!("that token is already hosted under another name.");
@@ -694,11 +784,24 @@ async fn do_add_bot(
     }
     // Validate before persisting (get_me is async → do it outside the lock).
     let client = Client::new(token.to_string()).context("bad token")?;
-    let username = client.get_me().await.context("Telegram rejected the token")?;
+    let username = client
+        .get_me()
+        .await
+        .context("Telegram rejected the token")?;
     add_bot_entry(name, token)?;
     // Inherit a SNAPSHOT of the primary allowlist (a private chat id == the owner's id across bots).
     let allowed = Arc::new(Mutex::new(base_allowed.lock().unwrap().clone()));
-    spawn_bot(bots, menu, name.to_string(), token.to_string(), allowed, None, None, tx).await;
+    spawn_bot(
+        bots,
+        menu,
+        name.to_string(),
+        token.to_string(),
+        allowed,
+        None,
+        None,
+        tx,
+    )
+    .await;
     Ok(username)
 }
 
@@ -726,14 +829,22 @@ fn do_list_bots(bots: &Arc<Mutex<HashMap<String, BotHandle>>>) -> Vec<BotInfo> {
     bots.lock()
         .unwrap()
         .iter()
-        .map(|(n, h)| BotInfo { name: n.clone(), username: h.username.clone(), chats: h.allowed.lock().unwrap().len() })
+        .map(|(n, h)| BotInfo {
+            name: n.clone(),
+            username: h.username.clone(),
+            chats: h.allowed.lock().unwrap().len(),
+        })
         .collect()
 }
 
 /// Set the per-bot persona on a RUNNING bot's handle + its `bots.json` entry. Shared by the
 /// `bot_admin` tool. Dropping the bot's sessions is the caller's job (so the next turn re-seeds the
 /// system prompt with the new character).
-fn do_set_persona(bots: &Arc<Mutex<HashMap<String, BotHandle>>>, name: &str, persona: Option<String>) -> Result<()> {
+fn do_set_persona(
+    bots: &Arc<Mutex<HashMap<String, BotHandle>>>,
+    name: &str,
+    persona: Option<String>,
+) -> Result<()> {
     if name == "default" {
         bail!("\"default\" uses the primary agent's own persona — set it on the host with `aizen persona`.");
     }
@@ -793,8 +904,13 @@ impl Platform for TelegramPlatform {
         )
         .await;
         for b in store::load_bots() {
-            let Some(token) = b.token.clone() else { continue };
-            if b.name.is_empty() || b.name == "default" || self.bots.lock().unwrap().contains_key(&b.name) {
+            let Some(token) = b.token.clone() else {
+                continue;
+            };
+            if b.name.is_empty()
+                || b.name == "default"
+                || self.bots.lock().unwrap().contains_key(&b.name)
+            {
                 continue;
             }
             let ids = if b.allowed_chat_ids.is_empty() {
@@ -803,7 +919,17 @@ impl Platform for TelegramPlatform {
                 b.allowed_chat_ids.clone()
             };
             let allowed = Arc::new(Mutex::new(ids));
-            spawn_bot(&self.bots, &self.menu, b.name.clone(), token, allowed, b.persona.clone(), None, &tx).await;
+            spawn_bot(
+                &self.bots,
+                &self.menu,
+                b.name.clone(),
+                token,
+                allowed,
+                b.persona.clone(),
+                None,
+                &tx,
+            )
+            .await;
         }
         // Publish the live handles so the `bot_admin` agent tool can reach this running daemon.
         *BOT_CONTROL.lock().unwrap() = Some(Arc::new(BotControl {
@@ -818,7 +944,11 @@ impl Platform for TelegramPlatform {
     fn render_reply(&self, raw: &str) -> Vec<Outbound> {
         crate::ui::channel_markdown::render_telegram_chunks(raw, self.message_max())
             .into_iter()
-            .map(|chunk| Outbound { text: chunk.html, fallback: chunk.plain, rich: true })
+            .map(|chunk| Outbound {
+                text: chunk.html,
+                fallback: chunk.plain,
+                rich: true,
+            })
             .collect()
     }
 
@@ -840,11 +970,21 @@ impl Platform for TelegramPlatform {
         Ok(Some(StatusHandle(msg.message_id)))
     }
 
-    async fn finish_status(&self, route: &str, chat: i64, status: Option<StatusHandle>, failed: bool) -> Result<()> {
-        let Some(StatusHandle(message_id)) = status else { return Ok(()) };
+    async fn finish_status(
+        &self,
+        route: &str,
+        chat: i64,
+        status: Option<StatusHandle>,
+        failed: bool,
+    ) -> Result<()> {
+        let Some(StatusHandle(message_id)) = status else {
+            return Ok(());
+        };
         let client = self.route_client(route)?;
         if failed {
-            return client.edit_text(chat, message_id, "⚠ Không thể hoàn tất").await;
+            return client
+                .edit_text(chat, message_id, "⚠ Không thể hoàn tất")
+                .await;
         }
         if client.delete_message(chat, message_id).await.is_err() {
             client.edit_text(chat, message_id, "✓ Hoàn tất").await?;
@@ -891,7 +1031,11 @@ impl Platform for TelegramPlatform {
     }
 
     fn persona_for(&self, route: &str) -> Option<String> {
-        self.bots.lock().unwrap().get(route).and_then(|h| h.persona.clone())
+        self.bots
+            .lock()
+            .unwrap()
+            .get(route)
+            .and_then(|h| h.persona.clone())
     }
 
     fn shutdown(&self) {
@@ -916,7 +1060,10 @@ impl Platform for TelegramPlatform {
 /// common path is the REPL with no daemon running: persist, then `aizen serve` boots it (pairing).
 async fn admin_set_primary(token: &str) -> Result<String> {
     let client = Client::new(token.to_string()).context("bad token")?;
-    let username = client.get_me().await.context("Telegram rejected the token")?;
+    let username = client
+        .get_me()
+        .await
+        .context("Telegram rejected the token")?;
     let mut cfg = cli_config::load();
     let mut tg = cfg.telegram.clone().unwrap_or_default();
     tg.token = Some(token.to_string());
@@ -941,15 +1088,28 @@ async fn admin_add_bot(name: &str, token: &str) -> Result<String> {
     }
     match bot_control() {
         Some(ctl) => {
-            let user = do_add_bot(&ctl.bots, &ctl.base_allowed, &ctl.menu, &ctl.tx, name, token).await?;
+            let user = do_add_bot(
+                &ctl.bots,
+                &ctl.base_allowed,
+                &ctl.menu,
+                &ctl.tx,
+                name,
+                token,
+            )
+            .await?;
             Ok(format!("hosting @{user} as \"{name}\" (live)"))
         }
         None => {
             // No live daemon: validate the token, then persist for the next serve.
             let client = Client::new(token.to_string()).context("bad token")?;
-            let user = client.get_me().await.context("Telegram rejected the token")?;
+            let user = client
+                .get_me()
+                .await
+                .context("Telegram rejected the token")?;
             add_bot_entry(name, token)?;
-            Ok(format!("saved @{user} as \"{name}\" — it will start on the next `aizen serve`"))
+            Ok(format!(
+                "saved @{user} as \"{name}\" — it will start on the next `aizen serve`"
+            ))
         }
     }
 }
@@ -1043,7 +1203,10 @@ impl Tool for BotAdmin {
         false // mutates the shared bot registry + config
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let action = args.get("action").and_then(|v| v.as_str()).context("missing 'action'")?;
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .context("missing 'action'")?;
         let name = args.get("name").and_then(|v| v.as_str());
         match action {
             "list" => {
@@ -1051,7 +1214,11 @@ impl Tool for BotAdmin {
                     Some(ctl) => do_list_bots(&ctl.bots),
                     None => store::load_bots()
                         .into_iter()
-                        .map(|b| BotInfo { name: b.name, username: "?".to_string(), chats: 0 })
+                        .map(|b| BotInfo {
+                            name: b.name,
+                            username: "?".to_string(),
+                            chats: 0,
+                        })
                         .collect(),
                 };
                 if bots.is_empty() {
@@ -1065,13 +1232,19 @@ impl Tool for BotAdmin {
                         .find(|x| x.name == b.name)
                         .and_then(|x| x.persona.clone())
                         .unwrap_or_else(|| "(default agent)".to_string());
-                    s.push_str(&format!("• {} — @{} · persona: {}\n", b.name, b.username, persona));
+                    s.push_str(&format!(
+                        "• {} — @{} · persona: {}\n",
+                        b.name, b.username, persona
+                    ));
                 }
                 Ok(s.trim_end().to_string())
             }
             "add" => {
                 let name = name.context("'add' needs a bot name")?;
-                let token = args.get("token").and_then(|v| v.as_str()).context("'add' needs a token")?;
+                let token = args
+                    .get("token")
+                    .and_then(|v| v.as_str())
+                    .context("'add' needs a token")?;
                 block(async { admin_add_bot(name, token).await })
             }
             "remove" => {
@@ -1080,7 +1253,10 @@ impl Tool for BotAdmin {
             }
             "set_persona" => {
                 let name = name.context("'set_persona' needs a bot name")?;
-                let persona = args.get("persona").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let persona = args
+                    .get("persona")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 admin_set_persona(name, persona)
             }
             other => bail!("unknown action '{other}' (use list|add|remove|set_persona)"),
@@ -1094,8 +1270,14 @@ mod tests {
 
     #[test]
     fn parse_callback_roundtrip() {
-        assert_eq!(parse_callback("ng/appr/123-4/y"), Some(("123-4".to_string(), true)));
-        assert_eq!(parse_callback("ng/appr/abc/n"), Some(("abc".to_string(), false)));
+        assert_eq!(
+            parse_callback("ng/appr/123-4/y"),
+            Some(("123-4".to_string(), true))
+        );
+        assert_eq!(
+            parse_callback("ng/appr/abc/n"),
+            Some(("abc".to_string(), false))
+        );
         assert_eq!(parse_callback("ng/appr/x/maybe"), None);
         assert_eq!(parse_callback("other/y"), None);
     }
@@ -1128,15 +1310,28 @@ mod tests {
     fn bot_admin_is_destructive_and_serial() {
         // Writes tokens to config / stops running bots → must route an approval, and never run
         // on the parallel batch path.
-        assert!(BotAdmin.is_destructive(), "bot_admin edits host config → approval-gated");
-        assert!(!BotAdmin.is_concurrency_safe(), "mutates the shared registry + config");
+        assert!(
+            BotAdmin.is_destructive(),
+            "bot_admin edits host config → approval-gated"
+        );
+        assert!(
+            !BotAdmin.is_concurrency_safe(),
+            "mutates the shared registry + config"
+        );
         assert_eq!(BotAdmin.name(), "bot_admin");
     }
 
     #[test]
     fn pairing_code_is_six_digits() {
         let code = gen_pairing_code();
-        assert_eq!(code.len(), 6, "pairing code is zero-padded to 6 digits: {code}");
-        assert!(code.chars().all(|c| c.is_ascii_digit()), "digits only: {code}");
+        assert_eq!(
+            code.len(),
+            6,
+            "pairing code is zero-padded to 6 digits: {code}"
+        );
+        assert!(
+            code.chars().all(|c| c.is_ascii_digit()),
+            "digits only: {code}"
+        );
     }
 }

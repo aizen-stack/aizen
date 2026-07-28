@@ -26,7 +26,10 @@ pub(crate) fn site_of(host: &str) -> Option<String> {
         "serverfault.com" => Some("serverfault".into()),
         "askubuntu.com" => Some("askubuntu".into()),
         "mathoverflow.net" => Some("mathoverflow.net".into()),
-        _ => h.strip_suffix(".stackexchange.com").filter(|s| !s.is_empty() && !s.contains('.')).map(str::to_string),
+        _ => h
+            .strip_suffix(".stackexchange.com")
+            .filter(|s| !s.is_empty() && !s.contains('.'))
+            .map(str::to_string),
     }
 }
 
@@ -47,9 +50,11 @@ pub(crate) async fn read(url: &reqwest::Url, site: &str, qid: u64) -> Result<Str
         Ok(s) => Ok(s),
         Err(e) => {
             super::note_err("stackexchange", "api", &e.to_string());
-            let s = super::web::direct_read(&c, url.as_str()).await.map_err(|de| {
-                anyhow::anyhow!("StackExchange API failed ({e}); page fetch also failed: {de}")
-            })?;
+            let s = super::web::direct_read(&c, url.as_str())
+                .await
+                .map_err(|de| {
+                    anyhow::anyhow!("StackExchange API failed ({e}); page fetch also failed: {de}")
+                })?;
             super::note_ok("stackexchange", "html");
             Ok(s)
         }
@@ -58,7 +63,8 @@ pub(crate) async fn read(url: &reqwest::Url, site: &str, qid: u64) -> Result<Str
 
 async fn read_api(c: &reqwest::Client, site: &str, qid: u64) -> Result<String> {
     super::pace("stackexchange", Duration::from_millis(200)).await;
-    let qurl = format!("https://api.stackexchange.com/2.3/questions/{qid}?site={site}&filter=withbody");
+    let qurl =
+        format!("https://api.stackexchange.com/2.3/questions/{qid}?site={site}&filter=withbody");
     let qv = http::get_json(c, &qurl, &api_headers()).await?;
     honor_backoff(&qv).await;
     check_quota(&qv)?;
@@ -72,10 +78,17 @@ async fn read_api(c: &reqwest::Client, site: &str, qid: u64) -> Result<String> {
         decode_entities(q["title"].as_str().unwrap_or("(untitled)")),
         q["score"].as_i64().unwrap_or(0),
         q["answer_count"].as_u64().unwrap_or(0),
-        if q["is_answered"].as_bool().unwrap_or(false) { ", accepted" } else { "" },
+        if q["is_answered"].as_bool().unwrap_or(false) {
+            ", accepted"
+        } else {
+            ""
+        },
         q["owner"]["display_name"].as_str().unwrap_or("?"),
         q["link"].as_str().unwrap_or(""),
-        truncate_chars(&html_to_text(q["body"].as_str().unwrap_or("(no body)")), POST_CAP),
+        truncate_chars(
+            &html_to_text(q["body"].as_str().unwrap_or("(no body)")),
+            POST_CAP
+        ),
     );
 
     // Top answers by votes (one more call, capped).
@@ -88,7 +101,11 @@ async fn read_api(c: &reqwest::Client, site: &str, qid: u64) -> Result<String> {
             s.push_str(&format!(
                 "\n── answer (score {}{}) by {} ──\n{}\n",
                 a["score"].as_i64().unwrap_or(0),
-                if a["is_accepted"].as_bool().unwrap_or(false) { ", ✓ accepted" } else { "" },
+                if a["is_accepted"].as_bool().unwrap_or(false) {
+                    ", ✓ accepted"
+                } else {
+                    ""
+                },
                 a["owner"]["display_name"].as_str().unwrap_or("?"),
                 truncate_chars(&html_to_text(a["body"].as_str().unwrap_or("")), POST_CAP),
             ));
@@ -127,12 +144,20 @@ pub(crate) async fn probe_api() -> super::Probe {
         Ok(c) => c,
         Err(e) => return super::Probe::Fail(e.to_string()),
     };
-    match http::get_json(&c, "https://api.stackexchange.com/2.3/info?site=stackoverflow", &api_headers()).await {
+    match http::get_json(
+        &c,
+        "https://api.stackexchange.com/2.3/info?site=stackoverflow",
+        &api_headers(),
+    )
+    .await
+    {
         Ok(v) => {
             let rem = v["quota_remaining"].as_u64().unwrap_or(0);
             let max = v["quota_max"].as_u64().unwrap_or(300);
             if rem == 0 {
-                super::Probe::Warn(format!("quota exhausted (0/{max} today) — html fallback active"))
+                super::Probe::Warn(format!(
+                    "quota exhausted (0/{max} today) — html fallback active"
+                ))
             } else {
                 super::Probe::Ok(format!("Q&A reads OK — quota {rem}/{max} today"))
             }
@@ -151,11 +176,21 @@ mod tests {
 
     #[test]
     fn maps_hosts_to_api_sites() {
-        assert_eq!(site_of("stackoverflow.com").as_deref(), Some("stackoverflow"));
-        assert_eq!(site_of("www.stackoverflow.com").as_deref(), Some("stackoverflow"));
+        assert_eq!(
+            site_of("stackoverflow.com").as_deref(),
+            Some("stackoverflow")
+        );
+        assert_eq!(
+            site_of("www.stackoverflow.com").as_deref(),
+            Some("stackoverflow")
+        );
         assert_eq!(site_of("superuser.com").as_deref(), Some("superuser"));
         assert_eq!(site_of("rust.stackexchange.com").as_deref(), Some("rust"));
-        assert_eq!(site_of("meta.rust.stackexchange.com"), None, "nested subdomains refused");
+        assert_eq!(
+            site_of("meta.rust.stackexchange.com"),
+            None,
+            "nested subdomains refused"
+        );
         assert_eq!(site_of("example.com"), None);
     }
 
@@ -165,15 +200,28 @@ mod tests {
             question(&u("https://stackoverflow.com/questions/12345/how-do-i-x")),
             Some(("stackoverflow".into(), 12345))
         );
-        assert_eq!(question(&u("https://stackoverflow.com/q/999")), Some(("stackoverflow".into(), 999)));
-        assert_eq!(question(&u("https://stackoverflow.com/users/1/someone")), None);
-        assert_eq!(question(&u("https://stackoverflow.com/questions/tagged/rust")), None, "non-numeric id");
+        assert_eq!(
+            question(&u("https://stackoverflow.com/q/999")),
+            Some(("stackoverflow".into(), 999))
+        );
+        assert_eq!(
+            question(&u("https://stackoverflow.com/users/1/someone")),
+            None
+        );
+        assert_eq!(
+            question(&u("https://stackoverflow.com/questions/tagged/rust")),
+            None,
+            "non-numeric id"
+        );
     }
 
     #[test]
     fn quota_zero_is_an_error() {
         assert!(check_quota(&serde_json::json!({"quota_remaining": 0})).is_err());
         assert!(check_quota(&serde_json::json!({"quota_remaining": 5})).is_ok());
-        assert!(check_quota(&serde_json::json!({})).is_ok(), "absent field is not an error");
+        assert!(
+            check_quota(&serde_json::json!({})).is_ok(),
+            "absent field is not an error"
+        );
     }
 }

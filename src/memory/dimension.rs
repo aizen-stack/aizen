@@ -50,26 +50,120 @@ impl Dimension {
 // Single-word keywords are matched against the text's word set; multi-word / symbol-bearing
 // keywords (have a space) are matched as a lowercased substring.
 const STYLE_KW: &[&str] = &[
-    "reply", "replies", "respond", "response", "answer", "language", "vietnamese", "english",
-    "tiếng việt", "tiếng anh", "concise", "terse", "brief", "succinct", "verbose", "tone",
-    "ngắn gọn", "súc tích", "explanation", "wording", "formatting",
+    "reply",
+    "replies",
+    "respond",
+    "response",
+    "answer",
+    "language",
+    "vietnamese",
+    "english",
+    "tiếng việt",
+    "tiếng anh",
+    "concise",
+    "terse",
+    "brief",
+    "succinct",
+    "verbose",
+    "tone",
+    "ngắn gọn",
+    "súc tích",
+    "explanation",
+    "wording",
+    "formatting",
 ];
 const TOOLING_KW: &[&str] = &[
-    "pnpm", "npm", "yarn", "bun", "cargo", "pip", "poetry", "uv", "git", "prettier", "eslint",
-    "rustfmt", "clippy", "black", "ruff", "make", "docker", "vite", "webpack", "esbuild", "bash",
-    "zsh", "fish", "powershell", "pwsh", "vim", "neovim", "nvim", "vscode", "tabs", "spaces",
-    "formatter", "linter", "package manager",
+    "pnpm",
+    "npm",
+    "yarn",
+    "bun",
+    "cargo",
+    "pip",
+    "poetry",
+    "uv",
+    "git",
+    "prettier",
+    "eslint",
+    "rustfmt",
+    "clippy",
+    "black",
+    "ruff",
+    "make",
+    "docker",
+    "vite",
+    "webpack",
+    "esbuild",
+    "bash",
+    "zsh",
+    "fish",
+    "powershell",
+    "pwsh",
+    "vim",
+    "neovim",
+    "nvim",
+    "vscode",
+    "tabs",
+    "spaces",
+    "formatter",
+    "linter",
+    "package manager",
 ];
 const WORKFLOW_KW: &[&str] = &[
-    "test", "tests", "testing", "commit", "commits", "deploy", "push", "build", "plan", "review",
-    "pipeline", "merge", "rebase", "branch", "lint", "typecheck", "verify", "confirm", "approve",
-    "autonomous", "just do it", "run the tests", "ci",
+    "test",
+    "tests",
+    "testing",
+    "commit",
+    "commits",
+    "deploy",
+    "push",
+    "build",
+    "plan",
+    "review",
+    "pipeline",
+    "merge",
+    "rebase",
+    "branch",
+    "lint",
+    "typecheck",
+    "verify",
+    "confirm",
+    "approve",
+    "autonomous",
+    "just do it",
+    "run the tests",
+    "ci",
 ];
 const STACK_KW: &[&str] = &[
-    "rust", "typescript", "javascript", "python", "react", "next", "nextjs", "vue", "svelte",
-    "dotnet", ".net", "csharp", "c#", "golang", "kotlin", "node", "nodejs", "postgres",
-    "postgresql", "redis", "valkey", "tailwind", "fastapi", "django", "flask", "express", "axum",
-    "tokio", "java", "go",
+    "rust",
+    "typescript",
+    "javascript",
+    "python",
+    "react",
+    "next",
+    "nextjs",
+    "vue",
+    "svelte",
+    "dotnet",
+    ".net",
+    "csharp",
+    "c#",
+    "golang",
+    "kotlin",
+    "node",
+    "nodejs",
+    "postgres",
+    "postgresql",
+    "redis",
+    "valkey",
+    "tailwind",
+    "fastapi",
+    "django",
+    "flask",
+    "express",
+    "axum",
+    "tokio",
+    "java",
+    "go",
 ];
 
 fn count_hits(text_lower: &str, words: &std::collections::HashSet<String>, kws: &[&str]) -> usize {
@@ -136,13 +230,19 @@ mod tests {
 
     #[test]
     fn classifies_workflow() {
-        assert_eq!(classify("always run the tests before commit"), Dimension::Workflow);
+        assert_eq!(
+            classify("always run the tests before commit"),
+            Dimension::Workflow
+        );
         assert_eq!(classify("ask before you deploy"), Dimension::Workflow);
     }
 
     #[test]
     fn classifies_stack() {
-        assert_eq!(classify("the backend is rust with tokio and axum"), Dimension::Stack);
+        assert_eq!(
+            classify("the backend is rust with tokio and axum"),
+            Dimension::Stack
+        );
         assert_eq!(classify("we use react and typescript"), Dimension::Stack);
     }
 
@@ -154,7 +254,13 @@ mod tests {
 
     #[test]
     fn parse_roundtrip() {
-        for d in [Dimension::Style, Dimension::Tooling, Dimension::Workflow, Dimension::Stack, Dimension::Other] {
+        for d in [
+            Dimension::Style,
+            Dimension::Tooling,
+            Dimension::Workflow,
+            Dimension::Stack,
+            Dimension::Other,
+        ] {
             assert_eq!(Dimension::parse(d.as_str()), Some(d));
         }
         assert_eq!(Dimension::parse("nonsense"), None);

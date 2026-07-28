@@ -104,8 +104,10 @@ pub async fn crawl(client: &reqwest::Client, opts: &CrawlOptions) -> Result<Craw
     if seed_urls.is_empty() {
         bail!("no seed URLs");
     }
-    let scope_hosts: Vec<String> =
-        seed_urls.iter().filter_map(|u| u.host_str().map(str::to_string)).collect();
+    let scope_hosts: Vec<String> = seed_urls
+        .iter()
+        .filter_map(|u| u.host_str().map(str::to_string))
+        .collect();
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut found: Vec<Found> = Vec::new();
@@ -114,7 +116,11 @@ pub async fn crawl(client: &reqwest::Client, opts: &CrawlOptions) -> Result<Craw
     for u in &seed_urls {
         let key = u.as_str().to_string();
         if seen.insert(key.clone()) {
-            found.push(Found { url: key, depth: 0, via: Source::Seed });
+            found.push(Found {
+                url: key,
+                depth: 0,
+                via: Source::Seed,
+            });
             if opts.max_depth > 0 {
                 frontier.push_back((u.clone(), 0));
             }
@@ -154,7 +160,11 @@ pub async fn crawl(client: &reqwest::Client, opts: &CrawlOptions) -> Result<Craw
                 let key = child.as_str().to_string();
                 if seen.insert(key.clone()) {
                     let child_depth = depth + 1;
-                    found.push(Found { url: key, depth: child_depth, via: src });
+                    found.push(Found {
+                        url: key,
+                        depth: child_depth,
+                        via: src,
+                    });
                     if child_depth < opts.max_depth {
                         frontier.push_back((child, child_depth));
                     }
@@ -164,7 +174,10 @@ pub async fn crawl(client: &reqwest::Client, opts: &CrawlOptions) -> Result<Craw
     }
 
     found.sort_by(|a, b| a.url.cmp(&b.url));
-    Ok(CrawlReport { found, pages_fetched })
+    Ok(CrawlReport {
+        found,
+        pages_fetched,
+    })
 }
 
 /// GET a URL; return `(content_type, body)` or `None` on any error / non-2xx. Only text-ish bodies
@@ -172,7 +185,10 @@ pub async fn crawl(client: &reqwest::Client, opts: &CrawlOptions) -> Result<Craw
 async fn fetch_body(client: &reqwest::Client, url: &Url, timeout: u64) -> Option<(String, String)> {
     // SSRF floor: skip any URL that resolves to a private/loopback/link-local address. Best-effort
     // (recon shouldn't abort on one blocked link) — the seed is also vetted by the caller.
-    if crate::core::net_guard::guard_url_async(url.as_str()).await.is_err() {
+    if crate::core::net_guard::guard_url_async(url.as_str())
+        .await
+        .is_err()
+    {
         return None;
     }
     let resp = client
@@ -277,10 +293,9 @@ fn normalize(u: &Url) -> Url {
 /// not two. Hardcoded (no `psl` dep → keeps the single static binary) — covers the cases people hit.
 const MULTI_LABEL_SUFFIXES: &[&str] = &[
     "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "net.uk", "sch.uk", "ltd.uk", "plc.uk",
-    "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au",
-    "co.jp", "ne.jp", "or.jp", "go.jp", "ac.jp",
-    "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz",
-    "co.in", "co.kr", "co.za", "com.br", "com.cn", "com.sg", "com.hk", "com.mx", "com.tr",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au", "co.jp", "ne.jp", "or.jp", "go.jp",
+    "ac.jp", "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz", "co.in", "co.kr", "co.za", "com.br",
+    "com.cn", "com.sg", "com.hk", "com.mx", "com.tr",
 ];
 
 /// The registrable domain of a host — the last two dot-labels, or three when the last two form a
@@ -296,7 +311,11 @@ fn root_domain(host: &str) -> String {
         return host;
     }
     let last2 = format!("{}.{}", labels[n - 2], labels[n - 1]);
-    let take = if n >= 3 && MULTI_LABEL_SUFFIXES.contains(&last2.as_str()) { 3 } else { 2 };
+    let take = if n >= 3 && MULTI_LABEL_SUFFIXES.contains(&last2.as_str()) {
+        3
+    } else {
+        2
+    };
     labels[n - take..].join(".")
 }
 
@@ -327,12 +346,18 @@ mod tests {
         let html = r##"<a href="/about">A</a> <a href="sub/x.html">B</a>
             <link href="https://cdn.example.com/s.css"> <img src="../img/p.png">
             <a href="#frag">skip</a> <a href="mailto:x@y.com">skip</a>"##;
-        let urls: Vec<String> = extract_html_links(html, &base()).iter().map(|u| u.as_str().to_string()).collect();
+        let urls: Vec<String> = extract_html_links(html, &base())
+            .iter()
+            .map(|u| u.as_str().to_string())
+            .collect();
         assert!(urls.contains(&"https://example.com/about".to_string()));
         assert!(urls.contains(&"https://example.com/dir/sub/x.html".to_string()));
         assert!(urls.contains(&"https://cdn.example.com/s.css".to_string()));
         assert!(urls.contains(&"https://example.com/img/p.png".to_string()));
-        assert!(!urls.iter().any(|u| u.contains("frag")), "fragment-only link dropped");
+        assert!(
+            !urls.iter().any(|u| u.contains("frag")),
+            "fragment-only link dropped"
+        );
         assert!(!urls.iter().any(|u| u.contains("mailto")), "mailto dropped");
     }
 
@@ -340,12 +365,23 @@ mod tests {
     fn js_endpoints_extracted() {
         let js = r#"const a = "/api/v2/users"; fetch("https://api.example.com/data");
             var b = "/"; let c = "notapath"; const d = '/static/app.js';"#;
-        let urls: Vec<String> = extract_js_endpoints(js, &base()).iter().map(|u| u.as_str().to_string()).collect();
+        let urls: Vec<String> = extract_js_endpoints(js, &base())
+            .iter()
+            .map(|u| u.as_str().to_string())
+            .collect();
         assert!(urls.contains(&"https://example.com/api/v2/users".to_string()));
         assert!(urls.contains(&"https://api.example.com/data".to_string()));
         assert!(urls.contains(&"https://example.com/static/app.js".to_string()));
-        assert!(!urls.iter().any(|u| u.ends_with("/example.com/") && u.len() < 22), "bare '/' skipped");
-        assert!(!urls.iter().any(|u| u.contains("notapath")), "non-path word skipped");
+        assert!(
+            !urls
+                .iter()
+                .any(|u| u.ends_with("/example.com/") && u.len() < 22),
+            "bare '/' skipped"
+        );
+        assert!(
+            !urls.iter().any(|u| u.contains("notapath")),
+            "non-path word skipped"
+        );
     }
 
     #[test]
@@ -355,9 +391,18 @@ mod tests {
         let sub = Url::parse("https://api.example.com/x").unwrap();
         let other = Url::parse("https://evil.org/x").unwrap();
         assert!(in_scope(&same, &hosts, Scope::Strict));
-        assert!(!in_scope(&sub, &hosts, Scope::Strict), "subdomain out of strict scope");
-        assert!(in_scope(&sub, &hosts, Scope::Subdomain), "subdomain in subdomain scope");
-        assert!(!in_scope(&other, &hosts, Scope::Subdomain), "other domain always out");
+        assert!(
+            !in_scope(&sub, &hosts, Scope::Strict),
+            "subdomain out of strict scope"
+        );
+        assert!(
+            in_scope(&sub, &hosts, Scope::Subdomain),
+            "subdomain in subdomain scope"
+        );
+        assert!(
+            !in_scope(&other, &hosts, Scope::Subdomain),
+            "other domain always out"
+        );
     }
 
     #[test]

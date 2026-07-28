@@ -17,9 +17,14 @@ use std::path::{Path, PathBuf};
 /// Convert an ABSOLUTE filesystem path to a `file://` URI string (e.g. `file:///C:/src/main.rs`).
 /// Errors on a relative path or one the `url` crate can't represent (returns `Err(())` there).
 pub fn path_to_uri(path: &Path) -> Result<String> {
-    url::Url::from_file_path(path).map(|u| u.to_string()).map_err(|()| {
-        anyhow!("cannot build a file:// URI from path (must be absolute): {}", path.display())
-    })
+    url::Url::from_file_path(path)
+        .map(|u| u.to_string())
+        .map_err(|()| {
+            anyhow!(
+                "cannot build a file:// URI from path (must be absolute): {}",
+                path.display()
+            )
+        })
 }
 
 /// Parse a `file://` URI back into a local filesystem path.
@@ -28,7 +33,8 @@ pub fn uri_to_path(uri: &str) -> Result<PathBuf> {
     if url.scheme() != "file" {
         return Err(anyhow!("not a file:// URI: {uri:?}"));
     }
-    url.to_file_path().map_err(|()| anyhow!("file:// URI has no local path: {uri:?}"))
+    url.to_file_path()
+        .map_err(|()| anyhow!("file:// URI has no local path: {uri:?}"))
 }
 
 /// A canonical form of a `file://` URI for comparison / dedup / keying. Round-trips through the path
@@ -55,7 +61,10 @@ fn lower_drive_letter(uri: &str) -> String {
         && bytes[drive].is_ascii_uppercase()
     {
         let mut s = uri.to_string();
-        s.replace_range(drive..drive + 1, &uri[drive..drive + 1].to_ascii_lowercase());
+        s.replace_range(
+            drive..drive + 1,
+            &uri[drive..drive + 1].to_ascii_lowercase(),
+        );
         s
     } else {
         uri.to_string()
@@ -100,7 +109,11 @@ mod tests {
     fn windows_normalize_lowercases_drive_and_unifies_case() {
         let upper = "file:///C:/src/main.rs";
         let lower = "file:///c:/src/main.rs";
-        assert_eq!(normalize_uri(upper), normalize_uri(lower), "C: and c: must key equal");
+        assert_eq!(
+            normalize_uri(upper),
+            normalize_uri(lower),
+            "C: and c: must key equal"
+        );
         assert!(normalize_uri(upper).starts_with("file:///c:/"));
     }
 

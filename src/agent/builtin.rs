@@ -90,12 +90,16 @@ static ACTIVE_TOOL_NAMES: Lazy<Mutex<Option<HashSet<String>>>> = Lazy::new(|| Mu
 /// Publish the live tool surface (idempotent). ONLY the top-level registry calls this — never the
 /// smaller `role_registry`, so the set is never wrongly shrunk when a sub-agent assembles a prompt.
 fn publish_active_tools(r: &ToolRegistry) {
-    *ACTIVE_TOOL_NAMES.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.names().into_iter().collect());
+    *ACTIVE_TOOL_NAMES.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(r.names().into_iter().collect());
 }
 
 /// The published live tool surface, or `None` if no session registry has been built yet.
 pub fn active_tool_names() -> Option<HashSet<String>> {
-    ACTIVE_TOOL_NAMES.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    ACTIVE_TOOL_NAMES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// Resolve + canonicalize the working-directory root — the base that relative file/shell paths
@@ -118,11 +122,14 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     crate::agent::mcp::prepare_fresh_turn();
     let mut r = ToolRegistry::new();
     r.register(Box::new(MemorySearch));
+    r.register(Box::new(MemoryList));
     r.register(Box::new(MemoryProfile));
     r.register(Box::new(MemoryAsk));
     r.register(Box::new(FileRead::new(root.to_path_buf())));
     r.register(Box::new(FileGlob::new(root.to_path_buf())));
-    r.register(Box::new(crate::agent::search::SearchFiles::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::search::SearchFiles::new(
+        root.to_path_buf(),
+    )));
     // Semantic chunk search over the `/init` index (read-only). Self-errors with "run /init" when
     // the index is missing, so it's safe to always advertise.
     r.register(Box::new(crate::agent::codebase::CodebaseSearch));
@@ -141,6 +148,12 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     r.register(Box::new(crate::features::timemachine::CheckpointList));
     r.register(Box::new(crate::features::timemachine::CheckpointDiff));
     r.register(Box::new(crate::features::timemachine::CheckpointRestore));
+    // Memory WRITE surface — top-level only. A sub-agent gets `memory_list`/`memory_search` but may
+    // never mutate the user's long-term store: a specialist run is short-lived and unsupervised, so a
+    // wrong write there would outlive the run it came from with no one having seen it.
+    r.register(Box::new(MemorySave));
+    r.register(Box::new(MemoryUpdate));
+    r.register(Box::new(MemoryForget));
     r.register(Box::new(FileEdit::new(root.to_path_buf())));
     r.register(Box::new(MultiEdit::new(root.to_path_buf())));
     r.register(Box::new(FileWrite::new(root.to_path_buf())));
@@ -151,7 +164,9 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     // Top-level only (NOT in role sub-agents) — the in-session list + process pool are shared, so a
     // sub-agent must not clobber them. `role_registry` builds its own list and never gets these.
     r.register(Box::new(crate::agent::todo::TodoWrite));
-    r.register(Box::new(crate::agent::process::Process::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::process::Process::new(
+        root.to_path_buf(),
+    )));
     // `clarify` yields the turn back to the interactive user — meaningless inside an autonomous
     // sub-agent (no user to answer), so it stays top-level only, like todo/process.
     r.register(Box::new(crate::agent::clarify::Clarify));
@@ -165,17 +180,37 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     // manager is armed at session start; tools register when `LSP.is_enabled()` (still true after
     // `/lsp on`, false after `/lsp off`). Sub-agents use `subagent_read_only_base` and never get it.
     if crate::agent::lsp::LSP.is_enabled() {
-        r.register(Box::new(crate::agent::lsp::tools::LspReferences::new(root.to_path_buf())));
-        r.register(Box::new(crate::agent::lsp::tools::LspDefinition::new(root.to_path_buf())));
-        r.register(Box::new(crate::agent::lsp::tools::LspSymbolBody::new(root.to_path_buf())));
-        r.register(Box::new(crate::agent::lsp::tools::LspHover::new(root.to_path_buf())));
-        r.register(Box::new(crate::agent::lsp::tools::LspDocumentSymbols::new(root.to_path_buf())));
-        r.register(Box::new(crate::agent::lsp::tools::LspWorkspaceSymbol::new(root.to_path_buf())));
-        r.register(Box::new(crate::agent::lsp::tools::LspDiagnostics::new(root.to_path_buf())));
-        r.register(Box::new(crate::agent::lsp::tools::SymbolReplace::new(root.to_path_buf())));
-        r.register(Box::new(crate::agent::lsp::tools::SymbolInsert::new(root.to_path_buf())));
+        r.register(Box::new(crate::agent::lsp::tools::LspReferences::new(
+            root.to_path_buf(),
+        )));
+        r.register(Box::new(crate::agent::lsp::tools::LspDefinition::new(
+            root.to_path_buf(),
+        )));
+        r.register(Box::new(crate::agent::lsp::tools::LspSymbolBody::new(
+            root.to_path_buf(),
+        )));
+        r.register(Box::new(crate::agent::lsp::tools::LspHover::new(
+            root.to_path_buf(),
+        )));
+        r.register(Box::new(crate::agent::lsp::tools::LspDocumentSymbols::new(
+            root.to_path_buf(),
+        )));
+        r.register(Box::new(crate::agent::lsp::tools::LspWorkspaceSymbol::new(
+            root.to_path_buf(),
+        )));
+        r.register(Box::new(crate::agent::lsp::tools::LspDiagnostics::new(
+            root.to_path_buf(),
+        )));
+        r.register(Box::new(crate::agent::lsp::tools::SymbolReplace::new(
+            root.to_path_buf(),
+        )));
+        r.register(Box::new(crate::agent::lsp::tools::SymbolInsert::new(
+            root.to_path_buf(),
+        )));
         // The ranked codebase skeleton rides the LSP gate too (its symbols come from the servers).
-        r.register(Box::new(crate::agent::repo_map::RepoMap::new(root.to_path_buf())));
+        r.register(Box::new(crate::agent::repo_map::RepoMap::new(
+            root.to_path_buf(),
+        )));
     }
     // User-configurable MCP servers (`~/.nextgen/mcp.json`) — each remote tool wrapped as
     // `mcp_<server>_<tool>`. Empty (zero cost) when MCP is unconfigured. Top-level only, like
@@ -273,7 +308,12 @@ pub fn default_registry_with_task(
     // an explicit `workflow_tool: true` in config.
     if should_register_workflow() {
         r.register(Box::new(crate::agent::workflow_tool::WorkflowTool::new(
-            client, base_url, api_key, model, approval_mode, 0,
+            client,
+            base_url,
+            api_key,
+            model,
+            approval_mode,
+            0,
         )));
     }
     crate::agent::toolsets::apply_toolset_filter(&mut r);
@@ -304,11 +344,17 @@ fn subagent_read_only_base(root: &Path) -> ToolRegistry {
     use crate::agent::web_tools::{WebCrawl, WebFetch, WebSearch};
     let mut r = ToolRegistry::new();
     r.register(Box::new(MemorySearch));
+    // `memory_list` is read-only, so a sub-agent may inventory what is stored (that's what stops it
+    // guessing) — but the WRITE trio (save/update/forget) is top-level only, registered in
+    // `default_registry_in` and deliberately absent here.
+    r.register(Box::new(MemoryList));
     r.register(Box::new(MemoryProfile));
     r.register(Box::new(MemoryAsk));
     r.register(Box::new(FileRead::new(root.to_path_buf())));
     r.register(Box::new(FileGlob::new(root.to_path_buf())));
-    r.register(Box::new(crate::agent::search::SearchFiles::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::search::SearchFiles::new(
+        root.to_path_buf(),
+    )));
     r.register(Box::new(crate::agent::codebase::CodebaseSearch));
     r.register(Box::new(WebSearch));
     r.register(Box::new(WebFetch));
@@ -335,14 +381,30 @@ fn register_subagent_lsp_read(r: &mut ToolRegistry, root: &Path) {
     if !crate::agent::lsp::LSP.is_enabled() {
         return;
     }
-    r.register(Box::new(crate::agent::lsp::tools::LspReferences::new(root.to_path_buf())));
-    r.register(Box::new(crate::agent::lsp::tools::LspDefinition::new(root.to_path_buf())));
-    r.register(Box::new(crate::agent::lsp::tools::LspSymbolBody::new(root.to_path_buf())));
-    r.register(Box::new(crate::agent::lsp::tools::LspHover::new(root.to_path_buf())));
-    r.register(Box::new(crate::agent::lsp::tools::LspDocumentSymbols::new(root.to_path_buf())));
-    r.register(Box::new(crate::agent::lsp::tools::LspWorkspaceSymbol::new(root.to_path_buf())));
-    r.register(Box::new(crate::agent::lsp::tools::LspDiagnostics::new(root.to_path_buf())));
-    r.register(Box::new(crate::agent::repo_map::RepoMap::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::lsp::tools::LspReferences::new(
+        root.to_path_buf(),
+    )));
+    r.register(Box::new(crate::agent::lsp::tools::LspDefinition::new(
+        root.to_path_buf(),
+    )));
+    r.register(Box::new(crate::agent::lsp::tools::LspSymbolBody::new(
+        root.to_path_buf(),
+    )));
+    r.register(Box::new(crate::agent::lsp::tools::LspHover::new(
+        root.to_path_buf(),
+    )));
+    r.register(Box::new(crate::agent::lsp::tools::LspDocumentSymbols::new(
+        root.to_path_buf(),
+    )));
+    r.register(Box::new(crate::agent::lsp::tools::LspWorkspaceSymbol::new(
+        root.to_path_buf(),
+    )));
+    r.register(Box::new(crate::agent::lsp::tools::LspDiagnostics::new(
+        root.to_path_buf(),
+    )));
+    r.register(Box::new(crate::agent::repo_map::RepoMap::new(
+        root.to_path_buf(),
+    )));
 }
 
 /// Symbolic edit tools for write-capable sub-agents (coder / specialist with edit scope). Gated on
@@ -351,8 +413,12 @@ fn register_subagent_lsp_write(r: &mut ToolRegistry, root: &Path) {
     if !crate::agent::lsp::LSP.is_enabled() {
         return;
     }
-    r.register(Box::new(crate::agent::lsp::tools::SymbolReplace::new(root.to_path_buf())));
-    r.register(Box::new(crate::agent::lsp::tools::SymbolInsert::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::lsp::tools::SymbolReplace::new(
+        root.to_path_buf(),
+    )));
+    r.register(Box::new(crate::agent::lsp::tools::SymbolInsert::new(
+        root.to_path_buf(),
+    )));
 }
 
 /// Build a READ/WRITE-scoped registry for a sub-agent of the given `role`. NEVER includes the
@@ -459,9 +525,8 @@ fn canonical_subagent_tool(raw: &str) -> Option<&'static str> {
         }
         "multiedit" | "multi_edit" => Some("multi_edit"),
         // whole-file create/overwrite (Claude-Code's "Write" maps here now that file_write exists)
-        "write" | "file_write" | "filewrite" | "write_file" | "writefile" | "create" | "create_file" => {
-            Some("file_write")
-        }
+        "write" | "file_write" | "filewrite" | "write_file" | "writefile" | "create"
+        | "create_file" => Some("file_write"),
         // rename / move
         "file_move" | "filemove" | "move_file" | "movefile" | "mv_file" | "mv" | "file_rename"
         | "filerename" | "rename_file" | "renamefile" | "rename" => Some("file_move"),
@@ -479,10 +544,20 @@ fn canonical_subagent_tool(raw: &str) -> Option<&'static str> {
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn write_effect(root: &Path, raw: Option<&str>) -> WorkspaceEffect {
-    let Some(raw) = raw else { return WorkspaceEffect::OpaqueWorkspace };
+    let Some(raw) = raw else {
+        return WorkspaceEffect::OpaqueWorkspace;
+    };
     let path = Path::new(raw);
-    let joined = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
-    let parent = if joined.exists() { joined.as_path() } else { joined.parent().unwrap_or(root) };
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let parent = if joined.exists() {
+        joined.as_path()
+    } else {
+        joined.parent().unwrap_or(root)
+    };
     match parent.canonicalize() {
         Ok(canon) if canon.starts_with(root) => WorkspaceEffect::Paths,
         _ => WorkspaceEffect::External,
@@ -517,7 +592,11 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 /// re-join the file name (so a not-yet-existing target still resolves).
 pub(crate) fn confine(base: &Path, path: &str, must_exist: bool) -> Result<PathBuf> {
     let raw = Path::new(path);
-    let joined = if raw.is_absolute() { raw.to_path_buf() } else { base.join(raw) };
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        base.join(raw)
+    };
     let resolved = if must_exist {
         joined
             .canonicalize()
@@ -655,11 +734,41 @@ impl WalkBudget {
 /// otherwise burn the whole budget. NOT applied to a NARROW anchored walk (there the user pointed at
 /// a specific dir and asked to see everything, build output included).
 static BROAD_PRUNE: &[&str] = &[
-    "node_modules", "target", ".git", ".hg", ".svn", "vendor", "dist", "build", "out",
-    ".cache", ".cargo", ".rustup", ".npm", ".gradle", ".m2", ".nuget", ".venv", "venv",
-    "__pycache__", ".next", ".nuxt", ".terraform", ".tox", ".idea", ".vscode",
-    "AppData", "$Recycle.Bin", "System Volume Information", "Windows", "WinSxS",
-    "Program Files", "Program Files (x86)", "ProgramData", "$WinREAgent", ".Trash",
+    "node_modules",
+    "target",
+    ".git",
+    ".hg",
+    ".svn",
+    "vendor",
+    "dist",
+    "build",
+    "out",
+    ".cache",
+    ".cargo",
+    ".rustup",
+    ".npm",
+    ".gradle",
+    ".m2",
+    ".nuget",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".next",
+    ".nuxt",
+    ".terraform",
+    ".tox",
+    ".idea",
+    ".vscode",
+    "AppData",
+    "$Recycle.Bin",
+    "System Volume Information",
+    "Windows",
+    "WinSxS",
+    "Program Files",
+    "Program Files (x86)",
+    "ProgramData",
+    "$WinREAgent",
+    ".Trash",
 ];
 
 /// Run a bounded, parallel walk over `roots`, keeping every entry (file OR directory) for which
@@ -670,7 +779,13 @@ static BROAD_PRUNE: &[&str] = &[
 /// subtree skipping (on for a broad name-find, off for a structured anchored glob). `match_cap`
 /// bounds how many kept paths we retain (ranking later trims to a display count). All roots SHARE one
 /// budget, so the global node/wall-clock ceiling bounds the total work across every root.
-fn bounded_walk<F>(roots: &[(PathBuf, usize)], prune: bool, match_cap: usize, budget: &WalkBudget, keep: F) -> WalkOutcome
+fn bounded_walk<F>(
+    roots: &[(PathBuf, usize)],
+    prune: bool,
+    match_cap: usize,
+    budget: &WalkBudget,
+    keep: F,
+) -> WalkOutcome
 where
     F: Fn(&Path, &str) -> bool + Sync,
 {
@@ -718,7 +833,11 @@ where
                 if kept.load(Ordering::Relaxed) >= match_cap {
                     return WalkState::Quit;
                 }
-                let rel = path.strip_prefix(&root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 if keep(path, &rel) {
                     if kept.fetch_add(1, Ordering::Relaxed) >= match_cap {
                         return WalkState::Quit;
@@ -734,7 +853,11 @@ where
     paths.sort();
     paths.dedup();
     let capped = kept.load(Ordering::Relaxed) >= match_cap;
-    WalkOutcome { paths, budget_hit: budget.is_tripped(), capped }
+    WalkOutcome {
+        paths,
+        budget_hit: budget.is_tripped(),
+        capped,
+    }
 }
 
 /// Read the user's home directory from the environment WITHOUT pulling the `dirs` crate (its
@@ -771,7 +894,9 @@ fn seed_dirs(root: &Path) -> Vec<(PathBuf, usize)> {
     // huge ancestor. Each ancestor is walked SHALLOW.
     let mut cur = root.to_path_buf();
     for _ in 0..6 {
-        let Some(parent) = cur.parent().map(|p| p.to_path_buf()) else { break };
+        let Some(parent) = cur.parent().map(|p| p.to_path_buf()) else {
+            break;
+        };
         // Don't seed home or a root: parent-of-parent None means `parent` is a drive/fs root.
         if home.as_deref() == Some(parent.as_path()) || parent.parent().is_none() {
             break;
@@ -780,7 +905,16 @@ fn seed_dirs(root: &Path) -> Vec<(PathBuf, usize)> {
         cur = parent;
     }
     if let Some(home) = home {
-        for sub in ["Desktop", "Documents", "Downloads", "Projects", "Code", "src", "dev", "repos"] {
+        for sub in [
+            "Desktop",
+            "Documents",
+            "Downloads",
+            "Projects",
+            "Code",
+            "src",
+            "dev",
+            "repos",
+        ] {
             let p = home.join(sub);
             if p.is_dir() {
                 seeds.push((p, SEED_DEPTH_WIDE));
@@ -827,12 +961,20 @@ fn minimal_roots(seeds: Vec<(PathBuf, usize)>) -> Vec<(PathBuf, usize)> {
 /// working dir (shared path-prefix depth) · a small recency nudge from mtime. Used both to order
 /// glob hits and to pick the fuzzy-fallback suggestions, so the BEST answer is always line one.
 fn score_path(p: &Path, needle: &str, root: &Path, now: std::time::SystemTime) -> f64 {
-    let name = p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    let strip = |s: &str| s.chars().filter(|c| !matches!(c, '_' | '-' | ' ' | '.')).collect::<String>();
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let strip = |s: &str| {
+        s.chars()
+            .filter(|c| !matches!(c, '_' | '-' | ' ' | '.'))
+            .collect::<String>()
+    };
     let mut score = if needle.is_empty() {
         0.5
     } else {
-        let sim = strsim::jaro_winkler(needle, &name).max(strsim::jaro_winkler(&strip(needle), &strip(&name)));
+        let sim = strsim::jaro_winkler(needle, &name)
+            .max(strsim::jaro_winkler(&strip(needle), &strip(&name)));
         if name == needle {
             1.5 // exact filename — unbeatable
         } else if name.contains(needle) || strip(&name).contains(&strip(needle)) {
@@ -968,14 +1110,32 @@ impl Tool for MemorySearch {
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let query = str_arg(args, "query")?;
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5).clamp(1, 20) as usize;
-        let sel = match args.get("scope").and_then(|v| v.as_str()).map(str::trim).unwrap_or("current") {
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5)
+            .clamp(1, 20) as usize;
+        let sel = match args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("current")
+        {
             "" | "current" => crate::memory::ScopeSel::default_view(),
             "all" => crate::memory::ScopeSel::All,
             "global" => crate::memory::ScopeSel::Global,
-            other => return Ok(format!("error: unknown scope '{other}' (use current|all|global)")),
+            other => {
+                return Ok(format!(
+                    "error: unknown scope '{other}' (use current|all|global)"
+                ))
+            }
         };
-        let cat = match args.get("category").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+        let cat = match args
+            .get("category")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             None => None,
             Some(s) => match crate::memory::category::Category::parse(s) {
                 Some(c) => Some(c),
@@ -992,7 +1152,10 @@ impl Tool for MemorySearch {
         if hits.is_empty() {
             return Ok(format!("(no memory matches '{query}')"));
         }
-        Ok(format_memory_hits(&hits, crate::memory::settings().search_max_tokens))
+        Ok(format_memory_hits(
+            &hits,
+            crate::memory::settings().search_max_tokens,
+        ))
     }
 }
 
@@ -1024,7 +1187,10 @@ fn format_memory_hits(hits: &[crate::memory::Hit], max_tokens: usize) -> String 
         );
         let cost = crate::memory::render::est_tokens(&line);
         if used + cost > max_tokens && shown > 0 {
-            s.push_str(&format!("(+{} more hit(s) over the token budget — narrow the query)\n", hits.len() - shown));
+            s.push_str(&format!(
+                "(+{} more hit(s) over the token budget — narrow the query)\n",
+                hits.len() - shown
+            ));
             break;
         }
         used += cost;
@@ -1086,6 +1252,306 @@ impl Tool for MemoryAsk {
     }
 }
 
+// ── memory_list ───────────────────────────────────────────────────────────────
+
+/// Inventory of what is stored, WITHOUT a query. `memory_search` needs a query, so before this tool
+/// existed the agent had no way to answer "what do you remember about me?" — it could only guess
+/// query terms and report whatever happened to match, which reads as confidently not knowing its
+/// own state. This is the tool that makes the store legible.
+struct MemoryList;
+impl Tool for MemoryList {
+    fn name(&self) -> &str {
+        "memory_list"
+    }
+    fn description(&self) -> &str {
+        "Inventory the stored facts (id · type · zone · category · one-line summary) with NO query \
+         — use to answer 'what do you remember?', to audit what's saved before editing/forgetting, \
+         or to find the exact id `memory_update`/`memory_forget` needs. Not for finding one fact by \
+         topic → use memory_search. Read-only."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "scope": {"type": "string", "enum": ["current", "all", "global", "project"], "description": "zones to list: current project + global (default), every zone, global-only, or this project only"},
+                "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"], "description": "restrict to one memory type (optional)"},
+                "limit": {"type": "integer", "description": "max entries (default 50, max 200)"},
+                "include_archived": {"type": "boolean", "description": "list the recoverable archive instead of the live store (default false)"}
+            },
+            "additionalProperties": false
+        })
+    }
+    fn execute(&self, args: &Value) -> Result<String> {
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .clamp(1, 200) as usize;
+        let archived = args
+            .get("include_archived")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mtype = match args
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => None,
+            Some(s) => match crate::memory::store::MemoryType::parse_strict(s) {
+                Some(t) => Some(t),
+                None => {
+                    return Ok(format!(
+                        "error: unknown type '{s}' (user|feedback|project|reference)"
+                    ))
+                }
+            },
+        };
+        let sel = match args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("current")
+        {
+            "" | "current" => crate::memory::ScopeSel::default_view(),
+            "all" => crate::memory::ScopeSel::All,
+            "global" => crate::memory::ScopeSel::Global,
+            "project" => crate::memory::ScopeSel::Project(crate::core::config::project_slug()),
+            other => {
+                return Ok(format!(
+                    "error: unknown scope '{other}' (use current|all|global|project)"
+                ))
+            }
+        };
+        Ok(crate::memory::inventory(&sel, mtype, limit, archived)?)
+    }
+}
+
+// ── memory_save ───────────────────────────────────────────────────────────────
+
+/// Deliberate write. Distinct from the passive learning pipeline: when the user says "remember
+/// this", the agent should be able to act on it in the same turn instead of hoping an extractor
+/// picks it up later.
+struct MemorySave;
+impl Tool for MemorySave {
+    fn name(&self) -> &str {
+        "memory_save"
+    }
+    fn description(&self) -> &str {
+        "Store ONE durable fact the user asked you to remember, or a project fact worth keeping \
+         across sessions. Check memory_list/memory_search FIRST — if a fact on this topic already \
+         exists, use memory_update instead of adding a near-duplicate. Not for scratch notes within \
+         one turn. Defaults to the current project zone; set scope:'global' for a fact true \
+         everywhere."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "short, unique, kebab-case-ish title — becomes the id"},
+                "body": {"type": "string", "description": "the fact itself, self-contained (a reader with no chat context must understand it); use absolute dates, not 'yesterday'"},
+                "description": {"type": "string", "description": "one-line summary used for recall ranking (optional)"},
+                "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"], "description": "user = who they are; feedback = how they want you to work; project = this codebase's state/goals; reference = external pointers. Default project."},
+                "scope": {"type": "string", "description": "'global' for a fact true in every workspace; omit (or 'project') to scope it to the current project"}
+            },
+            "required": ["name", "body"],
+            "additionalProperties": false
+        })
+    }
+    // Writes a file + is the kind of thing the user wants to see; keep it off the parallel path.
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
+    fn execute(&self, args: &Value) -> Result<String> {
+        let name = str_arg(args, "name")?;
+        let body = str_arg(args, "body")?;
+        if body.trim().is_empty() {
+            return Ok("error: empty body — nothing to remember".to_string());
+        }
+        let desc = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let t = match args
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => crate::memory::store::MemoryType::Project,
+            Some(s) => match crate::memory::store::MemoryType::parse_strict(s) {
+                Some(t) => t,
+                None => {
+                    return Ok(format!(
+                        "error: unknown type '{s}' (user|feedback|project|reference)"
+                    ))
+                }
+            },
+        };
+        // Global only when explicitly asked; anything else (absent, "project", "current") stays in
+        // this workspace's zone — a fact learned here must not leak into unrelated projects.
+        let scope = match args.get("scope").and_then(|v| v.as_str()).map(str::trim) {
+            Some(s) if s.eq_ignore_ascii_case("global") => None,
+            _ => Some(crate::core::config::project_slug()),
+        };
+        match crate::memory::store::add_scoped(name, desc, t, body.trim(), scope.as_deref()) {
+            Ok(id) => Ok(format!(
+                "saved memory '{id}' (type={}, {}). Use memory_update to revise it.",
+                t.as_str(),
+                scope
+                    .as_deref()
+                    .map(|s| format!("zone {s}"))
+                    .unwrap_or_else(|| "global".into())
+            )),
+            // The store refuses to overwrite; surface the "update instead" path rather than failing.
+            Err(e) => Ok(format!("error: {e}")),
+        }
+    }
+}
+
+// ── memory_update ─────────────────────────────────────────────────────────────
+
+struct MemoryUpdate;
+impl Tool for MemoryUpdate {
+    fn name(&self) -> &str {
+        "memory_update"
+    }
+    fn description(&self) -> &str {
+        "Revise a stored fact in place by id — correct it, sharpen the wording, retype it, or move \
+         it between global/project scope. Only the fields you pass change; the id and every other \
+         field stay put. Use this instead of saving a second, contradictory fact on the same topic. \
+         Get ids from memory_list."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "the fact's id (or exact name) from memory_list"},
+                "body": {"type": "string", "description": "replacement body — the corrected fact, in full"},
+                "description": {"type": "string", "description": "replacement one-liner (empty string clears it)"},
+                "name": {"type": "string", "description": "replacement display title (the id does NOT change)"},
+                "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
+                "scope": {"type": "string", "description": "'global' to make it apply everywhere, or 'project' to scope it to the current workspace"}
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        })
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
+    fn execute(&self, args: &Value) -> Result<String> {
+        let id = str_arg(args, "id")?;
+        let mtype = match args
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => None,
+            Some(s) => match crate::memory::store::MemoryType::parse_strict(s) {
+                Some(t) => Some(t),
+                None => {
+                    return Ok(format!(
+                        "error: unknown type '{s}' (user|feedback|project|reference)"
+                    ))
+                }
+            },
+        };
+        let scope = args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .map(|s| {
+                if s.eq_ignore_ascii_case("global") || s.is_empty() {
+                    None
+                } else {
+                    Some(crate::core::config::project_slug())
+                }
+            });
+        let patch = crate::memory::store::EntryPatch {
+            name: args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            description: args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            mtype,
+            body: args
+                .get("body")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            scope,
+            preserve_updated: false, // a content update IS a touch — stamp the aging clock
+            // Not exposed to the model: dropping a `supersedes:` claim revives a retired fact, which
+            // is `aizen memory revive` — a human decision with its own audit line, not a field an
+            // edit tool gets to flip as a side effect of rewording a body.
+            clear_supersede: false,
+        };
+        if patch.is_empty() {
+            return Ok(
+                "error: nothing to update — pass at least one of body/description/name/type/scope"
+                    .to_string(),
+            );
+        }
+        let e = match crate::memory::resolve_entry(id) {
+            Ok(e) => e,
+            Err(err) => return Ok(format!("error: {err}")),
+        };
+        match crate::memory::store::update(&e, &patch) {
+            Ok(()) => Ok(format!("updated memory '{}'", e.id)),
+            Err(err) => Ok(format!("error: {err}")),
+        }
+    }
+}
+
+// ── memory_forget ─────────────────────────────────────────────────────────────
+
+/// Retire a fact. Deliberately a SOFT delete (archive, restorable by the human) and
+/// approval-gated: the store's premise is that a fact is never lost, and a model concluding
+/// something is obsolete is exactly the case where that premise earns its keep.
+struct MemoryForget;
+impl Tool for MemoryForget {
+    fn name(&self) -> &str {
+        "memory_forget"
+    }
+    fn description(&self) -> &str {
+        "Retire a stored fact the user says is wrong or obsolete. Moves it to a recoverable archive \
+         (the user can restore it) — it is NOT erased. Prefer memory_update when the fact is merely \
+         out of date, and only forget when it should stop applying entirely. Get ids from memory_list."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "the fact's id (or exact name) from memory_list"},
+                "reason": {"type": "string", "description": "why it should stop applying (shown to the user in the approval prompt)"}
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        })
+    }
+    fn is_destructive(&self) -> bool {
+        true
+    }
+    fn execute(&self, args: &Value) -> Result<String> {
+        let id = str_arg(args, "id")?;
+        let e = match crate::memory::resolve_entry(id) {
+            Ok(e) => e,
+            Err(err) => return Ok(format!("error: {err}")),
+        };
+        match crate::memory::store::retire(&e) {
+            Ok(archived) => Ok(format!(
+                "retired memory '{}' → archived as '{archived}' (user can restore: `aizen memory restore {archived}`)",
+                e.id
+            )),
+            Err(err) => Ok(format!("error: {err}")),
+        }
+    }
+}
+
 // ── file_read ──────────────────────────────────────────────────────────────
 
 struct FileRead {
@@ -1128,11 +1594,19 @@ impl Tool for FileRead {
             .with_context(|| format!("reading {}", resolved.display()))?;
         let start = args.get("start").and_then(|v| v.as_u64());
         let end = args.get("end").and_then(|v| v.as_u64());
-        let number = args.get("number").and_then(|v| v.as_bool()).unwrap_or(false);
+        let number = args
+            .get("number")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         // The whole file — verbatim under budget (the common case; keeps old_string round-trips
         // byte-exact), or a clearly-marked head+tail preview when it's pathologically large.
         if start.is_none() && end.is_none() && !number {
-            return Ok(budget_view(&content, path, FILE_READ_MAX_LINES, FILE_READ_MAX_BYTES));
+            return Ok(budget_view(
+                &content,
+                path,
+                FILE_READ_MAX_LINES,
+                FILE_READ_MAX_BYTES,
+            ));
         }
         let lines: Vec<&str> = content.lines().collect();
         let s = start.unwrap_or(1).max(1) as usize;
@@ -1208,7 +1682,11 @@ fn budget_view(content: &str, path: &str, max_lines: usize, max_bytes: usize) ->
     }
     let kb = total_bytes / 1024;
     // Per-slice byte clamp (a giant line inside the head/tail window can't blow the budget).
-    let bcap = if max_bytes > 0 { (max_bytes / 2).max(1) } else { usize::MAX };
+    let bcap = if max_bytes > 0 {
+        (max_bytes / 2).max(1)
+    } else {
+        usize::MAX
+    };
     if over_lines {
         let half = (max_lines / 2).max(1);
         let head = take_bytes_prefix(&content[..spans[half].0], bcap);
@@ -1287,7 +1765,11 @@ impl Tool for FileGlob {
         // (cwd → ancestors → Desktop/Documents/Downloads/home) so the file is found even when it
         // lives above the cwd — the whole reason a model no longer needs to shell out to `where`.
         let (anchor, sub) = glob_anchor(&self.root, pattern);
-        let sub_re = if sub.is_empty() { pattern.replace('\\', "/") } else { sub.clone() };
+        let sub_re = if sub.is_empty() {
+            pattern.replace('\\', "/")
+        } else {
+            sub.clone()
+        };
         // STRUCTURED vs BARE-NAME. A pattern with a path SEPARATOR, a glob metacharacter (`*`/`?`), a
         // `..`, or an absolute prefix is a deliberate STRUCTURED query → walk just its anchor DEEP with
         // NO pruning (the caller pointed somewhere specific and wants everything under it, build output
@@ -1296,10 +1778,8 @@ impl Tool for FileGlob {
         // seeds (cwd deep, ancestors + Desktop/Documents/… shallow) WITH heavy/system-dir pruning and
         // ranking, so it's found even above the cwd without scanning the whole drive.
         let norm = pattern.replace('\\', "/");
-        let structured = norm.contains('/')
-            || norm.contains('*')
-            || norm.contains('?')
-            || anchor != self.root;
+        let structured =
+            norm.contains('/') || norm.contains('*') || norm.contains('?') || anchor != self.root;
         let narrow = structured;
         let ci = smart_case_insensitive(&sub_re);
         let re = compile_glob(&sub_re, ci)?;
@@ -1309,9 +1789,15 @@ impl Tool for FileGlob {
         // ancestors + familiar folders shallow) with subtree pruning of heavy/system dirs. Match the
         // entry's path RELATIVE to the walk root against the glob; for a broad walk we also test the
         // BASENAME so a bare `**/*.rs`-style regex matches by name regardless of how deep the seed sits.
-        let roots: Vec<(PathBuf, usize)> =
-            if narrow { vec![(anchor.clone(), SEED_DEPTH_CWD)] } else { seed_dirs(&self.root) };
-        let budget = WalkBudget::new(if narrow { 400_000 } else { 250_000 }, Duration::from_millis(if narrow { 4000 } else { 2500 }));
+        let roots: Vec<(PathBuf, usize)> = if narrow {
+            vec![(anchor.clone(), SEED_DEPTH_CWD)]
+        } else {
+            seed_dirs(&self.root)
+        };
+        let budget = WalkBudget::new(
+            if narrow { 400_000 } else { 250_000 },
+            Duration::from_millis(if narrow { 4000 } else { 2500 }),
+        );
         let re_ref = &re;
         let outcome = bounded_walk(&roots, !narrow, 2000, &budget, |p, rel| {
             if re_ref.is_match(rel) {
@@ -1341,14 +1827,23 @@ impl Tool for FileGlob {
                 .iter()
                 .map(|p| {
                     let s = display_path(&self.root, p);
-                    if p.is_dir() { format!("{s}/") } else { s }
+                    if p.is_dir() {
+                        format!("{s}/")
+                    } else {
+                        s
+                    }
                 })
                 .collect();
             // Truncation / budget flags TEACH the model to narrow instead of trusting a partial list.
             if ranked.len() > shown {
-                lines.push(format!("…[{} more — showing the {shown} best; narrow the pattern to see the rest]", ranked.len() - shown));
+                lines.push(format!(
+                    "…[{} more — showing the {shown} best; narrow the pattern to see the rest]",
+                    ranked.len() - shown
+                ));
             } else if outcome.capped {
-                lines.push("…[result cap reached — more matches exist; narrow the pattern]".to_string());
+                lines.push(
+                    "…[result cap reached — more matches exist; narrow the pattern]".to_string(),
+                );
             } else if outcome.budget_hit {
                 lines.push("…[search budget reached before the whole tree was scanned — narrow the pattern or pass a ../ or absolute path to search a specific place]".to_string());
             }
@@ -1359,13 +1854,24 @@ impl Tool for FileGlob {
         // No exact glob hit → find the closest names (typo / separator tolerance). Reuse the SAME
         // bounded walk over the same roots (P1.4) — no second bespoke recursive scan.
         let needle = last_literal_segment(pattern);
-        let needle = needle.trim_matches(|c| c == '*' || c == '?').to_ascii_lowercase();
+        let needle = needle
+            .trim_matches(|c| c == '*' || c == '?')
+            .to_ascii_lowercase();
         if needle.is_empty() {
-            return Ok(format!("no files matched '{pattern}' (give a name or a glob like src/**/*.rs)"));
+            return Ok(format!(
+                "no files matched '{pattern}' (give a name or a glob like src/**/*.rs)"
+            ));
         }
-        let strip = |s: &str| s.chars().filter(|c| !matches!(c, '_' | '-' | ' ' | '.')).collect::<String>();
+        let strip = |s: &str| {
+            s.chars()
+                .filter(|c| !matches!(c, '_' | '-' | ' ' | '.'))
+                .collect::<String>()
+        };
         let needle_ref = &needle;
-        let fuzzy_budget = WalkBudget::new(if narrow { 400_000 } else { 250_000 }, Duration::from_millis(if narrow { 4000 } else { 2500 }));
+        let fuzzy_budget = WalkBudget::new(
+            if narrow { 400_000 } else { 250_000 },
+            Duration::from_millis(if narrow { 4000 } else { 2500 }),
+        );
         let pool = bounded_walk(&roots, !narrow, 6000, &fuzzy_budget, |p, _rel| {
             match p.file_name().and_then(|n| n.to_str()) {
                 Some(name) => {
@@ -1393,10 +1899,17 @@ impl Tool for FileGlob {
             .iter()
             .map(|(_, p)| {
                 let s = display_path(&self.root, p);
-                if p.is_dir() { format!("{s}/  (folder)") } else { s }
+                if p.is_dir() {
+                    format!("{s}/  (folder)")
+                } else {
+                    s
+                }
             })
             .collect();
-        Ok(format!("closest matches for '{pattern}' (ranked):\n{}", lines.join("\n")))
+        Ok(format!(
+            "closest matches for '{pattern}' (ranked):\n{}",
+            lines.join("\n")
+        ))
     }
 }
 
@@ -1447,8 +1960,14 @@ impl Tool for FileEdit {
     fn execute(&self, args: &Value) -> Result<String> {
         let path = str_arg(args, "path")?;
         let new = str_arg(args, "new_string")?;
-        let old = args.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
-        let replace_all = args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+        let old = args
+            .get("old_string")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let replace_all = args
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         if old.is_empty() {
             // create-new path
@@ -1469,12 +1988,21 @@ impl Tool for FileEdit {
         // No-op guard: a match that produced byte-identical content (e.g. old_string == new_string)
         // must not touch disk or arm the verify gate (W16).
         if applied.content == content {
-            return Ok(format!("{NOOP_WRITE_PREFIX}: {path} unchanged (old_string == new_string)"));
+            return Ok(format!(
+                "{NOOP_WRITE_PREFIX}: {path} unchanged (old_string == new_string)"
+            ));
         }
-        crate::core::persist::compare_and_atomic_write(&target, &expected, applied.content.as_bytes())
-            .with_context(|| format!("writing {}", target.display()))?;
-        let mut out =
-            format!("edited {path} ({})\n{}", applied.summary(), diff_preview(&applied.before, &applied.after));
+        crate::core::persist::compare_and_atomic_write(
+            &target,
+            &expected,
+            applied.content.as_bytes(),
+        )
+        .with_context(|| format!("writing {}", target.display()))?;
+        let mut out = format!(
+            "edited {path} ({})\n{}",
+            applied.summary(),
+            diff_preview(&applied.before, &applied.after)
+        );
         // Post-edit LSP fold: NEW diagnostics land in THIS result (zero extra round-trips to
         // discover breakage). Fail-soft + hard-capped inside; a no-op when LSP is off.
         if let Some(fb) = crate::agent::lsp::LSP.edit_feedback(&target) {
@@ -1549,7 +2077,9 @@ impl Tool for FileWrite {
         // needless git-diff noise) and must not arm the verify gate (W16). A create with empty
         // content is a real op (the file did not exist), so gate on `existed`.
         if existed && before == content {
-            return Ok(format!("{NOOP_WRITE_PREFIX}: {path} already holds this exact content"));
+            return Ok(format!(
+                "{NOOP_WRITE_PREFIX}: {path} already holds this exact content"
+            ));
         }
         crate::core::persist::compare_and_atomic_write(&target, &expected, content.as_bytes())
             .with_context(|| format!("writing {}", target.display()))?;
@@ -1623,17 +2153,27 @@ impl Tool for FileMove {
     fn execute(&self, args: &Value) -> Result<String> {
         let from = str_arg(args, "from")?;
         let to = str_arg(args, "to")?;
-        let overwrite = args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false);
-        let create_dirs = args.get("create_dirs").and_then(|v| v.as_bool()).unwrap_or(false);
+        let overwrite = args
+            .get("overwrite")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let create_dirs = args
+            .get("create_dirs")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // Source MUST exist (must_exist=true canonicalizes the whole path → clear error if missing).
-        let src = confine(&self.root, from, true)
-            .with_context(|| format!("source {from} not found"))?;
+        let src =
+            confine(&self.root, from, true).with_context(|| format!("source {from} not found"))?;
         // Destination need only have an existing parent (must_exist=false), unless create_dirs asks
         // us to make it. Resolve the parent ourselves so we can create it BEFORE confine() tries to
         // canonicalize it (confine requires the parent to already exist).
         let raw_to = Path::new(to);
-        let joined_to = if raw_to.is_absolute() { raw_to.to_path_buf() } else { self.root.join(raw_to) };
+        let joined_to = if raw_to.is_absolute() {
+            raw_to.to_path_buf()
+        } else {
+            self.root.join(raw_to)
+        };
         if create_dirs {
             if let Some(parent) = joined_to.parent() {
                 std::fs::create_dir_all(parent)
@@ -1645,7 +2185,9 @@ impl Tool for FileMove {
 
         // Moving a path onto itself is a no-op (don't churn the FS or arm the verify gate).
         if src == dst {
-            return Ok(format!("{NOOP_WRITE_PREFIX}: {from} and {to} are the same path"));
+            return Ok(format!(
+                "{NOOP_WRITE_PREFIX}: {from} and {to} are the same path"
+            ));
         }
         // CASE-ONLY (or otherwise same-inode) rename on a case-insensitive FS: `foo.txt` → `Foo.txt`.
         // `src` is canonicalized to the on-disk casing while `dst` keeps the requested casing, so
@@ -1653,10 +2195,7 @@ impl Tool for FileMove {
         // inode. The old code then DELETED that one inode and renamed a now-missing source into the
         // void: permanent data loss. Detect it by canonicalizing `dst`; if it resolves to `src`, this
         // is the same file and a direct rename just changes its recorded casing — never delete.
-        let dst_is_src = dst
-            .canonicalize()
-            .map(|c| c == src)
-            .unwrap_or(false);
+        let dst_is_src = dst.canonicalize().map(|c| c == src).unwrap_or(false);
         if dst_is_src {
             move_path(&src, &dst).with_context(|| format!("renaming {from} → {to}"))?;
             let kind = if dst.is_dir() { "directory" } else { "file" };
@@ -1687,8 +2226,9 @@ impl Tool for FileMove {
                     // Roll back: put the original destination back exactly where it was, then report
                     // the move failure (not the rollback) as the actionable error.
                     let _ = std::fs::rename(&stash, &dst);
-                    return Err(anyhow::Error::new(move_err))
-                        .with_context(|| format!("moving {from} → {to} (destination left unchanged)"));
+                    return Err(anyhow::Error::new(move_err)).with_context(|| {
+                        format!("moving {from} → {to} (destination left unchanged)")
+                    });
                 }
             }
             let kind = if dst.is_dir() { "directory" } else { "file" };
@@ -1713,7 +2253,10 @@ impl Tool for FileMove {
 pub(crate) fn atomic_write(target: &Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let fname = target.file_name().and_then(|n| n.to_str()).unwrap_or("out");
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = parent.join(format!(".{fname}.ng-tmp.{}.{n}", std::process::id()));
@@ -1749,7 +2292,10 @@ pub(crate) fn atomic_write(target: &Path, content: &[u8]) -> std::io::Result<()>
 /// the same directory as `p`, so the stash rename stays on one filesystem (and is thus atomic).
 fn stash_path(p: &Path) -> PathBuf {
     static STASH_COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let parent = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let parent = p
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("dst");
     let n = STASH_COUNTER.fetch_add(1, Ordering::Relaxed);
     parent.join(format!(".{fname}.ng-stash.{}.{n}", std::process::id()))
@@ -1853,7 +2399,13 @@ const NEAREST_MISS_MAX_FILE_LINES: usize = 20_000;
 ///
 /// `old` MUST be non-empty (create-new is the caller's concern). `label` names the target in
 /// errors (a path for file_edit; "edit #N (path)" for multi_edit).
-fn apply_one_edit(content: &str, old: &str, new: &str, replace_all: bool, label: &str) -> Result<EditApplied> {
+fn apply_one_edit(
+    content: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+    label: &str,
+) -> Result<EditApplied> {
     if old.is_empty() {
         bail!("empty old_string is only valid for creating a new file (file_edit), not mid-edit");
     }
@@ -1863,8 +2415,18 @@ fn apply_one_edit(content: &str, old: &str, new: &str, replace_all: bool, label:
         if count > 1 && !replace_all {
             bail!("old_string is not unique in {label} ({count} matches); add context or set replace_all");
         }
-        let updated = if replace_all { content.replace(old, new) } else { content.replacen(old, new, 1) };
-        return Ok(EditApplied { content: updated, before: old.to_string(), after: new.to_string(), count, rung: "exact" });
+        let updated = if replace_all {
+            content.replace(old, new)
+        } else {
+            content.replacen(old, new, 1)
+        };
+        return Ok(EditApplied {
+            content: updated,
+            before: old.to_string(),
+            after: new.to_string(),
+            count,
+            rung: "exact",
+        });
     }
     // R2 indent-tolerant (kept uncapped + byte-stable messages — the original fallback).
     if let Some(a) = block_rung(content, old, new, trim_norm, "indent", label)? {
@@ -1932,7 +2494,13 @@ fn apply_one_edit(content: &str, old: &str, new: &str, replace_all: bool, label:
 /// One full sub-ladder (R1 exact → R2 trim → R3 ws-collapse) over a DERIVED (old,new) pair —
 /// the driver for the R4/R5 variants. Same invariant: 1 ⇒ apply as `rung`, >1 ⇒ hard error,
 /// 0 ⇒ `None` (fall through).
-fn try_pair(content: &str, old: &str, new: &str, rung: &'static str, label: &str) -> Result<Option<EditApplied>> {
+fn try_pair(
+    content: &str,
+    old: &str,
+    new: &str,
+    rung: &'static str,
+    label: &str,
+) -> Result<Option<EditApplied>> {
     if old.trim().is_empty() {
         return Ok(None); // a variant that trimmed away all signal proves nothing
     }
@@ -1974,7 +2542,13 @@ fn block_rung(
             let before = content[bs..be].to_string();
             let spliced = preserve_eol(new, &before, &content[be..]);
             let updated = format!("{}{}{}", &content[..bs], spliced, &content[be..]);
-            Ok(Some(EditApplied { content: updated, before, after: new.to_string(), count: 1, rung }))
+            Ok(Some(EditApplied {
+                content: updated,
+                before,
+                after: new.to_string(),
+                count: 1,
+                rung,
+            }))
         }
         n => {
             if rung == "indent" {
@@ -1996,7 +2570,11 @@ fn preserve_eol(new: &str, before: &str, after_be: &str) -> String {
     if !crlf {
         return new.to_string();
     }
-    let mut out = if new.contains('\n') && !new.contains("\r\n") { new.replace('\n', "\r\n") } else { new.to_string() };
+    let mut out = if new.contains('\n') && !new.contains("\r\n") {
+        new.replace('\n', "\r\n")
+    } else {
+        new.to_string()
+    };
     if after_be.starts_with('\n') && !out.ends_with('\r') {
         out.push('\r');
     }
@@ -2035,7 +2613,10 @@ fn anchor_trim_variants(old: &str, new: &str) -> Vec<(String, String)> {
         out.push((ol[..ol.len() - 1].join("\n"), nl[..nl.len() - 1].join("\n")));
     }
     if first_shared && last_shared && ol.len() >= 3 && nl.len() >= 2 {
-        out.push((ol[1..ol.len() - 1].join("\n"), nl[1..nl.len() - 1].join("\n")));
+        out.push((
+            ol[1..ol.len() - 1].join("\n"),
+            nl[1..nl.len() - 1].join("\n"),
+        ));
     }
     out
 }
@@ -2212,7 +2793,6 @@ fn blank_insensitive_blocks(content: &str, old: &str) -> Vec<(usize, usize)> {
     out
 }
 
-
 /// A compact **unified diff** of an edit: common leading/trailing lines are trimmed away (so a big
 /// block collapses to just its changed window), the removed lines are prefixed `-`, the added lines
 /// `+`, and a couple of context lines (prefixed with a space) bracket the change. Gives the model
@@ -2235,7 +2815,10 @@ fn diff_preview(before: &str, after: &str) -> String {
         p += 1;
     }
     let mut s = 0;
-    while s < b.len().saturating_sub(p) && s < a.len().saturating_sub(p) && b[b.len() - 1 - s] == a[a.len() - 1 - s] {
+    while s < b.len().saturating_sub(p)
+        && s < a.len().saturating_sub(p)
+        && b[b.len() - 1 - s] == a[a.len() - 1 - s]
+    {
         s += 1;
     }
     let removed = &b[p..b.len() - s];
@@ -2250,7 +2833,10 @@ fn diff_preview(before: &str, after: &str) -> String {
         out.push_str(&format!("-{line}\n"));
     }
     if removed.len() > MAX_SIDE {
-        out.push_str(&format!("…({} more lines removed)\n", removed.len() - MAX_SIDE));
+        out.push_str(&format!(
+            "…({} more lines removed)\n",
+            removed.len() - MAX_SIDE
+        ));
     }
     for line in added.iter().take(MAX_SIDE) {
         out.push_str(&format!("+{line}\n"));
@@ -2356,8 +2942,12 @@ impl Tool for MultiEdit {
                 .get("new_string")
                 .and_then(|v| v.as_str())
                 .with_context(|| format!("edit #{n}: missing new_string"))?;
-            let replace_all = e.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
-            let applied = apply_one_edit(&buf, old, new, replace_all, &format!("edit #{n} ({path})"))?;
+            let replace_all = e
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let applied =
+                apply_one_edit(&buf, old, new, replace_all, &format!("edit #{n} ({path})"))?;
             let detail = match applied.rung {
                 "indent" => "1 replacement, indentation-tolerant".to_string(),
                 "exact" if replace_all => format!("{} replacement(s), replace_all", applied.count),
@@ -2373,7 +2963,10 @@ impl Tool for MultiEdit {
         // but a sequence that nets out to the original content (e.g. a change immediately undone by
         // a later edit) must not touch disk or arm the verify gate (W16).
         if buf == original {
-            return Ok(format!("{NOOP_WRITE_PREFIX}: {path} unchanged after {} edit(s) net to nothing", edits.len()));
+            return Ok(format!(
+                "{NOOP_WRITE_PREFIX}: {path} unchanged after {} edit(s) net to nothing",
+                edits.len()
+            ));
         }
         crate::core::persist::compare_and_atomic_write(&target, &expected, buf.as_bytes())
             .with_context(|| format!("writing {}", target.display()))?;
@@ -2461,12 +3054,17 @@ impl Tool for ShellRun {
         // stdin means the child never touches the console input handle, so our mode survives. The
         // command already runs non-interactively (drained pipes, wall-clock timeout), so it has no
         // legitimate use for the terminal's stdin anyway.
-        cmd.current_dir(&dir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         // Contain the tree BEFORE anything can go wrong with it: on Windows we spawn a `cmd.exe`
         // wrapper, so killing our direct child leaves the real work (cargo, node, a dev server)
         // orphaned — still running, and still holding the write end of the pipes below.
         crate::core::proctree::prepare(&mut cmd);
-        let mut child = cmd.spawn().with_context(|| format!("spawning shell for `{command}`"))?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("spawning shell for `{command}`"))?;
         let containment = crate::core::proctree::contain(&child);
 
         // Drain the pipes on threads so a chatty command can't deadlock on a full buffer,
@@ -2616,8 +3214,12 @@ impl Tool for SkillLoad {
                 Ok(crate::skills::render_loaded(&sk))
             }
             None => {
-                let avail: Vec<String> = crate::skills::list().into_iter().map(|s| s.name).collect();
-                Ok(format!("(no skill named '{name}'; available: {})", avail.join(", ")))
+                let avail: Vec<String> =
+                    crate::skills::list().into_iter().map(|s| s.name).collect();
+                Ok(format!(
+                    "(no skill named '{name}'; available: {})",
+                    avail.join(", ")
+                ))
             }
         }
     }
@@ -2658,9 +3260,15 @@ impl Tool for SkillSave {
     fn execute(&self, args: &Value) -> Result<String> {
         let name = str_arg(args, "name")?;
         let body = str_arg(args, "body")?;
-        let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let when = args.get("when").and_then(|v| v.as_str()).unwrap_or("");
-        let project_zone = matches!(args.get("scope").and_then(|v| v.as_str()).map(str::trim), Some("project"));
+        let project_zone = matches!(
+            args.get("scope").and_then(|v| v.as_str()).map(str::trim),
+            Some("project")
+        );
         let path = crate::skills::save_scoped(name, description, when, body, project_zone)?;
         Ok(format!("saved skill '{name}' → {}", path.display()))
     }
@@ -2708,7 +3316,10 @@ impl Tool for SkillRefine {
         let description = args.get("description").and_then(|v| v.as_str());
         let when = args.get("when").and_then(|v| v.as_str());
         let (version, archived) = crate::skills::refine(name, body, description, when)?;
-        Ok(format!("refined skill '{name}' → v{version} (prior version archived at {})", archived.display()))
+        Ok(format!(
+            "refined skill '{name}' → v{version} (prior version archived at {})",
+            archived.display()
+        ))
     }
 }
 
@@ -2757,7 +3368,10 @@ impl Tool for PersonaCreate {
         let body = str_arg(args, "body")?;
         let role = args.get("role").and_then(|v| v.as_str()).unwrap_or("");
         let voice = args.get("voice").and_then(|v| v.as_str()).unwrap_or("");
-        let activate = args.get("activate").and_then(|v| v.as_bool()).unwrap_or(true);
+        let activate = args
+            .get("activate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let path = crate::persona::save(name, role, voice, body)?;
         if activate {
             crate::persona::set_active(name)?;
@@ -2767,7 +3381,10 @@ impl Tool for PersonaCreate {
                 path.display()
             ))
         } else {
-            Ok(format!("created persona '{name}' → {} (not active; switch with /persona).", path.display()))
+            Ok(format!(
+                "created persona '{name}' → {} (not active; switch with /persona).",
+                path.display()
+            ))
         }
     }
 }
@@ -2802,7 +3419,10 @@ mod tests {
         let out = format_memory_hits(&hits, 120);
         assert!(out.contains("fact-0"), "{out}");
         assert!(out.contains("more hit(s) over the token budget"), "{out}");
-        assert!(crate::memory::render::est_tokens(&out) <= 160, "output stays near the budget: {out}");
+        assert!(
+            crate::memory::render::est_tokens(&out) <= 160,
+            "output stays near the budget: {out}"
+        );
         // zone tag renders for project-scoped hits
         let tagged = format_memory_hits(&[hit("zoned", Some("proj-00000001"))], 1200);
         assert!(tagged.contains("[p:proj-00000001]"), "{tagged}");
@@ -2830,11 +3450,19 @@ mod tests {
         // (used to be rejected) so the agent can work on sibling projects the user points it at.
         let root = temp_root("confine");
         std::fs::write(root.join("ok.txt"), "hi").unwrap();
-        assert!(confine(&root, "ok.txt", true).is_ok(), "in-tree path resolves");
+        assert!(
+            confine(&root, "ok.txt", true).is_ok(),
+            "in-tree path resolves"
+        );
         // A create-target (must_exist=false) that escapes the root no longer errors — it resolves to
         // a path OUTSIDE root. Its parent (root's parent) exists, so canonicalize+rejoin succeeds.
-        let escaped = confine(&root, "../ng-confine-escape.txt", false).expect("escape now resolves");
-        assert!(!escaped.starts_with(&root), "resolved target is outside the root: {}", escaped.display());
+        let escaped =
+            confine(&root, "../ng-confine-escape.txt", false).expect("escape now resolves");
+        assert!(
+            !escaped.starts_with(&root),
+            "resolved target is outside the root: {}",
+            escaped.display()
+        );
     }
 
     #[test]
@@ -2844,12 +3472,30 @@ mod tests {
         let before = "1\n2\n3\n4\n5\nOLD\n7\n8\n9\n10";
         let after = "1\n2\n3\n4\n5\nNEW\n7\n8\n9\n10";
         let d = diff_preview(before, after);
-        assert!(d.lines().any(|l| l == "-OLD"), "removed line, column-0 '-': {d:?}");
-        assert!(d.lines().any(|l| l == "+NEW"), "added line, column-0 '+': {d:?}");
-        assert!(d.lines().any(|l| l == " 5"), "keeps a leading context line: {d:?}");
-        assert!(d.lines().any(|l| l == " 7"), "keeps a trailing context line: {d:?}");
-        assert!(!d.contains("--- before") && !d.contains("+++ after"), "no old block headers: {d:?}");
-        assert!(!d.contains('1'), "far prefix/suffix bulk is trimmed away: {d:?}");
+        assert!(
+            d.lines().any(|l| l == "-OLD"),
+            "removed line, column-0 '-': {d:?}"
+        );
+        assert!(
+            d.lines().any(|l| l == "+NEW"),
+            "added line, column-0 '+': {d:?}"
+        );
+        assert!(
+            d.lines().any(|l| l == " 5"),
+            "keeps a leading context line: {d:?}"
+        );
+        assert!(
+            d.lines().any(|l| l == " 7"),
+            "keeps a trailing context line: {d:?}"
+        );
+        assert!(
+            !d.contains("--- before") && !d.contains("+++ after"),
+            "no old block headers: {d:?}"
+        );
+        assert!(
+            !d.contains('1'),
+            "far prefix/suffix bulk is trimmed away: {d:?}"
+        );
     }
 
     #[test]
@@ -2859,7 +3505,9 @@ mod tests {
         let t = FileRead::new(root.clone());
         let all = t.execute(&serde_json::json!({"path":"f.txt"})).unwrap();
         assert_eq!(all, "l1\nl2\nl3\nl4");
-        let mid = t.execute(&serde_json::json!({"path":"f.txt","start":2,"end":3})).unwrap();
+        let mid = t
+            .execute(&serde_json::json!({"path":"f.txt","start":2,"end":3}))
+            .unwrap();
         assert_eq!(mid, "l2\nl3");
     }
 
@@ -2871,7 +3519,9 @@ mod tests {
         // missing-file error, not a boundary that no longer exists.
         let root = temp_root("read-missing");
         let t = FileRead::new(root);
-        assert!(t.execute(&serde_json::json!({"path":"../../nonexistent-xyzzy-secret"})).is_err());
+        assert!(t
+            .execute(&serde_json::json!({"path":"../../nonexistent-xyzzy-secret"}))
+            .is_err());
     }
 
     #[test]
@@ -2882,7 +3532,9 @@ mod tests {
         std::fs::write(root.join("src/sub/b.rs"), "").unwrap();
         std::fs::write(root.join("src/c.ts"), "").unwrap();
         let t = FileGlob::new(root);
-        let out = t.execute(&serde_json::json!({"pattern":"src/**/*.rs"})).unwrap();
+        let out = t
+            .execute(&serde_json::json!({"pattern":"src/**/*.rs"}))
+            .unwrap();
         assert!(out.contains("src/a.rs"));
         assert!(out.contains("src/sub/b.rs"));
         assert!(!out.contains("c.ts"));
@@ -2899,9 +3551,17 @@ mod tests {
         std::fs::write(root.join(".hidden/secret.rs"), "").unwrap();
         std::fs::write(root.join(".env.rs"), "").unwrap();
         let t = FileGlob::new(root);
-        let out = t.execute(&serde_json::json!({"pattern":"**/*.rs"})).unwrap();
-        assert!(out.contains("target/debug/app.rs"), "build dir walked: {out}");
-        assert!(out.contains(".hidden/secret.rs"), "hidden dir walked: {out}");
+        let out = t
+            .execute(&serde_json::json!({"pattern":"**/*.rs"}))
+            .unwrap();
+        assert!(
+            out.contains("target/debug/app.rs"),
+            "build dir walked: {out}"
+        );
+        assert!(
+            out.contains(".hidden/secret.rs"),
+            "hidden dir walked: {out}"
+        );
         assert!(out.contains(".env.rs"), "hidden file matched: {out}");
     }
 
@@ -2914,8 +3574,13 @@ mod tests {
         std::fs::create_dir_all(base.join("proj_b")).unwrap();
         std::fs::write(base.join("proj_b/level.js"), "").unwrap();
         let t = FileGlob::new(base.join("proj_a").canonicalize().unwrap());
-        let out = t.execute(&serde_json::json!({"pattern":"../proj_b/**/*.js"})).unwrap();
-        assert!(out.contains("level.js"), "should reach the sibling project: {out}");
+        let out = t
+            .execute(&serde_json::json!({"pattern":"../proj_b/**/*.js"}))
+            .unwrap();
+        assert!(
+            out.contains("level.js"),
+            "should reach the sibling project: {out}"
+        );
     }
 
     #[test]
@@ -2926,8 +3591,13 @@ mod tests {
         std::fs::write(root.join("snake_game.js"), "").unwrap();
         std::fs::write(root.join("readme.md"), "").unwrap();
         let t = FileGlob::new(root);
-        let out = t.execute(&serde_json::json!({"pattern":"snakegame.js"})).unwrap();
-        assert!(out.contains("closest matches"), "fuzzy header present: {out}");
+        let out = t
+            .execute(&serde_json::json!({"pattern":"snakegame.js"}))
+            .unwrap();
+        assert!(
+            out.contains("closest matches"),
+            "fuzzy header present: {out}"
+        );
         assert!(out.contains("snake_game.js"), "near-name surfaced: {out}");
     }
 
@@ -2938,8 +3608,13 @@ mod tests {
         std::fs::create_dir_all(root.join("src/mini_project")).unwrap();
         std::fs::write(root.join("src/mini_project/main.rs"), "").unwrap();
         let t = FileGlob::new(root);
-        let out = t.execute(&serde_json::json!({"pattern":"**/mini_project"})).unwrap();
-        assert!(out.contains("src/mini_project"), "the folder itself is listed: {out}");
+        let out = t
+            .execute(&serde_json::json!({"pattern":"**/mini_project"}))
+            .unwrap();
+        assert!(
+            out.contains("src/mini_project"),
+            "the folder itself is listed: {out}"
+        );
     }
 
     #[test]
@@ -2951,8 +3626,13 @@ mod tests {
         let ws = base.join("mini_project").join("aizen");
         std::fs::create_dir_all(&ws).unwrap();
         let t = FileGlob::new(ws.canonicalize().unwrap());
-        let out = t.execute(&serde_json::json!({"pattern":"miniproject"})).unwrap();
-        assert!(out.contains("mini_project"), "parent folder surfaced by fuzzy: {out}");
+        let out = t
+            .execute(&serde_json::json!({"pattern":"miniproject"}))
+            .unwrap();
+        assert!(
+            out.contains("mini_project"),
+            "parent folder surfaced by fuzzy: {out}"
+        );
         assert!(out.contains("(folder)"), "it's tagged as a folder: {out}");
     }
 
@@ -2963,8 +3643,13 @@ mod tests {
         let root = temp_root("glob-case");
         std::fs::write(root.join("README.md"), "").unwrap();
         let t = FileGlob::new(root);
-        let out = t.execute(&serde_json::json!({"pattern":"readme.md"})).unwrap();
-        assert!(out.contains("README.md"), "lowercase pattern is case-insensitive: {out}");
+        let out = t
+            .execute(&serde_json::json!({"pattern":"readme.md"}))
+            .unwrap();
+        assert!(
+            out.contains("README.md"),
+            "lowercase pattern is case-insensitive: {out}"
+        );
     }
 
     #[test]
@@ -2977,9 +3662,14 @@ mod tests {
         std::fs::write(root.join("a/config.toml.bak"), "").unwrap();
         std::fs::write(root.join("b/config.toml"), "").unwrap();
         let t = FileGlob::new(root);
-        let out = t.execute(&serde_json::json!({"pattern":"**/config.toml"})).unwrap();
+        let out = t
+            .execute(&serde_json::json!({"pattern":"**/config.toml"}))
+            .unwrap();
         let first = out.lines().next().unwrap_or("");
-        assert!(first.ends_with("b/config.toml"), "exact name ranked first: {out}");
+        assert!(
+            first.ends_with("b/config.toml"),
+            "exact name ranked first: {out}"
+        );
     }
 
     #[test]
@@ -2989,8 +3679,13 @@ mod tests {
         let root = temp_root("glob-nomatch");
         std::fs::write(root.join("alpha.rs"), "").unwrap();
         let t = FileGlob::new(root);
-        let out = t.execute(&serde_json::json!({"pattern":"zzqwx_nonexistent_qq"})).unwrap();
-        assert!(!out.starts_with('('), "no leading negative parenthetical: {out}");
+        let out = t
+            .execute(&serde_json::json!({"pattern":"zzqwx_nonexistent_qq"}))
+            .unwrap();
+        assert!(
+            !out.starts_with('('),
+            "no leading negative parenthetical: {out}"
+        );
         assert!(out.contains("searched"), "says where it looked: {out}");
     }
 
@@ -2999,9 +3694,14 @@ mod tests {
         let root = temp_root("edit");
         std::fs::write(root.join("f.txt"), "hello world").unwrap();
         let t = FileEdit::new(root.clone());
-        let r = t.execute(&serde_json::json!({"path":"f.txt","old_string":"world","new_string":"rust"})).unwrap();
+        let r = t
+            .execute(&serde_json::json!({"path":"f.txt","old_string":"world","new_string":"rust"}))
+            .unwrap();
         assert!(r.contains("edited"));
-        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "hello rust");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "hello rust"
+        );
     }
 
     #[test]
@@ -3009,7 +3709,9 @@ mod tests {
         let root = temp_root("read-num");
         std::fs::write(root.join("f.txt"), "alpha\nbeta\ngamma").unwrap();
         let t = FileRead::new(root);
-        let out = t.execute(&serde_json::json!({"path":"f.txt","number":true})).unwrap();
+        let out = t
+            .execute(&serde_json::json!({"path":"f.txt","number":true}))
+            .unwrap();
         assert_eq!(out, "1|alpha\n2|beta\n3|gamma");
         // default (no number) stays byte-exact so old_string round-trips into file_edit cleanly
         let plain = t.execute(&serde_json::json!({"path":"f.txt"})).unwrap();
@@ -3027,11 +3729,20 @@ mod tests {
     fn budget_view_over_lines_marks_headtail_byte_exact() {
         let c = "L1\r\nL2\r\nL3\r\nL4\r\nL5\r\n";
         let out = budget_view(c, "f.txt", 4, 0); // line cap 4, byte cap disabled
-        assert!(out.contains("over the 4-line read budget"), "loud marker: {out}");
-        assert!(out.contains("L1\r\nL2\r\n"), "head slice is byte-exact incl CRLF");
+        assert!(
+            out.contains("over the 4-line read budget"),
+            "loud marker: {out}"
+        );
+        assert!(
+            out.contains("L1\r\nL2\r\n"),
+            "head slice is byte-exact incl CRLF"
+        );
         assert!(out.contains("L5"), "tail slice present");
         assert!(!out.contains("L3"), "the omitted middle is not shown");
-        assert!(out.contains("lines omitted: 3-4"), "names the omitted range: {out}");
+        assert!(
+            out.contains("lines omitted: 3-4"),
+            "names the omitted range: {out}"
+        );
     }
 
     #[test]
@@ -3041,7 +3752,10 @@ mod tests {
         assert!(out.starts_with("[file_read:"), "marker first");
         assert!(out.contains("KB read budget"));
         assert!(out.contains("bytes omitted"));
-        assert!(out.len() < c.len(), "result is bounded below the original size");
+        assert!(
+            out.len() < c.len(),
+            "result is bounded below the original size"
+        );
     }
 
     #[test]
@@ -3054,26 +3768,43 @@ mod tests {
     fn file_read_over_budget_via_execute() {
         // The real consts (2000 lines): a whole-file read of a 2500-line file is trimmed + marked.
         let root = temp_root("read-budget");
-        let big: String = (1..=2500).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let big: String = (1..=2500)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(root.join("big.txt"), &big).unwrap();
         let t = FileRead::new(root);
         let out = t.execute(&serde_json::json!({"path":"big.txt"})).unwrap();
-        assert!(out.contains("over the 2000-line read budget"), "marker present");
+        assert!(
+            out.contains("over the 2000-line read budget"),
+            "marker present"
+        );
         assert!(out.contains("line1\n"), "head present");
         assert!(out.contains("line2500"), "tail present");
-        assert!(!out.contains("line1300\n"), "the omitted middle is not shown");
+        assert!(
+            !out.contains("line1300\n"),
+            "the omitted middle is not shown"
+        );
     }
 
     #[test]
     fn file_read_explicit_range_skips_budget() {
         // An explicit start/end on the SAME large file returns the exact range — never re-bounded.
         let root = temp_root("read-budget-range");
-        let big: String = (1..=2500).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let big: String = (1..=2500)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(root.join("big.txt"), &big).unwrap();
         let t = FileRead::new(root);
-        let out = t.execute(&serde_json::json!({"path":"big.txt","start":5,"end":7})).unwrap();
+        let out = t
+            .execute(&serde_json::json!({"path":"big.txt","start":5,"end":7}))
+            .unwrap();
         assert_eq!(out, "line5\nline6\nline7");
-        assert!(!out.contains("read budget"), "range reads are never budgeted");
+        assert!(
+            !out.contains("read budget"),
+            "range reads are never budgeted"
+        );
     }
 
     #[test]
@@ -3096,19 +3827,30 @@ mod tests {
         let a = apply_one_edit(content, old, new, false, "t").unwrap();
         assert_eq!(a.rung, "anchor-trim");
         assert!(a.content.contains("new_body();"), "{}", a.content);
-        assert!(a.content.contains("fn main() {"), "the real context line is untouched");
+        assert!(
+            a.content.contains("fn main() {"),
+            "the real context line is untouched"
+        );
         // NOT shared (the first line actually differs between old and new) → no R4, hard failure.
         let old2 = "fn mian() {\n    body();";
         let new2 = "fn other() {\n    new_body();";
-        assert!(apply_one_edit(content, old2, new2, false, "t").is_err(), "no anchor-trim without shared context");
+        assert!(
+            apply_one_edit(content, old2, new2, false, "t").is_err(),
+            "no anchor-trim without shared context"
+        );
     }
 
     #[test]
     fn ladder_ambiguous_at_any_rung_refuses() {
         // Two ws-normalized matches → hard error, must NOT fall through to a looser rung.
         let content = "foo( a );\nfoo(  a );\n";
-        let err = apply_one_edit(content, "foo(a );", "bar();", false, "t").unwrap_err().to_string();
-        assert!(err.contains("2") && err.contains("t"), "ambiguity is a hard refusal: {err}");
+        let err = apply_one_edit(content, "foo(a );", "bar();", false, "t")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("2") && err.contains("t"),
+            "ambiguity is a hard refusal: {err}"
+        );
     }
 
     #[test]
@@ -3132,7 +3874,11 @@ mod tests {
         assert_eq!(a.rung, "blank-norm");
         assert!(a.content.contains("let a = 10;"), "{}", a.content);
         assert!(a.content.contains("let b = 20;"), "{}", a.content);
-        assert!(!a.content.contains("let a = 1;"), "old first line replaced: {}", a.content);
+        assert!(
+            !a.content.contains("let a = 1;"),
+            "old first line replaced: {}",
+            a.content
+        );
         assert!(a.summary().contains("blank-line-insensitive"));
     }
 
@@ -3144,26 +3890,40 @@ mod tests {
         let err = apply_one_edit(content, "a = 1;\nb = 2;", "z = 9;", false, "t")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("blank lines") && err.contains('2'), "ambiguity is a hard refusal: {err}");
+        assert!(
+            err.contains("blank lines") && err.contains('2'),
+            "ambiguity is a hard refusal: {err}"
+        );
     }
 
     #[test]
     fn ladder_nearest_miss_reports_line_numbers() {
-        let content = (1..=30).map(|i| format!("line number {i} content")).collect::<Vec<_>>().join("\n");
+        let content = (1..=30)
+            .map(|i| format!("line number {i} content"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let err = apply_one_edit(&content, "line number 17 contnet", "x", false, "f.rs")
             .unwrap_err()
             .to_string();
         assert!(err.contains("Nearest match"), "{err}");
-        assert!(err.contains("17| "), "the real line is quoted with its number: {err}");
+        assert!(
+            err.contains("17| "),
+            "the real line is quoted with its number: {err}"
+        );
         assert!(err.contains("Copy old_string EXACTLY"), "{err}");
     }
 
     #[test]
     fn ladder_no_similar_region_keeps_plain_error() {
         let content = "completely different text\n";
-        let err = apply_one_edit(content, "zzz qqq www", "x", false, "f.rs").unwrap_err().to_string();
+        let err = apply_one_edit(content, "zzz qqq www", "x", false, "f.rs")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not found"), "{err}");
-        assert!(!err.contains("Nearest match"), "below the similarity floor → no random quote: {err}");
+        assert!(
+            !err.contains("Nearest match"),
+            "below the similarity floor → no random quote: {err}"
+        );
     }
 
     #[test]
@@ -3171,14 +3931,22 @@ mod tests {
         assert_eq!(json_unescape("a\\nb").as_deref(), Some("a\nb"));
         assert_eq!(json_unescape("a\\\\b").as_deref(), Some("a\\b"));
         assert_eq!(json_unescape("plain"), None, "no backslash → no rung");
-        assert_eq!(json_unescape("C:\\path\\dir"), None, "unknown escapes alone don't count as a change");
+        assert_eq!(
+            json_unescape("C:\\path\\dir"),
+            None,
+            "unknown escapes alone don't count as a change"
+        );
     }
 
     #[test]
     fn file_edit_indentation_tolerant_fallback() {
         let root = temp_root("edit-indent");
         // File uses 4-space indentation; the model's old_string uses 2 spaces (a real mismatch).
-        std::fs::write(root.join("f.rs"), "fn main() {\n    let x = 1;\n    foo();\n}\n").unwrap();
+        std::fs::write(
+            root.join("f.rs"),
+            "fn main() {\n    let x = 1;\n    foo();\n}\n",
+        )
+        .unwrap();
         let t = FileEdit::new(root.clone());
         let r = t
             .execute(&serde_json::json!({
@@ -3189,8 +3957,14 @@ mod tests {
             .unwrap();
         assert!(r.contains("indentation-tolerant"), "got: {r}");
         // the unified diff preview shows the removed/added lines (column-0 -/+ markers)
-        assert!(r.lines().any(|l| l.starts_with('-')), "diff shows a removed line: {r}");
-        assert!(r.lines().any(|l| l.starts_with('+')), "diff shows an added line: {r}");
+        assert!(
+            r.lines().any(|l| l.starts_with('-')),
+            "diff shows a removed line: {r}"
+        );
+        assert!(
+            r.lines().any(|l| l.starts_with('+')),
+            "diff shows an added line: {r}"
+        );
         let after = std::fs::read_to_string(root.join("f.rs")).unwrap();
         assert_eq!(after, "fn main() {\n    let x = 2;\n    bar();\n}\n");
     }
@@ -3203,12 +3977,19 @@ mod tests {
         // degrade to a lone-LF line among CRLF neighbours (Windows mixed-ending corruption).
         std::fs::write(root.join("f.rs"), "a\r\n    b\r\nc\r\n").unwrap();
         let t = FileEdit::new(root.clone());
-        t.execute(&serde_json::json!({"path":"f.rs","old_string":"  b","new_string":"X"})).unwrap();
+        t.execute(&serde_json::json!({"path":"f.rs","old_string":"  b","new_string":"X"}))
+            .unwrap();
         let after = std::fs::read_to_string(root.join("f.rs")).unwrap();
         // The invariant is line endings, not indentation (the indent rung reapplies leading space):
         // the edited line is written with CRLF, and no lone-LF line survives anywhere.
-        assert!(after.contains("X\r\n"), "edited line written with CRLF: {after:?}");
-        assert!(!after.replace("\r\n", "").contains('\n'), "no lone-LF line survived the edit: {after:?}");
+        assert!(
+            after.contains("X\r\n"),
+            "edited line written with CRLF: {after:?}"
+        );
+        assert!(
+            !after.replace("\r\n", "").contains('\n'),
+            "no lone-LF line survived the edit: {after:?}"
+        );
     }
 
     #[test]
@@ -3228,7 +4009,8 @@ mod tests {
         std::fs::write(root.join("f.txt"), "  a\nb\n    a\nb\n").unwrap();
         let t = FileEdit::new(root);
         // "a\nb" matches two blocks once indentation is ignored → refuse, don't corrupt.
-        let r = t.execute(&serde_json::json!({"path":"f.txt","old_string":"a\nb","new_string":"X"}));
+        let r =
+            t.execute(&serde_json::json!({"path":"f.txt","old_string":"a\nb","new_string":"X"}));
         assert!(r.is_err(), "ambiguous tolerant match must refuse");
     }
 
@@ -3237,16 +4019,23 @@ mod tests {
         let root = temp_root("edit-dup");
         std::fs::write(root.join("f.txt"), "a a a").unwrap();
         let t = FileEdit::new(root);
-        assert!(t.execute(&serde_json::json!({"path":"f.txt","old_string":"a","new_string":"b"})).is_err());
+        assert!(t
+            .execute(&serde_json::json!({"path":"f.txt","old_string":"a","new_string":"b"}))
+            .is_err());
     }
 
     #[test]
     fn file_edit_creates_new_when_old_empty() {
         let root = temp_root("edit-new");
         let t = FileEdit::new(root.clone());
-        let r = t.execute(&serde_json::json!({"path":"new.txt","old_string":"","new_string":"content"})).unwrap();
+        let r = t
+            .execute(&serde_json::json!({"path":"new.txt","old_string":"","new_string":"content"}))
+            .unwrap();
         assert!(r.contains("created"));
-        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "content");
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.txt")).unwrap(),
+            "content"
+        );
     }
 
     #[test]
@@ -3261,13 +4050,23 @@ mod tests {
         let root = temp_root("write");
         let t = FileWrite::new(root.clone());
         // create
-        let r = t.execute(&serde_json::json!({"path":"a.txt","content":"one\ntwo\n"})).unwrap();
+        let r = t
+            .execute(&serde_json::json!({"path":"a.txt","content":"one\ntwo\n"}))
+            .unwrap();
         assert!(r.starts_with("created a.txt"), "{r:?}");
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "one\ntwo\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "one\ntwo\n"
+        );
         // overwrite an EXISTING non-empty file wholesale — the case that used to force `type NUL >`.
-        let r2 = t.execute(&serde_json::json!({"path":"a.txt","content":"brand new\n"})).unwrap();
+        let r2 = t
+            .execute(&serde_json::json!({"path":"a.txt","content":"brand new\n"}))
+            .unwrap();
         assert!(r2.starts_with("overwrote a.txt"), "{r2:?}");
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "brand new\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "brand new\n"
+        );
         assert!(t.is_destructive() && !t.is_concurrency_safe());
     }
 
@@ -3279,11 +4078,15 @@ mod tests {
         // temp dir, exists) instead of being refused. Clean up the file we create outside root.
         let outside = root.parent().unwrap().join("evil.txt");
         let _ = std::fs::remove_file(&outside);
-        assert!(t.execute(&serde_json::json!({"path":"../evil.txt","content":"x"})).is_ok());
+        assert!(t
+            .execute(&serde_json::json!({"path":"../evil.txt","content":"x"}))
+            .is_ok());
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "x");
         let _ = std::fs::remove_file(&outside);
         // The one remaining guard: writing into a non-existent subdir still errors (parent must exist).
-        assert!(t.execute(&serde_json::json!({"path":"nope/deep.txt","content":"x"})).is_err());
+        assert!(t
+            .execute(&serde_json::json!({"path":"nope/deep.txt","content":"x"}))
+            .is_err());
     }
 
     #[test]
@@ -3302,7 +4105,10 @@ mod tests {
             .unwrap();
         assert!(r.contains("2 edits applied"), "got: {r}");
         assert!(r.contains("#1") && r.contains("#2"));
-        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "A beta G");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "A beta G"
+        );
     }
 
     #[test]
@@ -3319,7 +4125,10 @@ mod tests {
             ]
         }))
         .unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "three");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "three"
+        );
     }
 
     #[test]
@@ -3358,7 +4167,10 @@ mod tests {
             }))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("edit #2"), "error names the failing edit index: {err}");
+        assert!(
+            err.contains("edit #2"),
+            "error names the failing edit index: {err}"
+        );
     }
 
     #[test]
@@ -3374,7 +4186,10 @@ mod tests {
             ]
         }))
         .unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "Z Z Z | Y");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "Z Z Z | Y"
+        );
         // A non-unique edit WITHOUT replace_all aborts atomically.
         std::fs::write(root.join("g.txt"), "a a").unwrap();
         let r = t.execute(&serde_json::json!({
@@ -3390,7 +4205,11 @@ mod tests {
         // A 2-line block with wrong indentation on BOTH lines isn't an accidental exact substring,
         // so it genuinely exercises the indentation-tolerant fallback (mirrors the file_edit test).
         let root = temp_root("medit-indent");
-        std::fs::write(root.join("f.rs"), "fn main() {\n    let x = 1;\n    foo();\n}\n").unwrap();
+        std::fs::write(
+            root.join("f.rs"),
+            "fn main() {\n    let x = 1;\n    foo();\n}\n",
+        )
+        .unwrap();
         let t = MultiEdit::new(root.clone());
         let r = t
             .execute(&serde_json::json!({
@@ -3410,7 +4229,9 @@ mod tests {
         let root = temp_root("medit-empty");
         std::fs::write(root.join("f.txt"), "hi").unwrap();
         let t = MultiEdit::new(root);
-        assert!(t.execute(&serde_json::json!({"path": "f.txt", "edits": []})).is_err());
+        assert!(t
+            .execute(&serde_json::json!({"path": "f.txt", "edits": []}))
+            .is_err());
     }
 
     #[test]
@@ -3451,7 +4272,11 @@ mod tests {
             "edits": [{"old_string": "", "new_string": "X"}]
         }));
         assert!(r.is_err(), "empty old_string mid-edit must error");
-        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "hi", "nothing written");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "hi",
+            "nothing written"
+        );
     }
 
     #[test]
@@ -3464,7 +4289,9 @@ mod tests {
         let mtime_before = std::fs::metadata(&p).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         let t = FileWrite::new(root.clone());
-        let r = t.execute(&serde_json::json!({"path": "f.txt", "content": "same\n"})).unwrap();
+        let r = t
+            .execute(&serde_json::json!({"path": "f.txt", "content": "same\n"}))
+            .unwrap();
         assert!(r.starts_with(NOOP_WRITE_PREFIX), "got: {r}");
         assert_eq!(
             std::fs::metadata(&p).unwrap().modified().unwrap(),
@@ -3478,8 +4305,13 @@ mod tests {
         // A create with empty content is a genuine op (the file did not exist) — not a no-op.
         let root = temp_root("fw-newempty");
         let t = FileWrite::new(root.clone());
-        let r = t.execute(&serde_json::json!({"path": "new.txt", "content": ""})).unwrap();
-        assert!(!r.starts_with(NOOP_WRITE_PREFIX), "creating a new file is never a no-op: {r}");
+        let r = t
+            .execute(&serde_json::json!({"path": "new.txt", "content": ""}))
+            .unwrap();
+        assert!(
+            !r.starts_with(NOOP_WRITE_PREFIX),
+            "creating a new file is never a no-op: {r}"
+        );
         assert!(root.join("new.txt").exists());
     }
 
@@ -3493,10 +4325,15 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let t = FileEdit::new(root.clone());
         let r = t
-            .execute(&serde_json::json!({"path": "f.txt", "old_string": "beta", "new_string": "beta"}))
+            .execute(
+                &serde_json::json!({"path": "f.txt", "old_string": "beta", "new_string": "beta"}),
+            )
             .unwrap();
         assert!(r.starts_with(NOOP_WRITE_PREFIX), "got: {r}");
-        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), mtime_before);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().modified().unwrap(),
+            mtime_before
+        );
     }
 
     #[test]
@@ -3518,7 +4355,10 @@ mod tests {
             }))
             .unwrap();
         assert!(r.starts_with(NOOP_WRITE_PREFIX), "got: {r}");
-        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), mtime_before);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().modified().unwrap(),
+            mtime_before
+        );
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "one two three\n");
     }
 
@@ -3527,18 +4367,28 @@ mod tests {
         let root = temp_root("fmv-rename");
         std::fs::write(root.join("a.txt"), "hello\n").unwrap();
         let t = FileMove::new(root.clone());
-        let r = t.execute(&serde_json::json!({"from": "a.txt", "to": "b.txt"})).unwrap();
+        let r = t
+            .execute(&serde_json::json!({"from": "a.txt", "to": "b.txt"}))
+            .unwrap();
         assert!(r.starts_with("moved file"), "got: {r}");
         assert!(!root.join("a.txt").exists(), "source is gone after a move");
-        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "hello\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "hello\n"
+        );
     }
 
     #[test]
     fn file_move_errors_on_missing_source() {
         let root = temp_root("fmv-missing");
         let t = FileMove::new(root.clone());
-        let err = t.execute(&serde_json::json!({"from": "nope.txt", "to": "x.txt"})).unwrap_err();
-        assert!(format!("{err:#}").contains("nope.txt"), "error names the source: {err:#}");
+        let err = t
+            .execute(&serde_json::json!({"from": "nope.txt", "to": "x.txt"}))
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("nope.txt"),
+            "error names the source: {err:#}"
+        );
     }
 
     #[test]
@@ -3548,8 +4398,13 @@ mod tests {
         std::fs::write(root.join("b.txt"), "B\n").unwrap();
         let t = FileMove::new(root.clone());
         // Default: refuse to overwrite an existing destination.
-        let err = t.execute(&serde_json::json!({"from": "a.txt", "to": "b.txt"})).unwrap_err();
-        assert!(format!("{err:#}").contains("already exists"), "got: {err:#}");
+        let err = t
+            .execute(&serde_json::json!({"from": "a.txt", "to": "b.txt"}))
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("already exists"),
+            "got: {err:#}"
+        );
         // Both files must be untouched after the refusal.
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "A\n");
         assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "B\n");
@@ -3566,7 +4421,11 @@ mod tests {
             .unwrap();
         assert!(r.starts_with("moved file"), "got: {r}");
         assert!(!root.join("a.txt").exists());
-        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "A\n", "dest now holds source content");
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "A\n",
+            "dest now holds source content"
+        );
     }
 
     #[test]
@@ -3576,13 +4435,19 @@ mod tests {
         let t = FileMove::new(root.clone());
         // Destination parent (`nested/deep/`) does not exist yet.
         let no_parent = t.execute(&serde_json::json!({"from": "a.txt", "to": "nested/deep/b.txt"}));
-        assert!(no_parent.is_err(), "missing parent errors without create_dirs");
+        assert!(
+            no_parent.is_err(),
+            "missing parent errors without create_dirs"
+        );
         // With create_dirs it makes the parents and moves.
         let r = t
             .execute(&serde_json::json!({"from": "a.txt", "to": "nested/deep/b.txt", "create_dirs": true}))
             .unwrap();
         assert!(r.starts_with("moved file"), "got: {r}");
-        assert_eq!(std::fs::read_to_string(root.join("nested/deep/b.txt")).unwrap(), "hi\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("nested/deep/b.txt")).unwrap(),
+            "hi\n"
+        );
     }
 
     #[test]
@@ -3591,10 +4456,15 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/f.txt"), "x\n").unwrap();
         let t = FileMove::new(root.clone());
-        let r = t.execute(&serde_json::json!({"from": "src", "to": "dst"})).unwrap();
+        let r = t
+            .execute(&serde_json::json!({"from": "src", "to": "dst"}))
+            .unwrap();
         assert!(r.starts_with("moved directory"), "got: {r}");
         assert!(!root.join("src").exists());
-        assert_eq!(std::fs::read_to_string(root.join("dst/f.txt")).unwrap(), "x\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("dst/f.txt")).unwrap(),
+            "x\n"
+        );
     }
 
     #[test]
@@ -3602,9 +4472,14 @@ mod tests {
         let root = temp_root("fmv-noop");
         std::fs::write(root.join("a.txt"), "keep\n").unwrap();
         let t = FileMove::new(root.clone());
-        let r = t.execute(&serde_json::json!({"from": "a.txt", "to": "a.txt"})).unwrap();
+        let r = t
+            .execute(&serde_json::json!({"from": "a.txt", "to": "a.txt"}))
+            .unwrap();
         assert!(r.starts_with(NOOP_WRITE_PREFIX), "got: {r}");
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "keep\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "keep\n"
+        );
     }
 
     #[test]
@@ -3645,7 +4520,12 @@ mod tests {
         // A rewrite must carry the executable bit over (temp files are created 0644 by default).
         atomic_write(&target, b"#!/bin/sh\necho hi\n").unwrap();
         let mode = std::fs::metadata(&target).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o755, "rewrite reset the mode: {:o}", mode & 0o777);
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "rewrite reset the mode: {:o}",
+            mode & 0o777
+        );
     }
 
     #[test]
@@ -3655,9 +4535,14 @@ mod tests {
         let root = temp_root("fw-atomic");
         std::fs::write(root.join("a.txt"), "old\n").unwrap();
         let t = FileWrite::new(root.clone());
-        let r = t.execute(&serde_json::json!({"path": "a.txt", "content": "new\n"})).unwrap();
+        let r = t
+            .execute(&serde_json::json!({"path": "a.txt", "content": "new\n"}))
+            .unwrap();
         assert!(r.starts_with("overwrote"), "got: {r}");
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "new\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "new\n"
+        );
         let leftovers: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -3701,8 +4586,14 @@ mod tests {
         let t = FileMove::new(root.clone());
         t.execute(&serde_json::json!({"from": "src", "to": "dst", "overwrite": true}))
             .unwrap();
-        assert!(root.join("dst/new.txt").exists(), "dst holds the source tree");
-        assert!(!root.join("dst/old.txt").exists(), "old dst contents are gone, not merged");
+        assert!(
+            root.join("dst/new.txt").exists(),
+            "dst holds the source tree"
+        );
+        assert!(
+            !root.join("dst/old.txt").exists(),
+            "old dst contents are gone, not merged"
+        );
         assert!(!root.join("src").exists(), "source consumed by the move");
     }
 
@@ -3710,7 +4601,9 @@ mod tests {
     fn shell_run_executes() {
         let root = temp_root("shell");
         let t = ShellRun::new(root);
-        let out = t.execute(&serde_json::json!({"command":"echo hello-ng"})).unwrap();
+        let out = t
+            .execute(&serde_json::json!({"command":"echo hello-ng"}))
+            .unwrap();
         assert!(out.contains("hello-ng"));
         assert!(out.starts_with("exit 0"));
     }
@@ -3724,11 +4617,15 @@ mod tests {
         // Timing is the assertion. A 10s cap (the clamp floor) plus the 2s drain grace bounds the
         // honest worst case well under the 40s the grandchild would otherwise sleep, so a regression
         // shows up as a failure rather than a suite that never finishes.
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var(SHELL_TIMEOUT_ENV, "10");
         let command = if cfg!(windows) {
             let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-            format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -Command Start-Sleep -Seconds 40")
+            format!(
+                r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -Command Start-Sleep -Seconds 40"
+            )
         } else {
             "sleep 40 & wait".to_string()
         };
@@ -3738,7 +4635,10 @@ mod tests {
         let elapsed = started.elapsed();
         std::env::remove_var(SHELL_TIMEOUT_ENV);
 
-        assert!(out.starts_with("error: command timed out"), "should report a timeout; got: {out}");
+        assert!(
+            out.starts_with("error: command timed out"),
+            "should report a timeout; got: {out}"
+        );
         assert!(
             elapsed < Duration::from_secs(30),
             "shell_run took {elapsed:?} for a 10s cap — it is waiting on a pipe an orphan still holds"
@@ -3749,15 +4649,29 @@ mod tests {
     fn shell_timeout_env_is_clamped_to_a_sane_band() {
         // A cap that can be set to 0 (or to a week) is not a cap. The band keeps the agent loop
         // responsive no matter what the environment says.
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var(SHELL_TIMEOUT_ENV, "0");
         assert_eq!(shell_timeout_secs(), 10, "0 clamps up to the floor");
         std::env::set_var(SHELL_TIMEOUT_ENV, "999999");
-        assert_eq!(shell_timeout_secs(), 3600, "absurd values clamp to the ceiling");
+        assert_eq!(
+            shell_timeout_secs(),
+            3600,
+            "absurd values clamp to the ceiling"
+        );
         std::env::set_var(SHELL_TIMEOUT_ENV, "600");
-        assert_eq!(shell_timeout_secs(), 600, "a reasonable value passes through");
+        assert_eq!(
+            shell_timeout_secs(),
+            600,
+            "a reasonable value passes through"
+        );
         std::env::set_var(SHELL_TIMEOUT_ENV, "not-a-number");
-        assert_eq!(shell_timeout_secs(), SHELL_TIMEOUT_SECS, "garbage falls back to the default");
+        assert_eq!(
+            shell_timeout_secs(),
+            SHELL_TIMEOUT_SECS,
+            "garbage falls back to the default"
+        );
         std::env::remove_var(SHELL_TIMEOUT_ENV);
         assert_eq!(shell_timeout_secs(), SHELL_TIMEOUT_SECS, "unset = default");
     }
@@ -3772,12 +4686,17 @@ mod tests {
         assert!(got.contains("Directory of"), "ASCII structure preserved");
         assert!(got.contains("file-"));
         assert!(got.contains("2 files"));
-        assert!(got.contains('\u{fffd}'), "bad bytes degrade to the replacement char, not loss");
+        assert!(
+            got.contains('\u{fffd}'),
+            "bad bytes degrade to the replacement char, not loss"
+        );
     }
 
     #[test]
     fn persona_create_writes_and_activates() {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-persona-tool-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("NEXTGEN_HOME", &dir);
@@ -3796,16 +4715,25 @@ mod tests {
             .unwrap();
         assert!(out.contains("created persona 'Sherlock'"));
         assert!(out.contains("switched to it"));
-        assert_eq!(crate::core::cli_config::load().persona.as_deref(), Some("Sherlock"));
+        assert_eq!(
+            crate::core::cli_config::load().persona.as_deref(),
+            Some("Sherlock")
+        );
         let p = crate::persona::load("sherlock").expect("persona card written");
         assert_eq!(p.role, "a sharp consulting detective");
 
         // activate=false → authored for later, active persona unchanged
         let out2 = t
-            .execute(&serde_json::json!({"name":"Watson","body":"A loyal chronicler.","activate":false}))
+            .execute(
+                &serde_json::json!({"name":"Watson","body":"A loyal chronicler.","activate":false}),
+            )
             .unwrap();
         assert!(out2.contains("not active"));
-        assert_eq!(crate::core::cli_config::load().persona.as_deref(), Some("Sherlock"), "still Sherlock");
+        assert_eq!(
+            crate::core::cli_config::load().persona.as_deref(),
+            Some("Sherlock"),
+            "still Sherlock"
+        );
 
         // missing required body → error (no half-formed card)
         assert!(t.execute(&serde_json::json!({"name":"Empty"})).is_err());
@@ -3822,7 +4750,10 @@ mod tests {
         let root = std::env::temp_dir();
         for role in ["coder", "tester", "planner", "reviewer", "unknown-role"] {
             let r = role_registry(role, &root);
-            assert!(r.get("todo_write").is_some(), "role {role} has a scratch plan");
+            assert!(
+                r.get("todo_write").is_some(),
+                "role {role} has a scratch plan"
+            );
         }
         // A specialist (empty tools = coder scope) also gets it.
         let spec = agent_registry(
@@ -3841,7 +4772,10 @@ mod tests {
             },
             &root,
         );
-        assert!(spec.get("todo_write").is_some(), "specialist has a scratch plan");
+        assert!(
+            spec.get("todo_write").is_some(),
+            "specialist has a scratch plan"
+        );
         // The scratch plan is a scratch plan — writing to it never touches the process-global list
         // (proven per-instance in todo::tests; here we only assert presence + read-only classification).
         assert!(

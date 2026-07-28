@@ -35,7 +35,12 @@ pub struct Bm25Params {
 
 impl Default for Bm25Params {
     fn default() -> Self {
-        Bm25Params { k1: 1.2, b: 0.75, fuzzy_min_sim: 0.92, fuzzy_min_len: 4 }
+        Bm25Params {
+            k1: 1.2,
+            b: 0.75,
+            fuzzy_min_sim: 0.92,
+            fuzzy_min_len: 4,
+        }
     }
 }
 
@@ -74,8 +79,17 @@ impl Bm25Index {
                 }
             }
         }
-        let avgdl = if n_docs == 0 { 1.0 } else { (total_len as f64 / n_docs as f64).max(1.0) };
-        Bm25Index { df, n_docs: n_docs as f64, avgdl, params }
+        let avgdl = if n_docs == 0 {
+            1.0
+        } else {
+            (total_len as f64 / n_docs as f64).max(1.0)
+        };
+        Bm25Index {
+            df,
+            n_docs: n_docs as f64,
+            avgdl,
+            params,
+        }
     }
 
     /// Lucene/Okapi floored IDF: `ln(1 + (N - df + 0.5)/(df + 0.5))` — always ≥ 0, stable on a
@@ -134,7 +148,11 @@ impl Bm25Index {
 }
 
 /// Best fuzzy match for `q_term` among the doc's terms by Jaro-Winkler, gated by `min_sim`.
-fn best_fuzzy<'a>(q_term: &str, doc_tf: &HashMap<&'a str, u32>, min_sim: f64) -> Option<(&'a str, f64)> {
+fn best_fuzzy<'a>(
+    q_term: &str,
+    doc_tf: &HashMap<&'a str, u32>,
+    min_sim: f64,
+) -> Option<(&'a str, f64)> {
     let mut best: Option<(&str, f64)> = None;
     for &dt in doc_tf.keys() {
         // skip equal-or-trivial-length doc terms that can't be a meaningful near-match
@@ -184,7 +202,11 @@ pub fn lexical_score_tokens(q_tokens: &[String], doc_tokens: &[String]) -> f64 {
 
     let doc_set_size = doc_freq.len() as f64;
     let union = q_set.len() as f64 + doc_set_size - inter as f64;
-    let jaccard = if union > 0.0 { inter as f64 / union } else { 0.0 };
+    let jaccard = if union > 0.0 {
+        inter as f64 / union
+    } else {
+        0.0
+    };
     let tf_boost = weighted / (weighted + 1.0);
     0.7 * jaccard + 0.3 * tf_boost
 }
@@ -284,7 +306,10 @@ mod tests {
         let docs = corpus3();
         let idx = Bm25Index::build(docs.iter().map(Vec::as_slice));
         let s = idx.score(&tokenize("query"), &docs[0]);
-        assert!(s > 0.0, "ubiquitous-but-present term still scores positive, got {s}");
+        assert!(
+            s > 0.0,
+            "ubiquitous-but-present term still scores positive, got {s}"
+        );
     }
 
     #[test]
@@ -299,7 +324,10 @@ mod tests {
     fn bm25_length_norm_prefers_concise_match() {
         // Same single hit, but a shorter doc should score higher (length normalization).
         let short = tokenize("kubernetes deployment");
-        let long = tokenize(&format!("kubernetes deployment {}", "unrelated filler words ".repeat(20)));
+        let long = tokenize(&format!(
+            "kubernetes deployment {}",
+            "unrelated filler words ".repeat(20)
+        ));
         let docs = vec![short.clone(), long.clone()];
         let idx = Bm25Index::build(docs.iter().map(Vec::as_slice));
         let s_short = idx.score(&tokenize("kubernetes"), &short);
@@ -331,7 +359,10 @@ mod tests {
 
     #[test]
     fn salience_is_bounded_and_neutral_at_zero() {
-        assert!((salience(0, 0.0) - 0.5).abs() < 1e-9, "no reuse → neutral 0.5");
+        assert!(
+            (salience(0, 0.0) - 0.5).abs() < 1e-9,
+            "no reuse → neutral 0.5"
+        );
         assert!(salience(1_000_000, 1.0) <= 1.0, "bounded above by 1.0");
         assert!(salience(0, 1.0) >= 0.5 && salience(0, 1.0) <= 1.0);
     }

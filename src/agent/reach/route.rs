@@ -72,7 +72,9 @@ pub async fn read_url(raw: &str) -> Result<String> {
         Target::GitHub(t) => ("github", github::read(&url, t).await),
         Target::HnItem(id) => ("hackernews", hn::read_item(id).await),
         Target::HnFront => ("hackernews", hn::read_front_page().await),
-        Target::Wikipedia { lang, title } => ("wikipedia", wikipedia::read(&url, &lang, &title).await),
+        Target::Wikipedia { lang, title } => {
+            ("wikipedia", wikipedia::read(&url, &lang, &title).await)
+        }
         Target::StackEx { site, qid } => ("stackexchange", stackex::read(&url, &site, qid).await),
         Target::Feed => ("feed", feed::read(raw).await),
         Target::Web => return web::read(raw).await,
@@ -82,7 +84,10 @@ pub async fn read_url(raw: &str) -> Result<String> {
         Err(e) => {
             // Whole-channel failure → last-resort plain web read, with the cause kept visible.
             match web::read(raw).await {
-                Ok(s) => Ok(format!("(note: {channel} channel failed — {}; fell back to a plain page read)\n{s}", super::http::snippet(&e.to_string()))),
+                Ok(s) => Ok(format!(
+                    "(note: {channel} channel failed — {}; fell back to a plain page read)\n{s}",
+                    super::http::snippet(&e.to_string())
+                )),
                 Err(_) => Err(e), // the channel error is the more specific diagnosis
             }
         }
@@ -107,11 +112,16 @@ fn canonical_site(site_key: &str) -> &'static str {
 /// cached in-process for a short TTL (W23) so a repeated query — a retry, a sub-agent re-asking —
 /// skips both the network and the `pace` politeness floor.
 pub async fn search(query: &str, limit: usize, site: Option<&str>) -> Result<String> {
-    let site_key = site.map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    let site_key = site
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
     // Canonicalize aliases (`gh`→`github`, …) BEFORE the cache key so `site="github"` and
     // `site="gh"` — which hit the exact same handler — share one cache entry instead of two.
     let canon_site = canonical_site(&site_key);
-    let cache_key = format!("s|{canon_site}|{limit}|{}", query.trim().to_ascii_lowercase());
+    let cache_key = format!(
+        "s|{canon_site}|{limit}|{}",
+        query.trim().to_ascii_lowercase()
+    );
     if let Some(hit) = super::cache_get(&cache_key) {
         return Ok(hit);
     }
@@ -139,7 +149,11 @@ pub async fn search_multi(queries: &[String], limit: usize, site: Option<&str>) 
         None | Some("") | Some("web") => {
             // Cache the whole fan-out under the ordered, normalized query set (its own dedup happens
             // inside web_multi; the key just needs to be stable for identical fan-out calls).
-            let mut norm: Vec<String> = queries.iter().map(|q| q.trim().to_ascii_lowercase()).filter(|q| !q.is_empty()).collect();
+            let mut norm: Vec<String> = queries
+                .iter()
+                .map(|q| q.trim().to_ascii_lowercase())
+                .filter(|q| !q.is_empty())
+                .collect();
             norm.sort();
             norm.dedup(); // identical queries collapse — web_multi dedups them anyway, so the
                           // cache key should too (["rust","rust"] and ["rust"] → one entry).
@@ -175,39 +189,62 @@ mod itest {
     #[ignore]
     async fn reach_end_to_end() {
         // YouTube: metadata + transcript through InnerTube.
-        let yt = read_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ").await.expect("youtube read");
+        let yt = read_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+            .await
+            .expect("youtube read");
         assert!(yt.contains("[youtube dQw4w9WgXcQ]"), "{yt}");
-        assert!(yt.to_ascii_lowercase().contains("transcript") || yt.contains("no caption"), "{yt}");
+        assert!(
+            yt.to_ascii_lowercase().contains("transcript") || yt.contains("no caption"),
+            "{yt}"
+        );
 
         // Tweet 20 via fxtwitter/syndication.
-        let tw = read_url("https://x.com/jack/status/20").await.expect("tweet read");
+        let tw = read_url("https://x.com/jack/status/20")
+            .await
+            .expect("tweet read");
         assert!(tw.contains("just setting up my twttr"), "{tw}");
 
         // GitHub blob → raw (unmetered, no API quota).
-        let gh = read_url("https://github.com/rust-lang/rust/blob/master/README.md").await.expect("github read");
-        assert!(gh.contains("[github raw rust-lang/rust/master/README.md]"), "{gh}");
+        let gh = read_url("https://github.com/rust-lang/rust/blob/master/README.md")
+            .await
+            .expect("github read");
+        assert!(
+            gh.contains("[github raw rust-lang/rust/master/README.md]"),
+            "{gh}"
+        );
         assert!(gh.to_ascii_lowercase().contains("rust"), "{gh}");
 
         // Hacker News item 8863 (the 2007 Dropbox announcement) with comments.
-        let hn = read_url("https://news.ycombinator.com/item?id=8863").await.expect("hn read");
+        let hn = read_url("https://news.ycombinator.com/item?id=8863")
+            .await
+            .expect("hn read");
         assert!(hn.contains("[hackernews 8863]"), "{hn}");
         assert!(hn.contains("▸"), "comments flattened: {hn}");
 
         // Wikipedia summary + article.
-        let wp = read_url("https://en.wikipedia.org/wiki/Rust_(programming_language)").await.expect("wikipedia read");
+        let wp = read_url("https://en.wikipedia.org/wiki/Rust_(programming_language)")
+            .await
+            .expect("wikipedia read");
         assert!(wp.contains("[wikipedia en]"), "{wp}");
         assert!(wp.contains("full article"), "{wp}");
 
         // arXiv API rides the feed channel.
-        let ax = read_url("https://export.arxiv.org/api/query?search_query=all:rust&max_results=2").await.expect("arxiv read");
+        let ax = read_url("https://export.arxiv.org/api/query?search_query=all:rust&max_results=2")
+            .await
+            .expect("arxiv read");
         assert!(ax.contains("[feed "), "{ax}");
         assert!(ax.contains("•"), "{ax}");
 
         // Stack Overflow question + answers through the API (id 11227809 = the famous branch-prediction question).
-        let so = read_url("https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster")
-            .await
-            .expect("stackoverflow read");
-        assert!(so.contains("[stackoverflow q11227809]") || so.contains("[2"), "api or html fallback: {so}");
+        let so = read_url(
+            "https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster",
+        )
+        .await
+        .expect("stackoverflow read");
+        assert!(
+            so.contains("[stackoverflow q11227809]") || so.contains("[2"),
+            "api or html fallback: {so}"
+        );
 
         // Plain web read still works (and search).
         let web = read_url("https://example.com").await.expect("web read");
@@ -223,7 +260,9 @@ mod itest {
             }
             Err(e) => panic!("web search: {e}"),
         }
-        let gs = search("async runtime", 5, Some("github")).await.expect("github search");
+        let gs = search("async runtime", 5, Some("github"))
+            .await
+            .expect("github search");
         assert!(gs.contains("1. "), "{gs}");
     }
 }
@@ -248,21 +287,59 @@ mod tests {
 
     #[test]
     fn classifies_platform_urls() {
-        assert!(matches!(t("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), Target::YouTube(id) if id == "dQw4w9WgXcQ"));
+        assert!(
+            matches!(t("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), Target::YouTube(id) if id == "dQw4w9WgXcQ")
+        );
         assert!(matches!(t("https://x.com/jack/status/20"), Target::Tweet(id) if id == "20"));
-        assert!(matches!(t("https://github.com/rust-lang/rust"), Target::GitHub(_)));
-        assert!(matches!(t("https://raw.githubusercontent.com/o/r/main/f.rs"), Target::GitHub(_)));
-        assert!(matches!(t("https://news.ycombinator.com/item?id=8863"), Target::HnItem(8863)));
-        assert!(matches!(t("https://news.ycombinator.com/"), Target::HnFront));
-        assert!(matches!(t("https://en.wikipedia.org/wiki/Rust_(programming_language)"), Target::Wikipedia { .. }));
-        assert!(matches!(t("https://stackoverflow.com/questions/12345/x"), Target::StackEx { qid: 12345, .. }));
-        assert!(matches!(t("https://blog.rust-lang.org/feed.xml"), Target::Feed));
-        assert!(matches!(t("https://export.arxiv.org/api/query?search_query=all:rust"), Target::Feed));
+        assert!(matches!(
+            t("https://github.com/rust-lang/rust"),
+            Target::GitHub(_)
+        ));
+        assert!(matches!(
+            t("https://raw.githubusercontent.com/o/r/main/f.rs"),
+            Target::GitHub(_)
+        ));
+        assert!(matches!(
+            t("https://news.ycombinator.com/item?id=8863"),
+            Target::HnItem(8863)
+        ));
+        assert!(matches!(
+            t("https://news.ycombinator.com/"),
+            Target::HnFront
+        ));
+        assert!(matches!(
+            t("https://en.wikipedia.org/wiki/Rust_(programming_language)"),
+            Target::Wikipedia { .. }
+        ));
+        assert!(matches!(
+            t("https://stackoverflow.com/questions/12345/x"),
+            Target::StackEx { qid: 12345, .. }
+        ));
+        assert!(matches!(
+            t("https://blog.rust-lang.org/feed.xml"),
+            Target::Feed
+        ));
+        assert!(matches!(
+            t("https://export.arxiv.org/api/query?search_query=all:rust"),
+            Target::Feed
+        ));
         // Everything else is the generic web (including the platforms' non-item pages).
         assert!(matches!(t("https://example.com/article"), Target::Web));
-        assert!(matches!(t("https://www.youtube.com/@SomeChannel"), Target::Web));
-        assert!(matches!(t("https://x.com/jack"), Target::Web), "profile pages ride the web/jina chain");
-        assert!(matches!(t("https://github.com/rust-lang/rust/actions"), Target::Web));
-        assert!(matches!(t("https://www.reddit.com/r/rust/"), Target::Web), "reddit is web(jina-first)");
+        assert!(matches!(
+            t("https://www.youtube.com/@SomeChannel"),
+            Target::Web
+        ));
+        assert!(
+            matches!(t("https://x.com/jack"), Target::Web),
+            "profile pages ride the web/jina chain"
+        );
+        assert!(matches!(
+            t("https://github.com/rust-lang/rust/actions"),
+            Target::Web
+        ));
+        assert!(
+            matches!(t("https://www.reddit.com/r/rust/"), Target::Web),
+            "reddit is web(jina-first)"
+        );
     }
 }

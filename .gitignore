@@ -11,3 +11,8 @@
 
 # demo video is embedded via GitHub web upload (user-attachments URL), not tracked in the repo
 dist/liveaizen.mp4
+
+# review scratch: crystallized diffs handed to review subagents (regenerated per review)
+.aizen-tmp/
+.main_diff.txt
+main_diff*.txt

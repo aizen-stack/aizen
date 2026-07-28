@@ -78,7 +78,9 @@ struct RunManifest {
 const RUN_SCHEMA: u32 = 1;
 
 fn manifest_root() -> PathBuf {
-    crate::core::config::nextgen_home().join("orchestration").join("runs")
+    crate::core::config::nextgen_home()
+        .join("orchestration")
+        .join("runs")
 }
 
 fn manifest_path(id: u64) -> PathBuf {
@@ -90,7 +92,10 @@ fn manifest_lock(id: u64) -> PathBuf {
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn kind_name(kind: Kind) -> &'static str {
@@ -137,7 +142,11 @@ fn persist_manifest(e: &Entry) {
         Ok(bytes) => bytes,
         Err(_) => return,
     };
-    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(&manifest_lock(e.id), Duration::from_secs(2)).ok();
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &manifest_lock(e.id),
+        Duration::from_secs(2),
+    )
+    .ok();
     if _lock.is_none() {
         return;
     }
@@ -148,7 +157,11 @@ fn persist_manifest(e: &Entry) {
 /// Best-effort removal of this run's manifest (called when the run reaches a terminal state — the
 /// remote view only surfaces running/synthesizing rows, so a finished file is just dead weight).
 fn remove_manifest(id: u64) {
-    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(&manifest_lock(id), Duration::from_secs(1)).ok();
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &manifest_lock(id),
+        Duration::from_secs(1),
+    )
+    .ok();
     let _ = crate::core::persist::remove_if_exists(&manifest_path(id));
 }
 
@@ -157,7 +170,9 @@ fn remove_manifest(id: u64) {
 const MANIFEST_STALE_SECS: u64 = 6 * 3600;
 
 fn load_remote_manifests() -> Vec<RunManifest> {
-    let Ok(entries) = fs::read_dir(manifest_root()) else { return Vec::new() };
+    let Ok(entries) = fs::read_dir(manifest_root()) else {
+        return Vec::new();
+    };
     let now = unix_now();
     let mut out = Vec::new();
     for entry in entries.flatten() {
@@ -186,7 +201,10 @@ fn load_remote_manifests() -> Vec<RunManifest> {
 }
 
 fn remote_row(m: &RunManifest) -> String {
-    let elapsed = m.finished_unix.unwrap_or_else(unix_now).saturating_sub(m.started_unix);
+    let elapsed = m
+        .finished_unix
+        .unwrap_or_else(unix_now)
+        .saturating_sub(m.started_unix);
     let mark = match m.phase.as_str() {
         "running" => "⋯",
         "synthesizing" => "✦",
@@ -194,12 +212,21 @@ fn remote_row(m: &RunManifest) -> String {
         "failed" => "✗",
         _ => "?",
     };
-    let label = if m.label.is_empty() || m.label == m.name { String::new() } else { format!(" ({})", m.label) };
-    let detail = if m.detail.is_empty() { String::new() } else { format!(" — {}", m.detail) };
-    format!("  {mark} [{}] {}{}  · {}s{} · pid {}\n", m.kind, m.name, label, elapsed, detail, m.pid)
+    let label = if m.label.is_empty() || m.label == m.name {
+        String::new()
+    } else {
+        format!(" ({})", m.label)
+    };
+    let detail = if m.detail.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", m.detail)
+    };
+    format!(
+        "  {mark} [{}] {}{}  · {}s{} · pid {}\n",
+        m.kind, m.name, label, elapsed, detail, m.pid
+    )
 }
-
-
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -223,7 +250,11 @@ impl Store {
     fn push_live(&mut self, e: Entry) {
         if self.live.len() >= LIVE_SOFT_CAP {
             // Drop the oldest finished-looking live row if any; else the oldest.
-            if let Some(i) = self.live.iter().position(|x| matches!(x.phase, Phase::Done | Phase::Failed)) {
+            if let Some(i) = self
+                .live
+                .iter()
+                .position(|x| matches!(x.phase, Phase::Done | Phase::Failed))
+            {
                 let old = self.live.remove(i);
                 self.push_history(old);
             } else if !self.live.is_empty() {
@@ -286,13 +317,19 @@ impl Track {
 
     /// Mark successful completion (or a terminal non-error status like `max-iters` still "done-ish").
     pub fn finish_ok(mut self, detail: impl Into<String>) {
-        store().lock().unwrap_or_else(|e| e.into_inner()).finish(self.id, Phase::Done, detail);
+        store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish(self.id, Phase::Done, detail);
         self.finished = true;
     }
 
     /// Mark failure / error.
     pub fn finish_err(mut self, detail: impl Into<String>) {
-        store().lock().unwrap_or_else(|e| e.into_inner()).finish(self.id, Phase::Failed, detail);
+        store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish(self.id, Phase::Failed, detail);
         self.finished = true;
     }
 
@@ -308,15 +345,21 @@ impl Track {
 impl Drop for Track {
     fn drop(&mut self) {
         if !self.finished {
-            store()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .finish(self.id, Phase::Failed, "aborted");
+            store().lock().unwrap_or_else(|e| e.into_inner()).finish(
+                self.id,
+                Phase::Failed,
+                "aborted",
+            );
         }
     }
 }
 
-fn start(kind: Kind, name: impl Into<String>, label: impl Into<String>, parent: Option<u64>) -> Track {
+fn start(
+    kind: Kind,
+    name: impl Into<String>,
+    label: impl Into<String>,
+    parent: Option<u64>,
+) -> Track {
     let id = next_id();
     let now = unix_now();
     let e = Entry {
@@ -333,8 +376,14 @@ fn start(kind: Kind, name: impl Into<String>, label: impl Into<String>, parent: 
         parent,
     };
     persist_manifest(&e);
-    store().lock().unwrap_or_else(|e| e.into_inner()).push_live(e);
-    Track { id, finished: false }
+    store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_live(e);
+    Track {
+        id,
+        finished: false,
+    }
 }
 
 /// Begin tracking a top-level `task` dispatch.
@@ -350,7 +399,11 @@ pub fn start_workflow(name: impl Into<String>, n_tasks: usize) -> Track {
 }
 
 /// Begin tracking one child inside a workflow.
-pub fn start_workflow_child(parent: Option<u64>, task_id: impl Into<String>, label: impl Into<String>) -> Track {
+pub fn start_workflow_child(
+    parent: Option<u64>,
+    task_id: impl Into<String>,
+    label: impl Into<String>,
+) -> Track {
     start(Kind::WorkflowChild, task_id.into(), label.into(), parent)
 }
 
@@ -366,11 +419,7 @@ pub fn gate_cap() -> usize {
 
 /// Number of live (not-yet-finished) orchestration entries.
 pub fn live_count() -> usize {
-    store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .live
-        .len()
+    store().lock().unwrap_or_else(|e| e.into_inner()).live.len()
 }
 
 fn fmt_elapsed(started: Instant, finished: Option<Instant>) -> String {
@@ -433,8 +482,7 @@ pub fn format_status() -> String {
     let remote = load_remote_manifests()
         .into_iter()
         .filter(|m| {
-            m.pid != std::process::id()
-                && matches!(m.phase.as_str(), "running" | "synthesizing")
+            m.pid != std::process::id() && matches!(m.phase.as_str(), "running" | "synthesizing")
         })
         .collect::<Vec<_>>();
     if !remote.is_empty() {
@@ -473,11 +521,11 @@ fn format_row(e: &Entry) -> String {
     } else {
         format!(" — {}", e.detail)
     };
-    let parent = e
-        .parent
-        .map(|p| format!(" ←#{p}"))
-        .unwrap_or_default();
-    format!("  {mark} [{tag}] {}{label}  · {elapsed}{detail}{parent}\n", e.name)
+    let parent = e.parent.map(|p| format!(" ←#{p}")).unwrap_or_default();
+    format!(
+        "  {mark} [{tag}] {}{label}  · {elapsed}{detail}{parent}\n",
+        e.name
+    )
 }
 
 /// Compact one-liner for the HUD / status bar when agents are in flight.
@@ -509,7 +557,10 @@ mod tests {
         w.finish_ok("synthesized");
         let s = format_status();
         assert!(s.contains("Multi-agent"), "{s}");
-        assert!(s.contains("review") || s.contains("bugs") || s.contains("impl"), "{s}");
+        assert!(
+            s.contains("review") || s.contains("bugs") || s.contains("impl"),
+            "{s}"
+        );
         assert!(s.contains("slots"), "{s}");
     }
 
@@ -527,7 +578,9 @@ mod tests {
             "dropped track must leave live"
         );
         assert!(
-            g.history.iter().any(|e| e.id == id && e.phase == Phase::Failed),
+            g.history
+                .iter()
+                .any(|e| e.id == id && e.phase == Phase::Failed),
             "drop → Failed in history; status was:\n{s}"
         );
     }

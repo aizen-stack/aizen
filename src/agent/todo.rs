@@ -121,19 +121,35 @@ pub fn render_block(items: &[Todo]) -> String {
         return String::new();
     }
     let mut out = String::new();
-    out.push_str(&style("todos:").color256(crate::ui::splash::ACCENT).to_string());
+    out.push_str(
+        &style("todos:")
+            .color256(crate::ui::splash::ACCENT)
+            .to_string(),
+    );
     out.push('\n');
     for t in items {
         let g = glyph(t.status);
         let line = match t.status {
             // Design: green ✓ + struck, muted text · moonlight ▸ + bright active row · faint ○ + muted.
             Status::Done => {
-                format!(" {} {}", crate::ui::theme::ok(g), style(&t.content).dim().strikethrough())
+                format!(
+                    " {} {}",
+                    crate::ui::theme::ok(g),
+                    style(&t.content).dim().strikethrough()
+                )
             }
             Status::InProgress => {
-                format!(" {} {}", style(g).color256(crate::ui::splash::ACCENT).bold(), style(&t.content).bold())
+                format!(
+                    " {} {}",
+                    style(g).color256(crate::ui::splash::ACCENT).bold(),
+                    style(&t.content).bold()
+                )
             }
-            Status::Pending => format!(" {} {}", crate::ui::theme::faint(g), crate::ui::theme::muted(&t.content)),
+            Status::Pending => format!(
+                " {} {}",
+                crate::ui::theme::faint(g),
+                crate::ui::theme::muted(&t.content)
+            ),
         };
         out.push_str(&line);
         out.push('\n');
@@ -148,8 +164,14 @@ fn model_ack(items: &[Todo]) -> String {
         return "todo list cleared".to_string();
     }
     let done = items.iter().filter(|t| t.status == Status::Done).count();
-    let doing = items.iter().filter(|t| t.status == Status::InProgress).count();
-    format!("todo list updated: {} item(s), {done} done, {doing} in progress", items.len())
+    let doing = items
+        .iter()
+        .filter(|t| t.status == Status::InProgress)
+        .count();
+    format!(
+        "todo list updated: {} item(s), {done} done, {doing} in progress",
+        items.len()
+    )
 }
 
 /// Clamp optional 0–100 fields after serde (accepts up to u8::MAX from JSON).
@@ -170,8 +192,9 @@ fn normalize_todos(mut items: Vec<Todo>) -> Vec<Todo> {
 fn parse_todos(args: &serde_json::Value) -> Result<Vec<Todo>> {
     match args.get("todos") {
         Some(v) => {
-            let items: Vec<Todo> = serde_json::from_value(v.clone())
-                .map_err(|e| anyhow::anyhow!("invalid `todos` (expect [{{content, status}}]): {e}"))?;
+            let items: Vec<Todo> = serde_json::from_value(v.clone()).map_err(|e| {
+                anyhow::anyhow!("invalid `todos` (expect [{{content, status}}]): {e}")
+            })?;
             Ok(normalize_todos(items))
         }
         None => anyhow::bail!("missing `todos` array"),
@@ -361,7 +384,8 @@ mod tests {
     fn execute_replaces_list() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let t = TodoWrite;
-        t.execute(&serde_json::json!({"todos":[{"content":"x","status":"pending"}]})).unwrap();
+        t.execute(&serde_json::json!({"todos":[{"content":"x","status":"pending"}]}))
+            .unwrap();
         assert_eq!(snapshot().len(), 1);
         // A second call REPLACES (does not append).
         t.execute(&serde_json::json!({"todos":[
@@ -385,14 +409,16 @@ mod tests {
             "status":"in_progress",
             "confidence": 40,
             "hill_climbable": 85
-        }]})).unwrap();
+        }]}))
+        .unwrap();
         let s = snapshot();
         assert_eq!(s[0].confidence, Some(40));
         assert_eq!(s[0].hill_climbable, Some(85));
         // Clamp >100.
         t.execute(&serde_json::json!({"todos":[{
             "content":"x","status":"done","confidence": 200, "hill_climbable": 150
-        }]})).unwrap();
+        }]}))
+        .unwrap();
         let s = snapshot();
         assert_eq!(s[0].confidence, Some(100));
         assert_eq!(s[0].hill_climbable, Some(100));
@@ -428,7 +454,10 @@ mod tests {
                 {"content":"sub-step-2","status":"pending"}
             ]}))
             .unwrap();
-        assert!(ack.contains("2 item"), "ack reflects the sub-agent's own list: {ack}");
+        assert!(
+            ack.contains("2 item"),
+            "ack reflects the sub-agent's own list: {ack}"
+        );
 
         // The global list is UNTOUCHED — no leak between the sub-agent and the user's plan.
         let global = snapshot();
@@ -440,7 +469,10 @@ mod tests {
         let other_ack = other
             .execute(&serde_json::json!({"todos":[{"content":"x","status":"done"}]}))
             .unwrap();
-        assert!(other_ack.contains("1 item"), "second sub-agent has its own list");
+        assert!(
+            other_ack.contains("1 item"),
+            "second sub-agent has its own list"
+        );
         // The first sub-agent's list is still its own 2 items.
         assert_eq!(sub.items.lock().unwrap().len(), 2);
 

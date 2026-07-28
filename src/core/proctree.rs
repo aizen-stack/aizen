@@ -176,9 +176,15 @@ pub struct BoundedOutput {
 /// the UI rather than just one tool call.
 ///
 /// The caller owns `cmd` (working dir, env); stdio is configured here.
-pub fn output_bounded(cmd: &mut Command, timeout: Duration, drain_grace: Duration) -> std::io::Result<BoundedOutput> {
+pub fn output_bounded(
+    cmd: &mut Command,
+    timeout: Duration,
+    drain_grace: Duration,
+) -> std::io::Result<BoundedOutput> {
     use std::process::Stdio;
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     prepare(cmd);
     let mut child = cmd.spawn()?;
     let containment = contain(&child);
@@ -207,7 +213,13 @@ pub fn output_bounded(cmd: &mut Command, timeout: Duration, drain_grace: Duratio
 
     let (stdout, out_cut) = join_drain(oh, drain_grace);
     let (stderr, err_cut) = join_drain(eh, drain_grace);
-    Ok(BoundedOutput { stdout, stderr, code, timed_out, output_truncated: out_cut || err_cut })
+    Ok(BoundedOutput {
+        stdout,
+        stderr,
+        code,
+        timed_out,
+        output_truncated: out_cut || err_cut,
+    })
 }
 
 /// [`prepare`] for the async spawn path.
@@ -352,7 +364,9 @@ pub mod windows_job {
     }
 
     fn assign(process: HANDLE) -> Containment {
-        let Some(job) = Job::kill_on_close() else { return Containment::None };
+        let Some(job) = Job::kill_on_close() else {
+            return Containment::None;
+        };
         // SAFETY: both handles are live — the job is owned locally, the process handle belongs to a
         // child the caller still owns.
         let ok = unsafe { AssignProcessToJobObject(job.0, process) != 0 };
@@ -380,7 +394,9 @@ mod tests {
             c.arg("-c").arg(command);
             c
         };
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         cmd
     }
 
@@ -393,7 +409,10 @@ mod tests {
         prepare(&mut cmd);
         let mut child = cmd.spawn().expect("spawn shell");
         let c = contain(&child);
-        assert!(c.is_contained(), "job/group containment must be available: {c:?}");
+        assert!(
+            c.is_contained(),
+            "job/group containment must be available: {c:?}"
+        );
         kill_tree(&mut child, &c);
     }
 
@@ -407,7 +426,9 @@ mod tests {
     fn sleeper_command() -> String {
         if cfg!(windows) {
             let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-            format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -Command Start-Sleep -Seconds 40")
+            format!(
+                r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -Command Start-Sleep -Seconds 40"
+            )
         } else {
             // Background + wait, so `sh` does NOT exec-replace itself with `sleep`: we need a real
             // grandchild, otherwise killing the direct child would already end everything.

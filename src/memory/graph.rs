@@ -169,7 +169,12 @@ pub fn record_coretrieval(ids: &[&str], today: &str) -> anyhow::Result<bool> {
                     changed = true;
                 }
                 None => {
-                    let e = Edge { a: k.0.clone(), b: k.1.clone(), weight: 1.0, last: today.to_string() };
+                    let e = Edge {
+                        a: k.0.clone(),
+                        b: k.1.clone(),
+                        weight: 1.0,
+                        last: today.to_string(),
+                    };
                     index.insert(k, edges.len());
                     edges.push(e);
                     changed = true;
@@ -213,7 +218,9 @@ pub fn neighbors(id: &str, today: &str, k: usize, floor: f64) -> Vec<(String, f6
         })
         .collect();
     out.sort_by(|x, y| {
-        y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal).then(x.0.cmp(&y.0))
+        y.1.partial_cmp(&x.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(x.0.cmp(&y.0))
     });
     out.truncate(k);
     out
@@ -225,8 +232,10 @@ pub fn neighbors(id: &str, today: &str, k: usize, floor: f64) -> Vec<(String, f6
 pub fn prune(live: &HashSet<String>, today: &str) -> anyhow::Result<usize> {
     let edges = load();
     let before = edges.len();
-    let kept: Vec<Edge> =
-        edges.into_iter().filter(|e| live.contains(&e.a) && live.contains(&e.b)).collect();
+    let kept: Vec<Edge> = edges
+        .into_iter()
+        .filter(|e| live.contains(&e.a) && live.contains(&e.b))
+        .collect();
     let pruned = before - kept.len();
     if pruned > 0 {
         save(kept, today)?;
@@ -256,7 +265,9 @@ mod tests {
     use crate::core::config;
 
     fn with_temp_home<T>(tag: &str, f: impl FnOnce() -> T) -> T {
-        let _g = config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-graph-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -290,7 +301,10 @@ mod tests {
             // a new day → strengthens
             assert!(record_coretrieval(&["a", "b"], "2026-07-05").unwrap());
             let w2 = neighbors("a", "2026-07-05", 5, 0.0)[0].1;
-            assert!(w2 > w1, "a second-day co-fire must strengthen the link (w1={w1} w2={w2})");
+            assert!(
+                w2 > w1,
+                "a second-day co-fire must strengthen the link (w1={w1} w2={w2})"
+            );
         });
     }
 
@@ -309,7 +323,10 @@ mod tests {
     fn a_single_id_or_dup_batch_is_a_noop() {
         with_temp_home("single", || {
             assert!(!record_coretrieval(&["only"], "2026-07-01").unwrap());
-            assert!(!record_coretrieval(&["x", "x", "x"], "2026-07-01").unwrap(), "dups collapse to one node");
+            assert!(
+                !record_coretrieval(&["x", "x", "x"], "2026-07-01").unwrap(),
+                "dups collapse to one node"
+            );
             assert!(neighbors("only", "2026-07-01", 5, 0.0).is_empty());
         });
     }
@@ -321,7 +338,11 @@ mod tests {
             let fresh = neighbors("a", "2026-01-01", 5, 0.0)[0].1;
             // ~6 months later the same edge is much weaker (60d half-life)
             let faded = neighbors("a", "2026-07-01", 5, 0.0);
-            assert!(faded[0].1 < fresh, "an old edge must decay (fresh={fresh} faded={})", faded[0].1);
+            assert!(
+                faded[0].1 < fresh,
+                "an old edge must decay (fresh={fresh} faded={})",
+                faded[0].1
+            );
             // a floor above the faded weight hides it entirely
             assert!(neighbors("a", "2026-07-01", 5, faded[0].1 + 0.01).is_empty());
         });
@@ -350,7 +371,7 @@ mod tests {
         with_temp_home("roundtrip", || {
             record_coretrieval(&["alpha-1", "beta-2"], "2026-07-01").unwrap();
             record_coretrieval(&["alpha-1", "beta-2"], "2026-07-02").unwrap(); // weight 2.0
-            // fresh load from disk sees the accumulated weight
+                                                                               // fresh load from disk sees the accumulated weight
             let n = neighbors("alpha-1", "2026-07-02", 5, 0.0);
             assert_eq!(n.len(), 1);
             assert_eq!(n[0].0, "beta-2");
@@ -380,12 +401,24 @@ mod tests {
             // `load()` canonicalizes each pair (endpoints sorted), so assert via the endpoint-
             // agnostic neighbor view rather than the raw `a` field: every surviving edge is
             // `hub`↔`n{i}`, so `hub`'s neighbor set is exactly the kept `n{i}` ids.
-            let kept: HashSet<String> =
-                neighbors("hub", today, MAX_EDGES, 0.0).into_iter().map(|(id, _)| id).collect();
-            assert_eq!(kept.len(), MAX_EDGES, "hub keeps one edge to each surviving node");
+            let kept: HashSet<String> = neighbors("hub", today, MAX_EDGES, 0.0)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(
+                kept.len(),
+                MAX_EDGES,
+                "hub keeps one edge to each surviving node"
+            );
             // the weakest (n0..n9, weight 1..10) were evicted; the strongest survive
-            assert!(!kept.contains("n0") && !kept.contains("n9"), "weakest edges evicted");
-            assert!(kept.contains(&format!("n{}", MAX_EDGES + 9)), "strongest edge kept");
+            assert!(
+                !kept.contains("n0") && !kept.contains("n9"),
+                "weakest edges evicted"
+            );
+            assert!(
+                kept.contains(&format!("n{}", MAX_EDGES + 9)),
+                "strongest edge kept"
+            );
         });
     }
 
@@ -407,7 +440,10 @@ mod tests {
             let n = neighbors("a", "2026-07-01", 5, 0.0);
             assert_eq!(n.len(), 1);
             assert_eq!(n[0].0, "b");
-            assert!(neighbors("self", "2026-07-01", 5, 0.0).is_empty(), "self-loop dropped");
+            assert!(
+                neighbors("self", "2026-07-01", 5, 0.0).is_empty(),
+                "self-loop dropped"
+            );
         });
     }
 

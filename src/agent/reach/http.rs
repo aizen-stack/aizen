@@ -48,9 +48,16 @@ impl Fetched {
 /// Credential headers (Authorization) are sent only to the ORIGINAL host — a redirect to another
 /// host must not receive the caller's bearer token (the same rule reqwest's own redirect policy
 /// applies).
-pub(crate) async fn get(c: &reqwest::Client, url: &str, headers: &[(&str, String)]) -> Result<Fetched> {
+pub(crate) async fn get(
+    c: &reqwest::Client,
+    url: &str,
+    headers: &[(&str, String)],
+) -> Result<Fetched> {
     fn host_of(u: &str) -> Option<String> {
-        reqwest::Url::parse(u).ok()?.host_str().map(str::to_ascii_lowercase)
+        reqwest::Url::parse(u)
+            .ok()?
+            .host_str()
+            .map(str::to_ascii_lowercase)
     }
     let origin_host = host_of(url);
     let mut url = url.to_string();
@@ -63,7 +70,10 @@ pub(crate) async fn get(c: &reqwest::Client, url: &str, headers: &[(&str, String
             }
             req = req.header(*k, v);
         }
-        let resp = req.send().await.with_context(|| format!("GET {url} failed"))?;
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("GET {url} failed"))?;
         if let Some(next) = redirect_target(&resp, &url)? {
             crate::core::net_guard::guard_url_async(&next).await?;
             url = next;
@@ -85,7 +95,10 @@ pub(crate) async fn post_json(
     for (k, v) in headers {
         req = req.header(*k, v);
     }
-    let resp = req.send().await.with_context(|| format!("POST {url} failed"))?;
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("POST {url} failed"))?;
     read_body(resp).await
 }
 
@@ -98,7 +111,12 @@ fn redirect_target(resp: &reqwest::Response, current: &str) -> Result<Option<Str
         .headers()
         .get(reqwest::header::LOCATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow::anyhow!("redirect ({}) with no usable Location header", resp.status()))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "redirect ({}) with no usable Location header",
+                resp.status()
+            )
+        })?;
     let next = reqwest::Url::parse(current)
         .ok()
         .and_then(|base| base.join(loc).ok())
@@ -141,7 +159,11 @@ async fn read_body(mut resp: reqwest::Response) -> Result<Fetched> {
     } else {
         bytes
     };
-    Ok(Fetched { status, ctype, body })
+    Ok(Fetched {
+        status,
+        ctype,
+        body,
+    })
 }
 
 /// Inflate a gzip body (pure-Rust miniz_oxide backend), bounded like the raw read.
@@ -149,7 +171,8 @@ fn gunzip(bytes: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut out = Vec::new();
     let mut dec = flate2::read::GzDecoder::new(bytes).take(MAX_BODY_BYTES as u64 + 1);
-    dec.read_to_end(&mut out).context("inflating gzip response")?;
+    dec.read_to_end(&mut out)
+        .context("inflating gzip response")?;
     if out.len() > MAX_BODY_BYTES {
         bail!("decompressed body too large (> {MAX_BODY_BYTES} bytes)");
     }

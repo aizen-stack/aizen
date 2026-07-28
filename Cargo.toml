@@ -1,6 +1,6 @@
 [package]
 name = "aizen"
-version = "0.4.8"
+version = "0.5.0"
 edition = "2021"
 description = "Aizen first-party agentic coding CLI — OpenAI-compatible, hermes-style provider-agnostic API client"
 license-file = "LICENSE"
@@ -160,4 +160,5 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_Registry",
 ] }

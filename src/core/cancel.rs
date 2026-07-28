@@ -128,7 +128,9 @@ mod tests {
         let inner = TurnCancel::new();
         with_current(outer.clone(), || {
             assert!(current().unwrap().same_turn(&outer));
-            with_current(inner.clone(), || assert!(current().unwrap().same_turn(&inner)));
+            with_current(inner.clone(), || {
+                assert!(current().unwrap().same_turn(&inner))
+            });
             assert!(current().unwrap().same_turn(&outer));
         });
         assert!(current().is_none());

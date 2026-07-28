@@ -82,7 +82,10 @@ impl Tool for LspReferences {
 
     fn execute(&self, args: &Value) -> Result<String> {
         let symbol = req_str(args, "symbol")?;
-        let include_decl = args.get("include_declaration").and_then(|v| v.as_bool()).unwrap_or(true);
+        let include_decl = args
+            .get("include_declaration")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let anchor = anchor_from(&self.root, args)?;
         LSP.references(&anchor, symbol, include_decl)
     }

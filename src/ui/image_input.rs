@@ -33,8 +33,16 @@ pub fn base64_encode(input: &[u8]) -> String {
         let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
         out.push(T[b0 >> 2] as char);
         out.push(T[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
-        out.push(if chunk.len() > 1 { T[((b1 & 0x0f) << 2) | (b2 >> 6)] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[b2 & 0x3f] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[((b1 & 0x0f) << 2) | (b2 >> 6)] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[b2 & 0x3f] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -69,7 +77,8 @@ pub fn image_file_to_data_url(path: &str) -> Result<String> {
         bytes.len() / 1_048_576,
         MAX_BYTES / 1_048_576
     );
-    let mime = sniff_mime(&bytes).with_context(|| format!("{path} is not a PNG/JPEG/GIF/WebP image"))?;
+    let mime =
+        sniff_mime(&bytes).with_context(|| format!("{path} is not a PNG/JPEG/GIF/WebP image"))?;
     Ok(data_url(mime, &bytes))
 }
 
@@ -222,7 +231,10 @@ mod tests {
 
     #[test]
     fn sniff_mime_detects_formats() {
-        assert_eq!(sniff_mime(&[0x89, b'P', b'N', b'G', 0, 0]), Some("image/png"));
+        assert_eq!(
+            sniff_mime(&[0x89, b'P', b'N', b'G', 0, 0]),
+            Some("image/png")
+        );
         assert_eq!(sniff_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
         assert_eq!(sniff_mime(b"GIF89a...."), Some("image/gif"));
         assert_eq!(sniff_mime(b"hello not an image"), None);
@@ -252,7 +264,10 @@ mod tests {
         // a non-image file is rejected
         let txt = std::env::temp_dir().join(format!("ng-not-img-{}.png", std::process::id()));
         std::fs::write(&txt, b"i am plain text").unwrap();
-        assert!(image_file_to_data_url(txt.to_str().unwrap()).is_err(), "not a real image");
+        assert!(
+            image_file_to_data_url(txt.to_str().unwrap()).is_err(),
+            "not a real image"
+        );
         std::fs::remove_file(&txt).ok();
     }
 
@@ -292,7 +307,10 @@ mod tests {
     #[test]
     fn png_round_trips_through_data_url() {
         let png = encode_png(&[255, 0, 0, 255], 1, 1).unwrap();
-        assert!(png.starts_with(&[0x89, b'P', b'N', b'G']), "valid PNG signature");
+        assert!(
+            png.starts_with(&[0x89, b'P', b'N', b'G']),
+            "valid PNG signature"
+        );
         assert!(data_url("image/png", &png).starts_with("data:image/png;base64,"));
     }
 }

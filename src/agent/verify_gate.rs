@@ -105,7 +105,10 @@ fn load_custom_verify(cwd: &Path) -> Option<Vec<VerifyCommand>> {
             .filter_map(|c| c.as_str())
             .take(3)
             .filter(|c| {
-                !matches!(crate::agent::cmd_guard::classify(c), crate::agent::cmd_guard::Verdict::Blocked(_))
+                !matches!(
+                    crate::agent::cmd_guard::classify(c),
+                    crate::agent::cmd_guard::Verdict::Blocked(_)
+                )
             })
             .map(|c| VerifyCommand::Custom(c.to_string()))
             .collect(),
@@ -183,7 +186,11 @@ pub async fn run_verify_gate(cwd: &Path, timeout_secs: u64) -> Option<VerifyGate
 }
 
 /// Run ONE verify command in `cwd` with a wall-clock timeout.
-async fn run_one_verify(cwd: &Path, cmd: &VerifyCommand, timeout_secs: u64) -> Option<VerifyGateResult> {
+async fn run_one_verify(
+    cwd: &Path,
+    cmd: &VerifyCommand,
+    timeout_secs: u64,
+) -> Option<VerifyGateResult> {
     let command_line = cmd.command_line();
     let start = Instant::now();
 
@@ -193,10 +200,10 @@ async fn run_one_verify(cwd: &Path, cmd: &VerifyCommand, timeout_secs: u64) -> O
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true); // a dropped (timed-out) future kills the child.
-    // `kill_on_drop` alone reaches only the `cmd.exe`/`sh` wrapper. The verify command is a BUILD
-    // (`cargo check`, `tsc`, `npm test`), so the surviving grandchild is a compiler holding a lock on
-    // `target/` — the next verify then blocks on that lock and times out too, and the timeouts
-    // compound instead of clearing. Containment makes the timeout actually stop the work.
+                             // `kill_on_drop` alone reaches only the `cmd.exe`/`sh` wrapper. The verify command is a BUILD
+                             // (`cargo check`, `tsc`, `npm test`), so the surviving grandchild is a compiler holding a lock on
+                             // `target/` — the next verify then blocks on that lock and times out too, and the timeouts
+                             // compound instead of clearing. Containment makes the timeout actually stop the work.
     crate::core::proctree::prepare_tokio(&mut command);
 
     let child = command.spawn().ok()?; // spawn failure (no toolchain) → silent no-op.
@@ -259,7 +266,9 @@ fn collect_source_files(dir: &Path, out: &mut Vec<std::path::PathBuf>, depth: us
     if depth > 32 {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -277,7 +286,22 @@ fn collect_source_files(dir: &Path, out: &mut Vec<std::path::PathBuf>, depth: us
 fn is_source_or_manifest(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
-        Some("rs" | "toml" | "lock" | "json" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "cs" | "cpp" | "h" | "hpp")
+        Some(
+            "rs" | "toml"
+                | "lock"
+                | "json"
+                | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "py"
+                | "go"
+                | "java"
+                | "cs"
+                | "cpp"
+                | "h"
+                | "hpp"
+        )
     )
 }
 
@@ -340,7 +364,11 @@ fn shape_cargo(raw: &str) -> Option<String> {
         if is_err_start(l) {
             let mut block: Vec<&str> = vec![l];
             let mut j = i + 1;
-            while j < lines.len() && block.len() < 6 && !is_err_start(lines[j]) && !lines[j].starts_with("warning:") {
+            while j < lines.len()
+                && block.len() < 6
+                && !is_err_start(lines[j])
+                && !lines[j].starts_with("warning:")
+            {
                 if !lines[j].trim().is_empty() {
                     block.push(lines[j]);
                 }
@@ -383,7 +411,10 @@ fn shape_tsc(raw: &str) -> Option<String> {
     let mut rows: Vec<String> = Vec::new();
     for c in RE.captures_iter(raw) {
         if seen.insert(format!("{}|{}|{}", &c[1], &c[4], &c[5])) {
-            rows.push(format!("{} {}:{}  {} {}", &c[1], &c[2], &c[3], &c[4], &c[5]));
+            rows.push(format!(
+                "{} {}:{}  {} {}",
+                &c[1], &c[2], &c[3], &c[4], &c[5]
+            ));
         }
     }
     if rows.is_empty() {
@@ -456,8 +487,14 @@ mod tests {
             r#"{"scripts":{"build":"x","type-check":"tsc","typecheck":"tsc --noEmit"}}"#,
         )
         .unwrap();
-        assert_eq!(detect_verify_command(&d), Some(VerifyCommand::Npm("typecheck".into())));
-        assert_eq!(VerifyCommand::Npm("typecheck".into()).command_line(), "npm run typecheck");
+        assert_eq!(
+            detect_verify_command(&d),
+            Some(VerifyCommand::Npm("typecheck".into()))
+        );
+        assert_eq!(
+            VerifyCommand::Npm("typecheck".into()).command_line(),
+            "npm run typecheck"
+        );
     }
 
     #[test]
@@ -509,10 +546,20 @@ error[E0425]: cannot find value `foo`
 warning: dead code
 ";
         let s = shape_failure_output(raw);
-        assert_eq!(s.matches("error[E0308]").count(), 1, "duplicate header deduped: {s}");
+        assert_eq!(
+            s.matches("error[E0308]").count(),
+            1,
+            "duplicate header deduped: {s}"
+        );
         assert!(s.contains("error[E0425]"), "{s}");
-        assert!(s.contains("--> src/a.rs:10:5"), "the location line survives: {s}");
-        assert!(s.contains("2 warning(s)") && s.contains("suppressed"), "{s}");
+        assert!(
+            s.contains("--> src/a.rs:10:5"),
+            "the location line survives: {s}"
+        );
+        assert!(
+            s.contains("2 warning(s)") && s.contains("suppressed"),
+            "{s}"
+        );
     }
 
     #[test]
@@ -531,7 +578,11 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
     fn unknown_shape_falls_back_to_tail() {
         let raw = format!("{}THE REAL FAILURE AT THE END", "noise\n".repeat(2000));
         let s = shape_failure_output(&raw);
-        assert!(s.contains("THE REAL FAILURE AT THE END"), "tail preserved: …{}", &s[s.len().saturating_sub(80)..]);
+        assert!(
+            s.contains("THE REAL FAILURE AT THE END"),
+            "tail preserved: …{}",
+            &s[s.len().saturating_sub(80)..]
+        );
         assert!(s.contains("truncated"));
     }
 
@@ -539,16 +590,26 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
     fn custom_verify_requires_trust_gate() {
         // An untrusted repo's verify.json must be INERT. Sandbox NEXTGEN_HOME so the developer's
         // real trust store (which may trust THIS repo) can't leak into the assertion.
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = temp_dir("custom-untrusted-home");
         std::env::set_var("NEXTGEN_HOME", &home);
         let d = temp_dir("custom-untrusted");
         std::fs::create_dir_all(d.join(".aizen")).unwrap();
-        std::fs::write(d.join(".aizen").join("verify.json"), r#"{"commands":["echo pwned"]}"#).unwrap();
+        std::fs::write(
+            d.join(".aizen").join("verify.json"),
+            r#"{"commands":["echo pwned"]}"#,
+        )
+        .unwrap();
         std::fs::write(d.join("Cargo.toml"), "[package]").unwrap();
         let cmds = detect_verify_commands(&d);
         std::env::remove_var("NEXTGEN_HOME");
-        assert_eq!(cmds, vec![VerifyCommand::Cargo], "untrusted verify.json ignored: {cmds:?}");
+        assert_eq!(
+            cmds,
+            vec![VerifyCommand::Cargo],
+            "untrusted verify.json ignored: {cmds:?}"
+        );
     }
 
     #[test]

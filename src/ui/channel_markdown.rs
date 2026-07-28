@@ -689,7 +689,10 @@ mod tests {
         let chunks = render_telegram_chunks(&input, 240);
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|c| utf16_len(&c.html) <= 240));
-        assert!(chunks.iter().all(|c| !c.html.contains("<b>")), "split fallback must not emit broken tags");
+        assert!(
+            chunks.iter().all(|c| !c.html.contains("<b>")),
+            "split fallback must not emit broken tags"
+        );
     }
 
     #[test]

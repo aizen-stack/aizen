@@ -26,18 +26,29 @@ pub struct FileFingerprint {
 
 impl FileFingerprint {
     pub fn missing() -> Self {
-        Self { exists: false, byte_len: 0, sha256: [0; 32] }
+        Self {
+            exists: false,
+            byte_len: 0,
+            sha256: [0; 32],
+        }
     }
 
     pub fn for_bytes(bytes: &[u8]) -> Self {
         let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
         let mut sha256 = [0u8; 32];
         sha256.copy_from_slice(digest.as_ref());
-        Self { exists: true, byte_len: bytes.len() as u64, sha256 }
+        Self {
+            exists: true,
+            byte_len: bytes.len() as u64,
+            sha256,
+        }
     }
 
     pub fn short_id(&self) -> String {
-        self.sha256[..6].iter().map(|b| format!("{b:02x}")).collect()
+        self.sha256[..6]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 }
 
@@ -91,7 +102,9 @@ pub fn read_with_fingerprint(path: &Path) -> Result<(Option<Vec<u8>>, FileFinger
             let fingerprint = FileFingerprint::for_bytes(&bytes);
             Ok((Some(bytes), fingerprint))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((None, FileFingerprint::missing())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok((None, FileFingerprint::missing()))
+        }
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
 }
@@ -112,7 +125,12 @@ pub fn compare_and_atomic_write(
 ) -> Result<FileFingerprint> {
     let actual = fingerprint(path)?;
     if &actual != expected {
-        return Err(WriteConflict { path: path.to_path_buf(), expected: expected.clone(), actual }.into());
+        return Err(WriteConflict {
+            path: path.to_path_buf(),
+            expected: expected.clone(),
+            actual,
+        }
+        .into());
     }
     if expected.exists {
         atomic_write(path, bytes)?;
@@ -129,7 +147,12 @@ pub fn create_if_absent(path: &Path, bytes: &[u8]) -> Result<FileFingerprint> {
 pub fn remove_if_unchanged(path: &Path, expected: &FileFingerprint) -> Result<bool> {
     let actual = fingerprint(path)?;
     if &actual != expected {
-        return Err(WriteConflict { path: path.to_path_buf(), expected: expected.clone(), actual }.into());
+        return Err(WriteConflict {
+            path: path.to_path_buf(),
+            expected: expected.clone(),
+            actual,
+        }
+        .into());
     }
     if !expected.exists {
         return Ok(false);
@@ -185,22 +208,23 @@ fn atomic_create(path: &Path, bytes: &[u8]) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut file = opts
-        .open(path)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                WriteConflict {
-                    path: path.to_path_buf(),
-                    expected: FileFingerprint::missing(),
-                    actual: fingerprint(path).unwrap_or_else(|_| FileFingerprint::for_bytes(b"occupied")),
-                }
-                .into()
-            } else {
-                anyhow::Error::from(e).context(format!("creating {}", path.display()))
+    let mut file = opts.open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            WriteConflict {
+                path: path.to_path_buf(),
+                expected: FileFingerprint::missing(),
+                actual: fingerprint(path)
+                    .unwrap_or_else(|_| FileFingerprint::for_bytes(b"occupied")),
             }
-        })?;
-    file.write_all(bytes).with_context(|| format!("writing {}", path.display()))?;
-    file.sync_all().with_context(|| format!("flushing {}", path.display()))?;
+            .into()
+        } else {
+            anyhow::Error::from(e).context(format!("creating {}", path.display()))
+        }
+    })?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("flushing {}", path.display()))?;
     drop(file);
     sync_parent(path);
     Ok(())
@@ -228,11 +252,25 @@ fn replace_file(tmp: &Path, dst: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
-        let from: Vec<u16> = tmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        let to: Vec<u16> = dst.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        let from: Vec<u16> = tmp
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let to: Vec<u16> = dst
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         let ok = unsafe {
-            MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
         };
         if ok == 0 {
             return Err(std::io::Error::last_os_error());
@@ -316,7 +354,11 @@ pub fn harden_owner_only_checked(path: &Path) -> Result<()> {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("building owner-only ACL for {}", path.display()));
         }
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         let applied = unsafe {
             SetFileSecurityW(
                 wide.as_ptr(),

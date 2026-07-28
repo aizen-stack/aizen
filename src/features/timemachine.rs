@@ -119,7 +119,9 @@ impl RewindTarget {
 /// Restore the working tree to a run-scoped anchor. Caps rewinds per run; never accepts arbitrary ids.
 pub fn rewind_run(target: RewindTarget) -> Result<Snapshot> {
     let (id, used) = {
-        let g = RUN_RECOVERY.lock().map_err(|_| anyhow::anyhow!("recovery lock poisoned"))?;
+        let g = RUN_RECOVERY
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recovery lock poisoned"))?;
         if g.rewinds_used >= MAX_RUN_REWINDS {
             bail!(
                 "run rewind budget exhausted ({MAX_RUN_REWINDS}/{MAX_RUN_REWINDS}). \
@@ -261,7 +263,10 @@ impl Ledger {
             );
         }
         if self.cursor_id.is_none() {
-            self.cursor_id = self.cursor.and_then(|i| self.snapshots.get(i)).map(|s| s.id);
+            self.cursor_id = self
+                .cursor
+                .and_then(|i| self.snapshots.get(i))
+                .map(|s| s.id);
         }
         self.cursor = self
             .cursor_id
@@ -270,10 +275,16 @@ impl Ledger {
         let mut ids = HashSet::new();
         for s in &self.snapshots {
             if s.id == 0 || !ids.insert(s.id) {
-                bail!("time-machine ledger contains duplicate/invalid checkpoint id #{}", s.id);
+                bail!(
+                    "time-machine ledger contains duplicate/invalid checkpoint id #{}",
+                    s.id
+                );
             }
             if s.commit.len() != 40 || s.tree.len() != 40 {
-                bail!("time-machine checkpoint #{} contains an invalid Git object id", s.id);
+                bail!(
+                    "time-machine checkpoint #{} contains an invalid Git object id",
+                    s.id
+                );
             }
         }
         if let Some(id) = self.cursor_id {
@@ -281,7 +292,14 @@ impl Ledger {
                 bail!("time-machine cursor points at missing checkpoint #{id}");
             }
         }
-        let min_next = self.snapshots.iter().map(|s| s.id).max().unwrap_or(0).saturating_add(1).max(1);
+        let min_next = self
+            .snapshots
+            .iter()
+            .map(|s| s.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(1);
         if self.next_id == 0 {
             self.next_id = min_next;
         } else if self.next_id < min_next {
@@ -401,13 +419,22 @@ impl RepoContext {
                 if msg.contains("not a git repository") || msg.contains("not a work tree") {
                     bail!("not a git repository (run `git init` first to use the time machine)");
                 }
+                // git absent ≠ git failed: keep the typed GitMissing chain untouched so the
+                // benign-path callers can recognize it without substring guessing.
+                if crate::core::gitx::is_git_missing(&e) {
+                    return Err(e);
+                }
                 return Err(e).context("time machine could not use git in this directory");
             }
         };
-        let root = PathBuf::from(root).canonicalize().context("canonicalizing repository root")?;
+        let root = PathBuf::from(root)
+            .canonicalize()
+            .context("canonicalizing repository root")?;
         let git_dir = absolute_git_path(&root, &raw_git(&root, &["rev-parse", "--git-dir"])?);
-        let common_git_dir = absolute_git_path(&root, &raw_git(&root, &["rev-parse", "--git-common-dir"])?);
-        let common_canon = fs::canonicalize(&common_git_dir).unwrap_or_else(|_| common_git_dir.clone());
+        let common_git_dir =
+            absolute_git_path(&root, &raw_git(&root, &["rev-parse", "--git-common-dir"])?);
+        let common_canon =
+            fs::canonicalize(&common_git_dir).unwrap_or_else(|_| common_git_dir.clone());
         let wt_canon = fs::canonicalize(&git_dir).unwrap_or_else(|_| git_dir.clone());
         let repo_id = format!("repo-{:016x}", fnv1a64(&common_canon.to_string_lossy()));
         let worktree_id = format!("wt-{:016x}", fnv1a64(&wt_canon.to_string_lossy()));
@@ -457,7 +484,9 @@ impl RepoContext {
     }
 
     fn inrepo_namespace_dir(&self) -> PathBuf {
-        self.common_git_dir.join("aizen-timemachine").join(&self.worktree_id)
+        self.common_git_dir
+            .join("aizen-timemachine")
+            .join(&self.worktree_id)
     }
 
     /// Oldest legacy ledger: `<git-dir>/ng_timemachine.json`.
@@ -482,7 +511,9 @@ impl RepoContext {
     }
 
     fn inrepo_chat_path(&self, id: u32) -> PathBuf {
-        self.inrepo_namespace_dir().join("chat").join(format!("{id}.json"))
+        self.inrepo_namespace_dir()
+            .join("chat")
+            .join(format!("{id}.json"))
     }
 
     fn legacy_chat_path(&self, id: u32) -> PathBuf {
@@ -513,7 +544,10 @@ impl RepoContext {
     {
         let output = self.git_output(index, args)?;
         if !output.status.success() {
-            bail!("internal git operation failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+            bail!(
+                "internal git operation failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
@@ -524,8 +558,10 @@ impl RepoContext {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut cmd = Command::new("git");
-        let hooks = strip_windows_verbatim(&self.hooks_dir).to_string_lossy().replace('\\', "/");
+        let mut cmd = git_cmd();
+        let hooks = strip_windows_verbatim(&self.hooks_dir)
+            .to_string_lossy()
+            .replace('\\', "/");
         let store = strip_windows_verbatim(&self.store_git_dir);
         let work_tree = strip_windows_verbatim(&self.root);
         cmd.current_dir(&self.root)
@@ -545,10 +581,23 @@ impl RepoContext {
             .env("GIT_COMMITTER_EMAIL", "timemachine@localhost")
             .arg("-c")
             .arg(format!("core.hooksPath={hooks}"))
-            .args(["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"])
             .args([
-                "-c", "filter.lfs.required=false", "-c", "filter.lfs.clean=", "-c", "filter.lfs.smudge=",
-                "-c", "filter.lfs.process=", "-c", "filter.lfs.delay=false",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+            ])
+            .args([
+                "-c",
+                "filter.lfs.required=false",
+                "-c",
+                "filter.lfs.clean=",
+                "-c",
+                "filter.lfs.smudge=",
+                "-c",
+                "filter.lfs.process=",
+                "-c",
+                "filter.lfs.delay=false",
             ])
             .args(args);
         if let Some(idx) = index {
@@ -556,7 +605,8 @@ impl RepoContext {
         } else {
             cmd.env_remove("GIT_INDEX_FILE");
         }
-        cmd.output().context("running internal git operation (is git installed?)")
+        cmd.output()
+            .context("running internal git operation (is git installed?)")
     }
 
     /// Probe the **source** repository for external filter drivers (not the private store).
@@ -565,7 +615,7 @@ impl RepoContext {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut cmd = Command::new("git");
+        let mut cmd = git_cmd();
         let git_dir = strip_windows_verbatim(&self.git_dir);
         let work_tree = strip_windows_verbatim(&self.root);
         cmd.current_dir(&self.root)
@@ -574,7 +624,8 @@ impl RepoContext {
             .env_remove("GIT_INDEX_FILE")
             .env_remove("GIT_OBJECT_DIRECTORY")
             .args(args);
-        cmd.output().context("running source git probe (is git installed?)")
+        cmd.output()
+            .context("running source git probe (is git installed?)")
     }
 
     fn source_git<I, S>(&self, args: I) -> Result<String>
@@ -584,7 +635,10 @@ impl RepoContext {
     {
         let output = self.source_git_output(args)?;
         if !output.status.success() {
-            bail!("source git probe failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+            bail!(
+                "source git probe failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
@@ -596,7 +650,13 @@ impl RepoContext {
         // `.gitattributes` can name arbitrary clean/smudge/process drivers. Git offers no global
         // "disable every filter" switch, so reject configured external drivers before plumbing
         // commands touch the worktree. The built-in `lfs` name is neutralized in `git_output`.
-        let out = self.source_git_output(["config", "--local", "--get-regexp", r"^filter\..*\.(clean|smudge|process|required)$"])
+        let out = self
+            .source_git_output([
+                "config",
+                "--local",
+                "--get-regexp",
+                r"^filter\..*\.(clean|smudge|process|required)$",
+            ])
             .context("checking repository Git filters")?;
         if out.status.success() {
             let lines = String::from_utf8_lossy(&out.stdout);
@@ -637,7 +697,10 @@ impl RepoContext {
     /// Exclusive store lease for a whole-store sweep (`doctor_gc`): no other worktree may create or
     /// delete refs while it enumerates and reaps orphans across every namespace.
     fn store_exclusive(&self) -> Result<crate::core::repo_lock::RepoTxnLock> {
-        crate::core::repo_lock::RepoTxnLock::acquire_exclusive(&self.store_lock_path(), LOCK_TIMEOUT)
+        crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+            &self.store_lock_path(),
+            LOCK_TIMEOUT,
+        )
     }
 
     fn load_ledger(&self) -> Result<Ledger> {
@@ -648,8 +711,12 @@ impl RepoContext {
             Some(bytes) => bytes,
             None => return self.load_migratable_ledger(),
         };
-        let mut ledger: Ledger = serde_json::from_slice(&bytes)
-            .with_context(|| format!("time-machine ledger {} is corrupt; run `aizen time doctor`", path.display()))?;
+        let mut ledger: Ledger = serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "time-machine ledger {} is corrupt; run `aizen time doctor`",
+                path.display()
+            )
+        })?;
         ledger.normalize()?;
         Ok(ledger)
     }
@@ -657,9 +724,13 @@ impl RepoContext {
     /// Read-only fallback: in-repo namespaced ledger, then oldest legacy ledger. Migration is
     /// finalized later under the transaction lock by `migrate_legacy_refs`.
     fn load_migratable_ledger(&self) -> Result<Ledger> {
-        for path in [self.inrepo_namespace_ledger_path(), self.legacy_ledger_path()] {
-            let Some(bytes) = crate::core::persist::read_optional(&path)
-                .with_context(|| format!("reading migratable time-machine ledger {}", path.display()))?
+        for path in [
+            self.inrepo_namespace_ledger_path(),
+            self.legacy_ledger_path(),
+        ] {
+            let Some(bytes) = crate::core::persist::read_optional(&path).with_context(|| {
+                format!("reading migratable time-machine ledger {}", path.display())
+            })?
             else {
                 continue;
             };
@@ -691,8 +762,12 @@ impl RepoContext {
         else {
             return Ok(None);
         };
-        let journal = serde_json::from_slice(&bytes)
-            .with_context(|| format!("transaction journal {} is corrupt; run `aizen time doctor`", path.display()))?;
+        let journal = serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "transaction journal {} is corrupt; run `aizen time doctor`",
+                path.display()
+            )
+        })?;
         Ok(Some(journal))
     }
 
@@ -705,8 +780,12 @@ impl RepoContext {
     }
 
     fn clear_journal(&self) -> Result<()> {
-        crate::core::persist::remove_if_exists(&self.journal_path())
-            .with_context(|| format!("removing transaction journal {}", self.journal_path().display()))?;
+        crate::core::persist::remove_if_exists(&self.journal_path()).with_context(|| {
+            format!(
+                "removing transaction journal {}",
+                self.journal_path().display()
+            )
+        })?;
         Ok(())
     }
 
@@ -742,7 +821,8 @@ impl RepoContext {
                 for candidate in &candidates {
                     // Look up the candidate in the *source* repo first; if present, create the same
                     // ref name in the private store (objects resolve via alternates).
-                    if let Ok(oid) = self.source_git(["rev-parse", "--verify", candidate.as_str()]) {
+                    if let Ok(oid) = self.source_git(["rev-parse", "--verify", candidate.as_str()])
+                    {
                         if oid != snap.commit {
                             bail!(
                                 "cannot migrate checkpoint #{}: source ref {candidate} does not match ledger",
@@ -774,11 +854,20 @@ impl RepoContext {
                 }
                 if !imported {
                     // Last resort: object may still be reachable through alternates by OID alone.
-                    if self.git(None, ["cat-file", "-e", &format!("{}^{{commit}}", snap.commit)]).is_ok() {
+                    if self
+                        .git(
+                            None,
+                            ["cat-file", "-e", &format!("{}^{{commit}}", snap.commit)],
+                        )
+                        .is_ok()
+                    {
                         self.materialize_commit(&snap.commit)?;
                         self.update_ref_create(&new_ref, &snap.commit)?;
                     } else {
-                        bail!("cannot migrate checkpoint #{}: source ref/object is missing", snap.id);
+                        bail!(
+                            "cannot migrate checkpoint #{}: source ref/object is missing",
+                            snap.id
+                        );
                     }
                 }
             }
@@ -807,9 +896,11 @@ impl RepoContext {
     fn materialize_commit(&self, commit: &str) -> Result<()> {
         // `cat-file --batch-check` validates reachability; `repack -a -d --window=0` is too heavy.
         // Use `pack-objects` of a single commit via stdin — pure plumbing, no hooks.
-        let mut child = Command::new("git");
+        let mut child = git_cmd();
         let store = strip_windows_verbatim(&self.store_git_dir);
-        let hooks = strip_windows_verbatim(&self.hooks_dir).to_string_lossy().replace('\\', "/");
+        let hooks = strip_windows_verbatim(&self.hooks_dir)
+            .to_string_lossy()
+            .replace('\\', "/");
         child
             .current_dir(&self.root)
             .env("GIT_DIR", &store)
@@ -819,7 +910,13 @@ impl RepoContext {
             .arg("-c")
             .arg(format!("core.hooksPath={hooks}"))
             .args(["-c", "core.fsmonitor=false"])
-            .args(["pack-objects", "--revs", "--all-progress-implied", "-q", "--stdout"])
+            .args([
+                "pack-objects",
+                "--revs",
+                "--all-progress-implied",
+                "-q",
+                "--stdout",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -827,7 +924,9 @@ impl RepoContext {
         // object is present via `cat-file` (alternates) then write a thin local ref pin — objects
         // stay in alternates until `doctor_gc` optionally copies. For independence, use
         // `git unpack-objects` of a generated pack.
-        let mut pack = child.spawn().context("starting private-store pack-objects")?;
+        let mut pack = child
+            .spawn()
+            .context("starting private-store pack-objects")?;
         use std::io::Write;
         {
             let stdin = pack.stdin.as_mut().context("pack-objects stdin")?;
@@ -835,7 +934,9 @@ impl RepoContext {
             // Terminate rev-list style input.
             writeln!(stdin)?;
         }
-        let pack_out = pack.wait_with_output().context("running pack-objects for materialize")?;
+        let pack_out = pack
+            .wait_with_output()
+            .context("running pack-objects for materialize")?;
         if !pack_out.status.success() {
             // Fall back: object remains reachable via alternates. Migration still creates the ref;
             // independence is best-effort when pack-objects cannot run (e.g. empty tree edge).
@@ -846,7 +947,7 @@ impl RepoContext {
             let _ = self.git(None, ["cat-file", "-e", &format!("{commit}^{{commit}}")])?;
             return Ok(());
         }
-        let mut unpack = Command::new("git");
+        let mut unpack = git_cmd();
         unpack
             .current_dir(&self.root)
             .env("GIT_DIR", &store)
@@ -857,12 +958,16 @@ impl RepoContext {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        let mut child = unpack.spawn().context("starting unpack-objects for materialize")?;
+        let mut child = unpack
+            .spawn()
+            .context("starting unpack-objects for materialize")?;
         {
             let stdin = child.stdin.as_mut().context("unpack-objects stdin")?;
             stdin.write_all(&pack_out.stdout)?;
         }
-        let out = child.wait_with_output().context("running unpack-objects for materialize")?;
+        let out = child
+            .wait_with_output()
+            .context("running unpack-objects for materialize")?;
         if !out.status.success() {
             // Alternates still provide reachability; ref create below is enough for restore.
             let _ = self.git(None, ["cat-file", "-e", &format!("{commit}^{{commit}}")])?;
@@ -871,25 +976,41 @@ impl RepoContext {
     }
 
     fn update_ref_create(&self, name: &str, oid: &str) -> Result<()> {
-        self.git(None, ["update-ref", name, oid, ZERO_OID]).map(|_| ())
+        self.git(None, ["update-ref", name, oid, ZERO_OID])
+            .map(|_| ())
     }
 
     fn update_ref_delete(&self, name: &str, expected: &str) -> Result<()> {
-        self.git(None, ["update-ref", "-d", name, expected]).map(|_| ())
+        self.git(None, ["update-ref", "-d", name, expected])
+            .map(|_| ())
     }
 
     fn validate_snapshot_ref(&self, snap: &Snapshot) -> Result<()> {
         let expected = &snap.commit;
         let new_ref = self.ref_name(snap.id);
-        let actual = self.git(None, ["rev-parse", "--verify", &new_ref]).or_else(|_| {
-            // Migration windows may still resolve the in-repo namespaced form via alternates.
-            self.source_git(["rev-parse", "--verify", &format!("refs/ng/tm/{}/{}", self.worktree_id, snap.id)])
-                .or_else(|_| self.source_git(["rev-parse", "--verify", &format!("refs/ng/tm/{}", snap.id)]))
-        })?;
+        let actual = self
+            .git(None, ["rev-parse", "--verify", &new_ref])
+            .or_else(|_| {
+                // Migration windows may still resolve the in-repo namespaced form via alternates.
+                self.source_git([
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/ng/tm/{}/{}", self.worktree_id, snap.id),
+                ])
+                .or_else(|_| {
+                    self.source_git(["rev-parse", "--verify", &format!("refs/ng/tm/{}", snap.id)])
+                })
+            })?;
         if &actual != expected {
-            bail!("checkpoint #{} ref does not match its ledger commit", snap.id);
+            bail!(
+                "checkpoint #{} ref does not match its ledger commit",
+                snap.id
+            );
         }
-        self.git(None, ["cat-file", "-e", &format!("{}^{{commit}}", snap.commit)])?;
+        self.git(
+            None,
+            ["cat-file", "-e", &format!("{}^{{commit}}", snap.commit)],
+        )?;
         self.git(None, ["cat-file", "-e", &format!("{}^{{tree}}", snap.tree)])?;
         Ok(())
     }
@@ -903,14 +1024,23 @@ impl RepoContext {
         }
         match journal.kind {
             JournalKind::Save => {
-                let id = journal.checkpoint_id.context("save journal is missing checkpoint id")?;
+                let id = journal
+                    .checkpoint_id
+                    .context("save journal is missing checkpoint id")?;
                 let committed = ledger.snapshots.iter().any(|s| s.id == id);
                 if committed {
                     self.clear_journal()?;
                     return Ok(());
                 }
-                if let (Some(name), Some(oid)) = (journal.ref_name.as_deref(), journal.new_oid.as_deref()) {
-                    if self.git(None, ["rev-parse", "--verify", name]).ok().as_deref() == Some(oid) {
+                if let (Some(name), Some(oid)) =
+                    (journal.ref_name.as_deref(), journal.new_oid.as_deref())
+                {
+                    if self
+                        .git(None, ["rev-parse", "--verify", name])
+                        .ok()
+                        .as_deref()
+                        == Some(oid)
+                    {
                         self.update_ref_delete(name, oid)?;
                     }
                 }
@@ -918,13 +1048,17 @@ impl RepoContext {
                 self.clear_journal()?;
             }
             JournalKind::Restore => {
-                let target_id = journal.target_id.context("restore journal is missing target id")?;
+                let target_id = journal
+                    .target_id
+                    .context("restore journal is missing target id")?;
                 let target = ledger
                     .snapshots
                     .iter()
                     .find(|s| s.id == target_id)
                     .cloned()
-                    .with_context(|| format!("restore journal targets missing checkpoint #{target_id}"))?;
+                    .with_context(|| {
+                        format!("restore journal targets missing checkpoint #{target_id}")
+                    })?;
                 let current = current_tree(self).map(|(tree, _)| tree).ok();
                 if current.as_deref() == Some(target.tree.as_str()) {
                     ledger.set_cursor(Some(target_id));
@@ -938,7 +1072,9 @@ impl RepoContext {
                         .iter()
                         .find(|s| s.id == preimage_id)
                         .cloned()
-                        .with_context(|| format!("restore journal preimage checkpoint #{preimage_id} is missing"))?;
+                        .with_context(|| {
+                            format!("restore journal preimage checkpoint #{preimage_id} is missing")
+                        })?;
                     if current.as_deref() == Some(preimage.tree.as_str()) {
                         ledger.set_cursor(Some(preimage_id));
                         self.save_ledger(ledger)?;
@@ -971,7 +1107,11 @@ impl RepoContext {
 
 fn absolute_git_path(root: &Path, value: &str) -> PathBuf {
     let path = PathBuf::from(value);
-    if path.is_absolute() { path } else { root.join(path) }
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
 }
 
 /// Create (or repair) the private bare store under `~/.aizen/timemachine/<repo>/store.git`.
@@ -981,9 +1121,13 @@ fn absolute_git_path(root: &Path, value: &str) -> PathBuf {
 /// written only into the private store.
 fn ensure_private_store(store_git_dir: &Path, common_git_dir: &Path) -> Result<()> {
     if !store_git_dir.join("HEAD").exists() {
-        fs::create_dir_all(store_git_dir)
-            .with_context(|| format!("creating private time-machine store {}", store_git_dir.display()))?;
-        let out = Command::new("git")
+        fs::create_dir_all(store_git_dir).with_context(|| {
+            format!(
+                "creating private time-machine store {}",
+                store_git_dir.display()
+            )
+        })?;
+        let out = git_cmd()
             .args(["init", "--bare", "-q"])
             .arg(store_git_dir)
             .output()
@@ -1021,7 +1165,7 @@ fn ensure_private_store(store_git_dir: &Path, common_git_dir: &Path) -> Result<(
     }
 
     // Neutralize config inside the private store itself (no shared hooks/fsmonitor).
-    let _ = Command::new("git")
+    let _ = git_cmd()
         .env("GIT_DIR", strip_windows_verbatim(store_git_dir))
         .args(["config", "core.hooksPath", "hooks-disabled"])
         .output();
@@ -1045,7 +1189,22 @@ fn strip_windows_verbatim(path: &Path) -> PathBuf {
 }
 
 fn null_device() -> &'static str {
-    if cfg!(windows) { "NUL" } else { "/dev/null" }
+    if cfg!(windows) {
+        "NUL"
+    } else {
+        "/dev/null"
+    }
+}
+
+/// Builder for every git spawn in this module: the executable resolved by `core::gitx` (PATH or a
+/// well-known install location), so the time machine keeps working in shells where git isn't on
+/// PATH. Falls back to the literal name only when resolution says Missing — the spawn then fails
+/// with the same ENOENT it always had, and `raw_git`/`discover` classify it as GitMissing.
+fn git_cmd() -> Command {
+    match crate::core::gitx::git_exe() {
+        Some(p) => Command::new(p),
+        None => Command::new("git"),
+    }
 }
 
 fn fnv1a64(s: &str) -> u64 {
@@ -1062,13 +1221,19 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let out = Command::new("git")
+    // Absence of a git executable is a TYPED error (GitMissing), not a spawn ENOENT dressed as a
+    // repo problem — `save_protected_change`/`preflight` treat it as "checkpoints simply off"
+    // instead of refusing every file edit on a machine without git.
+    let out = crate::core::gitx::command()?
         .current_dir(root)
         .args(args)
         .output()
         .context("running git (is git installed?)")?;
     if !out.status.success() {
-        bail!("git repository probe failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "git repository probe failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -1089,7 +1254,8 @@ fn seed_index(ctx: &RepoContext) -> Result<TempIndex> {
     // The private store does not own that index; it only receives the alternate-index snapshot.
     let source = ctx.git_dir.join("index");
     if source.is_file() {
-        fs::copy(&source, &path).with_context(|| format!("seeding temporary index from {}", source.display()))?;
+        fs::copy(&source, &path)
+            .with_context(|| format!("seeding temporary index from {}", source.display()))?;
     } else if let Ok(head) = ctx.source_git(["rev-parse", "--verify", "HEAD"]) {
         // HEAD may only exist in the source repo; objects resolve via sealed alternates.
         ctx.git(Some(&path), ["read-tree", &head])?;
@@ -1208,9 +1374,11 @@ fn index_blob_bytes(ctx: &RepoContext, index: &Path) -> Result<u64> {
     }
 
     // One `cat-file --batch-check` process instead of N `cat-file -s` spawns.
-    let mut child = Command::new("git");
+    let mut child = git_cmd();
     let store = strip_windows_verbatim(&ctx.store_git_dir);
-    let hooks = strip_windows_verbatim(&ctx.hooks_dir).to_string_lossy().replace('\\', "/");
+    let hooks = strip_windows_verbatim(&ctx.hooks_dir)
+        .to_string_lossy()
+        .replace('\\', "/");
     child
         .current_dir(&ctx.root)
         .env("GIT_DIR", &store)
@@ -1220,7 +1388,10 @@ fn index_blob_bytes(ctx: &RepoContext, index: &Path) -> Result<u64> {
         .arg("-c")
         .arg(format!("core.hooksPath={hooks}"))
         .args(["-c", "core.fsmonitor=false"])
-        .args(["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"])
+        .args([
+            "cat-file",
+            "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1232,7 +1403,9 @@ fn index_blob_bytes(ctx: &RepoContext, index: &Path) -> Result<u64> {
             writeln!(stdin, "{oid}")?;
         }
     }
-    let out = proc.wait_with_output().context("running cat-file --batch-check")?;
+    let out = proc
+        .wait_with_output()
+        .context("running cat-file --batch-check")?;
     if !out.status.success() {
         bail!(
             "internal git operation failed: {}",
@@ -1249,7 +1422,9 @@ fn index_blob_bytes(ctx: &RepoContext, index: &Path) -> Result<u64> {
         // Formats: "<oid> <type> <size>" or "<oid> missing"
         let mut fields = line.split_whitespace();
         let Some(oid) = fields.next() else { continue };
-        let Some(kind_or_missing) = fields.next() else { continue };
+        let Some(kind_or_missing) = fields.next() else {
+            continue;
+        };
         if kind_or_missing == "missing" {
             bail!("checkpoint budget probe: blob {oid} is missing from the private store");
         }
@@ -1261,7 +1436,9 @@ fn index_blob_bytes(ctx: &RepoContext, index: &Path) -> Result<u64> {
         if size > max_single {
             bail!("checkpoint budget exceeded: one file/blob is {size} bytes > configured limit {max_single}");
         }
-        total = total.checked_add(size).context("checkpoint byte count overflow")?;
+        total = total
+            .checked_add(size)
+            .context("checkpoint byte count overflow")?;
     }
     Ok(total)
 }
@@ -1275,7 +1452,11 @@ fn current_tree(ctx: &RepoContext) -> Result<(String, Coverage)> {
     ctx.git(Some(&idx.0), ["add", "-A", "--", "."])?;
     let tree = ctx.git(Some(&idx.0), ["write-tree"])?;
     let list = ctx.git(Some(&idx.0), ["ls-files", "-z"])?;
-    let count = if list.is_empty() { 0 } else { list.as_bytes().iter().filter(|b| **b == 0).count() as u64 };
+    let count = if list.is_empty() {
+        0
+    } else {
+        list.as_bytes().iter().filter(|b| **b == 0).count() as u64
+    };
     let byte_count = index_blob_bytes(ctx, &idx.0)?;
     let cfg = crate::core::cli_config::load();
     let max_files = cfg.timemachine_max_files.unwrap_or(100_000);
@@ -1291,7 +1472,10 @@ fn current_tree(ctx: &RepoContext) -> Result<(String, Coverage)> {
         Coverage {
             file_count: count,
             byte_count,
-            notes: vec!["git-visible repository tree; ignored/outside/nested repositories are not covered".to_string()],
+            notes: vec![
+                "git-visible repository tree; ignored/outside/nested repositories are not covered"
+                    .to_string(),
+            ],
         },
     ))
 }
@@ -1306,12 +1490,15 @@ fn write_chat(ctx: &RepoContext, id: u32, chat: &[Message]) -> Result<()> {
 }
 
 fn read_chat_in(ctx: &RepoContext, id: u32) -> Result<Option<Vec<Message>>> {
-    for path in [ctx.chat_path(id), ctx.inrepo_chat_path(id), ctx.legacy_chat_path(id)] {
+    for path in [
+        ctx.chat_path(id),
+        ctx.inrepo_chat_path(id),
+        ctx.legacy_chat_path(id),
+    ] {
         if let Some(bytes) = crate::core::persist::read_optional(&path)? {
-            return Ok(Some(
-                serde_json::from_slice(&bytes)
-                    .with_context(|| format!("conversation sidecar for checkpoint #{id} is corrupt"))?,
-            ));
+            return Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
+                format!("conversation sidecar for checkpoint #{id} is corrupt")
+            })?));
         }
     }
     Ok(None)
@@ -1325,6 +1512,15 @@ pub fn is_repo() -> bool {
     RepoContext::current().is_ok()
 }
 
+/// "Checkpoints are simply off here" — either the directory isn't a repo, or there is no git
+/// executable at all. Both must degrade to no-checkpoint instead of failing the caller: the
+/// git-missing case used to propagate as a hard error, and because the protected-edit gate runs
+/// before every mutation, that refused EVERY `file_write`/`multi_edit` on a gitless machine
+/// while blaming "the pre-edit checkpoint".
+fn benign_no_checkpoint(e: &anyhow::Error) -> bool {
+    e.to_string().contains("not a git repository") || crate::core::gitx::is_git_missing(e)
+}
+
 /// Validate Time Machine metadata without capturing a tree. Kept for CLI diagnostics; protected
 /// mutations should call [`save_protected_change`] while their workspace writer lease is held.
 #[allow(dead_code)]
@@ -1336,7 +1532,7 @@ pub fn preflight_protected_change() -> Result<bool> {
             ctx.recover_pending(&mut ledger)?;
             Ok(true)
         }
-        Err(e) if e.to_string().contains("not a git repository") => Ok(false),
+        Err(e) if benign_no_checkpoint(&e) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -1347,7 +1543,7 @@ pub fn preflight_protected_change() -> Result<bool> {
 pub fn save_protected_change(label: &str) -> Result<Option<Snapshot>> {
     match RepoContext::current() {
         Ok(ctx) => save_in(&ctx, label, true, None).map(Some),
-        Err(e) if e.to_string().contains("not a git repository") => Ok(None),
+        Err(e) if benign_no_checkpoint(&e) => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -1355,7 +1551,9 @@ pub fn save_protected_change(label: &str) -> Result<Option<Snapshot>> {
 pub fn save(label: &str, auto: bool) -> Result<Snapshot> {
     let ctx = RepoContext::current()?;
     let snap = save_in(&ctx, label, auto, None)?;
-    let keep = crate::core::cli_config::load().timemachine_keep.unwrap_or(DEFAULT_KEEP);
+    let keep = crate::core::cli_config::load()
+        .timemachine_keep
+        .unwrap_or(DEFAULT_KEEP);
     prune_after_save(&ctx, keep, &[snap.id])?;
     Ok(snap)
 }
@@ -1363,7 +1561,9 @@ pub fn save(label: &str, auto: bool) -> Result<Snapshot> {
 pub fn save_with_chat(label: &str, auto: bool, chat: &[Message]) -> Result<Snapshot> {
     let ctx = RepoContext::current()?;
     let snap = save_in(&ctx, label, auto, Some(chat))?;
-    let keep = crate::core::cli_config::load().timemachine_keep.unwrap_or(DEFAULT_KEEP);
+    let keep = crate::core::cli_config::load()
+        .timemachine_keep
+        .unwrap_or(DEFAULT_KEEP);
     prune_after_save(&ctx, keep, &[snap.id])?;
     Ok(snap)
 }
@@ -1392,7 +1592,12 @@ fn prune_after_save(ctx: &RepoContext, keep: usize, protected: &[u32]) -> Result
     Ok(())
 }
 
-fn save_in(ctx: &RepoContext, label: &str, auto: bool, chat: Option<&[Message]>) -> Result<Snapshot> {
+fn save_in(
+    ctx: &RepoContext,
+    label: &str,
+    auto: bool,
+    chat: Option<&[Message]>,
+) -> Result<Snapshot> {
     let _store = ctx.store_shared()?;
     let _lock = ctx.lock()?;
     let mut ledger = ctx.load_ledger()?;
@@ -1415,8 +1620,7 @@ fn save_in(ctx: &RepoContext, label: &str, auto: bool, chat: Option<&[Message]>)
 
 pub fn load_chat_checked(id: u32) -> Result<Vec<Message>> {
     let ctx = RepoContext::current()?;
-    read_chat_in(&ctx, id)?
-        .with_context(|| format!("checkpoint #{id} has no saved conversation"))
+    read_chat_in(&ctx, id)?.with_context(|| format!("checkpoint #{id} has no saved conversation"))
 }
 
 fn enforce_retention_plan(ledger: &mut Ledger, keep: usize, protected: &[u32]) -> Vec<Snapshot> {
@@ -1530,8 +1734,20 @@ fn capture_checkpoint_locked(
         .and_then(|pid| ledger.snapshots.iter().find(|s| s.id == pid))
         .map(|s| s.commit.clone())
         .or_else(|| ctx.source_git(["rev-parse", "--verify", "HEAD"]).ok());
-    let msg = format!("aizen checkpoint: {}", if label.is_empty() { "(no label)" } else { label });
-    let mut args = vec!["commit-tree".to_string(), tree.clone(), "-m".to_string(), msg];
+    let msg = format!(
+        "aizen checkpoint: {}",
+        if label.is_empty() {
+            "(no label)"
+        } else {
+            label
+        }
+    );
+    let mut args = vec![
+        "commit-tree".to_string(),
+        tree.clone(),
+        "-m".to_string(),
+        msg,
+    ];
     if let Some(parent) = parent_commit {
         args.push("-p".to_string());
         args.push(parent);
@@ -1620,14 +1836,22 @@ fn restore_in(ctx: &RepoContext, id: u32) -> Result<Snapshot> {
     let preimage_id = if cur_tree != target.tree {
         // Restore always creates a fresh immutable preimage event. Reusing an older equal-tree
         // checkpoint makes `/redo` ambiguous after branching and can leave no forward recovery point.
-        Some(save_preimage_locked(ctx, &mut ledger, cur_tree, cur_coverage)?)
+        Some(save_preimage_locked(
+            ctx,
+            &mut ledger,
+            cur_tree,
+            cur_coverage,
+        )?)
     } else {
         ledger.cursor_id
     };
     if let Some(pid) = preimage_id {
         if let Some(preimage) = ledger.snapshots.iter().find(|s| s.id == pid) {
             let recovery_ref = ctx.recovery_ref_name(pid);
-            if ctx.git(None, ["rev-parse", "--verify", &recovery_ref]).is_err() {
+            if ctx
+                .git(None, ["rev-parse", "--verify", &recovery_ref])
+                .is_err()
+            {
                 ctx.update_ref_create(&recovery_ref, &preimage.commit)?;
             }
         }
@@ -1654,7 +1878,9 @@ fn restore_in(ctx: &RepoContext, id: u32) -> Result<Snapshot> {
                 let _ = apply_tree(ctx, &preimage.commit);
             }
         }
-        bail!("restore verification failed; recovery journal was preserved for `aizen time doctor`");
+        bail!(
+            "restore verification failed; recovery journal was preserved for `aizen time doctor`"
+        );
     }
 
     ledger.set_cursor(Some(id));
@@ -1772,7 +1998,11 @@ impl DiffSide {
         let t = s.trim().to_ascii_lowercase();
         match t.as_str() {
             "working" | "worktree" | "wt" | "now" | "current" | "disk" => Some(Self::Working),
-            _ => t.trim_start_matches('#').parse::<u32>().ok().map(Self::Checkpoint),
+            _ => t
+                .trim_start_matches('#')
+                .parse::<u32>()
+                .ok()
+                .map(Self::Checkpoint),
         }
     }
 
@@ -1850,7 +2080,13 @@ fn nul_fields(bytes: &[u8]) -> Vec<String> {
 /// A `-` count means binary; it maps to `None` rather than `0` so "no text change" stays distinct
 /// from "not text".
 fn merge_diff_streams(name_status: &[u8], numstat: &[u8]) -> Vec<FileChange> {
-    let parse_count = |v: &str| if v == "-" { None } else { v.parse::<u64>().ok() };
+    let parse_count = |v: &str| {
+        if v == "-" {
+            None
+        } else {
+            v.parse::<u64>().ok()
+        }
+    };
 
     let mut counts: std::collections::HashMap<String, (Option<u64>, Option<u64>)> =
         std::collections::HashMap::new();
@@ -1867,7 +2103,10 @@ fn merge_diff_streams(name_status: &[u8], numstat: &[u8]) -> Vec<FileChange> {
         } else if i + 2 < num_fields.len() {
             // Rename/copy: counts row, then old path, then new path. Key on the new path, which is
             // what `--name-status` reports as the row's path.
-            counts.insert(num_fields[i + 2].clone(), (parse_count(add), parse_count(del)));
+            counts.insert(
+                num_fields[i + 2].clone(),
+                (parse_count(add), parse_count(del)),
+            );
             i += 3;
         } else {
             break;
@@ -1881,12 +2120,22 @@ fn merge_diff_streams(name_status: &[u8], numstat: &[u8]) -> Vec<FileChange> {
         let status = name_fields[j].chars().next().unwrap_or('M');
         let paired = matches!(status, 'R' | 'C');
         let (path, old_path, step) = if paired && j + 2 < name_fields.len() {
-            (name_fields[j + 2].clone(), Some(name_fields[j + 1].clone()), 3)
+            (
+                name_fields[j + 2].clone(),
+                Some(name_fields[j + 1].clone()),
+                3,
+            )
         } else {
             (name_fields[j + 1].clone(), None, 2)
         };
         let (added, deleted) = counts.get(&path).copied().unwrap_or((None, None));
-        files.push(FileChange { status, path, old_path, added, deleted });
+        files.push(FileChange {
+            status,
+            path,
+            old_path,
+            added,
+            deleted,
+        });
         j += step;
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1951,7 +2200,10 @@ pub fn diff(
     name_args.extend(pathspec.iter().cloned());
     let name_out = ctx.git_output(None, &name_args)?;
     if !name_out.status.success() {
-        bail!("diff failed: {}", String::from_utf8_lossy(&name_out.stderr).trim());
+        bail!(
+            "diff failed: {}",
+            String::from_utf8_lossy(&name_out.stderr).trim()
+        );
     }
 
     let mut num_args = vec![
@@ -1967,7 +2219,10 @@ pub fn diff(
     num_args.extend(pathspec.iter().cloned());
     let num_out = ctx.git_output(None, &num_args)?;
     if !num_out.status.success() {
-        bail!("diff failed: {}", String::from_utf8_lossy(&num_out.stderr).trim());
+        bail!(
+            "diff failed: {}",
+            String::from_utf8_lossy(&num_out.stderr).trim()
+        );
     }
 
     let files = merge_diff_streams(&name_out.stdout, &num_out.stdout);
@@ -1987,7 +2242,10 @@ pub fn diff(
             args.extend(pathspec.iter().cloned());
             let out = ctx.git_output(None, &args)?;
             if !out.status.success() {
-                bail!("diff failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+                bail!(
+                    "diff failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
             }
             let text = String::from_utf8_lossy(&out.stdout).to_string();
             if text.len() > limit {
@@ -2003,7 +2261,13 @@ pub fn diff(
         }
     };
 
-    Ok(DiffReport { from: from.label(), to: to.label(), files, patch, patch_truncated })
+    Ok(DiffReport {
+        from: from.label(),
+        to: to.label(),
+        files,
+        patch,
+        patch_truncated,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -2020,9 +2284,16 @@ pub fn doctor() -> Result<DoctorReport> {
     let ctx = RepoContext::current()?;
     let mut issues = Vec::new();
     if !ctx.store_git_dir.join("HEAD").exists() {
-        issues.push(format!("private store missing at {}", ctx.store_git_dir.display()));
+        issues.push(format!(
+            "private store missing at {}",
+            ctx.store_git_dir.display()
+        ));
     }
-    let alternates = ctx.store_git_dir.join("objects").join("info").join("alternates");
+    let alternates = ctx
+        .store_git_dir
+        .join("objects")
+        .join("info")
+        .join("alternates");
     match crate::core::persist::read_optional(&alternates) {
         Ok(None) => issues.push("private store alternates pointer is missing".into()),
         Ok(Some(bytes)) => {
@@ -2052,7 +2323,10 @@ pub fn doctor() -> Result<DoctorReport> {
         }
     };
     if let Ok(Some(journal)) = ctx.load_journal() {
-        issues.push(format!("unfinished {:?} transaction {} ({:?})", journal.kind, journal.operation_id, journal.phase));
+        issues.push(format!(
+            "unfinished {:?} transaction {} ({:?})",
+            journal.kind, journal.operation_id, journal.phase
+        ));
     }
     for snap in &ledger.snapshots {
         if let Err(e) = ctx.validate_snapshot_ref(snap) {
@@ -2061,7 +2335,10 @@ pub fn doctor() -> Result<DoctorReport> {
         if snap.has_chat {
             match read_chat_in(&ctx, snap.id) {
                 Ok(Some(_)) => {}
-                Ok(None) => issues.push(format!("checkpoint #{} claims chat but sidecar is missing", snap.id)),
+                Ok(None) => issues.push(format!(
+                    "checkpoint #{} claims chat but sidecar is missing",
+                    snap.id
+                )),
                 Err(e) => issues.push(format!("checkpoint #{} chat: {e}", snap.id)),
             }
         }
@@ -2100,7 +2377,14 @@ pub fn doctor_gc() -> Result<DoctorReport> {
     let live_ids: HashSet<u32> = ledger.snapshots.iter().map(|s| s.id).collect();
     // Sweep the whole private store's `refs/ng/tm/**` (all worktrees). Orphans from other worktree
     // ids or recovery pins must not survive just because this process is bound to one prefix.
-    let refs = ctx.git(None, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/ng/tm"])?;
+    let refs = ctx.git(
+        None,
+        [
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/ng/tm",
+        ],
+    )?;
     for line in refs.lines() {
         let mut fields = line.split_whitespace();
         let Some(name) = fields.next() else { continue };
@@ -2116,8 +2400,7 @@ pub fn doctor_gc() -> Result<DoctorReport> {
             continue;
         }
         let id = name.rsplit('/').next().and_then(|s| s.parse::<u32>().ok());
-        let ours = name.starts_with(&(ctx.ref_prefix.clone() + "/"))
-            || name == ctx.ref_prefix;
+        let ours = name.starts_with(&(ctx.ref_prefix.clone() + "/")) || name == ctx.ref_prefix;
         // Delete: (a) orphan ids under our prefix, or (b) any ref under a dead worktree prefix that
         // is not our live prefix (foreign worktree namespaces keep their own live ledgers — only
         // delete ids that are under our prefix and not live).
@@ -2152,7 +2435,10 @@ pub fn doctor_gc() -> Result<DoctorReport> {
     if ctx.chat_dir().is_dir() {
         for entry in fs::read_dir(ctx.chat_dir())? {
             let path = entry?.path();
-            let id = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u32>().ok());
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u32>().ok());
             if id.is_some_and(|id| !live_ids.contains(&id)) {
                 let _ = crate::core::persist::remove_if_exists(&path)?;
             }
@@ -2167,7 +2453,9 @@ pub fn doctor_gc() -> Result<DoctorReport> {
 
 pub struct Checkpoint;
 impl crate::agent::tools::Tool for Checkpoint {
-    fn name(&self) -> &str { "checkpoint" }
+    fn name(&self) -> &str {
+        "checkpoint"
+    }
     fn description(&self) -> &str {
         "Create an explicit Time Machine checkpoint (private store). Use before high-risk work the \
          runtime won't auto-catch. The runtime already auto-checkpoints before the first edit and \
@@ -2181,16 +2469,26 @@ impl crate::agent::tools::Tool for Checkpoint {
             "additionalProperties": false
         })
     }
-    fn is_destructive(&self) -> bool { true }
-    fn is_concurrency_safe(&self) -> bool { false }
+    fn is_destructive(&self) -> bool {
+        true
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
     fn workspace_effect(&self, _args: &serde_json::Value) -> crate::agent::tools::WorkspaceEffect {
         crate::agent::tools::WorkspaceEffect::RepoMetadata
     }
     fn execute(&self, args: &serde_json::Value) -> Result<String> {
         if !is_repo() {
-            return Ok("error: not a git repository — checkpoints need git (run `git init`)".to_string());
+            return Ok(
+                "error: not a git repository — checkpoints need git (run `git init`)".to_string(),
+            );
         }
-        let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let label = args
+            .get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         let snap = save(label, false)?;
         // Explicit saves also count as last_good within the run (model just pinned a known-good tree).
         note_last_good(snap.id);
@@ -2208,7 +2506,9 @@ impl crate::agent::tools::Tool for Checkpoint {
 /// agent run — never arbitrary snapshot ids (those stay human/CLI). Cap: [`MAX_RUN_REWINDS`].
 pub struct CheckpointRewind;
 impl crate::agent::tools::Tool for CheckpointRewind {
-    fn name(&self) -> &str { "checkpoint_rewind" }
+    fn name(&self) -> &str {
+        "checkpoint_rewind"
+    }
     fn description(&self) -> &str {
         "Rewind the working tree to a recovery anchor from THIS agent run only. Use when your last \
          approach broke the tree and a clean base is cheaper than patching further. \
@@ -2234,8 +2534,12 @@ impl crate::agent::tools::Tool for CheckpointRewind {
             "additionalProperties": false
         })
     }
-    fn is_destructive(&self) -> bool { true }
-    fn is_concurrency_safe(&self) -> bool { false }
+    fn is_destructive(&self) -> bool {
+        true
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
     fn workspace_effect(&self, _args: &serde_json::Value) -> crate::agent::tools::WorkspaceEffect {
         // Mutates the working tree. The agent loop skips the pre-edit checkpoint for this tool
         // (restoring is the recovery path; snapshotting the broken tree first is restore's job).
@@ -2284,7 +2588,11 @@ impl crate::agent::tools::Tool for CheckpointRewind {
 /// chat sidecar exists, and the creation time. Absolute paths / store internals never leak here.
 fn format_timeline_row(snap: &Snapshot, is_cursor: bool) -> String {
     let marker = if is_cursor { "▸" } else { " " };
-    let label = if snap.label.is_empty() { "(no label)" } else { &snap.label };
+    let label = if snap.label.is_empty() {
+        "(no label)"
+    } else {
+        &snap.label
+    };
     let kind = if snap.auto { "auto" } else { "manual" };
     format!("{marker} #{} — {label} [{kind}, {}]", snap.id, snap.created)
 }
@@ -2294,7 +2602,9 @@ fn format_timeline_row(snap: &Snapshot, is_cursor: bool) -> String {
 /// specific earlier state (across turns, where run-scoped `checkpoint_rewind` has no anchor).
 pub struct CheckpointList;
 impl crate::agent::tools::Tool for CheckpointList {
-    fn name(&self) -> &str { "checkpoint_list" }
+    fn name(&self) -> &str {
+        "checkpoint_list"
+    }
     fn description(&self) -> &str {
         "List Time Machine checkpoints (newest last), with the ▸ marking the current tree. Use to \
          find the id to pass to `checkpoint_restore` when the user asks to go back to an earlier \
@@ -2339,7 +2649,9 @@ impl crate::agent::tools::Tool for CheckpointList {
 /// (re-acquiring the same `workspace.lock` would self-deadlock — see `rewind_run`).
 pub struct CheckpointRestore;
 impl crate::agent::tools::Tool for CheckpointRestore {
-    fn name(&self) -> &str { "checkpoint_restore" }
+    fn name(&self) -> &str {
+        "checkpoint_restore"
+    }
     fn description(&self) -> &str {
         "Restore the working tree to a specific Time Machine checkpoint by id (see `checkpoint_list`). \
          Use when the user asks to go back to an earlier state — including from a PREVIOUS turn, which \
@@ -2358,8 +2670,12 @@ impl crate::agent::tools::Tool for CheckpointRestore {
             "additionalProperties": false
         })
     }
-    fn is_destructive(&self) -> bool { true }
-    fn is_concurrency_safe(&self) -> bool { false }
+    fn is_destructive(&self) -> bool {
+        true
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
     fn workspace_effect(&self, _args: &serde_json::Value) -> crate::agent::tools::WorkspaceEffect {
         // Mutates the working tree. The loop takes the workspace writer lease for `Paths`; restore
         // itself takes only store/metadata locks (a different namespace), so no self-deadlock.
@@ -2370,16 +2686,27 @@ impl crate::agent::tools::Tool for CheckpointRestore {
             return Ok("error: not a git repository — nothing to restore".to_string());
         }
         let Some(id) = args.get("id").and_then(|v| v.as_u64()) else {
-            return Ok("error: `id` is required (an integer checkpoint id — see `checkpoint_list`)".to_string());
+            return Ok(
+                "error: `id` is required (an integer checkpoint id — see `checkpoint_list`)"
+                    .to_string(),
+            );
         };
         let id = id as u32;
-        let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let reason = args
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         match restore_under_lease(id) {
             Ok(snap) => {
                 // Restoring an arbitrary id makes that tree the new run floor: a subsequent
                 // `checkpoint_rewind target=last_good` should land here, not on a stale post-edit id.
                 note_last_good(snap.id);
-                let why = if reason.is_empty() { String::new() } else { format!(" reason: {reason}.") };
+                let why = if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(" reason: {reason}.")
+                };
                 Ok(format!(
                     "restored working tree to checkpoint #{} ({}).{why} Files only — chat history was NOT \
                      changed, and this is reversible (the pre-restore tree was auto-snapshotted; a human can \
@@ -2426,7 +2753,10 @@ fn format_diff(report: &DiffReport, max_rows: usize) -> String {
         }
     }
     if report.files.len() > shown {
-        out.push_str(&format!("  … {} more file(s)\n", report.files.len() - shown));
+        out.push_str(&format!(
+            "  … {} more file(s)\n",
+            report.files.len() - shown
+        ));
     }
     if let Some(patch) = &report.patch {
         out.push_str("\n");
@@ -2448,7 +2778,9 @@ fn format_diff(report: &DiffReport, max_rows: usize) -> String {
 /// is read the diff → fix the one file, and `checkpoint_rewind` becomes the fallback it should be.
 pub struct CheckpointDiff;
 impl crate::agent::tools::Tool for CheckpointDiff {
-    fn name(&self) -> &str { "checkpoint_diff" }
+    fn name(&self) -> &str {
+        "checkpoint_diff"
+    }
     fn description(&self) -> &str {
         "Show what changed between two Time Machine points: checkpoint↔checkpoint, or a checkpoint↔the \
          live working tree (`to`/`from` = \"working\"). Defaults to `from`=the last run anchor, \
@@ -2484,10 +2816,14 @@ impl crate::agent::tools::Tool for CheckpointDiff {
     }
     fn execute(&self, args: &serde_json::Value) -> Result<String> {
         if !is_repo() {
-            return Ok("error: not a git repository — no timeline to diff (run `git init`)".to_string());
+            return Ok(
+                "error: not a git repository — no timeline to diff (run `git init`)".to_string(),
+            );
         }
         let side = |key: &str| -> Option<DiffSide> {
-            args.get(key).and_then(|v| v.as_str()).and_then(DiffSide::parse)
+            args.get(key)
+                .and_then(|v| v.as_str())
+                .and_then(DiffSide::parse)
         };
         // "what have I changed" is the overwhelmingly common question, so both ends default toward it:
         // `to` = the live tree, `from` = this run's pre-edit anchor (falling back to the newest
@@ -2518,7 +2854,12 @@ impl crate::agent::tools::Tool for CheckpointDiff {
         let paths: Vec<String> = args
             .get("paths")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
             .unwrap_or_default();
         let want_patch = args.get("patch").and_then(|v| v.as_bool()).unwrap_or(false);
         // Patch bytes are the one unbounded part of this result; cap them so a broad `patch=true`
@@ -2553,25 +2894,46 @@ mod tests {
 
     #[test]
     fn ledger_rejects_duplicate_ids_and_regressed_counter() {
-        let mut duplicate = Ledger { snapshots: vec![mk(1, None), mk(1, None)], next_id: 2, ..Default::default() };
+        let mut duplicate = Ledger {
+            snapshots: vec![mk(1, None), mk(1, None)],
+            next_id: 2,
+            ..Default::default()
+        };
         assert!(duplicate.normalize().is_err());
-        let mut regressed = Ledger { snapshots: vec![mk(9, None)], next_id: 2, ..Default::default() };
+        let mut regressed = Ledger {
+            snapshots: vec![mk(9, None)],
+            next_id: 2,
+            ..Default::default()
+        };
         assert!(regressed.normalize().is_err());
     }
 
     #[test]
     fn retention_protects_cursor_and_explicit_ids() {
-        let mut l = Ledger { snapshots: vec![mk(1, None), mk(2, Some(1)), mk(3, Some(2)), mk(4, Some(3))], next_id: 5, ..Default::default() };
+        let mut l = Ledger {
+            snapshots: vec![mk(1, None), mk(2, Some(1)), mk(3, Some(2)), mk(4, Some(3))],
+            next_id: 5,
+            ..Default::default()
+        };
         l.set_cursor(Some(1));
         let dropped = enforce_retention_plan(&mut l, 2, &[4]);
-        assert_eq!(l.snapshots.iter().map(|s| s.id).collect::<Vec<_>>(), vec![1, 4]);
+        assert_eq!(
+            l.snapshots.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 4]
+        );
         assert_eq!(dropped.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2, 3]);
         assert_eq!(l.cursor_id, Some(1));
     }
 
     #[test]
     fn legacy_cursor_migrates_to_id() {
-        let mut l = Ledger { snapshots: vec![mk(7, None), mk(9, Some(7))], cursor: Some(1), cursor_id: None, next_id: 10, ..Default::default() };
+        let mut l = Ledger {
+            snapshots: vec![mk(7, None), mk(9, Some(7))],
+            cursor: Some(1),
+            cursor_id: None,
+            next_id: 10,
+            ..Default::default()
+        };
         l.normalize().unwrap();
         assert_eq!(l.cursor_id, Some(9));
     }
@@ -2582,8 +2944,15 @@ mod tests {
         // real branch tip #2, not the recovery safety snapshot.
         let snaps = vec![
             mk(1, None),
-            Snapshot { recovery: false, ..mk(2, Some(1)) },
-            Snapshot { recovery: true, label: "before time-travel".into(), ..mk(3, Some(1)) },
+            Snapshot {
+                recovery: false,
+                ..mk(2, Some(1))
+            },
+            Snapshot {
+                recovery: true,
+                label: "before time-travel".into(),
+                ..mk(3, Some(1))
+            },
         ];
         let child = snaps
             .iter()
@@ -2618,8 +2987,14 @@ mod tests {
         assert_eq!(DiffSide::parse("5"), Some(DiffSide::Checkpoint(5)));
         // The timeline prints ids as `#5`, so pasting one back must work.
         assert_eq!(DiffSide::parse("#12"), Some(DiffSide::Checkpoint(12)));
-        for alias in ["working", "worktree", "wt", "now", "current", "disk", "WORKING"] {
-            assert_eq!(DiffSide::parse(alias), Some(DiffSide::Working), "alias {alias}");
+        for alias in [
+            "working", "worktree", "wt", "now", "current", "disk", "WORKING",
+        ] {
+            assert_eq!(
+                DiffSide::parse(alias),
+                Some(DiffSide::Working),
+                "alias {alias}"
+            );
         }
         assert_eq!(DiffSide::parse("nonsense"), None);
         // `0` is not a valid checkpoint id (the ledger starts at 1) but parses as one; the ledger
@@ -2636,8 +3011,14 @@ mod tests {
         let files = merge_diff_streams(name, num);
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].path, "Cargo.lock");
-        assert_eq!((files[0].status, files[0].added, files[0].deleted), ('M', Some(1), Some(1)));
-        assert_eq!((files[1].status, files[1].added, files[1].deleted), ('M', Some(2), Some(3)));
+        assert_eq!(
+            (files[0].status, files[0].added, files[0].deleted),
+            ('M', Some(1), Some(1))
+        );
+        assert_eq!(
+            (files[1].status, files[1].added, files[1].deleted),
+            ('M', Some(2), Some(3))
+        );
         assert!(files.iter().all(|f| f.old_path.is_none()));
     }
 
@@ -2678,8 +3059,20 @@ mod tests {
             from: "#1".into(),
             to: "working tree".into(),
             files: vec![
-                FileChange { status: 'M', path: "a.rs".into(), old_path: None, added: Some(3), deleted: Some(1) },
-                FileChange { status: 'M', path: "b.png".into(), old_path: None, added: None, deleted: None },
+                FileChange {
+                    status: 'M',
+                    path: "a.rs".into(),
+                    old_path: None,
+                    added: Some(3),
+                    deleted: Some(1),
+                },
+                FileChange {
+                    status: 'M',
+                    path: "b.png".into(),
+                    old_path: None,
+                    added: None,
+                    deleted: None,
+                },
             ],
             patch: None,
             patch_truncated: false,
@@ -2692,7 +3085,10 @@ mod tests {
     #[test]
     fn rewind_target_parse() {
         assert_eq!(RewindTarget::parse("pre_edit"), Some(RewindTarget::PreEdit));
-        assert_eq!(RewindTarget::parse("last-good"), Some(RewindTarget::LastGood));
+        assert_eq!(
+            RewindTarget::parse("last-good"),
+            Some(RewindTarget::LastGood)
+        );
         assert_eq!(RewindTarget::parse("undo"), Some(RewindTarget::LastGood));
         assert_eq!(RewindTarget::parse("42"), None);
     }

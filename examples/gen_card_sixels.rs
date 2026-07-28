@@ -48,7 +48,10 @@ fn main() {
         let (sixel, w, h, colors) = encode_card(path, target_w);
         let slug = slugify(path.file_stem().and_then(|s| s.to_str()).unwrap_or("card"));
         let out = out_dir.join(format!("{slug}.sixel"));
-        File::create(&out).unwrap().write_all(sixel.as_bytes()).unwrap();
+        File::create(&out)
+            .unwrap()
+            .write_all(sixel.as_bytes())
+            .unwrap();
         eprintln!(
             "wrote {} ({} bytes) — {w}x{h}, {colors} colours",
             out.display(),
@@ -132,8 +135,12 @@ fn encode_card(path: &Path, target_w: usize) -> (String, usize, usize, usize) {
                 } else {
                     (0.0, 0.0, 0.0)
                 };
-                px[ty * target_w + tx] =
-                    [rr.round() as u8, gg.round() as u8, bb.round() as u8, (a / n).round() as u8];
+                px[ty * target_w + tx] = [
+                    rr.round() as u8,
+                    gg.round() as u8,
+                    bb.round() as u8,
+                    (a / n).round() as u8,
+                ];
             }
         }
     }

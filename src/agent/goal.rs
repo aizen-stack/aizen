@@ -171,20 +171,34 @@ mod tests {
     #[test]
     fn build_ack_mentions_summary_and_stop() {
         let ack = build_ack("  added --version flag  ");
-        assert!(ack.contains("added --version flag"), "summary echoed: {ack}");
-        assert!(ack.contains("STOP now"), "the model must be told to stop calling tools: {ack}");
-        assert!(ack.contains("verif"), "the model must be told verification runs next: {ack}");
+        assert!(
+            ack.contains("added --version flag"),
+            "summary echoed: {ack}"
+        );
+        assert!(
+            ack.contains("STOP now"),
+            "the model must be told to stop calling tools: {ack}"
+        );
+        assert!(
+            ack.contains("verif"),
+            "the model must be told verification runs next: {ack}"
+        );
     }
 
     #[test]
     fn execute_sets_pending_and_take_drains_it() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = take_pending(); // clear any leftover from another test
-        let ack = GoalComplete.execute(&json!({"summary": "did the thing"})).unwrap();
+        let ack = GoalComplete
+            .execute(&json!({"summary": "did the thing"}))
+            .unwrap();
         assert!(ack.contains("did the thing"));
         let pending = take_pending().expect("a claim must be pending after execute");
         assert_eq!(pending, "did the thing");
-        assert!(take_pending().is_none(), "take must drain — a second take yields nothing");
+        assert!(
+            take_pending().is_none(),
+            "take must drain — a second take yields nothing"
+        );
     }
 
     #[test]
@@ -192,20 +206,32 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = GoalComplete.execute(&json!({"summary": "x"})).unwrap();
         clear();
-        assert!(take_pending().is_none(), "clear must drain the pending claim");
+        assert!(
+            take_pending().is_none(),
+            "clear must drain the pending claim"
+        );
     }
 
     #[test]
     fn execute_rejects_empty_or_missing_summary() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert!(GoalComplete.execute(&json!({})).is_err(), "missing summary");
-        assert!(GoalComplete.execute(&json!({"summary": "   "})).is_err(), "blank summary");
+        assert!(
+            GoalComplete.execute(&json!({"summary": "   "})).is_err(),
+            "blank summary"
+        );
         let _ = take_pending();
     }
 
     #[test]
     fn flags_are_nondestructive_and_serial() {
-        assert!(!GoalComplete.is_destructive(), "declaring completion changes nothing");
-        assert!(!GoalComplete.is_concurrency_safe(), "global side effect → must run serially");
+        assert!(
+            !GoalComplete.is_destructive(),
+            "declaring completion changes nothing"
+        );
+        assert!(
+            !GoalComplete.is_concurrency_safe(),
+            "global side effect → must run serially"
+        );
     }
 }

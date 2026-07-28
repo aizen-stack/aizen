@@ -51,7 +51,9 @@ pub struct CacheControl {
 }
 impl CacheControl {
     pub fn ephemeral() -> Self {
-        Self { kind: "ephemeral".into() }
+        Self {
+            kind: "ephemeral".into(),
+        }
     }
 }
 
@@ -81,7 +83,11 @@ impl Usage {
     /// Cached input tokens read this call, from whichever shape the provider used (0 if none).
     pub fn cache_read(&self) -> u64 {
         self.cache_read_input_tokens
-            .or_else(|| self.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens))
+            .or_else(|| {
+                self.prompt_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.cached_tokens)
+            })
             .unwrap_or(0)
     }
 }
@@ -162,29 +168,71 @@ impl Serialize for Message {
 
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: Some(content.into()), tool_calls: Vec::new(), tool_call_id: None, images: Vec::new(), cache_control: None }
+        Self {
+            role: "system".into(),
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            images: Vec::new(),
+            cache_control: None,
+        }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: Some(content.into()), tool_calls: Vec::new(), tool_call_id: None, images: Vec::new(), cache_control: None }
+        Self {
+            role: "user".into(),
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            images: Vec::new(),
+            cache_control: None,
+        }
     }
     /// A user turn with vision attachments (data URLs). `content` may be empty (image-only message).
     pub fn user_with_images(content: impl Into<String>, images: Vec<String>) -> Self {
-        Self { role: "user".into(), content: Some(content.into()), tool_calls: Vec::new(), tool_call_id: None, images, cache_control: None }
+        Self {
+            role: "user".into(),
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            images,
+            cache_control: None,
+        }
     }
     /// An assistant turn carrying natural-language content (used to thread multi-turn chat history).
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: Some(content.into()), tool_calls: Vec::new(), tool_call_id: None, images: Vec::new(), cache_control: None }
+        Self {
+            role: "assistant".into(),
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            images: Vec::new(),
+            cache_control: None,
+        }
     }
     /// An assistant turn that requests tool calls (no natural-language content).
     /// The loop builds its own assistant message inline (to preserve any content); this is
     /// the canonical constructor used by tests + future callers.
     #[allow(dead_code)]
     pub fn assistant_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
-        Self { role: "assistant".into(), content: None, tool_calls, tool_call_id: None, images: Vec::new(), cache_control: None }
+        Self {
+            role: "assistant".into(),
+            content: None,
+            tool_calls,
+            tool_call_id: None,
+            images: Vec::new(),
+            cache_control: None,
+        }
     }
     /// A tool-result turn, linked back to the call by `tool_call_id`.
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: "tool".into(), content: Some(content.into()), tool_calls: Vec::new(), tool_call_id: Some(tool_call_id.into()), images: Vec::new(), cache_control: None }
+        Self {
+            role: "tool".into(),
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
+            images: Vec::new(),
+            cache_control: None,
+        }
     }
 }
 
@@ -204,10 +252,18 @@ pub struct ToolDef {
 
 impl ToolDef {
     /// Build a `function` tool. `parameters` is a JSON-Schema object.
-    pub fn function(name: impl Into<String>, description: impl Into<String>, parameters: serde_json::Value) -> Self {
+    pub fn function(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
         Self {
             kind: "function".into(),
-            function: FunctionDef { name: name.into(), description: description.into(), parameters },
+            function: FunctionDef {
+                name: name.into(),
+                description: description.into(),
+                parameters,
+            },
             cache_control: None,
         }
     }
@@ -353,7 +409,10 @@ mod tests {
         assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(choice.message.tool_calls.len(), 1);
         assert_eq!(choice.message.tool_calls[0].function.name, "memory_search");
-        assert_eq!(choice.message.tool_calls[0].function.arguments, "{\"query\":\"pnpm\"}");
+        assert_eq!(
+            choice.message.tool_calls[0].function.arguments,
+            "{\"query\":\"pnpm\"}"
+        );
         assert!(choice.message.content.is_none());
     }
 
@@ -372,7 +431,10 @@ mod tests {
         let json = r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":""}}]},"finish_reason":"stop"}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
-        assert!(!resp.choices[0].message.tool_calls.is_empty(), "must detect tools by the array, not finish_reason");
+        assert!(
+            !resp.choices[0].message.tool_calls.is_empty(),
+            "must detect tools by the array, not finish_reason"
+        );
     }
 
     #[test]
@@ -382,7 +444,10 @@ mod tests {
         assert!(resp.choices[0].finish_reason.is_none());
         let tc = &resp.choices[0].message.tool_calls[0];
         assert_eq!(tc.kind, "function", "type defaults to function");
-        assert_eq!(tc.function.arguments, "", "missing arguments → empty string");
+        assert_eq!(
+            tc.function.arguments, "",
+            "missing arguments → empty string"
+        );
     }
 
     #[test]
@@ -390,11 +455,17 @@ mod tests {
         let m = Message::assistant_tool_calls(vec![ToolCall {
             id: "c".into(),
             kind: "function".into(),
-            function: FunctionCall { name: "f".into(), arguments: "{}".into() },
+            function: FunctionCall {
+                name: "f".into(),
+                arguments: "{}".into(),
+            },
         }]);
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["role"], "assistant");
-        assert!(v["content"].is_null(), "assistant tool-call turn must send content:null");
+        assert!(
+            v["content"].is_null(),
+            "assistant tool-call turn must send content:null"
+        );
         assert_eq!(v["tool_calls"][0]["function"]["name"], "f");
         assert_eq!(v["tool_calls"][0]["function"]["arguments"], "{}");
     }
@@ -411,18 +482,26 @@ mod tests {
     fn user_message_with_images_serializes_content_as_parts_array() {
         let m = Message::user_with_images(
             "what is this?",
-            vec!["data:image/png;base64,AAAA".into(), "data:image/jpeg;base64,BBBB".into()],
+            vec![
+                "data:image/png;base64,AAAA".into(),
+                "data:image/jpeg;base64,BBBB".into(),
+            ],
         );
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["role"], "user");
-        let parts = v["content"].as_array().expect("content is a parts array when images present");
+        let parts = v["content"]
+            .as_array()
+            .expect("content is a parts array when images present");
         assert_eq!(parts.len(), 3, "1 text part + 2 image parts");
         assert_eq!(parts[0]["type"], "text");
         assert_eq!(parts[0]["text"], "what is this?");
         assert_eq!(parts[1]["type"], "image_url");
         assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAAA");
         assert_eq!(parts[2]["image_url"]["url"], "data:image/jpeg;base64,BBBB");
-        assert!(v.get("images").is_none(), "the images field is not emitted directly");
+        assert!(
+            v.get("images").is_none(),
+            "the images field is not emitted directly"
+        );
     }
 
     #[test]
@@ -491,7 +570,10 @@ mod tests {
         assert_eq!(v["tools"][0]["function"]["name"], "memory_search");
         assert_eq!(v["tool_choice"], "auto");
         assert_eq!(v["parallel_tool_calls"], true);
-        assert!(v["tools"][0].get("cache_control").is_none(), "no breakpoint unless stamped");
+        assert!(
+            v["tools"][0].get("cache_control").is_none(),
+            "no breakpoint unless stamped"
+        );
     }
 
     #[test]
@@ -510,22 +592,35 @@ mod tests {
         m.cache_control = Some(CacheControl::ephemeral());
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["cache_control"]["type"], "ephemeral");
-        assert_eq!(v["content"], "sys", "content still emitted alongside the breakpoint");
+        assert_eq!(
+            v["content"], "sys",
+            "content still emitted alongside the breakpoint"
+        );
     }
 
     #[test]
     fn tool_def_emits_cache_control_when_set() {
         let mut t = ToolDef::function("f", "d", serde_json::json!({"type":"object"}));
-        assert!(serde_json::to_value(&t).unwrap().get("cache_control").is_none());
+        assert!(serde_json::to_value(&t)
+            .unwrap()
+            .get("cache_control")
+            .is_none());
         t.cache_control = Some(CacheControl::ephemeral());
-        assert_eq!(serde_json::to_value(&t).unwrap()["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            serde_json::to_value(&t).unwrap()["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 
     #[test]
     fn usage_cache_read_reads_either_shape() {
-        let anthropic: Usage = serde_json::from_str(r#"{"prompt_tokens":10,"cache_read_input_tokens":7}"#).unwrap();
+        let anthropic: Usage =
+            serde_json::from_str(r#"{"prompt_tokens":10,"cache_read_input_tokens":7}"#).unwrap();
         assert_eq!(anthropic.cache_read(), 7);
-        let openai: Usage = serde_json::from_str(r#"{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":5}}"#).unwrap();
+        let openai: Usage = serde_json::from_str(
+            r#"{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":5}}"#,
+        )
+        .unwrap();
         assert_eq!(openai.cache_read(), 5);
         let none: Usage = serde_json::from_str(r#"{"prompt_tokens":10}"#).unwrap();
         assert_eq!(none.cache_read(), 0);

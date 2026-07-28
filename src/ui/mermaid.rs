@@ -14,13 +14,31 @@ struct Edge {
 pub fn render(source: &str, width: usize) -> Option<String> {
     let first = source.lines().find(|line| !line.trim().is_empty())?.trim();
     if first.starts_with("flowchart") || first.starts_with("graph ") {
-        return render_flow(source.lines().skip_while(|line| line.trim().is_empty()).skip(1), width);
+        return render_flow(
+            source
+                .lines()
+                .skip_while(|line| line.trim().is_empty())
+                .skip(1),
+            width,
+        );
     }
     if first.starts_with("stateDiagram") {
-        return render_flow(source.lines().skip_while(|line| line.trim().is_empty()).skip(1), width);
+        return render_flow(
+            source
+                .lines()
+                .skip_while(|line| line.trim().is_empty())
+                .skip(1),
+            width,
+        );
     }
     if first.starts_with("sequenceDiagram") {
-        return render_sequence(source.lines().skip_while(|line| line.trim().is_empty()).skip(1), width);
+        return render_sequence(
+            source
+                .lines()
+                .skip_while(|line| line.trim().is_empty())
+                .skip(1),
+            width,
+        );
     }
     None
 }
@@ -31,18 +49,28 @@ fn render_flow<'a>(lines: impl Iterator<Item = &'a str>, width: usize) -> Option
     let mut node_aliases = std::collections::HashMap::<String, String>::new();
     for raw in lines {
         let line = raw.trim().trim_end_matches(';');
-        if line.is_empty() || line.starts_with("%%") || line.starts_with("classDef") || line.starts_with("class ") {
+        if line.is_empty()
+            || line.starts_with("%%")
+            || line.starts_with("classDef")
+            || line.starts_with("class ")
+        {
             continue;
         }
         let (left, rest, arrow) = split_arrow(line)?;
         let (label, right) = if arrow == "-->|" {
             let close = rest.find('|')?;
-            (Some(rest[..close].trim().to_string()), rest[close + 1..].trim())
+            (
+                Some(rest[..close].trim().to_string()),
+                rest[close + 1..].trim(),
+            )
         } else if let Some(tagged) = rest.strip_prefix('|') {
             // Common Mermaid label form: `A -->|yes| B`. Since split_arrow matched `-->`
             // (the bar comes AFTER the arrow), parse the leading `|label|` here.
             let close = tagged.find('|')?;
-            (Some(tagged[..close].trim().to_string()), tagged[close + 1..].trim())
+            (
+                Some(tagged[..close].trim().to_string()),
+                tagged[close + 1..].trim(),
+            )
         } else {
             (None, rest.trim())
         };
@@ -59,7 +87,11 @@ fn render_flow<'a>(lines: impl Iterator<Item = &'a str>, width: usize) -> Option
             node_aliases.insert(to_label.clone(), to_id.clone());
             node_labels.insert(to_id.clone(), to_label);
         }
-        edges.push(Edge { from: from_id, to: to_id, label });
+        edges.push(Edge {
+            from: from_id,
+            to: to_id,
+            label,
+        });
     }
     if edges.is_empty() {
         return None;
@@ -82,7 +114,11 @@ fn render_flow<'a>(lines: impl Iterator<Item = &'a str>, width: usize) -> Option
     }
     let mut out = String::new();
     for (i, edge) in edges.iter().enumerate() {
-        let arrow = edge.label.as_deref().map(|l| format!(" ──{l}──▶ ")).unwrap_or_else(|| " ───▶ ".to_string());
+        let arrow = edge
+            .label
+            .as_deref()
+            .map(|l| format!(" ──{l}──▶ "))
+            .unwrap_or_else(|| " ───▶ ".to_string());
         let row = format!("{}{}{}", edge.from, arrow, edge.to);
         out.push_str(&truncate(&row, width));
         if i + 1 < edges.len() {
@@ -96,12 +132,20 @@ fn render_sequence<'a>(lines: impl Iterator<Item = &'a str>, width: usize) -> Op
     let mut rows = Vec::new();
     for raw in lines {
         let line = raw.trim();
-        if line.is_empty() || line.starts_with("%%") || line.starts_with("participant ") || line.starts_with("actor ") {
+        if line.is_empty()
+            || line.starts_with("%%")
+            || line.starts_with("participant ")
+            || line.starts_with("actor ")
+        {
             continue;
         }
         let (left, rest, arrow) = split_sequence_arrow(line)?;
         let (right, label) = rest.split_once(':').unwrap_or((rest, ""));
-        let glyph = if arrow.contains("--") { " - -▶ " } else { " ───▶ " };
+        let glyph = if arrow.contains("--") {
+            " - -▶ "
+        } else {
+            " ───▶ "
+        };
         let mut row = format!("{}{}{}", left.trim(), glyph, right.trim());
         if !label.trim().is_empty() {
             row.push_str(&format!("  {}", label.trim()));
@@ -121,7 +165,12 @@ fn split_arrow(line: &str) -> Option<(&str, &str, &'static str)> {
 }
 
 fn split_sequence_arrow(line: &str) -> Option<(&str, &str, &'static str)> {
-    for (pat, tag) in [("-->>", "-->>"), ("->>", "->>"), ("-->", "-->"), ("->", "->")] {
+    for (pat, tag) in [
+        ("-->>", "-->>"),
+        ("->>", "->>"),
+        ("-->", "-->"),
+        ("->", "->"),
+    ] {
         if let Some(i) = line.find(pat) {
             return Some((&line[..i], &line[i + pat.len()..], tag));
         }
@@ -131,9 +180,15 @@ fn split_sequence_arrow(line: &str) -> Option<(&str, &str, &'static str)> {
 
 fn node_parts(raw: &str) -> (String, String) {
     let t = raw.trim();
-    let id_end = t.find(['[', '(', '{']).unwrap_or_else(|| t.find(char::is_whitespace).unwrap_or(t.len()));
+    let id_end = t
+        .find(['[', '(', '{'])
+        .unwrap_or_else(|| t.find(char::is_whitespace).unwrap_or(t.len()));
     let id = t[..id_end].trim();
-    let label = if t.contains(['[', '(', '{']) { node_label(t) } else { String::new() };
+    let label = if t.contains(['[', '(', '{']) {
+        node_label(t)
+    } else {
+        String::new()
+    };
     let id = if id == "[*]" { "●" } else { id };
     (id.to_string(), label)
 }
@@ -150,7 +205,11 @@ fn node_label(raw: &str) -> String {
         }
     }
     let id = t.split_whitespace().next().unwrap_or("");
-    if id == "[*]" { "●".to_string() } else { id.to_string() }
+    if id == "[*]" {
+        "●".to_string()
+    } else {
+        id.to_string()
+    }
 }
 
 fn truncate(s: &str, width: usize) -> String {
@@ -168,7 +227,11 @@ mod tests {
 
     #[test]
     fn flowchart_renders_labels() {
-        let got = render("flowchart LR\n A[Input] --> B{Check}\n B -->|yes| C[Done]", 80).unwrap();
+        let got = render(
+            "flowchart LR\n A[Input] --> B{Check}\n B -->|yes| C[Done]",
+            80,
+        )
+        .unwrap();
         assert!(got.contains("Input ───▶ Check"), "{got}");
         assert!(got.contains("Check ──yes──▶ Done"), "{got}");
     }

@@ -25,12 +25,30 @@ pub struct Card {
 /// by slug so the rotation stays stable across releases. The index of each card is ALSO a semantic
 /// slot referenced by [`card_for_tool`] — reordering here means updating that map.
 pub const CARDS: &[Card] = &[
-    Card { title: "A layered identity", png: include_bytes!("cards/a-layered-identity.png") },
-    Card { title: "A memory that learns you", png: include_bytes!("cards/a-memory-that-learns-you.png") },
-    Card { title: "Delegate to sub-agents", png: include_bytes!("cards/delegate-to-sub-agents.png") },
-    Card { title: "Lives everywhere", png: include_bytes!("cards/lives-everywhere.png") },
-    Card { title: "Researches the web", png: include_bytes!("cards/researches-the-web.png") },
-    Card { title: "Safe autonomy", png: include_bytes!("cards/safe-autonomy.png") },
+    Card {
+        title: "A layered identity",
+        png: include_bytes!("cards/a-layered-identity.png"),
+    },
+    Card {
+        title: "A memory that learns you",
+        png: include_bytes!("cards/a-memory-that-learns-you.png"),
+    },
+    Card {
+        title: "Delegate to sub-agents",
+        png: include_bytes!("cards/delegate-to-sub-agents.png"),
+    },
+    Card {
+        title: "Lives everywhere",
+        png: include_bytes!("cards/lives-everywhere.png"),
+    },
+    Card {
+        title: "Researches the web",
+        png: include_bytes!("cards/researches-the-web.png"),
+    },
+    Card {
+        title: "Safe autonomy",
+        png: include_bytes!("cards/safe-autonomy.png"),
+    },
 ];
 
 /// The card whose feature the session most recently exercised (a sub-agent spawn, a memory write, a
@@ -47,7 +65,8 @@ pub fn card_for_tool(tool: &str) -> Option<usize> {
         // Delegation → "Delegate to sub-agents"
         "task" | "workflow" => 2,
         // Memory writes/reads → "A memory that learns you"
-        "memory_search" | "memory_profile" | "memory_ask" | "memory_write" | "memory_consolidate" => 1,
+        "memory_search" | "memory_profile" | "memory_ask" | "memory_write"
+        | "memory_consolidate" => 1,
         // Web research → "Researches the web"
         "web_search" | "web_fetch" | "web_crawl" => 4,
         // Identity/persona layers → "A layered identity"
@@ -170,13 +189,17 @@ pub fn render_cover_sixel(idx: usize, px_w: u32, px_h: u32) -> Option<String> {
         let sy = off_y + (ty * crop_h) / th_us;
         for tx in 0..tw_us {
             let sx = off_x + (tx * crop_w) / tw_us;
-            px[ty * tw_us + tx] = src[sy.min(sh as usize - 1) * sw as usize + sx.min(sw as usize - 1)];
+            px[ty * tw_us + tx] =
+                src[sy.min(sh as usize - 1) * sw as usize + sx.min(sw as usize - 1)];
         }
     }
 
     // ── Palette over the opaque pixels (median cut) ──
-    let opaque: Vec<[u8; 3]> =
-        px.iter().filter(|p| p[3] >= ALPHA_CUTOFF).map(|p| [p[0], p[1], p[2]]).collect();
+    let opaque: Vec<[u8; 3]> = px
+        .iter()
+        .filter(|p| p[3] >= ALPHA_CUTOFF)
+        .map(|p| [p[0], p[1], p[2]])
+        .collect();
     let palette = median_cut(&opaque, PALETTE);
 
     let idx_of = |c: [u8; 3]| -> usize {
@@ -383,7 +406,11 @@ mod tests {
             let decoded = decode_rgba(c.png);
             assert!(decoded.is_some(), "{} must decode as PNG", c.title);
             let (px, w, h) = decoded.unwrap();
-            assert!(w > 0 && h > 0 && px.len() == (w * h) as usize, "{} bad dims", c.title);
+            assert!(
+                w > 0 && h > 0 && px.len() == (w * h) as usize,
+                "{} bad dims",
+                c.title
+            );
             assert!(!c.title.is_empty());
         }
     }
@@ -395,7 +422,10 @@ mod tests {
         let s = render_cover_sixel(0, 200, 100).expect("encode");
         assert!(s.starts_with("\x1bP"), "must open a sixel DCS");
         assert!(s.ends_with("\x1b\\"), "must close with ST");
-        assert!(s.contains("\"1;1;200;100"), "must declare 200x100 raster attributes");
+        assert!(
+            s.contains("\"1;1;200;100"),
+            "must declare 200x100 raster attributes"
+        );
     }
 
     #[test]
@@ -429,7 +459,10 @@ mod tests {
         for (tool, needle) in cases {
             let idx = card_for_tool(tool).unwrap_or_else(|| panic!("{tool} must map to a card"));
             let title = card_title(idx).expect("mapped index must have a title");
-            assert!(title.contains(needle), "{tool} → {title:?} should mention {needle:?}");
+            assert!(
+                title.contains(needle),
+                "{tool} → {title:?} should mention {needle:?}"
+            );
         }
         // An unwired tool moves nothing.
         assert!(card_for_tool("file_read").is_none());

@@ -62,7 +62,8 @@ fn project_dir() -> PathBuf {
 
 /// All custom commands, project entries overriding global ones of the same name. Sorted by name.
 pub fn list() -> Vec<CustomCommand> {
-    let mut by_name: std::collections::BTreeMap<String, CustomCommand> = std::collections::BTreeMap::new();
+    let mut by_name: std::collections::BTreeMap<String, CustomCommand> =
+        std::collections::BTreeMap::new();
     // Global first, then project — so project insertions overwrite global on collision.
     for (dir, source) in [(global_dir(), "global"), (project_dir(), "project")] {
         for cmd in load_dir(&dir, &dir, source) {
@@ -86,7 +87,9 @@ pub fn find(name: &str) -> Option<CustomCommand> {
 /// Recursively load `*.md` under `dir`, namespacing by path relative to `base`.
 fn load_dir(dir: &Path, base: &Path, source: &'static str) -> Vec<CustomCommand> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -117,8 +120,15 @@ fn parse_file(path: &Path, base: &Path, source: &'static str) -> Option<CustomCo
     Some(CustomCommand {
         name,
         description: fm.get("description").unwrap_or("").to_string(),
-        argument_hint: fm.get("argument-hint").or_else(|| fm.get("argument_hint")).unwrap_or("").to_string(),
-        model: fm.get("model").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        argument_hint: fm
+            .get("argument-hint")
+            .or_else(|| fm.get("argument_hint"))
+            .unwrap_or("")
+            .to_string(),
+        model: fm
+            .get("model")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         body: fm.body.trim().to_string(),
         source,
     })
@@ -157,7 +167,10 @@ fn expand_files(s: &str) -> Result<String> {
     static RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?:^|\s)@([^\s`]+)").unwrap());
     // Canonicalize so `confine`'s `starts_with(base)` check (which canonicalizes the target) sees a
     // matching prefix — a bare cwd may differ from its canonical form (UNC/case) and falsely escape.
-    let root = std::env::current_dir().context("resolving cwd")?.canonicalize().context("canonicalizing cwd")?;
+    let root = std::env::current_dir()
+        .context("resolving cwd")?
+        .canonicalize()
+        .context("canonicalizing cwd")?;
     let mut out = String::with_capacity(s.len());
     let mut last = 0;
     for cap in RE.captures_iter(s) {
@@ -167,7 +180,9 @@ fn expand_files(s: &str) -> Result<String> {
         let lead = &whole.as_str()[..whole.as_str().len() - path.len() - 1];
         out.push_str(&s[last..whole.start()]);
         out.push_str(lead);
-        match crate::agent::builtin::confine(&root, path, true).and_then(|p| Ok(std::fs::read_to_string(p)?)) {
+        match crate::agent::builtin::confine(&root, path, true)
+            .and_then(|p| Ok(std::fs::read_to_string(p)?))
+        {
             Ok(content) => {
                 out.push_str(&format!("\n```{path}\n{}\n```\n", content.trim_end()));
             }
@@ -185,7 +200,10 @@ fn expand_files(s: &str) -> Result<String> {
 /// blocked or non-read-only commands are refused with the reason (never executed silently).
 fn expand_shell(s: &str) -> Result<String> {
     static RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"!`([^`]+)`").unwrap());
-    let root = std::env::current_dir().context("resolving cwd")?.canonicalize().context("canonicalizing cwd")?;
+    let root = std::env::current_dir()
+        .context("resolving cwd")?
+        .canonicalize()
+        .context("canonicalizing cwd")?;
     let mut out = String::with_capacity(s.len());
     let mut last = 0;
     for cap in RE.captures_iter(s) {
@@ -264,8 +282,16 @@ pub fn summary() -> Option<String> {
     }
     let mut s = String::from("Your custom commands (drop a markdown file in ~/.aizen/commands/ or ./.aizen/commands/):\n");
     for c in &cmds {
-        let hint = if c.argument_hint.is_empty() { String::new() } else { format!(" {}", c.argument_hint) };
-        let desc = if c.description.is_empty() { String::new() } else { format!("  —  {}", c.description) };
+        let hint = if c.argument_hint.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", c.argument_hint)
+        };
+        let desc = if c.description.is_empty() {
+            String::new()
+        } else {
+            format!("  —  {}", c.description)
+        };
         s.push_str(&format!("  /{}{}  [{}]{}\n", c.name, hint, c.source, desc));
     }
     Some(s.trim_end().to_string())
@@ -289,7 +315,10 @@ mod tests {
     #[test]
     fn expands_arguments_and_positionals() {
         let c = cmd("PR #$1 by $2 — all: $ARGUMENTS");
-        assert_eq!(expand(&c, "42 alice extra").unwrap(), "PR #42 by alice — all: 42 alice extra");
+        assert_eq!(
+            expand(&c, "42 alice extra").unwrap(),
+            "PR #42 by alice — all: 42 alice extra"
+        );
     }
 
     #[test]
@@ -303,7 +332,10 @@ mod tests {
         // Reference this very test file via a relative path from cwd (the crate root in tests).
         let c = cmd("see @Cargo.toml here");
         let out = expand(&c, "").unwrap();
-        assert!(out.contains("```Cargo.toml"), "should fence the file; got:\n{out}");
+        assert!(
+            out.contains("```Cargo.toml"),
+            "should fence the file; got:\n{out}"
+        );
         assert!(out.contains("aizen"), "should inline Cargo.toml contents");
 
         // A `@word` that isn't a readable file passes through unchanged (doesn't corrupt prose).
@@ -326,10 +358,16 @@ mod tests {
         // A read-only command (git status-shaped) is allowed; an `rm -rf /` is blocked.
         let blocked = cmd("danger: !`rm -rf /`");
         let e = expand(&blocked, "").unwrap_err().to_string();
-        assert!(e.contains("safety floor"), "rm -rf / must be refused; got: {e}");
+        assert!(
+            e.contains("safety floor"),
+            "rm -rf / must be refused; got: {e}"
+        );
 
         // A clearly non-read-only but non-blocked command → Ask → refused (not auto-run).
         let ask = cmd("!`npm install left-pad`");
-        assert!(expand(&ask, "").unwrap_err().to_string().contains("not auto-runnable"));
+        assert!(expand(&ask, "")
+            .unwrap_err()
+            .to_string()
+            .contains("not auto-runnable"));
     }
 }

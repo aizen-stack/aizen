@@ -100,7 +100,12 @@ impl LspStatus {
             } else {
                 "indexing…"
             };
-            s.push_str(&format!("  {} [{}]  {}\n", sv.lang, state, sv.root.display()));
+            s.push_str(&format!(
+                "  {} [{}]  {}\n",
+                sv.lang,
+                state,
+                sv.root.display()
+            ));
         }
         s.trim_end().to_string()
     }
@@ -153,7 +158,8 @@ impl LspManager {
 
     /// Set the per-request timeout (seconds, min 1). Called from config at startup / `/lsp on`.
     pub fn set_request_timeout(&self, secs: u64) {
-        self.request_timeout_secs.store(secs.max(1), Ordering::Relaxed);
+        self.request_timeout_secs
+            .store(secs.max(1), Ordering::Relaxed);
     }
 
     fn request_timeout(&self) -> Duration {
@@ -174,7 +180,10 @@ impl LspManager {
             *guard = Some(rt);
         }
         // Fresh session semantics: `/lsp restart` (disable+enable) also resets the give-up counters.
-        self.restarts.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.restarts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.enabled.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -190,8 +199,15 @@ impl LspManager {
             .drain()
             .map(|(_, v)| v)
             .collect();
-        self.restarts.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        let rt = self.runtime.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.restarts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let rt = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         // Teardown blocks (the graceful shutdown handshake + dropping the runtime waits on its
         // workers) and must not run inside another runtime — hand it to a plain OS thread.
         std::thread::spawn(move || {
@@ -223,7 +239,10 @@ impl LspManager {
                 alive: s.is_alive(),
             })
             .collect();
-        LspStatus { enabled: self.is_enabled(), servers }
+        LspStatus {
+            enabled: self.is_enabled(),
+            servers,
+        }
     }
 
     /// Find references to `symbol` (by NAME) within the project that owns `anchor` (a file in the
@@ -233,7 +252,9 @@ impl LspManager {
         let sym = symbol.to_string();
         let hint = anchor.is_file().then(|| anchor.to_path_buf());
         self.run_query(anchor, "references", move |s| async move {
-            let hits = s.references_by_name(hint.as_deref(), &sym, include_decl).await?;
+            let hits = s
+                .references_by_name(hint.as_deref(), &sym, include_decl)
+                .await?;
             Ok(format_hits(&s.root, &sym, &hits))
         })
     }
@@ -271,7 +292,9 @@ impl LspManager {
     /// renders its own compact skeleton instead of the tool's outline).
     pub fn document_symbols_items(&self, file: &Path) -> Result<Vec<DocSym>> {
         let f = file.to_path_buf();
-        self.run_query(file, "documentSymbol", move |s| async move { s.document_symbols(&f).await })
+        self.run_query(file, "documentSymbol", move |s| async move {
+            s.document_symbols(&f).await
+        })
     }
 
     /// Project-wide fuzzy symbol search by name (`max` caps the rendered hits).
@@ -349,8 +372,9 @@ impl LspManager {
         let body = text.to_string();
         let hint = anchor.is_file().then(|| anchor.to_path_buf());
         self.run_query(anchor, "symbolInsert", move |s| async move {
-            let (path, at, new_text, base_fingerprint) =
-                s.insert_relative_to_symbol(hint.as_deref(), &sym, where_, &body).await?;
+            let (path, at, new_text, base_fingerprint) = s
+                .insert_relative_to_symbol(hint.as_deref(), &sym, where_, &body)
+                .await?;
             Ok(SymbolEditPlan {
                 path,
                 start_line: at,
@@ -382,7 +406,12 @@ impl LspManager {
         let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
         let (spec, root) = discovery::detect(&file)?;
         let key = format!("{}\0{}", spec.lang, root.display());
-        let server = self.servers.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
+        let server = self
+            .servers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned();
         let Some(server) = server else {
             self.warm_spawn(spec, root); // folds activate from the NEXT edit onward
             return None;
@@ -405,7 +434,10 @@ impl LspManager {
                 _ => None,
             });
         });
-        let items = rx.recv_timeout(Duration::from_millis(3_500)).ok().flatten()?;
+        let items = rx
+            .recv_timeout(Duration::from_millis(3_500))
+            .ok()
+            .flatten()?;
 
         let fingerprints: std::collections::HashSet<String> =
             items.iter().map(diag_fingerprint).collect();
@@ -415,7 +447,10 @@ impl LspManager {
             let prev = base.get(&file);
             had_baseline = prev.is_some();
             let fresh: Vec<&DiagItem> = match prev {
-                Some(prev) => items.iter().filter(|d| !prev.contains(&diag_fingerprint(d))).collect(),
+                Some(prev) => items
+                    .iter()
+                    .filter(|d| !prev.contains(&diag_fingerprint(d)))
+                    .collect(),
                 // First edit with no baseline: report only ERRORS (a pre-existing warning wall
                 // must not spam), labeled `current` not `new`.
                 None => items.iter().filter(|d| d.severity == "error").collect(),
@@ -430,7 +465,10 @@ impl LspManager {
     fn update_baseline(&self, file: &Path, items: &[DiagItem]) {
         let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
         let fp = items.iter().map(diag_fingerprint).collect();
-        self.diag_baseline.lock().unwrap_or_else(|e| e.into_inner()).insert(file, fp);
+        self.diag_baseline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(file, fp);
     }
 
     /// Fire-and-forget server spawn (a throwaway OS thread carries the blocking handshake) so the
@@ -456,7 +494,10 @@ impl LspManager {
             bail!("LSP is off — enable it with `/lsp on`");
         }
         let (spec, root) = discovery::detect(anchor).ok_or_else(|| {
-            anyhow!("no supported language project found at/above {}", anchor.display())
+            anyhow!(
+                "no supported language project found at/above {}",
+                anchor.display()
+            )
         })?;
         let timeout = self.request_timeout();
         let handle = self.handle()?;
@@ -505,11 +546,21 @@ impl LspManager {
                 }
                 // Dead server: evict + count the respawn (bounded — never a restart storm).
                 servers.remove(&key);
-                *self.restarts.lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_insert(0) += 1;
+                *self
+                    .restarts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(key.clone())
+                    .or_insert(0) += 1;
             }
         }
-        let respawns =
-            self.restarts.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied().unwrap_or(0);
+        let respawns = self
+            .restarts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
         if respawns > MAX_RESPAWNS {
             bail!(
                 "the {} language server crashed repeatedly — disabled for this session (`/lsp restart` to reset)",
@@ -546,7 +597,9 @@ fn rel_display(root: &Path, path: &Path) -> PathBuf {
         return r.to_path_buf();
     }
     let norm = |p: &Path| {
-        p.to_string_lossy().trim_start_matches(r"\\?\").replace('/', r"\")
+        p.to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .replace('/', r"\")
     };
     let (r, p) = (norm(root), norm(path));
     if cfg!(windows) && p.len() > r.len() && p[..r.len()].eq_ignore_ascii_case(&r) {
@@ -587,8 +640,13 @@ fn format_hits(root: &Path, symbol: &str, hits: &[RefHit]) -> String {
 /// Render a definition: header line + the definition source, fenced for readability.
 fn format_def(root: &Path, symbol: &str, def: &DefHit) -> String {
     let rel = rel_display(root, &def.path);
-    let mut out =
-        format!("definition of '{}' — {}:{}:{}\n", symbol, rel.display(), def.line + 1, def.col + 1);
+    let mut out = format!(
+        "definition of '{}' — {}:{}:{}\n",
+        symbol,
+        rel.display(),
+        def.line + 1,
+        def.col + 1
+    );
     out.push_str(&def.source);
     if def.truncated {
         out.push_str("\n  … (truncated — read the file for the rest)");
@@ -617,7 +675,11 @@ const HOVER_MAX_LINES: usize = 24;
 fn format_hover(root: &Path, symbol: &str, hit: &HoverHit) -> String {
     let rel = rel_display(root, &hit.path);
     if hit.text.is_empty() {
-        return format!("no hover info for '{symbol}' ({}:{})", rel.display(), hit.line + 1);
+        return format!(
+            "no hover info for '{symbol}' ({}:{})",
+            rel.display(),
+            hit.line + 1
+        );
     }
     let mut lines: Vec<&str> = hit.text.lines().collect();
     let truncated = lines.len() > HOVER_MAX_LINES;
@@ -626,19 +688,34 @@ fn format_hover(root: &Path, symbol: &str, hit: &HoverHit) -> String {
     if truncated {
         body.push_str("\n  … (truncated — use read_symbol for the full body)");
     }
-    format!("hover '{}' — {}:{}\n{}", hit.name, rel.display(), hit.line + 1, body)
+    format!(
+        "hover '{}' — {}:{}\n{}",
+        hit.name,
+        rel.display(),
+        hit.line + 1,
+        body
+    )
 }
 
 /// Render a file outline with indentation showing nesting.
 fn format_doc_symbols(root: &Path, file: &Path, syms: &[DocSym]) -> String {
     let rel = rel_display(root, file);
     if syms.is_empty() {
-        return format!("no symbols found in {} (empty file or unsupported)", rel.display());
+        return format!(
+            "no symbols found in {} (empty file or unsupported)",
+            rel.display()
+        );
     }
     const MAX: usize = 200;
     let mut out = format!("{} symbol(s) in {}:\n", syms.len(), rel.display());
     for s in syms.iter().take(MAX) {
-        out.push_str(&format!("  {}{} {}  :{}\n", "  ".repeat(s.depth), s.kind, s.name, s.line + 1));
+        out.push_str(&format!(
+            "  {}{} {}  :{}\n",
+            "  ".repeat(s.depth),
+            s.kind,
+            s.name,
+            s.line + 1
+        ));
     }
     if syms.len() > MAX {
         out.push_str(&format!("  … (+{} more)\n", syms.len() - MAX));
@@ -656,12 +733,21 @@ fn format_ws_symbols(root: &Path, query: &str, syms: &[WsSym], max: usize) -> St
     for s in syms.iter().take(max) {
         let rel = rel_display(root, &s.path);
         match s.line {
-            Some(l) => out.push_str(&format!("  {} {}  {}:{}\n", s.kind, s.name, rel.display(), l + 1)),
+            Some(l) => out.push_str(&format!(
+                "  {} {}  {}:{}\n",
+                s.kind,
+                s.name,
+                rel.display(),
+                l + 1
+            )),
             None => out.push_str(&format!("  {} {}  {}\n", s.kind, s.name, rel.display())),
         }
     }
     if syms.len() > max {
-        out.push_str(&format!("  … (+{} more — narrow the query)\n", syms.len() - max));
+        out.push_str(&format!(
+            "  … (+{} more — narrow the query)\n",
+            syms.len() - max
+        ));
     }
     out.trim_end().to_string()
 }
@@ -671,8 +757,20 @@ fn format_ws_symbols(root: &Path, query: &str, syms: &[WsSym], max: usize) -> St
 /// edit shifts every line below it, so a positional identity would mark every pre-existing
 /// diagnostic "new" after each edit.
 fn diag_fingerprint(d: &DiagItem) -> String {
-    let first: String = d.message.lines().next().unwrap_or("").chars().take(120).collect();
-    format!("{}|{}|{}", d.severity, d.code.as_deref().unwrap_or(""), first)
+    let first: String = d
+        .message
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(120)
+        .collect();
+    format!(
+        "{}|{}|{}",
+        d.severity,
+        d.code.as_deref().unwrap_or(""),
+        first
+    )
 }
 
 /// The post-edit fold block appended to an edit result. `had_baseline` picks the honest label:
@@ -684,12 +782,29 @@ fn format_edit_feedback(items: &[&DiagItem], had_baseline: bool) -> String {
     let label = if had_baseline { "new" } else { "current" };
     let mut s = format!("[lsp] {} {label} diagnostic(s) after edit:", items.len());
     for d in items.iter().take(5) {
-        let first: String = d.message.lines().next().unwrap_or("").chars().take(140).collect();
-        let code = d.code.as_deref().map(|c| format!(" [{c}]")).unwrap_or_default();
-        s.push_str(&format!("\n  {} {}:{}  {first}{code}", d.severity, d.line, d.col));
+        let first: String = d
+            .message
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(140)
+            .collect();
+        let code = d
+            .code
+            .as_deref()
+            .map(|c| format!(" [{c}]"))
+            .unwrap_or_default();
+        s.push_str(&format!(
+            "\n  {} {}:{}  {first}{code}",
+            d.severity, d.line, d.col
+        ));
     }
     if items.len() > 5 {
-        s.push_str(&format!("\n  (+{} more — run lsp_diagnostics for the full list)", items.len() - 5));
+        s.push_str(&format!(
+            "\n  (+{} more — run lsp_diagnostics for the full list)",
+            items.len() - 5
+        ));
     }
     s
 }
@@ -712,9 +827,25 @@ fn format_diagnostics(root: &Path, file: &Path, items: &[DiagItem]) -> String {
     for d in items.iter().take(MAX) {
         let first_line = d.message.lines().next().unwrap_or("");
         let msg: String = first_line.chars().take(300).collect();
-        let more = if d.message.lines().count() > 1 { " …" } else { "" };
-        let code = d.code.as_deref().map(|c| format!(" [{c}]")).unwrap_or_default();
-        out.push_str(&format!("  {} {}:{}  {}{}{}\n", d.severity, d.line + 1, d.col + 1, msg, more, code));
+        let more = if d.message.lines().count() > 1 {
+            " …"
+        } else {
+            ""
+        };
+        let code = d
+            .code
+            .as_deref()
+            .map(|c| format!(" [{c}]"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "  {} {}:{}  {}{}{}\n",
+            d.severity,
+            d.line + 1,
+            d.col + 1,
+            msg,
+            more,
+            code
+        ));
     }
     if items.len() > MAX {
         out.push_str(&format!("  … (+{} more)\n", items.len() - MAX));
@@ -733,35 +864,59 @@ mod tests {
     /// full path and the `a.rs`-shaped assertions below fail on the unix CI jobs while staying green
     /// locally. Build both sides of the comparison the same way and the tests hold everywhere.
     fn tpath(root: &str, rest: &str) -> PathBuf {
-        let mut p =
-            PathBuf::from(if cfg!(windows) { format!(r"C:\{root}") } else { format!("/{root}") });
+        let mut p = PathBuf::from(if cfg!(windows) {
+            format!(r"C:\{root}")
+        } else {
+            format!("/{root}")
+        });
         p.extend(rest.split('/').filter(|s| !s.is_empty()));
         p
     }
 
     fn diag(sev: &'static str, line: usize, msg: &str, code: Option<&str>) -> DiagItem {
-        DiagItem { line, col: 1, severity: sev, message: msg.into(), code: code.map(String::from) }
+        DiagItem {
+            line,
+            col: 1,
+            severity: sev,
+            message: msg.into(),
+            code: code.map(String::from),
+        }
     }
 
     #[test]
     fn diag_fingerprint_ignores_line_numbers() {
         let a = diag("error", 10, "cannot find value `x`", Some("E0425"));
         let b = diag("error", 99, "cannot find value `x`", Some("E0425"));
-        assert_eq!(diag_fingerprint(&a), diag_fingerprint(&b), "same diagnostic, shifted lines");
+        assert_eq!(
+            diag_fingerprint(&a),
+            diag_fingerprint(&b),
+            "same diagnostic, shifted lines"
+        );
         let c = diag("warning", 10, "cannot find value `x`", Some("E0425"));
-        assert_ne!(diag_fingerprint(&a), diag_fingerprint(&c), "severity is identity");
+        assert_ne!(
+            diag_fingerprint(&a),
+            diag_fingerprint(&c),
+            "severity is identity"
+        );
     }
 
     #[test]
     fn edit_feedback_formats_cap_and_labels() {
-        let items: Vec<DiagItem> =
-            (0..8).map(|i| diag("error", i, &format!("problem {i}"), None)).collect();
+        let items: Vec<DiagItem> = (0..8)
+            .map(|i| diag("error", i, &format!("problem {i}"), None))
+            .collect();
         let refs: Vec<&DiagItem> = items.iter().collect();
         let s = format_edit_feedback(&refs, true);
-        assert!(s.starts_with("[lsp] 8 new diagnostic(s) after edit:"), "{s}");
+        assert!(
+            s.starts_with("[lsp] 8 new diagnostic(s) after edit:"),
+            "{s}"
+        );
         assert!(s.contains("(+3 more"), "capped at 5: {s}");
         let s2 = format_edit_feedback(&refs[..1], false);
-        assert!(s2.contains("1 current diagnostic"), "no baseline → honest 'current' label: {s2}");
+        assert!(
+            s2.contains("1 current diagnostic"),
+            "no baseline → honest 'current' label: {s2}"
+        );
         assert_eq!(format_edit_feedback(&[], true), "[lsp] no new diagnostics");
     }
 
@@ -792,8 +947,14 @@ mod tests {
         ];
         let out = format_hits(Path::new(r"C:\proj"), "foo", &hits);
         assert!(out.contains("2 reference(s) to 'foo'"), "{out}");
-        assert!(out.contains(r"a.rs:42:9  [in fn run_loop]  foo();"), "enclosing shown: {out}");
-        assert!(out.contains(r"b.rs:3:5  use crate::foo;"), "no bracket when None: {out}");
+        assert!(
+            out.contains(r"a.rs:42:9  [in fn run_loop]  foo();"),
+            "enclosing shown: {out}"
+        );
+        assert!(
+            out.contains(r"b.rs:3:5  use crate::foo;"),
+            "no bracket when None: {out}"
+        );
         assert!(!out.contains("[in  ]"), "no empty bracket: {out}");
     }
 
@@ -802,7 +963,7 @@ mod tests {
         // Plain prefix → strip_prefix path.
         assert_eq!(
             rel_display(&tpath("proj", ""), &tpath("proj", "src/a.rs")),
-            [ "src", "a.rs" ].iter().collect::<PathBuf>()
+            ["src", "a.rs"].iter().collect::<PathBuf>()
         );
         if cfg!(windows) {
             // Canonicalized root (`\\?\C:\…`) vs lowercase-drive server path (`c:\…`). Windows-only
@@ -831,7 +992,10 @@ mod tests {
         assert!(out.contains(":10:5"), "1-based position: {out}");
         assert!(out.contains("pub struct Foo"), "{out}");
         assert!(!out.contains("truncated"), "{out}");
-        let def_t = DefHit { truncated: true, ..def };
+        let def_t = DefHit {
+            truncated: true,
+            ..def
+        };
         assert!(format_def(Path::new(r"C:\proj"), "Foo", &def_t).contains("truncated"));
     }
 
@@ -865,29 +1029,60 @@ mod tests {
         assert!(out.starts_with("hover 'Foo' — "), "{out}");
         assert!(out.contains(":10\n"), "1-based line: {out}");
         assert!(out.contains("pub struct Foo"), "signature present: {out}");
-        assert!(!out.contains("truncated"), "short hover not truncated: {out}");
+        assert!(
+            !out.contains("truncated"),
+            "short hover not truncated: {out}"
+        );
         // Over-cap hover → truncated marker pointing at read_symbol.
-        let long = (0..HOVER_MAX_LINES + 5).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
-        let hit_long = HoverHit { text: long, ..hit.clone() };
+        let long = (0..HOVER_MAX_LINES + 5)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hit_long = HoverHit {
+            text: long,
+            ..hit.clone()
+        };
         let out_long = format_hover(Path::new(r"C:\proj"), "Foo", &hit_long);
-        assert!(out_long.contains("truncated — use read_symbol"), "{out_long}");
+        assert!(
+            out_long.contains("truncated — use read_symbol"),
+            "{out_long}"
+        );
         // Empty hover → honest "no hover info" with location.
-        let hit_empty = HoverHit { text: String::new(), ..hit };
+        let hit_empty = HoverHit {
+            text: String::new(),
+            ..hit
+        };
         let out_empty = format_hover(Path::new(r"C:\proj"), "Foo", &hit_empty);
-        assert!(out_empty.starts_with("no hover info for 'Foo'"), "{out_empty}");
+        assert!(
+            out_empty.starts_with("no hover info for 'Foo'"),
+            "{out_empty}"
+        );
     }
 
     #[test]
     fn outline_formatting_indents_by_depth() {
         let syms = vec![
-            DocSym { name: "Outer".into(), kind: "struct", line: 0, depth: 0 },
-            DocSym { name: "field".into(), kind: "field", line: 1, depth: 1 },
+            DocSym {
+                name: "Outer".into(),
+                kind: "struct",
+                line: 0,
+                depth: 0,
+            },
+            DocSym {
+                name: "field".into(),
+                kind: "field",
+                line: 1,
+                depth: 1,
+            },
         ];
         let (root, file) = (tpath("p", ""), tpath("p", "a.rs"));
         let out = format_doc_symbols(&root, &file, &syms);
         assert!(out.contains("2 symbol(s) in a.rs"), "{out}");
         assert!(out.contains("  struct Outer  :1"), "{out}");
-        assert!(out.contains("    field field  :2"), "depth-1 gets deeper indent: {out}");
+        assert!(
+            out.contains("    field field  :2"),
+            "depth-1 gets deeper indent: {out}"
+        );
         let empty = format_doc_symbols(&root, &file, &[]);
         assert!(empty.contains("no symbols"), "{empty}");
     }
@@ -913,13 +1108,31 @@ mod tests {
     #[test]
     fn diagnostics_formatting() {
         let items = vec![
-            DiagItem { line: 2, col: 0, severity: "error", message: "mismatched types\nexpected u32".into(), code: Some("E0308".into()) },
-            DiagItem { line: 5, col: 3, severity: "warning", message: "unused variable".into(), code: None },
+            DiagItem {
+                line: 2,
+                col: 0,
+                severity: "error",
+                message: "mismatched types\nexpected u32".into(),
+                code: Some("E0308".into()),
+            },
+            DiagItem {
+                line: 5,
+                col: 3,
+                severity: "warning",
+                message: "unused variable".into(),
+                code: None,
+            },
         ];
         let (root, file) = (tpath("p", ""), tpath("p", "a.rs"));
         let out = format_diagnostics(&root, &file, &items);
-        assert!(out.contains("2 diagnostic(s) for a.rs (1 error, 1 warning)"), "{out}");
-        assert!(out.contains("error 3:1  mismatched types … [E0308]"), "first line only + code: {out}");
+        assert!(
+            out.contains("2 diagnostic(s) for a.rs (1 error, 1 warning)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("error 3:1  mismatched types … [E0308]"),
+            "first line only + code: {out}"
+        );
         assert!(out.contains("warning 6:4  unused variable"), "{out}");
         assert!(format_diagnostics(&root, &file, &[]).contains("clean"));
     }
@@ -947,24 +1160,46 @@ mod itest {
         // `AgentConfig` is referenced across many files of this crate → exercises cross-file refs.
         let anchor = Path::new("src/agent/mod.rs");
 
-        let refs = LSP.references(anchor, "AgentConfig", true).expect("references query failed");
+        let refs = LSP
+            .references(anchor, "AgentConfig", true)
+            .expect("references query failed");
         eprintln!("--- lsp_references(AgentConfig) ---\n{refs}\n---");
-        assert!(refs.contains("reference(s) to 'AgentConfig'"), "unexpected output:\n{refs}");
+        assert!(
+            refs.contains("reference(s) to 'AgentConfig'"),
+            "unexpected output:\n{refs}"
+        );
 
-        let def = LSP.definition(anchor, "AgentConfig").expect("definition query failed");
+        let def = LSP
+            .definition(anchor, "AgentConfig")
+            .expect("definition query failed");
         eprintln!("--- lsp_definition(AgentConfig) ---\n{def}\n---");
-        assert!(def.contains("definition of 'AgentConfig'"), "unexpected output:\n{def}");
-        assert!(def.contains("pub struct AgentConfig"), "definition source inline:\n{def}");
+        assert!(
+            def.contains("definition of 'AgentConfig'"),
+            "unexpected output:\n{def}"
+        );
+        assert!(
+            def.contains("pub struct AgentConfig"),
+            "definition source inline:\n{def}"
+        );
 
-        let outline = LSP.document_symbols(Path::new("src/agent/lsp/mod.rs")).expect("outline failed");
+        let outline = LSP
+            .document_symbols(Path::new("src/agent/lsp/mod.rs"))
+            .expect("outline failed");
         eprintln!("--- lsp_document_symbols(lsp/mod.rs) ---\n{outline}\n---");
-        assert!(outline.contains("LspManager"), "unexpected outline:\n{outline}");
+        assert!(
+            outline.contains("LspManager"),
+            "unexpected outline:\n{outline}"
+        );
 
-        let ws = LSP.workspace_symbols(anchor, "LspManager", 30).expect("workspace symbols failed");
+        let ws = LSP
+            .workspace_symbols(anchor, "LspManager", 30)
+            .expect("workspace symbols failed");
         eprintln!("--- lsp_workspace_symbol(LspManager) ---\n{ws}\n---");
         assert!(ws.contains("LspManager"), "unexpected output:\n{ws}");
 
-        let diags = LSP.diagnostics(Path::new("src/agent/lsp/mod.rs")).expect("diagnostics failed");
+        let diags = LSP
+            .diagnostics(Path::new("src/agent/lsp/mod.rs"))
+            .expect("diagnostics failed");
         eprintln!("--- lsp_diagnostics(lsp/mod.rs) ---\n{diags}\n---");
         assert!(
             diags.contains("diagnostic(s) for") || diags.contains("clean"),

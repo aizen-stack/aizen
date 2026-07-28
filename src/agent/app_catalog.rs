@@ -20,7 +20,10 @@ use serde_json::{json, Map, Value};
 pub const DEFAULT_REGISTRY: &str = "https://registry.modelcontextprotocol.io";
 
 pub fn registry_base() -> String {
-    std::env::var("NG_MCP_REGISTRY").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| DEFAULT_REGISTRY.to_string())
+    std::env::var("NG_MCP_REGISTRY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_REGISTRY.to_string())
 }
 
 // ───────────────────────────── registry schema (the subset we use) ─────────────────────────────
@@ -124,7 +127,10 @@ impl RegistryServer {
     /// Compact transport tag for the picker: `local·npx` / `sign-in` / `hosted` / `—`.
     pub fn transport_tag(&self) -> String {
         match pick_transport(self) {
-            Some(TransportChoice::Package(i)) => format!("local·{}", self.packages.get(i).map(|p| p.runner()).unwrap_or("local")),
+            Some(TransportChoice::Package(i)) => format!(
+                "local·{}",
+                self.packages.get(i).map(|p| p.runner()).unwrap_or("local")
+            ),
             Some(TransportChoice::OAuthRemote(_)) => "sign-in".to_string(),
             Some(TransportChoice::Remote(_)) => "hosted".to_string(),
             None => "—".to_string(),
@@ -135,28 +141,55 @@ impl RegistryServer {
     /// reverse-DNS prefix noise): `io.github.n24q02m/better-notion-mcp` → `n24q02m/better-notion-mcp`.
     pub fn short_name(&self) -> String {
         match self.name.split_once('/') {
-            Some((publisher, rest)) => format!("{}/{rest}", publisher.rsplit('.').next().unwrap_or(publisher)),
+            Some((publisher, rest)) => format!(
+                "{}/{rest}",
+                publisher.rsplit('.').next().unwrap_or(publisher)
+            ),
             None => self.name.clone(),
         }
     }
 
     /// A short, human one-liner for search lists.
     pub fn summary_line(&self) -> String {
-        let what = if !self.title.is_empty() { &self.title } else { &self.name };
+        let what = if !self.title.is_empty() {
+            &self.title
+        } else {
+            &self.name
+        };
         let desc: String = self.description.chars().take(80).collect();
         let via = match pick_transport(self) {
             Some(TransportChoice::Remote(i)) => {
-                format!("hosted remote @ {}", self.remotes.get(i).map(|r| host_of(&r.url)).unwrap_or_default())
+                format!(
+                    "hosted remote @ {}",
+                    self.remotes
+                        .get(i)
+                        .map(|r| host_of(&r.url))
+                        .unwrap_or_default()
+                )
             }
             Some(TransportChoice::Package(i)) => {
-                format!("local · {}", self.packages.get(i).map(|p| p.runner()).unwrap_or("local"))
+                format!(
+                    "local · {}",
+                    self.packages.get(i).map(|p| p.runner()).unwrap_or("local")
+                )
             }
             Some(TransportChoice::OAuthRemote(i)) => {
-                format!("sign in @ {}", self.remotes.get(i).map(|r| host_of(&r.url)).unwrap_or_default())
+                format!(
+                    "sign in @ {}",
+                    self.remotes
+                        .get(i)
+                        .map(|r| host_of(&r.url))
+                        .unwrap_or_default()
+                )
             }
             None => "⚠ not connectable (legacy sse only)".to_string(),
         };
-        let ver = self.version.as_deref().filter(|v| !v.is_empty()).map(|v| format!(" v{v}")).unwrap_or_default();
+        let ver = self
+            .version
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .map(|v| format!(" v{v}"))
+            .unwrap_or_default();
         format!("{what}{ver} [{via}] — {desc}")
     }
 }
@@ -230,14 +263,26 @@ pub fn pick_transport(s: &RegistryServer) -> Option<TransportChoice> {
 /// The host (authority) of a URL — shows WHO hosts a remote server (so a third-party gateway is
 /// visible at a glance, e.g. `spotify.api.trendsmcp.ai`).
 pub fn host_of(url: &str) -> String {
-    url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or(url).to_string()
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url)
+        .to_string()
 }
 
 /// Is a runner (npx/uvx/docker/dnx) actually on PATH? Windows adds the shim extensions. Used so the
 /// installer doesn't pick a package the user can't run when a remote (or another package) would work.
 pub fn runner_available(runner: &str) -> bool {
-    let exts: &[&str] = if cfg!(windows) { &["", ".cmd", ".exe", ".bat"] } else { &[""] };
-    let Some(path) = std::env::var_os("PATH") else { return false };
+    let exts: &[&str] = if cfg!(windows) {
+        &["", ".cmd", ".exe", ".bat"]
+    } else {
+        &[""]
+    };
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
     for dir in std::env::split_paths(&path) {
         for ext in exts {
             if dir.join(format!("{runner}{ext}")).is_file() {
@@ -254,7 +299,11 @@ pub fn runner_available(runner: &str) -> bool {
 /// (logical viability, used by search/list) while the install never silently picks an unrunnable one.
 pub fn pick_transport_for_install(s: &RegistryServer) -> Option<TransportChoice> {
     for ty in ["npm", "pypi", "oci", "nuget"] {
-        if let Some(i) = s.packages.iter().position(|p| p.registry_type == ty && runner_available(p.runner())) {
+        if let Some(i) = s
+            .packages
+            .iter()
+            .position(|p| p.registry_type == ty && runner_available(p.runner()))
+        {
             return Some(TransportChoice::Package(i));
         }
     }
@@ -297,7 +346,11 @@ fn http() -> Result<reqwest::Client> {
 /// Tolerantly pull server objects out of a `/v0/servers` body: items are wrapped as
 /// `{ "server": {...}, "_meta": {...} }`, but accept a flat `{...}` entry too.
 fn parse_servers(body: &Value) -> Vec<RegistryServer> {
-    let arr = body.get("servers").and_then(|s| s.as_array()).cloned().unwrap_or_default();
+    let arr = body
+        .get("servers")
+        .and_then(|s| s.as_array())
+        .cloned()
+        .unwrap_or_default();
     arr.into_iter()
         .filter_map(|item| {
             let obj = item.get("server").cloned().unwrap_or(item);
@@ -323,12 +376,20 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<RegistryServer>> {
     let mut out: Vec<RegistryServer> = Vec::new();
     let mut cursor: Option<String> = None;
     for _page in 0..6 {
-        let mut q: Vec<(&str, String)> =
-            vec![("search", query.to_string()), ("version", "latest".to_string()), ("limit", per_page.clone())];
+        let mut q: Vec<(&str, String)> = vec![
+            ("search", query.to_string()),
+            ("version", "latest".to_string()),
+            ("limit", per_page.clone()),
+        ];
         if let Some(c) = &cursor {
             q.push(("cursor", c.clone()));
         }
-        let resp = client.get(&url).query(&q).send().await.with_context(|| format!("searching {base}"))?;
+        let resp = client
+            .get(&url)
+            .query(&q)
+            .send()
+            .await
+            .with_context(|| format!("searching {base}"))?;
         if !resp.status().is_success() {
             bail!("registry {base} returned HTTP {}", resp.status().as_u16());
         }
@@ -337,7 +398,11 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<RegistryServer>> {
         if out.len() >= want {
             break;
         }
-        match body.get("metadata").and_then(|m| m.get("nextCursor")).and_then(|c| c.as_str()) {
+        match body
+            .get("metadata")
+            .and_then(|m| m.get("nextCursor"))
+            .and_then(|c| c.as_str())
+        {
             Some(c) if !c.is_empty() => cursor = Some(c.to_string()),
             _ => break,
         }
@@ -349,7 +414,8 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<RegistryServer>> {
 /// single highest-version entry, preserving first-seen order. Keeps `apps search` / pick lists clean.
 pub fn dedupe_latest(servers: Vec<RegistryServer>) -> Vec<RegistryServer> {
     let mut order: Vec<String> = Vec::new();
-    let mut best: std::collections::HashMap<String, RegistryServer> = std::collections::HashMap::new();
+    let mut best: std::collections::HashMap<String, RegistryServer> =
+        std::collections::HashMap::new();
     for s in servers {
         let keep = match best.get(&s.name) {
             Some(prev) => version_key(s.version.as_deref()) >= version_key(prev.version.as_deref()),
@@ -373,8 +439,16 @@ fn version_key(v: Option<&str>) -> (Vec<u64>, u8) {
     // Everything before the first '-' (pre-release) or '+' (build metadata) is the core.
     let core = raw.split(['-', '+']).next().unwrap_or(raw);
     let is_ga = !raw.contains('-'); // SemVer: a '-' introduces a pre-release identifier
-    let nums: Vec<u64> =
-        core.split('.').map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0)).collect();
+    let nums: Vec<u64> = core
+        .split('.')
+        .map(|p| {
+            p.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0)
+        })
+        .collect();
     (nums, is_ga as u8)
 }
 
@@ -396,7 +470,8 @@ pub fn pick_best(results: &[RegistryServer], prefer: &str) -> Option<RegistrySer
         .iter()
         .enumerate()
         .max_by_key(|(i, s)| {
-            let matches = s.name.to_lowercase().contains(&pref) || s.title.to_lowercase().contains(&pref);
+            let matches =
+                s.name.to_lowercase().contains(&pref) || s.title.to_lowercase().contains(&pref);
             let local = matches!(pick_transport(s), Some(TransportChoice::Package(_)));
             ((matches as u8) * 2 + local as u8, std::cmp::Reverse(*i))
         })
@@ -436,9 +511,16 @@ fn placeholders(t: &str) -> Vec<String> {
 /// Resolve one input's concrete value, asking the user for placeholders / required secrets.
 /// `Ok(None)` = optional input the user left blank (skip — never write an empty value). `Err` = a
 /// REQUIRED input left empty (so we refuse to write a broken `Authorization: ""` / empty env entry).
-fn resolve_input(inp: &KeyValueInput, ask: &mut dyn FnMut(&PromptSpec) -> String) -> Result<Option<String>> {
+fn resolve_input(
+    inp: &KeyValueInput,
+    ask: &mut dyn FnMut(&PromptSpec) -> String,
+) -> Result<Option<String>> {
     let template = inp.value.clone().or_else(|| inp.default.clone());
-    let label = if inp.name.is_empty() { "value".to_string() } else { inp.name.clone() };
+    let label = if inp.name.is_empty() {
+        "value".to_string()
+    } else {
+        inp.name.clone()
+    };
     match template {
         Some(t) if t.contains('{') => {
             let mut out = t.clone();
@@ -518,7 +600,10 @@ fn normalize_auth(header_name: &str, val: String) -> String {
 /// that is REQUIRED (or carries a `value_hint`) is PROMPTED — previously such args were silently
 /// dropped, so servers that take a required CLI arg (the official filesystem server's root path,
 /// docker image paths) launched misconfigured. `Err` if a required arg is left empty.
-fn arg_tokens(args: &[Argument], ask: &mut dyn FnMut(&PromptSpec) -> String) -> Result<Vec<String>> {
+fn arg_tokens(
+    args: &[Argument],
+    ask: &mut dyn FnMut(&PromptSpec) -> String,
+) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for a in args {
         // Resolve this arg's value.
@@ -531,14 +616,21 @@ fn arg_tokens(args: &[Argument], ask: &mut dyn FnMut(&PromptSpec) -> String) -> 
         } else if let Some(d) = &a.default {
             Some(d.clone())
         } else if a.is_required || a.value_hint.is_some() {
-            let label = a.name.clone().or_else(|| a.value_hint.clone()).unwrap_or_else(|| "argument".to_string());
+            let label = a
+                .name
+                .clone()
+                .or_else(|| a.value_hint.clone())
+                .unwrap_or_else(|| "argument".to_string());
             let v = ask(&PromptSpec {
                 label,
                 description: a.value_hint.clone().unwrap_or_default(),
                 is_secret: false,
             });
             if a.is_required && v.trim().is_empty() {
-                bail!("required argument '{}' was left empty", a.name.clone().or(a.value_hint.clone()).unwrap_or_default());
+                bail!(
+                    "required argument '{}' was left empty",
+                    a.name.clone().or(a.value_hint.clone()).unwrap_or_default()
+                );
             }
             if v.trim().is_empty() {
                 None
@@ -555,7 +647,7 @@ fn arg_tokens(args: &[Argument], ask: &mut dyn FnMut(&PromptSpec) -> String) -> 
                 out.push(v);
             }
             ("named", Some(name), None) => out.push(name.clone()), // a bare flag
-            (_, _, Some(v)) => out.push(v), // positional
+            (_, _, Some(v)) => out.push(v),                        // positional
             _ => {}
         }
     }
@@ -686,7 +778,9 @@ fn servers_key(root: &Value) -> &'static str {
 fn read_mcp_json() -> Result<Value> {
     let path = crate::agent::mcp::config_path();
     match std::fs::read_to_string(&path) {
-        Ok(s) if !s.trim().is_empty() => serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display())),
+        Ok(s) if !s.trim().is_empty() => {
+            serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display()))
+        }
         _ => Ok(json!({})),
     }
 }
@@ -700,7 +794,9 @@ fn write_mcp_json(root: &Value) -> Result<()> {
 
 /// Server keys currently present in HOME mcp.json.
 pub fn installed_keys() -> Vec<String> {
-    let Ok(root) = read_mcp_json() else { return Vec::new() };
+    let Ok(root) = read_mcp_json() else {
+        return Vec::new();
+    };
     let key = servers_key(&root);
     root.get(key)
         .and_then(|m| m.as_object())
@@ -720,7 +816,10 @@ pub fn write_server(key: &str, entry: Value) -> Result<()> {
     if !servers.is_object() {
         *servers = json!({});
     }
-    servers.as_object_mut().unwrap().insert(key.to_string(), entry);
+    servers
+        .as_object_mut()
+        .unwrap()
+        .insert(key.to_string(), entry);
     write_mcp_json(&root)
 }
 
@@ -874,7 +973,11 @@ mod tests {
                 url: "https://x/mcp".into(),
                 headers: vec![kv("Authorization", true, true, None)],
             }],
-            packages: vec![Package { registry_type: "npm".into(), identifier: "p".into(), ..Default::default() }],
+            packages: vec![Package {
+                registry_type: "npm".into(),
+                identifier: "p".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         assert_eq!(pick_transport(&s), Some(TransportChoice::Package(0)));
@@ -892,7 +995,11 @@ mod tests {
 
         // OAuth-only remote (no header), no package → now connectable via sign-in (was None before).
         let s3 = RegistryServer {
-            remotes: vec![Remote { kind: "streamable-http".into(), url: "https://x/mcp".into(), headers: vec![] }],
+            remotes: vec![Remote {
+                kind: "streamable-http".into(),
+                url: "https://x/mcp".into(),
+                headers: vec![],
+            }],
             ..Default::default()
         };
         assert_eq!(pick_transport(&s3), Some(TransportChoice::OAuthRemote(0)));
@@ -900,7 +1007,11 @@ mod tests {
 
         // legacy sse-only remote → still not connectable (our client doesn't implement two-endpoint sse)
         let s4 = RegistryServer {
-            remotes: vec![Remote { kind: "sse".into(), url: "https://x/sse".into(), headers: vec![] }],
+            remotes: vec![Remote {
+                kind: "sse".into(),
+                url: "https://x/sse".into(),
+                headers: vec![],
+            }],
             ..Default::default()
         };
         assert_eq!(pick_transport(&s4), None);
@@ -913,14 +1024,22 @@ mod tests {
         // must record `{url, auth:"oauth"}` so the caller can run the sign-in flow.
         let s = RegistryServer {
             name: "com.linear/linear".into(),
-            remotes: vec![Remote { kind: "streamable-http".into(), url: "https://mcp.linear.app/mcp".into(), headers: vec![] }],
+            remotes: vec![Remote {
+                kind: "streamable-http".into(),
+                url: "https://mcp.linear.app/mcp".into(),
+                headers: vec![],
+            }],
             ..Default::default()
         };
-        let mut ask = |_: &PromptSpec| -> String { panic!("OAuth remote must not prompt for a secret") };
+        let mut ask =
+            |_: &PromptSpec| -> String { panic!("OAuth remote must not prompt for a secret") };
         let entry = build_entry(&s, TransportChoice::OAuthRemote(0), &mut ask).unwrap();
         assert_eq!(entry["url"], json!("https://mcp.linear.app/mcp"));
         assert_eq!(entry["auth"], json!("oauth"));
-        assert!(entry.get("headers").is_none(), "no headers written for an OAuth remote");
+        assert!(
+            entry.get("headers").is_none(),
+            "no headers written for an OAuth remote"
+        );
     }
 
     #[test]
@@ -955,18 +1074,37 @@ mod tests {
         let mk = |name: &str, ver: &str| RegistryServer {
             name: name.into(),
             version: Some(ver.into()),
-            packages: vec![Package { registry_type: "npm".into(), identifier: "p".into(), ..Default::default() }],
+            packages: vec![Package {
+                registry_type: "npm".into(),
+                identifier: "p".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         // numeric-aware: 1.0.10 must beat 1.0.2 (not string-compared)
-        let r = dedupe_latest(vec![mk("a/x", "1.0.1"), mk("a/x", "1.0.10"), mk("a/x", "1.0.2"), mk("b/y", "0.1.0")]);
+        let r = dedupe_latest(vec![
+            mk("a/x", "1.0.1"),
+            mk("a/x", "1.0.10"),
+            mk("a/x", "1.0.2"),
+            mk("b/y", "0.1.0"),
+        ]);
         assert_eq!(r.len(), 2);
-        assert_eq!(r.iter().find(|s| s.name == "a/x").unwrap().version.as_deref(), Some("1.0.10"));
+        assert_eq!(
+            r.iter()
+                .find(|s| s.name == "a/x")
+                .unwrap()
+                .version
+                .as_deref(),
+            Some("1.0.10")
+        );
     }
 
     #[test]
     fn host_of_extracts_authority() {
-        assert_eq!(host_of("https://spotify.api.trendsmcp.ai/mcp"), "spotify.api.trendsmcp.ai");
+        assert_eq!(
+            host_of("https://spotify.api.trendsmcp.ai/mcp"),
+            "spotify.api.trendsmcp.ai"
+        );
         assert_eq!(host_of("http://localhost:8080/x"), "localhost:8080");
     }
 
@@ -985,7 +1123,11 @@ mod tests {
         let mut ask = |_: &PromptSpec| answers.next().unwrap();
         let entry = build_entry(&s, TransportChoice::Remote(0), &mut ask).unwrap();
         assert_eq!(entry["url"], json!("https://api.githubcopilot.com/mcp/"));
-        assert_eq!(entry["headers"]["Authorization"], json!("Bearer ghp_abc123"), "bare token gets Bearer");
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            json!("Bearer ghp_abc123"),
+            "bare token gets Bearer"
+        );
     }
 
     #[test]
@@ -1041,8 +1183,16 @@ mod tests {
         let mut ask = |_: &PromptSpec| answers.next().unwrap();
         let entry = build_entry(&s, TransportChoice::Package(0), &mut ask).unwrap();
         assert_eq!(entry["command"], json!("docker"));
-        let args: Vec<String> = entry["args"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
-        assert_eq!(args, vec!["run", "-i", "--rm", "-e", "TOKEN", "docker.io/x/srv:1.0"]);
+        let args: Vec<String> = entry["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["run", "-i", "--rm", "-e", "TOKEN", "docker.io/x/srv:1.0"]
+        );
         assert_eq!(entry["env"]["TOKEN"], json!("t"));
     }
 
@@ -1051,15 +1201,30 @@ mod tests {
         let make = |name: &str, viable: bool| RegistryServer {
             name: name.into(),
             packages: if viable {
-                vec![Package { registry_type: "npm".into(), identifier: "p".into(), ..Default::default() }]
+                vec![Package {
+                    registry_type: "npm".into(),
+                    identifier: "p".into(),
+                    ..Default::default()
+                }]
             } else {
                 vec![]
             },
-            remotes: if viable { vec![] } else { vec![Remote { kind: "sse".into(), url: "u".into(), headers: vec![] }] },
+            remotes: if viable {
+                vec![]
+            } else {
+                vec![Remote {
+                    kind: "sse".into(),
+                    url: "u".into(),
+                    headers: vec![],
+                }]
+            },
             ..Default::default()
         };
-        let results =
-            vec![make("com.random/notion-thing", true), make("com.notion/official", false), make("io.github.x/notion", true)];
+        let results = vec![
+            make("com.random/notion-thing", true),
+            make("com.notion/official", false),
+            make("io.github.x/notion", true),
+        ];
         // official is not viable (OAuth) → pick the viable one whose name contains "notion"
         let best = pick_best(&results, "notion").unwrap();
         assert_eq!(best.name, "com.random/notion-thing");
@@ -1074,14 +1239,18 @@ mod tests {
 
     #[test]
     fn slug_from_name_takes_tail_and_sanitizes() {
-        assert_eq!(slug_from_name("io.github.github/github-mcp-server"), "github_mcp_server");
+        assert_eq!(
+            slug_from_name("io.github.github/github-mcp-server"),
+            "github_mcp_server"
+        );
         assert_eq!(slug_from_name("com.notion/mcp"), "mcp");
     }
 
     #[test]
     fn optional_input_without_value_is_skipped() {
         let inp = kv("OPTIONAL", false, false, None);
-        let mut ask = |_: &PromptSpec| -> String { panic!("must not ask for an optional empty input") };
+        let mut ask =
+            |_: &PromptSpec| -> String { panic!("must not ask for an optional empty input") };
         assert!(resolve_input(&inp, &mut ask).unwrap().is_none());
     }
 
@@ -1116,12 +1285,23 @@ mod tests {
             }],
             ..Default::default()
         };
-        let s = RegistryServer { packages: vec![p], ..Default::default() };
+        let s = RegistryServer {
+            packages: vec![p],
+            ..Default::default()
+        };
         let mut answers = vec!["/home/me/project".to_string()].into_iter();
         let mut ask = |_: &PromptSpec| answers.next().unwrap();
         let entry = build_entry(&s, TransportChoice::Package(0), &mut ask).unwrap();
-        let args: Vec<String> = entry["args"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
-        assert!(args.contains(&"/home/me/project".to_string()), "required positional arg must be emitted: {args:?}");
+        let args: Vec<String> = entry["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            args.contains(&"/home/me/project".to_string()),
+            "required positional arg must be emitted: {args:?}"
+        );
     }
 
     #[test]
@@ -1130,7 +1310,12 @@ mod tests {
         let mut vars = std::collections::HashMap::new();
         vars.insert("tok".to_string(), kv("tok", true, true, None));
         let args = arg_tokens(
-            &[Argument { kind: "positional".into(), value: Some("--token={tok}".into()), variables: vars, ..Default::default() }],
+            &[Argument {
+                kind: "positional".into(),
+                value: Some("--token={tok}".into()),
+                variables: vars,
+                ..Default::default()
+            }],
             &mut |_: &PromptSpec| "SEKRET".to_string(),
         )
         .unwrap();
@@ -1139,18 +1324,38 @@ mod tests {
 
     #[test]
     fn version_key_orders_ga_above_prerelease_and_numeric() {
-        assert!(version_key(Some("1.10.0")) > version_key(Some("1.9.0")), "numeric, not lexical");
-        assert!(version_key(Some("1.2.0")) > version_key(Some("1.2.0-rc1")), "GA beats its own pre-release");
-        assert!(version_key(Some("2.0.0-rc1")) > version_key(Some("1.5.0")), "higher core wins even as pre-release");
-        assert!(version_key(None) < version_key(Some("0.0.1")), "absent sorts lowest");
+        assert!(
+            version_key(Some("1.10.0")) > version_key(Some("1.9.0")),
+            "numeric, not lexical"
+        );
+        assert!(
+            version_key(Some("1.2.0")) > version_key(Some("1.2.0-rc1")),
+            "GA beats its own pre-release"
+        );
+        assert!(
+            version_key(Some("2.0.0-rc1")) > version_key(Some("1.5.0")),
+            "higher core wins even as pre-release"
+        );
+        assert!(
+            version_key(None) < version_key(Some("0.0.1")),
+            "absent sorts lowest"
+        );
         // dedupe of the same core keeps the GA, not a same-core pre-release listed alongside it.
         let mk = |v: &str| RegistryServer {
             name: "a/x".into(),
             version: Some(v.into()),
-            packages: vec![Package { registry_type: "npm".into(), identifier: "p".into(), ..Default::default() }],
+            packages: vec![Package {
+                registry_type: "npm".into(),
+                identifier: "p".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let r = dedupe_latest(vec![mk("1.2.0-rc1"), mk("1.2.0")]);
-        assert_eq!(r[0].version.as_deref(), Some("1.2.0"), "GA of the same core wins");
+        assert_eq!(
+            r[0].version.as_deref(),
+            Some("1.2.0"),
+            "GA of the same core wins"
+        );
     }
 }

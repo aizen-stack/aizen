@@ -56,22 +56,106 @@ impl Answer {
 }
 
 // ── intent routing lexicons (question → dimension) ───────────────────────────
-const Q_VERBOSITY: &[&str] = &["verbose", "terse", "concise", "brief", "short", "long", "detail", "detailed", "wordy", "length"];
-const Q_LANGUAGE: &[&str] = &["reply in", "respond in", "speak", "write in", "vietnamese", "english", "tiếng việt", "tiếng anh", "what language should"];
-const Q_AUTONOMY: &[&str] = &["ask", "ask first", "confirm", "permission", "autonomous", "just do it", "without asking", "should i ask", "proceed", "go ahead"];
-const Q_TOOLING: &[&str] = &["package manager", "pnpm", "npm", "yarn", "formatter", "linter", "editor", "shell", "tabs", "spaces", "prettier", "eslint", "which tool", "vcs"];
-const Q_STACK: &[&str] = &["framework", "stack", "programming", "rust", "typescript", "react", "python", "tech stack", "tokio", "axum", "library", "which language"];
-const Q_FRUSTRATIONS: &[&str] = &["avoid", "hate", "dislike", "frustrat", "annoy", "footgun", "pet peeve", "should i not", "things to avoid", "never"];
+const Q_VERBOSITY: &[&str] = &[
+    "verbose", "terse", "concise", "brief", "short", "long", "detail", "detailed", "wordy",
+    "length",
+];
+const Q_LANGUAGE: &[&str] = &[
+    "reply in",
+    "respond in",
+    "speak",
+    "write in",
+    "vietnamese",
+    "english",
+    "tiếng việt",
+    "tiếng anh",
+    "what language should",
+];
+const Q_AUTONOMY: &[&str] = &[
+    "ask",
+    "ask first",
+    "confirm",
+    "permission",
+    "autonomous",
+    "just do it",
+    "without asking",
+    "should i ask",
+    "proceed",
+    "go ahead",
+];
+const Q_TOOLING: &[&str] = &[
+    "package manager",
+    "pnpm",
+    "npm",
+    "yarn",
+    "formatter",
+    "linter",
+    "editor",
+    "shell",
+    "tabs",
+    "spaces",
+    "prettier",
+    "eslint",
+    "which tool",
+    "vcs",
+];
+const Q_STACK: &[&str] = &[
+    "framework",
+    "stack",
+    "programming",
+    "rust",
+    "typescript",
+    "react",
+    "python",
+    "tech stack",
+    "tokio",
+    "axum",
+    "library",
+    "which language",
+];
+const Q_FRUSTRATIONS: &[&str] = &[
+    "avoid",
+    "hate",
+    "dislike",
+    "frustrat",
+    "annoy",
+    "footgun",
+    "pet peeve",
+    "should i not",
+    "things to avoid",
+    "never",
+];
 
-const COUNTERFACTUAL: &[&str] = &["would you", "what if", "hypothetic", "imagine", "suppose", "if i were", "unfamiliar", "never seen", "predict", "in a new situation"];
+const COUNTERFACTUAL: &[&str] = &[
+    "would you",
+    "what if",
+    "hypothetic",
+    "imagine",
+    "suppose",
+    "if i were",
+    "unfamiliar",
+    "never seen",
+    "predict",
+    "in a new situation",
+];
 
 fn word_set(lower: &str) -> HashSet<String> {
-    lower.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+    lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn hits(lower: &str, words: &HashSet<String>, kws: &[&str]) -> usize {
     kws.iter()
-        .filter(|kw| if kw.contains(' ') { lower.contains(**kw) } else { words.contains(**kw) })
+        .filter(|kw| {
+            if kw.contains(' ') {
+                lower.contains(**kw)
+            } else {
+                words.contains(**kw)
+            }
+        })
         .count()
 }
 
@@ -86,7 +170,11 @@ pub fn route(query: &str) -> Option<ProfileDim> {
         (hits(&lower, &words, Q_VERBOSITY), 2, ProfileDim::Verbosity),
         (hits(&lower, &words, Q_LANGUAGE), 3, ProfileDim::Language),
         (hits(&lower, &words, Q_STACK), 4, ProfileDim::Stack),
-        (hits(&lower, &words, Q_FRUSTRATIONS), 5, ProfileDim::Frustrations),
+        (
+            hits(&lower, &words, Q_FRUSTRATIONS),
+            5,
+            ProfileDim::Frustrations,
+        ),
     ];
     candidates
         .iter()
@@ -111,7 +199,9 @@ pub fn answer(profile: &UserProfile, entries: &[MemoryEntry], query: &str) -> An
                     dimension: Some(d),
                     confidence: s.confidence,
                     text: render_verdict(d, &s.verdict, s.confidence),
-                    kind: AnswerKind::Profile { verdict: s.verdict.clone() },
+                    kind: AnswerKind::Profile {
+                        verdict: s.verdict.clone(),
+                    },
                     basis: s.basis.clone(),
                 };
             }
@@ -132,14 +222,21 @@ pub fn answer(profile: &UserProfile, entries: &[MemoryEntry], query: &str) -> An
     if !hits.is_empty() {
         let basis: Vec<BasisFact> = hits
             .iter()
-            .map(|h| BasisFact { id: h.entry.id.clone(), name: h.entry.name.clone(), weight: h.score })
+            .map(|h| BasisFact {
+                id: h.entry.id.clone(),
+                name: h.entry.name.clone(),
+                weight: h.score,
+            })
             .collect();
         let names: Vec<String> = basis.iter().map(|b| b.name.clone()).collect();
         return Answer {
             dimension: None,
             confidence: hits[0].score,
             kind: AnswerKind::Evidence,
-            text: format!("No settled preference; closest stored facts: {}", names.join("; ")),
+            text: format!(
+                "No settled preference; closest stored facts: {}",
+                names.join("; ")
+            ),
             basis,
         };
     }
@@ -161,14 +258,22 @@ fn abstain(dim: Option<ProfileDim>, reason: AbstainReason) -> Answer {
         AbstainReason::InsufficientEvidence => "Not enough in memory to answer this confidently.",
         AbstainReason::NoMatch => "Nothing in memory addresses this question.",
     };
-    Answer { dimension: dim, kind: AnswerKind::Abstain { reason }, confidence: 0.0, basis: Vec::new(), text: text.to_string() }
+    Answer {
+        dimension: dim,
+        kind: AnswerKind::Abstain { reason },
+        confidence: 0.0,
+        basis: Vec::new(),
+        text: text.to_string(),
+    }
 }
 
 fn render_verdict(d: ProfileDim, v: &Verdict, conf: f64) -> String {
     let c = format!("{:.0}%", conf * 100.0);
     match v {
         Verdict::Scalar { label, .. } => format!("{}: {label} (confidence {c})", d.as_str()),
-        Verdict::Choice { value, runner_up, .. } => match runner_up {
+        Verdict::Choice {
+            value, runner_up, ..
+        } => match runner_up {
             Some(r) => format!("{}: {value} (over {r}, confidence {c})", d.as_str()),
             None => format!("{}: {value} (confidence {c})", d.as_str()),
         },
@@ -216,10 +321,22 @@ mod tests {
 
     #[test]
     fn routes_to_dimensions() {
-        assert_eq!(route("how verbose should I be?"), Some(ProfileDim::Verbosity));
-        assert_eq!(route("which package manager do they use?"), Some(ProfileDim::Tooling));
-        assert_eq!(route("should I ask before deleting?"), Some(ProfileDim::Autonomy));
-        assert_eq!(route("what language should I reply in?"), Some(ProfileDim::Language));
+        assert_eq!(
+            route("how verbose should I be?"),
+            Some(ProfileDim::Verbosity)
+        );
+        assert_eq!(
+            route("which package manager do they use?"),
+            Some(ProfileDim::Tooling)
+        );
+        assert_eq!(
+            route("should I ask before deleting?"),
+            Some(ProfileDim::Autonomy)
+        );
+        assert_eq!(
+            route("what language should I reply in?"),
+            Some(ProfileDim::Language)
+        );
         assert_eq!(route("the meeting is on friday"), None);
     }
 
@@ -227,7 +344,10 @@ mod tests {
     fn settled_question_answers_not_abstains() {
         let (p, e) = sample();
         let a = answer(&p, &e, "should my replies be terse or verbose?");
-        assert!(!a.is_abstain(), "a settled verbosity question must be answered, got {a:?}");
+        assert!(
+            !a.is_abstain(),
+            "a settled verbosity question must be answered, got {a:?}"
+        );
         assert_eq!(a.dimension, Some(ProfileDim::Verbosity));
         assert!(!a.basis.is_empty(), "answer must cite basis facts");
     }
@@ -244,10 +364,16 @@ mod tests {
     fn counterfactual_novel_abstains() {
         let (p, e) = sample();
         // hypothetical about something with no settled evidence → MUST abstain.
-        let a = answer(&p, &e, "would you want me to rewrite the whole module in haskell?");
+        let a = answer(
+            &p,
+            &e,
+            "would you want me to rewrite the whole module in haskell?",
+        );
         assert!(a.is_abstain());
         match a.kind {
-            AnswerKind::Abstain { reason } => assert_eq!(reason, AbstainReason::CounterfactualNovel),
+            AnswerKind::Abstain { reason } => {
+                assert_eq!(reason, AbstainReason::CounterfactualNovel)
+            }
             other => panic!("expected counterfactual abstain, got {other:?}"),
         }
     }
@@ -255,7 +381,11 @@ mod tests {
     #[test]
     fn unknown_question_abstains_no_match() {
         let (p, e) = sample();
-        let a = answer(&p, &e, "what is the airspeed velocity of an unladen swallow?");
+        let a = answer(
+            &p,
+            &e,
+            "what is the airspeed velocity of an unladen swallow?",
+        );
         assert!(a.is_abstain());
         match a.kind {
             AnswerKind::Abstain { reason } => assert_eq!(reason, AbstainReason::NoMatch),
@@ -270,7 +400,9 @@ mod tests {
         let a = answer(&p, &e, "should I ask first or just proceed?");
         assert!(a.is_abstain());
         match a.kind {
-            AnswerKind::Abstain { reason } => assert_eq!(reason, AbstainReason::InsufficientEvidence),
+            AnswerKind::Abstain { reason } => {
+                assert_eq!(reason, AbstainReason::InsufficientEvidence)
+            }
             other => panic!("expected insufficient-evidence abstain, got {other:?}"),
         }
         assert_eq!(a.dimension, Some(ProfileDim::Autonomy));
@@ -281,7 +413,10 @@ mod tests {
         let (p, e) = sample();
         // "would you" phrasing, but Language is settled → answer, don't abstain.
         let a = answer(&p, &e, "would you reply in vietnamese?");
-        assert!(!a.is_abstain(), "settled dim must win over counterfactual phrasing");
+        assert!(
+            !a.is_abstain(),
+            "settled dim must win over counterfactual phrasing"
+        );
         assert_eq!(a.dimension, Some(ProfileDim::Language));
     }
 
@@ -291,6 +426,9 @@ mod tests {
         // routes to nothing, not counterfactual, but a fact lexically matches "axum"
         let a = answer(&p, &e, "tell me about axum");
         // routes to Stack (axum is a stack term) → answered OR evidence; must not falsely abstain
-        assert!(!a.is_abstain(), "a question with matching facts must not abstain, got {a:?}");
+        assert!(
+            !a.is_abstain(),
+            "a question with matching facts must not abstain, got {a:?}"
+        );
     }
 }

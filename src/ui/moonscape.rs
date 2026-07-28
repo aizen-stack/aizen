@@ -35,7 +35,11 @@ const BIT: [[u32; 4]; 2] = [[0, 1, 2, 6], [3, 4, 5, 7]];
 
 impl Canvas {
     fn new(w: usize, h: usize) -> Self {
-        Self { w, h, px: vec![0; w * h] }
+        Self {
+            w,
+            h,
+            px: vec![0; w * h],
+        }
     }
 
     /// Light one dot at the brightness `lvl` (0..=4), keeping the brighter value if already lit.
@@ -221,7 +225,14 @@ fn astronaut(c: &mut Canvas, cx: f64, feet_y: f64, ah: f64) {
     let hy1 = top + head_r * 2.25;
     c.rrect(hx0, hy0, hx1, hy1, head_r * 0.85, bright);
     let inset = head_r * 0.35;
-    c.rrect(hx0 + inset, hy0 + inset * 1.3, hx1 - inset, hy1 - inset * 0.7, head_r * 0.6, mid);
+    c.rrect(
+        hx0 + inset,
+        hy0 + inset * 1.3,
+        hx1 - inset,
+        hy1 - inset * 0.7,
+        head_r * 0.6,
+        mid,
+    );
 
     // Torso (life-support pack) — a tall rounded box below the helmet.
     let sh_y = hy1 + ah * 0.02;
@@ -230,20 +241,60 @@ fn astronaut(c: &mut Canvas, cx: f64, feet_y: f64, ah: f64) {
     let tx1 = cx + aw;
     c.rrect(tx0, sh_y, tx1, torso_y1, aw * 0.45, bright);
     // Chest control panel + dial.
-    c.rrect(cx - aw * 0.52, top + ah * 0.36, cx + aw * 0.52, top + ah * 0.52, aw * 0.14, mid);
+    c.rrect(
+        cx - aw * 0.52,
+        top + ah * 0.36,
+        cx + aw * 0.52,
+        top + ah * 0.52,
+        aw * 0.14,
+        mid,
+    );
     c.ring(cx + aw * 0.24, top + ah * 0.44, aw * 0.13, mid);
 
     // Left arm hanging beside the torso.
     let arm_w = aw * 0.42;
-    c.rrect(tx0 - arm_w, sh_y + ah * 0.02, tx0 + arm_w * 0.15, torso_y1 - ah * 0.02, arm_w * 0.5, bright);
+    c.rrect(
+        tx0 - arm_w,
+        sh_y + ah * 0.02,
+        tx0 + arm_w * 0.15,
+        torso_y1 - ah * 0.02,
+        arm_w * 0.5,
+        bright,
+    );
 
     // Legs (two rounded boxes) + a hint of boots.
     let gap = aw * 0.16;
     let leg_w = aw * 0.72;
-    c.rrect(cx - gap - leg_w, torso_y1 - ah * 0.02, cx - gap, feet_y, leg_w * 0.34, bright);
-    c.rrect(cx + gap, torso_y1 - ah * 0.02, cx + gap + leg_w, feet_y, leg_w * 0.34, bright);
-    c.line(cx - gap - leg_w, feet_y, cx - gap - leg_w * 0.3, feet_y, bright);
-    c.line(cx + gap + leg_w * 0.3, feet_y, cx + gap + leg_w, feet_y, bright);
+    c.rrect(
+        cx - gap - leg_w,
+        torso_y1 - ah * 0.02,
+        cx - gap,
+        feet_y,
+        leg_w * 0.34,
+        bright,
+    );
+    c.rrect(
+        cx + gap,
+        torso_y1 - ah * 0.02,
+        cx + gap + leg_w,
+        feet_y,
+        leg_w * 0.34,
+        bright,
+    );
+    c.line(
+        cx - gap - leg_w,
+        feet_y,
+        cx - gap - leg_w * 0.3,
+        feet_y,
+        bright,
+    );
+    c.line(
+        cx + gap + leg_w * 0.3,
+        feet_y,
+        cx + gap + leg_w,
+        feet_y,
+        bright,
+    );
 
     // Flag pole to the right + right arm reaching to grip it.
     let pole_x = cx + aw * 2.05;
@@ -251,8 +302,15 @@ fn astronaut(c: &mut Canvas, cx: f64, feet_y: f64, ah: f64) {
     let grip_y = top + ah * 0.30;
     c.line(pole_x, feet_y + ah * 0.02, pole_x, pole_top, bright);
     c.plotf(pole_x, pole_top - 1.0, mid); // finial
-    // Right arm: shoulder → grip on the pole.
-    c.rrect(tx1 - arm_w * 0.15, sh_y + ah * 0.03, pole_x, sh_y + ah * 0.03 + arm_w, arm_w * 0.42, bright);
+                                          // Right arm: shoulder → grip on the pole.
+    c.rrect(
+        tx1 - arm_w * 0.15,
+        sh_y + ah * 0.03,
+        pole_x,
+        sh_y + ah * 0.03 + arm_w,
+        arm_w * 0.42,
+        bright,
+    );
 
     // Flag: a stippled field flying from the pole top.
     let fx0 = pole_x + 2.0;
@@ -312,8 +370,12 @@ pub fn frame(cols: usize, rows: usize, phase: f64) -> String {
     }
 
     // ── Mountains: two ridge layers (back faint, front brighter) ────────────
-    for (layer, (base, amp, lvl)) in
-        [(horizon * 0.86, hf * 0.10, 1u8), (horizon * 0.99, hf * 0.15, 2u8)].into_iter().enumerate()
+    for (layer, (base, amp, lvl)) in [
+        (horizon * 0.86, hf * 0.10, 1u8),
+        (horizon * 0.99, hf * 0.15, 2u8),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let seed = layer as f64 * 11.0;
         let mut prev: Option<(f64, f64)> = None;
@@ -338,14 +400,18 @@ pub fn frame(cols: usize, rows: usize, phase: f64) -> String {
         let t = k as f64 / (bands as f64 - 1.0);
         let base = horizon + (hf - horizon) * t.powf(1.35);
         let amp = hf * (0.010 + 0.045 * t);
-        let lvl = if t < 0.35 { 1 } else if t < 0.7 { 2 } else { 3 };
+        let lvl = if t < 0.35 {
+            1
+        } else if t < 0.7 {
+            2
+        } else {
+            3
+        };
         let ph = phase + k as f64 * 0.6;
         let mut prev: Option<(f64, f64)> = None;
         let mut x = 0.0;
         while x <= wf {
-            let y = base
-                + (x * 0.03 + ph).sin() * amp
-                + (x * 0.013 - ph * 0.7).sin() * amp * 0.6;
+            let y = base + (x * 0.03 + ph).sin() * amp + (x * 0.013 - ph * 0.7).sin() * amp * 0.6;
             if let Some((px, py)) = prev {
                 c.line(px, py, x, y, lvl);
             }
@@ -420,7 +486,11 @@ mod tests {
     fn frame_is_nonempty_and_has_bar() {
         let f = frame(100, 30, 0.0);
         assert!(f.contains("Loading modules"), "loading bar present");
-        assert!(f.lines().count() > 10, "several braille rows: {}", f.lines().count());
+        assert!(
+            f.lines().count() > 10,
+            "several braille rows: {}",
+            f.lines().count()
+        );
     }
 
     #[test]

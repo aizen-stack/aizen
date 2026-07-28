@@ -36,10 +36,10 @@ static STOPWORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
         "my", "our", "your", "their", "its", "also", "just", "into", "than", "then", "so", "if",
         "else",
         // Vietnamese function words (high-frequency; content words like "cà phê", "dữ liệu" stay)
-        "và", "là", "của", "có", "không", "được", "cho", "với", "các", "những", "một", "này",
-        "đó", "đây", "khi", "để", "đã", "sẽ", "đang", "thì", "mà", "ra", "vào", "lên", "trong",
-        "trên", "về", "từ", "đến", "theo", "như", "nếu", "vì", "nên", "hay", "hoặc", "cũng",
-        "rất", "quá", "gì", "nào", "thế", "vậy", "làm",
+        "và", "là", "của", "có", "không", "được", "cho", "với", "các", "những", "một", "này", "đó",
+        "đây", "khi", "để", "đã", "sẽ", "đang", "thì", "mà", "ra", "vào", "lên", "trong", "trên",
+        "về", "từ", "đến", "theo", "như", "nếu", "vì", "nên", "hay", "hoặc", "cũng", "rất", "quá",
+        "gì", "nào", "thế", "vậy", "làm",
     ]
     .into_iter()
     .collect()

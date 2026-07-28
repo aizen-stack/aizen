@@ -47,7 +47,11 @@ pub enum Verdict {
     /// A position on an axis, [-1,1], with a human label for the leaning pole.
     Scalar { value: f64, label: String },
     /// A winning choice (+ runner-up + margin).
-    Choice { value: String, runner_up: Option<String>, margin: f64 },
+    Choice {
+        value: String,
+        runner_up: Option<String>,
+        margin: f64,
+    },
     /// A ranked set (term, weight).
     Ranked { items: Vec<(String, f64)> },
     /// Not enough evidence to say anything.
@@ -81,21 +85,103 @@ impl UserProfile {
 }
 
 // ── lexicons (EN + VI) ───────────────────────────────────────────────────────
-const TERSE_KW: &[&str] = &["terse", "concise", "brief", "short", "succinct", "to the point", "ngắn gọn", "súc tích"];
-const VERBOSE_KW: &[&str] = &["verbose", "detailed", "thorough", "elaborate", "in detail", "step by step", "dài dòng"];
-const AUTONOMOUS_KW: &[&str] = &["just do it", "autonomous", "go ahead", "proceed", "without asking", "don't ask", "do not ask"];
-const ASKFIRST_KW: &[&str] = &["ask first", "ask before", "confirm", "check with me", "wait for", "let me review", "hỏi trước"];
+const TERSE_KW: &[&str] = &[
+    "terse",
+    "concise",
+    "brief",
+    "short",
+    "succinct",
+    "to the point",
+    "ngắn gọn",
+    "súc tích",
+];
+const VERBOSE_KW: &[&str] = &[
+    "verbose",
+    "detailed",
+    "thorough",
+    "elaborate",
+    "in detail",
+    "step by step",
+    "dài dòng",
+];
+const AUTONOMOUS_KW: &[&str] = &[
+    "just do it",
+    "autonomous",
+    "go ahead",
+    "proceed",
+    "without asking",
+    "don't ask",
+    "do not ask",
+];
+const ASKFIRST_KW: &[&str] = &[
+    "ask first",
+    "ask before",
+    "confirm",
+    "check with me",
+    "wait for",
+    "let me review",
+    "hỏi trước",
+];
 const TOOL_NAMES: &[&str] = &[
-    "pnpm", "npm", "yarn", "bun", "cargo", "pip", "poetry", "uv", "git", "prettier", "eslint",
-    "rustfmt", "clippy", "black", "ruff", "make", "docker", "vite", "webpack", "bash", "zsh",
-    "fish", "powershell", "vim", "neovim", "vscode", "tabs", "spaces",
+    "pnpm",
+    "npm",
+    "yarn",
+    "bun",
+    "cargo",
+    "pip",
+    "poetry",
+    "uv",
+    "git",
+    "prettier",
+    "eslint",
+    "rustfmt",
+    "clippy",
+    "black",
+    "ruff",
+    "make",
+    "docker",
+    "vite",
+    "webpack",
+    "bash",
+    "zsh",
+    "fish",
+    "powershell",
+    "vim",
+    "neovim",
+    "vscode",
+    "tabs",
+    "spaces",
 ];
 const STACK_TERMS: &[&str] = &[
-    "rust", "typescript", "javascript", "python", "react", "nextjs", "vue", "svelte", "dotnet",
-    "csharp", "golang", "kotlin", "node", "postgres", "redis", "valkey", "tailwind", "fastapi",
-    "django", "flask", "express", "axum", "tokio", "java", "go",
+    "rust",
+    "typescript",
+    "javascript",
+    "python",
+    "react",
+    "nextjs",
+    "vue",
+    "svelte",
+    "dotnet",
+    "csharp",
+    "golang",
+    "kotlin",
+    "node",
+    "postgres",
+    "redis",
+    "valkey",
+    "tailwind",
+    "fastapi",
+    "django",
+    "flask",
+    "express",
+    "axum",
+    "tokio",
+    "java",
+    "go",
 ];
-const NEG_KW: &[&str] = &["don't", "dont", "do not", "never", "avoid", "stop", "không", "đừng"];
+const NEG_KW: &[&str] = &[
+    "don't", "dont", "do not", "never", "avoid", "stop", "không", "đừng",
+];
 
 fn word_set(lower: &str) -> HashSet<String> {
     lower
@@ -107,7 +193,13 @@ fn word_set(lower: &str) -> HashSet<String> {
 
 fn hits(lower: &str, words: &HashSet<String>, kws: &[&str]) -> usize {
     kws.iter()
-        .filter(|kw| if kw.contains(' ') { lower.contains(**kw) } else { words.contains(**kw) })
+        .filter(|kw| {
+            if kw.contains(' ') {
+                lower.contains(**kw)
+            } else {
+                words.contains(**kw)
+            }
+        })
         .count()
 }
 
@@ -139,8 +231,26 @@ pub fn build(entries: &[MemoryEntry], today: &str, half_life: f64) -> UserProfil
 
     let dims = vec![
         build_language(&active, &w),
-        build_scalar(ProfileDim::Verbosity, Dimension::Style, &active, &w, TERSE_KW, VERBOSE_KW, "terse", "verbose"),
-        build_scalar(ProfileDim::Autonomy, Dimension::Workflow, &active, &w, AUTONOMOUS_KW, ASKFIRST_KW, "autonomous", "asks first"),
+        build_scalar(
+            ProfileDim::Verbosity,
+            Dimension::Style,
+            &active,
+            &w,
+            TERSE_KW,
+            VERBOSE_KW,
+            "terse",
+            "verbose",
+        ),
+        build_scalar(
+            ProfileDim::Autonomy,
+            Dimension::Workflow,
+            &active,
+            &w,
+            AUTONOMOUS_KW,
+            ASKFIRST_KW,
+            "autonomous",
+            "asks first",
+        ),
         build_tooling(&active, &w),
         build_stack(&active, &w),
         build_frustrations(&active, &w),
@@ -188,10 +298,19 @@ fn build_scalar(
         }
         raw += wi * s;
         total += wi;
-        basis.push(BasisFact { id: e.id.clone(), name: e.name.clone(), weight: wi });
+        basis.push(BasisFact {
+            id: e.id.clone(),
+            name: e.name.clone(),
+            weight: wi,
+        });
     }
     if total <= 0.0 {
-        return DimSummary { dim, verdict: Verdict::Insufficient, confidence: 0.0, basis: Vec::new() };
+        return DimSummary {
+            dim,
+            verdict: Verdict::Insufficient,
+            confidence: 0.0,
+            basis: Vec::new(),
+        };
     }
     let value = (raw / 2.0).tanh();
     let label = if value > 0.15 {
@@ -203,7 +322,10 @@ fn build_scalar(
     };
     DimSummary {
         dim,
-        verdict: Verdict::Scalar { value, label: label.to_string() },
+        verdict: Verdict::Scalar {
+            value,
+            label: label.to_string(),
+        },
         confidence: confidence(raw.abs(), total),
         basis: top_basis(basis, 3),
     }
@@ -223,25 +345,56 @@ fn build_language(active: &[&MemoryEntry], w: &impl Fn(&MemoryEntry) -> f64) -> 
             if hits(&lower, &words, kws) > 0 {
                 let wi = w(e);
                 weights[i] += wi;
-                basis.push(BasisFact { id: e.id.clone(), name: e.name.clone(), weight: wi });
+                basis.push(BasisFact {
+                    id: e.id.clone(),
+                    name: e.name.clone(),
+                    weight: wi,
+                });
             }
         }
     }
     let total: f64 = weights.iter().sum();
     if total <= 0.0 {
-        return DimSummary { dim: ProfileDim::Language, verdict: Verdict::Insufficient, confidence: 0.0, basis: Vec::new() };
+        return DimSummary {
+            dim: ProfileDim::Language,
+            verdict: Verdict::Insufficient,
+            confidence: 0.0,
+            basis: Vec::new(),
+        };
     }
-    let (top_i, top_w) = weights.iter().enumerate().fold((0usize, 0.0), |a, (i, &v)| if v > a.1 { (i, v) } else { a });
-    let second = weights.iter().enumerate().filter(|(i, _)| *i != top_i).map(|(_, &v)| v).fold(0.0, f64::max);
+    let (top_i, top_w) = weights
+        .iter()
+        .enumerate()
+        .fold((0usize, 0.0), |a, (i, &v)| if v > a.1 { (i, v) } else { a });
+    let second = weights
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != top_i)
+        .map(|(_, &v)| v)
+        .fold(0.0, f64::max);
     let margin = (top_w - second) / top_w;
     let runner_up = if second > 0.0 {
-        Some(langs[weights.iter().enumerate().filter(|(i, _)| *i != top_i).max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i).unwrap_or(top_i)].0.to_string())
+        Some(
+            langs[weights
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != top_i)
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap_or(top_i)]
+            .0
+            .to_string(),
+        )
     } else {
         None
     };
     DimSummary {
         dim: ProfileDim::Language,
-        verdict: Verdict::Choice { value: langs[top_i].0.to_string(), runner_up, margin },
+        verdict: Verdict::Choice {
+            value: langs[top_i].0.to_string(),
+            runner_up,
+            margin,
+        },
         confidence: confidence(top_w, total) * margin.max(0.5),
         basis: top_basis(basis, 3),
     }
@@ -277,19 +430,40 @@ fn build_tooling(active: &[&MemoryEntry], w: &impl Fn(&MemoryEntry) -> f64) -> D
             if !in_pre && !in_post {
                 continue;
             }
-            let sign = if neg_fact || (in_post && !in_pre) { -1.0 } else { 1.0 };
+            let sign = if neg_fact || (in_post && !in_pre) {
+                -1.0
+            } else {
+                1.0
+            };
             *net.entry(tool).or_insert(0.0) += sign * wi;
             touched = true;
         }
         if touched {
-            basis.push(BasisFact { id: e.id.clone(), name: e.name.clone(), weight: wi });
+            basis.push(BasisFact {
+                id: e.id.clone(),
+                name: e.name.clone(),
+                weight: wi,
+            });
         }
     }
-    let mut items: Vec<(String, f64)> = net.into_iter().filter(|(_, v)| *v > 0.0).map(|(k, v)| (k.to_string(), v)).collect();
-    items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    let mut items: Vec<(String, f64)> = net
+        .into_iter()
+        .filter(|(_, v)| *v > 0.0)
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    items.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     items.truncate(6);
     if items.is_empty() {
-        return DimSummary { dim: ProfileDim::Tooling, verdict: Verdict::Insufficient, confidence: 0.0, basis: Vec::new() };
+        return DimSummary {
+            dim: ProfileDim::Tooling,
+            verdict: Verdict::Insufficient,
+            confidence: 0.0,
+            basis: Vec::new(),
+        };
     }
     let total: f64 = items.iter().map(|(_, v)| v).sum();
     DimSummary {
@@ -316,14 +490,30 @@ fn build_stack(active: &[&MemoryEntry], w: &impl Fn(&MemoryEntry) -> f64) -> Dim
             }
         }
         if touched {
-            basis.push(BasisFact { id: e.id.clone(), name: e.name.clone(), weight: wi });
+            basis.push(BasisFact {
+                id: e.id.clone(),
+                name: e.name.clone(),
+                weight: wi,
+            });
         }
     }
-    let mut items: Vec<(String, f64)> = weights.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-    items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    let mut items: Vec<(String, f64)> = weights
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    items.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     items.truncate(8);
     if items.is_empty() {
-        return DimSummary { dim: ProfileDim::Stack, verdict: Verdict::Insufficient, confidence: 0.0, basis: Vec::new() };
+        return DimSummary {
+            dim: ProfileDim::Stack,
+            verdict: Verdict::Insufficient,
+            confidence: 0.0,
+            basis: Vec::new(),
+        };
     }
     let total: f64 = items.iter().map(|(_, v)| v).sum();
     DimSummary {
@@ -344,14 +534,27 @@ fn build_frustrations(active: &[&MemoryEntry], w: &impl Fn(&MemoryEntry) -> f64)
             let wi = w(e);
             if wi > 0.0 {
                 items.push((e.name.clone(), wi));
-                basis.push(BasisFact { id: e.id.clone(), name: e.name.clone(), weight: wi });
+                basis.push(BasisFact {
+                    id: e.id.clone(),
+                    name: e.name.clone(),
+                    weight: wi,
+                });
             }
         }
     }
-    items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    items.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     items.truncate(8);
     if items.is_empty() {
-        return DimSummary { dim: ProfileDim::Frustrations, verdict: Verdict::Insufficient, confidence: 0.0, basis: Vec::new() };
+        return DimSummary {
+            dim: ProfileDim::Frustrations,
+            verdict: Verdict::Insufficient,
+            confidence: 0.0,
+            basis: Vec::new(),
+        };
     }
     let total: f64 = items.iter().map(|(_, v)| v).sum();
     DimSummary {
@@ -390,8 +593,18 @@ mod tests {
     #[test]
     fn verbosity_terse_from_style_facts() {
         let entries = vec![
-            fact("f1", "keep replies concise and terse", ProvenanceKind::Manual, 3),
-            fact("f2", "be brief and to the point", ProvenanceKind::UserExplicit, 1),
+            fact(
+                "f1",
+                "keep replies concise and terse",
+                ProvenanceKind::Manual,
+                3,
+            ),
+            fact(
+                "f2",
+                "be brief and to the point",
+                ProvenanceKind::UserExplicit,
+                1,
+            ),
         ];
         let p = build(&entries, TODAY, 30.0);
         let v = p.dim(ProfileDim::Verbosity).unwrap();
@@ -408,7 +621,12 @@ mod tests {
 
     #[test]
     fn language_vietnamese_choice() {
-        let entries = vec![fact("f1", "please reply in vietnamese", ProvenanceKind::Manual, 2)];
+        let entries = vec![fact(
+            "f1",
+            "please reply in vietnamese",
+            ProvenanceKind::Manual,
+            2,
+        )];
         let p = build(&entries, TODAY, 30.0);
         match &p.dim(ProfileDim::Language).unwrap().verdict {
             Verdict::Choice { value, .. } => assert_eq!(value, "vietnamese"),
@@ -419,14 +637,27 @@ mod tests {
     #[test]
     fn tooling_prefers_pnpm_excludes_avoided() {
         let entries = vec![
-            fact("f1", "I prefer pnpm as my package manager", ProvenanceKind::Manual, 4),
-            fact("f2", "avoid yarn in this repo", ProvenanceKind::UserExplicit, 1),
+            fact(
+                "f1",
+                "I prefer pnpm as my package manager",
+                ProvenanceKind::Manual,
+                4,
+            ),
+            fact(
+                "f2",
+                "avoid yarn in this repo",
+                ProvenanceKind::UserExplicit,
+                1,
+            ),
         ];
         let p = build(&entries, TODAY, 30.0);
         match &p.dim(ProfileDim::Tooling).unwrap().verdict {
             Verdict::Ranked { items } => {
                 assert!(items.iter().any(|(t, _)| t == "pnpm"), "pnpm preferred");
-                assert!(!items.iter().any(|(t, _)| t == "yarn"), "avoided yarn must not rank as preferred");
+                assert!(
+                    !items.iter().any(|(t, _)| t == "yarn"),
+                    "avoided yarn must not rank as preferred"
+                );
             }
             other => panic!("expected ranked, got {other:?}"),
         }
@@ -435,12 +666,20 @@ mod tests {
     #[test]
     fn tooling_directional_pref_demotes_the_loser() {
         // "prefer pnpm over npm" → pnpm preferred, npm NOT (and npm⊂pnpm must not leak).
-        let entries = vec![fact("f1", "prefer pnpm over npm", ProvenanceKind::Manual, 2)];
+        let entries = vec![fact(
+            "f1",
+            "prefer pnpm over npm",
+            ProvenanceKind::Manual,
+            2,
+        )];
         let p = build(&entries, TODAY, 30.0);
         match &p.dim(ProfileDim::Tooling).unwrap().verdict {
             Verdict::Ranked { items } => {
                 assert!(items.iter().any(|(t, _)| t == "pnpm"), "pnpm preferred");
-                assert!(!items.iter().any(|(t, _)| t == "npm"), "npm is the loser, must not rank");
+                assert!(
+                    !items.iter().any(|(t, _)| t == "npm"),
+                    "npm is the loser, must not rank"
+                );
             }
             other => panic!("expected ranked, got {other:?}"),
         }
@@ -448,7 +687,12 @@ mod tests {
 
     #[test]
     fn stack_ranks_terms() {
-        let entries = vec![fact("f1", "the backend is rust with tokio and axum", ProvenanceKind::Manual, 1)];
+        let entries = vec![fact(
+            "f1",
+            "the backend is rust with tokio and axum",
+            ProvenanceKind::Manual,
+            1,
+        )];
         let p = build(&entries, TODAY, 30.0);
         match &p.dim(ProfileDim::Stack).unwrap().verdict {
             Verdict::Ranked { items } => assert!(items.iter().any(|(t, _)| t == "rust")),
@@ -458,7 +702,12 @@ mod tests {
 
     #[test]
     fn frustrations_surface_negatives() {
-        let entries = vec![fact("f1", "never force-push to main", ProvenanceKind::UserExplicit, 2)];
+        let entries = vec![fact(
+            "f1",
+            "never force-push to main",
+            ProvenanceKind::UserExplicit,
+            2,
+        )];
         let p = build(&entries, TODAY, 30.0);
         match &p.dim(ProfileDim::Frustrations).unwrap().verdict {
             Verdict::Ranked { items } => assert!(!items.is_empty()),
@@ -469,7 +718,10 @@ mod tests {
     #[test]
     fn empty_store_is_insufficient_everywhere() {
         let p = build(&[], TODAY, 30.0);
-        assert!(p.dims.iter().all(|d| matches!(d.verdict, Verdict::Insufficient)));
+        assert!(p
+            .dims
+            .iter()
+            .all(|d| matches!(d.verdict, Verdict::Insufficient)));
     }
 
     #[test]
@@ -483,9 +735,18 @@ mod tests {
         let cw = {
             let mut e = weak[0].clone();
             e.confidence = 0.5;
-            build(std::slice::from_ref(&e), TODAY, 30.0).dim(ProfileDim::Verbosity).unwrap().confidence
+            build(std::slice::from_ref(&e), TODAY, 30.0)
+                .dim(ProfileDim::Verbosity)
+                .unwrap()
+                .confidence
         };
-        let cs = build(&strong, TODAY, 30.0).dim(ProfileDim::Verbosity).unwrap().confidence;
-        assert!(cs > cw, "strong corroborated evidence must beat one weak inferred fact ({cs} vs {cw})");
+        let cs = build(&strong, TODAY, 30.0)
+            .dim(ProfileDim::Verbosity)
+            .unwrap()
+            .confidence;
+        assert!(
+            cs > cw,
+            "strong corroborated evidence must beat one weak inferred fact ({cs} vs {cw})"
+        );
     }
 }

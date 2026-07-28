@@ -269,7 +269,7 @@ Retained overlays and lightweight frame timing/cache counters share the same fra
 Ctrl-C restores the terminal (shows the cursor, leaves the alternate screen) before the process exits.
 
 ### 4.1 In-chat slash commands (live-filtered palette, ~7 rows, Tab/↑↓ to pick)
-`/help` · `/model` (pick model, shows context windows) · `/sessions` (save/restore/delete chats) · `/workflows` (`/wf`, retained Activity overlay) · `/recover` (safe crashed-session restore/discard) · `/timeline` (`/tm`) and `/checkpoint` (`/cp`,`/snapshot`) — time machine · `/compact` (compress context) · `/memory` (`/mem`) · `/persona` (`/character`) · `/skills` · `/apps` · `/mcp` · `/browser` (profile/routes status) · `/commands` (custom) · `/telegram` (`/tg`) · `/serve` · `/config` (`/setup`) · `/approval ask|smart|yolo` (legacy aliases still accepted) · `/cost` (`/usage`) · `/tokens` · `/clear` (`/new`,`/reset`) · `/quit` (`/exit`,`/q`). Plus any user **custom commands**.
+`/help` · `/model` (pick model, shows context windows) · `/sessions` (save/restore/delete chats) · `/workflows` (`/wf`, retained Activity overlay) · `/recover` (safe crashed-session restore/discard) · `/timemachine` (`/timeline`,`/tm`) — one checkpoint list; picking a row rewinds to that code + chat — and `/checkpoint` (`/cp`,`/snapshot`) · `/compact` (compress context) · `/memory` (`/mem`) · `/persona` (`/character`) · `/skills` · `/apps` · `/mcp` · `/browser` (profile/routes status) · `/commands` (custom) · `/telegram` (`/tg`) · `/serve` · `/config` (`/setup`) · `/approval ask|smart|yolo` (legacy aliases still accepted) · `/cost` (`/usage`) · `/tokens` · `/clear` (`/new`,`/reset`) · `/quit` (`/exit`,`/q`). Plus any user **custom commands**.
 
 ### 4.2 Landing & onboarding (bare `aizen`)
 Branded **splash** (sun logo via sixel where supported, else braille — the retained backend always uses the text-only braille intro so no DCS image reaches the alternate screen; block-art "AIZEN" wordmark, tagline "ARTIFICIAL INTELLIGENCE AGENT"), a one-time welcome ("about 30 seconds"), then the **setup wizard**: base URL → API key (hidden) → model picker (live list with context windows, or a custom-id option) → optional compact threshold → optional messaging-app connect. The full splash also renders a **capabilities panel** (tool groups + command list + "N tools · M commands").
@@ -390,7 +390,7 @@ Home root: **`~/.aizen/`** (auto-migrated from legacy `~/.nextgen/`). Project-lo
 **UI screens that most need design love:**
 - The **TUI** (§4): scroll region + sticky input + HUD + slash palette + approval modal + working pill + image chips. This is the product.
 - The **landing/onboarding** splash + setup wizard (first impression).
-- **Pickers** (arrow-key Select): model, persona, app/transport, session, timeline.
+- **Pickers** (arrow-key Select): model, persona, app/transport, session, time machine, version.
 - **Status/HUD** micro-typography (model · tokens · % · mode badge).
 - A **capabilities map** graphic (tool groups + the layered identity stack).
 

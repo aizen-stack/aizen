@@ -65,8 +65,13 @@ fn host_and_port(url: &str) -> Result<(String, u16)> {
         "http" | "https" => {}
         s => bail!("unsupported URL scheme '{s}' (only http/https)"),
     }
-    let host = u.host_str().ok_or_else(|| anyhow::anyhow!("URL has no host"))?.to_string();
-    let port = u.port_or_known_default().unwrap_or(if u.scheme() == "https" { 443 } else { 80 });
+    let host = u
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("URL has no host"))?
+        .to_string();
+    let port = u
+        .port_or_known_default()
+        .unwrap_or(if u.scheme() == "https" { 443 } else { 80 });
     Ok((host, port))
 }
 
@@ -82,7 +87,11 @@ fn blocked_msg(host: &str) -> String {
 /// a DNS resolution to decide.
 fn pre_dns_verdict(host: &str) -> Option<Result<()>> {
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Some(if is_blocked_ip(&ip) { Err(anyhow::anyhow!(blocked_msg(host))) } else { Ok(()) });
+        return Some(if is_blocked_ip(&ip) {
+            Err(anyhow::anyhow!(blocked_msg(host)))
+        } else {
+            Ok(())
+        });
     }
     let lower = host.to_ascii_lowercase();
     if lower == "localhost" || lower.ends_with(".localhost") {
@@ -155,7 +164,10 @@ mod tests {
     #[test]
     fn blocks_the_dangerous_ranges() {
         assert!(is_blocked_ip(&ip("127.0.0.1")));
-        assert!(is_blocked_ip(&ip("169.254.169.254")), "cloud metadata endpoint");
+        assert!(
+            is_blocked_ip(&ip("169.254.169.254")),
+            "cloud metadata endpoint"
+        );
         assert!(is_blocked_ip(&ip("10.0.0.5")));
         assert!(is_blocked_ip(&ip("172.16.3.4")));
         assert!(is_blocked_ip(&ip("192.168.1.1")));
@@ -165,7 +177,10 @@ mod tests {
         assert!(is_blocked_ip(&ip("fe80::1")));
         assert!(is_blocked_ip(&ip("fc00::1")), "ULA");
         assert!(is_blocked_ip(&ip("::ffff:127.0.0.1")), "v4-mapped loopback");
-        assert!(is_blocked_ip(&ip("::ffff:169.254.169.254")), "v4-mapped metadata");
+        assert!(
+            is_blocked_ip(&ip("::ffff:169.254.169.254")),
+            "v4-mapped metadata"
+        );
     }
 
     #[test]
@@ -202,10 +217,18 @@ mod tests {
     #[test]
     fn opt_out_env_disables_the_guard() {
         // Serialize against other env-mutating tests via the shared home lock (any global lock works).
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("AIZEN_ALLOW_PRIVATE_NET", "1");
-        assert!(guard_url("http://127.0.0.1/").is_ok(), "opt-out env permits private");
+        assert!(
+            guard_url("http://127.0.0.1/").is_ok(),
+            "opt-out env permits private"
+        );
         std::env::remove_var("AIZEN_ALLOW_PRIVATE_NET");
-        assert!(guard_url("http://127.0.0.1/").is_err(), "and re-blocks once unset");
+        assert!(
+            guard_url("http://127.0.0.1/").is_err(),
+            "and re-blocks once unset"
+        );
     }
 }

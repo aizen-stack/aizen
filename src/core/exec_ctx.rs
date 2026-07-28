@@ -100,7 +100,10 @@ mod tests {
 
     #[test]
     fn default_is_the_shared_identity() {
-        assert_eq!(ExecutionContext::default().conversation().as_str(), "default");
+        assert_eq!(
+            ExecutionContext::default().conversation().as_str(),
+            "default"
+        );
     }
 
     #[test]
@@ -115,7 +118,10 @@ mod tests {
         with_current(outer.clone(), || {
             assert_eq!(current().unwrap().conversation().as_str(), "repl:main");
             with_current(inner.clone(), || {
-                assert_eq!(current().unwrap().conversation().as_str(), "telegram:main:42");
+                assert_eq!(
+                    current().unwrap().conversation().as_str(),
+                    "telegram:main:42"
+                );
             });
             assert_eq!(
                 current().unwrap().conversation().as_str(),
@@ -123,6 +129,9 @@ mod tests {
                 "inner context popped on exit, outer restored"
             );
         });
-        assert!(current().is_none(), "outer context popped after the outermost scope");
+        assert!(
+            current().is_none(),
+            "outer context popped after the outermost scope"
+        );
     }
 }

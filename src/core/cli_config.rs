@@ -28,7 +28,11 @@ pub enum ResponseVisuals {
 
 impl fmt::Display for ResponseVisuals {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self { Self::Auto => "auto", Self::Always => "always", Self::Off => "off" })
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Off => "off",
+        })
     }
 }
 
@@ -168,6 +172,11 @@ pub struct CliConfig {
     /// `None` ⇒ the default `https://agentskill.sh`. Override to point at a private registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_registry: Option<String>,
+    /// Silent background release check at REPL startup (cached 24h; only ever prints a one-line
+    /// notice). `None` ⇒ ON. `Some(false)` ⇒ never contacts the release channel. `AIZEN_NO_UPDATE_CHECK`
+    /// also disables it without editing this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_check: Option<bool>,
     /// Max time-machine checkpoints retained (oldest auto-pruned past this on each save, never the
     /// active one). `None` ⇒ default 50. `Some(0)` ⇒ unlimited (keep everything).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -271,10 +280,12 @@ pub fn resolve_role(role: &str, main: &ResolvedEndpoint) -> ResolvedEndpoint {
         _ => None,
     });
     let key_from_ref = |r: &RoleModelConfig| {
-        r.api_key_ref.as_ref().and_then(|k| match k.strip_prefix("env:") {
-            Some(var) => env_nonempty(var),
-            None => Some(k.clone()),
-        })
+        r.api_key_ref
+            .as_ref()
+            .and_then(|k| match k.strip_prefix("env:") {
+                Some(var) => env_nonempty(var),
+                None => Some(k.clone()),
+            })
     };
     ResolvedEndpoint {
         model: env_nonempty(&format!("NG_{up}_MODEL"))
@@ -320,13 +331,21 @@ pub fn endpoint_for_model(model: &str, caller: &ResolvedEndpoint) -> ResolvedEnd
     // Env key: NG_MODEL_<sanitized-upper>_{BASE_URL,API_KEY}. Sanitize so `gpt-4o` → `GPT_4O`.
     let up: String = model
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
     let key_from_ref = |e: &ModelEndpoint| {
-        e.api_key_ref.as_ref().and_then(|k| match k.strip_prefix("env:") {
-            Some(var) => env_nonempty(var),
-            None => Some(k.clone()),
-        })
+        e.api_key_ref
+            .as_ref()
+            .and_then(|k| match k.strip_prefix("env:") {
+                Some(var) => env_nonempty(var),
+                None => Some(k.clone()),
+            })
     };
     ResolvedEndpoint {
         model: model.to_string(),
@@ -349,6 +368,29 @@ pub fn endpoint_for_model(model: &str, caller: &ResolvedEndpoint) -> ResolvedEnd
 pub fn subagent_endpoint(main: &ResolvedEndpoint) -> ResolvedEndpoint {
     let role = resolve_role("subagent_default", main);
     endpoint_for_model(&role.model, &role)
+}
+
+/// Resolve whether editing runs should spend the one-shot self-review turn.
+/// An explicit value always wins; otherwise a configured oracle role opts in because it supplies the
+/// reviewer endpoint. No oracle role keeps the feature off by default.
+pub fn self_review_enabled(cfg: &CliConfig) -> bool {
+    cfg.self_review.unwrap_or_else(|| role_configured("oracle"))
+}
+
+/// Whether the REPL may run its silent, cached release check at startup.
+/// The env kill-switch wins so a locked-down environment needs no config edit; otherwise an explicit
+/// config value wins, and the unset default is on.
+pub fn update_check_enabled(cfg: &CliConfig) -> bool {
+    if matches!(
+        std::env::var("AIZEN_NO_UPDATE_CHECK")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    ) {
+        return false;
+    }
+    cfg.update_check.unwrap_or(true)
 }
 
 /// Is any override configured for `role` (config or env)? Consumers that should stay OFF without
@@ -391,15 +433,21 @@ pub struct ReachConfig {
 impl ReachConfig {
     /// Effective Tavily key: `AIZEN_TAVILY_API_KEY` > `TAVILY_API_KEY` > config file.
     pub fn resolved_tavily_key(&self) -> Option<String> {
-        branded_env("TAVILY_API_KEY").or_else(|| env_nonempty("TAVILY_API_KEY")).or_else(|| self.tavily_api_key.clone())
+        branded_env("TAVILY_API_KEY")
+            .or_else(|| env_nonempty("TAVILY_API_KEY"))
+            .or_else(|| self.tavily_api_key.clone())
     }
     /// Effective Jina key: `AIZEN_JINA_API_KEY` > `JINA_API_KEY` > config file.
     pub fn resolved_jina_key(&self) -> Option<String> {
-        branded_env("JINA_API_KEY").or_else(|| env_nonempty("JINA_API_KEY")).or_else(|| self.jina_api_key.clone())
+        branded_env("JINA_API_KEY")
+            .or_else(|| env_nonempty("JINA_API_KEY"))
+            .or_else(|| self.jina_api_key.clone())
     }
     /// Effective GitHub token: `AIZEN_GITHUB_TOKEN` > the conventional `GITHUB_TOKEN` > config file.
     pub fn resolved_github_token(&self) -> Option<String> {
-        branded_env("GITHUB_TOKEN").or_else(|| env_nonempty("GITHUB_TOKEN")).or_else(|| self.github_token.clone())
+        branded_env("GITHUB_TOKEN")
+            .or_else(|| env_nonempty("GITHUB_TOKEN"))
+            .or_else(|| self.github_token.clone())
     }
 }
 
@@ -480,7 +528,10 @@ pub fn clear_effort_override() {
 
 /// Read the current per-turn override. Outer `None` ⇒ no override armed (use the config default).
 pub fn effort_override() -> Option<Option<String>> {
-    EFFORT_OVERRIDE.read().unwrap_or_else(|e| e.into_inner()).clone()
+    EFFORT_OVERRIDE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// Resolve the `reasoning_effort` to stamp on an outgoing request: the per-turn override when one
@@ -524,7 +575,10 @@ impl Drop for EffortOverrideSuppressed {
 /// anything else ⇒ off); otherwise the `auto_effort` config field, defaulting to ON when unset.
 pub fn auto_effort_enabled() -> bool {
     if let Ok(v) = std::env::var("AIZEN_AUTO_EFFORT") {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
+        return matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        );
     }
     load().auto_effort.unwrap_or(true)
 }
@@ -533,7 +587,10 @@ pub fn auto_effort_enabled() -> bool {
 /// `ultimate` config field, defaulting to OFF. Mirrors `auto_effort_enabled` (env-forced, else config).
 pub fn ultimate_enabled() -> bool {
     if let Ok(v) = std::env::var("AIZEN_ULTIMATE") {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
+        return matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        );
     }
     load().ultimate.unwrap_or(false)
 }
@@ -542,7 +599,10 @@ pub fn ultimate_enabled() -> bool {
 /// `adaptive_effort` config field, defaulting to OFF (so the heuristic caps at `high` by default).
 pub fn adaptive_effort_enabled() -> bool {
     if let Ok(v) = std::env::var("AIZEN_ADAPTIVE_EFFORT") {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
+        return matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        );
     }
     load().adaptive_effort.unwrap_or(false)
 }
@@ -585,7 +645,6 @@ impl TelegramConfig {
         branded_env("TELEGRAM_TOKEN").or_else(|| self.token.clone())
     }
 }
-
 
 /// Outbound notification channels — one-way HTTP POST sinks. Each URL can also be supplied via env
 /// (`AIZEN_DISCORD_WEBHOOK`, `AIZEN_SLACK_WEBHOOK`, `AIZEN_WEBHOOK_URL`), which overrides the stored value.
@@ -683,8 +742,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn self_review_resolution_honors_explicit_values_and_oracle_default() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("aizen-self-review-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("AIZEN_HOME", &dir);
+
+        let plain = CliConfig::default();
+        assert!(
+            !self_review_enabled(&plain),
+            "no oracle keeps the default off"
+        );
+
+        save(&CliConfig {
+            roles: Some(RolesConfig {
+                oracle: Some(RoleModelConfig {
+                    model: Some("reviewer".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            self_review_enabled(&CliConfig::default()),
+            "a configured oracle implies review"
+        );
+        assert!(!self_review_enabled(&CliConfig {
+            self_review: Some(false),
+            ..Default::default()
+        }));
+        assert!(self_review_enabled(&CliConfig {
+            self_review: Some(true),
+            ..Default::default()
+        }));
+
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn role_routing_resolves_with_fallback() {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-roles-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("NEXTGEN_HOME", &dir);
@@ -703,7 +807,10 @@ mod tests {
         // Config: model-only summarizer (endpoint inherits) + env-indirected oracle key.
         save(&CliConfig {
             roles: Some(RolesConfig {
-                summarizer: Some(RoleModelConfig { model: Some("cheap".into()), ..Default::default() }),
+                summarizer: Some(RoleModelConfig {
+                    model: Some("cheap".into()),
+                    ..Default::default()
+                }),
                 oracle: Some(RoleModelConfig {
                     api_key_ref: Some("env:NG_TEST_ORACLE_KEY".into()),
                     ..Default::default()
@@ -715,11 +822,21 @@ mod tests {
         .unwrap();
         let r = resolve_role("summarizer", &main);
         assert_eq!(r.model, "cheap");
-        assert_eq!(r.base_url, "https://main/v1", "unset fields inherit the main endpoint");
+        assert_eq!(
+            r.base_url, "https://main/v1",
+            "unset fields inherit the main endpoint"
+        );
         assert!(role_configured("summarizer"));
-        assert!(role_configured("oracle"), "an api_key_ref alone counts as configured");
+        assert!(
+            role_configured("oracle"),
+            "an api_key_ref alone counts as configured"
+        );
         std::env::set_var("NG_TEST_ORACLE_KEY", "ok-secret");
-        assert_eq!(resolve_role("oracle", &main).api_key, "ok-secret", "env: indirection resolves");
+        assert_eq!(
+            resolve_role("oracle", &main).api_key,
+            "ok-secret",
+            "env: indirection resolves"
+        );
         std::env::remove_var("NG_TEST_ORACLE_KEY");
         // Env beats config.
         std::env::set_var("NG_SUMMARIZER_MODEL", "env-model");
@@ -731,7 +848,9 @@ mod tests {
 
     #[test]
     fn model_endpoint_registry_routes_endpoint_with_model() {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-mep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("NEXTGEN_HOME", &dir);
@@ -743,7 +862,10 @@ mod tests {
         // No registry entry → only the model name changes; endpoint stays the caller's.
         let r = endpoint_for_model("gpt-4o", &caller);
         assert_eq!(r.model, "gpt-4o");
-        assert_eq!(r.base_url, "https://parent/v1", "no entry ⇒ caller's endpoint");
+        assert_eq!(
+            r.base_url, "https://parent/v1",
+            "no entry ⇒ caller's endpoint"
+        );
         assert_eq!(r.api_key, "parent-key");
         // Register gpt-4o on its own gateway with an env-indirected key.
         save(&CliConfig {
@@ -763,11 +885,17 @@ mod tests {
             "the model carries its own gateway + key"
         );
         // A model with no entry still inherits the caller (registry is per-model, not global).
-        assert_eq!(endpoint_for_model("other", &caller).base_url, "https://parent/v1");
+        assert_eq!(
+            endpoint_for_model("other", &caller).base_url,
+            "https://parent/v1"
+        );
         std::env::remove_var("NG_TEST_OAI_KEY");
         // Env override: NG_MODEL_<sanitized-upper>_BASE_URL beats the config entry.
         std::env::set_var("NG_MODEL_GPT_4O_BASE_URL", "https://env-override/v1");
-        assert_eq!(endpoint_for_model("gpt-4o", &caller).base_url, "https://env-override/v1");
+        assert_eq!(
+            endpoint_for_model("gpt-4o", &caller).base_url,
+            "https://env-override/v1"
+        );
         std::env::remove_var("NG_MODEL_GPT_4O_BASE_URL");
         std::env::remove_var("NEXTGEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
@@ -775,7 +903,9 @@ mod tests {
 
     #[test]
     fn subagent_endpoint_folds_role_default_through_registry() {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-subep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("NEXTGEN_HOME", &dir);
@@ -832,7 +962,9 @@ mod tests {
 
     #[test]
     fn round_trips_through_disk() {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-cfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("NEXTGEN_HOME", &dir);
@@ -860,10 +992,23 @@ mod tests {
     fn response_visuals_defaults_parses_and_round_trips() {
         let legacy: CliConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(legacy.response_visuals(), ResponseVisuals::Auto);
-        for (raw, mode) in [("auto", ResponseVisuals::Auto), ("always", ResponseVisuals::Always), ("off", ResponseVisuals::Off)] {
+        for (raw, mode) in [
+            ("auto", ResponseVisuals::Auto),
+            ("always", ResponseVisuals::Always),
+            ("off", ResponseVisuals::Off),
+        ] {
             assert_eq!(raw.parse::<ResponseVisuals>().unwrap(), mode);
-            let json = serde_json::to_string(&CliConfig { response_visuals: Some(mode), ..Default::default() }).unwrap();
-            assert_eq!(serde_json::from_str::<CliConfig>(&json).unwrap().response_visuals(), mode);
+            let json = serde_json::to_string(&CliConfig {
+                response_visuals: Some(mode),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(
+                serde_json::from_str::<CliConfig>(&json)
+                    .unwrap()
+                    .response_visuals(),
+                mode
+            );
         }
         assert!("sometimes".parse::<ResponseVisuals>().is_err());
     }
@@ -889,12 +1034,18 @@ mod tests {
 
     #[test]
     fn save_normalizes_legacy_approval_fields() {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-approval-cfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("NEXTGEN_HOME", &dir);
 
-        save(&CliConfig { smart_approve: Some(true), ..Default::default() }).unwrap();
+        save(&CliConfig {
+            smart_approve: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
         let raw = std::fs::read_to_string(config_path()).unwrap();
         assert!(raw.contains("\"approval_mode\": \"smart\""), "{raw}");
         assert!(!raw.contains("smart_approve"), "{raw}");
@@ -908,37 +1059,57 @@ mod tests {
     #[test]
     fn suppress_effort_override_isolates_subagents_then_restores() {
         // Serialize against any other test that touches the process-global override.
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Start clean.
         clear_effort_override();
-        assert_eq!(resolved_reasoning_effort(Some("low".into())), Some("low".into()),
-            "disarmed → caller's config default is used");
+        assert_eq!(
+            resolved_reasoning_effort(Some("low".into())),
+            Some("low".into()),
+            "disarmed → caller's config default is used"
+        );
 
         // Parent turn arms the override (e.g. ultimate pins `max`).
         set_effort_override(Some("max".into()));
-        assert_eq!(resolved_reasoning_effort(Some("low".into())), Some("max".into()),
-            "armed → parent tier wins over the caller default");
+        assert_eq!(
+            resolved_reasoning_effort(Some("low".into())),
+            Some("max".into()),
+            "armed → parent tier wins over the caller default"
+        );
 
         // A sub-agent dispatch suppresses it: inside the guard, the caller's own default wins again.
         {
             let _s = suppress_effort_override();
             assert_eq!(resolved_reasoning_effort(Some("low".into())), Some("low".into()),
                 "suppressed → sub-agent resolves its own cfg.reasoning_effort, not the parent's max");
-            assert_eq!(resolved_reasoning_effort(None), None,
-                "suppressed with no caller default → omit the field");
+            assert_eq!(
+                resolved_reasoning_effort(None),
+                None,
+                "suppressed with no caller default → omit the field"
+            );
         }
         // Guard dropped → the parent's armed override is restored for the rest of the turn.
-        assert_eq!(resolved_reasoning_effort(Some("low".into())), Some("max".into()),
-            "drop restores the parent tier");
+        assert_eq!(
+            resolved_reasoning_effort(Some("low".into())),
+            Some("max".into()),
+            "drop restores the parent tier"
+        );
 
         // The nested "omit" state (Some(None)) must also round-trip through suppression.
         set_effort_override(None); // armed-but-omit
         {
             let _s = suppress_effort_override();
-            assert_eq!(resolved_reasoning_effort(Some("high".into())), Some("high".into()));
+            assert_eq!(
+                resolved_reasoning_effort(Some("high".into())),
+                Some("high".into())
+            );
         }
-        assert_eq!(resolved_reasoning_effort(Some("high".into())), None,
-            "restored to armed-but-omit (Some(None)), so the field is omitted again");
+        assert_eq!(
+            resolved_reasoning_effort(Some("high".into())),
+            None,
+            "restored to armed-but-omit (Some(None)), so the field is omitted again"
+        );
 
         clear_effort_override();
     }
@@ -954,7 +1125,9 @@ mod tests {
 
     #[test]
     fn branded_env_reads_aizen_only() {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // A suffix nothing else in the process reads, so setting these can't disturb other tests.
         let (brand, legacy) = ("AIZEN_BRANDED_UT", "NG_BRANDED_UT");
         for v in [brand, legacy] {

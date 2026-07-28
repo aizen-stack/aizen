@@ -128,8 +128,18 @@ pub fn regressions(baseline: &BenchMetrics, current: &BenchMetrics, eps: f64) ->
             v.push(format!("{name} regressed: {b:.4} -> {c:.4} (eps {eps})"));
         }
     };
-    drop("recall@5", baseline.recall_at_5, current.recall_at_5, &mut out);
-    drop("recall@10", baseline.recall_at_10, current.recall_at_10, &mut out);
+    drop(
+        "recall@5",
+        baseline.recall_at_5,
+        current.recall_at_5,
+        &mut out,
+    );
+    drop(
+        "recall@10",
+        baseline.recall_at_10,
+        current.recall_at_10,
+        &mut out,
+    );
     drop("mrr", baseline.mrr, current.mrr, &mut out);
     drop("ndcg@5", baseline.ndcg_at_5, current.ndcg_at_5, &mut out);
     if current.noise_rate > baseline.noise_rate + eps {

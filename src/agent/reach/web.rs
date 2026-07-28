@@ -20,14 +20,19 @@ const JINA_FIRST: &[&str] = &["reddit.com", "linkedin.com", "x.com", "twitter.co
 
 fn jina_first(host: &str) -> bool {
     let h = host.to_ascii_lowercase();
-    JINA_FIRST.iter().any(|d| h == *d || h.ends_with(&format!(".{d}")))
+    JINA_FIRST
+        .iter()
+        .any(|d| h == *d || h.ends_with(&format!(".{d}")))
 }
 
 /// Read any URL: direct fetch with automatic Jina-reader fallback (or jina-first for known-blocked
 /// hosts). The caller (route) has already run the SSRF guard on `url`.
 pub(crate) async fn read(url: &str) -> Result<String> {
     let c = http::client()?;
-    let host = reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
     if jina_first(&host) {
         match jina_read(&c, url).await {
             Ok(s) => return Ok(s),
@@ -47,7 +52,8 @@ pub(crate) async fn read(url: &str) -> Result<String> {
                 Err(je) => {
                     super::note_err("web", "jina", &je.to_string());
                     // Prefer the direct result (even a thin one) over a double failure.
-                    direct_result.map_err(|de| anyhow::anyhow!("{de}; jina fallback also failed: {je}"))
+                    direct_result
+                        .map_err(|de| anyhow::anyhow!("{de}; jina fallback also failed: {je}"))
                 }
             }
         }
@@ -68,9 +74,18 @@ pub(crate) async fn direct_read(c: &reqwest::Client, url: &str) -> Result<String
                 }
             }
             let looks_html = f.ctype.contains("html") || text.trim_start().starts_with('<');
-            let content = if looks_html { html_to_text(&text) } else { text };
+            let content = if looks_html {
+                html_to_text(&text)
+            } else {
+                text
+            };
             super::note_ok("web", "direct");
-            Ok(format!("[{} {}]\n{}", f.status, url, truncate_chars(&content, FETCH_CAP)))
+            Ok(format!(
+                "[{} {}]\n{}",
+                f.status,
+                url,
+                truncate_chars(&content, FETCH_CAP)
+            ))
         }
         Err(e) => {
             super::note_err("web", "direct", &e.to_string());
@@ -91,8 +106,18 @@ fn looks_blocked_or_thin(rendered: &str) -> bool {
         return true;
     }
     let body = rendered.split_once('\n').map(|x| x.1).unwrap_or("");
-    let head: String = body.chars().take(600).collect::<String>().to_ascii_lowercase();
-    let challenge = ["just a moment", "enable javascript", "verify you are human", "attention required", "checking your browser"];
+    let head: String = body
+        .chars()
+        .take(600)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let challenge = [
+        "just a moment",
+        "enable javascript",
+        "verify you are human",
+        "attention required",
+        "checking your browser",
+    ];
     if challenge.iter().any(|m| head.contains(m)) {
         return true;
     }
@@ -105,7 +130,15 @@ fn looks_blocked_or_thin(rendered: &str) -> bool {
 /// lifts the quota, so pacing relaxes).
 pub(crate) async fn jina_read(c: &reqwest::Client, url: &str) -> Result<String> {
     let key = super::jina_key();
-    super::pace("jina", if key.is_some() { Duration::from_millis(500) } else { Duration::from_secs(3) }).await;
+    super::pace(
+        "jina",
+        if key.is_some() {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(3)
+        },
+    )
+    .await;
     let mut headers: Vec<(&str, String)> = Vec::new();
     if let Some(k) = &key {
         headers.push(("Authorization", format!("Bearer {k}")));
@@ -115,10 +148,18 @@ pub(crate) async fn jina_read(c: &reqwest::Client, url: &str) -> Result<String> 
         bail!("jina reader rate-limited (HTTP 429; keyless tier is ~20 req/min — set JINA_API_KEY to raise it)");
     }
     if !f.is_success() {
-        bail!("jina reader returned HTTP {}: {}", f.status, http::snippet(&f.text()));
+        bail!(
+            "jina reader returned HTTP {}: {}",
+            f.status,
+            http::snippet(&f.text())
+        );
     }
     super::note_ok("web", "jina");
-    Ok(format!("[jina {}]\n{}", url, truncate_chars(&f.text(), FETCH_CAP)))
+    Ok(format!(
+        "[jina {}]\n{}",
+        url,
+        truncate_chars(&f.text(), FETCH_CAP)
+    ))
 }
 
 // ── doctor probe ────────────────────────────────────────────────────────────
@@ -135,7 +176,9 @@ pub(crate) async fn probe_jina() -> super::Probe {
         } else {
             "reader OK (keyless ≈20 req/min; JINA_API_KEY raises it)".into()
         }),
-        Err(e) if e.to_string().contains("429") => super::Probe::Warn(format!("rate-limited: {}", http::snippet(&e.to_string()))),
+        Err(e) if e.to_string().contains("429") => {
+            super::Probe::Warn(format!("rate-limited: {}", http::snippet(&e.to_string())))
+        }
         Err(e) => super::Probe::Fail(http::snippet(&e.to_string())),
     }
 }
@@ -152,18 +195,32 @@ mod tests {
         assert!(jina_first("www.linkedin.com"));
         assert!(jina_first("x.com"));
         assert!(!jina_first("example.com"));
-        assert!(!jina_first("notreddit.com"), "suffix must match on a label boundary");
+        assert!(
+            !jina_first("notreddit.com"),
+            "suffix must match on a label boundary"
+        );
     }
 
     #[test]
     fn blocked_detection_is_conservative() {
         assert!(looks_blocked_or_thin("[403 https://a.com]\nForbidden"));
-        assert!(looks_blocked_or_thin("[200 https://a.com]\nJust a moment... Enable JavaScript and cookies to continue"));
-        assert!(looks_blocked_or_thin("[200 https://a.com]\n  \n"), "empty shell");
-        let real = format!("[200 https://a.com]\n{}", "Real page content here. ".repeat(20));
+        assert!(looks_blocked_or_thin(
+            "[200 https://a.com]\nJust a moment... Enable JavaScript and cookies to continue"
+        ));
+        assert!(
+            looks_blocked_or_thin("[200 https://a.com]\n  \n"),
+            "empty shell"
+        );
+        let real = format!(
+            "[200 https://a.com]\n{}",
+            "Real page content here. ".repeat(20)
+        );
         assert!(!looks_blocked_or_thin(&real));
         // A short-but-real page (an API health endpoint, say) over the 40-char floor stays direct.
-        let short = format!("[200 https://a.com]\n{}", "ok — service healthy, version 1.2.3, uptime 99 days");
+        let short = format!(
+            "[200 https://a.com]\n{}",
+            "ok — service healthy, version 1.2.3, uptime 99 days"
+        );
         assert!(!looks_blocked_or_thin(&short));
     }
 }

@@ -85,7 +85,10 @@ mod tests {
 
     #[test]
     fn serde_uses_lowercase_strings() {
-        assert_eq!(serde_json::to_string(&ApprovalMode::Smart).unwrap(), "\"smart\"");
+        assert_eq!(
+            serde_json::to_string(&ApprovalMode::Smart).unwrap(),
+            "\"smart\""
+        );
         assert_eq!(
             serde_json::from_str::<ApprovalMode>("\"yolo\"").unwrap(),
             ApprovalMode::Yolo

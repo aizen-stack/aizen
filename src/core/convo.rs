@@ -64,6 +64,10 @@ mod tests {
         set_active(Some(ConversationId::new("telegram:main:42")));
         assert_eq!(active().as_str(), "telegram:main:42");
         set_active(None);
-        assert_eq!(active().as_str(), "default", "clearing reverts to the shared default");
+        assert_eq!(
+            active().as_str(),
+            "default",
+            "clearing reverts to the shared default"
+        );
     }
 }

@@ -110,53 +110,199 @@ impl Category {
 // Single-word keywords match against the text's word set; multi-word / symbol-bearing keywords
 // (have a space) match as a lowercased substring. Bilingual EN + VI throughout.
 const BUG_KW: &[&str] = &[
-    "bug", "crash", "crashed", "panic", "panicked", "regression", "broke", "broken", "error",
-    "exception", "traceback", "stacktrace", "segfault", "npe", "nullpointer", "fails", "failing",
-    "lỗi", "sập", "hỏng", "vỡ", "báo lỗi",
+    "bug",
+    "crash",
+    "crashed",
+    "panic",
+    "panicked",
+    "regression",
+    "broke",
+    "broken",
+    "error",
+    "exception",
+    "traceback",
+    "stacktrace",
+    "segfault",
+    "npe",
+    "nullpointer",
+    "fails",
+    "failing",
+    "lỗi",
+    "sập",
+    "hỏng",
+    "vỡ",
+    "báo lỗi",
 ];
 const FAILED_KW: &[&str] = &[
-    "didn't work", "did not work", "does not work", "doesn't work", "no luck", "dead end",
-    "gave up", "abandoned", "reverted", "rolled back", "not the way", "wrong approach", "avoid",
-    "không hoạt động", "không chạy", "thất bại", "bỏ cuộc", "quay lại", "cách sai", "tránh",
+    "didn't work",
+    "did not work",
+    "does not work",
+    "doesn't work",
+    "no luck",
+    "dead end",
+    "gave up",
+    "abandoned",
+    "reverted",
+    "rolled back",
+    "not the way",
+    "wrong approach",
+    "avoid",
+    "không hoạt động",
+    "không chạy",
+    "thất bại",
+    "bỏ cuộc",
+    "quay lại",
+    "cách sai",
+    "tránh",
 ];
 const SUCCESS_KW: &[&str] = &[
-    "worked", "works", "fixed", "solved", "resolved", "the fix", "the trick", "turned out",
-    "solution was", "in the end", "finally", "pattern", "recipe", "approach that",
-    "đã sửa", "đã fix", "giải quyết", "hoạt động rồi", "chạy rồi", "cách làm", "mẹo",
+    "worked",
+    "works",
+    "fixed",
+    "solved",
+    "resolved",
+    "the fix",
+    "the trick",
+    "turned out",
+    "solution was",
+    "in the end",
+    "finally",
+    "pattern",
+    "recipe",
+    "approach that",
+    "đã sửa",
+    "đã fix",
+    "giải quyết",
+    "hoạt động rồi",
+    "chạy rồi",
+    "cách làm",
+    "mẹo",
 ];
 const DECISION_KW: &[&str] = &[
-    "decided", "decision", "we chose", "chose to", "convention", "architecture", "design",
-    "standard", "policy", "rule of thumb", "always structure", "the pattern is", "we use",
-    "quyết định", "kiến trúc", "quy ước", "chuẩn", "nguyên tắc", "thiết kế", "chọn dùng",
+    "decided",
+    "decision",
+    "we chose",
+    "chose to",
+    "convention",
+    "architecture",
+    "design",
+    "standard",
+    "policy",
+    "rule of thumb",
+    "always structure",
+    "the pattern is",
+    "we use",
+    "quyết định",
+    "kiến trúc",
+    "quy ước",
+    "chuẩn",
+    "nguyên tắc",
+    "thiết kế",
+    "chọn dùng",
 ];
 const COMMAND_KW: &[&str] = &[
-    "command", "run:", "run ", "cargo ", "npm run", "pnpm ", "make ", "docker ", "git ", "invoke",
-    "cli", "flag", "argument", "script", "./", "npx ", "bash ", "powershell ",
-    "lệnh", "chạy lệnh", "câu lệnh", "tham số",
+    "command",
+    "run:",
+    "run ",
+    "cargo ",
+    "npm run",
+    "pnpm ",
+    "make ",
+    "docker ",
+    "git ",
+    "invoke",
+    "cli",
+    "flag",
+    "argument",
+    "script",
+    "./",
+    "npx ",
+    "bash ",
+    "powershell ",
+    "lệnh",
+    "chạy lệnh",
+    "câu lệnh",
+    "tham số",
 ];
 const SECURITY_KW: &[&str] = &[
-    "security", "secret", "secrets", "credential", "credentials", "token", "api key", "password",
-    "auth", "authentication", "authorization", "permission", "vulnerability", "cve", "encrypt",
-    "never commit", "never print", "sanitize", "injection",
-    "bảo mật", "mật khẩu", "bí mật", "khoá", "mã hoá", "không được commit", "không in",
+    "security",
+    "secret",
+    "secrets",
+    "credential",
+    "credentials",
+    "token",
+    "api key",
+    "password",
+    "auth",
+    "authentication",
+    "authorization",
+    "permission",
+    "vulnerability",
+    "cve",
+    "encrypt",
+    "never commit",
+    "never print",
+    "sanitize",
+    "injection",
+    "bảo mật",
+    "mật khẩu",
+    "bí mật",
+    "khoá",
+    "mã hoá",
+    "không được commit",
+    "không in",
 ];
 const DEPLOY_KW: &[&str] = &[
-    "deploy", "deployment", "release", "ci", "cd", "pipeline", "publish", "ship", "rollout",
-    "staging", "production", "prod", "docker build", "kubernetes", "k8s", "fly", "vercel",
-    "netlify", "github actions", "runner",
-    "triển khai", "phát hành", "lên prod", "đóng gói",
+    "deploy",
+    "deployment",
+    "release",
+    "ci",
+    "cd",
+    "pipeline",
+    "publish",
+    "ship",
+    "rollout",
+    "staging",
+    "production",
+    "prod",
+    "docker build",
+    "kubernetes",
+    "k8s",
+    "fly",
+    "vercel",
+    "netlify",
+    "github actions",
+    "runner",
+    "triển khai",
+    "phát hành",
+    "lên prod",
+    "đóng gói",
 ];
 const CODEBASE_KW: &[&str] = &[
-    "lives in", "defined in", "located in", "the module", "the function", "the file", "the struct",
-    "the enum", "the class", "implemented in", "handles", "responsible for", "entry point",
-    "nằm ở", "nằm trong", "định nghĩa ở", "hàm", "module", "tập tin", "cấu trúc", "xử lý",
+    "lives in",
+    "defined in",
+    "located in",
+    "the module",
+    "the function",
+    "the file",
+    "the struct",
+    "the enum",
+    "the class",
+    "implemented in",
+    "handles",
+    "responsible for",
+    "entry point",
+    "nằm ở",
+    "nằm trong",
+    "định nghĩa ở",
+    "hàm",
+    "module",
+    "tập tin",
+    "cấu trúc",
+    "xử lý",
 ];
 
-fn count_hits(
-    text_lower: &str,
-    words: &std::collections::HashSet<String>,
-    kws: &[&str],
-) -> usize {
+fn count_hits(text_lower: &str, words: &std::collections::HashSet<String>, kws: &[&str]) -> usize {
     kws.iter()
         .filter(|kw| {
             if kw.contains(' ') || kw.contains('/') || kw.contains(':') {
@@ -181,14 +327,38 @@ pub fn classify(text: &str) -> Category {
 
     // (count, priority-rank, category) — higher count wins; tie → lower rank wins.
     let candidates = [
-        (count_hits(&lower, &words, SECURITY_KW), 0, Category::SecurityRule),
-        (count_hits(&lower, &words, FAILED_KW), 1, Category::FailedAttempt),
+        (
+            count_hits(&lower, &words, SECURITY_KW),
+            0,
+            Category::SecurityRule,
+        ),
+        (
+            count_hits(&lower, &words, FAILED_KW),
+            1,
+            Category::FailedAttempt,
+        ),
         (count_hits(&lower, &words, BUG_KW), 2, Category::BugHistory),
-        (count_hits(&lower, &words, SUCCESS_KW), 3, Category::SuccessPattern),
-        (count_hits(&lower, &words, DEPLOY_KW), 4, Category::DeployNote),
-        (count_hits(&lower, &words, DECISION_KW), 5, Category::ArchDecision),
+        (
+            count_hits(&lower, &words, SUCCESS_KW),
+            3,
+            Category::SuccessPattern,
+        ),
+        (
+            count_hits(&lower, &words, DEPLOY_KW),
+            4,
+            Category::DeployNote,
+        ),
+        (
+            count_hits(&lower, &words, DECISION_KW),
+            5,
+            Category::ArchDecision,
+        ),
         (count_hits(&lower, &words, COMMAND_KW), 6, Category::Command),
-        (count_hits(&lower, &words, CODEBASE_KW), 7, Category::Codebase),
+        (
+            count_hits(&lower, &words, CODEBASE_KW),
+            7,
+            Category::Codebase,
+        ),
     ];
     let best = candidates
         .iter()
@@ -206,20 +376,50 @@ mod tests {
 
     #[test]
     fn classifies_the_core_categories_en() {
-        assert_eq!(classify("hit a null pointer panic in the parser"), Category::BugHistory);
-        assert_eq!(classify("tried the recursive approach but it didn't work, dead end"), Category::FailedAttempt);
-        assert_eq!(classify("the fix was to flush the buffer — that worked"), Category::SuccessPattern);
-        assert_eq!(classify("we decided the architecture uses one store per zone by convention"), Category::ArchDecision);
-        assert_eq!(classify("never commit the api key; sanitize before logging"), Category::SecurityRule);
-        assert_eq!(classify("deploy to production via the github actions pipeline"), Category::DeployNote);
+        assert_eq!(
+            classify("hit a null pointer panic in the parser"),
+            Category::BugHistory
+        );
+        assert_eq!(
+            classify("tried the recursive approach but it didn't work, dead end"),
+            Category::FailedAttempt
+        );
+        assert_eq!(
+            classify("the fix was to flush the buffer — that worked"),
+            Category::SuccessPattern
+        );
+        assert_eq!(
+            classify("we decided the architecture uses one store per zone by convention"),
+            Category::ArchDecision
+        );
+        assert_eq!(
+            classify("never commit the api key; sanitize before logging"),
+            Category::SecurityRule
+        );
+        assert_eq!(
+            classify("deploy to production via the github actions pipeline"),
+            Category::DeployNote
+        );
     }
 
     #[test]
     fn classifies_the_core_categories_vi() {
-        assert_eq!(classify("gặp lỗi sập chương trình khi parse"), Category::BugHistory);
-        assert_eq!(classify("thử cách đệ quy nhưng không hoạt động, cách sai"), Category::FailedAttempt);
-        assert_eq!(classify("không được commit mật khẩu, phải mã hoá bí mật"), Category::SecurityRule);
-        assert_eq!(classify("triển khai lên prod qua pipeline"), Category::DeployNote);
+        assert_eq!(
+            classify("gặp lỗi sập chương trình khi parse"),
+            Category::BugHistory
+        );
+        assert_eq!(
+            classify("thử cách đệ quy nhưng không hoạt động, cách sai"),
+            Category::FailedAttempt
+        );
+        assert_eq!(
+            classify("không được commit mật khẩu, phải mã hoá bí mật"),
+            Category::SecurityRule
+        );
+        assert_eq!(
+            classify("triển khai lên prod qua pipeline"),
+            Category::DeployNote
+        );
     }
 
     #[test]
@@ -232,7 +432,10 @@ mod tests {
     fn priority_files_the_most_critical_type_on_a_tie() {
         // A line that names both a security rule and a command must file as security (rank 0),
         // not command (rank 6) — the decision-critical axis wins a 1-1 tie.
-        assert_eq!(classify("run the command that rotates the secret token"), Category::SecurityRule);
+        assert_eq!(
+            classify("run the command that rotates the secret token"),
+            Category::SecurityRule
+        );
     }
 
     #[test]
@@ -244,7 +447,11 @@ mod tests {
         assert_eq!(Category::Codebase.kind(), Kind::Semantic);
         assert_eq!(Category::SecurityRule.kind(), Kind::Procedural);
         assert_eq!(Category::DeployNote.kind(), Kind::Procedural);
-        assert_eq!(Category::None.kind(), Kind::Episodic, "an untyped observation is a raw episode");
+        assert_eq!(
+            Category::None.kind(),
+            Kind::Episodic,
+            "an untyped observation is a raw episode"
+        );
     }
 
     #[test]
@@ -260,7 +467,12 @@ mod tests {
             Category::Codebase,
             Category::None,
         ] {
-            assert_eq!(Category::parse(c.as_str()), Some(c), "{} must round-trip", c.as_str());
+            assert_eq!(
+                Category::parse(c.as_str()),
+                Some(c),
+                "{} must round-trip",
+                c.as_str()
+            );
         }
         assert_eq!(Category::parse("nonsense"), None);
     }

@@ -114,15 +114,30 @@ fn from_file(path: &Path) -> Option<SelfMemory> {
         .and_then(|s| s.trim().parse::<u8>().ok())
         .unwrap_or(3)
         .min(10);
-    let created = fm.get("created").map(str::to_string).filter(|s| !s.trim().is_empty());
-    let updated = fm.get("updated").map(str::to_string).filter(|s| !s.trim().is_empty());
+    let created = fm
+        .get("created")
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+    let updated = fm
+        .get("updated")
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
     let mtime_ms = fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    Some(SelfMemory { id, path: path.to_path_buf(), kind, importance, created, updated, body: fm.body, mtime_ms })
+    Some(SelfMemory {
+        id,
+        path: path.to_path_buf(),
+        kind,
+        importance,
+        created,
+        updated,
+        body: fm.body,
+        mtime_ms,
+    })
 }
 
 /// All self-memories for a character (missing dir → empty; never errors).
@@ -134,7 +149,11 @@ pub fn list(persona_slug: &str) -> Vec<SelfMemory> {
     };
     for e in rd.flatten() {
         let p = e.path();
-        if p.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("md")) != Some(true) {
+        if p.extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x.eq_ignore_ascii_case("md"))
+            != Some(true)
+        {
             continue;
         }
         if let Some(m) = from_file(&p) {
@@ -157,10 +176,24 @@ fn unique_path(dir: &Path, prefix: &str, body: &str) -> PathBuf {
     // a short, stable-ish stem from the body's first words, uniquified on collision
     let words: String = body
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
         .collect();
-    let slug: String = words.split_whitespace().take(5).collect::<Vec<_>>().join("-");
-    let slug = if slug.is_empty() { "mem".to_string() } else { slug };
+    let slug: String = words
+        .split_whitespace()
+        .take(5)
+        .collect::<Vec<_>>()
+        .join("-");
+    let slug = if slug.is_empty() {
+        "mem".to_string()
+    } else {
+        slug
+    };
     let base = format!("{prefix}-{slug}");
     let first = dir.join(format!("{base}.md"));
     if !first.exists() {
@@ -194,7 +227,11 @@ fn write(persona_slug: &str, kind: Kind, importance: u8, body: &str) -> Result<S
         &path,
         render(kind, importance, &now, &now, body).as_bytes(),
     )?;
-    Ok(path.file_stem().and_then(|s| s.to_str()).unwrap_or("mem").to_string())
+    Ok(path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("mem")
+        .to_string())
 }
 
 /// Record a free episode (zero model cost). Near-dups against a window of recent episodes *and*
@@ -225,16 +262,19 @@ pub fn save_insight(persona_slug: &str, body: &str, importance: u8) -> Result<St
 }
 
 fn normalize(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Token set for cheap near-dup (Jaccard). Short stopwords stripped so "the user asked hello"
 /// doesn't thrash on function words.
 fn content_tokens(s: &str) -> std::collections::HashSet<String> {
     const STOP: &[&str] = &[
-        "the", "a", "an", "i", "me", "my", "you", "your", "and", "or", "to", "of", "in", "on", "for",
-        "is", "are", "was", "were", "it", "this", "that", "with", "as", "at", "be", "have", "has",
-        "user", "asked", "answered", "directly", "via", "steps", "tool", "tools",
+        "the", "a", "an", "i", "me", "my", "you", "your", "and", "or", "to", "of", "in", "on",
+        "for", "is", "are", "was", "were", "it", "this", "that", "with", "as", "at", "be", "have",
+        "has", "user", "asked", "answered", "directly", "via", "steps", "tool", "tools",
     ];
     normalize(s)
         .split(|c: char| !c.is_alphanumeric())
@@ -260,8 +300,10 @@ fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<
 fn is_near_duplicate(persona_slug: &str, body: &str) -> bool {
     let cand = content_tokens(body);
     let norm = normalize(body);
-    let mut eps: Vec<SelfMemory> =
-        list(persona_slug).into_iter().filter(|m| m.kind == Kind::Episode).collect();
+    let mut eps: Vec<SelfMemory> = list(persona_slug)
+        .into_iter()
+        .filter(|m| m.kind == Kind::Episode)
+        .collect();
     eps.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
     for m in eps.into_iter().take(DEDUP_WINDOW) {
         if normalize(&m.body) == norm {
@@ -272,7 +314,10 @@ fn is_near_duplicate(persona_slug: &str, body: &str) -> bool {
         }
     }
     // Also skip if an insight already covers the same content (evolution already distilled it).
-    for m in list(persona_slug).into_iter().filter(|m| m.kind == Kind::Insight) {
+    for m in list(persona_slug)
+        .into_iter()
+        .filter(|m| m.kind == Kind::Insight)
+    {
         if jaccard(&cand, &content_tokens(&m.body)) >= 0.75 {
             return true;
         }
@@ -323,9 +368,26 @@ pub fn looks_like_correction(text: &str) -> bool {
     }
     let t = text.to_lowercase();
     const SIGNALS: &[&str] = &[
-        "no,", "nope", "actually", "instead", "wrong", "don't", "do not", "stop", "revert", "undo",
-        "incorrect", "not right", "that's not", // en
-        "không phải", "sai rồi", "sai ròi", "đừng", "sửa lại", "thực ra", "thay vào", // vi
+        "no,",
+        "nope",
+        "actually",
+        "instead",
+        "wrong",
+        "don't",
+        "do not",
+        "stop",
+        "revert",
+        "undo",
+        "incorrect",
+        "not right",
+        "that's not", // en
+        "không phải",
+        "sai rồi",
+        "sai ròi",
+        "đừng",
+        "sửa lại",
+        "thực ra",
+        "thay vào", // vi
     ];
     SIGNALS.iter().any(|s| t.contains(s))
 }
@@ -338,21 +400,60 @@ pub fn is_smalltalk(text: &str) -> bool {
     }
     // Very short pure greetings / acks.
     const PHATIC: &[&str] = &[
-        "hi", "hello", "hey", "yo", "sup", "hola", "ok", "okay", "k", "kk", "thanks", "thank you",
-        "ty", "thx", "bye", "good morning", "good night", "good evening", "gm", "gn",
-        "xin chào", "chào", "chào bạn", "chào em", "chào anh", "cảm ơn", "cam on", "ok luôn",
-        "ừ", "uh", "ừm", "umm", "alo", "test", "ping",
+        "hi",
+        "hello",
+        "hey",
+        "yo",
+        "sup",
+        "hola",
+        "ok",
+        "okay",
+        "k",
+        "kk",
+        "thanks",
+        "thank you",
+        "ty",
+        "thx",
+        "bye",
+        "good morning",
+        "good night",
+        "good evening",
+        "gm",
+        "gn",
+        "xin chào",
+        "chào",
+        "chào bạn",
+        "chào em",
+        "chào anh",
+        "cảm ơn",
+        "cam on",
+        "ok luôn",
+        "ừ",
+        "uh",
+        "ừm",
+        "umm",
+        "alo",
+        "test",
+        "ping",
     ];
     if PHATIC.iter().any(|p| t == *p) {
         return true;
     }
     // "hello!" / "chào 👋" / "hi there" with almost no content.
-    let alpha: String = t.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
+    let alpha: String = t
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect();
     let words: Vec<&str> = alpha.split_whitespace().collect();
     if words.len() <= 2 {
-        const GREET_HEAD: &[&str] =
-            &["hi", "hello", "hey", "chào", "chao", "thanks", "thank", "ok", "okay", "xin"];
-        if words.first().map(|w| GREET_HEAD.contains(w)).unwrap_or(false) {
+        const GREET_HEAD: &[&str] = &[
+            "hi", "hello", "hey", "chào", "chao", "thanks", "thank", "ok", "okay", "xin",
+        ];
+        if words
+            .first()
+            .map(|w| GREET_HEAD.contains(w))
+            .unwrap_or(false)
+        {
             return true;
         }
     }
@@ -380,7 +481,10 @@ pub fn classify_turn(user_text: &str, tool_calls: usize) -> Option<TurnSalience>
 
     if corrected || sig.kind == SignalKind::Correction {
         let imp = if long { 8 } else { 7 };
-        return Some(TurnSalience { kind: EventKind::Correction, importance: imp });
+        return Some(TurnSalience {
+            kind: EventKind::Correction,
+            importance: imp,
+        });
     }
     if sig.kind == SignalKind::Remember {
         return Some(TurnSalience {
@@ -398,7 +502,10 @@ pub fn classify_turn(user_text: &str, tool_calls: usize) -> Option<TurnSalience>
         // Work alone is weaker than a correction/preference — still formative enough to reflect on
         // "how we work together", not every bugfix.
         let imp = if tool_calls >= 5 || long { 6 } else { 5 };
-        return Some(TurnSalience { kind: EventKind::Work, importance: imp });
+        return Some(TurnSalience {
+            kind: EventKind::Work,
+            importance: imp,
+        });
     }
     None
 }
@@ -406,9 +513,15 @@ pub fn classify_turn(user_text: &str, tool_calls: usize) -> Option<TurnSalience>
 /// Backward-compatible importance helper (CLI `persona remember` + tests). Prefer [`classify_turn`].
 pub fn episode_importance(user_text: &str, tool_calls: usize, corrected: bool) -> u8 {
     if corrected {
-        return if user_text.chars().count() > 160 { 8 } else { 7 };
+        return if user_text.chars().count() > 160 {
+            8
+        } else {
+            7
+        };
     }
-    classify_turn(user_text, tool_calls).map(|s| s.importance).unwrap_or(0)
+    classify_turn(user_text, tool_calls)
+        .map(|s| s.importance)
+        .unwrap_or(0)
 }
 
 /// Build a typed free episode body (no model cost). Keeps the reflection substrate clean.
@@ -448,14 +561,18 @@ fn truncate_words(s: &str, max_words: usize) -> String {
 }
 
 fn age_days(created: &Option<String>, today: chrono::NaiveDate) -> f64 {
-    match created.as_deref().and_then(|s| chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok()) {
+    match created
+        .as_deref()
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok())
+    {
         Some(d) => (today - d).num_days().max(0) as f64,
         None => 0.0,
     }
 }
 
 fn rank(m: &SelfMemory, today: chrono::NaiveDate) -> f64 {
-    let base = (m.importance as f64 / 10.0) * recency_factor(age_days(&m.created, today), SELF_HALF_LIFE_DAYS);
+    let base = (m.importance as f64 / 10.0)
+        * recency_factor(age_days(&m.created, today), SELF_HALF_LIFE_DAYS);
     if m.kind == Kind::Insight {
         base * INSIGHT_RANK_BONUS
     } else {
@@ -534,26 +651,43 @@ pub fn self_block(persona_slug: &str, max_tokens: usize) -> Option<String> {
     Some(format!("{header}\n{}", lines.join("\n")))
 }
 
-/// Prune each kind to its LRU cap: drop the lowest (importance, then oldest) over the limit.
-/// Episodes are deleted outright (transient); insights too once over their generous cap.
+/// Prune each kind to its LRU cap: move the lowest (importance, then oldest) over the limit
+/// into `<slug>.self/.archive/`. Nothing is hard-deleted — a character's accumulated experience
+/// is user data, and at a saturated cap this path runs after *every* formative turn.
 fn prune(persona_slug: &str) {
     prune_kind(persona_slug, Kind::Episode, EPISODE_CAP);
     prune_kind(persona_slug, Kind::Insight, INSIGHT_CAP);
 }
 
+/// Where evicted self-memories go. Not scanned by `list()` (it only reads `*.md` directly under
+/// `self_dir`, and a directory has no `.md` extension), so archived items leave the live set.
+pub fn archive_dir(persona_slug: &str) -> PathBuf {
+    self_dir(persona_slug).join(".archive")
+}
+
 fn prune_kind(persona_slug: &str, kind: Kind, cap: usize) {
-    let mut of_kind: Vec<SelfMemory> = list(persona_slug).into_iter().filter(|m| m.kind == kind).collect();
+    let mut of_kind: Vec<SelfMemory> = list(persona_slug)
+        .into_iter()
+        .filter(|m| m.kind == kind)
+        .collect();
     if of_kind.len() <= cap {
         return;
     }
-    // keep the best `cap` by (importance desc, mtime desc); delete the rest.
+    // keep the best `cap` by (importance desc, mtime desc); archive the rest.
     of_kind.sort_by(|a, b| {
         b.importance
             .cmp(&a.importance)
             .then(b.mtime_ms.cmp(&a.mtime_ms))
     });
+    let adir = archive_dir(persona_slug);
+    if fs::create_dir_all(&adir).is_err() {
+        return; // can't archive → keep the file rather than lose it
+    }
     for victim in of_kind.into_iter().skip(cap) {
-        let _ = fs::remove_file(&victim.path);
+        // `unique_in` uniquifies on collision: two victims sharing a stem must not overwrite
+        // each other, and neither may overwrite an item archived on an earlier turn.
+        let dest = crate::memory::bloat::caps::unique_in(&adir, &victim.id);
+        let _ = fs::rename(&victim.path, &dest);
     }
 }
 
@@ -571,13 +705,16 @@ pub fn recent_episode_bodies(persona_slug: &str, n: usize) -> Vec<String> {
 
 /// Accumulated *formative* episode importance since the most-recent insight (reflection trigger).
 fn importance_since_last_insight(mems: &[SelfMemory]) -> (u32, usize) {
-    let last_insight = mems.iter().filter(|m| m.kind == Kind::Insight).map(|m| m.mtime_ms).max().unwrap_or(0);
+    let last_insight = mems
+        .iter()
+        .filter(|m| m.kind == Kind::Insight)
+        .map(|m| m.mtime_ms)
+        .max()
+        .unwrap_or(0);
     let fresh: Vec<&SelfMemory> = mems
         .iter()
         .filter(|m| {
-            m.kind == Kind::Episode
-                && m.importance >= FORMATIVE_MIN
-                && m.mtime_ms > last_insight
+            m.kind == Kind::Episode && m.importance >= FORMATIVE_MIN && m.mtime_ms > last_insight
         })
         .collect();
     let total: u32 = fresh.iter().map(|m| m.importance as u32).sum();
@@ -611,7 +748,9 @@ mod tests {
     use super::*;
 
     fn with_home<T>(tag: &str, f: impl FnOnce() -> T) -> T {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-self-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("NEXTGEN_HOME", &dir);
@@ -672,7 +811,12 @@ mod tests {
         let b = format_episode_body(EventKind::Correction, "No use tabs", 0, "");
         assert!(b.starts_with("correction:"));
         assert!(!b.contains("I answered directly"));
-        let w = format_episode_body(EventKind::Work, "fix the parse test", 3, "patched config.rs");
+        let w = format_episode_body(
+            EventKind::Work,
+            "fix the parse test",
+            3,
+            "patched config.rs",
+        );
         assert!(w.starts_with("work:"));
         assert!(w.contains("3 tool"));
     }
@@ -680,13 +824,16 @@ mod tests {
     #[test]
     fn episode_dedup_window_not_only_last() {
         with_home("dedup", || {
-            let a = record_episode("aria", "correction: user redirected me — \"use tabs\"", 7).unwrap();
+            let a =
+                record_episode("aria", "correction: user redirected me — \"use tabs\"", 7).unwrap();
             assert!(a.is_some());
             // Intervening different episode.
-            let mid = record_episode("aria", "work: handled \"fix parse\" via 3 tool steps", 6).unwrap();
+            let mid =
+                record_episode("aria", "work: handled \"fix parse\" via 3 tool steps", 6).unwrap();
             assert!(mid.is_some());
             // Near-identical to the FIRST episode (not last) must still skip.
-            let b = record_episode("aria", "correction: user redirected me — \"use tabs\"", 7).unwrap();
+            let b =
+                record_episode("aria", "correction: user redirected me — \"use tabs\"", 7).unwrap();
             assert!(b.is_none(), "near-dup against window must skip");
             let (eps, _) = counts("aria");
             assert_eq!(eps, 2);
@@ -722,7 +869,12 @@ mod tests {
     #[test]
     fn self_block_allows_hot_episode() {
         with_home("hot", || {
-            record_episode("aria", "correction: user redirected me — \"never force-push main\"", 8).unwrap();
+            record_episode(
+                "aria",
+                "correction: user redirected me — \"never force-push main\"",
+                8,
+            )
+            .unwrap();
             let block = self_block("aria", 700).expect("hot episode injects when no insights");
             assert!(block.contains("[episode]"));
             assert!(block.contains("force-push"));
@@ -749,13 +901,102 @@ mod tests {
             record_episode("aria", "KEEP THIS formative moment about trust", 8).unwrap();
             for i in 0..(EPISODE_CAP + 5) {
                 // importance 5 meets floor so they actually write, then get pruned.
-                record_episode("aria", &format!("work: handled \"chore number {i}\" via 2 tool steps"), 5)
-                    .unwrap();
+                record_episode(
+                    "aria",
+                    &format!("work: handled \"chore number {i}\" via 2 tool steps"),
+                    5,
+                )
+                .unwrap();
             }
             let (eps, _) = counts("aria");
             assert!(eps <= EPISODE_CAP, "episodes pruned to cap, got {eps}");
             let bodies: Vec<String> = list("aria").into_iter().map(|m| m.body).collect();
-            assert!(bodies.iter().any(|b| b.contains("KEEP THIS")), "the formative episode survives");
+            assert!(
+                bodies.iter().any(|b| b.contains("KEEP THIS")),
+                "the formative episode survives"
+            );
+        });
+    }
+
+    #[test]
+    fn prune_archives_instead_of_deleting() {
+        with_home("prune-archive", || {
+            // Bodies must differ ENOUGH to clear the 0.82 near-dup gate, or nothing is ever
+            // written past the first one and prune never runs (the older cap test writes
+            // "chore number {i}" bodies whose content tokens are identical after stopword
+            // stripping, so it asserts `eps <= CAP` against a store holding a single episode).
+            let want = EPISODE_CAP + 4;
+            for i in 0..want {
+                record_episode(
+                    "aria",
+                    &format!("work: fixed bug ab{i:02} in module cd{i:02}"),
+                    5,
+                )
+                .unwrap();
+            }
+            let (eps, _) = counts("aria");
+            assert_eq!(eps, EPISODE_CAP, "live set held exactly at the cap");
+
+            // The evicted experience is on disk under `.archive/`, not gone. At a saturated cap this
+            // path runs after EVERY formative turn, so a hard delete here bleeds user data.
+            let archived: Vec<PathBuf> = fs::read_dir(archive_dir("aria"))
+                .expect(".archive exists once something was evicted")
+                .flatten()
+                .map(|e| e.path())
+                .collect();
+            assert!(
+                !archived.is_empty(),
+                "evicted episodes are archived, never deleted"
+            );
+
+            // …and the archive is invisible to the live set (`list` only reads `*.md` directly under
+            // `self_dir`, and a directory carries no `.md` extension).
+            let live = self_dir("aria");
+            assert!(
+                list("aria")
+                    .iter()
+                    .all(|m| m.path.parent() == Some(live.as_path())),
+                "archived items must not come back through list()"
+            );
+        });
+    }
+
+    #[test]
+    fn archive_never_overwrites_same_stem() {
+        with_home("archive-collide", || {
+            let dir = self_dir("aria");
+            let adir = archive_dir("aria");
+            fs::create_dir_all(&dir).unwrap();
+            fs::create_dir_all(&adir).unwrap();
+            let render = |body: &str| format!("---\nkind: episode\nimportance: 5\n---\n{body}");
+
+            // An item archived on an earlier turn. Its stem is now FREE in the live dir, so
+            // `unique_path` will happily hand it out again — which is how a naive rename
+            // would silently overwrite this file later.
+            fs::write(adir.join("ep-old.md"), render("first life")).unwrap();
+            fs::write(dir.join("ep-old.md"), render("second life")).unwrap();
+
+            prune_kind("aria", Kind::Episode, 0);
+
+            let archived: Vec<String> = fs::read_dir(&adir)
+                .unwrap()
+                .flatten()
+                .filter_map(|e| fs::read_to_string(e.path()).ok())
+                .collect();
+            assert_eq!(
+                archived.len(),
+                2,
+                "collision uniquifies instead of overwriting"
+            );
+            assert!(
+                archived.iter().any(|c| c.contains("first life")),
+                "the older archive survives"
+            );
+            assert!(
+                archived.iter().any(|c| c.contains("second life")),
+                "the new eviction lands too"
+            );
+            assert_eq!(list("aria").len(), 0, "live set is empty at cap 0");
         });
     }
 }

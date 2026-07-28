@@ -68,7 +68,10 @@ static RE_TONE: Lazy<Regex> = Lazy::new(|| {
 });
 
 fn clean_span(s: &str) -> String {
-    s.trim().trim_matches(|c| c == '"' || c == '\'' || c == '`').trim().to_string()
+    s.trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+        .trim()
+        .to_string()
 }
 
 /// Short title (≤ 60 chars at a word boundary) for the file slug.
@@ -98,25 +101,26 @@ fn title_of(fact: &str) -> String {
 /// sanitizes, threat-scans, routes, and consolidates each.
 pub fn extract(text: &str) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = Vec::new();
-    let mut push = |text: String, name: String, kind, mtype, is_style, polarity, confidence: f64| {
-        let text = clean_span(&text);
-        if text.len() < 3 {
-            return;
-        }
-        // de-dup by case-insensitive body
-        if out.iter().any(|c| c.text.eq_ignore_ascii_case(&text)) {
-            return;
-        }
-        out.push(Candidate {
-            name: title_of(if name.is_empty() { &text } else { &name }),
-            text,
-            kind,
-            mtype,
-            is_style,
-            polarity,
-            confidence,
-        });
-    };
+    let mut push =
+        |text: String, name: String, kind, mtype, is_style, polarity, confidence: f64| {
+            let text = clean_span(&text);
+            if text.len() < 3 {
+                return;
+            }
+            // de-dup by case-insensitive body
+            if out.iter().any(|c| c.text.eq_ignore_ascii_case(&text)) {
+                return;
+            }
+            out.push(Candidate {
+                name: title_of(if name.is_empty() { &text } else { &name }),
+                text,
+                kind,
+                mtype,
+                is_style,
+                polarity,
+                confidence,
+            });
+        };
 
     // Style: language preference (highest-value, high precision)
     if let Some(c) = RE_LANG.captures(text) {
@@ -233,24 +237,32 @@ mod tests {
     #[test]
     fn use_instead_becomes_directed_pref() {
         let c = extract("use tabs instead of spaces");
-        assert!(c.iter().any(|x| x.text.contains("prefer") && x.text.contains("tabs") && x.text.contains("spaces")));
+        assert!(c.iter().any(|x| x.text.contains("prefer")
+            && x.text.contains("tabs")
+            && x.text.contains("spaces")));
     }
 
     #[test]
     fn language_is_style() {
         let c = extract("please reply in Vietnamese from now on");
-        assert!(c.iter().any(|x| x.is_style && x.kind == CandidateKind::StyleLanguage));
+        assert!(c
+            .iter()
+            .any(|x| x.is_style && x.kind == CandidateKind::StyleLanguage));
     }
 
     #[test]
     fn remember_high_confidence() {
         let c = extract("remember that I deploy on fridays only");
-        assert!(c.iter().any(|x| x.kind == CandidateKind::Remember && x.confidence >= 0.9));
+        assert!(c
+            .iter()
+            .any(|x| x.kind == CandidateKind::Remember && x.confidence >= 0.9));
     }
 
     #[test]
     fn negative_preference() {
         let c = extract("don't use yarn in this repo");
-        assert!(c.iter().any(|x| x.polarity == Polarity::Negate && x.text.to_lowercase().contains("yarn")));
+        assert!(c
+            .iter()
+            .any(|x| x.polarity == Polarity::Negate && x.text.to_lowercase().contains("yarn")));
     }
 }

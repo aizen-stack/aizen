@@ -75,7 +75,10 @@ impl RegistrySkill {
     /// The GitHub raw URL for the skill markdown — pinned to the immutable SHA when present (so a
     /// later upstream edit can't change what we installed), else the branch, else `main`.
     pub fn raw_url(&self) -> Option<String> {
-        if self.github_owner.is_empty() || self.github_repo.is_empty() || self.github_path.is_empty() {
+        if self.github_owner.is_empty()
+            || self.github_repo.is_empty()
+            || self.github_path.is_empty()
+        {
             return None;
         }
         let reff = if !self.github_sha.is_empty() {
@@ -86,13 +89,22 @@ impl RegistrySkill {
             "main"
         };
         let path = self.github_path.trim_start_matches('/');
-        Some(format!("https://raw.githubusercontent.com/{}/{}/{reff}/{path}", self.github_owner, self.github_repo))
+        Some(format!(
+            "https://raw.githubusercontent.com/{}/{}/{reff}/{path}",
+            self.github_owner, self.github_repo
+        ))
     }
 
     /// One-line summary for the search UI / tool result.
     pub fn summary_line(&self) -> String {
-        let q = self.content_quality_score.map(|s| format!(" · quality {s}")).unwrap_or_default();
-        let s = self.security_score.map(|s| format!(" · security {s}")).unwrap_or_default();
+        let q = self
+            .content_quality_score
+            .map(|s| format!(" · quality {s}"))
+            .unwrap_or_default();
+        let s = self
+            .security_score
+            .map(|s| format!(" · security {s}"))
+            .unwrap_or_default();
         let desc: String = self.description.chars().take(90).collect();
         format!("{}{q}{s} — {desc}", self.id())
     }
@@ -122,7 +134,8 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<RegistrySkill>> {
     if !f.is_success() {
         bail!("registry {base} returned HTTP {}", f.status);
     }
-    let parsed: SearchResponse = serde_json::from_slice(&f.body).context("parsing registry JSON")?;
+    let parsed: SearchResponse =
+        serde_json::from_slice(&f.body).context("parsing registry JSON")?;
     let _ = parsed.total;
     Ok(parsed.data)
 }
@@ -130,10 +143,14 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<RegistrySkill>> {
 /// Fetch a registry skill's markdown body from its GitHub raw URL. The URL is BUILT from the
 /// registry's response (untrusted input) → it passes the SSRF floor like any model-supplied URL.
 pub async fn fetch_body(sk: &RegistrySkill) -> Result<String> {
-    let url = sk.raw_url().context("this skill has no GitHub source location")?;
+    let url = sk
+        .raw_url()
+        .context("this skill has no GitHub source location")?;
     crate::core::net_guard::guard_url_async(&url).await?;
     let client = crate::agent::reach::http::client()?;
-    let f = crate::agent::reach::http::get(&client, &url, &[]).await.with_context(|| format!("GET {url}"))?;
+    let f = crate::agent::reach::http::get(&client, &url, &[])
+        .await
+        .with_context(|| format!("GET {url}"))?;
     if !f.is_success() {
         bail!("GitHub returned HTTP {} for {url}", f.status);
     }
@@ -154,8 +171,13 @@ pub async fn install(query: &str) -> Result<crate::skills::Skill> {
         .unwrap_or(&hits[0])
         .clone();
     let body_md = fetch_body(&chosen).await?;
-    let parsed = crate::skills::parse_markdown(&body_md, &crate::skills::sanitize_name(&chosen.name));
-    let name = if parsed.name.trim().is_empty() { chosen.name.clone() } else { parsed.name.clone() };
+    let parsed =
+        crate::skills::parse_markdown(&body_md, &crate::skills::sanitize_name(&chosen.name));
+    let name = if parsed.name.trim().is_empty() {
+        chosen.name.clone()
+    } else {
+        parsed.name.clone()
+    };
     crate::skills::save(&name, &parsed.description, &parsed.when, &parsed.body)?;
     Ok(crate::skills::Skill { name, ..parsed })
 }
@@ -193,13 +215,25 @@ impl Tool for SkillSearch {
         true // read-only marketplace query — the shared bridge is spawn_blocking-safe
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let query = args.get("query").and_then(|v| v.as_str()).context("missing required string arg 'query'")?;
-        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(DEFAULT_LIMIT).clamp(1, 50);
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .context("missing required string arg 'query'")?;
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_LIMIT)
+            .clamp(1, 50);
         let hits = block(search(query, limit))?;
         if hits.is_empty() {
             return Ok(format!("no skills on {} match '{query}'", registry_base()));
         }
-        let mut out = format!("{} result(s) from {} (skill_install \"<owner/name>\" to use one):\n", hits.len(), registry_base());
+        let mut out = format!(
+            "{} result(s) from {} (skill_install \"<owner/name>\" to use one):\n",
+            hits.len(),
+            registry_base()
+        );
         for sk in &hits {
             out.push_str(&format!("- {}\n", sk.summary_line()));
         }
@@ -232,9 +266,16 @@ impl Tool for SkillInstall {
         true // installs + persists third-party instructions the agent will then follow
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let slug = args.get("slug").and_then(|v| v.as_str()).context("missing required string arg 'slug'")?;
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .context("missing required string arg 'slug'")?;
         let sk = block(install(slug))?;
-        Ok(format!("installed '{}'.\n\n{}", sk.name, crate::skills::render_loaded(&sk)))
+        Ok(format!(
+            "installed '{}'.\n\n{}",
+            sk.name,
+            crate::skills::render_loaded(&sk)
+        ))
     }
 }
 
@@ -254,7 +295,12 @@ mod tests {
 
     #[test]
     fn raw_url_pins_to_sha_then_branch() {
-        let s = skill("NousResearch", "hermes-agent", "abc123", "skills/dev/spike/SKILL.md");
+        let s = skill(
+            "NousResearch",
+            "hermes-agent",
+            "abc123",
+            "skills/dev/spike/SKILL.md",
+        );
         assert_eq!(
             s.raw_url().as_deref(),
             Some("https://raw.githubusercontent.com/NousResearch/hermes-agent/abc123/skills/dev/spike/SKILL.md")
@@ -262,17 +308,27 @@ mod tests {
         // no sha → branch
         let mut b = skill("o", "r", "", "p.md");
         b.github_branch = "dev".into();
-        assert_eq!(b.raw_url().as_deref(), Some("https://raw.githubusercontent.com/o/r/dev/p.md"));
+        assert_eq!(
+            b.raw_url().as_deref(),
+            Some("https://raw.githubusercontent.com/o/r/dev/p.md")
+        );
         // no sha + no branch → main
         let m = skill("o", "r", "", "p.md");
-        assert_eq!(m.raw_url().as_deref(), Some("https://raw.githubusercontent.com/o/r/main/p.md"));
+        assert_eq!(
+            m.raw_url().as_deref(),
+            Some("https://raw.githubusercontent.com/o/r/main/p.md")
+        );
         // missing coordinates → None
         assert_eq!(RegistrySkill::default().raw_url(), None);
     }
 
     #[test]
     fn id_prefers_slug_then_owner_name() {
-        let mut s = RegistrySkill { name: "spike".into(), owner: "Nous".into(), ..Default::default() };
+        let mut s = RegistrySkill {
+            name: "spike".into(),
+            owner: "Nous".into(),
+            ..Default::default()
+        };
         assert_eq!(s.id(), "Nous/spike");
         s.slug = "Nous/spike-v2".into();
         assert_eq!(s.id(), "Nous/spike-v2");
@@ -291,7 +347,10 @@ mod tests {
         assert_eq!(s.security_score, Some(100));
         assert_eq!(s.content_quality_score, Some(83));
         assert_eq!(s.id(), "NousResearch/spike");
-        assert!(s.raw_url().unwrap().ends_with("/deadbeef/skills/spike/SKILL.md"));
+        assert!(s
+            .raw_url()
+            .unwrap()
+            .ends_with("/deadbeef/skills/spike/SKILL.md"));
         // a sparse object (only name) must not fail
         let sparse: SearchResponse = serde_json::from_str(r#"{"data":[{"name":"x"}]}"#).unwrap();
         assert_eq!(sparse.data[0].name, "x");
@@ -302,7 +361,9 @@ mod tests {
     /// A plain #[test] + local block_on so the env lock is never held across an await point.
     #[test]
     fn search_refuses_a_private_registry_base() {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-registry-ssrf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -310,19 +371,34 @@ mod tests {
         let mut cfg = crate::core::cli_config::load();
         cfg.skill_registry = Some("http://127.0.0.1:9".to_string());
         crate::core::cli_config::save(&cfg).unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let res = rt.block_on(search("anything", 5));
         std::env::remove_var("NEXTGEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
         let err = res.expect_err("a loopback registry base must be refused");
-        assert!(format!("{err:#}").contains("SSRF"), "refused by the SSRF floor: {err:#}");
+        assert!(
+            format!("{err:#}").contains("SSRF"),
+            "refused by the SSRF floor: {err:#}"
+        );
     }
 
     #[test]
     fn install_tool_is_destructive_search_is_not() {
-        assert!(SkillInstall.is_destructive(), "installing third-party instructions must be approval-gated");
+        assert!(
+            SkillInstall.is_destructive(),
+            "installing third-party instructions must be approval-gated"
+        );
         assert!(!SkillSearch.is_destructive());
-        assert!(SkillSearch.is_concurrency_safe(), "read-only marketplace query parallelizes");
-        assert!(!SkillInstall.is_concurrency_safe(), "installs stay serial (writes to disk)");
+        assert!(
+            SkillSearch.is_concurrency_safe(),
+            "read-only marketplace query parallelizes"
+        );
+        assert!(
+            !SkillInstall.is_concurrency_safe(),
+            "installs stay serial (writes to disk)"
+        );
     }
 }

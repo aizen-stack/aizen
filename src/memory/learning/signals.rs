@@ -59,15 +59,27 @@ pub fn looks_like_persona_intent(text: &str) -> bool {
 /// The single strongest signal present in `text`.
 pub fn detect(text: &str) -> Signal {
     if RE_REMEMBER.is_match(text) {
-        return Signal { kind: SignalKind::Remember, strength: 1.0 };
+        return Signal {
+            kind: SignalKind::Remember,
+            strength: 1.0,
+        };
     }
     if RE_CORRECTION.is_match(text) {
-        return Signal { kind: SignalKind::Correction, strength: 0.8 };
+        return Signal {
+            kind: SignalKind::Correction,
+            strength: 0.8,
+        };
     }
     if RE_PREFERENCE.is_match(text) {
-        return Signal { kind: SignalKind::Preference, strength: 0.65 };
+        return Signal {
+            kind: SignalKind::Preference,
+            strength: 0.65,
+        };
     }
-    Signal { kind: SignalKind::Passive, strength: 0.0 }
+    Signal {
+        kind: SignalKind::Passive,
+        strength: 0.0,
+    }
 }
 
 #[cfg(test)]
@@ -76,32 +88,61 @@ mod tests {
 
     #[test]
     fn passive_turn_has_no_signal() {
-        assert_eq!(detect("can you open the file and show me line 40").kind, SignalKind::Passive);
-        assert_eq!(detect("what does this function return").kind, SignalKind::Passive);
+        assert_eq!(
+            detect("can you open the file and show me line 40").kind,
+            SignalKind::Passive
+        );
+        assert_eq!(
+            detect("what does this function return").kind,
+            SignalKind::Passive
+        );
     }
 
     #[test]
     fn remember_is_strongest() {
-        assert_eq!(detect("remember that I deploy on fridays").kind, SignalKind::Remember);
-        assert_eq!(detect("ghi nhớ là tôi dùng pnpm").kind, SignalKind::Remember);
+        assert_eq!(
+            detect("remember that I deploy on fridays").kind,
+            SignalKind::Remember
+        );
+        assert_eq!(
+            detect("ghi nhớ là tôi dùng pnpm").kind,
+            SignalKind::Remember
+        );
         assert_eq!(detect("remember that I deploy on fridays").strength, 1.0);
     }
 
     #[test]
     fn correction_and_preference() {
-        assert_eq!(detect("no, that's wrong — use tabs").kind, SignalKind::Correction);
-        assert_eq!(detect("actually, use tabs not spaces").kind, SignalKind::Correction);
-        assert_eq!(detect("I prefer pnpm over npm").kind, SignalKind::Preference);
+        assert_eq!(
+            detect("no, that's wrong — use tabs").kind,
+            SignalKind::Correction
+        );
+        assert_eq!(
+            detect("actually, use tabs not spaces").kind,
+            SignalKind::Correction
+        );
+        assert_eq!(
+            detect("I prefer pnpm over npm").kind,
+            SignalKind::Preference
+        );
     }
 
     #[test]
     fn persona_authoring_turns_are_flagged() {
         // EN + VI ways of asking for a character / role-play — must be caught.
-        assert!(looks_like_persona_intent("tạo cho tôi một nhân vật là tướng lịch sử"));
+        assert!(looks_like_persona_intent(
+            "tạo cho tôi một nhân vật là tướng lịch sử"
+        ));
         assert!(looks_like_persona_intent("hãy đóng vai một thám tử noir"));
-        assert!(looks_like_persona_intent("create a persona named ApexCode, a principal architect"));
-        assert!(looks_like_persona_intent("let's do some role-play as a pirate captain"));
-        assert!(looks_like_persona_intent("here is a character card, become them"));
+        assert!(looks_like_persona_intent(
+            "create a persona named ApexCode, a principal architect"
+        ));
+        assert!(looks_like_persona_intent(
+            "let's do some role-play as a pirate captain"
+        ));
+        assert!(looks_like_persona_intent(
+            "here is a character card, become them"
+        ));
     }
 
     #[test]
@@ -109,8 +150,12 @@ mod tests {
         // A real user preference must NOT be mistaken for persona authoring (no over-suppression).
         assert!(!looks_like_persona_intent("I prefer pnpm over npm"));
         assert!(!looks_like_persona_intent("tôi thích dùng rust hơn go"));
-        assert!(!looks_like_persona_intent("remember that I deploy on fridays"));
-        assert!(!looks_like_persona_intent("reply in vietnamese and keep it terse"));
+        assert!(!looks_like_persona_intent(
+            "remember that I deploy on fridays"
+        ));
+        assert!(!looks_like_persona_intent(
+            "reply in vietnamese and keep it terse"
+        ));
     }
 
     // ── the STRONG, fact-based leak-guard: turn_authored_persona ─────────────────
@@ -124,7 +169,10 @@ mod tests {
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
                 kind: "function".into(),
-                function: FunctionCall { name: tool.into(), arguments: "{}".into() },
+                function: FunctionCall {
+                    name: tool.into(),
+                    arguments: "{}".into(),
+                },
             }],
             tool_call_id: None,
             images: Vec::new(),
@@ -140,11 +188,20 @@ mod tests {
             Message::user("here, use this system prompt: a terse strategist who speaks english"),
             assistant_calling(PERSONA_AUTHORING_TOOL),
         ];
-        assert!(turn_authored_persona(&authored), "persona_create firing must be caught");
+        assert!(
+            turn_authored_persona(&authored),
+            "persona_create firing must be caught"
+        );
 
         // A normal turn that ran OTHER tools is not authoring → learning proceeds as usual.
-        let plain = vec![Message::user("I prefer pnpm over npm"), assistant_calling("read_file")];
-        assert!(!turn_authored_persona(&plain), "unrelated tools must not trip the guard");
+        let plain = vec![
+            Message::user("I prefer pnpm over npm"),
+            assistant_calling("read_file"),
+        ];
+        assert!(
+            !turn_authored_persona(&plain),
+            "unrelated tools must not trip the guard"
+        );
 
         // Only the LAST turn counts: a persona authored earlier must not suppress this turn's learning.
         let prior_turn = vec![
@@ -153,6 +210,9 @@ mod tests {
             Message::user("I prefer pnpm over npm"),
             assistant_calling("read_file"),
         ];
-        assert!(!turn_authored_persona(&prior_turn), "guard is scoped to the current turn only");
+        assert!(
+            !turn_authored_persona(&prior_turn),
+            "guard is scoped to the current turn only"
+        );
     }
 }

@@ -11,11 +11,11 @@
 //! keeps its context). The PRIMARY bot's identity stays in `cli-config.json` (it's the daemon's own
 //! auth, set up with `aizen telegram/discord setup`). Self-host wiring (systemd) is in [`service`].
 
+mod daemon;
 pub mod platform;
 pub mod platforms;
-pub mod store;
-mod daemon;
 mod service;
+pub mod store;
 
 pub use daemon::{run_discord_serve, run_serve};
 pub use service::run_serve_service;

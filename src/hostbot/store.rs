@@ -114,11 +114,24 @@ struct SessionFile {
 /// of a negative chat id → kept; `.` path separators → `_`) so no value can escape the sessions dir.
 /// Platform slugs + bot names are already `[a-z0-9_]`; a chat id is `-?\d+`; this is defense in depth.
 fn sanitize(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect()
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn session_path(platform: &str, route: &str, chat: &str) -> PathBuf {
-    let name = format!("{}.{}.{}.json", sanitize(platform), sanitize(route), sanitize(chat));
+    let name = format!(
+        "{}.{}.{}.json",
+        sanitize(platform),
+        sanitize(route),
+        sanitize(chat)
+    );
     sessions_dir().join(name)
 }
 
@@ -137,8 +150,12 @@ pub fn load_sessions(platform: &str) -> Vec<(String, String, Vec<Message>)> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let Ok(s) = std::fs::read_to_string(&path) else { continue };
-        let Ok(sf) = serde_json::from_str::<SessionFile>(&s) else { continue };
+        let Ok(s) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(sf) = serde_json::from_str::<SessionFile>(&s) else {
+            continue;
+        };
         if sf.platform != platform {
             continue; // another platform's session dir-mate
         }
@@ -176,7 +193,9 @@ pub fn drop_session(platform: &str, route: &str, chat: &str) {
 pub fn drop_route_sessions(platform: &str, route: &str) {
     let prefix = format!("{}.{}.", sanitize(platform), sanitize(route));
     let dir = sessions_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         if let Some(name) = entry.file_name().to_str() {
             if name.starts_with(&prefix) {
@@ -197,7 +216,9 @@ mod tests {
     /// HIGHER precedence, so a leaked `AIZEN_HOME` would override the `NEXTGEN_HOME` those tests set and
     /// break them; `NEXTGEN_HOME` is the shared convention each test overwrites at its own start.
     fn with_temp_home() -> (std::sync::MutexGuard<'static, ()>, tempdir_guard::TempDir) {
-        let guard = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempdir_guard::TempDir::new();
         std::env::set_var("NEXTGEN_HOME", dir.path());
         (guard, dir)
@@ -208,8 +229,18 @@ mod tests {
         let (_g, _home) = with_temp_home();
         assert!(load_bots().is_empty(), "fresh store has no bots");
         let bots = vec![
-            HostedBot { name: "work".into(), token: Some("t1".into()), allowed_chat_ids: vec![], persona: None },
-            HostedBot { name: "ops".into(), token: Some("t2".into()), allowed_chat_ids: vec![7, 9], persona: Some("Aria".into()) },
+            HostedBot {
+                name: "work".into(),
+                token: Some("t1".into()),
+                allowed_chat_ids: vec![],
+                persona: None,
+            },
+            HostedBot {
+                name: "ops".into(),
+                token: Some("t2".into()),
+                allowed_chat_ids: vec![7, 9],
+                persona: Some("Aria".into()),
+            },
         ];
         save_bots(&bots).unwrap();
         let round = load_bots();
@@ -239,8 +270,15 @@ mod tests {
         assert_eq!(tg[0].0, "work");
 
         drop_route_sessions("telegram", "work");
-        assert!(load_sessions("telegram").is_empty(), "route drop removed the last telegram session");
-        assert_eq!(load_sessions("discord").len(), 1, "discord session untouched");
+        assert!(
+            load_sessions("telegram").is_empty(),
+            "route drop removed the last telegram session"
+        );
+        assert_eq!(
+            load_sessions("discord").len(),
+            1,
+            "discord session untouched"
+        );
     }
 
     #[test]
@@ -265,7 +303,11 @@ mod tempdir_guard {
         pub fn new() -> Self {
             static SEQ: AtomicU64 = AtomicU64::new(0);
             let n = SEQ.fetch_add(1, Ordering::Relaxed);
-            let p = std::env::temp_dir().join(format!("aizen-hostbot-test-{}-{}", std::process::id(), n));
+            let p = std::env::temp_dir().join(format!(
+                "aizen-hostbot-test-{}-{}",
+                std::process::id(),
+                n
+            ));
             let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).expect("create tempdir");
             TempDir(p)

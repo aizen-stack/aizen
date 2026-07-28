@@ -7,8 +7,8 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 
 use crate::core::types::{
-    CacheControl, ChatChunk, ChatRequest, ChatResponse, FunctionCall, Message, StreamOptions, ToolCall,
-    ToolCallDelta, ToolDef, Usage,
+    CacheControl, ChatChunk, ChatRequest, ChatResponse, FunctionCall, Message, StreamOptions,
+    ToolCall, ToolCallDelta, ToolDef, Usage,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,7 +63,9 @@ pub fn is_anthropic_model(model: &str) -> bool {
     if m.contains("claude") || m.contains("anthropic") {
         return true;
     }
-    ["opus", "sonnet", "haiku", "fable"].iter().any(|k| contains_word(&m, k))
+    ["opus", "sonnet", "haiku", "fable"]
+        .iter()
+        .any(|k| contains_word(&m, k))
 }
 
 /// `haystack` contains `needle` delimited by non-alphanumeric boundaries (so `-`, `_`, `.`, space
@@ -111,7 +113,10 @@ fn apply_cache_breakpoints(messages: &mut [Message], tools: &mut [ToolDef]) {
     }
     let n = messages.len();
     if n >= 3 {
-        if let Some(idx) = (0..n).rev().find(|&i| matches!(messages[i].role.as_str(), "assistant" | "tool")) {
+        if let Some(idx) = (0..n)
+            .rev()
+            .find(|&i| matches!(messages[i].role.as_str(), "assistant" | "tool"))
+        {
             if idx != 0 && !(idx == 1 && messages[0].role == "system") {
                 messages[idx].cache_control = Some(CacheControl::ephemeral());
             }
@@ -125,13 +130,19 @@ impl CostMeter {
         if u.prompt_tokens.is_none() && u.completion_tokens.is_none() && u.total_tokens.is_none() {
             return;
         }
-        self.prompt_tokens.fetch_add(u.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
-        self.completion_tokens.fetch_add(u.completion_tokens.unwrap_or(0), Ordering::Relaxed);
-        self.cache_read_tokens.fetch_add(u.cache_read(), Ordering::Relaxed);
+        self.prompt_tokens
+            .fetch_add(u.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
+        self.completion_tokens
+            .fetch_add(u.completion_tokens.unwrap_or(0), Ordering::Relaxed);
+        self.cache_read_tokens
+            .fetch_add(u.cache_read(), Ordering::Relaxed);
         self.calls_with_usage.fetch_add(1, Ordering::Relaxed);
-        self.last_prompt_tokens.store(u.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
-        self.last_cached_tokens.store(u.cache_read(), Ordering::Relaxed);
-        self.last_completion_tokens.store(u.completion_tokens.unwrap_or(0), Ordering::Relaxed);
+        self.last_prompt_tokens
+            .store(u.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
+        self.last_cached_tokens
+            .store(u.cache_read(), Ordering::Relaxed);
+        self.last_completion_tokens
+            .store(u.completion_tokens.unwrap_or(0), Ordering::Relaxed);
     }
 
     /// `(prompt, cached, completion)` of the most recent usage-carrying call; `None` before any.
@@ -185,11 +196,7 @@ pub struct ModelInfo {
 /// retry/backoff (unlike [`fetch_models_info`]). Callers should pass a short-timeout client so a dead
 /// endpoint fails fast. Success = 2xx (body is discarded). Failures surface as the same
 /// `upstream returned HTTP {status}: …` / transport error shapes [`classify_api_error`] already knows.
-pub async fn probe_models(
-    client: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-) -> Result<()> {
+pub async fn probe_models(client: &reqwest::Client, base_url: &str, api_key: &str) -> Result<()> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let resp = client
         .get(&url)
@@ -251,7 +258,10 @@ pub async fn fetch_models_info(
                 .or(m.max_context_length)
                 .or_else(|| m.top_provider.and_then(|t| t.context_length))
                 .filter(|&n| n > 0);
-            ModelInfo { id: m.id, context_length: ctx }
+            ModelInfo {
+                id: m.id,
+                context_length: ctx,
+            }
         })
         .collect())
 }
@@ -265,7 +275,10 @@ fn is_retryable_status(status: u16) -> bool {
 /// Exponential backoff CEILING (ms): `base * 2^attempt`, capped, floored at 1. Pure + monotonic so
 /// it can be unit-tested; the live delay adds jitter under this ceiling (see `backoff_ms`).
 fn backoff_ceiling_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
-    base_ms.saturating_mul(1u64 << attempt.min(20)).min(cap_ms).max(1)
+    base_ms
+        .saturating_mul(1u64 << attempt.min(20))
+        .min(cap_ms)
+        .max(1)
 }
 
 /// A small random u64 from the OS CSPRNG (already a dep) — for backoff jitter only.
@@ -273,6 +286,48 @@ fn rand_u64() -> u64 {
     let mut b = [0u8; 8];
     let _ = getrandom::getrandom(&mut b);
     u64::from_le_bytes(b)
+}
+
+/// Longest SILENCE tolerated inside a live SSE stream before we declare it dead.
+///
+/// This is the fix for a confirmed hang: `send_with_retry` protects the request, but once the
+/// provider answers 200 the `while let Some(event) = stream.next().await` loop had NO deadline at
+/// all. A gateway that accepts the request and then stops writing (dropped upstream socket, a
+/// load-balancer holding the connection open, a rate-limit stall) parks that loop forever — the
+/// turn never fails, never returns, and the only way out is Esc + asking the model to continue.
+/// reqwest's `read_timeout` is the backstop at 300s, which is far past the point where a person
+/// concludes the tool is broken.
+const STREAM_STALL_SECS: u64 = 90;
+
+/// Env override for the stall deadline, clamped to a sane band. A reasoning model can legitimately
+/// think for a long time before its first token, so the floor stays generous.
+const STREAM_STALL_ENV: &str = "AIZEN_STREAM_STALL_SECS";
+
+/// Resolve the inter-event stall deadline: env override (clamped 15s..=1800s) or the default.
+fn stream_stall_timeout() -> std::time::Duration {
+    let secs = std::env::var(STREAM_STALL_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.clamp(15, 1800))
+        .unwrap_or(STREAM_STALL_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// How many times a stream that died BEFORE producing anything is replayed. Bounded and only ever
+/// on the blank case — see `stream_chat_with_tools_eager`.
+const STREAM_BLANK_RETRIES: u32 = 2;
+
+/// Tell the user the stream stalled and is being replayed. Routed through the TUI funnel: a raw
+/// `eprintln!` here would be painted over by the retained render thread.
+fn stream_retry_note(reason: &str, attempt: u32, max: u32, delay_ms: u64) {
+    let line = format!(
+        "⟳ stream died before any output ({reason}) — retrying {attempt}/{max} in {delay_ms}ms"
+    );
+    if crate::ui::tui::active() {
+        crate::ui::tui::emit_line(&crate::ui::theme::faint(line).to_string());
+    } else {
+        eprintln!("{line}");
+    }
 }
 
 /// Full-jitter backoff: a uniform delay in `[ceil/2, ceil]`. Jitter spreads retries so a fleet of
@@ -286,7 +341,11 @@ fn backoff_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
 /// `Retry-After` as ms (integer-seconds form only), capped at 30s so a hostile header can't park us.
 /// The HTTP-date form is ignored (falls back to exponential backoff).
 fn retry_after_ms(resp: &reqwest::Response) -> Option<u64> {
-    let v = resp.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let v = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
     let secs: u64 = v.trim().parse().ok()?;
     Some(secs.saturating_mul(1000).min(30_000))
 }
@@ -312,7 +371,8 @@ where
                     return Ok(resp);
                 }
                 if is_retryable_status(status.as_u16()) && attempt < MAX_RETRIES {
-                    let delay = retry_after_ms(&resp).unwrap_or_else(|| backoff_ms(attempt, BASE_MS, CAP_MS));
+                    let delay = retry_after_ms(&resp)
+                        .unwrap_or_else(|| backoff_ms(attempt, BASE_MS, CAP_MS));
                     attempt += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     continue;
@@ -378,8 +438,9 @@ pub fn goal_backoff_ms(attempt: u32) -> u64 {
 /// guessed from the model name (a name heuristic would mis-serve every gateway that renames models).
 /// The first time a provider 400s on the field we record the model here, so every later turn strips
 /// it up front: at most ONE failed call per model per session, not one per turn.
-static EFFORT_UNSUPPORTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::OnceLock::new();
+static EFFORT_UNSUPPORTED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
 
 fn effort_unsupported_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
     EFFORT_UNSUPPORTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
@@ -387,7 +448,10 @@ fn effort_unsupported_set() -> &'static std::sync::Mutex<std::collections::HashS
 
 /// Has `model` already rejected `reasoning_effort` this session? (Then we send the field-free wire.)
 fn effort_known_unsupported(model: &str) -> bool {
-    effort_unsupported_set().lock().map(|s| s.contains(model)).unwrap_or(false)
+    effort_unsupported_set()
+        .lock()
+        .map(|s| s.contains(model))
+        .unwrap_or(false)
 }
 
 fn mark_effort_unsupported(model: &str) {
@@ -468,7 +532,8 @@ pub struct ChatTurn {
 /// Hook offered each tool call the moment its streamed arguments complete: return a running
 /// handle to START it early (read-only + prefix-safe only — the caller owns that policy), or
 /// `None` to let the executor run it normally after the stream ends.
-pub type EagerStartFn<'a> = &'a (dyn Fn(usize, &ToolCall) -> Option<tokio::task::JoinHandle<String>> + Send + Sync);
+pub type EagerStartFn<'a> =
+    &'a (dyn Fn(usize, &ToolCall) -> Option<tokio::task::JoinHandle<String>> + Send + Sync);
 
 /// Stream a chat completion. Prints content deltas to stdout as they arrive and
 /// returns the full concatenated assistant text. Returns a typed error on a non-2xx
@@ -493,7 +558,9 @@ pub async fn stream_chat_with_visual_contract(
     visual_contract: bool,
 ) -> Result<String> {
     if visual_contract {
-        if let Some(block) = crate::agent::response_visuals_prompt_block(crate::core::cli_config::load().response_visuals()) {
+        if let Some(block) = crate::agent::response_visuals_prompt_block(
+            crate::core::cli_config::load().response_visuals(),
+        ) {
             messages.insert(0, Message::system(block));
         }
     }
@@ -532,11 +599,24 @@ pub async fn stream_chat_with_visual_contract(
     // newline below still runs (a clean line break before the error surfaces) — same invariant
     // as `stream_chat_with_tools`.
     let mut stream_err: Option<anyhow::Error> = None;
-    while let Some(event) = stream.next().await {
-        let event = match event {
-            Ok(e) => e,
-            Err(e) => {
+    // Same stall watchdog as the tool-calling path: a provider that answers 200 and then goes quiet
+    // would otherwise park this loop until reqwest's 300s read timeout — and only if it withholds
+    // BYTES, which keepalive frames defeat entirely. No replay here: this one-shot surface has no
+    // eager handles to detach and its caller already prints the error.
+    let stall = stream_stall_timeout();
+    loop {
+        let event = match tokio::time::timeout(stall, stream.next()).await {
+            Ok(Some(Ok(e))) => e,
+            Ok(Some(Err(e))) => {
                 stream_err = Some(anyhow!("SSE stream error: {e}"));
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => {
+                stream_err = Some(anyhow!(
+                    "SSE stream error: timeout — no data for {}s",
+                    stall.as_secs()
+                ));
                 break;
             }
         };
@@ -613,15 +693,24 @@ pub async fn chat_with_tools(
         temperature: None,
         max_tokens: cfg.max_tokens,
         tools: tool_defs,
-        tool_choice: if tools.is_empty() { None } else { Some("auto".to_string()) },
+        tool_choice: if tools.is_empty() {
+            None
+        } else {
+            Some("auto".to_string())
+        },
         parallel_tool_calls: if tools.is_empty() { None } else { Some(true) },
         stream_options: None, // non-streaming responses carry `usage` natively
-        reasoning_effort: crate::core::cli_config::resolved_reasoning_effort(cfg.reasoning_effort.clone()),
+        reasoning_effort: crate::core::cli_config::resolved_reasoning_effort(
+            cfg.reasoning_effort.clone(),
+        ),
     };
 
     let resp = send_chat(client, &url, api_key, body).await?;
 
-    let parsed: ChatResponse = resp.json().await.context("parsing chat-completions response")?;
+    let parsed: ChatResponse = resp
+        .json()
+        .await
+        .context("parsing chat-completions response")?;
     if let Some(u) = &parsed.usage {
         cost_meter().record(u);
     }
@@ -736,7 +825,10 @@ impl ToolCallAccumulator {
         Some(ToolCall {
             id: c.id.clone(),
             kind: "function".to_string(),
-            function: FunctionCall { name: c.name.clone(), arguments: c.args.clone() },
+            function: FunctionCall {
+                name: c.name.clone(),
+                arguments: c.args.clone(),
+            },
         })
     }
 
@@ -751,9 +843,16 @@ impl ToolCallAccumulator {
                 (
                     k,
                     ToolCall {
-                        id: if c.id.is_empty() { format!("call_{i}") } else { c.id },
+                        id: if c.id.is_empty() {
+                            format!("call_{i}")
+                        } else {
+                            c.id
+                        },
                         kind: "function".to_string(),
-                        function: FunctionCall { name: c.name, arguments: c.args },
+                        function: FunctionCall {
+                            name: c.name,
+                            arguments: c.args,
+                        },
                     },
                 )
             })
@@ -764,7 +863,10 @@ impl ToolCallAccumulator {
     /// position mapping; this stays as the plain API + test surface).
     #[allow(dead_code)]
     pub fn finish(self) -> Vec<ToolCall> {
-        self.finish_indexed().into_iter().map(|(_, tc)| tc).collect()
+        self.finish_indexed()
+            .into_iter()
+            .map(|(_, tc)| tc)
+            .collect()
     }
 }
 
@@ -811,175 +913,244 @@ pub async fn stream_chat_with_tools_eager(
         temperature: None,
         max_tokens: cfg.max_tokens,
         tools: tool_defs,
-        tool_choice: if tools.is_empty() { None } else { Some("auto".to_string()) },
+        tool_choice: if tools.is_empty() {
+            None
+        } else {
+            Some("auto".to_string())
+        },
         parallel_tool_calls: if tools.is_empty() { None } else { Some(true) },
-        stream_options: Some(StreamOptions { include_usage: true }), // ask for a final usage chunk
-        reasoning_effort: crate::core::cli_config::resolved_reasoning_effort(cfg.reasoning_effort.clone()),
+        stream_options: Some(StreamOptions {
+            include_usage: true,
+        }), // ask for a final usage chunk
+        reasoning_effort: crate::core::cli_config::resolved_reasoning_effort(
+            cfg.reasoning_effort.clone(),
+        ),
     };
 
-    // Spinner during the "thinking" gap: from request send until the first token / tool delta
-    // streams back. TTY-only (silent no-op on pipes/CI). Cleared before any output is printed.
-    // Suppressed under the sticky TUI — its box shows the "⚡ working…" indicator instead, and a
-    // carriage-return spinner would fight the pinned footer.
-    let mut spin = if crate::ui::tui::active() { None } else { Some(crate::ui::spinner::Spinner::start("thinking")) };
+    // BLANK-STREAM REPLAY. The request layer (`send_with_retry`) only covers failures that happen
+    // before the 200; a stream that is accepted and then dies or goes silent used to leave the turn
+    // parked forever with nothing to show. Retry the whole call, but ONLY while the stream has
+    // produced literally nothing (no text, no tool-call fragment, no usage): re-sending after
+    // partial output would duplicate text in the transcript or resurrect a half-streamed tool call.
+    // Once anything has arrived we fall through to the existing error path and let the caller decide.
+    let mut blank_attempt: u32 = 0;
+    loop {
+        // Spinner during the "thinking" gap: from request send until the first token / tool delta
+        // streams back. TTY-only (silent no-op on pipes/CI). Cleared before any output is printed.
+        // Suppressed under the sticky TUI — its box shows the "⚡ working…" indicator instead, and a
+        // carriage-return spinner would fight the pinned footer.
+        let mut spin = if crate::ui::tui::active() {
+            None
+        } else {
+            Some(crate::ui::spinner::Spinner::start("thinking"))
+        };
 
-    let resp = match send_chat(client, &url, api_key, body).await {
-        Ok(r) => r,
-        Err(e) => {
-            spin.take(); // clear the spinner before surfacing the error
-            return Err(e);
-        }
-    };
-
-    let mut stream = resp.bytes_stream().eventsource();
-    let mut full = String::new();
-    let mut acc = ToolCallAccumulator::default();
-    let mut finish_reason: Option<String> = None;
-    let mut final_usage: Option<Usage> = None; // the final-chunk usage report, threaded to the loop
-    // Eager starts, keyed by accumulator SLOT until the final position mapping exists.
-    let mut eager_by_slot: std::collections::HashMap<usize, tokio::task::JoinHandle<String>> =
-        std::collections::HashMap::new();
-    let mut think = ThinkFilter::default(); // suppress `<think>…</think>` reasoning from the display
-    // Retained mode owns raw assistant blocks and reparses the whole active message; classic/one-shot
-    // paths keep the line-buffered display renderer. History always keeps the same raw Markdown.
-    let retained_display = crate::ui::tui::retained_active();
-    let decorate = !retained_display
-        && (crate::ui::tui::active() || std::io::IsTerminal::is_terminal(&std::io::stdout()));
-    let cols = crate::ui::tui::width(); // wrap to the box width (not a separately-probed window edge)
-    let mut md = crate::ui::markdown::MarkdownStream::new(decorate, cols);
-
-    // A mid-stream transport error (timeout, gateway drop, truncated body) must NOT short-circuit
-    // with `?` here: that would skip the `think.finish()` / `md.finish()` cleanup below, stranding
-    // the terminal with a half-rendered line or an UNCLOSED code-fence box that corrupts every
-    // subsequent turn. Capture the error, break, flush the display to a clean state, THEN propagate.
-    let mut stream_err: Option<anyhow::Error> = None;
-    while let Some(event) = stream.next().await {
-        let event = match event {
-            Ok(e) => e,
+        let resp = match send_chat(client, &url, api_key, body.clone()).await {
+            Ok(r) => r,
             Err(e) => {
-                stream_err = Some(anyhow!("SSE stream error: {e}"));
-                break;
+                spin.take(); // clear the spinner before surfacing the error
+                return Err(e);
             }
         };
-        if event.data.trim() == "[DONE]" {
-            break;
+
+        let mut stream = resp.bytes_stream().eventsource();
+        let mut full = String::new();
+        let mut acc = ToolCallAccumulator::default();
+        let mut finish_reason: Option<String> = None;
+        let mut final_usage: Option<Usage> = None; // the final-chunk usage report, threaded to the loop
+                                                   // Eager starts, keyed by accumulator SLOT until the final position mapping exists.
+        let mut eager_by_slot: std::collections::HashMap<usize, tokio::task::JoinHandle<String>> =
+            std::collections::HashMap::new();
+        let mut think = ThinkFilter::default(); // suppress `<think>…</think>` reasoning from the display
+                                                // Retained mode owns raw assistant blocks and reparses the whole active message; classic/one-shot
+                                                // paths keep the line-buffered display renderer. History always keeps the same raw Markdown.
+        let retained_display = crate::ui::tui::retained_active();
+        let decorate = !retained_display
+            && (crate::ui::tui::active() || std::io::IsTerminal::is_terminal(&std::io::stdout()));
+        let cols = crate::ui::tui::width(); // wrap to the box width (not a separately-probed window edge)
+        let mut md = crate::ui::markdown::MarkdownStream::new(decorate, cols);
+
+        // A mid-stream transport error (timeout, gateway drop, truncated body) must NOT short-circuit
+        // with `?` here: that would skip the `think.finish()` / `md.finish()` cleanup below, stranding
+        // the terminal with a half-rendered line or an UNCLOSED code-fence box that corrupts every
+        // subsequent turn. Capture the error, break, flush the display to a clean state, THEN propagate.
+        let mut stream_err: Option<anyhow::Error> = None;
+        // IDLE WATCHDOG. `reqwest`'s `read_timeout` fires only on a socket that delivers no BYTES; a
+        // gateway that keeps the connection warm with comment/keepalive frames, or an upstream that
+        // stalls after `role`, satisfies it forever — so the turn hung with no cap at all. Bound the gap
+        // between USEFUL events instead, and re-arm the timer on every one.
+        let idle_cap = stream_stall_timeout();
+        // Has this stream produced anything a retry would duplicate? Text, a tool-call fragment, or a
+        // usage report all count. Governs both the watchdog's error wording and blank-stream replay.
+        let mut produced = false;
+        loop {
+            let event = match tokio::time::timeout(idle_cap, stream.next()).await {
+                Ok(Some(Ok(e))) => e,
+                Ok(Some(Err(e))) => {
+                    stream_err = Some(anyhow!("SSE stream error: {e}"));
+                    break;
+                }
+                Ok(None) => break, // stream ended without [DONE]
+                Err(_) => {
+                    // No useful frame for `idle_cap`. Name it as a stall so the transcript says why the
+                    // turn ended, and mark it Transient-shaped ("timeout") for goal-mode classification.
+                    stream_err = Some(anyhow!(
+                        "SSE stream error: timeout — no data for {}s{}",
+                        idle_cap.as_secs(),
+                        if produced {
+                            " (stream stalled mid-response)"
+                        } else {
+                            " (stream never started)"
+                        }
+                    ));
+                    break;
+                }
+            };
+            if event.data.trim() == "[DONE]" {
+                break;
+            }
+            if event.data.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<ChatChunk>(&event.data) {
+                Ok(chunk) => {
+                    // Record usage ONLY on the final chunk (choices empty). Spec-compliant OpenAI sends
+                    // usage=null until then, but some gateways (vLLM/LiteLLM/OpenRouter) attach a
+                    // CUMULATIVE usage object to EVERY chunk — without this guard an N-chunk stream sums it
+                    // N times and inflates /cost (and calls_with_usage) ~N×.
+                    if let Some(u) = &chunk.usage {
+                        if chunk.choices.is_empty() {
+                            cost_meter().record(u);
+                            final_usage = Some(u.clone());
+                            produced = true; // a usage report means the call really was billed
+                        }
+                    }
+                    if let Some(choice) = chunk.choices.first() {
+                        // A dedicated reasoning channel (`reasoning_content`/`reasoning`) is the model
+                        // thinking out loud — suppress it entirely so output is uniform across models.
+                        // (Clear the spinner: the model IS producing, just not user-facing text yet.)
+                        if choice.delta.reasoning_content.is_some() {
+                            spin.take();
+                        }
+                        if let Some(content) = &choice.delta.content {
+                            spin.take(); // stop+clear the spinner before the first token prints
+                            produced = true; // even a content delta filtered to nothing was real output
+                            let shown = think.push(content);
+                            if !shown.is_empty() {
+                                full.push_str(&shown); // history keeps the RAW markdown
+                                crate::ui::tui::add_stream_chars(shown.chars().count() as u64); // live ↑tok pill
+                                if retained_display {
+                                    crate::ui::tui::assistant_stream_delta(&shown);
+                                } else {
+                                    let rendered = md.push(&shown); // styled, complete lines (gutter, md, code)
+                                    if !rendered.is_empty() {
+                                        crate::ui::tui::emit(&rendered); // classic TUI funnel / plain print
+                                    }
+                                }
+                            }
+                        }
+                        if !choice.delta.tool_calls.is_empty() {
+                            spin.take(); // a tool-only turn: clear before the loop prints tool traces
+                            produced = true; // a tool-call fragment must never be re-requested
+                            let completed = acc.ingest(&choice.delta.tool_calls);
+                            if let Some(hook) = eager_hook {
+                                for (slot, tc) in completed {
+                                    if let Some(h) = hook(slot, &tc) {
+                                        eager_by_slot.insert(slot, h);
+                                    }
+                                }
+                            }
+                        }
+                        if choice.finish_reason.is_some() {
+                            finish_reason = choice.finish_reason.clone();
+                        }
+                    }
+                }
+                Err(e) => {
+                    spin.take();
+                    // Gateways (vLLM/LiteLLM/OpenRouter) interleave keepalive / non-JSON frames mid-stream.
+                    // A raw `eprintln!` here writes straight to the terminal, bypassing the retained render
+                    // thread → corrupts the pinned frame ("breaks during work"). Route through the TUI funnel
+                    // when it owns the screen; only fall back to stderr when it doesn't.
+                    let warn = format!("[warn] unparseable stream frame ({e}): {}", event.data);
+                    if crate::ui::tui::active() {
+                        crate::ui::tui::emit_line(&crate::ui::theme::faint(warn).to_string());
+                    } else {
+                        eprintln!("\n{warn}");
+                    }
+                }
+            }
         }
-        if event.data.trim().is_empty() {
+        spin.take(); // stream ended (e.g. empty turn) — ensure the spinner is gone
+        let tail = think.finish();
+        if !tail.is_empty() {
+            full.push_str(&tail);
+            if retained_display {
+                crate::ui::tui::assistant_stream_delta(&tail);
+            } else {
+                let rendered = md.push(&tail);
+                if !rendered.is_empty() {
+                    crate::ui::tui::emit(&rendered);
+                }
+            }
+        }
+        if retained_display {
+            crate::ui::tui::assistant_stream_finish(stream_err.is_some());
+        } else {
+            let closing = md.finish(); // flush the final partial line + close any dangling code fence
+            if !closing.is_empty() {
+                crate::ui::tui::emit(&closing);
+            }
+            if !full.is_empty() {
+                crate::ui::tui::emit("\n"); // one blank line of breathing room before the next turn
+            }
+        }
+
+        // BLANK STREAM ⇒ REPLAY, not a dead turn. A stall or drop that produced NOTHING is exactly the
+        // case the user hits as "it froze; I killed the turn and told it to continue, then it was fine" —
+        // the manual retry worked because there was nothing wrong with the request. Do that retry here.
+        // Guarded on `!produced`, so a stream that emitted any text/tool-fragment/usage never replays
+        // (that would duplicate output). Also skipped once the model claimed `finish_reason`: an
+        // intentionally empty completion is a real answer, not a failure.
+        let blank_failure = !produced && finish_reason.is_none();
+        if blank_failure && blank_attempt < STREAM_BLANK_RETRIES {
+            blank_attempt += 1;
+            let delay = backoff_ms(blank_attempt - 1, 400, 4_000);
+            let why = stream_err
+                .as_ref()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "stream closed with no output".to_string());
+            stream_retry_note(&why, blank_attempt, STREAM_BLANK_RETRIES, delay);
+            // Detach any eager handles from the abandoned attempt. They are read-only by policy (the
+            // eager starter refuses destructive/unsafe calls), so dropping them is safe.
+            drop(eager_by_slot);
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             continue;
         }
-        match serde_json::from_str::<ChatChunk>(&event.data) {
-            Ok(chunk) => {
-                // Record usage ONLY on the final chunk (choices empty). Spec-compliant OpenAI sends
-                // usage=null until then, but some gateways (vLLM/LiteLLM/OpenRouter) attach a
-                // CUMULATIVE usage object to EVERY chunk — without this guard an N-chunk stream sums it
-                // N times and inflates /cost (and calls_with_usage) ~N×.
-                if let Some(u) = &chunk.usage {
-                    if chunk.choices.is_empty() {
-                        cost_meter().record(u);
-                        final_usage = Some(u.clone());
-                    }
-                }
-                if let Some(choice) = chunk.choices.first() {
-                    // A dedicated reasoning channel (`reasoning_content`/`reasoning`) is the model
-                    // thinking out loud — suppress it entirely so output is uniform across models.
-                    // (Clear the spinner: the model IS producing, just not user-facing text yet.)
-                    if choice.delta.reasoning_content.is_some() {
-                        spin.take();
-                    }
-                    if let Some(content) = &choice.delta.content {
-                        spin.take(); // stop+clear the spinner before the first token prints
-                        let shown = think.push(content);
-                        if !shown.is_empty() {
-                            full.push_str(&shown); // history keeps the RAW markdown
-                            crate::ui::tui::add_stream_chars(shown.chars().count() as u64); // live ↑tok pill
-                            if retained_display {
-                                crate::ui::tui::assistant_stream_delta(&shown);
-                            } else {
-                                let rendered = md.push(&shown); // styled, complete lines (gutter, md, code)
-                                if !rendered.is_empty() {
-                                    crate::ui::tui::emit(&rendered); // classic TUI funnel / plain print
-                                }
-                            }
-                        }
-                    }
-                    if !choice.delta.tool_calls.is_empty() {
-                        spin.take(); // a tool-only turn: clear before the loop prints tool traces
-                        let completed = acc.ingest(&choice.delta.tool_calls);
-                        if let Some(hook) = eager_hook {
-                            for (slot, tc) in completed {
-                                if let Some(h) = hook(slot, &tc) {
-                                    eager_by_slot.insert(slot, h);
-                                }
-                            }
-                        }
-                    }
-                    if choice.finish_reason.is_some() {
-                        finish_reason = choice.finish_reason.clone();
-                    }
-                }
-            }
-            Err(e) => {
-                spin.take();
-                // Gateways (vLLM/LiteLLM/OpenRouter) interleave keepalive / non-JSON frames mid-stream.
-                // A raw `eprintln!` here writes straight to the terminal, bypassing the retained render
-                // thread → corrupts the pinned frame ("breaks during work"). Route through the TUI funnel
-                // when it owns the screen; only fall back to stderr when it doesn't.
-                let warn = format!("[warn] unparseable stream frame ({e}): {}", event.data);
-                if crate::ui::tui::active() {
-                    crate::ui::tui::emit_line(&crate::ui::theme::faint(warn).to_string());
-                } else {
-                    eprintln!("\n{warn}");
-                }
-            }
-        }
-    }
-    spin.take(); // stream ended (e.g. empty turn) — ensure the spinner is gone
-    let tail = think.finish();
-    if !tail.is_empty() {
-        full.push_str(&tail);
-        if retained_display {
-            crate::ui::tui::assistant_stream_delta(&tail);
-        } else {
-            let rendered = md.push(&tail);
-            if !rendered.is_empty() {
-                crate::ui::tui::emit(&rendered);
-            }
-        }
-    }
-    if retained_display {
-        crate::ui::tui::assistant_stream_finish(stream_err.is_some());
-    } else {
-        let closing = md.finish(); // flush the final partial line + close any dangling code fence
-        if !closing.is_empty() {
-            crate::ui::tui::emit(&closing);
-        }
-        if !full.is_empty() {
-            crate::ui::tui::emit("\n"); // one blank line of breathing room before the next turn
-        }
-    }
 
-    // The display is now clean (fence closed, partial line flushed) — surface any transport error
-    // that interrupted the stream. The partial `full` / tool-calls are intentionally discarded: a
-    // truncated tool-call's arguments JSON is unparseable, so feeding it back would be worse than a
-    // clean turn failure the caller can retry.
-    if let Some(e) = stream_err {
-        return Err(e);
-    }
+        // The display is now clean (fence closed, partial line flushed) — surface any transport error
+        // that interrupted the stream. The partial `full` / tool-calls are intentionally discarded: a
+        // truncated tool-call's arguments JSON is unparseable, so feeding it back would be worse than a
+        // clean turn failure the caller can retry.
+        if let Some(e) = stream_err {
+            return Err(e);
+        }
 
-    // Map eager handles from accumulator SLOT to final POSITION (what the executor stitches by).
-    let indexed = acc.finish_indexed();
-    let eager: Vec<(usize, tokio::task::JoinHandle<String>)> = indexed
-        .iter()
-        .enumerate()
-        .filter_map(|(pos, (slot, _))| eager_by_slot.remove(slot).map(|h| (pos, h)))
-        .collect();
-    Ok(ChatTurn {
-        content: if full.is_empty() { None } else { Some(full) },
-        tool_calls: indexed.into_iter().map(|(_, tc)| tc).collect(),
-        finish_reason,
-        usage: final_usage,
-        eager,
-    })
+        // Map eager handles from accumulator SLOT to final POSITION (what the executor stitches by).
+        let indexed = acc.finish_indexed();
+        let eager: Vec<(usize, tokio::task::JoinHandle<String>)> = indexed
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, (slot, _))| eager_by_slot.remove(slot).map(|h| (pos, h)))
+            .collect();
+        return Ok(ChatTurn {
+            content: if full.is_empty() { None } else { Some(full) },
+            tool_calls: indexed.into_iter().map(|(_, tc)| tc).collect(),
+            finish_reason,
+            usage: final_usage,
+            eager,
+        });
+    } // end blank-stream replay loop
 }
 
 /// A streaming filter that suppresses `<think>…</think>` reasoning blocks from the printed output.
@@ -1054,6 +1225,57 @@ mod tests {
     use crate::core::types::FunctionDelta;
 
     #[test]
+    fn stall_timeout_defaults_and_clamps_the_env_override() {
+        // Serialize with every other env-touching test (the shared process environment is global).
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(STREAM_STALL_ENV);
+        assert_eq!(
+            stream_stall_timeout().as_secs(),
+            STREAM_STALL_SECS,
+            "no override → the default"
+        );
+        std::env::set_var(STREAM_STALL_ENV, "240");
+        assert_eq!(
+            stream_stall_timeout().as_secs(),
+            240,
+            "a sane override is honoured"
+        );
+        // A typo must not disable the deadline that keeps a stalled turn from hanging forever.
+        std::env::set_var(STREAM_STALL_ENV, "0");
+        assert_eq!(
+            stream_stall_timeout().as_secs(),
+            15,
+            "clamped up to the floor"
+        );
+        std::env::set_var(STREAM_STALL_ENV, "999999");
+        assert_eq!(
+            stream_stall_timeout().as_secs(),
+            1800,
+            "clamped down to the ceiling"
+        );
+        std::env::set_var(STREAM_STALL_ENV, "not-a-number");
+        assert_eq!(
+            stream_stall_timeout().as_secs(),
+            STREAM_STALL_SECS,
+            "garbage → the default"
+        );
+        std::env::remove_var(STREAM_STALL_ENV);
+    }
+
+    #[test]
+    fn a_stalled_stream_classifies_as_transient_so_goal_mode_retries() {
+        // The watchdog's wording must land on the retryable side of `classify_api_error` — a stall is
+        // exactly the flakiness goal mode exists to survive.
+        let e = anyhow!("SSE stream error: timeout — no data for 90s (stream never started)");
+        assert_eq!(classify_api_error(&e), ApiErrorKind::Transient);
+        let mid =
+            anyhow!("SSE stream error: timeout — no data for 90s (stream stalled mid-response)");
+        assert_eq!(classify_api_error(&mid), ApiErrorKind::Transient);
+    }
+
+    #[test]
     fn cost_meter_last_call_tracks_most_recent() {
         let m = CostMeter::default();
         assert_eq!(m.last_call(), None, "no usage seen yet");
@@ -1064,8 +1286,16 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(m.last_call(), Some((1000, 800, 50)));
-        m.record(&Usage { prompt_tokens: Some(2000), completion_tokens: Some(10), ..Default::default() });
-        assert_eq!(m.last_call(), Some((2000, 0, 10)), "most recent call wins; no cache → 0");
+        m.record(&Usage {
+            prompt_tokens: Some(2000),
+            completion_tokens: Some(10),
+            ..Default::default()
+        });
+        assert_eq!(
+            m.last_call(),
+            Some((2000, 0, 10)),
+            "most recent call wins; no cache → 0"
+        );
         m.reset();
         assert_eq!(m.last_call(), None, "reset clears the last-call signal");
     }
@@ -1074,9 +1304,16 @@ mod tests {
     fn body_blames_effort_matches_provider_wordings() {
         // The three shapes real providers use — with/without the underscore, various phrasings.
         assert!(body_blames_effort("Unknown parameter: reasoning_effort"));
-        assert!(body_blames_effort("reasoning_effort: unsupported value 'max'"));
-        assert!(body_blames_effort("This model does not support reasoning effort"));
-        assert!(body_blames_effort("REASONING_EFFORT is invalid"), "case-insensitive");
+        assert!(body_blames_effort(
+            "reasoning_effort: unsupported value 'max'"
+        ));
+        assert!(body_blames_effort(
+            "This model does not support reasoning effort"
+        ));
+        assert!(
+            body_blames_effort("REASONING_EFFORT is invalid"),
+            "case-insensitive"
+        );
         // A 400 about something else must NOT be mistaken for an effort rejection.
         assert!(!body_blames_effort("Unknown parameter: temperature"));
         assert!(!body_blames_effort("context_length_exceeded"));
@@ -1086,9 +1323,15 @@ mod tests {
     fn effort_unsupported_set_records_and_reports_per_model() {
         // A model is "supported" until it 400s once; then it's remembered for the session.
         let model = "test-only-effort-model-xyz"; // unique so it can't collide with another test
-        assert!(!effort_known_unsupported(model), "unseen model starts supported");
+        assert!(
+            !effort_known_unsupported(model),
+            "unseen model starts supported"
+        );
         mark_effort_unsupported(model);
-        assert!(effort_known_unsupported(model), "marked model is remembered");
+        assert!(
+            effort_known_unsupported(model),
+            "marked model is remembered"
+        );
         // An unrelated model is unaffected by the mark above.
         assert!(!effort_known_unsupported("some-other-model-abc"));
     }
@@ -1114,7 +1357,10 @@ mod tests {
         for w in seq.windows(2) {
             assert!(w[1] >= w[0], "ceiling must not decrease: {seq:?}");
         }
-        assert!(seq.iter().all(|&d| d >= 1 && d <= cap), "every delay in [1, cap]: {seq:?}");
+        assert!(
+            seq.iter().all(|&d| d >= 1 && d <= cap),
+            "every delay in [1, cap]: {seq:?}"
+        );
         assert_eq!(*seq.last().unwrap(), cap, "saturates at the cap");
     }
 
@@ -1125,7 +1371,11 @@ mod tests {
             let ceil = backoff_ceiling_ms(attempt, base, cap);
             for _ in 0..50 {
                 let d = backoff_ms(attempt, base, cap);
-                assert!(d >= ceil / 2 && d <= ceil, "jitter {d} outside [{}, {ceil}]", ceil / 2);
+                assert!(
+                    d >= ceil / 2 && d <= ceil,
+                    "jitter {d} outside [{}, {ceil}]",
+                    ceil / 2
+                );
             }
         }
     }
@@ -1162,8 +1412,18 @@ mod tests {
     fn cost_meter_sums_real_usage_and_ignores_empty() {
         // A LOCAL meter (not the global) so parallel tests don't race on it.
         let m = CostMeter::default();
-        m.record(&Usage { prompt_tokens: Some(100), completion_tokens: Some(40), total_tokens: Some(140), ..Default::default() });
-        m.record(&Usage { prompt_tokens: Some(10), completion_tokens: Some(5), total_tokens: None, ..Default::default() });
+        m.record(&Usage {
+            prompt_tokens: Some(100),
+            completion_tokens: Some(40),
+            total_tokens: Some(140),
+            ..Default::default()
+        });
+        m.record(&Usage {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            total_tokens: None,
+            ..Default::default()
+        });
         m.record(&Usage::default()); // all-None → NOT counted as a usage-reporting call
         assert_eq!(m.snapshot(), (110, 45, 2));
         m.reset();
@@ -1173,23 +1433,47 @@ mod tests {
     #[test]
     fn cost_meter_tracks_cache_reads() {
         let m = CostMeter::default();
-        m.record(&Usage { prompt_tokens: Some(100), cache_read_input_tokens: Some(80), ..Default::default() });
-        assert_eq!(m.cache_read(), 80, "cache-read tokens accumulate for the /cost probe");
+        m.record(&Usage {
+            prompt_tokens: Some(100),
+            cache_read_input_tokens: Some(80),
+            ..Default::default()
+        });
+        assert_eq!(
+            m.cache_read(),
+            80,
+            "cache-read tokens accumulate for the /cost probe"
+        );
         m.reset();
         assert_eq!(m.cache_read(), 0);
     }
 
     #[test]
     fn anthropic_model_detection() {
-        for m in ["opus-4-8", "claude-3-5", "Sonnet", "fable-5", "anthropic/claude", "claude-haiku-4-5"] {
+        for m in [
+            "opus-4-8",
+            "claude-3-5",
+            "Sonnet",
+            "fable-5",
+            "anthropic/claude",
+            "claude-haiku-4-5",
+        ] {
             assert!(is_anthropic_model(m), "{m} should be detected as Anthropic");
         }
         for m in ["gpt-4o", "deepseek-chat", "gemini-1.5", "llama-3"] {
             assert!(!is_anthropic_model(m), "{m} should NOT be Anthropic");
         }
         // Word-boundary guard: community models that merely EMBED a token must not trip AUTO cache.
-        for m in ["fable13b", "haikuwriter", "mythos-13b", "opusculum-7b", "sonnetizer"] {
-            assert!(!is_anthropic_model(m), "{m} embeds a token but is not Anthropic");
+        for m in [
+            "fable13b",
+            "haikuwriter",
+            "mythos-13b",
+            "opusculum-7b",
+            "sonnetizer",
+        ] {
+            assert!(
+                !is_anthropic_model(m),
+                "{m} embeds a token but is not Anthropic"
+            );
         }
     }
 
@@ -1215,28 +1499,55 @@ mod tests {
             ToolDef::function("b", "d", serde_json::json!({"type":"object"})),
         ];
         apply_cache_breakpoints(&mut msgs, &mut tools);
-        assert!(tools[0].cache_control.is_none(), "only the LAST tool def is stamped");
-        assert!(tools[1].cache_control.is_some(), "last tool def caches the whole tool block");
+        assert!(
+            tools[0].cache_control.is_none(),
+            "only the LAST tool def is stamped"
+        );
+        assert!(
+            tools[1].cache_control.is_some(),
+            "last tool def caches the whole tool block"
+        );
         assert!(msgs[0].cache_control.is_some(), "system message stamped");
-        assert!(msgs[3].cache_control.is_some(), "last stable assistant/tool message stamped");
-        assert!(msgs[4].cache_control.is_none(), "the newest user turn stays uncached");
+        assert!(
+            msgs[3].cache_control.is_some(),
+            "last stable assistant/tool message stamped"
+        );
+        assert!(
+            msgs[4].cache_control.is_none(),
+            "the newest user turn stays uncached"
+        );
     }
 
     #[test]
     fn cache_breakpoints_short_history_only_system_and_tools() {
         let mut msgs = vec![Message::system("sys"), Message::user("hi")];
-        let mut tools = vec![ToolDef::function("a", "d", serde_json::json!({"type":"object"}))];
+        let mut tools = vec![ToolDef::function(
+            "a",
+            "d",
+            serde_json::json!({"type":"object"}),
+        )];
         apply_cache_breakpoints(&mut msgs, &mut tools);
         assert!(msgs[0].cache_control.is_some());
         assert!(tools[0].cache_control.is_some());
-        assert!(msgs[1].cache_control.is_none(), "no history breakpoint when n < 3");
+        assert!(
+            msgs[1].cache_control.is_none(),
+            "no history breakpoint when n < 3"
+        );
     }
 
-    fn delta(index: usize, id: Option<&str>, name: Option<&str>, args: Option<&str>) -> ToolCallDelta {
+    fn delta(
+        index: usize,
+        id: Option<&str>,
+        name: Option<&str>,
+        args: Option<&str>,
+    ) -> ToolCallDelta {
         ToolCallDelta {
             index,
             id: id.map(String::from),
-            function: Some(FunctionDelta { name: name.map(String::from), arguments: args.map(String::from) }),
+            function: Some(FunctionDelta {
+                name: name.map(String::from),
+                arguments: args.map(String::from),
+            }),
         }
     }
 
@@ -1244,8 +1555,12 @@ mod tests {
     fn accumulator_emits_completion_when_next_slot_starts() {
         let mut acc = ToolCallAccumulator::default();
         // First call streams over two batches — nothing completes yet.
-        assert!(acc.ingest(&[delta(0, Some("a"), Some("file_read"), Some(r#"{"path":"#))]).is_empty());
-        assert!(acc.ingest(&[delta(0, None, None, Some(r#""x.rs"}"#))]).is_empty());
+        assert!(acc
+            .ingest(&[delta(0, Some("a"), Some("file_read"), Some(r#"{"path":"#))])
+            .is_empty());
+        assert!(acc
+            .ingest(&[delta(0, None, None, Some(r#""x.rs"}"#))])
+            .is_empty());
         // Slot 1 starts → slot 0 completes with its FULL arguments.
         let done = acc.ingest(&[delta(1, Some("b"), Some("file_glob"), Some("{}"))]);
         assert_eq!(done.len(), 1);
@@ -1255,8 +1570,14 @@ mod tests {
         // The LAST call never emits mid-stream — finish_indexed covers it, slot keys intact.
         let indexed = acc.finish_indexed();
         assert_eq!(indexed.len(), 2);
-        assert_eq!((indexed[0].0, indexed[0].1.function.name.as_str()), (0, "file_read"));
-        assert_eq!((indexed[1].0, indexed[1].1.function.name.as_str()), (1, "file_glob"));
+        assert_eq!(
+            (indexed[0].0, indexed[0].1.function.name.as_str()),
+            (0, "file_read")
+        );
+        assert_eq!(
+            (indexed[1].0, indexed[1].1.function.name.as_str()),
+            (1, "file_glob")
+        );
     }
 
     #[test]
@@ -1264,7 +1585,9 @@ mod tests {
         // Index-omitting provider: both calls claim index 0; the second id reroutes to a fresh
         // slot — and that reroute must still emit the first call's completion.
         let mut acc = ToolCallAccumulator::default();
-        assert!(acc.ingest(&[delta(0, Some("a"), Some("t_one"), Some("{}"))]).is_empty());
+        assert!(acc
+            .ingest(&[delta(0, Some("a"), Some("t_one"), Some("{}"))])
+            .is_empty());
         let done = acc.ingest(&[delta(0, Some("b"), Some("t_two"), Some("{}"))]);
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].1.function.name, "t_one");
@@ -1275,7 +1598,12 @@ mod tests {
     #[test]
     fn accumulator_reassembles_streamed_tool_call() {
         let mut acc = ToolCallAccumulator::default();
-        acc.ingest(&[delta(0, Some("call_1"), Some("memory_search"), Some("{\"que"))]);
+        acc.ingest(&[delta(
+            0,
+            Some("call_1"),
+            Some("memory_search"),
+            Some("{\"que"),
+        )]);
         acc.ingest(&[delta(0, None, None, Some("ry\":\"x\"}"))]);
         let calls = acc.finish();
         assert_eq!(calls.len(), 1);
@@ -1287,7 +1615,10 @@ mod tests {
     #[test]
     fn accumulator_handles_two_parallel_calls() {
         let mut acc = ToolCallAccumulator::default();
-        acc.ingest(&[delta(0, Some("a"), Some("f"), Some("{}")), delta(1, Some("b"), Some("g"), Some("{}"))]);
+        acc.ingest(&[
+            delta(0, Some("a"), Some("f"), Some("{}")),
+            delta(1, Some("b"), Some("g"), Some("{}")),
+        ]);
         let calls = acc.finish();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].function.name, "f");
@@ -1297,9 +1628,11 @@ mod tests {
     #[test]
     fn delta_captures_both_reasoning_field_names() {
         // DeepSeek-style `reasoning_content` and OpenRouter-style `reasoning` both land in the field.
-        let a: crate::core::types::Delta = serde_json::from_str(r#"{"reasoning_content":"thinking…"}"#).unwrap();
+        let a: crate::core::types::Delta =
+            serde_json::from_str(r#"{"reasoning_content":"thinking…"}"#).unwrap();
         assert_eq!(a.reasoning_content.as_deref(), Some("thinking…"));
-        let b: crate::core::types::Delta = serde_json::from_str(r#"{"reasoning":"thinking…"}"#).unwrap();
+        let b: crate::core::types::Delta =
+            serde_json::from_str(r#"{"reasoning":"thinking…"}"#).unwrap();
         assert_eq!(b.reasoning_content.as_deref(), Some("thinking…"));
         // Plain content chunk leaves the reasoning channel empty.
         let c: crate::core::types::Delta = serde_json::from_str(r#"{"content":"hi"}"#).unwrap();

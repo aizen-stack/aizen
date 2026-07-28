@@ -17,11 +17,11 @@
 //! Depth 0 only, like `task`. The tool itself is not concurrency-safe — it IS the parallelism.
 
 use crate::agent::tools::Tool;
+#[cfg(test)]
+use crate::agent::workflow::task_is_writer;
 use crate::agent::workflow::{
     enforce_singular_writer, run_workflow_collect, Synthesis, WorkflowSpec, WorkflowTask,
 };
-#[cfg(test)]
-use crate::agent::workflow::task_is_writer;
 use anyhow::{bail, Result};
 use serde_json::Value;
 
@@ -43,7 +43,14 @@ impl WorkflowTool {
         approval_mode: crate::core::approval::ApprovalMode,
         depth: usize,
     ) -> Self {
-        Self { client, base_url, api_key, model, approval_mode, depth }
+        Self {
+            client,
+            base_url,
+            api_key,
+            model,
+            approval_mode,
+            depth,
+        }
     }
 }
 
@@ -59,7 +66,10 @@ fn refuter_prompt(finding: &str) -> String {
 /// Build the spec for one call. Pure for role-only tasks; a task naming an `agent` resolves that
 /// specialist from disk to classify its write-capability (see [`task_is_writer`]).
 pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
-    let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("fanout");
+    let mode = args
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("fanout");
     match mode {
         "fanout" => {
             let tasks_in = args
@@ -72,7 +82,11 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
             }
             let mut tasks = Vec::new();
             for (i, t) in tasks_in.iter().enumerate() {
-                let role = t.get("role").and_then(|v| v.as_str()).unwrap_or("coder").to_string();
+                let role = t
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("coder")
+                    .to_string();
                 tasks.push(WorkflowTask {
                     id: t
                         .get("id")
@@ -113,9 +127,14 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                 .get("findings")
                 .and_then(|v| v.as_array())
                 .filter(|a| !a.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("verify mode requires a non-empty 'findings' array"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("verify mode requires a non-empty 'findings' array")
+                })?;
             if findings.len() > 5 {
-                bail!("verify caps at 5 findings per call (got {})", findings.len());
+                bail!(
+                    "verify caps at 5 findings per call (got {})",
+                    findings.len()
+                );
             }
             let tasks = findings
                 .iter()
@@ -186,7 +205,9 @@ impl Tool for WorkflowTool {
     }
     fn execute(&self, args: &Value) -> Result<String> {
         if self.depth >= 1 {
-            bail!("workflow is depth-capped at 1 — a sub-agent cannot orchestrate further fan-outs");
+            bail!(
+                "workflow is depth-capped at 1 — a sub-agent cannot orchestrate further fan-outs"
+            );
         }
         let (spec, synthesize) = build_spec(args)?;
         // Sub-agent gate is acquired INSIDE run_workflow_collect — one slot per concurrent child
@@ -211,8 +232,9 @@ impl Tool for WorkflowTool {
                     // resolves its own `cfg.reasoning_effort` instead of inheriting the parent's pinned tier.
                     // Restored on drop before control returns to the parent turn.
                     let _effort = crate::core::cli_config::suppress_effort_override();
-                    tokio::runtime::Handle::current()
-                        .block_on(run_workflow_collect(&client, &base, &key, &model, approval, &spec, synthesize))
+                    tokio::runtime::Handle::current().block_on(run_workflow_collect(
+                        &client, &base, &key, &model, approval, &spec, synthesize,
+                    ))
                 })
             })
         })
@@ -230,13 +252,22 @@ mod tests {
             "findings": ["off-by-one in src/a.rs:10", "race in src/b.rs:99"]
         }))
         .unwrap();
-        assert!(!synth, "verify returns raw verdicts, never a merged narrative");
+        assert!(
+            !synth,
+            "verify returns raw verdicts, never a merged narrative"
+        );
         assert_eq!(spec.tasks.len(), 2);
         assert_eq!(spec.tasks[0].id, "refute-1");
-        assert_eq!(spec.tasks[0].role, "reviewer", "refuters are read-only → they fan out");
+        assert_eq!(
+            spec.tasks[0].role, "reviewer",
+            "refuters are read-only → they fan out"
+        );
         assert!(spec.tasks[0].prompt.contains("REFUTE"));
         assert!(spec.tasks[0].prompt.contains("off-by-one in src/a.rs:10"));
-        assert!(spec.tasks[1].prompt.contains("verdict: confirmed"), "fixed verdict contract");
+        assert!(
+            spec.tasks[1].prompt.contains("verdict: confirmed"),
+            "fixed verdict contract"
+        );
     }
 
     #[test]
@@ -267,11 +298,25 @@ mod tests {
 
     #[test]
     fn spec_validation_rejects_junk() {
-        assert!(build_spec(&serde_json::json!({"mode": "fanout"})).is_err(), "no tasks");
-        assert!(build_spec(&serde_json::json!({"mode": "verify"})).is_err(), "no findings");
-        assert!(build_spec(&serde_json::json!({"mode": "dag"})).is_err(), "unknown mode");
-        let six: Vec<_> = (0..6).map(|i| serde_json::json!({"prompt": format!("t{i}"), "role": "reviewer"})).collect();
-        assert!(build_spec(&serde_json::json!({"mode": "fanout", "tasks": six})).is_err(), "cap 5");
+        assert!(
+            build_spec(&serde_json::json!({"mode": "fanout"})).is_err(),
+            "no tasks"
+        );
+        assert!(
+            build_spec(&serde_json::json!({"mode": "verify"})).is_err(),
+            "no findings"
+        );
+        assert!(
+            build_spec(&serde_json::json!({"mode": "dag"})).is_err(),
+            "unknown mode"
+        );
+        let six: Vec<_> = (0..6)
+            .map(|i| serde_json::json!({"prompt": format!("t{i}"), "role": "reviewer"}))
+            .collect();
+        assert!(
+            build_spec(&serde_json::json!({"mode": "fanout", "tasks": six})).is_err(),
+            "cap 5"
+        );
     }
 
     #[test]
@@ -309,7 +354,9 @@ mod tests {
             crate::core::approval::ApprovalMode::Ask,
             1,
         );
-        let err = t.execute(&serde_json::json!({"mode": "verify", "findings": ["x"]})).unwrap_err();
+        let err = t
+            .execute(&serde_json::json!({"mode": "verify", "findings": ["x"]}))
+            .unwrap_err();
         assert!(err.to_string().contains("depth-capped"), "{err}");
     }
 }

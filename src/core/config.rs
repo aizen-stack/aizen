@@ -62,15 +62,55 @@ pub fn project_root() -> PathBuf {
             return PathBuf::from(v);
         }
     }
-    if let Ok(out) = std::process::Command::new("git").args(["rev-parse", "--show-toplevel"]).output() {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                return PathBuf::from(s);
+    if let Ok(mut cmd) = crate::core::gitx::command() {
+        if let Ok(out) = cmd.args(["rev-parse", "--show-toplevel"]).output() {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return PathBuf::from(s);
+                }
             }
         }
     }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    // No usable git (absent, or it refused — e.g. dubious-ownership): walk UP for a project
+    // marker, pure-Rust. One checkout must keep ONE identity even on a gitless machine — the old
+    // straight-to-cwd fallback minted a fresh zone per LAUNCH DIR, which is half of the slug-fork
+    // disease. Looking ONLY for `.git` left that fork wide open for trees that aren't repos at all:
+    // `proj/` and `proj/src/` became two projects, so each subdir grew its own zone and disowned
+    // the other's sessions. A VCS marker outranks a manifest (it bounds the whole checkout), and
+    // within each class the OUTERMOST match wins — same semantics as `git rev-parse --show-toplevel`
+    // for a workspace member. cwd is the true last resort (a bare dir with no marker at all).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    const VCS: [&str; 4] = [".git", ".hg", ".svn", ".jj"];
+    const MANIFEST: [&str; 4] = ["Cargo.toml", "package.json", "pyproject.toml", "go.mod"];
+    // The walk stops BELOW the user's home dir. Without that bound a stray manifest in `~` would
+    // make every non-repo tree under it share one root — collapsing unrelated projects into a
+    // single zone, which is a worse identity bug than the per-subdir fork this fixes. (`.aizen`
+    // deliberately is NOT a marker: `~/.aizen` is the global home, so honoring it would resolve
+    // every project under the home dir to the home dir itself.)
+    let home_bound = std::env::var("USERPROFILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("HOME").ok().filter(|s| !s.trim().is_empty()))
+        .map(PathBuf::from);
+    let outermost = |markers: &[&str]| -> Option<PathBuf> {
+        let mut found = None;
+        let mut cur = Some(cwd.as_path());
+        while let Some(d) = cur {
+            // `h.starts_with(d)` is true exactly when `d` IS the home dir or an ancestor of it.
+            if home_bound.as_deref().is_some_and(|h| h.starts_with(d)) {
+                break;
+            }
+            if markers.iter().any(|m| d.join(m).exists()) {
+                found = Some(d.to_path_buf());
+            }
+            cur = d.parent();
+        }
+        found
+    };
+    outermost(&VCS)
+        .or_else(|| outermost(&MANIFEST))
+        .unwrap_or_else(|| cwd.clone())
 }
 
 /// Workspace-scoping kill-switch: `NG_NO_SCOPE=1` collapses memory back to one global pool
@@ -139,43 +179,160 @@ fn slug_fragment(name: &str) -> String {
     }
 }
 
-/// The stable identity of the current workspace: `dirname-hex8`. The hash key prefers the git
-/// `remote.origin.url` (a re-clone / worktree / moved checkout keeps the SAME memory zone), falling
-/// back to the canonical root path (non-repo dirs still get a stable zone). Cached per
-/// (`NG_PROJECT_ROOT` env, cwd) so production pays the git shell-outs once and tests that repoint
-/// `NG_PROJECT_ROOT` are never served a stale slug.
+/// The stable identity of the current workspace: `dirname-hex8`. The hash key is the workspace
+/// root's canonicalized path in ONE normalized spelling ([`workspace_key`]) — identity is WHERE
+/// the checkout lives, full stop. The old key preferred `remote.origin.url` with a raw
+/// `canonicalize` fallback, which let *whether git happened to spawn* (PATH luck) pick the key:
+/// the same repo silently forked into twin memory/skills/index zones. A moved or re-cloned
+/// checkout is now an explicit `aizen zone migrate`, never an implicit re-key. Cached per
+/// (`NG_PROJECT_ROOT` env, cwd) so tests that repoint `NG_PROJECT_ROOT` are never served a
+/// stale slug.
 pub fn project_slug() -> String {
-    static CACHE: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+    identity().2
+}
+
+/// The normalized identity key of the current project root — the exact string [`project_slug`]
+/// hashes. Session provenance stamps store it so "same project?" checks agree byte-for-byte with
+/// zone identity instead of re-deriving their own path comparison.
+pub fn project_key() -> String {
+    identity().1
+}
+
+/// `(root, key, slug)` for the current workspace, computed ONCE per (`NG_PROJECT_ROOT`, cwd).
+///
+/// The three are derived from the same `project_root()` call by construction, so a caller can never
+/// see a key and a slug that disagree. Sharing the cache also matters for cost: `project_root()` may
+/// spawn `git rev-parse`, and stamping session provenance wants all three every autosave — three
+/// separate lookups would have meant three git spawns per turn.
+fn identity() -> (PathBuf, String, String) {
+    static CACHE: std::sync::Mutex<Option<(String, (PathBuf, String, String))>> =
+        std::sync::Mutex::new(None);
     let cache_key = format!(
         "{}|{}",
         std::env::var("NG_PROJECT_ROOT").unwrap_or_default(),
-        std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
     );
     if let Ok(guard) = CACHE.lock() {
-        if let Some((k, slug)) = guard.as_ref() {
+        if let Some((k, ident)) = guard.as_ref() {
             if *k == cache_key {
-                return slug.clone();
+                return ident.clone();
             }
         }
     }
     let root = project_root();
-    let stable_key = git_remote_origin(&root).unwrap_or_else(|| {
-        std::fs::canonicalize(&root)
-            .unwrap_or_else(|_| root.clone())
-            .display()
-            .to_string()
-    });
-    let name = root.file_name().and_then(|s| s.to_str()).unwrap_or("project");
-    let slug = format!("{}-{:08x}", slug_fragment(name), fnv1a64(&stable_key) as u32);
+    let name = root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("project");
+    let key = workspace_key(&root);
+    let slug = slug_for_key(name, &key);
+    let ident = (root, key, slug);
     if let Ok(mut guard) = CACHE.lock() {
-        *guard = Some((cache_key, slug.clone()));
+        *guard = Some((cache_key, ident.clone()));
     }
-    slug
+    ident
+}
+
+/// The `dirname-hex8` slug for an explicit (name, hash key) pair — the one formatter both the
+/// live keying and the legacy-candidate computation go through (pub(crate) so the zones tests
+/// can fabricate byte-exact legacy slugs).
+pub(crate) fn slug_for_key(name: &str, key: &str) -> String {
+    format!("{}-{:08x}", slug_fragment(name), fnv1a64(key) as u32)
+}
+
+/// Hash key for a workspace root: its canonicalized path in ONE normalized spelling — verbatim
+/// `\\?\` prefix stripped, `\` → `/`, drive letter lowercased, no trailing slash — mirroring
+/// `workspace_txn::normalized_path` so the two identity systems agree on "same directory".
+/// Canonicalize-failure falls back to the raw path through the same normalizer (still
+/// deterministic for a given spelling), so a vanished dir can't panic the slug.
+fn workspace_key(root: &Path) -> String {
+    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    normalize_path_key(&canon)
+}
+
+/// See [`workspace_key`]. Split out so tests can prove every spelling of one directory
+/// (verbatim vs plain, trailing slash, mixed separators) hashes identically.
+pub fn normalize_path_key(p: &Path) -> String {
+    let mut value = p.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = value.strip_prefix("//?/UNC/") {
+        // Verbatim UNC (`\\?\UNC\server\share`) and the plain `\\server\share` spelling of the
+        // same share must collapse to one key, or network checkouts fork on canonicalize luck.
+        value = format!("//{rest}");
+    } else if let Some(rest) = value.strip_prefix("//?/") {
+        value = rest.to_string();
+    }
+    if value.as_bytes().get(1) == Some(&b':') {
+        value.replace_range(0..1, &value[..1].to_ascii_lowercase());
+    }
+    value.trim_end_matches('/').to_string()
+}
+
+/// Slugs the pre-2026-07 keying could have produced for the CURRENT project. Two eras to cover:
+/// the remote-URL key (git worked), and the path keys (git didn't) — where the OLD gitless
+/// fallback rooted at the LAUNCH DIR, so a habitual subdir launch keyed a zone under the
+/// SUBDIR's name and path. Candidates therefore span the root itself, today's cwd, and every
+/// directory between them, each in its canonicalize-verbatim and raw spellings. The current
+/// slug itself is excluded; `aizen zone migrate` merges artifacts found under the rest.
+pub fn legacy_slug_candidates() -> Vec<String> {
+    let root = project_root();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    legacy_slug_candidates_for(&root, &cwd, git_remote_origin(&root), &project_slug())
+}
+
+/// The injectable core of [`legacy_slug_candidates`] (cwd is process-global — tests must not
+/// `set_current_dir`, so they pass one in).
+fn legacy_slug_candidates_for(
+    root: &Path,
+    cwd: &Path,
+    remote_url: Option<String>,
+    current: &str,
+) -> Vec<String> {
+    let mut pairs: Vec<(String, String)> = Vec::new(); // (dirname, hash key)
+    let dirname = |p: &Path| {
+        p.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project")
+            .to_string()
+    };
+    if let Some(url) = remote_url {
+        pairs.push((dirname(root), url));
+    }
+    // The launch dirs the old keying could have rooted at: root, cwd, and everything between.
+    let mut dirs: Vec<PathBuf> = vec![root.to_path_buf()];
+    let mut cur = Some(cwd);
+    while let Some(p) = cur {
+        if p == root {
+            break;
+        }
+        if p.starts_with(root) {
+            dirs.push(p.to_path_buf());
+        }
+        cur = p.parent();
+    }
+    for d in dirs {
+        let n = dirname(&d);
+        if let Ok(c) = std::fs::canonicalize(&d) {
+            pairs.push((n.clone(), c.display().to_string())); // Windows: `\\?\C:\…` verbatim
+        }
+        pairs.push((n, d.display().to_string()));
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (n, k) in pairs {
+        let s = slug_for_key(&n, &k);
+        if s != current && !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
 }
 
 /// `git config --get remote.origin.url` in `root` — `None` when not a repo / no remote / no git.
-fn git_remote_origin(root: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
+/// No longer part of the identity key; kept for `zone migrate` (legacy-URL slugs) and `/where`.
+pub fn git_remote_origin(root: &Path) -> Option<String> {
+    let out = crate::core::gitx::command()
+        .ok()?
         .args(["config", "--get", "remote.origin.url"])
         .current_dir(root)
         .output()
@@ -231,6 +388,50 @@ pub fn harden_file(path: &Path) {
 #[cfg(not(unix))]
 pub fn harden_file(_path: &Path) {}
 
+/// Normalize an arbitrary path to the canonical anchor form used by the tier/place system:
+/// canonicalize (fallback raw) → normalize_path_key → to_ascii_lowercase (Windows segment-safe).
+pub fn anchor_of(path: &Path) -> String {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut key = normalize_path_key(&canon);
+    // ascii-lowercase: sigma-final-form / İ must not break prefix matching
+    key = key.to_ascii_lowercase();
+    key
+}
+
+/// The current working directory as a normalized anchor string (the anchor a `place` fact
+/// would get if the user didn't specify one).
+pub fn current_anchor() -> String {
+    match std::env::current_dir() {
+        Ok(p) => anchor_of(&p),
+        Err(_) => String::new(),
+    }
+}
+
+/// A human-friendly label for the current project (the git remote origin when available,
+/// else the directory name). Used in prompts and `/where`.
+pub fn project_label() -> Option<String> {
+    // Prefer the git remote origin
+    let root = project_root();
+    if let Some(url) = git_remote_origin(&root) {
+        // Extract a readable name from the URL
+        let label = url
+            .trim_end_matches(".git")
+            .rsplit('/')
+            .next()
+            .or_else(|| url.rsplit(':').next())
+            .unwrap_or(&url)
+            .to_string();
+        if !label.is_empty() {
+            return Some(label);
+        }
+    }
+    // Fallback: the directory name
+    root.file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Tighten a directory holding secrets to owner-only (0700) on Unix; a no-op on Windows.
 #[cfg(unix)]
 pub fn harden_dir(path: &Path) {
@@ -259,14 +460,22 @@ pub fn style_path() -> PathBuf {
 /// The slug is sanitized to a single safe path segment so a hostile repo name can't
 /// escape the index dir.
 pub fn codebase_index_path(slug: &str) -> PathBuf {
-    cli_memory_dir().join("codebase").join(format!("{}.json", safe_core_slug(slug)))
+    cli_memory_dir()
+        .join("codebase")
+        .join(format!("{}.json", safe_core_slug(slug)))
 }
 
 /// Sanitize a project slug for use as a single path segment (no `/` `\` `..`).
 fn safe_core_slug(slug: &str) -> String {
     let s: String = slug
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let s = s.trim_matches('-').to_string();
     if s.is_empty() {
@@ -448,6 +657,93 @@ mod tests {
         assert_eq!(slug_fragment("My Project!"), "my-project");
         assert_eq!(slug_fragment("***"), "project");
         assert!(slug_fragment(&"a".repeat(100)).chars().count() <= 24);
+    }
+
+    #[test]
+    fn normalize_path_key_is_spelling_invariant() {
+        // Pure string transform — host-independent, so windows-style literals are safe here.
+        // Every spelling of one directory must hash identically: the OLD key forked the zone on
+        // exactly this (verbatim `\\?\` canonicalize vs the plain-path fallback).
+        let want = "c:/Users/Admin/proj";
+        assert_eq!(
+            normalize_path_key(Path::new(r"\\?\C:\Users\Admin\proj")),
+            want
+        );
+        assert_eq!(normalize_path_key(Path::new(r"C:\Users\Admin\proj")), want);
+        assert_eq!(normalize_path_key(Path::new("C:/Users/Admin/proj/")), want);
+        assert_eq!(
+            normalize_path_key(Path::new("/home/u/proj/")),
+            "/home/u/proj"
+        );
+        // Verbatim UNC and the plain spelling of the same share collapse to one key.
+        assert_eq!(
+            normalize_path_key(Path::new(r"\\?\UNC\srv\share\proj")),
+            "//srv/share/proj"
+        );
+        assert_eq!(
+            normalize_path_key(Path::new(r"\\srv\share\proj")),
+            "//srv/share/proj"
+        );
+    }
+
+    #[test]
+    fn workspace_key_never_carries_the_verbatim_spelling() {
+        let dir = std::env::temp_dir().join(format!("ng-wskey-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let canon = std::fs::canonicalize(&dir).expect("canonicalize temp dir");
+        let key = workspace_key(&dir);
+        // The real regression pin (Windows): canonicalize returns the `\\?\` verbatim form, and
+        // exactly that spelling reaching the hash is what forked zones. The key must equal the
+        // normalizer applied to the verbatim DISPLAY STRING — the old fork input — not just to
+        // whatever canonicalize returns (that comparison would be a tautology).
+        assert!(
+            !key.starts_with("//?/"),
+            "verbatim prefix must never reach the key: {key}"
+        );
+        assert_eq!(
+            key,
+            normalize_path_key(Path::new(&canon.display().to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_candidates_cover_url_root_and_subdir_launch_eras() {
+        let base = std::env::temp_dir().join(format!("ng-legacy-{}", std::process::id()));
+        let root = base.join("repo");
+        let cwd = root.join("src").join("agent");
+        let _ = std::fs::create_dir_all(&cwd);
+        let current = slug_for_key("repo", &workspace_key(&root));
+        let cands = legacy_slug_candidates_for(
+            &root,
+            &cwd,
+            Some("https://example.com/o/repo.git".to_string()),
+            &current,
+        );
+        assert!(
+            !cands.contains(&current),
+            "current slug is never a candidate"
+        );
+        // URL era: hashed remote under the ROOT's name.
+        let url_slug = slug_for_key("repo", "https://example.com/o/repo.git");
+        assert!(
+            cands.contains(&url_slug),
+            "URL-keyed era must be covered: {cands:?}"
+        );
+        // Gitless era, habitual SUBDIR launch: the old fallback rooted at cwd, so the zone lived
+        // under the SUBDIR's name and raw path. That population must be findable.
+        let subdir_raw = slug_for_key("agent", &cwd.display().to_string());
+        assert!(
+            cands.contains(&subdir_raw),
+            "cwd-keyed gitless era must be covered: {cands:?}"
+        );
+        // …and the intermediate dir between cwd and root too.
+        let mid_raw = slug_for_key("src", &root.join("src").display().to_string());
+        assert!(
+            cands.contains(&mid_raw),
+            "intermediate launch dirs must be covered: {cands:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

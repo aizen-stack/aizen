@@ -69,7 +69,9 @@ pub fn load_project_context(cwd: &Path) -> Option<String> {
     let merged = sections.join("\n\n");
     if merged.chars().count() > MAX_CONTEXT_CHARS {
         let kept: String = merged.chars().take(MAX_CONTEXT_CHARS).collect();
-        return Some(format!("{kept}\n…[project context truncated at {MAX_CONTEXT_CHARS} chars]…"));
+        return Some(format!(
+            "{kept}\n…[project context truncated at {MAX_CONTEXT_CHARS} chars]…"
+        ));
     }
     Some(merged)
 }
@@ -81,7 +83,9 @@ fn display_label(path: &Path, base: &Path) -> String {
         .map(|p| p.display().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
-            path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string())
         })
 }
 
@@ -130,7 +134,10 @@ mod tests {
         let ctx = load_project_context(&cwd).expect("should load");
         let root_at = ctx.find("ROOT_RULES").unwrap();
         let sub_at = ctx.find("SUB_RULES").unwrap();
-        assert!(root_at < sub_at, "nearest (sub) must come last so it wins: {ctx}");
+        assert!(
+            root_at < sub_at,
+            "nearest (sub) must come last so it wins: {ctx}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -142,13 +149,19 @@ mod tests {
         write(&root, "CLAUDE.md", "FROM_CLAUDE");
         let ctx = load_project_context(&root).expect("should load");
         assert!(ctx.contains("FROM_AGENTS"));
-        assert!(!ctx.contains("FROM_CLAUDE"), "AGENTS.md wins within a dir: {ctx}");
+        assert!(
+            !ctx.contains("FROM_CLAUDE"),
+            "AGENTS.md wins within a dir: {ctx}"
+        );
         let _ = std::fs::remove_dir_all(&root);
 
         let root2 = sandbox("compat2");
         write(&root2, "CLAUDE.md", "ONLY_CLAUDE");
         let ctx2 = load_project_context(&root2).expect("should load");
-        assert!(ctx2.contains("ONLY_CLAUDE"), "CLAUDE.md alone is read: {ctx2}");
+        assert!(
+            ctx2.contains("ONLY_CLAUDE"),
+            "CLAUDE.md alone is read: {ctx2}"
+        );
         let _ = std::fs::remove_dir_all(&root2);
     }
 
@@ -157,7 +170,11 @@ mod tests {
         let root = sandbox("cap");
         write(&root, "AGENTS.md", &"x".repeat(MAX_CONTEXT_CHARS + 5_000));
         let ctx = load_project_context(&root).expect("should load");
-        assert!(ctx.chars().count() <= MAX_CONTEXT_CHARS + 80, "capped near MAX: {}", ctx.chars().count());
+        assert!(
+            ctx.chars().count() <= MAX_CONTEXT_CHARS + 80,
+            "capped near MAX: {}",
+            ctx.chars().count()
+        );
         assert!(ctx.contains("truncated"), "marks truncation");
         let _ = std::fs::remove_dir_all(&root);
     }

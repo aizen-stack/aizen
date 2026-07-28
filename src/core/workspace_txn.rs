@@ -22,6 +22,44 @@ pub struct WorkspaceIdentity {
 }
 
 impl WorkspaceIdentity {
+    /// [`discover`] with a process-wide per-root cache. Discovery costs three git spawns and the
+    /// writer lease runs it on EVERY destructive tool call — within one process the answer never
+    /// changes for a given root, and lock correctness wants all callers to AGREE on the key more
+    /// than it wants mid-process freshness (a `git init` mid-run re-keys on the next process).
+    pub fn discover_cached(root: &Path) -> Result<Self> {
+        static CACHE: std::sync::Mutex<
+            Option<std::collections::HashMap<String, WorkspaceIdentity>>,
+        > = std::sync::Mutex::new(None);
+        // The nearest `.git` marker is part of the key: a `git init` mid-process must re-key —
+        // an aizen started before it and one after must still agree on the lock path, or the
+        // writer lease stops excluding across processes. One bounded stat-walk, no git spawn.
+        let marker = {
+            let mut cur = Some(root);
+            let mut found = String::new();
+            while let Some(p) = cur {
+                if p.join(".git").exists() {
+                    found = normalized_path(p);
+                    break;
+                }
+                cur = p.parent();
+            }
+            found
+        };
+        let key = format!("{}|{marker}", normalized_path(root));
+        if let Ok(guard) = CACHE.lock() {
+            if let Some(id) = guard.as_ref().and_then(|m| m.get(&key)) {
+                return Ok(id.clone());
+            }
+        }
+        let id = Self::discover(root)?;
+        if let Ok(mut guard) = CACHE.lock() {
+            guard
+                .get_or_insert_with(Default::default)
+                .insert(key, id.clone());
+        }
+        Ok(id)
+    }
+
     pub fn discover(root: &Path) -> Result<Self> {
         let canonical_root = canonical_existing_or_parent(root)?;
         let top = git_path(root, ["rev-parse", "--show-toplevel"]);
@@ -39,7 +77,13 @@ impl WorkspaceIdentity {
             .transpose()?;
         let canonical_common_git_dir = common_dir
             .as_deref()
-            .map(|p| if p.is_absolute() { p.to_path_buf() } else { canonical_root.join(p) })
+            .map(|p| {
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    canonical_root.join(p)
+                }
+            })
             .map(|p| canonical_existing_or_parent(&p))
             .transpose()?;
 
@@ -104,7 +148,7 @@ impl WorkspaceWriterLease {
         cancel: Option<&crate::core::cancel::TurnCancel>,
         operation: &str,
     ) -> Result<Self> {
-        let identity = WorkspaceIdentity::discover(root)?;
+        let identity = WorkspaceIdentity::discover_cached(root)?;
         Self::acquire_identity(identity, timeout, cancel, operation)
     }
 
@@ -114,10 +158,7 @@ impl WorkspaceWriterLease {
         cancel: Option<&crate::core::cancel::TurnCancel>,
         operation: &str,
     ) -> Result<Self> {
-        let owner = LockOwner::new(
-            format!("{}-{}", std::process::id(), now_unix()),
-            operation,
-        );
+        let owner = LockOwner::new(format!("{}-{}", std::process::id(), now_unix()), operation);
         let locks = LockSet::acquire(
             vec![
                 LockRequest::new(
@@ -137,7 +178,10 @@ impl WorkspaceWriterLease {
             cancel,
             &owner,
         )?;
-        Ok(Self { identity, _locks: locks })
+        Ok(Self {
+            identity,
+            _locks: locks,
+        })
     }
 
     pub fn time_machine_lock(&self) -> Result<RepoTxnLock> {
@@ -168,7 +212,12 @@ pub struct LockRequest {
 
 impl LockRequest {
     pub fn new(class: LockClass, path: PathBuf, mode: LockMode, label: impl Into<String>) -> Self {
-        Self { class, path, mode, label: label.into() }
+        Self {
+            class,
+            path,
+            mode,
+            label: label.into(),
+        }
     }
 }
 
@@ -203,7 +252,10 @@ impl LockSet {
                 .with_context(|| format!("acquiring {}", request.label))?;
             let owner_path = owner_path(&request.path);
             write_owner(&owner_path, owner, &request);
-            held.push(HeldLock { _lock: lock, owner_path });
+            held.push(HeldLock {
+                _lock: lock,
+                owner_path,
+            });
         }
         Ok(Self { held })
     }
@@ -307,7 +359,12 @@ fn mode_rank(mode: LockMode) -> u8 {
 }
 
 fn git_path<const N: usize>(root: &Path, args: [&str; N]) -> Option<PathBuf> {
-    let out = std::process::Command::new("git").current_dir(root).args(args).output().ok()?;
+    let out = crate::core::gitx::command()
+        .ok()?
+        .current_dir(root)
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -318,12 +375,19 @@ fn git_path<const N: usize>(root: &Path, args: [&str; N]) -> Option<PathBuf> {
 
 fn canonical_existing_or_parent(path: &Path) -> Result<PathBuf> {
     if path.exists() {
-        return std::fs::canonicalize(path).with_context(|| format!("canonicalizing {}", path.display()));
+        return std::fs::canonicalize(path)
+            .with_context(|| format!("canonicalizing {}", path.display()));
     }
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let canonical_parent = std::fs::canonicalize(parent)
         .with_context(|| format!("canonicalizing parent {}", parent.display()))?;
-    Ok(path.file_name().map(|n| canonical_parent.join(n)).unwrap_or(canonical_parent))
+    Ok(path
+        .file_name()
+        .map(|n| canonical_parent.join(n))
+        .unwrap_or(canonical_parent))
 }
 
 fn normalized_path(path: &Path) -> String {
@@ -340,13 +404,26 @@ fn normalized_path(path: &Path) -> String {
 fn safe_segment(value: &str) -> String {
     let out: String = value
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    if out.is_empty() { "resource".to_string() } else { out }
+    if out.is_empty() {
+        "resource".to_string()
+    } else {
+        out
+    }
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -391,8 +468,18 @@ mod tests {
         let owner = LockOwner::new("test", "ordered locks");
         let locks = LockSet::acquire(
             vec![
-                LockRequest::new(LockClass::Workspace, b.clone(), LockMode::Exclusive, "workspace"),
-                LockRequest::new(LockClass::RepositoryStore, a.clone(), LockMode::Shared, "store"),
+                LockRequest::new(
+                    LockClass::Workspace,
+                    b.clone(),
+                    LockMode::Exclusive,
+                    "workspace",
+                ),
+                LockRequest::new(
+                    LockClass::RepositoryStore,
+                    a.clone(),
+                    LockMode::Shared,
+                    "store",
+                ),
             ],
             Duration::from_millis(100),
             None,

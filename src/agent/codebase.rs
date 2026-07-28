@@ -60,30 +60,120 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(20);
 /// skipping already remove most, but these are pruned unconditionally so an un-ignored `target/`
 /// or `node_modules/` never spends the budget. `.git` is hidden (skipped) but listed for safety.
 static SKIP_DIRS: &[&str] = &[
-    ".git", ".svn", ".hg", "node_modules", "dist", "build", "out", ".next", ".nuxt", "coverage",
-    "target", "vendor", "__pycache__", ".pytest_cache", ".mypy_cache", ".venv", "venv", "env",
-    ".gradle", ".idea", ".vscode", ".cache", ".parcel-cache", ".turbo", "tmp", "temp", "logs",
+    ".git",
+    ".svn",
+    ".hg",
+    "node_modules",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    ".nuxt",
+    "coverage",
+    "target",
+    "vendor",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".venv",
+    "venv",
+    "env",
+    ".gradle",
+    ".idea",
+    ".vscode",
+    ".cache",
+    ".parcel-cache",
+    ".turbo",
+    "tmp",
+    "temp",
+    "logs",
     // Never index the CLI's own home/state dir if it happens to sit inside the repo.
-    ".aizen", ".nextgen",
+    ".aizen",
+    ".nextgen",
 ];
 
 /// Extensions we treat as indexable source / config / docs. Extension-driven allow-list keeps data
 /// dumps and unknown blobs out of the index without a per-file content sniff for every candidate.
 static SOURCE_EXTS: &[&str] = &[
     // languages
-    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "kt", "kts", "cpp", "cc",
-    "cxx", "c", "h", "hpp", "cs", "php", "rb", "swift", "scala", "sh", "bash", "zsh", "sql", "lua",
-    "dart", "ex", "exs", "erl", "clj", "hs", "ml", "r", "jl", "pl", "pm",
+    "rs",
+    "ts",
+    "tsx",
+    "js",
+    "jsx",
+    "mjs",
+    "cjs",
+    "py",
+    "go",
+    "java",
+    "kt",
+    "kts",
+    "cpp",
+    "cc",
+    "cxx",
+    "c",
+    "h",
+    "hpp",
+    "cs",
+    "php",
+    "rb",
+    "swift",
+    "scala",
+    "sh",
+    "bash",
+    "zsh",
+    "sql",
+    "lua",
+    "dart",
+    "ex",
+    "exs",
+    "erl",
+    "clj",
+    "hs",
+    "ml",
+    "r",
+    "jl",
+    "pl",
+    "pm",
     // web / markup / style
-    "html", "htm", "css", "scss", "sass", "less", "vue", "svelte", "astro",
+    "html",
+    "htm",
+    "css",
+    "scss",
+    "sass",
+    "less",
+    "vue",
+    "svelte",
+    "astro",
     // docs / config
-    "md", "mdx", "rst", "txt", "json", "jsonc", "yaml", "yml", "toml", "ini", "cfg", "conf", "xml",
-    "gradle", "properties", "env-example",
+    "md",
+    "mdx",
+    "rst",
+    "txt",
+    "json",
+    "jsonc",
+    "yaml",
+    "yml",
+    "toml",
+    "ini",
+    "cfg",
+    "conf",
+    "xml",
+    "gradle",
+    "properties",
+    "env-example",
 ];
 
 /// Filenames (no extension) that are still worth indexing.
-static SOURCE_FILENAMES: &[&str] =
-    &["Dockerfile", "Makefile", "CMakeLists.txt", "Gemfile", "Rakefile", "Procfile", "Vagrantfile"];
+static SOURCE_FILENAMES: &[&str] = &[
+    "Dockerfile",
+    "Makefile",
+    "CMakeLists.txt",
+    "Gemfile",
+    "Rakefile",
+    "Procfile",
+    "Vagrantfile",
+];
 
 /// One indexed source file: its repo-relative path, cheap + reliable change-detection keys, the
 /// monorepo package it belongs to, sensitivity flags, and its chunk ids.
@@ -275,9 +365,17 @@ fn load_cached() -> Option<(Arc<CodebaseIndex>, Arc<Bm25Index>)> {
     }
     // Miss: parse + build BM25 once, then store.
     let idx = Arc::new(load()?);
-    let bm = Arc::new(Bm25Index::build(idx.chunks.iter().map(|c| c.tokens.as_slice())));
+    let bm = Arc::new(Bm25Index::build(
+        idx.chunks.iter().map(|c| c.tokens.as_slice()),
+    ));
     if let Ok(mut guard) = INDEX_CACHE.lock() {
-        *guard = Some(CachedIndex { path, mtime, len, idx: idx.clone(), bm: bm.clone() });
+        *guard = Some(CachedIndex {
+            path,
+            mtime,
+            len,
+            idx: idx.clone(),
+            bm: bm.clone(),
+        });
     }
     Some((idx, bm))
 }
@@ -359,7 +457,10 @@ pub fn ensure_fresh() {
             Ok(g) => g,
             Err(_) => return,
         };
-        if last.map(|t| t.elapsed() < FRESH_CHECK_DEBOUNCE).unwrap_or(false) {
+        if last
+            .map(|t| t.elapsed() < FRESH_CHECK_DEBOUNCE)
+            .unwrap_or(false)
+        {
             return;
         }
         *last = Some(Instant::now());
@@ -378,7 +479,9 @@ pub fn ensure_fresh() {
     }
     // Everything expensive (the gitignore walk + stat pass + rebuild) runs OFF the turn thread.
     std::thread::spawn(|| {
-        let drifted = load_cached().map(|(idx, _)| source_tree_drifted(&idx)).unwrap_or(false);
+        let drifted = load_cached()
+            .map(|(idx, _)| source_tree_drifted(&idx))
+            .unwrap_or(false);
         if drifted {
             // Incremental: reuses unchanged files by (len,mtime)+SHA-256, so a drift rebuild only
             // re-reads what actually changed, then calls invalidate_cache() so the next query
@@ -390,7 +493,10 @@ pub fn ensure_fresh() {
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn mtime_nanos(meta: &std::fs::Metadata) -> u64 {
@@ -410,12 +516,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Short (16 hex chars) stable id for a chunk.
 fn short_hash(s: &str) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, s.as_bytes());
-    digest.as_ref()[..8].iter().map(|b| format!("{b:02x}")).collect()
+    digest.as_ref()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// First non-blank line of the text, trimmed and clipped — a cheap "what is this" hint.
 fn make_preview(text: &str) -> String {
-    let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
     line.chars().take(PREVIEW_CHARS).collect()
 }
 
@@ -463,7 +576,10 @@ fn language_of(ext: &str, file_name: &str) -> String {
 /// Whether this file should be indexed at all (by extension or known filename).
 fn is_source_file(path: &Path) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if SOURCE_FILENAMES.iter().any(|f| f.eq_ignore_ascii_case(name)) {
+    if SOURCE_FILENAMES
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(name))
+    {
         return true;
     }
     // Safe-to-share env templates (`.env.example` / `.sample` / `.template`) are worth indexing —
@@ -471,12 +587,18 @@ fn is_source_file(path: &Path) -> bool {
     // (it's caught by `sensitivity_kind` first and recorded path-only).
     let lower = name.to_ascii_lowercase();
     if lower.starts_with(".env.")
-        && (lower.ends_with(".example") || lower.ends_with(".sample") || lower.ends_with(".template"))
+        && (lower.ends_with(".example")
+            || lower.ends_with(".sample")
+            || lower.ends_with(".template"))
     {
         return true;
     }
     // Other dotfiles like `.gitignore` aren't source.
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     !ext.is_empty() && SOURCE_EXTS.contains(&ext.as_str())
 }
 
@@ -499,8 +621,15 @@ fn sensitivity_kind(path: &Path) -> Option<&'static str> {
     if lower == "credentials" || lower == ".credentials" || lower.ends_with(".credentials") {
         return Some("credentials-file");
     }
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    if matches!(ext.as_str(), "pem" | "key" | "p12" | "pfx" | "keystore" | "jks") {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(
+        ext.as_str(),
+        "pem" | "key" | "p12" | "pfx" | "keystore" | "jks"
+    ) {
         return Some("private-key");
     }
     if lower == "id_rsa" || lower == "id_dsa" || lower == "id_ecdsa" || lower == "id_ed25519" {
@@ -512,7 +641,11 @@ fn sensitivity_kind(path: &Path) -> Option<&'static str> {
 /// Heuristic "this is machine-generated, don't chunk it" test (minified bundle, source map,
 /// lockfile, `@generated` banner). Generated files are indexed name-only.
 fn is_generated(path: &Path, text: &str) -> bool {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     if name.ends_with(".min.js") || name.ends_with(".min.css") || name.ends_with(".map") {
         return true;
     }
@@ -596,18 +729,58 @@ fn redact_secrets(text: &str) -> (String, bool) {
     (out, changed)
 }
 
+/// Strip the automatic per-turn codebase retrieval block, leaving the real user request intact.
+/// Only a marker at byte zero is recognized, so quoted/example tags in a normal request are safe.
+pub(crate) fn strip_retrieval_prefix(content: &str) -> &str {
+    const OPEN: &str = "<codebase_context>";
+    const CLOSE: &str = "</codebase_context>";
+    if !content.starts_with(OPEN) {
+        return content;
+    }
+    content
+        .find(CLOSE)
+        .map(|end| content[end + CLOSE.len()..].trim_start_matches(['\r', '\n']))
+        .unwrap_or(content)
+}
+
+/// Shared oracle/codebase privacy policy: sensitive path classification without reading contents.
+pub(crate) fn review_sensitivity(path: &Path) -> Option<&'static str> {
+    sensitivity_kind(path)
+}
+
+/// Shared oracle/codebase privacy policy: redact every secret-shaped value before egress.
+pub(crate) fn redact_for_review(text: &str) -> String {
+    redact_secrets(text).0
+}
+
+/// Shared bounded-file policy for untracked review excerpts.
+pub(crate) fn review_file_limit() -> u64 {
+    MAX_FILE_BYTES
+}
+
 // ── monorepo package tagging ────────────────────────────────────────────────────────────────
 
 /// Manifest filenames that mark a package/workspace root.
-static PACKAGE_MANIFESTS: &[&str] =
-    &["package.json", "Cargo.toml", "pyproject.toml", "go.mod", "pom.xml", "build.gradle", "composer.json"];
+static PACKAGE_MANIFESTS: &[&str] = &[
+    "package.json",
+    "Cargo.toml",
+    "pyproject.toml",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "composer.json",
+];
 
 /// Find the nearest ancestor dir (within the repo) that holds a package manifest — the file's
 /// monorepo package. Empty string when the package is the repo root itself.
 fn package_for(root: &Path, file_abs: &Path, manifest_dirs: &HashSet<String>) -> String {
     let mut cur = file_abs.parent();
     while let Some(dir) = cur {
-        let rel = dir.strip_prefix(root).unwrap_or(dir).to_string_lossy().replace('\\', "/");
+        let rel = dir
+            .strip_prefix(root)
+            .unwrap_or(dir)
+            .to_string_lossy()
+            .replace('\\', "/");
         if rel.is_empty() {
             return String::new(); // reached repo root
         }
@@ -657,7 +830,11 @@ fn symbol_at(language: &str, line: &str) -> Option<(&'static str, String)> {
             }
         }
         "python" => {
-            for (kw, kind) in [("def ", "function"), ("async def ", "function"), ("class ", "class")] {
+            for (kw, kind) in [
+                ("def ", "function"),
+                ("async def ", "function"),
+                ("class ", "class"),
+            ] {
                 if t.starts_with(kw) {
                     return Some((kind, grab(kw)));
                 }
@@ -708,7 +885,11 @@ fn symbol_at(language: &str, line: &str) -> Option<(&'static str, String)> {
             }
         }
         "ruby" => {
-            for (kw, kind) in [("def ", "function"), ("class ", "class"), ("module ", "module")] {
+            for (kw, kind) in [
+                ("def ", "function"),
+                ("class ", "class"),
+                ("module ", "module"),
+            ] {
                 if t.starts_with(kw) {
                     return Some((kind, grab(kw)));
                 }
@@ -775,7 +956,12 @@ fn chunk_file(rel_path: &str, language: &str, text: &str) -> Vec<CodeChunk> {
             rel_path,
             language,
             &lines,
-            vec![Region { start: 0, end: lines.len(), symbol_name: String::new(), symbol_type: "file" }],
+            vec![Region {
+                start: 0,
+                end: lines.len(),
+                symbol_name: String::new(),
+                symbol_type: "file",
+            }],
         );
     }
 
@@ -795,7 +981,12 @@ fn chunk_file(rel_path: &str, language: &str, text: &str) -> Vec<CodeChunk> {
         // Leading region before the first symbol (module docs / imports) — kept only if substantial.
         let first = boundaries[0].0;
         if first > 0 {
-            regions.push(Region { start: 0, end: first, symbol_name: String::new(), symbol_type: "preamble" });
+            regions.push(Region {
+                start: 0,
+                end: first,
+                symbol_name: String::new(),
+                symbol_type: "preamble",
+            });
         }
         for w in 0..boundaries.len() {
             let (start, ref name, kind) = boundaries[w];
@@ -812,7 +1003,12 @@ fn chunk_file(rel_path: &str, language: &str, text: &str) -> Vec<CodeChunk> {
                     regions.push(r);
                 }
             } else {
-                regions.push(Region { start, end, symbol_name: name.clone(), symbol_type: kind });
+                regions.push(Region {
+                    start,
+                    end,
+                    symbol_name: name.clone(),
+                    symbol_type: kind,
+                });
             }
         }
     }
@@ -830,7 +1026,12 @@ fn chunk_file(rel_path: &str, language: &str, text: &str) -> Vec<CodeChunk> {
 /// chunk body is sliced from `safe_text` (post-redaction), so a secret the server saw never enters
 /// the index. Redaction only rewrites WITHIN a line (never adds/removes newlines), so the server's
 /// 0-based line offsets align with `safe_text.lines()`.
-fn chunk_file_lsp(abs_path: &Path, rel_path: &str, language: &str, safe_text: &str) -> Option<Vec<CodeChunk>> {
+fn chunk_file_lsp(
+    abs_path: &Path,
+    rel_path: &str,
+    language: &str,
+    safe_text: &str,
+) -> Option<Vec<CodeChunk>> {
     if !crate::agent::lsp::LSP.is_enabled() {
         return None;
     }
@@ -839,7 +1040,9 @@ fn chunk_file_lsp(abs_path: &Path, rel_path: &str, language: &str, safe_text: &s
     if lines.len() <= CHUNK_SINGLE_MAX_LINES {
         return None;
     }
-    let syms = crate::agent::lsp::LSP.document_symbols_items(abs_path).ok()?;
+    let syms = crate::agent::lsp::LSP
+        .document_symbols_items(abs_path)
+        .ok()?;
     if syms.is_empty() {
         return None;
     }
@@ -876,7 +1079,12 @@ fn chunk_by_outline(
     let mut regions: Vec<Region> = Vec::new();
     let first = outline[0].0.min(n);
     if first > 0 {
-        regions.push(Region { start: 0, end: first, symbol_name: String::new(), symbol_type: "preamble" });
+        regions.push(Region {
+            start: 0,
+            end: first,
+            symbol_name: String::new(),
+            symbol_type: "preamble",
+        });
     }
     for w in 0..outline.len() {
         let start = outline[w].0.min(n);
@@ -897,7 +1105,12 @@ fn chunk_by_outline(
                 regions.push(r);
             }
         } else {
-            regions.push(Region { start, end, symbol_name: name.clone(), symbol_type: kind });
+            regions.push(Region {
+                start,
+                end,
+                symbol_name: name.clone(),
+                symbol_type: kind,
+            });
         }
     }
     finalize_regions(rel_path, language, lines, regions)
@@ -908,7 +1121,12 @@ fn window_split(start: usize, end: usize, out: &mut Vec<Region>) {
     let mut s = start;
     while s < end {
         let e = (s + CHUNK_MAX_LINES).min(end);
-        out.push(Region { start: s, end: e, symbol_name: String::new(), symbol_type: "window" });
+        out.push(Region {
+            start: s,
+            end: e,
+            symbol_name: String::new(),
+            symbol_type: "window",
+        });
         if e >= end {
             break;
         }
@@ -918,7 +1136,12 @@ fn window_split(start: usize, end: usize, out: &mut Vec<Region>) {
 
 /// Turn regions into `CodeChunk`s: drop trivial (import/blank-only) regions, tokenize, hash a stable
 /// id. `parent_symbol` is left empty in v2 (flat regions); the field is kept for future AST nesting.
-fn finalize_regions(rel_path: &str, language: &str, lines: &[&str], regions: Vec<Region>) -> Vec<CodeChunk> {
+fn finalize_regions(
+    rel_path: &str,
+    language: &str,
+    lines: &[&str],
+    regions: Vec<Region>,
+) -> Vec<CodeChunk> {
     let mut out = Vec::new();
     for r in regions {
         if r.end <= r.start {
@@ -926,7 +1149,10 @@ fn finalize_regions(rel_path: &str, language: &str, lines: &[&str], regions: Vec
         }
         let body = lines[r.start..r.end].join("\n");
         // Drop chunks that are only imports / comments / blanks.
-        if lines[r.start..r.end].iter().all(|l| is_trivial_line(language, l)) {
+        if lines[r.start..r.end]
+            .iter()
+            .all(|l| is_trivial_line(language, l))
+        {
             continue;
         }
         let tokens = tokenize(&body);
@@ -1014,9 +1240,16 @@ fn discover_packages(root: &Path, candidates: &[PathBuf]) -> HashSet<String> {
     let mut dirs = HashSet::new();
     for p in candidates {
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if PACKAGE_MANIFESTS.iter().any(|m| m.eq_ignore_ascii_case(name)) {
+        if PACKAGE_MANIFESTS
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(name))
+        {
             if let Some(parent) = p.parent() {
-                let rel = parent.strip_prefix(root).unwrap_or(parent).to_string_lossy().replace('\\', "/");
+                let rel = parent
+                    .strip_prefix(root)
+                    .unwrap_or(parent)
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 if !rel.is_empty() {
                     dirs.insert(rel);
                 }
@@ -1029,18 +1262,34 @@ fn discover_packages(root: &Path, candidates: &[PathBuf]) -> HashSet<String> {
 // ── project analysis ────────────────────────────────────────────────────────────────────────
 
 /// Derive the structured project summary from the file set + manifests present.
-fn analyze_project(root: &Path, files: &[IndexedFile], packages: &HashSet<String>) -> ProjectAnalysis {
+fn analyze_project(
+    root: &Path,
+    files: &[IndexedFile],
+    packages: &HashSet<String>,
+) -> ProjectAnalysis {
     let mut a = ProjectAnalysis {
-        project_name: root.file_name().and_then(|n| n.to_str()).unwrap_or("project").to_string(),
+        project_name: root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project")
+            .to_string(),
         project_root: root.to_string_lossy().replace('\\', "/"),
         ..Default::default()
     };
     let names: HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
     let has = |p: &str| names.contains(p);
-    let has_any_named = |name: &str| files.iter().any(|f| f.path.rsplit('/').next() == Some(name));
+    let has_any_named = |name: &str| {
+        files
+            .iter()
+            .any(|f| f.path.rsplit('/').next() == Some(name))
+    };
 
     for f in files {
-        if f.language != "text" && f.language != "json" && f.language != "yaml" && f.language != "toml" {
+        if f.language != "text"
+            && f.language != "json"
+            && f.language != "yaml"
+            && f.language != "toml"
+        {
             *a.languages.entry(f.language.clone()).or_insert(0) += 1;
         }
     }
@@ -1053,7 +1302,10 @@ fn analyze_project(root: &Path, files: &[IndexedFile], packages: &HashSet<String
     if has_any_named("Cargo.toml") {
         pm.push("cargo".to_string());
     }
-    if has_any_named("pyproject.toml") || has_any_named("requirements.txt") || has_any_named("setup.py") {
+    if has_any_named("pyproject.toml")
+        || has_any_named("requirements.txt")
+        || has_any_named("setup.py")
+    {
         pm.push("pip/python".to_string());
     }
     if has_any_named("go.mod") {
@@ -1075,7 +1327,10 @@ fn analyze_project(root: &Path, files: &[IndexedFile], packages: &HashSet<String
 
     // frameworks (best-effort from manifest presence + common config files)
     let mut fw = Vec::new();
-    if has_any_named("next.config.js") || has_any_named("next.config.mjs") || has_any_named("next.config.ts") {
+    if has_any_named("next.config.js")
+        || has_any_named("next.config.mjs")
+        || has_any_named("next.config.ts")
+    {
         fw.push("Next.js".to_string());
     }
     if has_any_named("nuxt.config.ts") || has_any_named("nuxt.config.js") {
@@ -1168,7 +1423,11 @@ pub fn analysis_summary(a: &ProjectAnalysis) -> String {
     if !a.languages.is_empty() {
         let mut langs: Vec<(&String, &usize)> = a.languages.iter().collect();
         langs.sort_by(|x, y| y.1.cmp(x.1));
-        let top: Vec<String> = langs.iter().take(6).map(|(l, n)| format!("{l} ({n})")).collect();
+        let top: Vec<String> = langs
+            .iter()
+            .take(6)
+            .map(|(l, n)| format!("{l} ({n})"))
+            .collect();
         s.push_str(&format!("languages: {}\n", top.join(", ")));
     }
     if !a.package_managers.is_empty() {
@@ -1224,7 +1483,9 @@ pub fn build_index(
         HashMap::new()
     };
     let prev_chunks: HashMap<String, CodeChunk> = if incremental {
-        load().map(|i| i.chunks.into_iter().map(|c| (c.id.clone(), c)).collect()).unwrap_or_default()
+        load()
+            .map(|i| i.chunks.into_iter().map(|c| (c.id.clone(), c)).collect())
+            .unwrap_or_default()
     } else {
         HashMap::new()
     };
@@ -1236,7 +1497,10 @@ pub fn build_index(
 
     let mut files: Vec<IndexedFile> = Vec::new();
     let mut chunks: Vec<CodeChunk> = Vec::new();
-    let mut stats = ScanStats { scanned: total, ..Default::default() };
+    let mut stats = ScanStats {
+        scanned: total,
+        ..Default::default()
+    };
 
     for (i, path) in candidates.iter().enumerate() {
         if i % throttle == 0 {
@@ -1249,9 +1513,17 @@ pub fn build_index(
             stats.capped = true;
             break;
         }
-        let rel = path.strip_prefix(&root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
         let package = package_for(&root, path, &package_dirs);
 
         // Sensitive files: record path + type ONLY. Never read the content into the index.
@@ -1387,11 +1659,18 @@ pub fn build_index(
 
     progress(Phase::Chunking);
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    chunks.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.start_line.cmp(&b.start_line)));
+    chunks.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.start_line.cmp(&b.start_line))
+    });
     stats.indexed = files.len();
     stats.chunks = chunks.len();
     let final_paths: HashSet<&String> = files.iter().map(|f| &f.path).collect();
-    stats.removed = prev_files.keys().filter(|k| !final_paths.contains(k)).count();
+    stats.removed = prev_files
+        .keys()
+        .filter(|k| !final_paths.contains(k))
+        .count();
 
     progress(Phase::Building);
     let analysis = analyze_project(&root, &files, &package_dirs);
@@ -1432,7 +1711,12 @@ struct Hit<'a> {
 #[cfg(feature = "dense")]
 fn code_dense_enabled() -> bool {
     std::env::var("AIZEN_CODE_DENSE")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -1469,7 +1753,11 @@ fn chunk_lexical_coverage(q_distinct: &HashSet<String>, hit_tokens: &[String]) -
 /// (score>0), already sorted best-first, BEFORE truncation — fusing here lets a dense-strong chunk
 /// climb into the top `limit`. No-op when the runtime flag is off or the set is trivial.
 #[cfg(feature = "dense")]
-fn fuse_dense<'a>(query: &str, q_distinct: &HashSet<String>, mut scored: Vec<Hit<'a>>) -> Vec<Hit<'a>> {
+fn fuse_dense<'a>(
+    query: &str,
+    q_distinct: &HashSet<String>,
+    mut scored: Vec<Hit<'a>>,
+) -> Vec<Hit<'a>> {
     if scored.len() < 2 || !code_dense_enabled() {
         return scored;
     }
@@ -1493,11 +1781,18 @@ fn fuse_dense<'a>(query: &str, q_distinct: &HashSet<String>, mut scored: Vec<Hit
         .filter(|(_, s)| *s > 0.0)
         .collect();
     cache.save();
-    dense.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
+    dense.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     let dense_ids: Vec<String> = dense.into_iter().map(|(id, _)| id).collect();
     let fused = crate::memory::fuse::rrf(&[lexical, dense_ids], 10.0);
-    let rank: HashMap<&str, usize> =
-        fused.iter().enumerate().map(|(i, (id, _))| (id.as_str(), i)).collect();
+    let rank: HashMap<&str, usize> = fused
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| (id.as_str(), i))
+        .collect();
     // Reorder the lexical candidates by fused rank (chunks absent from the fusion keep tail order).
     scored.sort_by_key(|h| rank.get(h.chunk.id.as_str()).copied().unwrap_or(usize::MAX));
     scored
@@ -1505,7 +1800,11 @@ fn fuse_dense<'a>(query: &str, q_distinct: &HashSet<String>, mut scored: Vec<Hit
 
 /// No-op fusion in the default (non-`dense`) build — `rank_chunks` stays purely lexical.
 #[cfg(not(feature = "dense"))]
-fn fuse_dense<'a>(_query: &str, _q_distinct: &HashSet<String>, scored: Vec<Hit<'a>>) -> Vec<Hit<'a>> {
+fn fuse_dense<'a>(
+    _query: &str,
+    _q_distinct: &HashSet<String>,
+    scored: Vec<Hit<'a>>,
+) -> Vec<Hit<'a>> {
     scored
 }
 
@@ -1513,7 +1812,12 @@ fn fuse_dense<'a>(_query: &str, _q_distinct: &HashSet<String>, scored: Vec<Hit<'
 /// prebuilt index over `idx.chunks` (from [`load_cached`]) — passed in so a per-turn query never
 /// rebuilds the O(total tokens) IDF table. With `--features dense` + `AIZEN_CODE_DENSE`, a gated
 /// dense tier is RRF-fused in ([`fuse_dense`]) before truncation; otherwise this is lexical-only.
-fn rank_chunks<'a>(idx: &'a CodebaseIndex, bm: &Bm25Index, query: &str, limit: usize) -> Vec<Hit<'a>> {
+fn rank_chunks<'a>(
+    idx: &'a CodebaseIndex,
+    bm: &Bm25Index,
+    query: &str,
+    limit: usize,
+) -> Vec<Hit<'a>> {
     let q = tokenize(query);
     if q.is_empty() || idx.chunks.is_empty() {
         return Vec::new();
@@ -1548,8 +1852,8 @@ fn rank_chunks<'a>(idx: &'a CodebaseIndex, bm: &Bm25Index, query: &str, limit: u
 /// Rank the indexed chunk corpus against `query`, returning at most `limit` chunks as a text block
 /// (`path:lines  (score)` + symbol + preview). Errors if `/init` hasn't run yet.
 pub fn search(query: &str, limit: usize) -> Result<String> {
-    let (idx, bm) =
-        load_cached().ok_or_else(|| anyhow!("no codebase index yet — run /init to build it first"))?;
+    let (idx, bm) = load_cached()
+        .ok_or_else(|| anyhow!("no codebase index yet — run /init to build it first"))?;
     if idx.chunks.is_empty() && idx.files.is_empty() {
         return Ok("the codebase index is empty (nothing matched the /init scan).".into());
     }
@@ -1568,7 +1872,10 @@ pub fn search(query: &str, limit: usize) -> Result<String> {
         } else {
             format!("  [{} {}]", c.symbol_type, c.symbol_name)
         };
-        out.push_str(&format!("{}:{}-{}  (score {:.2}){sym}", c.file_path, c.start_line, c.end_line, h.score));
+        out.push_str(&format!(
+            "{}:{}-{}  (score {:.2}){sym}",
+            c.file_path, c.start_line, c.end_line, h.score
+        ));
         if !c.preview.is_empty() && c.symbol_name.is_empty() {
             out.push_str(&format!("\n    {}", c.preview));
         }
@@ -1695,7 +2002,10 @@ impl Tool for CodebaseSearch {
         })
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let query = args.get("query").and_then(|v| v.as_str()).context("missing `query`")?;
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .context("missing `query`")?;
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
@@ -1728,9 +2038,15 @@ mod tests {
     fn sensitivity_detects_env_and_keys_but_allows_examples() {
         assert_eq!(sensitivity_kind(Path::new("proj/.env")), Some("dotenv"));
         assert_eq!(sensitivity_kind(Path::new(".env.local")), Some("dotenv"));
-        assert_eq!(sensitivity_kind(Path::new("server.pem")), Some("private-key"));
+        assert_eq!(
+            sensitivity_kind(Path::new("server.pem")),
+            Some("private-key")
+        );
         assert_eq!(sensitivity_kind(Path::new("id_rsa")), Some("private-key"));
-        assert_eq!(sensitivity_kind(Path::new(".npmrc")), Some("credentials-file"));
+        assert_eq!(
+            sensitivity_kind(Path::new(".npmrc")),
+            Some("credentials-file")
+        );
         // Safe-to-share templates are NOT sensitive.
         assert_eq!(sensitivity_kind(Path::new(".env.example")), None);
         assert_eq!(sensitivity_kind(Path::new("main.rs")), None);
@@ -1741,7 +2057,10 @@ mod tests {
         let src = "api_key = \"abcdef123456SECRET\"\nlet x = 1;";
         let (out, did) = redact_secrets(src);
         assert!(did, "should redact");
-        assert!(!out.contains("abcdef123456SECRET"), "secret value must be gone: {out}");
+        assert!(
+            !out.contains("abcdef123456SECRET"),
+            "secret value must be gone: {out}"
+        );
         assert!(out.contains("let x = 1;"), "non-secret code preserved");
 
         let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----";
@@ -1768,33 +2087,73 @@ mod tests {
         // Each of these appears as a bare literal (no secret-ish key name), so only the
         // vendor-prefix patterns can catch them. All must be blanked.
         let cases: &[(&str, &str)] = &[
-            ("github fine-grained PAT", "github_pat_11ABCDEFG0abcdefghijkl_mnopqrstuvwxyz0123456789ABCDEFGHIJKLM"),
-            ("anthropic key", "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789"),
-            ("stripe live secret", concat!("sk_live_", "abcdefghijklmnop0123456789")),
+            (
+                "github fine-grained PAT",
+                "github_pat_11ABCDEFG0abcdefghijkl_mnopqrstuvwxyz0123456789ABCDEFGHIJKLM",
+            ),
+            (
+                "anthropic key",
+                "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789",
+            ),
+            // These three are split with `concat!` on purpose: written as one literal, GitHub's
+            // push protection reads them as real leaked credentials and refuses the push, even
+            // though they are obvious dummies feeding a redaction test.
+            (
+                "stripe live secret",
+                concat!("sk_live_", "abcdefghijklmnop0123456789"),
+            ),
             ("gitlab PAT", "glpat-abcdefghij0123456789kl"),
-            ("slack bot token", concat!("xoxb-", "1234567890-ABCDEFGHIJKLMN")),
-            ("slack webhook", concat!("https://hooks.slack.com/services/", "T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX")),
+            (
+                "slack bot token",
+                concat!("xoxb-", "1234567890-ABCDEFGHIJKLMN"),
+            ),
+            (
+                "slack webhook",
+                concat!(
+                    "https://hooks.slack.com/services/",
+                    "T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"
+                ),
+            ),
             ("google api key", "AIzaSyB1234567890abcdefghijklmnopqrstuv"),
-            ("gcp oauth token", "ya29.a0ARrdaM-abcdefghijklmnopqrstuvwxyz"),
-            ("huggingface token", "hf_abcdefghijklmnopqrstuvwxyz0123456789"),
-            ("sendgrid key", "SG.abcdefghijklmnop.qrstuvwxyz0123456789ABCD"),
-            ("jwt", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.dQw4w9WgXcQabc123"),
+            (
+                "gcp oauth token",
+                "ya29.a0ARrdaM-abcdefghijklmnopqrstuvwxyz",
+            ),
+            (
+                "huggingface token",
+                "hf_abcdefghijklmnopqrstuvwxyz0123456789",
+            ),
+            (
+                "sendgrid key",
+                "SG.abcdefghijklmnop.qrstuvwxyz0123456789ABCD",
+            ),
+            (
+                "jwt",
+                "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.dQw4w9WgXcQabc123",
+            ),
             ("aws session key", "ASIAIOSFODNN7EXAMPLE"),
         ];
         for (label, secret) in cases {
             let src = format!("let x = \"{secret}\";");
             let (out, did) = redact_secrets(&src);
             assert!(did, "{label} should redact: {src}");
-            assert!(!out.contains(secret), "{label} value must be blanked: {out}");
+            assert!(
+                !out.contains(secret),
+                "{label} value must be blanked: {out}"
+            );
         }
     }
 
     #[test]
     fn encrypted_pem_header_is_redacted() {
-        let src = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIF...\n-----END ENCRYPTED PRIVATE KEY-----";
+        let src =
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIF...\n-----END ENCRYPTED PRIVATE KEY-----";
         let (out, did) = redact_secrets(src);
         assert!(did);
-        assert!(!out.contains("BEGIN ENCRYPTED PRIVATE KEY"), "PEM header must be blanked: {out}");
+        assert!(
+            !out.contains("BEGIN ENCRYPTED PRIVATE KEY"),
+            "PEM header must be blanked: {out}"
+        );
     }
 
     #[test]
@@ -1818,8 +2177,14 @@ mod tests {
             src.push_str("}\n");
         }
         let chunks = chunk_file("big.rs", "rust", &src);
-        assert!(chunks.len() >= 5, "expected one chunk per function, got {}", chunks.len());
-        assert!(chunks.iter().any(|c| c.symbol_name == "func0" && c.symbol_type == "function"));
+        assert!(
+            chunks.len() >= 5,
+            "expected one chunk per function, got {}",
+            chunks.len()
+        );
+        assert!(chunks
+            .iter()
+            .any(|c| c.symbol_name == "func0" && c.symbol_type == "function"));
         // line ranges are 1-based and ordered
         assert_eq!(chunks[0].start_line, 1);
         assert!(chunks[1].start_line > chunks[0].start_line);
@@ -1843,10 +2208,19 @@ mod tests {
         ];
         let chunks = chunk_by_outline("srv.rs", "rust", &lines, outline);
         // A preamble region (lines 0..2) + the two symbol regions, each big enough to survive.
-        assert!(chunks.iter().any(|c| c.symbol_name == "first_handler"), "got: {chunks:?}");
-        assert!(chunks.iter().any(|c| c.symbol_name == "second_handler"), "got: {chunks:?}");
+        assert!(
+            chunks.iter().any(|c| c.symbol_name == "first_handler"),
+            "got: {chunks:?}"
+        );
+        assert!(
+            chunks.iter().any(|c| c.symbol_name == "second_handler"),
+            "got: {chunks:?}"
+        );
         // The first symbol chunk starts at the server's line (1-based = 3), not a keyword guess.
-        let first = chunks.iter().find(|c| c.symbol_name == "first_handler").unwrap();
+        let first = chunks
+            .iter()
+            .find(|c| c.symbol_name == "first_handler")
+            .unwrap();
         assert_eq!(first.start_line, 3);
     }
 
@@ -1863,7 +2237,10 @@ mod tests {
         let chunks = chunk_by_outline("u.rs", "rust", &lines, outline);
         // Ordered by start line, no zero/negative-width region panicked the slice.
         let starts: Vec<usize> = chunks.iter().map(|c| c.start_line).collect();
-        assert!(starts.windows(2).all(|w| w[0] <= w[1]), "chunks must be line-ordered: {starts:?}");
+        assert!(
+            starts.windows(2).all(|w| w[0] <= w[1]),
+            "chunks must be line-ordered: {starts:?}"
+        );
         assert!(chunks.iter().any(|c| c.symbol_name == "a"));
         assert!(chunks.iter().any(|c| c.symbol_name == "b"));
     }
@@ -1873,14 +2250,21 @@ mod tests {
         // A python file that is only imports produces no chunk.
         let text = "import os\nimport sys\nfrom a import b\n";
         let chunks = chunk_file("imports.py", "python", text);
-        assert!(chunks.is_empty(), "import-only file yields no chunk: {chunks:?}");
+        assert!(
+            chunks.is_empty(),
+            "import-only file yields no chunk: {chunks:?}"
+        );
     }
 
     #[test]
     fn chunk_id_is_stable_across_position_shift() {
         // Same symbol + same body at different line offsets → same id (id excludes line numbers).
         let a = chunk_file("m.rs", "rust", "fn only() {\n    let x = 1;\n}\n");
-        let b = chunk_file("m.rs", "rust", "// leading comment\n\nfn only() {\n    let x = 1;\n}\n");
+        let b = chunk_file(
+            "m.rs",
+            "rust",
+            "// leading comment\n\nfn only() {\n    let x = 1;\n}\n",
+        );
         // both single-chunk (tiny) → compare the symbol-bearing body hash indirectly via id equality
         // requires equal body; here bodies differ (b has preamble), so ids differ — instead test the
         // hash primitive directly for position independence.
@@ -1902,7 +2286,10 @@ mod tests {
             md.push_str("more prose describing the retrieval pipeline internals\n");
         }
         let chunks = chunk_file("doc.md", "markdown", &md);
-        assert!(chunks.iter().any(|c| c.symbol_type == "heading"), "should detect headings: {chunks:?}");
+        assert!(
+            chunks.iter().any(|c| c.symbol_type == "heading"),
+            "should detect headings: {chunks:?}"
+        );
     }
 
     #[test]
@@ -1958,7 +2345,9 @@ mod tests {
     #[cfg(feature = "dense")]
     #[test]
     fn dense_coverage_gate_math() {
-        let q: HashSet<String> = tokenize("session token refresh rotate").into_iter().collect();
+        let q: HashSet<String> = tokenize("session token refresh rotate")
+            .into_iter()
+            .collect();
         // A hit covering every query token → coverage 1.0 (gate stays closed, dense skipped).
         let full = tokenize("session token refresh rotate here now");
         assert!((chunk_lexical_coverage(&q, &full) - 1.0).abs() < 1e-9);
@@ -1987,10 +2376,31 @@ mod tests {
                 preview: String::new(),
                 content: body.into(),
             };
-            let a = mk("a", "a.rs", "connection pool database handle acquire release");
-            let b = mk("b", "b.rs", "unrelated rendering pixels viewport scrolling code");
-            let scored = || vec![Hit { score: 2.0, chunk: &a }, Hit { score: 1.0, chunk: &b }];
-            let q: HashSet<String> = tokenize("how do we obtain a db connection").into_iter().collect();
+            let a = mk(
+                "a",
+                "a.rs",
+                "connection pool database handle acquire release",
+            );
+            let b = mk(
+                "b",
+                "b.rs",
+                "unrelated rendering pixels viewport scrolling code",
+            );
+            let scored = || {
+                vec![
+                    Hit {
+                        score: 2.0,
+                        chunk: &a,
+                    },
+                    Hit {
+                        score: 1.0,
+                        chunk: &b,
+                    },
+                ]
+            };
+            let q: HashSet<String> = tokenize("how do we obtain a db connection")
+                .into_iter()
+                .collect();
 
             // Flag OFF → no-op passthrough, original lexical order preserved regardless of coverage.
             std::env::remove_var("AIZEN_CODE_DENSE");
@@ -1999,10 +2409,14 @@ mod tests {
 
             // Flag ON but the top hit fully covers the query → gate closed, still no reorder.
             std::env::set_var("AIZEN_CODE_DENSE", "1");
-            let ql: HashSet<String> =
-                tokenize("connection pool database handle").into_iter().collect();
+            let ql: HashSet<String> = tokenize("connection pool database handle")
+                .into_iter()
+                .collect();
             let out2 = fuse_dense("connection pool database handle", &ql, scored());
-            assert_eq!(out2[0].chunk.id, "a", "confident literal match must skip dense");
+            assert_eq!(
+                out2[0].chunk.id, "a",
+                "confident literal match must skip dense"
+            );
 
             // Flag ON + low coverage → dense fusion runs (HashEmbedder fallback, deterministic) and
             // the call succeeds over the isolated code- cache without panicking or erroring.
@@ -2016,7 +2430,10 @@ mod tests {
     fn generated_file_is_detected() {
         assert!(is_generated(Path::new("bundle.min.js"), ""));
         assert!(is_generated(Path::new("Cargo.lock"), ""));
-        assert!(is_generated(Path::new("x.rs"), "// @generated by tool\nfn a(){}"));
+        assert!(is_generated(
+            Path::new("x.rs"),
+            "// @generated by tool\nfn a(){}"
+        ));
         assert!(!is_generated(Path::new("x.rs"), "fn a(){}"));
     }
 
@@ -2039,8 +2456,11 @@ mod tests {
 
     /// Run `f` with a fresh sandbox: an isolated home + project root, all env restored after.
     fn with_repo<T>(tag: &str, f: impl FnOnce(&Path) -> T) -> T {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = std::env::temp_dir().join(format!("ng-cb-{tag}-{}-{}", std::process::id(), now_unix()));
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base =
+            std::env::temp_dir().join(format!("ng-cb-{tag}-{}-{}", std::process::id(), now_unix()));
         let _ = std::fs::remove_dir_all(&base);
         let proj = base.join("proj");
         std::fs::create_dir_all(&proj).unwrap();
@@ -2051,7 +2471,13 @@ mod tests {
         std::env::set_var("NG_PROJECT_ROOT", &proj);
         // Kill the project-slug cache so a prior test's slug can't bleed through.
         let out = f(&proj);
-        for v in ["USERPROFILE", "HOME", "AIZEN_HOME", "NEXTGEN_HOME", "NG_PROJECT_ROOT"] {
+        for v in [
+            "USERPROFILE",
+            "HOME",
+            "AIZEN_HOME",
+            "NEXTGEN_HOME",
+            "NG_PROJECT_ROOT",
+        ] {
             std::env::remove_var(v);
         }
         let _ = std::fs::remove_dir_all(&base);
@@ -2094,25 +2520,45 @@ mod tests {
     fn env_file_is_stored_path_only_never_content() {
         with_repo("env", |proj| {
             write(proj, "src/main.rs", "fn main() {}\n");
-            write(proj, ".env", "API_KEY=supersecretvalue123456\nDB_PASSWORD=hunter2hunter2\n");
+            write(
+                proj,
+                ".env",
+                "API_KEY=supersecretvalue123456\nDB_PASSWORD=hunter2hunter2\n",
+            );
             write(proj, ".env.example", "API_KEY=\nDB_PASSWORD=\n");
 
             let stats = build(false);
             assert!(stats.sensitive >= 1, "the .env must be counted sensitive");
 
             let idx = load().unwrap();
-            let env = idx.files.iter().find(|f| f.path == ".env").expect(".env recorded path-only");
+            let env = idx
+                .files
+                .iter()
+                .find(|f| f.path == ".env")
+                .expect(".env recorded path-only");
             assert!(env.is_sensitive);
             assert!(env.chunk_ids.is_empty(), "sensitive file has no chunks");
-            assert!(env.content_hash.is_empty(), "sensitive file content never hashed/stored");
+            assert!(
+                env.content_hash.is_empty(),
+                "sensitive file content never hashed/stored"
+            );
 
             // The secret value must appear NOWHERE in the serialized index.
             let raw = std::fs::read_to_string(index_path()).unwrap();
-            assert!(!raw.contains("supersecretvalue123456"), "secret leaked into index");
-            assert!(!raw.contains("hunter2hunter2"), "password leaked into index");
+            assert!(
+                !raw.contains("supersecretvalue123456"),
+                "secret leaked into index"
+            );
+            assert!(
+                !raw.contains("hunter2hunter2"),
+                "password leaked into index"
+            );
 
             // The example template is indexed normally (not sensitive).
-            assert!(idx.files.iter().any(|f| f.path == ".env.example" && !f.is_sensitive));
+            assert!(idx
+                .files
+                .iter()
+                .any(|f| f.path == ".env.example" && !f.is_sensitive));
         });
     }
 
@@ -2128,7 +2574,10 @@ mod tests {
             assert!(stats.redacted >= 1, "a secret should have been redacted");
 
             let raw = std::fs::read_to_string(index_path()).unwrap();
-            assert!(!raw.contains("sk-abcdefghij0123456789XYZ"), "api key leaked");
+            assert!(
+                !raw.contains("sk-abcdefghij0123456789XYZ"),
+                "api key leaked"
+            );
             assert!(!raw.contains("p4ssw0rd"), "connection password leaked");
             // The surrounding non-secret code is still indexed.
             assert!(raw.contains("DEBUG"));
@@ -2163,8 +2612,14 @@ mod tests {
             build(false);
             let idx = load().unwrap();
             assert!(idx.files.iter().any(|f| f.path == "src/lib.rs"));
-            assert!(!idx.files.iter().any(|f| f.path.contains("node_modules")), "node_modules indexed");
-            assert!(!idx.files.iter().any(|f| f.path.starts_with("target/")), "target indexed");
+            assert!(
+                !idx.files.iter().any(|f| f.path.contains("node_modules")),
+                "node_modules indexed"
+            );
+            assert!(
+                !idx.files.iter().any(|f| f.path.starts_with("target/")),
+                "target indexed"
+            );
         });
     }
 
@@ -2178,7 +2633,10 @@ mod tests {
             build(false);
             let idx = load().unwrap();
             assert!(idx.files.iter().any(|f| f.path == "src/app.rs"));
-            assert!(!idx.files.iter().any(|f| f.path.contains("secret_dir")), "gitignored dir indexed");
+            assert!(
+                !idx.files.iter().any(|f| f.path.contains("secret_dir")),
+                "gitignored dir indexed"
+            );
         });
     }
 
@@ -2219,7 +2677,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
             write(proj, "x.rs", "fn x() { let v = 42; }\n");
             let s = build(true);
-            assert_eq!(s.reused, 1, "identical bytes → SHA-256 fast-path reuse despite new mtime");
+            assert_eq!(
+                s.reused, 1,
+                "identical bytes → SHA-256 fast-path reuse despite new mtime"
+            );
             assert_eq!(s.added, 0);
         });
     }
@@ -2244,7 +2705,10 @@ mod tests {
             assert_eq!(stats.chunks, 0);
             // Search over an empty index is a clean message, not a panic.
             let out = search("anything", 5).unwrap();
-            assert!(out.contains("empty") || out.contains("no indexed"), "got: {out}");
+            assert!(
+                out.contains("empty") || out.contains("no indexed"),
+                "got: {out}"
+            );
         });
     }
 
@@ -2255,8 +2719,15 @@ mod tests {
             write(proj, "my file.py", "def handler():\n    return 42\n");
             build(false);
             let idx = load().unwrap();
-            assert!(idx.files.iter().any(|f| f.path == "hồ_sơ.rs"), "unicode path missing: {:?}", idx.files.iter().map(|f| &f.path).collect::<Vec<_>>());
-            assert!(idx.files.iter().any(|f| f.path == "my file.py"), "spaced path missing");
+            assert!(
+                idx.files.iter().any(|f| f.path == "hồ_sơ.rs"),
+                "unicode path missing: {:?}",
+                idx.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+            );
+            assert!(
+                idx.files.iter().any(|f| f.path == "my file.py"),
+                "spaced path missing"
+            );
         });
     }
 
@@ -2265,16 +2736,35 @@ mod tests {
         with_repo("mono", |proj| {
             write(proj, "package.json", "{\"name\":\"root\"}\n");
             write(proj, "packages/api/package.json", "{\"name\":\"api\"}\n");
-            write(proj, "packages/api/src/server.ts", "export function serve() { return 1; }\n");
-            write(proj, "packages/web/Cargo.toml", "[package]\nname = \"web\"\n");
+            write(
+                proj,
+                "packages/api/src/server.ts",
+                "export function serve() { return 1; }\n",
+            );
+            write(
+                proj,
+                "packages/web/Cargo.toml",
+                "[package]\nname = \"web\"\n",
+            );
             write(proj, "packages/web/src/main.rs", "fn main() {}\n");
             build(false);
             let idx = load().unwrap();
-            let api = idx.files.iter().find(|f| f.path == "packages/api/src/server.ts").unwrap();
+            let api = idx
+                .files
+                .iter()
+                .find(|f| f.path == "packages/api/src/server.ts")
+                .unwrap();
             assert_eq!(api.package, "packages/api");
-            let web = idx.files.iter().find(|f| f.path == "packages/web/src/main.rs").unwrap();
+            let web = idx
+                .files
+                .iter()
+                .find(|f| f.path == "packages/web/src/main.rs")
+                .unwrap();
             assert_eq!(web.package, "packages/web");
-            assert!(idx.analysis.workspaces.contains(&"packages/api".to_string()));
+            assert!(idx
+                .analysis
+                .workspaces
+                .contains(&"packages/api".to_string()));
         });
     }
 
@@ -2287,8 +2777,15 @@ mod tests {
             build(false);
             let idx = load().unwrap();
             assert_eq!(idx.analysis.languages.get("rust").copied().unwrap_or(0), 2);
-            assert!(idx.analysis.package_managers.iter().any(|p| p.contains("cargo")));
-            assert!(idx.analysis.entry_points.contains(&"src/main.rs".to_string()));
+            assert!(idx
+                .analysis
+                .package_managers
+                .iter()
+                .any(|p| p.contains("cargo")));
+            assert!(idx
+                .analysis
+                .entry_points
+                .contains(&"src/main.rs".to_string()));
         });
     }
 
@@ -2327,9 +2824,13 @@ mod tests {
             write(proj, "a.rs", "fn a() {}\n");
             // Hold the exclusive lock, then a build must fail to acquire (short timeout via the
             // real LOCK_TIMEOUT is 20s — so instead grab it and confirm try-acquire fails fast).
-            let held = RepoTxnLock::acquire_exclusive(&lock_path(), Duration::from_millis(50)).unwrap();
+            let held =
+                RepoTxnLock::acquire_exclusive(&lock_path(), Duration::from_millis(50)).unwrap();
             let busy = RepoTxnLock::acquire_exclusive(&lock_path(), Duration::from_millis(50));
-            assert!(busy.is_err(), "second exclusive acquire must be refused while held");
+            assert!(
+                busy.is_err(),
+                "second exclusive acquire must be refused while held"
+            );
             drop(held);
             // Once released, a normal build proceeds.
             let s = build(false);
@@ -2353,7 +2854,10 @@ mod tests {
             let res = build_index(true, Some(&cancel), &|_| {});
             assert!(res.is_err(), "a pre-cancelled build must not succeed");
             let after = std::fs::read(index_path()).unwrap();
-            assert_eq!(before, after, "cancelled build must not modify the existing index");
+            assert_eq!(
+                before, after,
+                "cancelled build must not modify the existing index"
+            );
         });
     }
 
@@ -2363,9 +2867,13 @@ mod tests {
             write(proj, "src/payments.rs", "pub fn charge_card(amount: u64, token: &str) -> Result<(), String> {\n    process_payment(amount, token)\n}\n");
             build(false);
             // A matching query yields an attributed block with the path + line range.
-            let block = retrieval_block("how are card payments charged", 1000).expect("should retrieve");
+            let block =
+                retrieval_block("how are card payments charged", 1000).expect("should retrieve");
             assert!(block.contains("<codebase_context>"));
-            assert!(block.contains("src/payments.rs"), "must attribute the source path");
+            assert!(
+                block.contains("src/payments.rs"),
+                "must attribute the source path"
+            );
             // A query with no searchable terms → nothing injected.
             assert!(retrieval_block("a of the", 1000).is_none());
         });
@@ -2379,7 +2887,9 @@ mod tests {
             // "payment"/"charge"/"amount" match as whole tokens (not buried in snake_case idents).
             let mut big = String::from("pub fn process() {\n");
             for i in 0..400 {
-                big.push_str(&format!("    // charge payment amount for order number {i} today\n"));
+                big.push_str(&format!(
+                    "    // charge payment amount for order number {i} today\n"
+                ));
             }
             big.push_str("}\n");
             write(proj, "src/pay.rs", &big);
@@ -2441,7 +2951,10 @@ mod tests {
             write(proj, "src/alpha.rs", "pub fn alpha_widget() {\n    // configure the alpha widget rendering pipeline here\n}\n");
             build(false);
             let first = search("alpha widget rendering", 5).expect("search ok");
-            assert!(first.contains("src/alpha.rs"), "first index must be found: {first}");
+            assert!(
+                first.contains("src/alpha.rs"),
+                "first index must be found: {first}"
+            );
             assert!(!first.contains("beta"), "beta not indexed yet: {first}");
 
             // Rewrite the tree with entirely different content and re-index. build_index calls
@@ -2451,11 +2964,17 @@ mod tests {
             write(proj, "src/beta.rs", "pub fn beta_handler() {\n    // dispatch the beta handler request routing here\n}\n");
             build(false);
             let second = search("beta handler routing", 5).expect("search ok");
-            assert!(second.contains("src/beta.rs"), "re-index must be served, not stale cache: {second}");
+            assert!(
+                second.contains("src/beta.rs"),
+                "re-index must be served, not stale cache: {second}"
+            );
 
             // The old chunk is gone from results (cache genuinely invalidated, not merged).
             let stale = search("alpha widget rendering", 5).expect("search ok");
-            assert!(!stale.contains("src/alpha.rs"), "stale chunk must not survive re-index: {stale}");
+            assert!(
+                !stale.contains("src/alpha.rs"),
+                "stale chunk must not survive re-index: {stale}"
+            );
         });
     }
 
@@ -2467,25 +2986,37 @@ mod tests {
             build(false);
             let idx = load().expect("index persisted");
             let base_files = idx.files.len();
-            assert!(base_files >= 2, "expected >=2 indexed files, got {base_files}");
+            assert!(
+                base_files >= 2,
+                "expected >=2 indexed files, got {base_files}"
+            );
 
             // Clean tree, index dated in the far future → no file mtime can beat it and the count
             // matches → NOT drifted.
             let mut clean = idx.clone();
             clean.built_unix = u64::MAX;
-            assert!(!source_tree_drifted(&clean), "an untouched tree must not report drift");
+            assert!(
+                !source_tree_drifted(&clean),
+                "an untouched tree must not report drift"
+            );
 
             // An edit/add: a real file's mtime is always newer than epoch second 1 → drifted.
             let mut edited = idx.clone();
             edited.built_unix = 1;
-            assert!(source_tree_drifted(&edited), "a source mtime newer than built_unix is drift");
+            assert!(
+                source_tree_drifted(&edited),
+                "a source mtime newer than built_unix is drift"
+            );
 
             // A delete: the indexable file COUNT drops below the index's recorded count. Uses the
             // future build time so ONLY the count branch can trip.
             std::fs::remove_file(proj.join("src/b.rs")).unwrap();
             let mut deleted = idx.clone();
             deleted.built_unix = u64::MAX;
-            assert!(source_tree_drifted(&deleted), "a removed indexable file is drift");
+            assert!(
+                source_tree_drifted(&deleted),
+                "a removed indexable file is drift"
+            );
         });
     }
 
@@ -2493,11 +3024,18 @@ mod tests {
     fn ensure_fresh_rebuilds_in_background_after_delete() {
         with_repo("fresh", |proj| {
             write(proj, "src/keep.rs", "pub fn keep_me() { /* survives */ }\n");
-            write(proj, "src/gone.rs", "pub fn gone_soon() {\n    // the doomed dispatch handler routing table\n}\n");
+            write(
+                proj,
+                "src/gone.rs",
+                "pub fn gone_soon() {\n    // the doomed dispatch handler routing table\n}\n",
+            );
             build(false);
             // Warm the cache + confirm the doomed symbol is initially retrievable.
             let before = search("doomed dispatch handler routing", 5).expect("search ok");
-            assert!(before.contains("src/gone.rs"), "gone.rs must index first: {before}");
+            assert!(
+                before.contains("src/gone.rs"),
+                "gone.rs must index first: {before}"
+            );
 
             // Delete a file WITHOUT re-running /init, then let the automatic hook notice + rebuild.
             std::fs::remove_file(proj.join("src/gone.rs")).unwrap();
@@ -2518,7 +3056,10 @@ mod tests {
 
             // The rebuilt index no longer carries the deleted file.
             let after = search("doomed dispatch handler routing", 5).expect("search ok");
-            assert!(!after.contains("src/gone.rs"), "deleted file must be gone after auto re-index: {after}");
+            assert!(
+                !after.contains("src/gone.rs"),
+                "deleted file must be gone after auto re-index: {after}"
+            );
         });
     }
 }

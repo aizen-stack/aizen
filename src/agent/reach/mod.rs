@@ -49,19 +49,64 @@ pub struct ChannelSpec {
 }
 
 pub const CHANNELS: &[ChannelSpec] = &[
-    ChannelSpec { name: "web", label: "any web page", tier: 0, backends: &["direct", "jina"] },
+    ChannelSpec {
+        name: "web",
+        label: "any web page",
+        tier: 0,
+        backends: &["direct", "jina"],
+    },
     // KEYED-ONLY (tier 1): DuckDuckGo scraping + the Marginalia floor were dropped — DDG's anomaly
     // wall (HTTP 202) blocked keyless scraping too often to be a dependable primary. Tavily is the
     // real backend; jina-search is a secondary keyed fallback. With NO key, `web_search` returns an
     // actionable "add a Tavily key" error instead of degrading to an unreliable scrape.
-    ChannelSpec { name: "search", label: "web search (needs a key)", tier: 1, backends: &["tavily", "jina-search"] },
-    ChannelSpec { name: "github", label: "GitHub repos, files, issues/PRs", tier: 0, backends: &["api", "raw", "html"] },
-    ChannelSpec { name: "youtube", label: "YouTube metadata + transcripts", tier: 0, backends: &["innertube", "oembed"] },
-    ChannelSpec { name: "twitter", label: "Twitter/X single tweets", tier: 0, backends: &["fxtwitter", "syndication"] },
-    ChannelSpec { name: "hackernews", label: "Hacker News stories + comments", tier: 0, backends: &["algolia", "firebase"] },
-    ChannelSpec { name: "wikipedia", label: "Wikipedia summaries + articles", tier: 0, backends: &["rest", "html"] },
-    ChannelSpec { name: "feed", label: "RSS/Atom feeds (incl. arXiv API)", tier: 0, backends: &["builtin"] },
-    ChannelSpec { name: "stackexchange", label: "Stack Overflow / Stack Exchange Q&A", tier: 0, backends: &["api", "html"] },
+    ChannelSpec {
+        name: "search",
+        label: "web search (needs a key)",
+        tier: 1,
+        backends: &["tavily", "jina-search"],
+    },
+    ChannelSpec {
+        name: "github",
+        label: "GitHub repos, files, issues/PRs",
+        tier: 0,
+        backends: &["api", "raw", "html"],
+    },
+    ChannelSpec {
+        name: "youtube",
+        label: "YouTube metadata + transcripts",
+        tier: 0,
+        backends: &["innertube", "oembed"],
+    },
+    ChannelSpec {
+        name: "twitter",
+        label: "Twitter/X single tweets",
+        tier: 0,
+        backends: &["fxtwitter", "syndication"],
+    },
+    ChannelSpec {
+        name: "hackernews",
+        label: "Hacker News stories + comments",
+        tier: 0,
+        backends: &["algolia", "firebase"],
+    },
+    ChannelSpec {
+        name: "wikipedia",
+        label: "Wikipedia summaries + articles",
+        tier: 0,
+        backends: &["rest", "html"],
+    },
+    ChannelSpec {
+        name: "feed",
+        label: "RSS/Atom feeds (incl. arXiv API)",
+        tier: 0,
+        backends: &["builtin"],
+    },
+    ChannelSpec {
+        name: "stackexchange",
+        label: "Stack Overflow / Stack Exchange Q&A",
+        tier: 0,
+        backends: &["api", "html"],
+    },
 ];
 
 pub fn channel(name: &str) -> Option<&'static ChannelSpec> {
@@ -82,7 +127,10 @@ pub fn ordered_backends(name: &str) -> Vec<&'static str> {
     if let Ok(want) = std::env::var(&var) {
         let want = want.trim().to_ascii_lowercase();
         if !want.is_empty() {
-            if let Some(i) = candidates.iter().position(|b| *b == want || b.starts_with(want.as_str())) {
+            if let Some(i) = candidates
+                .iter()
+                .position(|b| *b == want || b.starts_with(want.as_str()))
+            {
                 let b = candidates.remove(i);
                 candidates.insert(0, b);
             }
@@ -99,12 +147,19 @@ struct Outcome {
 }
 
 static OUTCOMES: Lazy<Mutex<HashMap<String, Outcome>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-static ACTIVE: Lazy<Mutex<HashMap<&'static str, &'static str>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static ACTIVE: Lazy<Mutex<HashMap<&'static str, &'static str>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Record a successful real call (not a probe) — marks the backend active for its channel.
 pub(crate) fn note_ok(channel: &'static str, backend: &'static str) {
     let mut o = OUTCOMES.lock().unwrap_or_else(|e| e.into_inner());
-    o.insert(format!("{channel}/{backend}"), Outcome { ok: true, note: String::new() });
+    o.insert(
+        format!("{channel}/{backend}"),
+        Outcome {
+            ok: true,
+            note: String::new(),
+        },
+    );
     let mut a = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     a.insert(channel, backend);
 }
@@ -113,7 +168,13 @@ pub(crate) fn note_ok(channel: &'static str, backend: &'static str) {
 /// next backend).
 pub(crate) fn note_err(channel: &'static str, backend: &'static str, err: &str) {
     let mut o = OUTCOMES.lock().unwrap_or_else(|e| e.into_inner());
-    o.insert(format!("{channel}/{backend}"), Outcome { ok: false, note: http::snippet(err) });
+    o.insert(
+        format!("{channel}/{backend}"),
+        Outcome {
+            ok: false,
+            note: http::snippet(err),
+        },
+    );
 }
 
 /// The backend that served this channel's most recent successful call this session.
@@ -157,7 +218,8 @@ struct Cached {
     at: Instant,
 }
 
-static SEARCH_CACHE: Lazy<Mutex<HashMap<String, Cached>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static SEARCH_CACHE: Lazy<Mutex<HashMap<String, Cached>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 const CACHE_TTL: Duration = Duration::from_secs(600); // 10 min — fresh enough for a work session
 const CACHE_MAX: usize = 128;
 
@@ -181,26 +243,44 @@ pub(crate) fn cache_put(key: String, value: String) {
             c.remove(&oldest);
         }
     }
-    c.insert(key, Cached { value, at: Instant::now() });
+    c.insert(
+        key,
+        Cached {
+            value,
+            at: Instant::now(),
+        },
+    );
 }
 
 #[cfg(test)]
 pub(crate) fn cache_clear() {
-    SEARCH_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    SEARCH_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 // ── optional keys (everything works without them) ────────────────────────────
 
 pub(crate) fn tavily_key() -> Option<String> {
-    crate::core::cli_config::load().reach.unwrap_or_default().resolved_tavily_key()
+    crate::core::cli_config::load()
+        .reach
+        .unwrap_or_default()
+        .resolved_tavily_key()
 }
 
 pub(crate) fn jina_key() -> Option<String> {
-    crate::core::cli_config::load().reach.unwrap_or_default().resolved_jina_key()
+    crate::core::cli_config::load()
+        .reach
+        .unwrap_or_default()
+        .resolved_jina_key()
 }
 
 pub(crate) fn github_token() -> Option<String> {
-    crate::core::cli_config::load().reach.unwrap_or_default().resolved_github_token()
+    crate::core::cli_config::load()
+        .reach
+        .unwrap_or_default()
+        .resolved_github_token()
 }
 
 // ── doctor ───────────────────────────────────────────────────────────────────
@@ -235,11 +315,15 @@ fn derive_report(spec: &'static ChannelSpec, probes: Vec<(&'static str, Probe)>)
     let first_warn = probes.iter().position(|(_, p)| matches!(p, Probe::Warn(_)));
     let (status, active, mut message) = match (first_ok, first_warn) {
         (Some(i), _) => {
-            let (b, Probe::Ok(m)) = &probes[i] else { unreachable!() };
+            let (b, Probe::Ok(m)) = &probes[i] else {
+                unreachable!()
+            };
             ("ok", Some(*b), m.clone())
         }
         (None, Some(i)) => {
-            let (b, Probe::Warn(m)) = &probes[i] else { unreachable!() };
+            let (b, Probe::Warn(m)) = &probes[i] else {
+                unreachable!()
+            };
             ("warn", Some(*b), m.clone())
         }
         (None, None) => {
@@ -255,7 +339,11 @@ fn derive_report(spec: &'static ChannelSpec, probes: Vec<(&'static str, Probe)>)
                         Probe::Off(m) => Some(m.clone()),
                         _ => None,
                     });
-                    ("off", None, off.unwrap_or_else(|| "no backend available".into()))
+                    (
+                        "off",
+                        None,
+                        off.unwrap_or_else(|| "no backend available".into()),
+                    )
                 }
             }
         }
@@ -264,11 +352,25 @@ fn derive_report(spec: &'static ChannelSpec, probes: Vec<(&'static str, Probe)>)
     // path is degraded), but never more than one — single-action messages.
     if let Some(win) = active {
         let win_pos = probes.iter().position(|(b, _)| *b == win).unwrap_or(0);
-        if let Some((b, Probe::Fail(m))) = probes[..win_pos].iter().find(|(_, p)| matches!(p, Probe::Fail(_))) {
-            message.push_str(&format!("  [earlier backend '{b}' failing: {}]", http::snippet(m)));
+        if let Some((b, Probe::Fail(m))) = probes[..win_pos]
+            .iter()
+            .find(|(_, p)| matches!(p, Probe::Fail(_)))
+        {
+            message.push_str(&format!(
+                "  [earlier backend '{b}' failing: {}]",
+                http::snippet(m)
+            ));
         }
     }
-    ChannelReport { name: spec.name, label: spec.label, tier: spec.tier, backends, active_backend: active, status, message }
+    ChannelReport {
+        name: spec.name,
+        label: spec.label,
+        tier: spec.tier,
+        backends,
+        active_backend: active,
+        status,
+        message,
+    }
 }
 
 /// Run live health probes for every channel (concurrently, ~8 s cap per probe) and report which
@@ -293,13 +395,17 @@ pub async fn doctor() -> Vec<ChannelReport> {
             let b = *b;
             async move {
                 let p = match (spec.name, b) {
-                    ("web", "direct") => Probe::Ok("direct fetch — always-available floor (not probed)".into()),
+                    ("web", "direct") => {
+                        Probe::Ok("direct fetch — always-available floor (not probed)".into())
+                    }
                     ("web", "jina") => run(web::probe_jina()).await,
                     ("search", "tavily") => run(search::probe_tavily()).await,
                     ("search", "jina-search") => run(search::probe_jina_search()).await,
                     ("github", "api") => run(github::probe_api()).await,
                     ("github", "raw") => run(github::probe_raw()).await,
-                    ("github", "html") => Probe::Ok("plain page fetch fallback (not probed)".into()),
+                    ("github", "html") => {
+                        Probe::Ok("plain page fetch fallback (not probed)".into())
+                    }
                     ("youtube", "innertube") => run(youtube::probe_innertube()).await,
                     ("youtube", "oembed") => run(youtube::probe_oembed()).await,
                     ("twitter", "fxtwitter") => run(twitter::probe_fxtwitter()).await,
@@ -307,10 +413,16 @@ pub async fn doctor() -> Vec<ChannelReport> {
                     ("hackernews", "algolia") => run(hn::probe_algolia()).await,
                     ("hackernews", "firebase") => run(hn::probe_firebase()).await,
                     ("wikipedia", "rest") => run(wikipedia::probe_rest()).await,
-                    ("wikipedia", "html") => Probe::Ok("plain page fetch fallback (not probed)".into()),
-                    ("feed", "builtin") => Probe::Ok("built-in RSS/Atom parser — no network needed (not probed)".into()),
+                    ("wikipedia", "html") => {
+                        Probe::Ok("plain page fetch fallback (not probed)".into())
+                    }
+                    ("feed", "builtin") => Probe::Ok(
+                        "built-in RSS/Atom parser — no network needed (not probed)".into(),
+                    ),
                     ("stackexchange", "api") => run(stackex::probe_api()).await,
-                    ("stackexchange", "html") => Probe::Ok("plain page fetch fallback (not probed)".into()),
+                    ("stackexchange", "html") => {
+                        Probe::Ok("plain page fetch fallback (not probed)".into())
+                    }
                     _ => Probe::Fail("unknown backend".into()),
                 };
                 (b, p)
@@ -324,14 +436,20 @@ pub async fn doctor() -> Vec<ChannelReport> {
 
 /// Human doctor report, Agent-Reach style: legend, per-channel lines grouped by tier, N/M summary.
 pub fn render_report(reports: &[ChannelReport]) -> String {
-    let mut s = String::from("reach — platform-aware web access (web_fetch / web_search route through this)\n");
+    let mut s = String::from(
+        "reach — platform-aware web access (web_fetch / web_search route through this)\n",
+    );
     s.push_str("  legend: ✅ ok  [!] degraded  [·] off (optional)  [x] error\n");
     for tier in [0u8, 1] {
         let rows: Vec<&ChannelReport> = reports.iter().filter(|r| r.tier == tier).collect();
         if rows.is_empty() {
             continue;
         }
-        s.push_str(if tier == 0 { "  zero-config:\n" } else { "  optional (key raises limits):\n" });
+        s.push_str(if tier == 0 {
+            "  zero-config:\n"
+        } else {
+            "  optional (key raises limits):\n"
+        });
         for r in rows {
             let icon = match r.status {
                 "ok" => "✅",
@@ -344,10 +462,16 @@ pub fn render_report(reports: &[ChannelReport]) -> String {
                 Some(b) if r.backends.len() > 1 => format!("  (active: {b})"),
                 _ => String::new(),
             };
-            s.push_str(&format!("  {icon} {:<13} {} — {}{}\n", r.name, chain, r.message, active));
+            s.push_str(&format!(
+                "  {icon} {:<13} {} — {}{}\n",
+                r.name, chain, r.message, active
+            ));
         }
     }
-    let avail = reports.iter().filter(|r| r.status == "ok" || r.status == "warn").count();
+    let avail = reports
+        .iter()
+        .filter(|r| r.status == "ok" || r.status == "warn")
+        .count();
     s.push_str(&format!("  {avail}/{} channels available", reports.len()));
     if tavily_key().is_none() {
         s.push_str("\n  tip: web search NEEDS a key — set TAVILY_API_KEY (https://tavily.com) to enable it; a Jina key (JINA_API_KEY) adds a search fallback + raises the reader quota; GITHUB_TOKEN raises GitHub to 5000 req/h");
@@ -361,7 +485,9 @@ pub fn render_report(reports: &[ChannelReport]) -> String {
 /// session's real outcomes (✓ served / ✗ failed per backend). Live probing is `/reach doctor`.
 pub fn render_passive() -> String {
     let outcomes = OUTCOMES.lock().unwrap_or_else(|e| e.into_inner());
-    let mut s = String::from("reach — platform-aware web access (web_fetch / web_search route through this)\n");
+    let mut s = String::from(
+        "reach — platform-aware web access (web_fetch / web_search route through this)\n",
+    );
     let mut failures: Vec<String> = Vec::new();
     for spec in CHANNELS {
         let chain = ordered_backends(spec.name)
@@ -376,13 +502,20 @@ pub fn render_passive() -> String {
             })
             .collect::<Vec<_>>()
             .join(" · ");
-        let served = last_active(spec.name).map(|b| format!("  (last served by {b})")).unwrap_or_default();
-        s.push_str(&format!("  {:<13} {chain} — {}{served}\n", spec.name, spec.label));
+        let served = last_active(spec.name)
+            .map(|b| format!("  (last served by {b})"))
+            .unwrap_or_default();
+        s.push_str(&format!(
+            "  {:<13} {chain} — {}{served}\n",
+            spec.name, spec.label
+        ));
     }
     for f in failures.iter().take(5) {
         s.push_str(&format!("  last error {f}\n"));
     }
-    s.push_str("  (✓/✗ = this session's real calls; run `/reach doctor` to live-probe every backend)");
+    s.push_str(
+        "  (✓/✗ = this session's real calls; run `/reach doctor` to live-probe every backend)",
+    );
     s
 }
 
@@ -412,15 +545,26 @@ mod tests {
 
     #[test]
     fn override_reorders_and_never_pins() {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("AIZEN_REACH_TWITTER_BACKEND");
-        assert_eq!(ordered_backends("twitter"), vec!["fxtwitter", "syndication"]);
+        assert_eq!(
+            ordered_backends("twitter"),
+            vec!["fxtwitter", "syndication"]
+        );
         std::env::set_var("AIZEN_REACH_TWITTER_BACKEND", "syndication");
         // Reorder, not pin: the previous primary stays as a fallback.
-        assert_eq!(ordered_backends("twitter"), vec!["syndication", "fxtwitter"]);
+        assert_eq!(
+            ordered_backends("twitter"),
+            vec!["syndication", "fxtwitter"]
+        );
         // Unknown values are ignored — a stale override can't hide working backends.
         std::env::set_var("AIZEN_REACH_TWITTER_BACKEND", "nitter");
-        assert_eq!(ordered_backends("twitter"), vec!["fxtwitter", "syndication"]);
+        assert_eq!(
+            ordered_backends("twitter"),
+            vec!["fxtwitter", "syndication"]
+        );
         // Prefix match (like the original's startswith).
         std::env::set_var("AIZEN_REACH_TWITTER_BACKEND", "synd");
         assert_eq!(ordered_backends("twitter")[0], "syndication");
@@ -433,7 +577,10 @@ mod tests {
         // Primary failed, fallback ok → fallback active, primary failure surfaced as suffix.
         let r = derive_report(
             spec,
-            vec![("fxtwitter", Probe::Fail("HTTP 503".into())), ("syndication", Probe::Ok("tweet reads OK".into()))],
+            vec![
+                ("fxtwitter", Probe::Fail("HTTP 503".into())),
+                ("syndication", Probe::Ok("tweet reads OK".into())),
+            ],
         );
         assert_eq!(r.status, "ok");
         assert_eq!(r.active_backend, Some("syndication"));
@@ -442,24 +589,52 @@ mod tests {
         // Warn beats off/fail but loses to ok.
         let r = derive_report(
             spec,
-            vec![("fxtwitter", Probe::Warn("degraded".into())), ("syndication", Probe::Ok("fine".into()))],
+            vec![
+                ("fxtwitter", Probe::Warn("degraded".into())),
+                ("syndication", Probe::Ok("fine".into())),
+            ],
         );
         assert_eq!(r.active_backend, Some("syndication"));
         // All off → off.
-        let r = derive_report(spec, vec![("fxtwitter", Probe::Off("needs key".into())), ("syndication", Probe::Off("needs key".into()))]);
+        let r = derive_report(
+            spec,
+            vec![
+                ("fxtwitter", Probe::Off("needs key".into())),
+                ("syndication", Probe::Off("needs key".into())),
+            ],
+        );
         assert_eq!(r.status, "off");
         // Fail beats off for visibility.
-        let r = derive_report(spec, vec![("fxtwitter", Probe::Off("needs key".into())), ("syndication", Probe::Fail("boom".into()))]);
+        let r = derive_report(
+            spec,
+            vec![
+                ("fxtwitter", Probe::Off("needs key".into())),
+                ("syndication", Probe::Fail("boom".into())),
+            ],
+        );
         assert_eq!(r.status, "error");
     }
 
     #[test]
     fn report_json_matches_the_agent_reach_contract() {
         let spec = channel("hackernews").unwrap();
-        let r = derive_report(spec, vec![("algolia", Probe::Ok("ok".into())), ("firebase", Probe::Ok("ok".into()))]);
+        let r = derive_report(
+            spec,
+            vec![
+                ("algolia", Probe::Ok("ok".into())),
+                ("firebase", Probe::Ok("ok".into())),
+            ],
+        );
         let j = report_json(&[r]);
         let hn = &j["hackernews"];
-        for key in ["status", "name", "message", "tier", "backends", "active_backend"] {
+        for key in [
+            "status",
+            "name",
+            "message",
+            "tier",
+            "backends",
+            "active_backend",
+        ] {
             assert!(hn.get(key).is_some(), "missing key {key}");
         }
         assert_eq!(hn["status"], "ok");
@@ -469,7 +644,13 @@ mod tests {
     #[test]
     fn render_groups_and_summarizes() {
         let spec = channel("web").unwrap();
-        let r = derive_report(spec, vec![("direct", Probe::Ok("floor".into())), ("jina", Probe::Fail("429".into()))]);
+        let r = derive_report(
+            spec,
+            vec![
+                ("direct", Probe::Ok("floor".into())),
+                ("jina", Probe::Fail("429".into())),
+            ],
+        );
         let out = render_report(&[r]);
         assert!(out.contains("1/1 channels available"));
         assert!(out.contains("direct · jina"));
@@ -492,9 +673,16 @@ mod tests {
         // scrape remains — with no key `web_search` returns an actionable error, it doesn't degrade.
         let order = ordered_backends("search");
         assert_eq!(order, vec!["tavily", "jina-search"], "keyed-only chain");
-        assert!(!order.contains(&"ddg-html") && !order.contains(&"ddg-lite"), "DDG dropped");
+        assert!(
+            !order.contains(&"ddg-html") && !order.contains(&"ddg-lite"),
+            "DDG dropped"
+        );
         assert!(!order.contains(&"marginalia"), "Marginalia floor dropped");
-        assert_eq!(channel("search").unwrap().tier, 1, "search is now a tier-1 (keyed) channel");
+        assert_eq!(
+            channel("search").unwrap().tier,
+            1,
+            "search is now a tier-1 (keyed) channel"
+        );
     }
 
     #[test]

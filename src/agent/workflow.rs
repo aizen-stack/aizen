@@ -18,8 +18,8 @@
 use crate::agent::builtin::{agent_registry, role_registry};
 use crate::agent::task_tool::{build_agent_subagent_prompt, build_subagent_prompt};
 use crate::agent::{run_agent, AgentConfig, StopReason};
-use crate::llm::client::{chat_with_tools, stream_chat_with_visual_contract};
 use crate::core::types::{Message, ToolDef};
+use crate::llm::client::{chat_with_tools, stream_chat_with_visual_contract};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
@@ -32,6 +32,10 @@ const MAX_PARALLEL: usize = 5;
 const CHILD_MAX_ITERS: usize = 15;
 /// Hard ceiling on auto-extend for a workflow child (`2 × CHILD_MAX_ITERS`, same shape as task).
 const CHILD_AUTO_EXTEND: usize = 30;
+/// Transient model-call failures a workflow child absorbs per turn before giving up (see
+/// `AgentConfig::max_transient_retries`). Matches the `task` tool's sub-agent policy.
+const CHILD_TRANSIENT_RETRIES: usize = 4;
+
 /// Cap each child's summary before stuffing it into the synthesis prompt (chars). Prevents 5 verbose
 /// children from blowing the synth context / $$.
 const SUMMARY_CHAR_CAP: usize = 4_000;
@@ -105,7 +109,17 @@ pub async fn run_workflow(
     trace: Option<&Path>,
 ) -> Result<()> {
     let cancel = crate::core::cancel::TurnCancel::new();
-    run_workflow_with_cancel(http, base_url, api_key, model, approval_mode, spec, trace, cancel).await
+    run_workflow_with_cancel(
+        http,
+        base_url,
+        api_key,
+        model,
+        approval_mode,
+        spec,
+        trace,
+        cancel,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -163,7 +177,10 @@ async fn run_workflow_with_cancel(
     drop(slots);
 
     for r in &results {
-        eprintln!("  • {} ({}/{}) — {} [{} step(s)]", r.id, r.role, r.model, r.status, r.iters);
+        eprintln!(
+            "  • {} ({}/{}) — {} [{} step(s)]",
+            r.id, r.role, r.model, r.status, r.iters
+        );
     }
 
     if results.iter().any(|r| r.status == "cancelled") {
@@ -213,7 +230,10 @@ async fn run_workflow_with_cancel(
         bail!("workflow '{}': cancelled by user", spec.name);
     }
 
-    wf_track.set_phase(crate::agent::orchestration::Phase::Synthesizing, format!("via {synth_model}"));
+    wf_track.set_phase(
+        crate::agent::orchestration::Phase::Synthesizing,
+        format!("via {synth_model}"),
+    );
     eprintln!("synthesizing ({synth_model})…\n");
     match stream_chat_with_visual_contract(
         http,
@@ -222,7 +242,9 @@ async fn run_workflow_with_cancel(
         synth_model,
         vec![Message::user(synth_prompt)],
         true,
-    ).await {
+    )
+    .await
+    {
         Ok(_) => {
             wf_track.finish_ok("synthesized");
             Ok(())
@@ -245,7 +267,11 @@ fn validate_spec_ids(spec: &WorkflowSpec) -> Result<()> {
             bail!("workflow '{}' has a blank task id", spec.name);
         }
         if !seen.insert(t.id.as_str()) {
-            bail!("workflow '{}' has a duplicate task id '{}'", spec.name, t.id);
+            bail!(
+                "workflow '{}' has a duplicate task id '{}'",
+                spec.name,
+                t.id
+            );
         }
     }
     Ok(())
@@ -402,7 +428,10 @@ pub(crate) async fn run_workflow_collect(
     // future direct caller can't bypass it.
     enforce_singular_writer(spec)?;
 
-    let root = std::env::current_dir().context("resolving cwd")?.canonicalize().context("canonicalizing cwd")?;
+    let root = std::env::current_dir()
+        .context("resolving cwd")?
+        .canonicalize()
+        .context("canonicalizing cwd")?;
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     // Reserve ONE global sub-agent slot per concurrent child (bounded by both the workflow's own
     // MAX_PARALLEL and the number of tasks), so a fan-out is accounted against the process-global
@@ -417,25 +446,28 @@ pub(crate) async fn run_workflow_collect(
     let width = slots.len();
     // Header line into the transcript so the user sees the fan-out begin (TUI path only; no-op on
     // the CLI runner, which prints its own eprintln banner).
-    wf_header(&format!("workflow: {} · {} task(s)", spec.name, spec.tasks.len()));
+    wf_header(&format!(
+        "workflow: {} · {} task(s)",
+        spec.name,
+        spec.tasks.len()
+    ));
     // Live status for `/workflows` — parent + per-child tracks (children updated in run_one_task).
     let wf_track = crate::agent::orchestration::start_workflow(&spec.name, spec.tasks.len());
     let parent_id = wf_track.id();
-    let results =
-        fan_out_tracked(
-            http,
-            base_url,
-            api_key,
-            model,
-            approval_mode,
-            &root,
-            &date,
-            &spec.tasks,
-            width,
-            Some(parent_id),
-            cancel.clone(),
-        )
-        .await;
+    let results = fan_out_tracked(
+        http,
+        base_url,
+        api_key,
+        model,
+        approval_mode,
+        &root,
+        &date,
+        &spec.tasks,
+        width,
+        Some(parent_id),
+        cancel.clone(),
+    )
+    .await;
     drop(slots); // explicit: hold the reservation across the whole fan-out, free it here
 
     if results.iter().any(|r| r.status == "cancelled") {
@@ -444,12 +476,19 @@ pub(crate) async fn run_workflow_collect(
     }
     if results.iter().all(|r| r.status == "error") {
         wf_track.finish_err("all tasks failed");
-        bail!("workflow '{}': all {} task(s) failed — nothing to report", spec.name, results.len());
+        bail!(
+            "workflow '{}': all {} task(s) failed — nothing to report",
+            spec.name,
+            results.len()
+        );
     }
 
     let mut out = format!("[workflow: {}, {} task(s)]\n", spec.name, results.len());
     for r in &results {
-        out.push_str(&format!("  • {} ({}/{}) — {} [{} step(s)]\n", r.id, r.role, r.model, r.status, r.iters));
+        out.push_str(&format!(
+            "  • {} ({}/{}) — {} [{} step(s)]\n",
+            r.id, r.role, r.model, r.status, r.iters
+        ));
     }
     if !synthesize {
         // Verify-style callers want the RAW per-task outputs, not a merged narrative.
@@ -468,13 +507,24 @@ pub(crate) async fn run_workflow_collect(
         wf_track.finish_err("cancelled before synthesis");
         bail!("workflow '{}': cancelled by user", spec.name);
     }
-    let synth_model = spec.synthesis.as_ref().and_then(|s| s.model.as_deref()).unwrap_or(model);
+    let synth_model = spec
+        .synthesis
+        .as_ref()
+        .and_then(|s| s.model.as_deref())
+        .unwrap_or(model);
     let default_instruction = "Synthesize the sub-agent results below into ONE coherent, \
         deduplicated answer. Resolve any conflicts explicitly and note which task each key point \
         came from. Do not invent results that no task reported.";
-    let instruction = spec.synthesis.as_ref().and_then(|s| s.prompt.as_deref()).unwrap_or(default_instruction);
+    let instruction = spec
+        .synthesis
+        .as_ref()
+        .and_then(|s| s.prompt.as_deref())
+        .unwrap_or(default_instruction);
     let synth_prompt = build_synthesis_prompt(&spec.name, instruction, &results);
-    wf_track.set_phase(crate::agent::orchestration::Phase::Synthesizing, format!("via {synth_model}"));
+    wf_track.set_phase(
+        crate::agent::orchestration::Phase::Synthesizing,
+        format!("via {synth_model}"),
+    );
     wf_trace(&format!("⋯ synthesizing ({synth_model})…"));
     let merged = match crate::core::cancel::race(
         &cancel,
@@ -550,7 +600,11 @@ async fn run_one_task(
     };
     let (label, ep, registry, system) = match &spec {
         Some(def) => {
-            let m = task.model.as_deref().or(def.model.as_deref()).unwrap_or(model);
+            let m = task
+                .model
+                .as_deref()
+                .or(def.model.as_deref())
+                .unwrap_or(model);
             let ep = crate::core::cli_config::endpoint_for_model(m, &caller);
             let system = build_agent_subagent_prompt(def, root, &ep.model, date, None);
             (def.slug(), ep, agent_registry(def, root), system)
@@ -559,7 +613,12 @@ async fn run_one_task(
             let m = task.model.as_deref().unwrap_or(model);
             let ep = crate::core::cli_config::endpoint_for_model(m, &caller);
             let system = build_subagent_prompt(&task.role, root, &ep.model, date, None);
-            (task.role.clone(), ep, role_registry(&task.role, root), system)
+            (
+                task.role.clone(),
+                ep,
+                role_registry(&task.role, root),
+                system,
+            )
         }
     };
 
@@ -600,6 +659,9 @@ async fn run_one_task(
         enable_todo_poke: false,
         enable_confidence_gate: false,
         enable_hill_climb: false,
+        // Same reason as the `task` tool: a workflow child runs unwatched, and a transient gateway
+        // error used to reduce a whole child's work to `status: "error"` in the synthesis input.
+        max_transient_retries: CHILD_TRANSIENT_RETRIES,
         // Sub-agents leave context_window 0 (no tool-result clearing) — workflow children are short.
         // enable_lsp default true is fine; tools only appear if registered in the sub-agent registry.
         ..AgentConfig::default()
@@ -632,7 +694,10 @@ async fn run_one_task(
             } else {
                 child_track.finish_err(detail);
             }
-            wf_trace_done(ok, &format!("{} ({label}) — {status} [{} step(s)]", task.id, o.iters));
+            wf_trace_done(
+                ok,
+                &format!("{} ({label}) — {status} [{} step(s)]", task.id, o.iters),
+            );
             TaskOutcome {
                 id: task.id.clone(),
                 role: label.clone(),
@@ -667,7 +732,9 @@ async fn run_one_task(
 /// `✦` + label, matching the turn-start whimsy line's accent so it reads as a section opener.
 fn wf_header(line: &str) {
     if crate::ui::tui::active() {
-        let star = console::style("✦").color256(crate::ui::splash::ACCENT).bold();
+        let star = console::style("✦")
+            .color256(crate::ui::splash::ACCENT)
+            .bold();
         crate::ui::tui::emit_line(&format!("{star} {}", crate::ui::theme::accent(line)));
     }
 }
@@ -677,7 +744,11 @@ fn wf_header(line: &str) {
 /// CLI runner prints its own `eprintln!` status and isn't TUI-active, so this never double-prints.
 fn wf_trace(line: &str) {
     if crate::ui::tui::active() {
-        crate::ui::tui::emit_line(&format!("  {} {}", crate::ui::theme::faint("└"), crate::ui::theme::faint(line)));
+        crate::ui::tui::emit_line(&format!(
+            "  {} {}",
+            crate::ui::theme::faint("└"),
+            crate::ui::theme::faint(line)
+        ));
     }
 }
 
@@ -687,8 +758,16 @@ fn wf_trace_done(ok: bool, line: &str) {
     if !crate::ui::tui::active() {
         return;
     }
-    let corner = if ok { crate::ui::theme::faint("└") } else { crate::ui::theme::err("└") };
-    let body = if ok { crate::ui::theme::faint(line).to_string() } else { crate::ui::theme::err(line).to_string() };
+    let corner = if ok {
+        crate::ui::theme::faint("└")
+    } else {
+        crate::ui::theme::err("└")
+    };
+    let body = if ok {
+        crate::ui::theme::faint(line).to_string()
+    } else {
+        crate::ui::theme::err(line).to_string()
+    };
     crate::ui::tui::emit_line(&format!("  {corner} {body}"));
 }
 
@@ -721,7 +800,8 @@ fn write_trace(path: &Path, name: &str, results: &[TaskOutcome], synth_model: &s
 /// Long child summaries are hard-capped at [`SUMMARY_CHAR_CAP`] so 5 verbose agents cannot blow
 /// the synth context / $$.
 fn build_synthesis_prompt(name: &str, instruction: &str, results: &[TaskOutcome]) -> String {
-    let mut s = format!("You are synthesizing the results of workflow '{name}'.\n\n{instruction}\n\n");
+    let mut s =
+        format!("You are synthesizing the results of workflow '{name}'.\n\n{instruction}\n\n");
     for r in results {
         s.push_str(&format!(
             "=== task: {} (role={}, {}) ===\n{}\n\n",
@@ -764,7 +844,10 @@ mod tests {
         // We can't assert "nothing printed" cheaply, but we CAN assert they don't panic / gate
         // correctly on `tui::active()` (false under tests). A regression to an unconditional emit
         // would still run here without a live TUI and is caught by the smoke path.
-        assert!(!crate::ui::tui::active(), "test harness is never TUI-active");
+        assert!(
+            !crate::ui::tui::active(),
+            "test harness is never TUI-active"
+        );
         wf_header("workflow: t · 2 task(s)");
         wf_trace("⋯ a (reviewer) running…");
         wf_trace_done(true, "a (reviewer) — done [3 step(s)]");
@@ -784,7 +867,10 @@ mod tests {
         assert_eq!(spec.name, "review");
         assert_eq!(spec.tasks.len(), 2);
         assert_eq!(spec.tasks[0].role, "reviewer");
-        assert_eq!(spec.tasks[1].role, "coder", "missing role defaults to coder");
+        assert_eq!(
+            spec.tasks[1].role, "coder",
+            "missing role defaults to coder"
+        );
         assert!(spec.synthesis.is_none(), "synthesis is optional");
     }
 
@@ -812,8 +898,14 @@ mod tests {
         }"#;
         let spec: WorkflowSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.tasks[0].agent.as_deref(), Some("code-reviewer"));
-        assert!(spec.tasks[1].agent.is_none(), "agent is optional; defaults to None");
-        assert_eq!(spec.tasks[1].role, "coder", "no agent ⇒ role still defaults to coder");
+        assert!(
+            spec.tasks[1].agent.is_none(),
+            "agent is optional; defaults to None"
+        );
+        assert_eq!(
+            spec.tasks[1].role, "coder",
+            "no agent ⇒ role still defaults to coder"
+        );
     }
 
     #[test]
@@ -827,14 +919,31 @@ mod tests {
         }"#;
         let spec: WorkflowSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.tasks[0].model.as_deref(), Some("cheap-model"));
-        assert!(spec.tasks[1].model.is_none(), "no override → falls back to the workflow model");
+        assert!(
+            spec.tasks[1].model.is_none(),
+            "no override → falls back to the workflow model"
+        );
     }
 
     #[test]
     fn synthesis_prompt_labels_each_task() {
         let results = vec![
-            TaskOutcome { id: "bugs".into(), role: "reviewer".into(), model: "m".into(), status: "done".into(), summary: "found a null deref".into(), iters: 3 },
-            TaskOutcome { id: "perf".into(), role: "reviewer".into(), model: "m".into(), status: "done".into(), summary: "n+1 query".into(), iters: 2 },
+            TaskOutcome {
+                id: "bugs".into(),
+                role: "reviewer".into(),
+                model: "m".into(),
+                status: "done".into(),
+                summary: "found a null deref".into(),
+                iters: 3,
+            },
+            TaskOutcome {
+                id: "perf".into(),
+                role: "reviewer".into(),
+                model: "m".into(),
+                status: "done".into(),
+                summary: "n+1 query".into(),
+                iters: 2,
+            },
         ];
         let p = build_synthesis_prompt("review", "merge", &results);
         assert!(p.contains("workflow 'review'"));
@@ -857,7 +966,10 @@ mod tests {
         }];
         let p = build_synthesis_prompt("w", "merge", &results);
         assert!(p.contains("[truncated:"), "must mark truncation: {p}");
-        assert!(p.len() < SUMMARY_CHAR_CAP + 800, "prompt must not include the full long body");
+        assert!(
+            p.len() < SUMMARY_CHAR_CAP + 800,
+            "prompt must not include the full long body"
+        );
     }
 
     #[test]
@@ -922,12 +1034,24 @@ mod tests {
 
     #[tokio::test]
     async fn empty_tasks_is_rejected() {
-        let spec = WorkflowSpec { name: "empty".into(), tasks: vec![], synthesis: None };
+        let spec = WorkflowSpec {
+            name: "empty".into(),
+            tasks: vec![],
+            synthesis: None,
+        };
         let http = reqwest::Client::new();
         // bails on the empty-tasks check BEFORE any network call.
-        let err = run_workflow(&http, "http://localhost", "k", "m", crate::core::approval::ApprovalMode::Ask, &spec, None)
-            .await
-            .unwrap_err();
+        let err = run_workflow(
+            &http,
+            "http://localhost",
+            "k",
+            "m",
+            crate::core::approval::ApprovalMode::Ask,
+            &spec,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("no tasks"));
     }
 
@@ -935,13 +1059,27 @@ mod tests {
     async fn blank_task_id_rejected() {
         let spec = WorkflowSpec {
             name: "blank".into(),
-            tasks: vec![WorkflowTask { id: "  ".into(), role: "coder".into(), agent: None, prompt: "x".into(), model: None }],
+            tasks: vec![WorkflowTask {
+                id: "  ".into(),
+                role: "coder".into(),
+                agent: None,
+                prompt: "x".into(),
+                model: None,
+            }],
             synthesis: None,
         };
         let http = reqwest::Client::new();
-        let err = run_workflow(&http, "http://localhost", "k", "m", crate::core::approval::ApprovalMode::Ask, &spec, None)
-            .await
-            .unwrap_err();
+        let err = run_workflow(
+            &http,
+            "http://localhost",
+            "k",
+            "m",
+            crate::core::approval::ApprovalMode::Ask,
+            &spec,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("blank task id"));
     }
 
@@ -950,15 +1088,35 @@ mod tests {
         let spec = WorkflowSpec {
             name: "dup".into(),
             tasks: vec![
-                WorkflowTask { id: "a".into(), role: "coder".into(), agent: None, prompt: "x".into(), model: None },
-                WorkflowTask { id: "a".into(), role: "coder".into(), agent: None, prompt: "y".into(), model: None },
+                WorkflowTask {
+                    id: "a".into(),
+                    role: "coder".into(),
+                    agent: None,
+                    prompt: "x".into(),
+                    model: None,
+                },
+                WorkflowTask {
+                    id: "a".into(),
+                    role: "coder".into(),
+                    agent: None,
+                    prompt: "y".into(),
+                    model: None,
+                },
             ],
             synthesis: None,
         };
         let http = reqwest::Client::new();
-        let err = run_workflow(&http, "http://localhost", "k", "m", crate::core::approval::ApprovalMode::Ask, &spec, None)
-            .await
-            .unwrap_err();
+        let err = run_workflow(
+            &http,
+            "http://localhost",
+            "k",
+            "m",
+            crate::core::approval::ApprovalMode::Ask,
+            &spec,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("duplicate task id"));
     }
 }

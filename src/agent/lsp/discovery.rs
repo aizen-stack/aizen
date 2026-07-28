@@ -50,7 +50,12 @@ pub const SERVERS: &[ServerSpec] = &[
         command: "pyright-langserver",
         args: &["--stdio"],
         extensions: &["py", "pyi"],
-        manifests: &["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"],
+        manifests: &[
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "requirements.txt",
+        ],
     },
     ServerSpec {
         lang: "typescript",
@@ -86,7 +91,9 @@ pub fn language_id_for(path: &Path, fallback: &str) -> String {
 /// unsupported language ⇒ LSP stays out of the way and the agent uses text search.
 pub fn server_for_extension(ext: &str) -> Option<&'static ServerSpec> {
     let ext = ext.trim_start_matches('.').to_ascii_lowercase();
-    SERVERS.iter().find(|s| s.extensions.iter().any(|e| *e == ext))
+    SERVERS
+        .iter()
+        .find(|s| s.extensions.iter().any(|e| *e == ext))
 }
 
 /// Pick the server for a path by its file extension.
@@ -108,7 +115,11 @@ pub fn detect(anchor: &Path) -> Option<(&'static ServerSpec, PathBuf)> {
             return Some((spec, root));
         }
     }
-    let start = if anchor.is_dir() { anchor } else { anchor.parent().unwrap_or(anchor) };
+    let start = if anchor.is_dir() {
+        anchor
+    } else {
+        anchor.parent().unwrap_or(anchor)
+    };
     for spec in SERVERS {
         if let Some(root) = resolve_workspace_root(start, spec.manifests) {
             return Some((spec, root));
@@ -186,7 +197,11 @@ fn search_dirs(dirs: &[PathBuf], exts: &[String], cmd: &str) -> Option<PathBuf> 
 
 /// Best-effort `rustup which <bin>` → absolute path (rust-analyzer added via `rustup component`).
 fn rustup_which(bin: &str) -> Option<PathBuf> {
-    let out = std::process::Command::new("rustup").arg("which").arg(bin).output().ok()?;
+    let out = std::process::Command::new("rustup")
+        .arg("which")
+        .arg(bin)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -208,7 +223,11 @@ pub fn resolve_workspace_root(start: &Path, manifests: &[&str]) -> Option<PathBu
     let mut cur: &Path = &start;
     for _ in 0..MAX_CLIMB {
         if manifests.iter().any(|m| cur.join(m).is_file()) {
-            return if is_forbidden_root(cur) { None } else { Some(cur.to_path_buf()) };
+            return if is_forbidden_root(cur) {
+                None
+            } else {
+                Some(cur.to_path_buf())
+            };
         }
         match cur.parent() {
             Some(p) => cur = p,
@@ -233,7 +252,9 @@ fn is_forbidden_root(dir: &Path) -> bool {
 /// The user's home directory from the environment (`USERPROFILE` on Windows, `HOME` elsewhere).
 fn home_dir() -> Option<PathBuf> {
     let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    std::env::var_os(var).map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
 }
 
 /// Compare two directories by their canonical form (so `C:\x` vs `\\?\C:\x` etc. compare equal).
@@ -258,11 +279,25 @@ mod tests {
     #[test]
     fn extension_mapping() {
         assert_eq!(server_for_extension("rs").map(|s| s.lang), Some("rust"));
-        assert_eq!(server_for_extension("RS").map(|s| s.lang), Some("rust"), "case-insensitive");
-        assert_eq!(server_for_extension(".rs").map(|s| s.lang), Some("rust"), "leading dot tolerated");
+        assert_eq!(
+            server_for_extension("RS").map(|s| s.lang),
+            Some("rust"),
+            "case-insensitive"
+        );
+        assert_eq!(
+            server_for_extension(".rs").map(|s| s.lang),
+            Some("rust"),
+            "leading dot tolerated"
+        );
         assert_eq!(server_for_extension("py").map(|s| s.lang), Some("python"));
-        assert_eq!(server_for_extension("tsx").map(|s| s.lang), Some("typescript"));
-        assert_eq!(server_for_extension("mjs").map(|s| s.lang), Some("typescript"));
+        assert_eq!(
+            server_for_extension("tsx").map(|s| s.lang),
+            Some("typescript")
+        );
+        assert_eq!(
+            server_for_extension("mjs").map(|s| s.lang),
+            Some("typescript")
+        );
         assert!(server_for_extension("go").is_none(), "gopls is a later row");
         assert!(server_for_extension("").is_none());
     }
@@ -271,11 +306,27 @@ mod tests {
     fn language_ids() {
         assert_eq!(language_id_for(Path::new("a/m.rs"), "rust"), "rust");
         assert_eq!(language_id_for(Path::new("a/m.py"), "python"), "python");
-        assert_eq!(language_id_for(Path::new("a/m.ts"), "typescript"), "typescript");
-        assert_eq!(language_id_for(Path::new("a/m.tsx"), "typescript"), "typescriptreact");
-        assert_eq!(language_id_for(Path::new("a/m.js"), "typescript"), "javascript");
-        assert_eq!(language_id_for(Path::new("a/m.jsx"), "typescript"), "javascriptreact");
-        assert_eq!(language_id_for(Path::new("a/Makefile"), "python"), "python", "fallback");
+        assert_eq!(
+            language_id_for(Path::new("a/m.ts"), "typescript"),
+            "typescript"
+        );
+        assert_eq!(
+            language_id_for(Path::new("a/m.tsx"), "typescript"),
+            "typescriptreact"
+        );
+        assert_eq!(
+            language_id_for(Path::new("a/m.js"), "typescript"),
+            "javascript"
+        );
+        assert_eq!(
+            language_id_for(Path::new("a/m.jsx"), "typescript"),
+            "javascriptreact"
+        );
+        assert_eq!(
+            language_id_for(Path::new("a/Makefile"), "python"),
+            "python",
+            "fallback"
+        );
     }
 
     #[test]
@@ -295,8 +346,14 @@ mod tests {
 
     #[test]
     fn path_mapping() {
-        assert_eq!(server_for_path(Path::new("a/b/main.rs")).map(|s| s.lang), Some("rust"));
-        assert!(server_for_path(Path::new("a/b/README")).is_none(), "no extension → none");
+        assert_eq!(
+            server_for_path(Path::new("a/b/main.rs")).map(|s| s.lang),
+            Some("rust")
+        );
+        assert!(
+            server_for_path(Path::new("a/b/README")).is_none(),
+            "no extension → none"
+        );
     }
 
     #[test]
@@ -306,7 +363,11 @@ mod tests {
         let deep = root.join("src").join("agent");
         std::fs::create_dir_all(&deep).unwrap();
         let got = resolve_workspace_root(&deep, &["Cargo.toml"]).expect("should find the root");
-        assert_eq!(got, root.canonicalize().unwrap(), "resolves to the Cargo.toml dir");
+        assert_eq!(
+            got,
+            root.canonicalize().unwrap(),
+            "resolves to the Cargo.toml dir"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -320,7 +381,11 @@ mod tests {
         let deep = sub.join("src");
         std::fs::create_dir_all(&deep).unwrap();
         let got = resolve_workspace_root(&deep, &["Cargo.toml"]).expect("found");
-        assert_eq!(got, sub.canonicalize().unwrap(), "nearest (inner) manifest wins");
+        assert_eq!(
+            got,
+            sub.canonicalize().unwrap(),
+            "nearest (inner) manifest wins"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -366,27 +431,43 @@ mod tests {
         let exts = vec![".EXE".to_string(), ".cmd".to_string()];
         // Bare name + PATHEXT → finds the .cmd shim (the node-server case).
         let hit = search_dirs(&dirs, &exts, "srv").expect("resolves srv.cmd");
-        assert!(hit.to_string_lossy().to_ascii_lowercase().ends_with("srv.cmd"));
+        assert!(hit
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .ends_with("srv.cmd"));
         // Explicit extension → tried verbatim.
         assert!(search_dirs(&dirs, &exts, "srv.cmd").is_some());
         // Unix mode (no exts) → exact name only.
         assert!(search_dirs(&dirs, &[], "plain").is_some());
-        assert!(search_dirs(&dirs, &exts, "plain").is_none(), "bare name isn't executable on Windows");
+        assert!(
+            search_dirs(&dirs, &exts, "plain").is_none(),
+            "bare name isn't executable on Windows"
+        );
         assert!(search_dirs(&dirs, &exts, "missing").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn filesystem_root_is_forbidden() {
-        let root = if cfg!(windows) { Path::new(r"C:\") } else { Path::new("/") };
-        assert!(is_forbidden_root(root), "the filesystem root must never be a workspace root");
+        let root = if cfg!(windows) {
+            Path::new(r"C:\")
+        } else {
+            Path::new("/")
+        };
+        assert!(
+            is_forbidden_root(root),
+            "the filesystem root must never be a workspace root"
+        );
     }
 
     #[test]
     fn home_dir_is_forbidden() {
         if let Some(home) = home_dir() {
             if home.exists() {
-                assert!(is_forbidden_root(&home), "the home directory must never be a workspace root");
+                assert!(
+                    is_forbidden_root(&home),
+                    "the home directory must never be a workspace root"
+                );
             }
         }
     }
