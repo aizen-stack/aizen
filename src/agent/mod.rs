@@ -2223,6 +2223,17 @@ async fn execute_calls(
                                         // "no git executable" behave the same (checkpoints off, the
                                         // edit proceeds) but must never be conflated in what the
                                         // user reads — the latter is fixable by installing git.
+                                        // Record the reason on this session's manifest too: with no
+                                        // checkpoint there is no pre-image, so per-session diff is
+                                        // impossible and `/team status` should say why rather than
+                                        // show an empty change list that looks like a bug.
+                                        crate::features::coop::note_checkpoint_unavailable(
+                                            if crate::core::gitx::git_exe().is_none() {
+                                                "git executable not found"
+                                            } else {
+                                                "not a git repository"
+                                            },
+                                        );
                                         if !cfg.quiet {
                                             if crate::core::gitx::git_exe().is_none() {
                                                 emit_trace("→ checkpoint off: git executable not found — edits proceed without checkpoints");
@@ -2236,6 +2247,11 @@ async fn execute_calls(
                                         *auto_checkpointed = true;
                                         crate::features::timemachine::note_pre_edit(snap.id);
                                         crate::core::recovery::set_checkpoint(Some(snap.id));
+                                        // Same snapshot, second reader: this is the tree THIS
+                                        // session's changes are measured from, so another window can
+                                        // later diff exactly this session's work even after a third
+                                        // window overwrites the same files (`features::coop`).
+                                        crate::features::coop::note_turn_base(snap.id);
                                         if !cfg.quiet {
                                             emit_trace(&format!(
                                                 "→ checkpoint #{} saved (agent: `checkpoint_rewind` target=pre_edit; human: `aizen time restore {}`)",

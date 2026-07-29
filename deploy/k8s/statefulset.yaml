@@ -1,0 +1,147 @@
+# `aizen serve` on Kubernetes.
+#
+# READ THIS BEFORE CHANGING `replicas`.
+#
+# This is a StatefulSet with exactly one replica, and that is not a starting point to scale from —
+# it is the only correct shape. Three independent reasons, each sufficient on its own:
+#
+#  1. Telegram allows ONE `getUpdates` poller per bot token. A second one gets HTTP 409 Conflict
+#     forever (the daemon logs this — see src/hostbot/platforms/telegram.rs). `replicas: 2` is not
+#     "twice the throughput", it is one healthy pod and one permanent crashloop.
+#  2. Every on-disk store guards writes with a local file lock (flock / LockFileEx via
+#     src/core/repo_lock.rs). Those do not work across pods, and are not reliable over NFS — so the
+#     volume must be ReadWriteOnce and single-writer.
+#  3. The daemon processes messages SERIALLY by design: the per-turn approval route (which chat a
+#     destructive-op prompt returns to) is race-free precisely because only one turn runs at a time.
+#
+# `podManagementPolicy` and `updateStrategy` follow from (1): the old pod must be fully gone before
+# the new one starts polling, or the rollout itself creates the 409 collision.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aizen
+  namespace: aizen
+  labels:
+    app: aizen
+spec:
+  replicas: 1
+  serviceName: aizen  # headless service; required by the StatefulSet spec even with no network need
+  selector:
+    matchLabels:
+      app: aizen
+
+  # Terminate the old pod completely before creating the new one. The default RollingUpdate for a
+  # 1-replica StatefulSet already does this, but stating it makes the constraint explicit to whoever
+  # edits this next.
+  updateStrategy:
+    type: RollingUpdate
+  podManagementPolicy: OrderedReady
+
+  template:
+    metadata:
+      labels:
+        app: aizen
+    spec:
+      # The agent runs model-chosen shell commands. If it can read the projected service-account
+      # token at /var/run/secrets/kubernetes.io/serviceaccount/token, it can talk to the API server
+      # with this pod's identity — and no network guard prevents that, because the agent has a shell
+      # and reads the file directly. Do not turn this back on.
+      automountServiceAccountToken: false
+
+      # SIGTERM is handled (src/hostbot/daemon.rs::shutdown_signal): kill the process tree, drop the
+      # heartbeat, exit clean. The grace period gives an in-flight tool call time to land; after it
+      # elapses the kubelet sends SIGKILL and nothing can be done about that.
+      terminationGracePeriodSeconds: 60
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        # The PVC is mounted for uid 10001; fsGroup makes the kubelet chown it on first attach.
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: aizen
+          # Replace with your registry path. `Always` + a moving tag would restart into a new build
+          # unpredictably; pin a real tag or digest in anything you care about.
+          image: aizen:local
+          imagePullPolicy: IfNotPresent
+
+          # The image's ENTRYPOINT is `tini -- aizen`, which reaps the builds, tests, and language
+          # servers the agent spawns. Without a reaper as PID 1 those accumulate as zombies.
+          args: ["serve"]
+
+          envFrom:
+            - configMapRef:
+                name: aizen-config
+            - secretRef:
+                name: aizen-secrets
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # NOT read-only: the agent writes to /work, and cargo/npm/pip all need a writable tmp.
+            readOnlyRootFilesystem: false
+
+          # There is no HTTP endpoint to probe — the daemon deliberately listens on nothing (Telegram
+          # long-poll, Discord outbound websocket), which is what lets it run with no ingress. So the
+          # probes exec the CLI, which reads the heartbeat file the daemon stamps from inside its own
+          # select! loop. A detached ticker would keep beating while the loop was wedged; that is the
+          # one failure a liveness probe exists to catch, so the beat comes from the loop itself.
+          #
+          # The heartbeat distinguishes `idle` (must refresh every 15s) from `busy` (running one turn,
+          # given a long leash). Without that distinction, a probe tight enough to catch a wedge would
+          # kill a pod in the middle of a legitimate 10-minute build.
+          startupProbe:
+            exec:
+              command: ["aizen", "serve", "--health"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12  # up to 60s to come up
+          livenessProbe:
+            exec:
+              command: ["aizen", "serve", "--health"]
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          # No readinessProbe: nothing routes traffic to this pod, so "ready" has no meaning here.
+          # A readiness gate would only add a second thing to misconfigure.
+
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              # No CPU limit on purpose: throttling a build makes turns slower, which pushes them
+              # toward the busy deadline and into a liveness restart. Set one only if you must.
+              memory: "4Gi"
+
+          volumeMounts:
+            # Everything that must outlive the pod: cli-config.json (with the allowed_chat_ids that
+            # pairing writes), hostbot/bots.json (sub-bot tokens), hostbot/sessions/ (per-chat
+            # context), cli-memory/ (memory + codebase index), models/ (dense model cache).
+            - name: aizen-home
+              mountPath: /home/aizen/.aizen
+            # The agent's working tree. emptyDir here means work is scratch and dies with the pod —
+            # swap in a PVC if the agent should keep a checkout across restarts.
+            - name: work
+              mountPath: /work
+
+      volumes:
+        - name: work
+          emptyDir: {}
+
+  volumeClaimTemplates:
+    - metadata:
+        name: aizen-home
+      spec:
+        # ReadWriteOnce, not RWX: the stores use local file locks, which don't coordinate across
+        # nodes. RWX would let a second writer in and silently corrupt them.
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            # 2Gi covers config, memory, sessions, and the ~30 MB dense model with plenty of room.
+            storage: 2Gi

@@ -1,0 +1,15 @@
+# `kubectl apply -k deploy/k8s/` — the whole stack in one command.
+#
+# NOTE what is deliberately absent: `secret.example.yaml`. It is a template whose values are the
+# literal string REPLACE_ME, so including it here would let a routine re-apply overwrite a real
+# Secret with placeholders — the daemon would then fail auth on its next restart for no visible
+# reason. Create the Secret out-of-band instead (see README.md), and this file will never touch it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - service.yaml
+  - statefulset.yaml
+  - networkpolicy.yaml

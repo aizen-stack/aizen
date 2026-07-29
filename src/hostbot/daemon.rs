@@ -17,10 +17,39 @@ use tokio::sync::mpsc::{self, Sender};
 use crate::agent::{self, AgentConfig, StopReason};
 use crate::core::approval::ApprovalMode;
 use crate::core::types::Message;
+use crate::hostbot::health;
 use crate::hostbot::platform::{Inbound, Platform};
 use crate::hostbot::platforms;
 use crate::hostbot::store;
 use crate::llm::client;
+
+/// Resolve when the host asks us to stop, and name which signal did it. Ctrl-C is the terminal case;
+/// SIGTERM is how systemd, `docker stop`, and Kubernetes all ask first (SIGKILL follows their grace
+/// period, and nothing can be done about that one). Returning the name lets the log say which.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // If installing the SIGTERM handler fails we still honor Ctrl-C rather than never returning.
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = term.recv() => "SIGTERM",
+            },
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    // Windows has no SIGTERM. `ctrl_c` also fires for Ctrl-Break; window-close / logoff / shutdown are
+    // handled by the console control handler installed elsewhere.
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
+    }
+}
 
 /// The single source of truth for the command surface: `(name, arg-hint, description)`. Published to
 /// Telegram's "/" menu via `setMyCommands` and rendered into `/help`. The dispatcher arms in
@@ -320,10 +349,31 @@ async fn run_daemon<P: Platform>(platform: P) -> Result<()> {
         .dim()
     );
 
+    // Liveness for container/orchestrator probes (`aizen serve --health`). Stamped from INSIDE the
+    // loop below — a detached ticker would keep beating while the real loop was wedged, which is the
+    // one failure a liveness probe exists to catch. See `hostbot::health`.
+    health::beat(platform.name(), health::State::Idle);
+    let mut beat_tick =
+        tokio::time::interval(std::time::Duration::from_secs(health::BEAT_INTERVAL_SECS));
+    beat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    beat_tick.tick().await; // the first tick resolves immediately — consume it
+
     loop {
         let inbound = tokio::select! {
             biased;
-            _ = tokio::signal::ctrl_c() => { eprintln!("\nshutting down…"); crate::agent::process::kill_all(); break; }
+            // Ctrl-C (a terminal) OR SIGTERM (systemd `stop`, `docker stop`, a k8s pod delete). Without
+            // the SIGTERM arm an orchestrator's graceful stop killed us outright: no `kill_all`, so
+            // spawned builds/language servers were orphaned, and no `clear()`, so the heartbeat stayed
+            // behind and read as a live daemon.
+            sig = shutdown_signal() => {
+                eprintln!("\nshutting down… ({sig})");
+                crate::agent::process::kill_all();
+                break;
+            }
+            _ = beat_tick.tick() => {
+                health::beat(platform.name(), health::State::Idle);
+                continue;
+            }
             m = rx.recv() => match m { Some(m) => m, None => break },
         };
         let Inbound { route, chat, text } = inbound;
@@ -367,6 +417,10 @@ async fn run_daemon<P: Platform>(platform: P) -> Result<()> {
         if task.is_empty() {
             continue;
         }
+        // A turn is starting: switch the heartbeat to `busy` so a probe judges it by the long
+        // busy deadline instead of the idle one. Without this, any turn outlasting the idle
+        // deadline (a build, a test suite) would read as wedged and get itself restarted.
+        health::beat(platform.name(), health::State::Busy);
         let status = platform.start_status(&route, chat).await.ok().flatten();
         // Pin the approval route to THIS bot+chat so a destructive-op prompt returns here (serial loop
         // ⇒ no race). No-op on platforms without inline approval (Discord) — those auto-deny + skip.
@@ -423,9 +477,15 @@ async fn run_daemon<P: Platform>(platform: P) -> Result<()> {
         let _ = platform
             .finish_status(&route, chat, status, failed || send_failed)
             .await;
+        // Turn over — back to `idle`, which re-arms the tight deadline.
+        health::beat(platform.name(), health::State::Idle);
     }
 
     platform.shutdown();
+    // A stopped daemon must read as "not running", not as a stale live one — otherwise the next
+    // probe judges a heartbeat nobody is refreshing and the verdict depends on which deadline the
+    // last state happened to leave behind.
+    health::clear();
     Ok(())
 }
 

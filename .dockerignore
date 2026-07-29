@@ -1,0 +1,40 @@
+# Keep the build context small and free of secrets.
+#
+# This matters more than usual here: the repo's build dirs are MULTIPLE GIGABYTES (`target-msvc-dense`
+# alone is ~4 GB), and every byte of the context is sent to the Docker daemon before the first
+# instruction runs. Without this file a `docker build` appears to hang for minutes.
+
+# ── build outputs (the big ones) ──
+/target
+/target-msvc
+/target-msvc-dense
+*.exe
+
+# ── secret-bearing / machine-local state ──
+# `.aizen/` is the runtime state dir: session slots, coordination locks, persona/memory state. The
+# container gets its own via the volume; copying the host's in would leak tokens into an image layer.
+.aizen/
+.env
+*.pem
+*.key
+
+# ── scratch that has no business in an image ──
+.git
+.github
+.claude
+.codex-review/
+.aizen-tmp/
+.audit-out/
+main_diff*.txt
+.main_diff.txt
+/test_*.rs
+dist/
+
+# ── docs (not needed to build; keeps layers small) ──
+docs/
+examples/
+scripts/
+# Root-level markdown only (leading slash). NOT a bare `*.md`: `build.rs` reads
+# `src/agent/system_prompt.md` and `system_prompt_strict.md` at compile time and panics if either is
+# missing, so a pattern that could reach into `src/` would break the build in a confusing way.
+/*.md

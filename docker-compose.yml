@@ -1,0 +1,79 @@
+# `aizen serve` as a long-lived container — the Docker equivalent of the systemd unit that
+# `aizen serve --install` writes.
+#
+#   cp .env.example .env      # put your tokens there, then:
+#   docker compose up -d
+#   docker compose logs -f    # the pairing code prints here on a first run
+#
+# There is deliberately no `ports:` section. The daemon listens on NOTHING: Telegram is long-poll
+# (`getUpdates`), Discord is an outbound gateway websocket. That's what lets it run behind NAT with
+# no public URL, and it means there is no inbound surface to expose or firewall.
+
+services:
+  aizen:
+    build:
+      context: .
+      args:
+        # Set to an empty string for a lean build without the dense retrieval tier.
+        FEATURES: dense
+    image: aizen:local
+    container_name: aizen-serve
+
+    # SIGTERM is now handled (see `hostbot::daemon::shutdown_signal`): the process tree is killed and
+    # the heartbeat dropped. 40s of grace because a turn mid-shutdown may be finishing a tool call.
+    stop_grace_period: 40s
+
+    # `unless-stopped` is the `Restart=always` analogue — survives crashes and host reboots, but
+    # respects an explicit `docker compose stop`.
+    restart: unless-stopped
+
+    # tini is the image's ENTRYPOINT and reaps the agent's grandchildren (builds, tests, language
+    # servers). `init: true` would add Docker's own reaper on top; harmless but redundant.
+
+    env_file:
+      - .env
+
+    environment:
+      # A rejected key must read as rejected, so keep these explicit rather than relying on defaults.
+      AIZEN_NO_UPDATE_CHECK: "1"
+
+      # The SSRF floor (src/core/net_guard.rs) refuses private/loopback targets, which includes other
+      # containers on this network. UNCOMMENT ONLY if the agent must reach a service you run here —
+      # it also unblocks cloud instance-metadata (169.254.169.254), i.e. the node's credentials.
+      # AIZEN_ALLOW_PRIVATE_NET: "1"
+
+      # Raise if your turns routinely run long (big test suites) — the health probe calls a turn
+      # wedged after this many seconds. See src/hostbot/health.rs.
+      # AIZEN_HEALTH_MAX_BUSY_SECS: "3600"
+
+    volumes:
+      # EVERYTHING that must outlive the container: cli-config.json (with the allowed_chat_ids that
+      # pairing writes), hostbot/bots.json (sub-bot tokens), hostbot/sessions/ (per-chat context),
+      # cli-memory/ (memory + codebase index), models/ (dense model cache).
+      # Lose this and you lose owner pairing and all memory.
+      - aizen-home:/home/aizen/.aizen
+
+      # Your code. The agent edits what it finds here — mount only what you're willing to have edited.
+      # `:ro` if you want a read-only audit run instead.
+      - ./workspace:/work
+
+    healthcheck:
+      test: ["CMD", "aizen", "serve", "--health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+    # Defense in depth for a process that runs model-chosen shell commands.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # A runaway build inside the agent shouldn't be able to OOM the host. Tune to your machine;
+    # a `cargo build` on a large project wants well over 1 GB.
+    mem_limit: 4g
+    pids_limit: 2048
+
+volumes:
+  aizen-home:

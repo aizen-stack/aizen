@@ -26,7 +26,7 @@ mod ui; // tui · theme · markdown · spinner · splash · icons · image_input
 use crate::agent::app_catalog;
 use crate::channels::notify;
 use crate::core::{cli_config, config, types};
-use crate::features::{commands, crawl, cron, timemachine};
+use crate::features::{commands, coop, crawl, cron, timemachine};
 use crate::hostbot::platforms::{discord, telegram};
 use crate::llm::client;
 use crate::persona::soul;
@@ -124,6 +124,12 @@ enum Commands {
         /// Paste the bot token and run in one step; owner pairing happens in chat.
         #[arg(long)]
         token: Option<String>,
+        /// Report whether a `serve` daemon on this machine is alive, then exit 0 (healthy) or 1.
+        /// Reads the heartbeat the daemon writes; shaped for a container/systemd exec probe. The
+        /// daemon listens on no port (Telegram long-polls, Discord dials out), so there is no
+        /// `/healthz` to curl — and adding one would forfeit the run-behind-NAT property.
+        #[arg(long)]
+        health: bool,
     },
     /// Configure / test the Telegram bot integration.
     Telegram {
@@ -139,6 +145,16 @@ enum Commands {
     Time {
         #[command(subcommand)]
         cmd: TimeCmd,
+    },
+    /// Other aizen windows working in this repository: status · diff · claims · commit.
+    Team {
+        #[command(subcommand)]
+        cmd: TeamCmd,
+    },
+    /// Isolated Git worktrees, one per parallel task: new · list · remove.
+    Work {
+        #[command(subcommand)]
+        cmd: WorkCmd,
     },
     /// Show where aizen keeps THIS project's state: root, zone slug, git executable, home dirs.
     Where,
@@ -514,6 +530,58 @@ enum TimeCmd {
     Gc,
     /// Delete ALL checkpoints (Git objects are reclaimed later by normal Git maintenance).
     Clear,
+}
+
+#[derive(Subcommand, Debug)]
+enum TeamCmd {
+    /// List every aizen session in this repository: state, task, files touched, overlaps.
+    Status,
+    /// Show what ONE session changed, measured from its own pre-edit checkpoints.
+    Diff {
+        /// Session id, a unique suffix of one, `self`, or a row number from `status`.
+        session: String,
+        /// Print the unified patch, not just the per-file stat.
+        #[arg(short, long)]
+        patch: bool,
+    },
+    /// Show which session currently owns each changed path.
+    Claims,
+    /// Stage exactly one session's files and review them. Committing requires `--yes`.
+    Commit {
+        /// Session id, a unique suffix of one, `self`, or a row number from `status`.
+        session: String,
+        /// Commit message. Defaults to that session's task description.
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Stage and print the review, then unstage without committing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Proceed even when the session is still running or its files overlap another session's.
+        #[arg(long)]
+        force: bool,
+        /// Actually commit. Without it, this behaves as `--dry-run`.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkCmd {
+    /// Create an isolated worktree + branch (`aizen/<name>`) and print where it landed.
+    New {
+        /// Worktree name: letters, digits, `-`, `_`, `.` (1-64 chars).
+        name: String,
+    },
+    /// List aizen worktrees with their branch, dirty state, unmerged commits, and live sessions.
+    List,
+    /// Remove an aizen worktree. Refuses while it holds uncommitted or unmerged work.
+    Remove {
+        /// Worktree name.
+        name: String,
+        /// Remove anyway. The branch is kept either way, so commits stay reachable by name.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -991,7 +1059,16 @@ async fn main() -> Result<()> {
             user,
             now,
             token,
+            health,
         } => {
+            // The probe answers FIRST and touches nothing else: it runs every few seconds for the
+            // life of the container, so it must not load/rewrite config or start any subsystem.
+            // Shaped for a container `exec` probe — one line out, exit 0 healthy / 1 not. Exiting
+            // directly (rather than returning an `Err`) keeps it to that single line; an `Err` from
+            // `main` would add anyhow's "Error:" framing to every failed probe in the pod log.
+            if health {
+                std::process::exit(if hostbot::run_health_check() { 0 } else { 1 });
+            }
             // `--token` = "paste and run": persist it to config before booting, so `serve --token <t>`
             // on a fresh machine works with no separate `telegram setup` step (pairing captures owner).
             if let Some(token) = token.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -1010,6 +1087,8 @@ async fn main() -> Result<()> {
         Commands::Telegram { cmd } => run_telegram(cmd).await,
         Commands::Discord { cmd } => run_discord(cmd).await,
         Commands::Time { cmd } => run_time(cmd),
+        Commands::Team { cmd } => run_team(cmd),
+        Commands::Work { cmd } => run_work(cmd),
         Commands::Where => {
             println!("{}", where_report());
             Ok(())
@@ -2118,6 +2197,165 @@ fn run_zone(cmd: ZoneCmd) -> Result<()> {
 }
 
 // ───────────────────────────── time machine (git snapshots) ─────────────────────────────
+
+/// `aizen team …` — the non-interactive twin of `/team`. Same registry, same plan, `println!` instead
+/// of `tui::emit_line` (no retained frame is up here, so a raw print is the correct surface).
+fn run_team(cmd: TeamCmd) -> Result<()> {
+    match cmd {
+        TeamCmd::Status => {
+            for line in team_status_lines() {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        TeamCmd::Diff { session, patch } => {
+            let view = coop::resolve(&session)?;
+            let reports = coop::session_diff(&view, patch)?;
+            if reports.is_empty() {
+                println!(
+                    "{}",
+                    style(format!(
+                        "session {} has no file changes on disk",
+                        view.manifest.session_id
+                    ))
+                    .dim()
+                );
+                return Ok(());
+            }
+            for report in &reports {
+                for line in diff_lines(report, "--patch off") {
+                    println!("{line}");
+                }
+            }
+            Ok(())
+        }
+        TeamCmd::Claims => {
+            let claims = coop::claims();
+            if claims.is_empty() {
+                println!("{}", style("no path claims recorded yet").dim());
+                return Ok(());
+            }
+            for (path, claim) in claims {
+                println!("  {path}  ← {}", style(&claim.session_id).dim());
+            }
+            for o in coop::overlaps() {
+                println!(
+                    "  {} {}  ({} → {})",
+                    style("⚠").color256(theme::WARN),
+                    o.path,
+                    o.first,
+                    o.second
+                );
+            }
+            Ok(())
+        }
+        TeamCmd::Commit {
+            session,
+            message,
+            dry_run,
+            force,
+            yes,
+        } => {
+            let view = coop::resolve(&session)?;
+            let plan = coop::plan_commit(&view)?;
+            for b in &plan.blockers {
+                println!("{} {b}", style("⚠").color256(theme::WARN));
+            }
+            if !plan.blockers.is_empty() && !force {
+                bail!("refusing to commit; nothing was staged (re-run with --force to override)");
+            }
+            if !plan.shared_paths.is_empty() {
+                println!(
+                    "{} {} file(s) are shared with another session — committing them carries that \
+                     session's edits to the SAME file along: {}",
+                    style("⚠").color256(theme::WARN),
+                    plan.shared_paths.len(),
+                    plan.shared_paths.join(", ")
+                );
+            }
+            let review = coop::stage_plan(&plan)?;
+            for line in review.lines() {
+                println!("  {line}");
+            }
+            // `--yes` is the only path to an actual commit: a bare `aizen team commit` reviews and
+            // rolls the index back, so discovering the command cannot land one.
+            if dry_run || !yes {
+                coop::unstage_plan(&plan)?;
+                println!(
+                    "{}",
+                    style("review only — unstaged again, nothing was committed (add --yes to commit)")
+                        .dim()
+                );
+                return Ok(());
+            }
+            let msg = message.unwrap_or_else(|| {
+                let task = view.manifest.task.trim();
+                if task.is_empty() {
+                    format!("aizen session {}", plan.session_id)
+                } else {
+                    task.to_string()
+                }
+            });
+            let out = coop::commit_staged(&plan, &msg)?;
+            for line in out.lines().take(6) {
+                println!("  {line}");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `aizen work …` — isolated worktrees, for when two windows should not share one tree at all.
+fn run_work(cmd: WorkCmd) -> Result<()> {
+    match cmd {
+        WorkCmd::New { name } => {
+            let wt = coop::work_new(&name)?;
+            println!(
+                "{} {}\n  branch {}\n  open a session there:  cd {} && aizen",
+                style("✓ worktree").color256(splash::ACCENT),
+                wt.path.display(),
+                wt.branch,
+                wt.path.display()
+            );
+            Ok(())
+        }
+        WorkCmd::List => {
+            let all = coop::work_list()?;
+            if all.is_empty() {
+                println!(
+                    "{}",
+                    style("no aizen worktrees — create one with `aizen work new <name>`").dim()
+                );
+                return Ok(());
+            }
+            for wt in &all {
+                let mut notes = Vec::new();
+                if wt.dirty {
+                    notes.push("dirty".to_string());
+                }
+                if wt.ahead > 0 {
+                    notes.push(format!("{} unmerged commit(s)", wt.ahead));
+                }
+                if wt.sessions > 0 {
+                    notes.push(format!("{} live session(s)", wt.sessions));
+                }
+                let tail = if notes.is_empty() {
+                    style("clean".to_string()).dim().to_string()
+                } else {
+                    style(notes.join(" · ")).color256(theme::WARN).to_string()
+                };
+                println!("  {:<20} {:<24} {tail}", wt.name, wt.branch);
+                println!("    {}", style(wt.path.display().to_string()).dim());
+            }
+            Ok(())
+        }
+        WorkCmd::Remove { name, force } => {
+            let msg = coop::work_remove(&name, force)?;
+            println!("{} {msg}", style("✓").color256(splash::ACCENT));
+            Ok(())
+        }
+    }
+}
 
 fn run_time(cmd: TimeCmd) -> Result<()> {
     match cmd {
@@ -4697,6 +4935,13 @@ async fn run_menu_sticky() -> Result<()> {
         startup_update_probe();
     }
     crate::core::recovery::begin(repo_scope.clone(), current_session_slug());
+    // Publish this window to the repository's session registry so the OTHER aizen windows (and the
+    // one that eventually reviews and commits) can see it exists, what it is doing, and which files
+    // it has changed. Best-effort: a registry failure never blocks the REPL.
+    coop::begin(current_session_slug());
+    for line in coop::peers_banner() {
+        tui::emit_line(&style(line).dim().to_string());
+    }
     if let Some(offer) = crate::core::recovery::scan_stale(&repo_scope)
         .into_iter()
         .next()
@@ -4971,6 +5216,10 @@ async fn run_menu_sticky() -> Result<()> {
                 crate::core::recovery::set_phase(
                     crate::core::recovery::RecoveryPhase::WaitingModel,
                 );
+                // Tell the other windows this one is busy, and — unless the user pinned a task with
+                // `/team task` — describe what with the prompt that started the turn.
+                coop::suggest_task(&line);
+                coop::set_state(coop::SessionState::Working);
 
                 // Run the turn racing a cancel signal; on cancel the future is DROPPED at its current
                 // await (model stream / tool batch / verify gate), which aborts the in-flight request.
@@ -5084,6 +5333,19 @@ async fn run_menu_sticky() -> Result<()> {
                     tui::note_submission_enqueued();
                 }
                 crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::Finalizing);
+                // Attribute this turn's file changes to this session, before any other window's turn
+                // can start writing. Every branch below (ok / clarify / interrupt / error) flows
+                // through here, which is exactly the coverage the ledger needs: a cancelled turn that
+                // already wrote three files must still be reviewable by the coordinator.
+                for warning in coop::seal_turn() {
+                    tui::emit_line(&style(warning).color256(theme::WARN).to_string());
+                }
+                // `_` bindings only, so this reads the result without moving it out of the match below.
+                coop::set_state(if matches!(result, Some(Err(_))) {
+                    coop::SessionState::Failed
+                } else {
+                    coop::SessionState::Idle
+                });
                 // Disarm the per-turn effort override the moment the turn ends — every branch below
                 // (ok / clarify / interrupt / error) flows through here, so effort never leaks into
                 // the next turn regardless of how this one finished.
@@ -5250,6 +5512,9 @@ async fn run_menu_sticky() -> Result<()> {
     flush_live_session_on_exit();
     tui::deactivate();
     crate::core::recovery::clear();
+    // Unlike recovery, the coop manifest SURVIVES a clean exit: it is marked `finished` and kept so
+    // the coordinator window can still review and commit this session's work after it is closed.
+    coop::clear();
     crate::agent::process::kill_all(); // reap any background dev servers/watchers we started
     println!("{}", style("bye.").dim());
     Ok(())
@@ -7583,6 +7848,540 @@ fn slash_agents(arg: &str) {
     }
 }
 
+/// Rows for `/team status` — every aizen session registered in this repository.
+///
+/// The point of this table is the LAST two columns: who is still running, and which files each
+/// window changed. `git diff` alone cannot answer either question once two windows share a tree.
+fn team_status_lines() -> Vec<String> {
+    let sessions = coop::list();
+    if sessions.is_empty() {
+        return vec![style(
+            "no aizen sessions registered here yet — this window registers itself on start",
+        )
+        .dim()
+        .to_string()];
+    }
+    let mut out = vec![format!(
+        "{}  {} session(s) in this repository",
+        style("⚑ team").color256(splash::ACCENT).bold(),
+        sessions.len()
+    )];
+    for (i, v) in sessions.iter().enumerate() {
+        let m = &v.manifest;
+        let state = v.effective_state();
+        let color = match state {
+            "working" | "awaiting-approval" => theme::LINK,
+            "done" | "committed" | "finished" => theme::OK,
+            "abandoned" | "failed" => theme::WARN,
+            _ => theme::MUTED,
+        };
+        let mine = if v.is_self { " ●" } else { "" };
+        out.push(format!(
+            "  {:>2}. {}{mine}  {}  {}",
+            i + 1,
+            style(&m.session_id).bold(),
+            style(format!("[{state}]")).color256(color),
+            style(format!(
+                "{} file(s) · {} turn(s) · {}",
+                m.files.len(),
+                m.turns,
+                relative_age_secs(now_unix_secs().saturating_sub(m.updated_unix))
+            ))
+            .dim(),
+        ));
+        if !m.task.is_empty() {
+            out.push(format!("      {}", style(&m.task).color256(theme::ACCENT_DIM)));
+        }
+        let wt = v.worktree_label();
+        if !m.branch.as_deref().unwrap_or("").is_empty() || !wt.is_empty() {
+            out.push(
+                style(format!(
+                    "      {} · branch {}",
+                    wt,
+                    m.branch.as_deref().unwrap_or("(detached)")
+                ))
+                .dim()
+                .to_string(),
+            );
+        }
+        if !v.overlapping.is_empty() {
+            out.push(
+                style(format!(
+                    "      ⚠ shares {} file(s) with another session: {}",
+                    v.overlapping.len(),
+                    v.overlapping.join(", ")
+                ))
+                .color256(theme::WARN)
+                .to_string(),
+            );
+        }
+        if let Some(reason) = &m.degraded {
+            out.push(
+                style(format!("      ⚠ no per-session diff: {reason}"))
+                    .color256(theme::WARN)
+                    .to_string(),
+            );
+        }
+        if m.truncated_files > 0 {
+            out.push(
+                style(format!(
+                    "      ⚠ {} path(s) beyond the tracking ceiling are not recorded",
+                    m.truncated_files
+                ))
+                .color256(theme::WARN)
+                .to_string(),
+            );
+        }
+    }
+    out.push(
+        style("/team diff <n> [-p] · /team files <n> · /team claims · /team commit <n> · /team done")
+            .dim()
+            .to_string(),
+    );
+    out
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Compact age from an already-computed elapsed span. `fmt_time_ago` takes a timestamp and reads the
+/// clock itself; the `/team` tables have many rows against ONE `now`, so they subtract once.
+fn relative_age_secs(secs: u64) -> String {
+    if secs < 60 {
+        "now".to_string()
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// `/team` — read and act on what the OTHER aizen windows in this repository are doing.
+async fn slash_team(arg: &str) {
+    let mut parts = arg.splitn(2, char::is_whitespace);
+    let sub = parts.next().unwrap_or("").trim();
+    let rest = parts.next().unwrap_or("").trim();
+    match sub {
+        "" | "status" | "ls" | "list" => {
+            for line in team_status_lines() {
+                tui::emit_line(&line);
+            }
+        }
+        "task" => {
+            if rest.is_empty() {
+                tui::emit_line(
+                    &style("usage: /team task <what this window is working on>")
+                        .dim()
+                        .to_string(),
+                );
+                return;
+            }
+            coop::set_task(rest);
+            tui::emit_line(
+                &style(format!("this session's task: {rest}"))
+                    .color256(theme::OK)
+                    .to_string(),
+            );
+        }
+        "done" => {
+            coop::set_state(coop::SessionState::Done);
+            tui::emit_line(
+                &style("marked this session done — another window can now commit its work")
+                    .color256(theme::OK)
+                    .to_string(),
+            );
+        }
+        "files" => match coop::resolve(rest) {
+            Ok(view) => {
+                let paths = coop::session_paths(&view);
+                if paths.is_empty() {
+                    tui::emit_line(
+                        &style(format!(
+                            "{} has no recorded file changes",
+                            view.manifest.session_id
+                        ))
+                        .dim()
+                        .to_string(),
+                    );
+                    return;
+                }
+                tui::emit_line(&format!(
+                    "{} {} file(s) changed by {}",
+                    style("⚑").color256(splash::ACCENT),
+                    paths.len(),
+                    style(&view.manifest.session_id).bold()
+                ));
+                for f in &view.manifest.files {
+                    tui::emit_line(&format!(
+                        "  {} {}  {}",
+                        f.status,
+                        f.path,
+                        style(format!("from checkpoint #{}", f.base)).dim()
+                    ));
+                }
+            }
+            Err(e) => tui::emit_line(&format!("{} {e:#}", style("team:").red())),
+        },
+        "diff" => {
+            let mut patch = false;
+            let mut who = String::new();
+            for tok in rest.split_whitespace() {
+                match tok {
+                    "-p" | "--patch" => patch = true,
+                    _ => {
+                        if who.is_empty() {
+                            who = tok.to_string();
+                        }
+                    }
+                }
+            }
+            let view = match coop::resolve(&who) {
+                Ok(v) => v,
+                Err(e) => {
+                    tui::emit_line(&format!("{} {e:#}", style("team:").red()));
+                    return;
+                }
+            };
+            match coop::session_diff(&view, patch) {
+                Ok(reports) if reports.is_empty() => tui::emit_line(
+                    &style(format!(
+                        "{} has no changes still present in the working tree",
+                        view.manifest.session_id
+                    ))
+                    .dim()
+                    .to_string(),
+                ),
+                Ok(reports) => {
+                    tui::emit_line(&format!(
+                        "{} changes attributed to {}",
+                        style("⚑").color256(splash::ACCENT),
+                        style(&view.manifest.session_id).bold()
+                    ));
+                    for report in &reports {
+                        for line in diff_lines(report, "/team diff <n>") {
+                            tui::emit_line(&line);
+                        }
+                    }
+                    if !view.overlapping.is_empty() {
+                        tui::emit_line(
+                            &style(format!(
+                                "⚠ {} file(s) were also changed by another session — the diff above \
+                                 cannot separate their lines: {}",
+                                view.overlapping.len(),
+                                view.overlapping.join(", ")
+                            ))
+                            .color256(theme::WARN)
+                            .to_string(),
+                        );
+                    }
+                }
+                Err(e) => tui::emit_line(&format!("{} {e:#}", style("team diff:").red())),
+            }
+        }
+        "claims" => {
+            let claims = coop::claims();
+            if claims.is_empty() {
+                tui::emit_line(&style("no files are claimed yet").dim().to_string());
+                return;
+            }
+            tui::emit_line(&format!(
+                "{} {} claimed file(s) — most recent writer owns the claim",
+                style("⚑ claims").color256(splash::ACCENT).bold(),
+                claims.len()
+            ));
+            for (path, claim) in claims.iter().take(200) {
+                tui::emit_line(&format!(
+                    "  {path}  {}",
+                    style(format!(
+                        "{} · {}",
+                        claim.session_id,
+                        relative_age_secs(now_unix_secs().saturating_sub(claim.unix))
+                    ))
+                    .dim()
+                ));
+            }
+            let overlaps = coop::overlaps();
+            if !overlaps.is_empty() {
+                tui::emit_line(
+                    &style(format!("⚠ {} overlapping file(s):", overlaps.len()))
+                        .color256(theme::WARN)
+                        .to_string(),
+                );
+                for o in overlaps.iter().take(100) {
+                    tui::emit_line(&format!("  {}  {} → {}", o.path, o.first, o.second));
+                }
+            }
+        }
+        "commit" => slash_team_commit(rest).await,
+        other => tui::emit_line(
+            &style(format!(
+                "unknown /team subcommand '{other}' — status · task · done · files · diff · claims · commit"
+            ))
+            .dim()
+            .to_string(),
+        ),
+    }
+}
+
+/// `/team commit <session> [-m msg] [--verify] [--force] [--dry-run]`.
+///
+/// Staging is derived from the session's ledger, so the coordinator commits ONE window's work rather
+/// than whatever happens to be in the tree. The commit itself is confirmed interactively — it is the
+/// one irreversible step here.
+async fn slash_team_commit(rest: &str) {
+    let mut who = String::new();
+    let mut message = String::new();
+    let mut verify = false;
+    let mut force = false;
+    let mut dry_run = false;
+    let mut expect_message = false;
+    for tok in rest.split_whitespace() {
+        if expect_message {
+            if !message.is_empty() {
+                message.push(' ');
+            }
+            message.push_str(tok);
+            continue;
+        }
+        match tok {
+            "-m" | "--message" => expect_message = true,
+            "--verify" => verify = true,
+            "--force" => force = true,
+            "--dry-run" | "-n" => dry_run = true,
+            _ if who.is_empty() => who = tok.to_string(),
+            _ => {}
+        }
+    }
+    let view = match coop::resolve(&who) {
+        Ok(v) => v,
+        Err(e) => {
+            tui::emit_line(&format!("{} {e:#}", style("team commit:").red()));
+            return;
+        }
+    };
+    let plan = match coop::plan_commit(&view) {
+        Ok(p) => p,
+        Err(e) => {
+            tui::emit_line(&format!("{} {e:#}", style("team commit:").red()));
+            return;
+        }
+    };
+    tui::emit_line(&format!(
+        "{} {} file(s) from {}",
+        style("⚑ commit plan").color256(splash::ACCENT).bold(),
+        plan.paths.len(),
+        style(&plan.session_id).bold()
+    ));
+    for p in plan.paths.iter().take(100) {
+        tui::emit_line(&format!("  {p}"));
+    }
+    if plan.paths.len() > 100 {
+        tui::emit_line(&style(format!("  … {} more", plan.paths.len() - 100)).dim().to_string());
+    }
+    if !plan.shared_paths.is_empty() {
+        tui::emit_line(
+            &style(format!(
+                "⚠ {} of these file(s) were also changed by another session; committing them takes \
+                 that work along — git cannot split one file by author: {}",
+                plan.shared_paths.len(),
+                plan.shared_paths.join(", ")
+            ))
+            .color256(theme::WARN)
+            .to_string(),
+        );
+    }
+    if !plan.blockers.is_empty() {
+        for b in &plan.blockers {
+            tui::emit_line(&style(format!("⚠ {b}")).color256(theme::WARN).to_string());
+        }
+        if !force {
+            tui::emit_line(
+                &style("nothing was staged. Re-run with --force to proceed anyway.")
+                    .dim()
+                    .to_string(),
+            );
+            return;
+        }
+    }
+    let stat = match coop::stage_plan(&plan) {
+        Ok(s) => s,
+        Err(e) => {
+            tui::emit_line(&format!("{} {e:#}", style("team commit:").red()));
+            return;
+        }
+    };
+    for line in stat.lines() {
+        tui::emit_line(&format!("  {line}"));
+    }
+    if verify {
+        match crate::agent::verify_gate::run_verify_gate(&plan.root, 300).await {
+            None => tui::emit_line(
+                &style("verify: no known verify command for this project — skipped")
+                    .dim()
+                    .to_string(),
+            ),
+            Some(r) if r.passed => tui::emit_line(
+                &style(format!("verify: {} passed", r.command))
+                    .color256(theme::OK)
+                    .to_string(),
+            ),
+            Some(r) => {
+                tui::emit_line(
+                    &style(crate::agent::verify_gate::format_gate_failure(&r))
+                        .color256(theme::WARN)
+                        .to_string(),
+                );
+                let _ = coop::unstage_plan(&plan);
+                tui::emit_line(
+                    &style("unstaged the plan — the working tree was not touched")
+                        .dim()
+                        .to_string(),
+                );
+                return;
+            }
+        }
+    }
+    if dry_run {
+        let _ = coop::unstage_plan(&plan);
+        tui::emit_line(
+            &style("dry run — unstaged again, nothing was committed")
+                .dim()
+                .to_string(),
+        );
+        return;
+    }
+    let msg = if message.trim().is_empty() {
+        let task = view.manifest.task.trim();
+        if task.is_empty() {
+            format!("aizen session {}", plan.session_id)
+        } else {
+            task.to_string()
+        }
+    } else {
+        message.trim().to_string()
+    };
+    let status = tui::current_status();
+    tui::suspend();
+    let go = Confirm::with_theme(&ui_theme())
+        .with_prompt(format!("Commit {} file(s) as “{msg}”?", plan.paths.len()))
+        .default(false)
+        .interact()
+        .unwrap_or(false);
+    tui::resume(&status);
+    if !go {
+        let _ = coop::unstage_plan(&plan);
+        tui::emit_line(
+            &style("cancelled — unstaged, working tree untouched")
+                .dim()
+                .to_string(),
+        );
+        return;
+    }
+    match coop::commit_staged(&plan, &msg) {
+        Ok(out) => {
+            for line in out.lines().take(6) {
+                tui::emit_line(&format!("  {line}"));
+            }
+            tui::emit_line(
+                &style(format!("committed {}'s work", plan.session_id))
+                    .color256(theme::OK)
+                    .to_string(),
+            );
+        }
+        Err(e) => tui::emit_line(&format!("{} {e:#}", style("team commit:").red())),
+    }
+}
+
+/// `/work` — isolated worktree mode: one aizen window per linked worktree + branch.
+fn slash_work(arg: &str) {
+    let mut parts = arg.splitn(2, char::is_whitespace);
+    let sub = parts.next().unwrap_or("").trim();
+    let rest = parts.next().unwrap_or("").trim();
+    match sub {
+        "" | "list" | "ls" => match coop::work_list() {
+            Ok(list) if list.is_empty() => tui::emit_line(
+                &style("no aizen worktrees — create one with /work new <name>")
+                    .dim()
+                    .to_string(),
+            ),
+            Ok(list) => {
+                tui::emit_line(&format!(
+                    "{}  {} worktree(s)",
+                    style("⚑ work").color256(splash::ACCENT).bold(),
+                    list.len()
+                ));
+                for w in &list {
+                    let flags = coop::work_remove_blockers(w);
+                    let note = if flags.is_empty() {
+                        style("clean".to_string()).color256(theme::OK)
+                    } else {
+                        style(flags.join("; ")).color256(theme::WARN)
+                    };
+                    tui::emit_line(&format!(
+                        "  {:<20} {}  {}",
+                        w.name,
+                        style(&w.branch).dim(),
+                        note
+                    ));
+                    tui::emit_line(&style(format!("      {}", w.path.display())).dim().to_string());
+                }
+            }
+            Err(e) => tui::emit_line(&format!("{} {e:#}", style("work:").red())),
+        },
+        "new" | "add" => {
+            if rest.is_empty() {
+                tui::emit_line(&style("usage: /work new <name>").dim().to_string());
+                return;
+            }
+            match coop::work_new(rest) {
+                Ok(wt) => {
+                    tui::emit_line(
+                        &style(format!("created worktree {} on {}", wt.path.display(), wt.branch))
+                            .color256(theme::OK)
+                            .to_string(),
+                    );
+                    tui::emit_line(
+                        &style(format!("open a new terminal there: cd {}", wt.path.display()))
+                            .dim()
+                            .to_string(),
+                    );
+                }
+                Err(e) => tui::emit_line(&format!("{} {e:#}", style("work new:").red())),
+            }
+        }
+        "remove" | "rm" => {
+            let mut name = String::new();
+            let mut force = false;
+            for tok in rest.split_whitespace() {
+                match tok {
+                    "--force" | "-f" => force = true,
+                    _ if name.is_empty() => name = tok.to_string(),
+                    _ => {}
+                }
+            }
+            if name.is_empty() {
+                tui::emit_line(&style("usage: /work remove <name> [--force]").dim().to_string());
+                return;
+            }
+            match coop::work_remove(&name, force) {
+                Ok(msg) => tui::emit_line(&style(msg).color256(theme::OK).to_string()),
+                Err(e) => tui::emit_line(&format!("{} {e:#}", style("work remove:").red())),
+            }
+        }
+        other => tui::emit_line(
+            &style(format!("unknown /work subcommand '{other}' — list · new · remove"))
+                .dim()
+                .to_string(),
+        ),
+    }
+}
+
 async fn handle_slash(
     input: &str,
     history: &mut Vec<Message>,
@@ -7669,6 +8468,10 @@ async fn handle_slash(
             }
         }
         "workflows" | "workflow" | "wf" | "agents-status" => slash_workflows(arg).await,
+        // Multi-window cooperation: who else is in this repo, what they changed, and committing one
+        // window's work. `/work` manages the isolated-worktree mode.
+        "team" | "sessions-live" => slash_team(arg).await,
+        "work" | "worktree" | "worktrees" => slash_work(arg),
         "agents" | "agent" => slash_agents(arg),
         "recover" | "recovery" => {
             let repo_scope = crate::core::recovery::current_repo_scope();

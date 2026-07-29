@@ -12,10 +12,12 @@
 //! auth, set up with `aizen telegram/discord setup`). Self-host wiring (systemd) is in [`service`].
 
 mod daemon;
+pub mod health;
 pub mod platform;
 pub mod platforms;
 mod service;
 pub mod store;
 
 pub use daemon::{run_discord_serve, run_serve};
+pub use health::run_health_check;
 pub use service::run_serve_service;

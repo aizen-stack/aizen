@@ -8,6 +8,37 @@ development log lives in that monorepo's history.
 ## [Unreleased]
 
 ### Added
+- **Several aizen windows on one repository can now see each other: `/team` and `aizen team`.** Opening
+  aizen in four terminals against one checkout used to leave `git diff` as the only record — the union
+  of everyone's work, with no way to tell which window wrote which line, so the window doing the review
+  could neither check one task nor commit only it. Each session now publishes what it is doing and
+  which files it changed:
+  - `/team status` lists every session in the repository — state, task, files touched, overlaps — and
+    a startup line names the windows already working when a new one opens. A window whose process is
+    gone reads as `abandoned` rather than silently lingering as "working": the owner holds an OS lock
+    for its lifetime, so a lock a reader *can* take is proof the owner left.
+  - `/team diff <session>` shows what one session changed, `-p` for the patch. Each file is measured
+    from the pre-edit checkpoint of the turn that first touched it *in that session*, so the answer
+    stays right even after another window overwrites the same file — the earlier pre-image is still a
+    blob in that session's own checkpoint tree.
+  - `/team claims` shows which session owns each changed path. Two sessions editing one file is
+    **warned about once, for both sides, and never blocked** — the second writer is often the point.
+  - `/team commit <session>` stages exactly that session's files, prints the review, and commits only
+    after an explicit confirmation; `--dry-run` unstages again. It refuses while the session is still
+    running unless `--force`, and says plainly when a file is shared, because git tracks content and
+    not authorship: committing a shared file carries the other window's changes to it along.
+  - `/team task <text>` pins this window's description; otherwise it is taken from the turn's prompt.
+    `/team done` marks the window finished so a coordinator may commit it.
+  Attribution is exact rather than inferred: the workspace writer lease is already held exclusively
+  for the length of a turn, so two aizen sessions on one worktree are serialized at turn granularity.
+  Edits made by an external editor, or by git run by hand *while* a turn is in flight, land inside that
+  window and are attributed to whoever held the lease — documented rather than silently corrected.
+- **Isolated worktrees for sessions that shouldn't share a tree: `aizen work new|list|remove`.** Each
+  gets its own linked worktree and `aizen/<name>` branch, and shows up in `/team status` alongside
+  shared-tree sessions. `work remove` refuses while a worktree holds uncommitted changes, unmerged
+  commits, or a live session, and keeps the branch either way, so nothing it removes takes commits with
+  it.
+- **`team_status` tool**, so the agent can check who else is editing a file before it rewrites it.
 - **Setup verifies the connection instead of trusting it.** `/config` → Connection and first-run setup
   now check each step against the live endpoint before accepting it:
   - A **provider picker** (OpenAI · Anthropic · OpenRouter · Groq · DeepSeek · Ollama · Custom
@@ -33,6 +64,28 @@ development log lives in that monorepo's history.
   config flag, since the cargo feature, `AIZEN_MEM_DENSE`, and whether a model is installed all get a
   vote. New `embed_model` config field, overridden by `AIZEN_EMBED_MODEL`. `config show` gained the
   matching Memory section and now lists the Jina key too.
+- **Container hosting: `Dockerfile`, `docker-compose.yml`, and `deploy/k8s/`.** Two-stage build
+  (`rust:1.96-slim-bookworm` → `debian:bookworm-slim`, glibc because the release binary is glibc-linked)
+  producing a non-root image with the runtime the agent actually shells out to: `git`, `curl`, and
+  `tini` as PID 1 to reap the builds, tests, and language servers it spawns. No port is published,
+  because the daemon listens on nothing — Telegram is long-poll, Discord an outbound websocket — so
+  the container needs no ingress and no public URL.
+  The Kubernetes manifests are a StatefulSet with **one** replica and a ReadWriteOnce volume, and that
+  is the only correct shape rather than a starting point: Telegram allows one `getUpdates` poller per
+  token (a second gets 409 Conflict forever), the on-disk stores guard writes with local file locks
+  that do not coordinate across pods, and turns are processed serially so approval routing stays
+  race-free. Ships with a NetworkPolicy that denies all ingress and all *private* egress — including
+  `169.254.169.254`, the cloud metadata endpoint that hands out node credentials. That policy is the
+  layer that matters, because `net_guard`'s SSRF floor only covers the web tools and the agent also
+  has a shell, where `curl` never passes through it.
+- **`aizen serve --health`**, a liveness probe for container and orchestrator use. It reads a heartbeat
+  file the daemon stamps from inside its own `select!` loop and exits 0 or 1. The beat comes from the
+  loop itself on purpose: a detached ticker would keep beating while the loop was wedged, which is the
+  one failure a liveness probe exists to catch. The heartbeat records `idle` vs `busy` rather than a
+  bare timestamp, so a probe tight enough to notice a wedge (90s idle) does not restart a pod running
+  a legitimate 10-minute build (1800s busy, both tunable via `AIZEN_HEALTH_MAX_*_SECS`). An unknown
+  state falls back to plain freshness, so an old binary probing a newer daemon mid-rollout does not
+  kill a healthy pod.
 
 ### Changed
 - **API keys are visible while you type them** (setup, Connection, and the search keys). A masked
@@ -43,6 +96,13 @@ development log lives in that monorepo's history.
   retrieval knobs it feeds.
 
 ### Fixed
+- **`aizen serve` ignored SIGTERM.** Only Ctrl-C was handled, and SIGTERM is how systemd, `docker stop`,
+  and Kubernetes all ask a process to stop first — so the graceful path never ran and the daemon was
+  killed outright some seconds later. Every child it had spawned (builds, test runners, language
+  servers) was orphaned rather than reaped, and the heartbeat file was left behind claiming a live
+  process. It now handles both, logs which signal arrived, kills the process tree, and clears the
+  heartbeat before exiting. Windows has no SIGTERM; there `ctrl_c()` covers Ctrl-C and Ctrl-Break,
+  which is what the platform offers.
 - **The agent stopped mid-task instead of finishing it.** Three independent holes in the top-level
   loop, all of which surfaced the same way — partial work handed back with "say continue to carry
   on". A fix landed for sub-agents earlier; the loop the REPL actually drives still had all three.

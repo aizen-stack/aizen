@@ -985,6 +985,17 @@ pub fn set_working(working: bool) {
     }
 }
 
+/// The status line currently on screen. Needed by any surface that [`suspend`]s for a dialoguer
+/// prompt and must hand the SAME status back to [`resume`] — passing an empty string there blanks
+/// the footer for the rest of the session.
+pub fn current_status() -> String {
+    render()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .status
+        .clone()
+}
+
 /// Update the status text (model · tokens · yolo) and repaint. (Does not touch the output slot —
 /// see [`set_working`].)
 pub fn set_status(status: &str) {

@@ -148,6 +148,12 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     r.register(Box::new(crate::features::timemachine::CheckpointList));
     r.register(Box::new(crate::features::timemachine::CheckpointDiff));
     r.register(Box::new(crate::features::timemachine::CheckpointRestore));
+    // Who else is editing this repository right now. Top-level only, and not because it is unsafe
+    // (it is read-only): a sub-agent's writes are attributed to the SESSION that spawned it, so the
+    // overlap warning it would need already surfaces on this window's turn. Registering it in
+    // `subagent_read_only_base` would pay its schema on every delegated run for an answer the parent
+    // is the one acting on.
+    r.register(Box::new(crate::features::coop::TeamStatus));
     // Memory WRITE surface — top-level only. A sub-agent gets `memory_list`/`memory_search` but may
     // never mutate the user's long-term store: a specialist run is short-lived and unsupervised, so a
     // wrong write there would outlive the run it came from with no one having seen it.

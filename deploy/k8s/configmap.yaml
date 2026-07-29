@@ -1,0 +1,28 @@
+# Non-secret tuning. Anything with a credential in it belongs in the Secret, not here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aizen-config
+  namespace: aizen
+data:
+  # OpenAI-compatible endpoint + model. Change these to point at your provider.
+  AIZEN_BASE_URL: "https://api.openai.com/v1"
+  AIZEN_MODEL: "gpt-4o"
+
+  # The image is immutable, and /update works by renaming the running executable — pointless here and
+  # harmful if it half-succeeds. This disables the CHECK; there is no auto-apply to disable.
+  AIZEN_NO_UPDATE_CHECK: "1"
+
+  # Health deadlines read by `aizen serve --health` (src/hostbot/health.rs). The default busy leash is
+  # 1800s; raise it if your turns routinely run long, because the liveness probe will restart the pod
+  # mid-turn once this elapses. Lowering it below your slowest legitimate turn causes restart loops.
+  AIZEN_HEALTH_MAX_BUSY_SECS: "1800"
+  AIZEN_HEALTH_MAX_IDLE_SECS: "90"
+
+  # ── deliberately NOT set here ──
+  #
+  # AIZEN_ALLOW_PRIVATE_NET: the SSRF floor (src/core/net_guard.rs) refuses private/loopback/
+  # link-local fetches. In a cluster that means ClusterIP services are unreachable to `web_fetch` —
+  # which is the intended default, because the same flag also unblocks 169.254.169.254 (the node's
+  # instance metadata, i.e. cloud credentials). Set it only if the agent genuinely must reach an
+  # in-cluster service, and understand you are trading away that protection.

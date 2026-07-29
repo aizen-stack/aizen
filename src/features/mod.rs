@@ -4,6 +4,7 @@
 //! (Claude Code, Codex) so a conversation started there can be resumed here.
 
 pub mod commands;
+pub mod coop;
 pub mod crawl;
 pub mod cron;
 pub mod foreign_session;

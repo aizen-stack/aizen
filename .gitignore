@@ -19,6 +19,11 @@
 # demo video is embedded via GitHub web upload (user-attachments URL), not tracked in the repo
 dist/liveaizen.mp4
 
+# container env file — real tokens (model key, bot token). `.env.example` IS tracked; this is not.
+.env
+# the host directory docker-compose bind-mounts to /work (the agent's workspace, not our source)
+/workspace/
+
 # review scratch: crystallized diffs handed to review subagents (regenerated per review)
 .aizen-tmp/
 .main_diff.txt

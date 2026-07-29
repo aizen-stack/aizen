@@ -1,0 +1,25 @@
+# A headless service with no ports.
+#
+# This exists only because a StatefulSet's `serviceName` must name one — it is a schema requirement,
+# not a network need. The daemon listens on NOTHING: Telegram is long-poll (`getUpdates`), Discord is
+# an outbound gateway websocket. Nothing connects TO this pod, so there is no port to publish and no
+# ingress to configure.
+#
+# If you find yourself wanting to add a port here, check what for. There is no HTTP surface in the
+# binary; health is an exec probe against a heartbeat file (see statefulset.yaml).
+apiVersion: v1
+kind: Service
+metadata:
+  name: aizen
+  namespace: aizen
+  labels:
+    app: aizen
+spec:
+  clusterIP: None  # headless
+  selector:
+    app: aizen
+  ports:
+    # A placeholder port is required for the object to be valid; nothing listens on it.
+    - name: none
+      port: 9
+      targetPort: 9

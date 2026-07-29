@@ -131,6 +131,16 @@ const BUILTINS: &[Builtin] = &[
         argument_hint: "",
     },
     Builtin {
+        name: "team",
+        description: "see other aizen windows in this repo, their files, diffs, and commit their work",
+        argument_hint: "[status|diff <s>|claims|task <text>|done|commit <s>]",
+    },
+    Builtin {
+        name: "work",
+        description: "isolated git worktrees, one per session",
+        argument_hint: "[list|new <name>|remove <name>]",
+    },
+    Builtin {
         name: "agents",
         description: "list and configure specialist agents",
         argument_hint: "",

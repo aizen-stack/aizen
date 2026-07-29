@@ -1,0 +1,86 @@
+# Egress restriction for a pod that runs model-chosen shell commands.
+#
+# This is the k8s-native half of the same argument `net_guard.rs` makes in-process: the agent fetches
+# URLs it (or a prompt-injected page) chooses, so the reachable set should be the one you intended.
+# `net_guard` refuses private/loopback targets for the WEB TOOLS — but the agent also has a shell, and
+# `curl` from `shell_run` never passes through that check. Only the network layer covers both.
+#
+# What this allows: DNS, and all public egress. What it denies: every in-cluster address, the node's
+# link-local metadata endpoint (169.254.169.254 — cloud credentials), and all ingress.
+#
+# REQUIRES a CNI that enforces NetworkPolicy (Calico, Cilium, Antrea, ...). On a cluster without one
+# this object is accepted silently and enforces NOTHING — check before relying on it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aizen-egress
+  namespace: aizen
+spec:
+  podSelector:
+    matchLabels:
+      app: aizen
+  policyTypes:
+    - Ingress
+    - Egress
+
+  # Nothing connects to the daemon — it long-polls outward. So: no ingress at all.
+  ingress: []
+
+  egress:
+    # DNS to the cluster resolver. Without this nothing resolves and the pod looks broken in a way
+    # that's easy to misdiagnose as a token problem.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # Public internet: the model endpoint, api.telegram.org, the Discord gateway, git remotes,
+    # crates.io, whatever the agent fetches. The `except` blocks carve out everything private.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # Link-local — this is the important one. 169.254.169.254 is the cloud instance
+              # metadata service on AWS/GCP/Azure: reachable from any pod by default, and it hands
+              # out node credentials to whoever asks.
+              - 169.254.0.0/16
+              # RFC1918 — other pods, cluster services, the node itself, and your VPC.
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              # CGNAT (100.64/10) — used by some managed clusters for pod/service ranges, and by
+              # Tailscale. Blocked for the same reason as RFC1918.
+              - 100.64.0.0/10
+              # Loopback as a CIDR: harmless to list, and makes the intent explicit.
+              - 127.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+
+# ── if the agent must reach something in-cluster ───────────────────────────────────────
+#
+# Add a NARROW rule rather than widening the block above. For example, to allow a database in the
+# `data` namespace and nothing else private:
+#
+#   - to:
+#       - namespaceSelector:
+#           matchLabels:
+#             kubernetes.io/metadata.name: data
+#         podSelector:
+#           matchLabels:
+#             app: postgres
+#     ports:
+#       - protocol: TCP
+#         port: 5432
+#
+# You would ALSO need `AIZEN_ALLOW_PRIVATE_NET=1` for the web tools specifically (shell `curl` needs
+# only the network rule). Note what that env var costs: it is a single global switch with no
+# allowlist, so it re-permits the metadata endpoint for `web_fetch` too. The NetworkPolicy above is
+# what still blocks it — which is exactly why the two layers are both here.

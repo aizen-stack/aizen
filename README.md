@@ -68,7 +68,8 @@ https://github.com/user-attachments/assets/45bbdfc8-09a3-4995-870f-eb92452743c9
   and reusable skills mean the agent gets *more* useful over sessions instead of resetting every time.
 - **It runs where you aren't.** `aizen serve` turns any Telegram (or Discord) bot into a remote
   control for the agent on your machine — approve risky edits from your phone with a tap. Host it
-  24/7 as a systemd service on a VPS.
+  24/7 as a systemd service, a Docker container, or a Kubernetes StatefulSet — no inbound port, no
+  public URL, so it runs behind NAT.
 - **Safe by construction.** File/shell tools are confined to the working dir; a hard safety floor
   blocks catastrophic commands *even under auto-approve*; secrets are written owner-only and never
   printed. You stay in control of every destructive step.
@@ -82,7 +83,8 @@ https://github.com/user-attachments/assets/45bbdfc8-09a3-4995-870f-eb92452743c9
 | **Memory brain** | Offline, BM25-ranked, Unicode-aware (Vietnamese-safe) retrieval that **evolves from reuse** — no LLM, zero extra tokens. `#text` remembers a fact in one keystroke. Provable via `aizen bench memory`. |
 | **Persona + SOUL + skills** | A swappable **persona** with evolving self-memory (Generative-Agents style), a durable **SOUL** identity above every persona/project, and **skills** the agent loads on demand and *learns* automatically after real work. |
 | **Multi-agent** | `aizen workflow` fans out role-scoped sub-agents (mixture-of-agents) and merges the results; `/workflows` shows a live status registry of running tasks and workflows. |
-| **Remote control** | `aizen serve` (Telegram) / `aizen discord serve` — full `/` command menu, multi-bot hosting from one daemon, per-chat context, phone approvals, systemd self-host. |
+| **Remote control** | `aizen serve` (Telegram) / `aizen discord serve` — full `/` command menu, multi-bot hosting from one daemon, per-chat context, phone approvals. |
+| **Self-hosting** | systemd unit (`serve --install`), a non-root `Dockerfile` + `docker-compose.yml`, and `deploy/k8s/` (StatefulSet · RWO volume · deny-private-egress NetworkPolicy), all probed by `serve --health`. |
 | **Extensibility** | **MCP** servers (stdio/HTTP, OAuth 2.1 sign-in for Linear/Notion/Slack/Gmail/Atlassian) · custom markdown **slash-command macros** · outbound notify channels. |
 | **Web + browser** | `web_search` / `web_fetch` / `web_crawl` (katana-style crawler, SSRF-guarded) and opt-in **CDP browser tools** that drive a real Chrome/Edge — all pure-Rust, no headless engine bundled. |
 | **Safety + recovery** | Workspace confinement · hard command floor · owner-only secret files · crash-recoverable Git checkpoints (`/timemachine` · `/checkpoint`) · per-turn MCP schema pinning · per-conversation browser isolation. |
@@ -290,6 +292,67 @@ survives logout. Drop `--now` to just write the unit and print the enable steps;
 system unit (prints the `sudo` steps unless you're already root). `aizen serve --uninstall --user`
 removes it. On Windows/macOS the command prints the NSSM / launchd equivalent. Note: the bot lives only
 while the **VPS is on** — a powered-off VPS runs nothing (systemd restarts it the moment the VPS boots).
+
+### Host it in Docker
+
+Same daemon, packaged. Useful when you'd rather not install a toolchain on the host, or want the
+agent's shell commands confined to a container:
+
+```bash
+cp .env.example .env       # AIZEN_API_KEY + AIZEN_TELEGRAM_TOKEN
+docker compose up -d
+docker compose logs -f     # a first run prints a pairing code here — send it to your bot
+```
+
+Two things to know about the image. There is **no published port**, because the daemon listens on
+nothing — Telegram is long-poll, Discord an outbound websocket — so there's no ingress to expose or
+firewall. And `tini` is PID 1: the agent spawns builds, test runners, and language servers, and
+without a reaper those accumulate as zombies.
+
+Two volumes matter. `aizen-home` (`/home/aizen/.aizen`) holds everything that must outlive the
+container — the chat ids pairing wrote, sub-bot tokens, per-chat sessions, memory, the codebase index;
+lose it and you lose owner pairing and all memory. `./workspace` is mounted at `/work` and is what the
+agent edits, so mount only what you're willing to have edited (`:ro` for an audit-only run).
+
+Health is `aizen serve --health`, wired as the image's `HEALTHCHECK`. It reads a heartbeat the daemon
+stamps from inside its own event loop, and distinguishes idle from busy — so a probe tight enough to
+notice a wedged loop won't restart a container that's ten minutes into a legitimate build. Raise
+`AIZEN_HEALTH_MAX_BUSY_SECS` if your turns routinely run longer than 30 minutes.
+
+Build without the dense retrieval tier by passing `FEATURES=` (empty) — a smaller image, at the cost
+of the embedding-based memory tier.
+
+### Host it on Kubernetes
+
+Manifests in [`deploy/k8s/`](deploy/k8s/), with the reasoning in
+[`deploy/k8s/README.md`](deploy/k8s/README.md):
+
+```bash
+kubectl apply -f deploy/k8s/namespace.yaml
+kubectl -n aizen create secret generic aizen-secrets \
+  --from-literal=AIZEN_API_KEY='sk-...' \
+  --from-literal=AIZEN_TELEGRAM_TOKEN='123456:ABC-...'
+kubectl apply -k deploy/k8s/          # configmap, statefulset, service, networkpolicy
+kubectl -n aizen logs -f sts/aizen    # pairing code
+```
+
+It's a **StatefulSet with one replica**, and that's the finished shape rather than a starting point to
+scale from. Telegram allows exactly one `getUpdates` poller per token — a second replica gets HTTP 409
+forever, so it's one healthy pod plus one permanent crashloop, not double throughput. The on-disk
+stores guard writes with local file locks that don't coordinate across pods (hence `ReadWriteOnce`, not
+a shared volume). And turns run serially by design, which is what keeps approval routing race-free.
+
+If that sounds like it buys little over systemd, that's the honest read: pick k8s when you already run
+one and want its secret handling, node-failure rescheduling, and rollout mechanics — not for
+throughput. To host more bots, use `/addbot` in an existing daemon rather than adding replicas.
+
+The bundled `NetworkPolicy` is the part worth keeping even if you change everything else: it denies all
+ingress and all *private* egress, including `169.254.169.254`, the cloud metadata endpoint that hands
+out node credentials to any pod that asks. `net_guard`'s SSRF check covers the web tools, but the agent
+also has a shell, and `curl` from there never passes through it — only the network layer catches both.
+It needs a CNI that enforces NetworkPolicy (Calico, Cilium, Antrea); on a cluster without one the
+object is accepted and enforces nothing. The manifest also sets `automountServiceAccountToken: false`,
+since a shell that can read the projected token can talk to the API server as the pod.
 
 ## Configure
 
