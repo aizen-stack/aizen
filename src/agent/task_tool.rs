@@ -566,6 +566,12 @@ impl Tool for TaskTool {
             // used to discard every step it had already completed and surface to the parent as a bare
             // "sub-agent (coder) failed" — the work was gone, and the parent could only guess why.
             max_transient_retries: SUBAGENT_TRANSIENT_RETRIES,
+            // The dispatch loop below owns continuation for a sub-agent (`MAX_CONTINUATIONS` on a
+            // persistent `msgs`), so the in-loop grant must stay off here — otherwise a large task
+            // would multiply the two budgets together. Stall recovery likewise reads the
+            // process-global todo list, which is the PARENT's plan, not this child's ScopedTodo.
+            max_continuations: 0,
+            max_stall_recoveries: 0,
             ..AgentConfig::default()
         };
 

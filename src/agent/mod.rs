@@ -489,10 +489,11 @@ pub struct AgentConfig {
     /// How many times an ORDINARY (non-goal-mode) turn retries a TRANSIENT model-call failure
     /// (429/5xx/transport/timeout) with backoff before giving up. Permanent 4xx is never retried here.
     ///
-    /// `0` at the top level, deliberately: the REPL surfaces the error to a user who is right there
-    /// and can re-ask, and a silent retry would just look like a hang. DELEGATED loops set it > 0 —
-    /// nobody is watching a sub-agent, and one transient blip used to discard every step it had
-    /// completed and come back as a bare "sub-agent (coder) failed".
+    /// Non-zero even at the top level: a 429/5xx twenty steps into a task used to throw away every
+    /// step already completed and surface as a bare error the user could only answer with "continue".
+    /// Kept SMALL (2) rather than the delegated budget (4) precisely because someone is watching —
+    /// each attempt prints a retry line, so it reads as work-in-progress, not as a hang. Permanent
+    /// 4xx is never retried here: it cannot fix itself and burning backoff only delays the report.
     pub max_transient_retries: usize,
     /// GOAL MODE (`/goal <text>`). `Some(goal)` makes the loop run until the goal is genuinely
     /// finished — the iteration cap is bypassed (stop only on Esc or a verified completion), and
@@ -509,6 +510,24 @@ pub struct AgentConfig {
     /// workflow children leave it `false` so a steer aimed at the main task can't be swallowed by a
     /// delegated child. Default `false` (the mailbox is process-global; opting in is explicit).
     pub enable_steering: bool,
+    /// How many times a run that is STILL MAKING PROGRESS may be granted a fresh step budget after
+    /// exhausting `auto_extend_to`, instead of being cut off with [`StopReason::MaxIters`].
+    ///
+    /// The step cap exists to bound a *wandering* loop, but it was also cutting off healthy ones: a
+    /// genuinely large task (many files, many verify rounds) would hit 50 steps mid-work, synthesize
+    /// a "here's how far I got" summary, and hand the user a partial result they had to restart with
+    /// "continue". A run that is neither stalled (evidence ledger flat) nor looping (divergence latch
+    /// open) has no diagnosis problem — it just needs more room, so it gets another `max_iters`
+    /// worth. Each grant re-injects the task-completion contract, so the extra room is spent
+    /// finishing rather than drifting. `0` = the old hard-stop behavior (delegated children set this,
+    /// since `task`/`workflow` own their own continuation loop one level up).
+    pub max_continuations: usize,
+    /// How many times an evidence-flat stop may be converted into a "take a genuinely different
+    /// approach" turn instead of ending the run — but ONLY while the run has declared work still
+    /// open (incomplete todos, per `enable_todo_poke`). Without an open plan the stall guard is
+    /// almost always right and stops as before; with one, ending the run silently abandons work the
+    /// model itself said was unfinished. `0` = the old behavior (delegated children keep it).
+    pub max_stall_recoveries: usize,
     /// MID-TURN PERSISTENCE hook, called at each iteration boundary with the conversation so far.
     ///
     /// The loop borrows `messages` mutably for the whole turn, so nothing outside it can observe
@@ -560,7 +579,9 @@ impl Default for AgentConfig {
             enable_hill_climb: true,
             hill_climb_gate: 90,
             hill_climb_reminder_every: 6,
-            max_transient_retries: 0, // top level: the user sees the error and can re-ask
+            max_transient_retries: 2, // survive a gateway blip mid-task instead of losing the work
+            max_continuations: 3,
+            max_stall_recoveries: 1,
             goal: None,
             enable_steering: false,
             on_progress: None,
@@ -727,6 +748,12 @@ where
     let schema_overhead = estimate_defs_tokens(&defs);
     let mut cap = cfg.max_iters;
     let mut extended = false;
+    // Fresh budgets granted to a still-progressing run after the one-shot extension was spent, and
+    // stall-guard stops converted into a change-of-approach turn. Both are bounded (see
+    // `max_continuations` / `max_stall_recoveries`) so "don't stop early" can never become "never
+    // stop": a run that goes flat or starts looping loses the privilege immediately.
+    let mut continuations = 0usize;
+    let mut stall_recoveries = 0usize;
     // W1/W6: ring of recent EXECUTED-turn signatures for A,A + A,B,A,B detection, plus per-
     // signature nudge memory. nudged_sigs is cleared by any productive turn, so a legitimately
     // repeated call AFTER real progress earns a fresh nudge instead of an instant hard-stop (the
@@ -806,6 +833,7 @@ where
             });
         }
         if !goal_mode && iter >= cap {
+            let healthy = !stall.is_stalled() && nudged_sigs.is_empty();
             if should_auto_extend(
                 cfg.max_iters,
                 cap,
@@ -821,6 +849,34 @@ where
                     NUDGE_STEP_LIMIT,
                     "You are nearing the step limit. Finish the task now, or stop and state what is blocking you.",
                 );
+            } else if healthy && continuations < cfg.max_continuations {
+                // CONTINUATION: the one-shot extension is spent, but this run is neither stalled nor
+                // looping — it is simply a big task still moving. Cutting it here is what made aizen
+                // hand back partial work and wait for the user to type "continue"; do that for it
+                // instead. A `user`-role message (not a soft system nudge) so the model cannot treat
+                // it as ambient noise, and the whole conversation is preserved, so this is a
+                // CONTINUATION of the work, not a restart of it.
+                continuations += 1;
+                cap = cap.saturating_add(cfg.max_iters.max(1));
+                if !cfg.quiet {
+                    let line = format!(
+                        "→ continuing past the step limit ({}/{}) — the task is still progressing",
+                        continuations, cfg.max_continuations
+                    );
+                    if crate::ui::tui::active() {
+                        crate::ui::tui::emit_line(&line);
+                    } else {
+                        eprintln!("{line}");
+                    }
+                }
+                messages.push(Message::user(format!(
+                    "{CONTINUE_PREFIX} You used your step budget but the task is NOT finished and you \
+                     are still making progress, so you have more room ({continuations}/{}).\n\n\
+                     Keep going from exactly where you are — do not restart, re-plan from scratch, or \
+                     re-summarize what you already did. Finish the remaining work and verify it. If \
+                     something is genuinely blocking you, say what it is instead of stopping silently.",
+                    cfg.max_continuations
+                )));
             } else {
                 break;
             }
@@ -1196,7 +1252,8 @@ where
                         let delay = crate::llm::client::goal_backoff_ms(attempt);
                         attempt += 1;
                         if !cfg.quiet {
-                            goal_retry_line(
+                            retry_line(
+                                "transient",
                                 &format!(
                                     "API error; retry {attempt}/{}",
                                     cfg.max_transient_retries
@@ -1727,6 +1784,45 @@ where
         // Stop only after a warning has already been given and another turn still adds no evidence.
         // There is no separate hard turn-count threshold: genuine evidence resets the episode.
         if stall.should_stop() {
+            // STALL RECOVERY: the ledger is right that the last few turns added nothing — but if the
+            // model's OWN plan still has open items, ending here abandons work it declared unfinished
+            // and reports a partial result as the answer. Spend one bounded recovery instead: reset
+            // the flat episode and hand back a turn that must change approach. Gated on an open todo
+            // list (evidence the work isn't done) and on the run not ALSO being in a signature loop,
+            // so a genuinely looping run still hard-stops. Budget-bounded: a run that goes flat again
+            // after this stops for real.
+            if stall_recoveries < cfg.max_stall_recoveries
+                && cfg.enable_todo_poke
+                && nudged_sigs.is_empty()
+                && todo::has_incomplete()
+            {
+                stall_recoveries += 1;
+                stall.recover();
+                if !cfg.quiet {
+                    let line = format!(
+                        "→ stall recovery {}/{} — todos still open, changing approach instead of stopping",
+                        stall_recoveries, cfg.max_stall_recoveries
+                    );
+                    if crate::ui::tui::active() {
+                        crate::ui::tui::emit_line(&line);
+                    } else {
+                        eprintln!("{line}");
+                    }
+                }
+                let open = todo::incomplete_summary(600).unwrap_or_default();
+                messages.push(Message::user(format!(
+                    "{CONTINUE_PREFIX} Your last few attempts added no new evidence, but your task \
+                     list still has open items — so you are not finished.\n\n\
+                     Still open:\n{open}\n\n\
+                     Do NOT retry the same approach again. Pick a genuinely different route (read the \
+                     actual state instead of guessing, try another tool, narrow the problem), or — if \
+                     an item is truly impossible — say exactly why and mark it accordingly. \
+                     Recovery {stall_recoveries}/{}.",
+                    cfg.max_stall_recoveries
+                )));
+                iter += 1;
+                continue;
+            }
             let final_text = synthesize_final(
                 &chat,
                 messages,
@@ -2944,6 +3040,16 @@ impl StallLedger {
         self.nudged = true;
     }
 
+    /// Clear the flat episode after a bounded stall RECOVERY (see `max_stall_recoveries`): the run
+    /// gets a clean slate to try a different approach on. `nudged` resets too, so the next flat
+    /// episode re-earns its warning before it can stop the run — the warn-then-stop contract holds
+    /// per episode. The success/failure key sets are deliberately kept: they are the memory of what
+    /// has already been ruled out, and forgetting them would let a re-read masquerade as new evidence.
+    fn recover(&mut self) {
+        self.flat = 0;
+        self.nudged = false;
+    }
+
     fn is_stalled(&self) -> bool {
         self.flat >= FLAT_TURNS_BEFORE_NUDGE
     }
@@ -3604,6 +3710,10 @@ const NUDGE_HILL_CLIMB: &str = "[hill-climb]";
 /// completion via `goal_complete`, so we re-inject the goal text and keep it working. Mirrors the
 /// todo-poke gate's shape (a `user` message the model can't ignore), not a soft system nudge.
 const GOAL_POKE_PREFIX: &str = "[goal]";
+/// Budget-continuation / stall-recovery inject (user role — a hard "you are not done" block, same
+/// shape as the todo-poke and goal pokes rather than a soft system nudge). Shared by both paths so
+/// the transcript reads with one consistent marker for "the harness granted more room".
+const CONTINUE_PREFIX: &str = "[continue]";
 /// Save-before-clear warning (P-ctx2). Mirrors Claude's server-side "preserve important information"
 /// warning: fired ONCE, the turn BEFORE the first tool-result eviction, so the model can persist
 /// anything durable (memory files, todo_write) while the old results are still in context.
@@ -3619,7 +3729,15 @@ const NUDGE_BUDGET: &str = "Context budget:";
 /// failure shape and the wait, never the URL, key, or body (which could leak a token). Routed
 /// through the TUI when active so it lands in the retained buffer, else stderr.
 fn goal_retry_line(reason: &str, delay_ms: u64) {
-    let line = format!("⟳ goal: {reason} — retrying in {delay_ms}ms");
+    retry_line("goal", reason, delay_ms)
+}
+
+/// The retry trace, with the LANE it belongs to. Ordinary top-level turns retry too now (see
+/// `AgentConfig::max_transient_retries`), and labelling those `goal:` would report a mode the user
+/// never entered — the line exists so a backoff reads as work-in-progress rather than a hang, which
+/// only works if it names the right thing.
+fn retry_line(lane: &str, reason: &str, delay_ms: u64) {
+    let line = format!("⟳ {lane}: {reason} — retrying in {delay_ms}ms");
     if crate::ui::tui::active() {
         crate::ui::tui::emit_line(&line);
     } else {
@@ -4554,11 +4672,40 @@ mod tests {
             // Mirrors the production top-level default: a chat error is fatal unless a test opts in
             // (the delegated-loop tests set it explicitly).
             max_transient_retries: 0,
+            // Continuation / stall recovery OFF by default in unit tests: most scripts assert the
+            // RAW guard behavior (this many steps → MaxIters, this many flat turns → Divergence), and
+            // a default grant would silently change what those assertions mean. The tests that own
+            // these knobs set them explicitly.
+            max_continuations: 0,
+            max_stall_recoveries: 0,
             goal: None, // goal mode OFF in unit tests unless a test arms it
             // Steering OFF by default in unit tests: the mailbox is process-global, so an unrelated
             // script must not pick up a steer a steering test left behind.
             enable_steering: false,
             on_progress: None, // no live-history publishing in unit tests
+        }
+    }
+
+    /// The PRODUCTION defaults, with only the non-hermetic bits neutralized (verify gate spawns a
+    /// real `cargo check`; checkpoints would pollute this repo; the P0 gates read a process-global
+    /// todo list shared with other tests). Everything the "don't stop early" behavior depends on —
+    /// `max_transient_retries`, `max_continuations`, `max_stall_recoveries`, the caps — is left
+    /// exactly as shipped, so these tests fail if a default regresses. Contrast with [`cfg`], which
+    /// zeroes the grants to assert the raw guards.
+    impl AgentConfig {
+        fn production_defaults_for_test() -> Self {
+            Self {
+                enable_verify_gate: false,
+                auto_checkpoint: false,
+                checkpoint_each_edit: false,
+                enable_todo_poke: false,
+                enable_confidence_gate: false,
+                enable_hill_climb: false,
+                todo_reminder_every: 0,
+                enable_lsp: false,
+                quiet: true,
+                ..Self::default()
+            }
         }
     }
 
@@ -5505,6 +5652,269 @@ mod tests {
             "a repeat after real progress gets a fresh nudge, not a stop"
         );
         assert_eq!(out.final_text.as_deref(), Some("recovered"));
+    }
+
+    #[tokio::test]
+    async fn a_progressing_run_is_continued_past_the_step_cap_instead_of_cut_off() {
+        // THE regression this exists for: aizen stopping mid-task. A run that keeps producing NEW
+        // evidence every turn is not wandering — it is a big task still moving — but the step cap cut
+        // it off anyway, synthesized "here's how far I got", and left the user to type "continue".
+        // With a continuation budget it grants itself the room and finishes.
+        let r = registry();
+        let c = AgentConfig {
+            max_iters: 3,
+            auto_extend_to: 6, // one auto-extend, then continuations take over
+            max_continuations: 2,
+            ..cfg()
+        };
+        // 11 productive turns: 3 (cap) + 3 (extend) + 3 + 3 (two continuations) = 12 slots available.
+        let mut turns: Vec<_> = (0..11)
+            .map(|i| tool_turn("echo", &format!(r#"{{"text":"new {i}"}}"#)))
+            .collect();
+        turns.push(final_turn("finished the whole task"));
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let out = run_agent_loop(scripted(turns), &c, &r, &mut messages)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::Done,
+            "a progressing run must finish, not hit the cap"
+        );
+        assert_eq!(out.final_text.as_deref(), Some("finished the whole task"));
+        assert!(
+            out.iters > c.auto_extend_to,
+            "it must actually have run past the extended cap ({} steps)",
+            out.iters
+        );
+        // The grant is a `user`-role block the model can't treat as ambient noise, and it says
+        // "continue from where you are" rather than "start over".
+        let grants: Vec<_> = messages
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|t| t.starts_with(CONTINUE_PREFIX))
+            })
+            .collect();
+        assert_eq!(grants.len(), 2, "both continuations must be injected");
+        assert!(grants[0]
+            .content
+            .as_deref()
+            .is_some_and(|t| t.contains("do not restart")));
+        assert_valid_history(&messages);
+    }
+
+    #[tokio::test]
+    async fn continuation_budget_is_a_ceiling_not_a_licence_to_run_forever() {
+        // "Don't stop early" must never become "never stop". Once the continuation budget is spent, a
+        // still-progressing run DOES hit MaxIters — bounded by
+        // `auto_extend_to + max_continuations * max_iters`.
+        let r = registry();
+        let c = AgentConfig {
+            max_iters: 2,
+            auto_extend_to: 4,
+            max_continuations: 1,
+            ..cfg()
+        };
+        // Endless novel progress: 4 (extended) + 2 (one continuation) = 6 steps, then stop.
+        let turns: Vec<_> = (0..40)
+            .map(|i| tool_turn("echo", &format!(r#"{{"text":"new {i}"}}"#)))
+            .collect();
+        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(out.stop, StopReason::MaxIters);
+        assert_eq!(
+            out.iters, 6,
+            "the ceiling is auto_extend_to + max_continuations * max_iters"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_looping_or_stalled_run_is_never_granted_a_continuation() {
+        // The grant is conditional on HEALTH, and health is judged by the same two signals the
+        // auto-extend uses: an open divergence latch or a flat evidence ledger. A run that is
+        // thrashing must still be stopped promptly — otherwise the continuation budget would just
+        // multiply the length of a loop the guards exist to cut.
+        let r = registry();
+        let c = AgentConfig {
+            max_iters: 8,
+            auto_extend_to: 8, // room to spare: the GUARD must end this, not the cap
+            max_continuations: 5, // generous — and still must not be spent
+            ..cfg()
+        };
+        // Same failing call forever: the divergence latch + flat ledger both fire.
+        let turns: Vec<_> = (0..20).map(|_| tool_turn("fail", "{}")).collect();
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let out = run_agent_loop(scripted(turns), &c, &r, &mut messages)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::Divergence,
+            "a thrashing run is stopped by the guards, not extended by the grant"
+        );
+        assert!(
+            out.iters <= 4,
+            "and it stops promptly ({} steps)",
+            out.iters
+        );
+        assert!(
+            !messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|t| t.starts_with(CONTINUE_PREFIX))),
+            "an unhealthy run is never granted a continuation"
+        );
+
+        // The other route to the same rule: when the cap is reached WHILE the latch is open, the
+        // boundary breaks (MaxIters) instead of handing out room — the grant is gated on health, and a
+        // small cap must not turn a thrashing run into a long one.
+        let c_tight = AgentConfig {
+            max_iters: 2,
+            auto_extend_to: 4,
+            max_continuations: 5,
+            ..cfg()
+        };
+        let turns2: Vec<_> = (0..20).map(|_| tool_turn("fail", "{}")).collect();
+        let mut messages2 = vec![Message::system("sys"), Message::user("task")];
+        let out2 = run_agent_loop(scripted(turns2), &c_tight, &r, &mut messages2)
+            .await
+            .unwrap();
+        assert!(
+            out2.iters <= 4,
+            "the tight cap still bounds a thrashing run ({} steps)",
+            out2.iters
+        );
+        assert!(
+            !messages2.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|t| t.starts_with(CONTINUE_PREFIX))),
+            "…and grants nothing on the way out"
+        );
+    }
+
+    #[tokio::test]
+    async fn stall_recovery_changes_approach_while_todos_are_open_then_stops() {
+        // The stall guard is right that nothing new landed — but with the model's OWN plan still open,
+        // ending the run abandons work it declared unfinished. One bounded recovery turn is spent
+        // demanding a different approach; if the run goes flat AGAIN, it stops for real.
+        let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        todo::set(vec![
+            todo::Todo::new("still-open", todo::Status::InProgress),
+        ]);
+        let r = registry();
+        let c = AgentConfig {
+            max_iters: 30,
+            auto_extend_to: 30,
+            enable_todo_poke: true, // the gate that says "this run has a declared plan"
+            max_stall_recoveries: 1,
+            ..cfg()
+        };
+        // Distinct args, ONE failure class → no signature loop, but the ledger goes flat.
+        let mut turns: Vec<_> = (1..=8)
+            .map(|n| tool_turn("fail", &format!(r#"{{"n":"{n}"}}"#)))
+            .collect();
+        turns.push(final_turn("gave the best answer"));
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let out = run_agent_loop(scripted(turns), &c, &r, &mut messages)
+            .await
+            .unwrap();
+        todo::clear();
+        assert_eq!(
+            out.stop,
+            StopReason::Divergence,
+            "the budget is a ceiling: a second flat episode stops the run"
+        );
+        let recoveries = messages
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|t| t.starts_with(CONTINUE_PREFIX))
+            })
+            .count();
+        assert_eq!(recoveries, 1, "exactly one recovery, then a real stop");
+        assert!(
+            messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|t| t.contains("genuinely different route"))),
+            "the recovery must demand a DIFFERENT approach, not a retry"
+        );
+        assert!(
+            out.iters > 4,
+            "the recovery must have bought real extra turns ({} steps)",
+            out.iters
+        );
+        assert_valid_history(&messages);
+    }
+
+    #[tokio::test]
+    async fn no_stall_recovery_without_an_open_plan() {
+        // Without incomplete todos there is no evidence the work is unfinished, so the stall guard
+        // keeps its original prompt stop — the recovery must not fire on every flat run.
+        let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        todo::clear();
+        let r = registry();
+        let c = AgentConfig {
+            max_iters: 30,
+            auto_extend_to: 30,
+            enable_todo_poke: true,
+            max_stall_recoveries: 1,
+            ..cfg()
+        };
+        let mut turns: Vec<_> = (1..=4)
+            .map(|n| tool_turn("fail", &format!(r#"{{"n":"{n}"}}"#)))
+            .collect();
+        turns.push(final_turn("synth-answer"));
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let out = run_agent_loop(scripted(turns), &c, &r, &mut messages)
+            .await
+            .unwrap();
+        assert_eq!(out.stop, StopReason::Divergence);
+        assert_eq!(out.iters, 4, "no recovery → the original prompt stop");
+        assert!(
+            !messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|t| t.starts_with(CONTINUE_PREFIX))),
+            "no plan open → no recovery inject"
+        );
+    }
+
+    #[test]
+    fn stall_recovery_resets_the_episode_but_keeps_what_was_ruled_out() {
+        // `recover` must clear the flat episode AND the nudged latch (so the next episode re-earns its
+        // warning before it can stop the run), while KEEPING the success/failure keys — those are the
+        // memory of what has been ruled out, and forgetting them would let a re-read pose as evidence.
+        let mut ledger = StallLedger::new(0);
+        assert!(ledger.note_failure("fail", "error: boom"));
+        ledger.observe(false);
+        ledger.observe(false);
+        assert!(ledger.should_nudge());
+        ledger.mark_nudged();
+        ledger.observe(false);
+        assert!(ledger.should_stop());
+
+        ledger.recover();
+        assert!(!ledger.should_stop(), "the episode is cleared");
+        assert!(!ledger.should_nudge(), "and the warning is re-earned first");
+        assert!(
+            !ledger.note_failure("fail", "error: boom"),
+            "the same failure class is still known — no fake evidence"
+        );
+        // A second flat episode still warns, then stops: the contract holds per episode.
+        ledger.observe(false);
+        ledger.observe(false);
+        assert!(ledger.should_nudge());
+        ledger.mark_nudged();
+        ledger.observe(false);
+        assert!(ledger.should_stop(), "it can still stop for real");
     }
 
     #[tokio::test]
@@ -6742,24 +7152,52 @@ mod tests {
 
     #[tokio::test]
     async fn normal_mode_chat_error_is_fatal_and_no_goal_tool() {
-        // The control: with goal mode OFF, a chat error stays fatal (the old behavior is unchanged),
-        // proving the retry logic is gated strictly on `cfg.goal`.
+        // With a ZERO retry budget, a chat error is fatal — the retry is driven by the budget alone,
+        // not by `cfg.goal`. (The production top level now carries a small non-zero budget; that is
+        // asserted separately by `top_level_default_absorbs_a_transient_blip`.)
         let r = registry();
-        let c = cfg(); // goal: None
+        let c = cfg(); // goal: None, max_transient_retries: 0
         let mut messages = vec![Message::system("sys"), Message::user("task")];
         let chat = scripted_results(vec![Err(anyhow::anyhow!(
             "upstream returned HTTP 503: overloaded"
         ))]);
         let res = run_agent_loop(chat, &c, &r, &mut messages).await;
-        assert!(res.is_err(), "ordinary turns keep the fatal-on-error path");
+        assert!(res.is_err(), "a zero budget keeps the fatal-on-error path");
         assert_eq!(
             c.max_transient_retries, 0,
-            "the top-level default is what keeps it fatal"
+            "the zero budget is what keeps it fatal"
         );
+    }
+
+    #[tokio::test]
+    async fn top_level_default_absorbs_a_transient_blip() {
+        // The top level used to run with `max_transient_retries: 0`, so one 429/5xx twenty steps into
+        // a task discarded every step already completed and surfaced as an error the user could only
+        // answer with "continue". It now carries a small budget: the blip is absorbed and the work
+        // lands. Kept SMALL on purpose — someone is watching, and each attempt prints a retry line.
+        let r = registry();
+        let c = AgentConfig {
+            quiet: true,
+            ..AgentConfig::production_defaults_for_test()
+        };
+        assert!(
+            c.max_transient_retries > 0,
+            "the production top-level default must absorb a blip"
+        );
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let chat = scripted_results(vec![
+            Err(anyhow::anyhow!(
+                "upstream returned HTTP 503 Service Unavailable: overloaded"
+            )),
+            Ok(tool_turn("echo", r#"{"text":"real work"}"#)),
+            Ok(final_turn("finished despite the blip")),
+        ]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done);
         assert_eq!(
-            AgentConfig::default().max_transient_retries,
-            0,
-            "production top-level config agrees with the test cfg"
+            out.final_text.as_deref(),
+            Some("finished despite the blip"),
+            "the transient error must not discard the run"
         );
     }
 

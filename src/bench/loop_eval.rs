@@ -553,6 +553,12 @@ fn eval_cfg() -> AgentConfig {
         enable_todo_poke: false,
         enable_confidence_gate: false,
         enable_hill_climb: false,
+        // The eval measures the RAW loop shape: "this script must reach MaxIters / Divergence within
+        // N steps". Continuation and stall recovery are grants layered ON TOP of those guards, so
+        // leaving them at the production default would change what every anti-loop scenario asserts.
+        // Their own behavior is covered by unit tests in `agent::tests`.
+        max_continuations: 0,
+        max_stall_recoveries: 0,
         ..AgentConfig::default()
     }
 }

@@ -35,6 +35,12 @@ const CHILD_AUTO_EXTEND: usize = 30;
 /// Transient model-call failures a workflow child absorbs per turn before giving up (see
 /// `AgentConfig::max_transient_retries`). Matches the `task` tool's sub-agent policy.
 const CHILD_TRANSIENT_RETRIES: usize = 4;
+/// Fresh step budgets a STILL-PROGRESSING workflow child may be granted after its auto-extend is
+/// spent, instead of returning partial work as `status: "max-iters"` (see
+/// `AgentConfig::max_continuations`). Smaller than the top level's: children are meant to be narrow,
+/// and up to `MAX_PARALLEL` of them run at once, so the worst case is bounded by
+/// `MAX_PARALLEL × (CHILD_AUTO_EXTEND + CHILD_CONTINUATIONS × CHILD_MAX_ITERS)`.
+const CHILD_CONTINUATIONS: usize = 2;
 
 /// Cap each child's summary before stuffing it into the synthesis prompt (chars). Prevents 5 verbose
 /// children from blowing the synth context / $$.
@@ -662,6 +668,13 @@ async fn run_one_task(
         // Same reason as the `task` tool: a workflow child runs unwatched, and a transient gateway
         // error used to reduce a whole child's work to `status: "error"` in the synthesis input.
         max_transient_retries: CHILD_TRANSIENT_RETRIES,
+        // Unlike the `task` tool, nothing resumes a workflow child — a budget exhaustion here becomes
+        // `status: "max-iters"` in the synthesis input, i.e. partial work presented as a result. Grant
+        // the same in-loop continuation the top level gets, but smaller: children are meant to be
+        // narrow, and N of them run concurrently. Stall recovery stays off — it reads the
+        // process-global todo list, which belongs to the orchestrating turn, not this child.
+        max_continuations: CHILD_CONTINUATIONS,
+        max_stall_recoveries: 0,
         // Sub-agents leave context_window 0 (no tool-result clearing) — workflow children are short.
         // enable_lsp default true is fine; tools only appear if registered in the sub-agent registry.
         ..AgentConfig::default()
