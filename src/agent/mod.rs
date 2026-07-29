@@ -776,6 +776,12 @@ where
     // CUMULATIVE edit flag — set once any successful edit lands; arms the one-shot self-review AND
     // gates the verify gate (a run that never edited has nothing to verify).
     let mut made_any_edits = false;
+    // WHERE the most recent successful edit landed (a directory), so the verify gate can typecheck
+    // the tree the edit actually touched rather than the process cwd. The two differ constantly — a
+    // session launched from the home directory editing `Desktop/proj/src/x.js` — exactly the gap the
+    // pre-edit checkpoint already discovers via `target_dir`; the gate must not lag behind it. `None`
+    // (no path named, or the edit was `shell_run`) keeps the cwd-relative fallback.
+    let mut last_edit_dir: Option<std::path::PathBuf> = None;
     // Operation-scoped checkpoint latch: set only after a pre-edit checkpoint succeeds. Approval is
     // evaluated first; a declined call must never run Git hooks/filters or mutate recovery metadata.
     let mut auto_checkpointed = false;
@@ -1216,12 +1222,18 @@ where
                 }
             }
         } else {
-            // ORDINARY TURNS: a bounded TRANSIENT retry, then fatal. `max_transient_retries` is 0 at
-            // the top level (unchanged behavior: the REPL shows the error and the user is right there
-            // to re-ask), but non-zero for a delegated sub-agent — nobody is watching that loop, and
-            // one 429/5xx mid-run used to throw away every step of work it had already done and
-            // surface as a bare "sub-agent failed". Permanent 4xx never retries here: it can't fix
-            // itself and burning backoff on it only delays the report.
+            // ORDINARY TURNS: a bounded TRANSIENT retry, then fatal. `max_transient_retries` is
+            // SMALL (2) at the top level and LARGER (4) for a delegated sub-agent — nobody is
+            // watching that loop, and one 429/5xx mid-run used to throw away every step of work it
+            // had already done and surface as a bare "sub-agent failed". Permanent 4xx never retries
+            // here: it can't fix itself and burning backoff on it only delays the report.
+            //
+            // EMPTY-200 (a 200 with neither content nor a tool call) is retried on the SAME budget:
+            // it is the same silent-provider-failure goal mode already guards against, and outside
+            // goal mode it used to feed an empty turn straight into the done cascade — the model
+            // going quiet mid-task and the loop reporting an empty "Done". Bounded (not indefinite
+            // like goal mode) because someone is watching; if it survives the budget it falls
+            // through, unchanged.
             let mut attempt: u32 = 0;
             loop {
                 match crate::core::cancel::race(&cfg.cancel, chat(messages.clone(), defs.clone()))
@@ -1237,7 +1249,39 @@ where
                             stop: StopReason::Cancelled,
                         });
                     }
-                    Some(Ok(t)) => break t,
+                    Some(Ok(t)) => {
+                        let empty_200 = t.tool_calls.is_empty()
+                            && t.content
+                                .as_deref()
+                                .map(|s| s.trim().is_empty())
+                                .unwrap_or(true);
+                        if empty_200 && (attempt as usize) < cfg.max_transient_retries {
+                            let delay = crate::llm::client::goal_backoff_ms(attempt);
+                            attempt += 1;
+                            if !cfg.quiet {
+                                retry_line(
+                                    "empty",
+                                    &format!(
+                                        "empty response; retry {attempt}/{}",
+                                        cfg.max_transient_retries
+                                    ),
+                                    delay,
+                                );
+                            }
+                            if goal_sleep_or_cancel(&cfg.cancel, delay).await {
+                                if nudge_pushed {
+                                    messages.pop();
+                                }
+                                return Ok(AgentOutcome {
+                                    final_text: None,
+                                    iters: iter,
+                                    stop: StopReason::Cancelled,
+                                });
+                            }
+                            continue;
+                        }
+                        break t;
+                    }
                     Some(Err(e)) => {
                         let transient = matches!(
                             crate::llm::client::classify_api_error(&e),
@@ -1333,13 +1377,22 @@ where
                 && !verify_passed
                 && verify_attempts < cfg.max_verify_attempts
             {
-                // Canonicalize to match the tool-registry root (`builtin::resolve_root`), so the
-                // gate typechecks the same tree the file tools were confined to.
+                // Typecheck the tree the edits ACTUALLY landed in, not the process cwd. Since the
+                // confine guard was removed, a write can land outside cwd (a session launched from
+                // home editing `Desktop/proj/src/x.js`), and the checkpoint path already discovers
+                // the repo from the write target for exactly this reason — the gate must match, or it
+                // typechecks the wrong tree (or finds no manifest and skips verification silently).
+                // `verify_root` walks up from the edit dir to the nearest project manifest; falling
+                // back to cwd only when this run never named an edit path (e.g. shell-only edits).
                 let cwd = std::env::current_dir()
                     .and_then(|p| p.canonicalize())
                     .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let gate_dir = last_edit_dir
+                    .as_deref()
+                    .and_then(verify_gate::verify_root)
+                    .unwrap_or(cwd);
                 if let Some(result) =
-                    verify_gate::run_verify_gate(&cwd, cfg.verify_gate_timeout_secs).await
+                    verify_gate::run_verify_gate(&gate_dir, cfg.verify_gate_timeout_secs).await
                 {
                     if !cfg.quiet {
                         if result.passed {
@@ -1713,6 +1766,26 @@ where
             made_any_edits = true;
             // Fresh work invalidates any prior clean check — the gate must re-verify (W8).
             verify_passed = false;
+            // Remember WHERE this turn's edit landed so the verify gate typechecks that tree, not the
+            // process cwd. Take the target of the LAST edit whose result wasn't an error/no-op — the
+            // same successful-op filter `turn_made_edits` used — matching the checkpoint's
+            // `target_dir` discovery. A named path yields its parent dir; `None` (e.g. `shell_run`)
+            // leaves the previous value, so the gate falls back to cwd only when nothing better exists.
+            for (tc, (_, result)) in calls.iter().zip(&results) {
+                let Some(t) = registry.get(&tc.function.name) else {
+                    continue;
+                };
+                if result.starts_with("error:")
+                    || result.starts_with(crate::agent::builtin::NOOP_WRITE_PREFIX)
+                {
+                    continue;
+                }
+                let args = parse_call_args(&tc.function.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                if let Some(dir) = t.workspace_target(&args) {
+                    last_edit_dir = Some(dir);
+                }
+            }
             // PER-STEP CHECKPOINT (Cline-style): after each turn whose edits SUCCEEDED, stamp a
             // restore point so every editing step is independently rewindable — not just the whole
             // run from the single pre-edit snapshot. Best-effort; `save` dedups a zero-diff tree, so
@@ -7089,6 +7162,51 @@ mod tests {
             "empty-200 was retried, never poked as a premature stop"
         );
         crate::agent::goal::clear();
+    }
+
+    #[tokio::test]
+    async fn ordinary_mode_retries_empty_200_instead_of_reporting_empty_done() {
+        // NOT goal mode. An empty-200 (no content, no tool calls) used to fall straight into the done
+        // cascade and, with no edits pending and no open todos, return Done with empty final_text —
+        // the "model went quiet, loop silently reported done" failure. It must instead retry on the
+        // bounded transient budget and return the real turn that follows.
+        let r = registry();
+        let c = AgentConfig {
+            quiet: true,
+            max_transient_retries: 2, // the top-level default; the retry must fit inside it
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let chat = scripted(vec![empty_turn(), final_turn("real answer")]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(
+            out.final_text.as_deref(),
+            Some("real answer"),
+            "the empty-200 was retried, not reported as an empty Done"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_mode_empty_200_falls_through_once_budget_is_spent() {
+        // If empty-200s outlast the retry budget, the loop must not spin forever — it falls through
+        // with the empty turn (Done, empty final_text), the pre-fix behavior, so a persistently-broken
+        // provider still terminates rather than hanging.
+        let r = registry();
+        let c = AgentConfig {
+            quiet: true,
+            max_transient_retries: 1, // one retry, then fall through
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        // Three empties: initial + 1 retry both empty, budget spent → the 2nd is accepted as-is.
+        let chat = scripted(vec![empty_turn(), empty_turn(), empty_turn()]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::Done,
+            "a persistently empty provider terminates rather than spinning"
+        );
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ All notable changes to **Aizen** (`aizen`) — the pure-Rust agentic coding CLI.
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
-## [Unreleased]
+## [0.5.1] — 2026-07-30
 
 ### Added
 - **Several aizen windows on one repository can now see each other: `/team` and `aizen team`.** Opening
@@ -39,6 +39,45 @@ development log lives in that monorepo's history.
   commits, or a live session, and keeps the branch either way, so nothing it removes takes commits with
   it.
 - **`team_status` tool**, so the agent can check who else is editing a file before it rewrites it.
+- **A whole-file overwrite can no longer discard another window's work silently.** The CAS behind
+  every write compares against a fingerprint taken microseconds earlier inside the same call, so it
+  closes the read→write window and nothing wider. The torn cycle it cannot see is the one that
+  matters across windows: session A reads a file, session B rewrites it a turn later, A writes from a
+  stale idea of the content. `file_edit`/`multi_edit` survive that on their own — `old_string` is
+  matched against a fresh read, so a rewritten region simply fails to match — but `file_write` had no
+  anchor at all and its CAS passed against whatever was on disk. Every read now records what this
+  session saw, and a full overwrite refuses when disk no longer matches it, naming the re-read as the
+  recovery. A file this session never read is refused only when a *live* peer session claims it, so
+  single-window flows that legitimately regenerate a file are untouched. `file_move --overwrite`,
+  which has no CAS of its own, gets the same guard.
+- **A sub-agent that writes no longer deadlocks against its own parent.** The workspace lease is held
+  for the length of a turn, and both `LockFileEx` and `flock` conflict with a second handle in the
+  *same* process — so once a turn had written anything, a delegated write-capable `task` waited out
+  its 15-second timeout and failed with "workspace writer lease was not acquired" for an edit nothing
+  was contending. Nested acquisition inside one process is now reference-counted: two nested holders
+  are one writer as far as any other process can tell, and the OS lock is released only when the
+  outermost handle drops, so cross-session exclusion is unchanged.
+- **`/team commit` holds the lease while it stages, and commits only what was reviewed.** `git add`
+  reads the working tree, so staging while a peer window is mid-turn could capture half of an
+  in-flight edit. Staging now takes the lease for that step — released before the confirmation
+  prompt, since blocking every window for as long as a human takes to decide is worse than the race
+  it would close. The gap that leaves is closed by identity instead: the index is hashed at review
+  time and the commit refuses if it no longer matches, so content nobody looked at cannot ride along.
+- **A file two sessions both edited can now be committed for one of them alone.** Previously this was
+  the documented limit of the feature: git tracks content, not authorship, so committing a shared file
+  carried the other window's changes to it along, and all `/team commit` could do was warn. It is now
+  separated instead. The starting point is the last commit — deliberately *not* this session's pre-edit
+  checkpoint, which already contains the peer's work whenever the peer edited the file first — and only
+  this session's own turns are replayed onto it, one three-way merge each. Those turns are recoverable
+  because writes are already serialized: the workspace lease is held for a whole turn, so between one
+  turn's pre-edit checkpoint and the next turn's anywhere in the worktree lies the work of exactly one
+  session. The reconstruction is staged **index-only**: disk keeps the union, so the peer's live edits
+  are never overwritten, and the commit still holds one session's version. Where the two genuinely
+  collide, the file is refused with the reason rather than merged on a guess — and since git's merge
+  granularity is the hunk rather than the line, edits on adjacent lines count as colliding. A refusal
+  rolls the whole stage back, because a half-separated index is the one state where `--force` would
+  commit a mix nobody chose. Checkpoints that have been pruned away are reported the same way: without
+  a turn's pre-image there is no way to know what it changed, and guessing would silently drop work.
 - **Setup verifies the connection instead of trusting it.** `/config` → Connection and first-run setup
   now check each step against the live endpoint before accepting it:
   - A **provider picker** (OpenAI · Anthropic · OpenRouter · Groq · DeepSeek · Ollama · Custom
@@ -86,6 +125,13 @@ development log lives in that monorepo's history.
   a legitimate 10-minute build (1800s busy, both tunable via `AIZEN_HEALTH_MAX_*_SECS`). An unknown
   state falls back to plain freshness, so an old binary probing a newer daemon mid-rollout does not
   kill a healthy pod.
+- **Reading a whole source file suggests the cheaper symbolic path.** A `file_read` that pulls an
+  entire code file (a language server exists for its extension, LSP on, 400–2000 lines) now prepends
+  one advisory line: if you need a single item, `lsp_document_symbols` then `read_symbol` costs a
+  fraction and keeps the context lean, because that whole file is re-sent every turn. It is a hint,
+  not a gate — the full content still follows, since reading the whole file is sometimes exactly
+  right. It stays silent for prose files, when LSP is off, and below the threshold where the read is
+  small enough not to matter.
 
 ### Changed
 - **API keys are visible while you type them** (setup, Connection, and the search keys). A masked

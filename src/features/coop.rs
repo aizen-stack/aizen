@@ -20,6 +20,25 @@
 //! by hand, land inside that window and are attributed to whoever held the lease — documented, not
 //! silently corrected.
 //!
+//! # Conflict handling, in the three places it actually happens
+//!
+//! The lease serializes turns; it does NOT make a read-modify-write atomic across turns. Session A
+//! reads a file in turn 1, B rewrites it in turn 2, A writes in turn 3 — every lock honored at every
+//! instant, and the logical operation still torn. Three defenses, each at the layer that can see the
+//! problem:
+//!
+//! 1. **`file_edit` / `multi_edit`** match `old_string` against a FRESH read, so a rewritten region
+//!    fails to match on its own. Nothing to add.
+//! 2. **`file_write` / `file_move --overwrite`** have no anchor — a whole-file overwrite whose CAS
+//!    passes against whatever is on disk right now. [`crate::core::read_ledger`] is the anchor: what
+//!    THIS session last saw, per path, refusing the overwrite when the ground moved.
+//! 3. **Commit** takes the lease for the stage step (`git add` reads a tree a peer may be writing)
+//!    and pins the reviewed index by its tree hash, so what lands is what was approved.
+//!
+//! Overlap records remain a WARNING and never block: the second writer is frequently the point, and
+//! git cannot split one file by author anyway. What must not happen silently is losing the first
+//! writer's bytes, which is what the ledger above prevents.
+//!
 //! Layout (`repo_id`, so linked worktrees of one repository share a registry):
 //!
 //! ```text
@@ -35,7 +54,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -112,6 +131,15 @@ pub struct TouchedFile {
     /// Pre-edit checkpoint of the turn that FIRST changed this file in this session. The pre-image
     /// is a blob in that checkpoint's tree, so it survives later overwrites by other sessions.
     pub base: u32,
+    /// Pre-edit checkpoint of EVERY turn of this session that changed this path, ascending.
+    ///
+    /// `base` is the first of these and is what a whole-file diff measures from. This list is what
+    /// makes a *shared* file separable: each entry opens an interval that contains one turn by this
+    /// session and no other, so replaying just these intervals reconstructs this session's version
+    /// of a file another session also edited (see [`split_shared`]). Empty on manifests written
+    /// before the field existed — readers fall back to `base`.
+    #[serde(default)]
+    pub bases: Vec<u32>,
     /// Turn number (within this session) of the most recent change.
     pub last_turn: u64,
     /// Latest git status letter seen for this path (`A`/`M`/`D`/`R`/`C`/`T`).
@@ -558,6 +586,13 @@ fn merge_touched(
         if let Some(existing) = files.iter_mut().find(|f| &f.path == path) {
             existing.last_turn = turn;
             existing.status = *status;
+            // Every turn that touched the path is remembered, because each one opens an interval
+            // holding only this session's work. Dropping the later ones would make a split silently
+            // reconstruct just the first turn's version.
+            if !existing.bases.contains(&base) {
+                existing.bases.push(base);
+                existing.bases.sort_unstable();
+            }
             continue;
         }
         if files.len() >= MAX_FILES {
@@ -569,6 +604,7 @@ fn merge_touched(
             base,
             last_turn: turn,
             status: *status,
+            bases: vec![base],
         });
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -879,6 +915,45 @@ pub fn overlaps() -> Vec<Overlap> {
         .unwrap_or_default()
 }
 
+/// Who else — if anyone — most recently claimed `rel_path`, provided that session is still live and
+/// is not us. `None` when the path is unclaimed, ours, or owned by a session that has already gone.
+///
+/// This is the pre-write half of overlap handling. [`claim_paths`] records an overlap AFTER a turn
+/// has written, which is right for reporting but useless for prevention: a whole-file overwrite has
+/// already destroyed the other window's work by then. A tool about to blow away a file's contents
+/// asks this first, and refuses when the answer is another live session (see
+/// [`crate::core::read_ledger`]).
+///
+/// Deliberately cheap and lock-free: a stale read here can only cost a spurious refusal that names
+/// the session to check, never a silent loss. Claims from DEAD sessions are ignored — an abandoned
+/// window's leftovers must not wedge the tree forever.
+pub fn live_peer_claim(rel_path: &str) -> Option<String> {
+    let repo_id = current_repo_id()?;
+    let mine = current_session_id();
+    let claim = load_shared(&repo_id).owners.remove(rel_path)?;
+    if mine.as_deref() == Some(claim.session_id.as_str()) {
+        return None;
+    }
+    alive(&repo_id, &claim.session_id).then_some(claim.session_id)
+}
+
+/// [`live_peer_claim`] for an absolute path. `None` when the path lies outside this session's
+/// worktree (no claim could name it) or when no live peer holds it.
+pub fn live_peer_claim_at(abs: &Path) -> Option<String> {
+    live_peer_claim(&relative_to_worktree(abs)?)
+}
+
+/// Repository-relative form of `abs`, as git would name it, for claim lookups. `None` when the path
+/// is outside this session's worktree — a claim on it could not be meaningful.
+pub fn relative_to_worktree(abs: &Path) -> Option<String> {
+    let guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let root = PathBuf::from(&guard.as_ref()?.manifest.root);
+    let canon = abs.canonicalize().unwrap_or_else(|_| abs.to_path_buf());
+    let rel = canon.strip_prefix(&root).ok()?;
+    let s = rel.to_string_lossy().replace('\\', "/");
+    (!s.is_empty()).then_some(s)
+}
+
 /// Current path claims, newest first.
 pub fn claims() -> Vec<(String, Claim)> {
     let Some(repo_id) = current_repo_id() else {
@@ -887,6 +962,303 @@ pub fn claims() -> Vec<(String, Claim)> {
     let mut v: Vec<(String, Claim)> = load_shared(&repo_id).owners.into_iter().collect();
     v.sort_by(|a, b| b.1.unix.cmp(&a.1.unix).then_with(|| a.0.cmp(&b.0)));
     v
+}
+
+// ---------------------------------------------------------------------------------------------
+// Splitting one file that two sessions both edited
+// ---------------------------------------------------------------------------------------------
+
+/// One session's reconstructed version of a file another session also changed.
+#[derive(Debug, Clone)]
+pub struct SplitFile {
+    pub path: String,
+    /// Reconstructed content, or `None` when this session's work removed the file.
+    pub content: Option<Vec<u8>>,
+    /// Git file mode to stage it with.
+    pub mode: String,
+    /// Regions where this session's edit and the peer's cannot both be kept. Non-zero means the
+    /// reconstruction contains conflict markers and MUST NOT be staged.
+    pub conflicts: u32,
+    /// How many of this session's turns had to be replayed.
+    pub replayed: usize,
+    /// Set when this file cannot be separated at all; the reason is written for the user.
+    pub unavailable: Option<String>,
+}
+
+impl SplitFile {
+    /// Safe to stage: a clean reconstruction with no conflicts.
+    pub fn usable(&self) -> bool {
+        self.unavailable.is_none() && self.conflicts == 0
+    }
+}
+
+/// Checkpoint ids that START a turn, for every session in this worktree, ascending.
+///
+/// The end of one session's turn is the next turn to begin anywhere in the worktree, so this is the
+/// set of interval boundaries. Manual checkpoints (`aizen time save`) are deliberately excluded: they
+/// do not end a turn, and treating them as boundaries would truncate a turn's interval and silently
+/// drop the rest of that turn's work from the reconstruction.
+///
+/// `base_checkpoint` of a session mid-turn is included — that turn's writes are in flight and must
+/// bound the previous interval rather than being swept into it.
+fn turn_boundaries(repo_id: &str, worktree_id: &str, existing: &BTreeSet<u32>) -> Vec<u32> {
+    let mut ids: Vec<u32> = list_in(repo_id)
+        .into_iter()
+        .filter(|v| v.manifest.worktree_id == worktree_id)
+        .flat_map(|v| {
+            let mut per: Vec<u32> = v
+                .manifest
+                .files
+                .iter()
+                .flat_map(|f| {
+                    if f.bases.is_empty() {
+                        vec![f.base]
+                    } else {
+                        f.bases.clone()
+                    }
+                })
+                .collect();
+            per.extend(v.manifest.base_checkpoint);
+            per
+        })
+        .filter(|id| existing.contains(id))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Tree of the last commit, or `None` in a repository with no commits yet.
+fn head_tree(root: &Path) -> Option<String> {
+    git_ok(
+        root,
+        &[
+            "rev-parse".into(),
+            "-q".into(),
+            "--verify".into(),
+            "HEAD^{tree}".into(),
+        ],
+    )
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+}
+
+/// Scratch file inside the git directory.
+///
+/// NOT in the working tree: a temp file there would be picked up by another session's checkpoint
+/// (`add -A`) and land in its snapshot. The git directory is excluded from all of that.
+fn scratch_path(root: &Path, tag: &str) -> Result<PathBuf> {
+    let dir = git_ok(root, &["rev-parse".into(), "--absolute-git-dir".into()])?
+        .trim()
+        .to_string();
+    Ok(PathBuf::from(dir).join(format!(
+        "aizen-coop-{tag}-{}-{}",
+        std::process::id(),
+        crate::core::persist::unique_sequence()
+    )))
+}
+
+/// Three-way merge of raw bytes, returning the merged content and the conflict count.
+///
+/// Done through files rather than pipes so content that is not valid UTF-8 survives: the bounded
+/// runner decodes stdout lossily, which would corrupt a binary or latin-1 file on the way through.
+/// `git merge-file` rewrites `ours` in place, so the result is read back from disk byte for byte.
+fn merge_three_way(
+    root: &Path,
+    ours: &[u8],
+    base: &[u8],
+    theirs: &[u8],
+    labels: (&str, &str, &str),
+) -> Result<(Vec<u8>, u32)> {
+    let o = scratch_path(root, "ours")?;
+    let b = scratch_path(root, "base")?;
+    let t = scratch_path(root, "theirs")?;
+    let write_all = || -> std::io::Result<()> {
+        fs::write(&o, ours)?;
+        fs::write(&b, base)?;
+        fs::write(&t, theirs)
+    };
+    write_all().context("writing scratch files for the three-way merge")?;
+    let args: Vec<String> = vec![
+        "merge-file".into(),
+        "-q".into(),
+        "-L".into(),
+        labels.0.to_string(),
+        "-L".into(),
+        labels.1.to_string(),
+        "-L".into(),
+        labels.2.to_string(),
+        o.display().to_string(),
+        b.display().to_string(),
+        t.display().to_string(),
+    ];
+    let code = git_code(root, &args);
+    let merged = fs::read(&o);
+    for p in [&o, &b, &t] {
+        let _ = fs::remove_file(p);
+    }
+    let merged = merged.context("reading back the merged result")?;
+    match code {
+        // `merge-file` reports the conflict count as its exit status; anything from the error range
+        // means it could not merge at all, and a "0 conflicts" reading there would be a lie.
+        Some(c) if (0..128).contains(&c) => Ok((merged, c as u32)),
+        other => bail!(
+            "git merge-file could not reconstruct this file (exit {})",
+            other.map(|c| c.to_string()).unwrap_or_else(|| "killed".into())
+        ),
+    }
+}
+
+/// Reconstruct `path` as it would look with ONLY `view`'s work applied.
+///
+/// Why the pre-image is the wrong starting point: if the peer edited the file BEFORE this session
+/// first touched it, this session's pre-edit checkpoint already contains the peer's work, so diffing
+/// from it would carry that work along — exactly what a split is supposed to remove. The base is
+/// therefore the last commit, and only this session's own turns are replayed onto it.
+///
+/// Each turn is recoverable because writes are serialized: the workspace writer lease is held for a
+/// whole turn, so between one turn's pre-edit checkpoint and the next turn's there is the work of
+/// exactly one session. Replaying those intervals — and no others — onto the committed base yields
+/// this session's version, with the peer's edits to the same file left out.
+///
+/// Reads only. The working tree is never touched, so the peer keeps editing throughout.
+pub fn split_shared(view: &SessionView, path: &str) -> Result<SplitFile> {
+    let here = identity()?;
+    if view.manifest.worktree_id != here.worktree_id {
+        bail!(
+            "session {} works in a different worktree ({})",
+            view.manifest.session_id,
+            view.manifest.root
+        );
+    }
+    let entry = view
+        .manifest
+        .files
+        .iter()
+        .find(|f| f.path == path)
+        .with_context(|| {
+            format!(
+                "session {} did not change {path}",
+                view.manifest.session_id
+            )
+        })?;
+    let mut out = SplitFile {
+        path: path.to_string(),
+        content: None,
+        mode: String::new(),
+        conflicts: 0,
+        replayed: 0,
+        unavailable: None,
+    };
+
+    let mut mine: Vec<u32> = if entry.bases.is_empty() {
+        vec![entry.base]
+    } else {
+        entry.bases.clone()
+    };
+    mine.sort_unstable();
+    mine.dedup();
+
+    let existing: BTreeSet<u32> = timemachine::checkpoint_ids()
+        .context("listing checkpoints")?
+        .into_iter()
+        .collect();
+    let pruned: Vec<u32> = mine.iter().copied().filter(|i| !existing.contains(i)).collect();
+    if !pruned.is_empty() {
+        // Without the pre-image of a turn there is no way to know what that turn changed, and
+        // guessing would hand the user a file that silently drops work.
+        out.unavailable = Some(format!(
+            "checkpoint(s) {} for this session's edits to {path} have been pruned, so its turns \
+             cannot be replayed",
+            pruned
+                .iter()
+                .map(|i| format!("#{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        return Ok(out);
+    }
+
+    let root = PathBuf::from(&view.manifest.root);
+    let bounds = turn_boundaries(&view.manifest.repo_id, &view.manifest.worktree_id, &existing);
+    let working = timemachine::resolve_tree(&DiffSide::Working).context("hashing the working tree")?;
+
+    let base_blob = match head_tree(&root) {
+        Some(tree) => timemachine::blob_in_tree(&tree, path)
+            .with_context(|| format!("reading the committed version of {path}"))?,
+        None => None,
+    };
+    let mut acc: Option<Vec<u8>> = base_blob.as_ref().map(|b| b.bytes.clone());
+    if let Some(b) = &base_blob {
+        out.mode = b.mode.clone();
+    }
+
+    let sid = view.manifest.session_id.clone();
+    for start in &mine {
+        let start_tree = timemachine::resolve_tree(&DiffSide::Checkpoint(*start))
+            .with_context(|| format!("resolving checkpoint #{start}"))?;
+        let before = timemachine::blob_in_tree(&start_tree, path)?;
+        let end_tree = match bounds.iter().copied().find(|b| b > start) {
+            Some(end) => timemachine::resolve_tree(&DiffSide::Checkpoint(end))
+                .with_context(|| format!("resolving checkpoint #{end}"))?,
+            // No later turn anywhere: this session's work is the newest thing in the tree.
+            None => working.clone(),
+        };
+        let after = timemachine::blob_in_tree(&end_tree, path)?;
+
+        if before.as_ref().map(|b| &b.oid) == after.as_ref().map(|a| &a.oid) {
+            continue;
+        }
+        out.replayed += 1;
+        if let Some(a) = &after {
+            out.mode = a.mode.clone();
+        }
+        match (&before, &after) {
+            // The turn removed the file: nothing later can be merged onto absence.
+            (_, None) => acc = None,
+            (None, Some(a)) => match &acc {
+                None => acc = Some(a.bytes.clone()),
+                Some(cur) => {
+                    let (merged, c) = merge_three_way(
+                        &root,
+                        cur,
+                        &[],
+                        &a.bytes,
+                        (&sid, "committed", "this session"),
+                    )?;
+                    out.conflicts += c;
+                    acc = Some(merged);
+                }
+            },
+            (Some(bf), Some(af)) => {
+                let Some(cur) = &acc else {
+                    // The file exists only because the OTHER session created it. There is no
+                    // committed base to replay onto, and starting from the peer's creation would
+                    // commit the peer's work under this session's name.
+                    out.unavailable = Some(format!(
+                        "{path} does not exist in the last commit and was created by another \
+                         session, so this session's changes to it cannot be separated"
+                    ));
+                    return Ok(out);
+                };
+                let (merged, c) = merge_three_way(
+                    &root,
+                    cur,
+                    &bf.bytes,
+                    &af.bytes,
+                    (&sid, "before this turn", "after this turn"),
+                )?;
+                out.conflicts += c;
+                acc = Some(merged);
+            }
+        }
+    }
+    out.content = acc;
+    if out.mode.is_empty() {
+        out.mode = "100644".to_string();
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -949,32 +1321,197 @@ pub fn plan_commit(view: &SessionView) -> Result<CommitPlan> {
     })
 }
 
-/// Stage exactly the plan's paths and return `git diff --cached --stat` for review.
+/// Stage one reconstructed file, index-only.
+///
+/// The working tree is deliberately NOT written: it holds the union of both sessions' work, the peer
+/// is still editing it, and overwriting it with this session's version alone would destroy the peer's
+/// live changes — the precise failure this whole module exists to prevent. Git allows an index entry
+/// to differ from the file on disk, so the commit can hold one session's version while the other
+/// session keeps working from the union.
+///
+/// The bytes came out of existing blobs, i.e. already in clean-filtered form, so `--no-filters`
+/// stops a `.gitattributes` clean driver from being applied a second time.
+fn stage_split(root: &Path, split: &SplitFile) -> Result<()> {
+    let Some(bytes) = &split.content else {
+        // This session's work removed the file.
+        return git_ok(
+            root,
+            &[
+                "update-index".into(),
+                "--force-remove".into(),
+                "--".into(),
+                split.path.clone(),
+            ],
+        )
+        .map(|_| ());
+    };
+    let scratch = scratch_path(root, "blob")?;
+    fs::write(&scratch, bytes)
+        .with_context(|| format!("writing the reconstructed {}", split.path))?;
+    let hashed = git_ok(
+        root,
+        &[
+            "hash-object".into(),
+            "-w".into(),
+            "--no-filters".into(),
+            "--".into(),
+            scratch.display().to_string(),
+        ],
+    );
+    let _ = fs::remove_file(&scratch);
+    let oid = hashed
+        .with_context(|| format!("storing the reconstructed {}", split.path))?
+        .trim()
+        .to_string();
+    let mode = if split.mode.is_empty() {
+        "100644"
+    } else {
+        split.mode.as_str()
+    };
+    git_ok(
+        root,
+        &[
+            "update-index".into(),
+            "--add".into(),
+            "--cacheinfo".into(),
+            format!("{mode},{oid},{}", split.path),
+        ],
+    )
+    .map(|_| ())
+}
+
+/// What a staged review consists of: the stat a human reads, and the exact identity of the index
+/// they read it from.
+#[derive(Debug, Clone)]
+pub struct Staged {
+    /// `git diff --cached --stat`, for display.
+    pub stat: String,
+    /// Shared paths that were separated: the index holds this session's version, not the union on
+    /// disk. Worth telling the user, because the commit will not match the working tree for these.
+    pub separated: Vec<String>,
+    /// Tree object of the index at review time. [`commit_staged`] refuses unless the index still
+    /// hashes to this, so what gets committed is what was approved and nothing else.
+    pub tree: String,
+}
+
+/// Take the workspace lease for one short coordinator step.
+///
+/// The reason a coordinator needs it at all: `git add` reads the working tree, and a peer window
+/// mid-turn is writing to that same tree. Stage without the lease and the index can capture half of
+/// another session's in-flight edit. Reentrancy is handled in [`crate::core::workspace_txn`], so this
+/// is also correct when the coordinator window is itself inside a turn.
+///
+/// Deliberately NOT held across the approval prompt: blocking every other window for as long as a
+/// human takes to decide is worse than the race it would close, and the tree digest below closes that
+/// race without holding anything.
+fn coordinator_lease(root: &Path, what: &str) -> Option<crate::core::workspace_txn::WorkspaceWriterLease> {
+    crate::core::workspace_txn::WorkspaceWriterLease::acquire(
+        root,
+        Duration::from_secs(15),
+        None,
+        what,
+    )
+    .ok()
+}
+
+/// Hash of the current index, as a tree object. This is the review token: two indexes with the same
+/// tree are byte-for-byte the same staged content.
+fn index_tree(root: &Path) -> Result<String> {
+    git_ok(root, &["write-tree".into()])
+        .map(|s| s.trim().to_string())
+        .context("hashing the staged index")
+}
+
+/// Stage exactly the plan's paths and return the review plus the identity of what was staged.
 ///
 /// Deliberately additive: staging leaves the working tree untouched, so another window's in-flight
 /// edits cannot be lost by a review that is later abandoned.
-pub fn stage_plan(plan: &CommitPlan) -> Result<String> {
+///
+/// Files this session shares with another are not staged from disk — disk holds the union of both
+/// sessions' work. Each is reconstructed by [`split_shared`] and staged index-only, so the commit
+/// carries one session's version while the peer keeps editing the union. A file that cannot be
+/// separated cleanly aborts the whole stage rather than landing a commit with someone else's work
+/// (or conflict markers) in it.
+pub fn stage_plan(plan: &CommitPlan) -> Result<Staged> {
     if plan.paths.is_empty() {
         bail!("nothing to stage");
     }
+    let _lease = coordinator_lease(&plan.root, "coop stage");
     let mut args: Vec<String> = vec!["add".into(), "--".into()];
     args.extend(plan.paths.iter().cloned());
     // `git add` of a deleted path stages the deletion; `--` guards paths that look like flags.
     git_ok(&plan.root, &args).context("staging this session's files")?;
-    git_ok(
+
+    let mut separated = Vec::new();
+    if !plan.shared_paths.is_empty() {
+        let view = resolve(&plan.session_id)?;
+        let mut refused = Vec::new();
+        for path in &plan.shared_paths {
+            match split_shared(&view, path) {
+                Ok(split) if split.usable() => {
+                    stage_split(&plan.root, &split)?;
+                    separated.push(path.clone());
+                }
+                Ok(split) => refused.push(match &split.unavailable {
+                    Some(why) => format!("{path}: {why}"),
+                    None => format!(
+                        "{path}: this session's edits and another session's overlap in {} region(s) \
+                         and cannot be separated automatically",
+                        split.conflicts
+                    ),
+                }),
+                Err(e) => refused.push(format!("{path}: {e:#}")),
+            }
+        }
+        if !refused.is_empty() {
+            // Roll the index back: a partially separated stage is the one state where a later
+            // `--force` would commit a mix nobody chose.
+            let _ = unstage_plan(plan);
+            bail!(
+                "cannot commit this session alone — {} shared file(s) could not be separated:\n  {}\n\
+                 Resolve the overlap in the working tree (or commit both sessions together) and \
+                 re-run.",
+                refused.len(),
+                refused.join("\n  ")
+            );
+        }
+    }
+
+    let stat = git_ok(
         &plan.root,
         &["diff".into(), "--cached".into(), "--stat".into()],
-    )
+    )?;
+    let tree = index_tree(&plan.root)?;
+    Ok(Staged {
+        stat,
+        separated,
+        tree,
+    })
 }
 
 /// Commit what `stage_plan` staged. Caller is responsible for approval — this is the irreversible
 /// step and it is never reached without one.
-pub fn commit_staged(plan: &CommitPlan, message: &str) -> Result<String> {
-    let staged = git_ok(
+///
+/// `staged` is the review the user approved. If the index no longer hashes to it, something changed
+/// between review and approval — another window staged, or a hook ran — and committing would land
+/// content nobody looked at. That is refused rather than reconciled: the coordinator re-runs and
+/// reviews the new state.
+pub fn commit_staged(plan: &CommitPlan, message: &str, staged: &Staged) -> Result<String> {
+    let _lease = coordinator_lease(&plan.root, "coop commit");
+    let now = index_tree(&plan.root)?;
+    if now != staged.tree {
+        bail!(
+            "the staged changes are not the ones that were reviewed (index moved from {} to {}); \
+             nothing was committed. Re-run /team commit to review the current state",
+            &staged.tree[..staged.tree.len().min(8)],
+            &now[..now.len().min(8)]
+        );
+    }
+    let staged_names = git_ok(
         &plan.root,
         &["diff".into(), "--cached".into(), "--name-only".into()],
     )?;
-    if staged.trim().is_empty() {
+    if staged_names.trim().is_empty() {
         bail!("nothing is staged — run the plan again");
     }
     let out = git_ok(
@@ -1007,6 +1544,7 @@ pub fn unstage_plan(plan: &CommitPlan) -> Result<()> {
     if plan.paths.is_empty() {
         return Ok(());
     }
+    let _lease = coordinator_lease(&plan.root, "coop unstage");
     let mut args: Vec<String> = vec!["restore".into(), "--staged".into(), "--".into()];
     args.extend(plan.paths.iter().cloned());
     git_ok(&plan.root, &args).map(|_| ())
@@ -1320,6 +1858,22 @@ fn git_ok(root: &Path, args: &[String]) -> Result<String> {
     Ok(out.stdout)
 }
 
+/// Run git in `root` and return its exit code.
+///
+/// For the commands whose exit STATUS is the answer rather than a failure: `merge-file` reports the
+/// number of conflicts that way, so treating non-zero as an error would throw the result away.
+fn git_code(root: &Path, args: &[String]) -> Option<i32> {
+    let mut cmd = crate::core::gitx::command().ok()?;
+    cmd.current_dir(root);
+    cmd.args(args);
+    let out =
+        crate::core::proctree::output_bounded(&mut cmd, GIT_TIMEOUT, GIT_DRAIN_GRACE).ok()?;
+    if out.timed_out {
+        return None;
+    }
+    out.code
+}
+
 fn current_branch(root: &Path) -> Option<String> {
     git_ok(
         root,
@@ -1507,6 +2061,7 @@ mod tests {
                 base: 1,
                 last_turn: 1,
                 status: 'M',
+                bases: vec![1],
             })
             .collect();
         let dropped = merge_touched(&mut files, &[('A', "overflow.rs".into())], 2, 2);
@@ -1561,6 +2116,7 @@ mod tests {
             base: 1,
             last_turn: 1,
             status: 'M',
+            bases: vec![1],
         }];
         write_manifest(&a).unwrap();
         let b = manifest(repo, "s-b", SessionState::Finished);
@@ -1635,6 +2191,7 @@ mod tests {
             base: 1,
             last_turn: 1,
             status: 'M',
+            bases: vec![1],
         }];
         write_manifest(&m).unwrap();
         let _held = RepoTxnLock::acquire_exclusive(
@@ -1677,5 +2234,295 @@ mod tests {
             .filter(|s| s.starts_with("1000"))
             .collect();
         assert_eq!(ambiguous.len(), 2, "a shared prefix must not silently pick one");
+    }
+
+    /// A throwaway git repository with one commit. `None` when git is unavailable, so the suite still
+    /// passes on a machine without it rather than failing for the wrong reason.
+    fn temp_repo(tag: &str) -> Option<PathBuf> {
+        crate::core::gitx::git_exe()?;
+        let root = std::env::temp_dir().join(format!(
+            "aizen-coop-git-{tag}-{}-{}",
+            std::process::id(),
+            crate::core::persist::unique_sequence()
+        ));
+        fs::create_dir_all(&root).ok()?;
+        let root = root.canonicalize().ok()?;
+        let run = |args: &[&str]| {
+            git_ok(&root, &args.iter().map(|s| s.to_string()).collect::<Vec<_>>()).ok()
+        };
+        run(&["init", "--initial-branch=main"])?;
+        run(&["config", "user.email", "t@example.invalid"])?;
+        run(&["config", "user.name", "t"])?;
+        run(&["config", "commit.gpgsign", "false"])?;
+        fs::write(root.join("a.txt"), "base\n").ok()?;
+        run(&["add", "-A"])?;
+        run(&["commit", "-m", "base"])?;
+        Some(root)
+    }
+
+    #[test]
+    fn a_commit_is_refused_when_the_index_moved_after_the_review() {
+        // The window between "user reads the stat" and "user approves" is not held under any lock —
+        // holding one across a human decision would freeze every other window. The tree digest is
+        // what closes it: if anything staged in that window, the approved review no longer describes
+        // what would land, and committing it would ship content nobody looked at.
+        // Sandboxed home: `commit_staged` records the commit in `shared.json`, and that must land in
+        // a temp tree rather than the developer's real `~/.aizen`.
+        let _home = Home::new("treeguard");
+        let Some(root) = temp_repo("treeguard") else {
+            return;
+        };
+        fs::write(root.join("a.txt"), "session A's work\n").unwrap();
+        let plan = CommitPlan {
+            session_id: "s-a".into(),
+            paths: vec!["a.txt".into()],
+            shared_paths: Vec::new(),
+            blockers: Vec::new(),
+            root: root.clone(),
+        };
+        let review = stage_plan(&plan).expect("staging the plan");
+        assert!(review.stat.contains("a.txt"), "{}", review.stat);
+
+        // Another window stages something of its own between review and approval.
+        fs::write(root.join("b.txt"), "session B's work\n").unwrap();
+        git_ok(&root, &["add".into(), "--".into(), "b.txt".into()]).unwrap();
+
+        let err = commit_staged(&plan, "should not land", &review)
+            .expect_err("a moved index must refuse rather than commit the surprise");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not the ones that were reviewed"), "{msg}");
+        // Nothing was committed: HEAD still points at the single base commit.
+        let count = git_ok(&root, &["rev-list".into(), "--count".into(), "HEAD".into()]).unwrap();
+        assert_eq!(count.trim(), "1", "the refused commit must not have landed");
+
+        // Re-reviewing the current state succeeds — the guard refuses stale approvals, not progress.
+        let fresh = stage_plan(&plan).expect("re-staging");
+        commit_staged(&plan, "reviewed again", &fresh).expect("a current review commits");
+        let count = git_ok(&root, &["rev-list".into(), "--count".into(), "HEAD".into()]).unwrap();
+        assert_eq!(count.trim(), "2");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn every_turn_that_touches_a_path_is_remembered_not_just_the_first() {
+        // `base` stays at the first turn (a whole-file diff measures from there), but a split has to
+        // replay EVERY turn of this session. If later turns were dropped, a two-turn session would
+        // silently reconstruct only its first turn's work.
+        let mut files = Vec::new();
+        merge_touched(&mut files, &[('M', "src/a.rs".into())], 4, 1);
+        merge_touched(&mut files, &[('M', "src/a.rs".into())], 9, 2);
+        merge_touched(&mut files, &[('M', "src/a.rs".into())], 9, 3);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].base, 4, "the first turn remains the diff base");
+        assert_eq!(files[0].last_turn, 3);
+        assert_eq!(
+            files[0].bases,
+            vec![4, 9],
+            "each distinct turn interval is recorded exactly once"
+        );
+    }
+
+    #[test]
+    fn turn_boundaries_span_every_session_and_skip_pruned_checkpoints() {
+        // A session's turn ends where the NEXT turn begins — anywhere in the worktree, not just in
+        // the same session. Boundaries must therefore be collected across sessions, or an interval
+        // would swallow a peer's turn and attribute their work to this session.
+        let _home = Home::new("bounds");
+        let repo = "repo-bounds";
+        fs::create_dir_all(sessions_dir(repo)).unwrap();
+
+        let mut a = manifest(repo, "s-a", SessionState::Idle);
+        a.files = vec![TouchedFile {
+            path: "shared.rs".into(),
+            base: 2,
+            last_turn: 2,
+            status: 'M',
+            bases: vec![2, 6],
+        }];
+        write_manifest(&a).unwrap();
+
+        let mut b = manifest(repo, "s-b", SessionState::Working);
+        b.files = vec![TouchedFile {
+            path: "shared.rs".into(),
+            base: 4,
+            last_turn: 1,
+            status: 'M',
+            bases: vec![4],
+        }];
+        // Mid-turn: these writes are in flight and must bound the previous interval.
+        b.base_checkpoint = Some(8);
+        write_manifest(&b).unwrap();
+
+        // Another worktree of the same repository: its checkpoints live in a different ledger.
+        let mut other = manifest(repo, "s-other", SessionState::Idle);
+        other.worktree_id = "wt-elsewhere".into();
+        other.files = vec![TouchedFile {
+            path: "shared.rs".into(),
+            base: 5,
+            last_turn: 1,
+            status: 'M',
+            bases: vec![5],
+        }];
+        write_manifest(&other).unwrap();
+
+        // #6 has been pruned from the ledger; #99 was never a turn start.
+        let existing: BTreeSet<u32> = [2, 4, 5, 8, 99].into_iter().collect();
+        let bounds = turn_boundaries(repo, "wt", &existing);
+        assert_eq!(
+            bounds,
+            vec![2, 4, 8],
+            "both sessions' turns bound each other, the pruned and foreign ones are left out"
+        );
+    }
+
+    #[test]
+    fn replaying_one_turn_keeps_this_sessions_edit_and_drops_the_peers() {
+        // The property the whole split rests on. Session A changed line 2; session B changed line 3
+        // in the same file. Replaying A's interval onto the committed base must yield A's change and
+        // NOT B's — even though every tree A was measured in already contained B's work.
+        let Some(root) = temp_repo("replay") else {
+            return;
+        };
+        let committed = "1\nA-target\n3\n4\n5\n6\n7\n8\nB-target\n10\n";
+        // What A's turn saw before and after. BOTH trees already contain B's work on line 9 —
+        // that is the whole difficulty: A was never measured against a tree free of B's edits.
+        let before_turn = "1\nA-target\n3\n4\n5\n6\n7\n8\nB-EDITED\n10\n";
+        let after_turn = "1\nA-EDITED\n3\n4\n5\n6\n7\n8\nB-EDITED\n10\n";
+        let (merged, conflicts) = merge_three_way(
+            &root,
+            committed.as_bytes(),
+            before_turn.as_bytes(),
+            after_turn.as_bytes(),
+            ("s-a", "before", "after"),
+        )
+        .expect("replaying a clean turn");
+        assert_eq!(conflicts, 0, "the two sessions edited well-separated regions");
+        assert_eq!(
+            String::from_utf8_lossy(&merged),
+            "1\nA-EDITED\n3\n4\n5\n6\n7\n8\nB-target\n10\n",
+            "A's edit is kept and B's is left behind, even though every tree A was measured \
+             in already contained B's work"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn edits_on_adjacent_lines_are_reported_rather_than_merged() {
+        // Worth pinning down, because it bounds what the feature can promise. Git's merge granularity
+        // is the hunk, not the line: two sessions editing lines that fall in one hunk cannot be
+        // separated, even though no single line was touched twice. That is reported as a conflict —
+        // conservative in the safe direction, since the alternative is inventing a resolution.
+        let Some(root) = temp_repo("adjacent") else {
+            return;
+        };
+        let (_, conflicts) = merge_three_way(
+            &root,
+            b"one\ntwo\nB-EDITED\n",
+            b"one\ntwo\nthree\n",
+            b"one\nA-EDITED\nthree\n",
+            ("s-a", "before", "after"),
+        )
+        .expect("merge-file runs");
+        assert!(
+            conflicts > 0,
+            "adjacent-line edits share a hunk and must be reported, not silently resolved"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn two_sessions_editing_the_same_line_is_reported_not_guessed() {
+        let Some(root) = temp_repo("collide") else {
+            return;
+        };
+        // Both sessions rewrote line 2. There is no answer that keeps both.
+        let (merged, conflicts) = merge_three_way(
+            &root,
+            b"one\nB's version\nthree\n",
+            b"one\ntwo\nthree\n",
+            b"one\nA's version\nthree\n",
+            ("s-a", "before", "after"),
+        )
+        .expect("merge-file reports conflicts through its exit status");
+        assert!(conflicts > 0, "an overlapping edit must not report success");
+        let text = String::from_utf8_lossy(&merged);
+        assert!(text.contains("<<<<<<<"), "conflict markers are present: {text}");
+        // A SplitFile in this shape is refused by `usable()`, so markers can never be staged.
+        let split = SplitFile {
+            path: "x.rs".into(),
+            content: Some(merged),
+            mode: "100644".into(),
+            conflicts,
+            replayed: 1,
+            unavailable: None,
+        };
+        assert!(!split.usable(), "a conflicted reconstruction is never stageable");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_split_is_staged_without_disturbing_the_other_sessions_working_copy() {
+        // The reason staging is index-only: disk holds BOTH sessions' work and the peer is still
+        // editing it. Writing this session's version to disk would destroy the peer's live changes —
+        // the exact loss this module exists to prevent.
+        let Some(root) = temp_repo("indexonly") else {
+            return;
+        };
+        let union = "shared: A's line and B's line\n";
+        fs::write(root.join("a.txt"), union).unwrap();
+        let split = SplitFile {
+            path: "a.txt".into(),
+            content: Some(b"shared: only A's line\n".to_vec()),
+            mode: "100644".into(),
+            conflicts: 0,
+            replayed: 1,
+            unavailable: None,
+        };
+        stage_split(&root, &split).expect("staging a reconstructed blob");
+
+        let staged = git_ok(&root, &[
+            "show".into(),
+            ":a.txt".into(),
+        ])
+        .expect("reading the staged version");
+        assert_eq!(
+            staged.trim_end(),
+            "shared: only A's line",
+            "the index holds this session's version alone"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            union,
+            "the working tree still holds the union — the peer's edits are untouched"
+        );
+        // And it is a real commit, not a staging trick: the committed tree carries the split version.
+        git_ok(&root, &["commit".into(), "-m".into(), "A only".into()]).unwrap();
+        let committed = git_ok(&root, &["show".into(), "HEAD:a.txt".into()]).unwrap();
+        assert_eq!(committed.trim_end(), "shared: only A's line");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_split_that_removes_the_file_stages_a_deletion() {
+        let Some(root) = temp_repo("removal") else {
+            return;
+        };
+        let split = SplitFile {
+            path: "a.txt".into(),
+            content: None,
+            mode: String::new(),
+            conflicts: 0,
+            replayed: 1,
+            unavailable: None,
+        };
+        stage_split(&root, &split).expect("staging a removal");
+        let staged = git_ok(&root, &["diff".into(), "--cached".into(), "--name-status".into()])
+            .unwrap();
+        assert!(staged.starts_with('D'), "the deletion is staged: {staged}");
+        assert!(
+            root.join("a.txt").exists(),
+            "the file itself is left on disk for the other session"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

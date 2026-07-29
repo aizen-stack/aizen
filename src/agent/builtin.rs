@@ -79,6 +79,33 @@ pub(crate) const NOOP_WRITE_PREFIX: &str = "no change (identical content)";
 /// files (the common case) stay byte-exact so `old_string` round-trips. `0` disables a cap.
 const FILE_READ_MAX_LINES: usize = 2000;
 const FILE_READ_MAX_BYTES: usize = 200_000;
+/// Soft threshold (well below the hard `FILE_READ_MAX_LINES` budget): a WHOLE-file read of a
+/// SOURCE file longer than this earns a one-line hint to prefer `lsp_document_symbols` + `read_symbol`
+/// — the single biggest token sink in a real task is reading whole files the model only needs one
+/// item from, re-sent in history every loop. Advisory only (the full content still follows); the
+/// prompt already says "read the slice you need", but nothing applied pressure at call time.
+const FILE_READ_SYMBOL_HINT_LINES: usize = 400;
+
+/// The retrieval-first hint for a whole-file read, or `None` when it wouldn't help. Pure (no I/O /
+/// globals) so the policy is unit-testable: a hint fires only when the file is SOURCE (`is_code` —
+/// a language server exists for its extension, so the symbol tools actually work), the LSP surface
+/// is live (`lsp_on` — else the tools it names aren't registered), and the read is a long whole-file
+/// pull (`line_count` in the soft-hint band, under the hard budget where `budget_view` already warns).
+fn whole_file_symbol_hint(is_code: bool, lsp_on: bool, line_count: usize) -> Option<String> {
+    if is_code
+        && lsp_on
+        && line_count > FILE_READ_SYMBOL_HINT_LINES
+        && line_count <= FILE_READ_MAX_LINES
+    {
+        Some(format!(
+            "[hint: read {line_count} lines whole. If you need one item, `lsp_document_symbols` \
+             (outline) then `read_symbol` (one full body) is far cheaper and keeps context lean — \
+             this whole file is re-sent every turn. Ignore if you genuinely need all of it.]"
+        ))
+    } else {
+        None
+    }
+}
 
 /// The live top-level tool surface, published once the session's registry is built. The skills
 /// index consults it to hide any skill whose `requires:` tool is absent from this build/session
@@ -1617,6 +1644,14 @@ impl Tool for FileRead {
         let resolved = confine(&self.root, path, true)?;
         let content = std::fs::read_to_string(&resolved)
             .with_context(|| format!("reading {}", resolved.display()))?;
+        // Record WHAT THIS SESSION SAW, so a later whole-file overwrite can tell "I know this
+        // content" from "the ground moved under me". Noted even for a partial (start/end) read: the
+        // fingerprint describes the state of the file on disk at the moment we looked, which is
+        // exactly the question `read_ledger::overwrite_conflict` asks later.
+        crate::core::read_ledger::note(
+            &resolved,
+            &crate::core::persist::FileFingerprint::for_bytes(content.as_bytes()),
+        );
         let start = args.get("start").and_then(|v| v.as_u64());
         let end = args.get("end").and_then(|v| v.as_u64());
         let number = args
@@ -1626,12 +1661,19 @@ impl Tool for FileRead {
         // The whole file — verbatim under budget (the common case; keeps old_string round-trips
         // byte-exact), or a clearly-marked head+tail preview when it's pathologically large.
         if start.is_none() && end.is_none() && !number {
-            return Ok(budget_view(
-                &content,
-                path,
-                FILE_READ_MAX_LINES,
-                FILE_READ_MAX_BYTES,
-            ));
+            let view = budget_view(&content, path, FILE_READ_MAX_LINES, FILE_READ_MAX_BYTES);
+            // Retrieval-first nudge (mức 2): a long whole-file SOURCE read the model likely needs
+            // one item from. Advisory — the full `view` still follows — and only when the symbol
+            // tools it names are actually available (`is_code` + LSP on). Prepended so the model
+            // sees it before committing to re-reading the same file next turn.
+            let is_code =
+                crate::agent::lsp::discovery::server_for_path(&resolved).is_some();
+            let lsp_on = crate::agent::lsp::LSP.is_enabled();
+            let line_count = content.lines().count();
+            if let Some(hint) = whole_file_symbol_hint(is_code, lsp_on, line_count) {
+                return Ok(format!("{hint}\n{view}"));
+            }
+            return Ok(view);
         }
         let lines: Vec<&str> = content.lines().collect();
         let s = start.unwrap_or(1).max(1) as usize;
@@ -1759,19 +1801,12 @@ impl Tool for FileGlob {
         "file_glob"
     }
     fn description(&self) -> &str {
-        "Find files AND directories by NAME or glob (*, **, ?). This is the RIGHT tool for locating \
-         a file or folder — do NOT shell out to `where`, `dir /s`, `Get-ChildItem -Recurse`, `find`, \
-         or `fd` (they hang on large trees and aren't installed everywhere; this is faster and always \
-         present). Give a bare name (`Cargo.toml`, `snake_game.js`) or a glob (`src/**/*.rs`, \
-         `**/mini_project`); matching is case-insensitive unless your pattern has an uppercase \
-         letter. It automatically searches the working dir, its parent folders, and your \
-         Desktop/Documents/Downloads/home — so a bare name is found even when it lives above the cwd \
-         or on the Desktop, without you naming the path. A leading `../` or an absolute path \
-         (`C:/…`) targets a specific place. Results are RANKED best-first (line 1 is the most likely \
-         answer). If nothing matches exactly it falls back to the closest names (typo- and \
-         `_`/`-`/space-tolerant). Hidden files are included; heavy/system dirs (node_modules, target, \
-         .git, Windows, AppData…) are skipped on a broad search. Not for file CONTENT → use \
-         search_files. Read-only."
+        "Find files AND directories by name or glob (*, **, ?) — use this, not a shell command, to \
+         locate a file/folder. A bare name (`Cargo.toml`) runs a ranked, typo-tolerant search across \
+         the working dir, its parents, and Desktop/Documents/home; a glob (`src/**/*.rs`) or a \
+         `../`/absolute path targets a specific place. Case-insensitive unless the pattern has an \
+         uppercase letter; hidden files included, heavy dirs (node_modules, target, .git) skipped on \
+         a broad search. Not for file CONTENT → use search_files. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -2026,6 +2061,12 @@ impl Tool for FileEdit {
             applied.content.as_bytes(),
         )
         .with_context(|| format!("writing {}", target.display()))?;
+        // This edit read the file fresh and wrote it — the session now knows its content, so a later
+        // full overwrite in the same session is informed rather than blind.
+        crate::core::read_ledger::note(
+            &target,
+            &crate::core::persist::FileFingerprint::for_bytes(applied.content.as_bytes()),
+        );
         let mut out = format!(
             "edited {path} ({})\n{}",
             applied.summary(),
@@ -2108,12 +2149,29 @@ impl Tool for FileWrite {
         // needless git-diff noise) and must not arm the verify gate (W16). A create with empty
         // content is a real op (the file did not exist), so gate on `existed`.
         if existed && before == content {
+            // A no-op rewrite still teaches us what is on disk — record it before returning, or the
+            // very next overwrite would look uninformed and be refused for no reason.
+            crate::core::read_ledger::note(&target, &expected);
             return Ok(format!(
                 "{NOOP_WRITE_PREFIX}: {path} already holds this exact content"
             ));
         }
+        // CROSS-SESSION CLOBBER GUARD. The CAS below only compares against the fingerprint read two
+        // lines up, so it passes happily when another aizen window rewrote this file three turns ago:
+        // that window's work would vanish with no error. `file_edit`/`multi_edit` are safe on their
+        // own (`old_string` is matched against a fresh read, so a rewritten region fails to match);
+        // a whole-file write has no such anchor, which is why the check lives here.
+        if let Some(stale) = crate::core::read_ledger::overwrite_conflict(&target, &expected) {
+            bail!(crate::core::read_ledger::conflict_message(path, &stale));
+        }
         crate::core::persist::compare_and_atomic_write(&target, &expected, content.as_bytes())
             .with_context(|| format!("writing {}", target.display()))?;
+        // What we just wrote is now what this session knows to be there — otherwise a second write in
+        // the same turn would see its own change as someone else's interference.
+        crate::core::read_ledger::note(
+            &target,
+            &crate::core::persist::FileFingerprint::for_bytes(content.as_bytes()),
+        );
         let n = content.lines().count();
         let verb = if existed { "overwrote" } else { "created" };
         let mut out = format!("{verb} {path} ({n} line(s))");
@@ -2235,12 +2293,28 @@ impl Tool for FileMove {
         let dst_is_src = dst.canonicalize().map(|c| c == src).unwrap_or(false);
         if dst_is_src {
             move_path(&src, &dst).with_context(|| format!("renaming {from} → {to}"))?;
+            crate::core::read_ledger::forget(&src);
+            crate::core::read_ledger::forget(&dst);
             let kind = if dst.is_dir() { "directory" } else { "file" };
             return Ok(format!("moved {kind} {from} → {to}"));
         }
         if dst.exists() {
             if !overwrite {
                 bail!("destination {to} already exists; pass overwrite:true to replace it");
+            }
+            // An overwrite move destroys the destination's content outright, so it needs the same
+            // cross-session guard `file_write` has: refuse when another live window is editing the
+            // file we are about to replace and this session never looked at it. `file_move` has no
+            // CAS of its own, which makes this the ONLY check standing between a blind `overwrite:
+            // true` and another window's work.
+            if let Some(by) = crate::features::coop::live_peer_claim_at(&dst) {
+                if crate::core::read_ledger::observed(&dst).is_none() {
+                    bail!(
+                        "overwrite conflict: {to} is being edited by session {by} and this session \
+                         has not read it; nothing was moved. Replacing it would discard that \
+                         window's work — read it first if you mean to replace it."
+                    );
+                }
             }
             // Overwrite WITHOUT a pre-delete window: if we deleted `dst` first and the subsequent
             // rename then failed (permissions, a race, source vanished), `dst` would be gone with
@@ -2268,10 +2342,17 @@ impl Tool for FileMove {
                     });
                 }
             }
+            // Both identities changed hands: the source is gone and the destination holds different
+            // content than anything this session observed there. A stale observation on either would
+            // make the NEXT overwrite check answer about a file that no longer exists.
+            crate::core::read_ledger::forget(&src);
+            crate::core::read_ledger::forget(&dst);
             let kind = if dst.is_dir() { "directory" } else { "file" };
             return Ok(format!("moved {kind} {from} → {to}"));
         }
         move_path(&src, &dst).with_context(|| format!("moving {from} → {to}"))?;
+        crate::core::read_ledger::forget(&src);
+        crate::core::read_ledger::forget(&dst);
         let kind = if dst.is_dir() { "directory" } else { "file" };
         Ok(format!("moved {kind} {from} → {to}"))
     }
@@ -3010,6 +3091,11 @@ impl Tool for MultiEdit {
         }
         crate::core::persist::compare_and_atomic_write(&target, &expected, buf.as_bytes())
             .with_context(|| format!("writing {}", target.display()))?;
+        // Same as file_edit: record what this session now knows is on disk.
+        crate::core::read_ledger::note(
+            &target,
+            &crate::core::persist::FileFingerprint::for_bytes(buf.as_bytes()),
+        );
         let mut out = format!(
             "edited {path} ({} edits applied)\n{}\n{}",
             edits.len(),
@@ -3439,6 +3525,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn whole_file_symbol_hint_fires_only_for_long_source_with_lsp() {
+        // Fires: long source file, LSP live, under the hard budget.
+        assert!(whole_file_symbol_hint(true, true, 800).is_some());
+        // Silent: short file (nothing to save), non-source (no symbol tools apply),
+        // LSP off (the tools aren't registered), and at/over the hard budget (budget_view
+        // already warns there — no double nudge).
+        assert!(whole_file_symbol_hint(true, true, FILE_READ_SYMBOL_HINT_LINES).is_none());
+        assert!(whole_file_symbol_hint(false, true, 800).is_none());
+        assert!(whole_file_symbol_hint(true, false, 800).is_none());
+        assert!(whole_file_symbol_hint(true, true, FILE_READ_MAX_LINES + 1).is_none());
+    }
+
+    #[test]
+    fn tool_schema_stays_within_budget() {
+        // The whole tool array sits at the FRONT of every request and is re-sent at full price
+        // each time the prompt cache lapses (Anthropic's ~5-min TTL — i.e. after any think-pause
+        // in an interactive session), so schema bloat is a RECURRING cost, not a one-time one.
+        // These ceilings are a ratchet: a new tool (or a description that grows a paragraph of
+        // internal-mechanics prose the model doesn't need to CHOOSE the tool) trips the test
+        // instead of silently re-inflating the surface. Raise a ceiling only with a measurement
+        // that shows the added bytes earn their keep (better tool selection), never to make a
+        // fat description compile. Bytes, not tokens, so the bound is deterministic across
+        // tokenizers; ≈ bytes/4 tokens.
+        const TOTAL_CEILING: usize = 31_000; // measured ~30.2 KB after trimming file_glob (2026-07-29)
+        const PER_TOOL_CEILING: usize = 1_400; // no single tool should dwarf the rest (todo_write ~1.3 KB)
+
+        let root = temp_root("schema-budget");
+        let defs = default_registry_in(&root).defs();
+        let mut rows: Vec<(String, usize)> = defs
+            .iter()
+            .map(|d| (d.function.name.clone(), serde_json::to_string(d).unwrap().len()))
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let total: usize = rows.iter().map(|r| r.1).sum();
+        // A readable dump on failure so the diff that tripped the ratchet is obvious.
+        let dump = || {
+            let mut s = format!(
+                "tool schema: count={}, total={total} B (ceiling {TOTAL_CEILING})\n",
+                rows.len()
+            );
+            for (name, whole) in &rows {
+                s.push_str(&format!("  {name:<26} {whole:>7}\n"));
+            }
+            s
+        };
+        assert!(
+            total <= TOTAL_CEILING,
+            "total tool schema {total} B exceeds the {TOTAL_CEILING} B budget — trim a \
+             description or gate a tool rather than raising the ceiling.\n{}",
+            dump()
+        );
+        if let Some((name, whole)) = rows.first() {
+            assert!(
+                *whole <= PER_TOOL_CEILING,
+                "tool `{name}` is {whole} B (per-tool ceiling {PER_TOOL_CEILING}) — its \
+                 description likely explains HOW it works instead of WHEN to pick it.\n{}",
+                dump()
+            );
+        }
     }
 
     #[test]
@@ -4396,6 +4545,62 @@ mod tests {
             mtime_before,
             "no-op overwrite must not rewrite the file"
         );
+    }
+
+    #[test]
+    fn file_write_refuses_to_overwrite_what_changed_after_this_session_read_it() {
+        // The cross-session clobber `compare_and_atomic_write` cannot see: its fingerprint is taken
+        // microseconds before the write, so a peer window's rewrite passes the CAS and vanishes. The
+        // read ledger is the anchor — read, let someone else rewrite, and the full overwrite refuses.
+        let root = temp_root("fw-stale");
+        let p = root.join("shared.rs");
+        std::fs::write(&p, "fn a() {}\n").unwrap();
+        FileRead::new(root.clone())
+            .execute(&serde_json::json!({"path": "shared.rs"}))
+            .unwrap();
+        // Another window (or an external editor) rewrites it while we were thinking.
+        std::fs::write(&p, "fn a() {}\nfn peer_work() {}\n").unwrap();
+        let err = FileWrite::new(root.clone())
+            .execute(&serde_json::json!({"path": "shared.rs", "content": "fn a() { /* mine */ }\n"}))
+            .expect_err("a stale whole-file overwrite must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("overwrite conflict"), "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "fn a() {}\nfn peer_work() {}\n",
+            "the peer's work must still be on disk"
+        );
+        // Re-reading is the documented recovery: now the session knows what is there, and the same
+        // write goes through.
+        FileRead::new(root.clone())
+            .execute(&serde_json::json!({"path": "shared.rs"}))
+            .unwrap();
+        FileWrite::new(root.clone())
+            .execute(&serde_json::json!({"path": "shared.rs", "content": "merged\n"}))
+            .expect("after re-reading, the overwrite is allowed");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "merged\n");
+        crate::core::read_ledger::forget(&p);
+    }
+
+    #[test]
+    fn a_sessions_own_edit_does_not_make_its_next_write_look_like_interference() {
+        // The write tools update the ledger after a successful write: the bytes we just wrote ARE
+        // what this session now knows to be there. Without that, a session's second write to a file
+        // it edited itself would be refused as a conflict with its own work.
+        let root = temp_root("fw-selfedit");
+        let p = root.join("mine.rs");
+        std::fs::write(&p, "one\n").unwrap();
+        FileWrite::new(root.clone())
+            .execute(&serde_json::json!({"path": "mine.rs", "content": "two\n"}))
+            .expect("first write: never read, nothing claims it");
+        FileEdit::new(root.clone())
+            .execute(&serde_json::json!({"path": "mine.rs", "old_string": "two", "new_string": "three"}))
+            .expect("edit against a fresh read always works");
+        FileWrite::new(root.clone())
+            .execute(&serde_json::json!({"path": "mine.rs", "content": "four\n"}))
+            .expect("our own edit must not read as someone else's interference");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "four\n");
+        crate::core::read_ledger::forget(&p);
     }
 
     #[test]

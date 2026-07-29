@@ -2303,6 +2303,84 @@ pub fn diff(
     })
 }
 
+// ---------------------------------------------------------------------------------------------
+// Reading one file at one point in the timeline
+// ---------------------------------------------------------------------------------------------
+
+/// One entry from a tree: the mode Git recorded, the blob's oid, and its exact bytes.
+#[derive(Debug, Clone)]
+pub struct TreeBlob {
+    pub mode: String,
+    pub oid: String,
+    /// Verbatim blob content. Never decoded, so a file that is not valid UTF-8 survives a round trip.
+    pub bytes: Vec<u8>,
+}
+
+/// Tree oid behind a timeline side.
+///
+/// Public because resolving `Working` writes a fresh tree from the whole index: a caller reading
+/// several files from one point in time has to pay that once, not once per path.
+pub fn resolve_tree(side: &DiffSide) -> Result<String> {
+    let ctx = RepoContext::current()?;
+    let _store = ctx.store_shared()?;
+    let mut ledger = ctx.load_ledger()?;
+    ledger.normalize()?;
+    side_tree(&ctx, &ledger, side)
+}
+
+/// Exact bytes of `path` inside `tree`; `None` when the tree holds no blob there.
+///
+/// Reads through the private store, whose sealed alternates reach the repository's own objects — so
+/// trees written by checkpoints and trees that are plain repository history both resolve here.
+pub fn blob_in_tree(tree: &str, path: &str) -> Result<Option<TreeBlob>> {
+    let ctx = RepoContext::current()?;
+    let _store = ctx.store_shared()?;
+    let listing = ctx.git(None, ["ls-tree", "-r", "-z", tree, "--", path])?;
+    let Some(entry) = listing.split('\0').find(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    // `<mode> SP <type> SP <oid> TAB <path>`. Only the metadata ahead of the tab is needed, so the
+    // trailing path — the one field `-z` leaves unquoted and untrimmed — is never parsed.
+    let meta = entry.split('\t').next().unwrap_or(entry);
+    let mut fields = meta.split_whitespace();
+    let mode = fields.next().unwrap_or_default().to_string();
+    let kind = fields.next().unwrap_or_default().to_string();
+    let oid = fields.next().unwrap_or_default().to_string();
+    if kind != "blob" || oid.is_empty() {
+        // A gitlink (submodule) or a subtree holds no content a caller could compose.
+        return Ok(None);
+    }
+    let out = ctx.git_output(None, ["cat-file", "blob", &oid])?;
+    if !out.status.success() {
+        bail!(
+            "reading {path} at tree {tree}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(Some(TreeBlob {
+        mode,
+        oid,
+        bytes: out.stdout,
+    }))
+}
+
+/// Every checkpoint id in this worktree's ledger, ascending.
+///
+/// Ids are allocated monotonically, so ascending id IS chronological order, and two consecutive ids
+/// bracket exactly the work done between those two snapshots. Since the workspace writer lease is
+/// held for a whole turn, that interval is one turn by one session — which is what lets a caller
+/// attribute it, and reconstruct one session's version of a file the other also edited.
+pub fn checkpoint_ids() -> Result<Vec<u32>> {
+    let ctx = RepoContext::current()?;
+    let _store = ctx.store_shared()?;
+    let mut ledger = ctx.load_ledger()?;
+    ledger.normalize()?;
+    let mut ids: Vec<u32> = ledger.snapshots.iter().map(|s| s.id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
 #[derive(Debug, Serialize)]
 pub struct DoctorReport {
     pub ok: bool,

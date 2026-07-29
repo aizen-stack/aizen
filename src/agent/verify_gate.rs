@@ -75,6 +75,36 @@ pub fn detect_verify_command(cwd: &Path) -> Option<VerifyCommand> {
     None
 }
 
+/// Walk up from `start` (a directory, or a file's directory) to the nearest ancestor that looks
+/// like a project root — one carrying a manifest `detect_verify_command` recognizes (`Cargo.toml`,
+/// `package.json`, `tsconfig.json`) or a `./.aizen/verify.json`. Returns that directory, or `None`
+/// if no ancestor qualifies (the gate then falls back to cwd, preserving the old behavior).
+///
+/// This exists because the file tools can write OUTSIDE the process cwd (the confine guard was
+/// removed): the write target's directory is where the edit really landed, but that directory is
+/// often a `src/` subfolder, not the crate root where `Cargo.toml` lives. Detection keys on the
+/// manifest sitting in the SAME directory, so the gate must first climb to the directory that holds
+/// it — otherwise a real edit to `proj/src/x.rs` finds no manifest in `proj/src/` and skips
+/// verification silently, the exact gap this closes.
+pub fn verify_root(start: &Path) -> Option<std::path::PathBuf> {
+    // If `start` names a file, begin at its directory; a directory begins at itself.
+    let mut dir: &Path = if start.is_file() {
+        start.parent()?
+    } else {
+        start
+    };
+    loop {
+        let has_manifest = dir.join("Cargo.toml").is_file()
+            || dir.join("package.json").is_file()
+            || dir.join("tsconfig.json").is_file()
+            || dir.join(".aizen").join("verify.json").is_file();
+        if has_manifest {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+}
+
 /// The COMMAND LIST for a project: `./.aizen/verify.json` (project-supplied, e.g.
 /// `{"commands": ["cargo test --lib", "cargo clippy"], "timeout_secs": 180}`) when present AND the
 /// project is TRUSTED — auto-running repo-supplied commands is the same supply-chain surface as
@@ -512,6 +542,37 @@ mod tests {
         let d = temp_dir("none");
         std::fs::write(d.join("readme.txt"), "hi").unwrap();
         assert_eq!(detect_verify_command(&d), None);
+    }
+
+    #[test]
+    fn verify_root_walks_up_from_a_subdir_to_the_manifest() {
+        // The edit landed in `proj/src/` but `Cargo.toml` sits in `proj/` — the gate must climb.
+        let root = temp_dir("walkup");
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        let src = root.join("src").join("nested");
+        std::fs::create_dir_all(&src).unwrap();
+        // Canonicalize both sides: temp_dir may sit behind a symlink (e.g. macOS /var → /private).
+        assert_eq!(
+            verify_root(&src).map(|p| p.canonicalize().unwrap()),
+            Some(root.canonicalize().unwrap())
+        );
+        // A file argument begins at its parent dir and still finds the root.
+        let file = src.join("x.rs");
+        std::fs::write(&file, "// x").unwrap();
+        assert_eq!(
+            verify_root(&file).map(|p| p.canonicalize().unwrap()),
+            Some(root.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn verify_root_is_none_when_no_ancestor_has_a_manifest() {
+        let d = temp_dir("walkup-none");
+        let sub = d.join("a").join("b");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Nothing from `sub` up to the filesystem root carries a manifest we recognize. (temp dirs
+        // themselves never do, so this walks to `/` and returns None.)
+        assert_eq!(verify_root(&sub), None);
     }
 
     #[test]

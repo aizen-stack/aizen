@@ -5,7 +5,9 @@
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::core::repo_lock::{LockMode, RepoTxnLock};
@@ -136,9 +138,30 @@ impl WorkspaceIdentity {
     }
 }
 
+/// Worktree ids whose workspace lease THIS process already holds, with a nesting count.
+///
+/// An OS advisory lock is owned by the process, but both `LockFileEx` on a second handle and `flock`
+/// on a second descriptor still conflict — a nested acquire inside one process blocks against itself
+/// and then fails on timeout. That is not a theoretical case: the agent loop takes the lease on the
+/// first writing tool of a turn and holds it to the end of the turn, so a delegated sub-agent that
+/// writes (`task` with a write-capable role runs on the serialized path while the parent's lease is
+/// live) would deadlock against its own parent and report "workspace writer lease was not acquired"
+/// for an edit nothing was actually contending.
+///
+/// Reentrancy is safe precisely because the lease's purpose is mutual exclusion BETWEEN sessions:
+/// two nested holders in one process are one writer as far as any other process can tell, and the
+/// parent is suspended on the barrier path while the child runs.
+static HELD: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+
+fn held_map<T>(f: impl FnOnce(&mut HashMap<String, u32>) -> T) -> T {
+    let mut guard = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(HashMap::new))
+}
+
 pub struct WorkspaceWriterLease {
     identity: WorkspaceIdentity,
-    _locks: LockSet,
+    /// `None` for a reentrant handle: the OS locks are held by an outer handle in this process.
+    _locks: Option<LockSet>,
 }
 
 impl WorkspaceWriterLease {
@@ -158,6 +181,21 @@ impl WorkspaceWriterLease {
         cancel: Option<&crate::core::cancel::TurnCancel>,
         operation: &str,
     ) -> Result<Self> {
+        // Already ours? Take a nested reference instead of deadlocking against our own handle.
+        let reentrant = held_map(|m| match m.get_mut(&identity.worktree_id) {
+            Some(n) => {
+                *n += 1;
+                true
+            }
+            None => false,
+        });
+        if reentrant {
+            return Ok(Self {
+                identity,
+                _locks: None,
+            });
+        }
+
         let owner = LockOwner::new(format!("{}-{}", std::process::id(), now_unix()), operation);
         let locks = LockSet::acquire(
             vec![
@@ -178,10 +216,18 @@ impl WorkspaceWriterLease {
             cancel,
             &owner,
         )?;
+        // Registered only AFTER the OS locks are in hand, so a failed acquire never leaves a phantom
+        // entry that would let a later nested acquire believe it is covered.
+        held_map(|m| m.insert(identity.worktree_id.clone(), 1));
         Ok(Self {
             identity,
-            _locks: locks,
+            _locks: Some(locks),
         })
+    }
+
+    /// Does this process already hold the workspace lease for `identity`'s worktree?
+    pub fn held_by_this_process(identity: &WorkspaceIdentity) -> bool {
+        held_map(|m| m.contains_key(&identity.worktree_id))
     }
 
     pub fn time_machine_lock(&self) -> Result<RepoTxnLock> {
@@ -190,6 +236,26 @@ impl WorkspaceWriterLease {
 
     pub fn identity(&self) -> &WorkspaceIdentity {
         &self.identity
+    }
+}
+
+impl Drop for WorkspaceWriterLease {
+    fn drop(&mut self) {
+        // The registry must mean exactly one thing: "an OS lock for this worktree is held by this
+        // process right now". So the handle that OWNS the locks clears the entry outright as it goes
+        // — its `LockSet` is released immediately after this, and leaving a count behind would let the
+        // next acquire believe it was covered and skip the OS lock, silently dropping the exclusion
+        // that keeps two sessions apart. A nested handle merely decrements.
+        held_map(|m| {
+            if self._locks.is_some() {
+                m.remove(&self.identity.worktree_id);
+            } else if let Some(n) = m.get_mut(&self.identity.worktree_id) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    m.remove(&self.identity.worktree_id);
+                }
+            }
+        });
     }
 }
 
@@ -439,6 +505,59 @@ mod tests {
         assert!(!a.contains(input));
     }
 
+    /// A nested acquire inside one process must SUCCEED and must not release the OS locks early.
+    ///
+    /// Before reentrancy this deadlocked against itself: the agent loop holds the lease from the first
+    /// writing tool of a turn to the end of the turn, so a delegated sub-agent's first edit waited the
+    /// full timeout and then failed with "workspace writer lease was not acquired" — for a worktree
+    /// nothing else was contending.
+    #[test]
+    fn a_nested_lease_in_one_process_is_granted_and_outlives_the_inner_handle() {
+        let base = std::env::temp_dir().join(format!(
+            "aizen-lease-reentry-{}-{}",
+            std::process::id(),
+            crate::core::persist::unique_sequence()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let identity = WorkspaceIdentity::discover(&base).unwrap();
+
+        let outer = WorkspaceWriterLease::acquire_identity(
+            identity.clone(),
+            Duration::from_millis(200),
+            None,
+            "outer",
+        )
+        .expect("first acquire holds the OS locks");
+        assert!(WorkspaceWriterLease::held_by_this_process(&identity));
+
+        let inner = WorkspaceWriterLease::acquire_identity(
+            identity.clone(),
+            Duration::from_millis(200),
+            None,
+            "nested",
+        )
+        .expect("nested acquire must be granted, not time out against our own handle");
+
+        // Dropping the INNER handle must not surrender the worktree: the outer holder is still live.
+        drop(inner);
+        assert!(
+            WorkspaceWriterLease::held_by_this_process(&identity),
+            "inner drop must not release the lease the outer handle still owns"
+        );
+
+        drop(outer);
+        assert!(
+            !WorkspaceWriterLease::held_by_this_process(&identity),
+            "outermost drop must clear the entry, or the next acquire would skip the OS lock and \
+             silently lose cross-session exclusion"
+        );
+
+        // Proof the OS lock really came back: a fresh acquire succeeds immediately.
+        WorkspaceWriterLease::acquire_identity(identity, Duration::from_millis(200), None, "after")
+            .expect("lease must be re-acquirable once every handle is gone");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn different_non_git_roots_get_different_worktree_ids() {
         let base = std::env::temp_dir().join(format!(
@@ -489,6 +608,39 @@ mod tests {
         assert_eq!(locks.len(), 2);
         drop(locks);
         RepoTxnLock::acquire_exclusive(&b, Duration::from_millis(100)).unwrap();
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// The workspace lock is NOT reentrant, not even within one process: a second `LockSet` on the
+    /// same path from the same process is refused. Any design that takes the writer lease while one
+    /// is already held (a nested agent loop, a helper that re-acquires "just to be safe") must
+    /// therefore reuse the held lease rather than ask for a second one.
+    #[test]
+    fn the_same_process_cannot_take_one_lock_twice() {
+        let base = std::env::temp_dir().join(format!(
+            "aizen-lock-reentrancy-{}-{}",
+            std::process::id(),
+            crate::core::persist::unique_sequence()
+        ));
+        let path = base.join("x.lock");
+        let owner = LockOwner::new("test", "reentrancy");
+        let request = |label: &'static str| {
+            vec![LockRequest::new(
+                LockClass::Workspace,
+                path.clone(),
+                LockMode::Exclusive,
+                label,
+            )]
+        };
+        let first = LockSet::acquire(request("first"), Duration::from_millis(50), None, &owner)
+            .expect("first acquisition must succeed");
+        assert!(
+            LockSet::acquire(request("second"), Duration::from_millis(50), None, &owner).is_err(),
+            "a second lock on a path this process already holds must be refused"
+        );
+        drop(first);
+        LockSet::acquire(request("third"), Duration::from_millis(100), None, &owner)
+            .expect("the path must be lockable again once released");
         let _ = std::fs::remove_dir_all(base);
     }
 }

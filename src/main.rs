@@ -2274,8 +2274,17 @@ fn run_team(cmd: TeamCmd) -> Result<()> {
                 );
             }
             let review = coop::stage_plan(&plan)?;
-            for line in review.lines() {
+            for line in review.stat.lines() {
                 println!("  {line}");
+            }
+            if !review.separated.is_empty() {
+                println!(
+                    "{} {} shared file(s) were separated: the commit holds only this session's \
+                     version, while the working tree keeps both sessions' edits: {}",
+                    style("↔").color256(splash::ACCENT),
+                    review.separated.len(),
+                    review.separated.join(", ")
+                );
             }
             // `--yes` is the only path to an actual commit: a bare `aizen team commit` reviews and
             // rolls the index back, so discovering the command cannot land one.
@@ -2296,7 +2305,7 @@ fn run_team(cmd: TeamCmd) -> Result<()> {
                     task.to_string()
                 }
             });
-            let out = coop::commit_staged(&plan, &msg)?;
+            let out = coop::commit_staged(&plan, &msg, &review)?;
             for line in out.lines().take(6) {
                 println!("  {line}");
             }
@@ -4939,7 +4948,7 @@ async fn run_menu_sticky() -> Result<()> {
     // one that eventually reviews and commits) can see it exists, what it is doing, and which files
     // it has changed. Best-effort: a registry failure never blocks the REPL.
     coop::begin(current_session_slug());
-    for line in coop::peers_banner() {
+    if let Some(line) = coop::peers_banner() {
         tui::emit_line(&style(line).dim().to_string());
     }
     if let Some(offer) = crate::core::recovery::scan_stale(&repo_scope)
@@ -8209,15 +8218,27 @@ async fn slash_team_commit(rest: &str) {
             return;
         }
     }
-    let stat = match coop::stage_plan(&plan) {
+    let review = match coop::stage_plan(&plan) {
         Ok(s) => s,
         Err(e) => {
             tui::emit_line(&format!("{} {e:#}", style("team commit:").red()));
             return;
         }
     };
-    for line in stat.lines() {
+    for line in review.stat.lines() {
         tui::emit_line(&format!("  {line}"));
+    }
+    if !review.separated.is_empty() {
+        tui::emit_line(
+            &style(format!(
+                "↔ {} shared file(s) were separated: the commit holds only this session's version, \
+                 while the working tree keeps both sessions' edits — {}",
+                review.separated.len(),
+                review.separated.join(", ")
+            ))
+            .color256(splash::ACCENT)
+            .to_string(),
+        );
     }
     if verify {
         match crate::agent::verify_gate::run_verify_gate(&plan.root, 300).await {
@@ -8283,7 +8304,7 @@ async fn slash_team_commit(rest: &str) {
         );
         return;
     }
-    match coop::commit_staged(&plan, &msg) {
+    match coop::commit_staged(&plan, &msg, &review) {
         Ok(out) => {
             for line in out.lines().take(6) {
                 tui::emit_line(&format!("  {line}"));
