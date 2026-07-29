@@ -6781,9 +6781,12 @@ fn surface_abnormal_stop(outcome: &AgentOutcome) {
              — `/diff` to see what changed, `/rewind` to undo, or tell me to keep fixing.",
             outcome.iters
         ),
+        // Reaching here now means the loop ALREADY granted itself every continuation it was allowed
+        // (see `AgentConfig::max_continuations`) — so this is a genuinely long task, not the old
+        // "cut off at step 50" case. Say that, rather than implying one more nudge would have done it.
         StopReason::MaxIters => format!(
-            "⚠ hit the step limit ({} steps) — the task may be incomplete. Say \"continue\" to \
-             carry on from here.",
+            "⚠ ran out of step budget after {} steps, including the automatic continuations — the \
+             task may be incomplete. Say \"continue\" to carry on from here.",
             outcome.iters
         ),
         // Both signature loops and evidence-flat exploration reach here. The final synthesis above
@@ -8630,6 +8633,28 @@ fn fmt_session_age(mtime_ms: Option<u64>) -> String {
     fmt_time_ago((ms / 1000).max(1)) // .max(1): second 0 is fmt_time_ago's "unknown" sentinel
 }
 
+/// Age in at most three cells: `now`, `5m`, `19h`, `62d`, `2y`, or `?` when the mtime is unreadable.
+///
+/// For a LIST, not a status line. `fmt_session_age` spells the unit out, which is right when one age
+/// stands alone but wrong down a column: `19 hour(s) ago` against `1 min ago` is a six-character
+/// jitter sitting directly in front of the subject, so nothing lines up and the eye has to re-find
+/// the text on every row. A clock-skewed file reads `now` rather than announcing the skew — in a
+/// 240-row picker that sentence is longer than the row it describes, and the file still sorts first.
+fn fmt_session_age_compact(mtime_ms: Option<u64>) -> String {
+    let Some(ms) = mtime_ms else {
+        return "?".to_string();
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let secs = now_ms.saturating_sub(ms) / 1000;
+    match secs {
+        0..=59 => "now".to_string(),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        86_400..=31_535_999 => format!("{}d", secs / 86_400),
+        _ => format!("{}y", secs / 31_536_000),
+    }
+}
+
 /// Short human label for where a foreign or unlabeled session came from — the picker/hint suffix.
 /// Takes the meta rather than the row so the `last.json` re-home path (which has no row) can use it.
 ///
@@ -9130,12 +9155,15 @@ async fn import_menu(history: &mut Vec<Message>, model_label: &str) -> Result<()
         );
         return Ok(());
     }
-    let items: Vec<String> = pool.iter().map(|s| s.row(fmt_session_age)).collect();
-    let prompt = format!(
-        "Import — {} foreign transcript{} for this project, newest first · pick one to resume (Esc to go back)",
-        pool.len(),
-        if pool.len() == 1 { "" } else { "s" }
-    );
+    // Clip to the terminal, minus dialoguer's own `❯ ` prefix and one cell of right margin. An item
+    // that overflows gets WRAPPED onto a second line, which breaks the column alignment for every row
+    // below it — the whole reason the list is scannable.
+    let width = console::Term::stdout().size().1 as usize;
+    let items: Vec<String> = pool
+        .iter()
+        .map(|s| s.row(fmt_session_age_compact, width.saturating_sub(4).max(24)))
+        .collect();
+    let prompt = format!("Import — {} conversations from claude/codex", pool.len());
     let pick = match Select::with_theme(&theme)
         .with_prompt(prompt)
         .items(&items)
@@ -9925,10 +9953,6 @@ fn print_config(cfg: &cli_config::CliConfig) {
         format!("auto-learn {}", on(cfg.auto_skill_learn.unwrap_or(true))),
     );
     row(
-        "memory",
-        format!("auto-learn {}", on(cfg.memory_auto_learn.unwrap_or(true))),
-    );
-    row(
         "persona",
         format!(
             "{}  {} evolve {}",
@@ -9965,17 +9989,71 @@ fn print_config(cfg: &cli_config::CliConfig) {
         ),
     );
 
+    // ── Memory ──
+    // Reports the tier that will ACTUALLY run, not the config flag: `settings()` folds in the cargo
+    // feature, `AIZEN_MEM_DENSE`, and whether a model is installed. Printing the flag alone would
+    // claim dense recall on a build that has no semantic backend.
+    section("Memory");
+    row("auto-learn", on(cfg.memory_auto_learn.unwrap_or(true)));
+    row(
+        "recall",
+        if memory::settings().enable_dense {
+            format!("{}  {}", theme::accent("lexical + dense"), theme::ok("✓"))
+        } else if cfg!(feature = "dense") {
+            format!(
+                "{}  {}",
+                theme::accent("lexical"),
+                theme::faint("· no embedding model installed")
+            )
+        } else {
+            format!(
+                "{}  {}",
+                theme::accent("lexical"),
+                theme::faint("· this build has no semantic backend")
+            )
+        },
+    );
+    row(
+        "embed model",
+        match cfg.embed_model.as_deref() {
+            Some(m) => theme::accent(m).to_string(),
+            None => format!(
+                "{}  {}",
+                theme::faint("auto"),
+                theme::faint(format!(
+                    "· {}",
+                    memory::embed::discover_local_model()
+                        .map(|c| c.name)
+                        .unwrap_or_else(|| "none found".into())
+                ))
+            ),
+        },
+    );
+
     // ── Web search ──
+    // Both keys are listed because `/config` now edits both, and because the "needs a key" warning is
+    // only true when NEITHER is present: Jina alone is a working (if secondary) search backend, so
+    // warning next to a set Jina key would be wrong.
     section("Web search");
+    let tavily_key = cfg.reach.as_ref().and_then(|r| r.resolved_tavily_key());
+    let jina_key = cfg.reach.as_ref().and_then(|r| r.resolved_jina_key());
     row(
         "tavily key",
-        match cfg.reach.as_ref().and_then(|r| r.resolved_tavily_key()) {
-            Some(k) => format!("{}  {}", cli_config::mask(&k), theme::ok("✓")),
+        match &tavily_key {
+            Some(k) => format!("{}  {}", cli_config::mask(k), theme::ok("✓")),
+            None if jina_key.is_some() => format!("{}  {}", unset(), theme::faint("· using jina")),
             None => format!(
                 "{}  {}",
                 unset(),
                 theme::warn("web_search needs a key · run config")
             ),
+        },
+    );
+    row(
+        "jina key",
+        match &jina_key {
+            Some(k) => format!("{}  {}", cli_config::mask(k), theme::ok("✓")),
+            None => format!("{}  {}", unset(), theme::faint("· optional fallback")),
         },
     );
 
@@ -10053,6 +10131,346 @@ fn yn(theme: &ColorfulTheme, prompt: &str, default: bool) -> Result<bool> {
         .interact()?)
 }
 
+// ── setup: validated connection (provider → base URL → key → model) ──────────
+
+/// A known endpoint the user can pick instead of typing a URL. `base` is stored verbatim, so every
+/// entry here must already carry whatever version suffix the provider needs — that is the whole point
+/// of a preset: the `/v1` that people forget is baked in and can't be forgotten.
+struct ProviderPreset {
+    label: &'static str,
+    base: &'static str,
+    /// Where to get a key, shown right before we ask for one.
+    keys_url: &'static str,
+    /// A model id that exists there, used only as the manual-entry default if the list fetch fails.
+    sample_model: &'static str,
+}
+
+/// Presets offered by the provider picker, in menu order.
+///
+/// Anthropic is here as an OpenAI-COMPATIBLE entry, which is worth being precise about: aizen speaks
+/// `POST {base}/chat/completions` with a Bearer token, and Anthropic serves exactly that shape at
+/// `https://api.anthropic.com/v1/` (their documented OpenAI-SDK compatibility surface, where
+/// `authorization` is fully supported). So this preset needs no new wire protocol. The one wrinkle is
+/// `GET /v1/models`, which is the NATIVE endpoint and wants `x-api-key` + `anthropic-version` —
+/// handled in `client::with_provider_auth`, not here.
+const PROVIDER_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        label: "OpenAI",
+        base: "https://api.openai.com/v1",
+        keys_url: "https://platform.openai.com/api-keys",
+        sample_model: "gpt-4o",
+    },
+    ProviderPreset {
+        label: "Anthropic (Claude)",
+        base: "https://api.anthropic.com/v1",
+        keys_url: "https://console.anthropic.com/settings/keys",
+        sample_model: "claude-opus-5",
+    },
+    ProviderPreset {
+        label: "OpenRouter",
+        base: "https://openrouter.ai/api/v1",
+        keys_url: "https://openrouter.ai/keys",
+        sample_model: "anthropic/claude-opus-5",
+    },
+    ProviderPreset {
+        label: "Groq",
+        base: "https://api.groq.com/openai/v1",
+        keys_url: "https://console.groq.com/keys",
+        sample_model: "llama-3.3-70b-versatile",
+    },
+    ProviderPreset {
+        label: "DeepSeek",
+        base: "https://api.deepseek.com/v1",
+        keys_url: "https://platform.deepseek.com/api_keys",
+        sample_model: "deepseek-chat",
+    },
+    ProviderPreset {
+        label: "Ollama (local)",
+        base: "http://localhost:11434/v1",
+        keys_url: "no key needed — enter anything (e.g. `ollama`)",
+        sample_model: "llama3.2",
+    },
+];
+
+/// Await `fut` while a spinner animates on the line, then clear it. The verdict is the caller's to
+/// print — this only owns the "something is happening" gap.
+///
+/// Safe to draw here because every entry point into config SUSPENDS the retained TUI
+/// (`tui::slash_takes_stdin` lists `config`/`setup`), so stdout is ours. `Spinner` is itself a no-op
+/// off a TTY, so piped runs stay clean.
+async fn spin_while<T>(label: &str, fut: impl std::future::Future<Output = T>) -> T {
+    let sp = crate::ui::spinner::Spinner::start(label);
+    let out = fut.await;
+    drop(sp); // clears the line, leaves the cursor at column 0
+    out
+}
+
+/// `  ✓ <msg>` in the ok colour.
+fn line_ok(msg: &str) {
+    println!("  {} {}", crate::ui::theme::ok("✓"), style(msg).dim());
+}
+
+/// `  ✗ <msg>` in red — a failure the user has to act on.
+fn line_bad(msg: &str) {
+    println!("  {} {}", style("✗").red(), style(msg).red());
+}
+
+/// `  ! <msg>` in the warn colour — something to know, but not a stop.
+fn line_warn(msg: &str) {
+    println!(
+        "  {} {}",
+        style("!").color256(crate::ui::theme::WARN),
+        style(msg).color256(crate::ui::theme::WARN)
+    );
+}
+
+/// Ask for a base URL until one actually answers as a models endpoint, then return it with the model
+/// list the check already fetched.
+///
+/// Two deliberate choices:
+///
+/// * **A missing `/v1` is diagnosed, not just reported.** It is the single most common setup mistake,
+///   and the failure it produces (404 on `{base}/models`) is indistinguishable from a typo unless we
+///   say so. When the URL has no version segment we offer the `/v1` form as the next default, so
+///   fixing it is one Enter.
+/// * **The check runs BEFORE asking for a key** and passes `None`. An endpoint that answers 401
+///   without credentials has already proven it is reachable and speaks the protocol, which is exactly
+///   what this step needs to establish; asking for a key first would blame the key for a bad URL.
+///
+/// `current` pre-fills the prompt (Enter keeps it). Returns `None` if the user gives up (Esc/Ctrl-C
+/// propagate as errors; an empty entry with `allow_skip` returns `None`).
+async fn prompt_validated_base_url(
+    theme: &ColorfulTheme,
+    http: &reqwest::Client,
+    current: Option<&str>,
+    allow_skip: bool,
+) -> Result<Option<(String, Vec<client::ModelInfo>)>> {
+    let mut suggestion: Option<String> = current.map(str::to_string);
+    loop {
+        let mut input = Input::<String>::with_theme(theme)
+            .with_prompt("Base URL (must include the version path, e.g. https://api.openai.com/v1)")
+            .allow_empty(allow_skip);
+        if let Some(s) = suggestion.clone() {
+            input = input.default(s);
+        }
+        let raw = input.interact_text()?;
+        let base = raw.trim().trim_end_matches('/').to_string();
+        if base.is_empty() {
+            if allow_skip {
+                return Ok(None);
+            }
+            line_bad("a base URL is required");
+            continue;
+        }
+        if !(base.starts_with("http://") || base.starts_with("https://")) {
+            line_bad("must start with http:// or https://");
+            suggestion = Some(format!("https://{base}"));
+            continue;
+        }
+
+        let check = spin_while(
+            &format!("checking {base}"),
+            client::check_endpoint(http, &base, None),
+        )
+        .await;
+        match check {
+            client::EndpointCheck::Ok(infos) => {
+                line_ok(&format!("reachable — {} models", infos.len()));
+                return Ok(Some((base, infos)));
+            }
+            // Reachable + speaks the protocol; it just wants credentials, which is the next step.
+            client::EndpointCheck::Auth(_) => {
+                line_ok("reachable (needs a key — next step)");
+                return Ok(Some((base, Vec::new())));
+            }
+            client::EndpointCheck::NotFound(detail) => {
+                line_bad(&format!("no model list at {base}/models"));
+                if !detail.is_empty() {
+                    println!("    {}", style(&detail).dim());
+                }
+                match missing_version_suffix(&base) {
+                    Some(fixed) => {
+                        line_warn(&format!("most endpoints need a version path — try {fixed}"));
+                        suggestion = Some(fixed);
+                    }
+                    None => suggestion = Some(base),
+                }
+            }
+            client::EndpointCheck::Unreachable(detail) => {
+                line_bad(&format!("could not reach it: {detail}"));
+                suggestion = Some(base);
+            }
+            client::EndpointCheck::Http(code, detail) => {
+                line_bad(&format!("HTTP {code}"));
+                if !detail.is_empty() {
+                    println!("    {}", style(&detail).dim());
+                }
+                suggestion = Some(base);
+            }
+        }
+        if allow_skip && !yn(theme, "Try a different URL?", true)? {
+            return Ok(None);
+        }
+    }
+}
+
+/// `Some(base + "/v1")` when `base` has no version-looking final segment, else `None`.
+///
+/// "Already versioned" means the last segment is `v` + at least one digit, optionally followed by
+/// more alphanumerics — so `v1`, `v2`, and `v1beta` all count. The trailing-suffix allowance is not
+/// cosmetic: several providers ship `/v1beta`, and telling that user to try `/v1beta/v1` would send
+/// them somewhere that definitely doesn't exist.
+///
+/// A segment like `/api` or `/openai` is a path, not a version, so it still gets the hint — that's
+/// the case that otherwise leaves someone stuck on a 404 with nothing to try.
+fn missing_version_suffix(base: &str) -> Option<String> {
+    let after_scheme = base.split_once("://").map(|(_, r)| r).unwrap_or(base);
+    let last = after_scheme
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    let versioned = last
+        .strip_prefix('v')
+        .or_else(|| last.strip_prefix('V'))
+        .is_some_and(|rest| {
+            let mut chars = rest.chars();
+            // At least one digit right after the `v`, then anything alphanumeric (v1, v2, v1beta).
+            chars.next().is_some_and(|c| c.is_ascii_digit())
+                && chars.all(|c| c.is_ascii_alphanumeric())
+        });
+    if versioned {
+        None
+    } else {
+        Some(format!("{}/v1", base.trim_end_matches('/')))
+    }
+}
+
+/// Ask for an API key until the endpoint accepts it, returning it with the model list.
+///
+/// The key is entered in the CLEAR, not through `Password`. Pasting a 100-char secret into an
+/// invisible field gives you no way to see a truncated paste or a stray newline — and the usual
+/// justification (shoulder-surfing) doesn't hold when the value is one keystroke from being saved to
+/// a plaintext config file the user can `cat`. Only the ECHO changes: nothing new is logged, and the
+/// stored value is still masked everywhere it's displayed later.
+///
+/// `keys_url` (when known) is printed first, so someone without a key isn't sent hunting.
+async fn prompt_validated_api_key(
+    theme: &ColorfulTheme,
+    http: &reqwest::Client,
+    base: &str,
+    current: Option<&str>,
+    keys_url: Option<&str>,
+) -> Result<Option<(String, Vec<client::ModelInfo>)>> {
+    if let Some(url) = keys_url {
+        println!("  {}", style(format!("get a key: {url}")).dim());
+    }
+    loop {
+        let prompt = match current {
+            Some(k) => format!("API key (current {} — Enter keeps it)", cli_config::mask(k)),
+            None => "API key (visible as you type, so you can check the paste)".to_string(),
+        };
+        let entered = Input::<String>::with_theme(theme)
+            .with_prompt(prompt)
+            .allow_empty(true)
+            .interact_text()?;
+        let entered = entered.trim().to_string();
+        let candidate = if entered.is_empty() {
+            match current {
+                Some(k) => k.to_string(),
+                None => {
+                    line_bad("a key is required");
+                    continue;
+                }
+            }
+        } else {
+            entered
+        };
+
+        let check = spin_while(
+            "verifying the key",
+            client::check_endpoint(http, base, Some(&candidate)),
+        )
+        .await;
+        match check {
+            client::EndpointCheck::Ok(infos) => {
+                line_ok(&format!("key accepted — {} models available", infos.len()));
+                return Ok(Some((candidate, infos)));
+            }
+            client::EndpointCheck::Auth(detail) => {
+                line_bad("the endpoint rejected that key");
+                if !detail.is_empty() {
+                    println!("    {}", style(&detail).dim());
+                }
+            }
+            // Not the key's fault — don't make them re-paste a key that may be fine.
+            other => {
+                let what = match &other {
+                    client::EndpointCheck::NotFound(d) => {
+                        format!("no model list at this path ({d})")
+                    }
+                    client::EndpointCheck::Unreachable(d) => format!("could not reach it ({d})"),
+                    client::EndpointCheck::Http(c, d) => format!("HTTP {c} ({d})"),
+                    client::EndpointCheck::Ok(_) | client::EndpointCheck::Auth(_) => unreachable!(),
+                };
+                line_warn(&format!("could not verify the key — {what}"));
+                if yn(theme, "Keep this key anyway?", true)? {
+                    return Ok(Some((candidate, Vec::new())));
+                }
+            }
+        }
+        if !yn(theme, "Enter a different key?", true)? {
+            return Ok(None);
+        }
+    }
+}
+
+/// The provider step: pick a preset (URL pre-filled, version suffix already correct) or type a custom
+/// endpoint. Returns the chosen preset, or `None` for "custom / I'll type it".
+fn prompt_provider(
+    theme: &ColorfulTheme,
+    current_base: Option<&str>,
+) -> Result<Option<&'static ProviderPreset>> {
+    let mut items: Vec<String> = PROVIDER_PRESETS
+        .iter()
+        .map(|p| format!("{:<20} {}", p.label, p.base))
+        .collect();
+    // An endpoint that matches no preset belongs to this row, so show it ON the row. Otherwise a
+    // gateway/proxy/self-hosted user sees every preset's URL printed but not their own, which reads
+    // as "my endpoint isn't in this list" rather than "it's the row I'm already standing on".
+    let custom_current = current_base
+        .map(|b| b.trim_end_matches('/'))
+        .filter(|b| {
+            !PROVIDER_PRESETS
+                .iter()
+                .any(|p| p.base.trim_end_matches('/') == *b)
+        })
+        .map(str::to_string);
+    items.push(format!(
+        "{:<20} {}",
+        "Custom gateway",
+        custom_current
+            .as_deref()
+            .unwrap_or("self-hosted / proxy / any OpenAI-compatible — type a URL")
+    ));
+    // Land on the preset the user is already using, so re-entering the section doesn't silently
+    // propose a different provider.
+    let default = current_base
+        .and_then(|b| {
+            let b = b.trim_end_matches('/');
+            PROVIDER_PRESETS
+                .iter()
+                .position(|p| p.base.trim_end_matches('/') == b)
+        })
+        .unwrap_or(items.len() - 1);
+    let pick = Select::with_theme(theme)
+        .with_prompt("Provider")
+        .items(&items)
+        .default(default)
+        .interact()?;
+    Ok(PROVIDER_PRESETS.get(pick))
+}
+
 /// The config HUB: a `Select` of sections, each row showing its current value so the panel reads as a
 /// live dashboard. Pick a section → edit just that → it saves immediately → back to the menu. Esc or
 /// "Done" exits. Every field here is also scriptable via `aizen config set`, so nothing depends on it.
@@ -10097,6 +10515,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             format!("Connection      · api key {key_h}"),
             format!("Model & context · {model_h}"),
             format!("Web search      · tavily {tavily_h}"),
+            format!("Memory          · {}", memory_hint(&cfg)),
             format!("Session         · compact {compact_h}"),
             format!("Reasoning       · {effort_h}"),
             format!("Approval        · {approval_h}"),
@@ -10113,16 +10532,17 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             Some(i) => i,
             None => break,
         };
-        // Sections 0..=6 edit + save; 7 shows the panel; 8 (or Esc) exits.
+        // Sections 0..=7 edit + save; 8 shows the panel; 9 (or Esc) exits.
         let edited = match pick {
-            0 => config_edit_connection(&mut cfg),
+            0 => config_edit_connection(&mut cfg).await,
             1 => config_edit_model(&mut cfg).await,
-            2 => config_edit_websearch(&mut cfg),
-            3 => config_edit_session(&mut cfg),
-            4 => config_edit_reasoning(&mut cfg),
-            5 => config_edit_approval(&mut cfg),
-            6 => config_edit_display(&mut cfg),
-            7 => {
+            2 => config_edit_websearch(&mut cfg).await,
+            3 => config_edit_memory(&mut cfg),
+            4 => config_edit_session(&mut cfg),
+            5 => config_edit_reasoning(&mut cfg),
+            6 => config_edit_approval(&mut cfg),
+            7 => config_edit_display(&mut cfg),
+            8 => {
                 print_config(&cfg);
                 continue;
             }
@@ -10143,30 +10563,128 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
     Ok(())
 }
 
-/// Section editor: base URL + API key. Empty base keeps the current one; empty key keeps the current.
-fn config_edit_connection(cfg: &mut cli_config::CliConfig) -> Result<()> {
+/// Section editor: provider → base URL → API key, each step verified against the live endpoint
+/// before it is accepted. Nothing is written to `cfg` until a step actually passes, so a failed
+/// attempt leaves the previous working connection intact.
+async fn config_edit_connection(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let theme = ui_theme();
-    let mut base_in = Input::<String>::with_theme(&theme)
-        .with_prompt("Base URL (OpenAI-compatible)")
-        .allow_empty(true);
-    if let Some(cur) = cfg.base_url.clone() {
-        base_in = base_in.default(cur);
-    }
-    let base = base_in.interact_text()?;
-    let base = base.trim().trim_end_matches('/').to_string();
-    if !base.is_empty() {
-        cfg.base_url = Some(base);
-    }
-    let key_prompt = match cfg.api_key.as_deref() {
-        Some(k) => format!("API key (current {} — Enter to keep)", cli_config::mask(k)),
-        None => "API key".to_string(),
+    let http = http_client()?;
+
+    let preset = prompt_provider(&theme, cfg.base_url.as_deref())?;
+    // A preset's URL is already correct, so it only needs the reachability check — not the
+    // type-it-again loop. A custom endpoint goes through the full prompt.
+    let (base, mut infos) = match preset {
+        Some(p) => {
+            let check = spin_while(
+                &format!("checking {}", p.base),
+                client::check_endpoint(&http, p.base, None),
+            )
+            .await;
+            match check {
+                client::EndpointCheck::Ok(infos) => {
+                    line_ok(&format!("reachable — {} models", infos.len()));
+                    (p.base.to_string(), infos)
+                }
+                client::EndpointCheck::Auth(_) => {
+                    line_ok("reachable (needs a key — next step)");
+                    (p.base.to_string(), Vec::new())
+                }
+                // Even a preset can be unreachable (Ollama not running, network down, provider
+                // outage). Say so and let them keep it or type something else, rather than pretending.
+                other => {
+                    let what = match &other {
+                        client::EndpointCheck::NotFound(d) => format!("no model list there ({d})"),
+                        client::EndpointCheck::Unreachable(d) => {
+                            format!("could not reach it ({d})")
+                        }
+                        client::EndpointCheck::Http(c, d) => format!("HTTP {c} ({d})"),
+                        _ => unreachable!(),
+                    };
+                    line_warn(&format!("{} — {what}", p.label));
+                    if yn(&theme, "Use this URL anyway?", true)? {
+                        (p.base.to_string(), Vec::new())
+                    } else {
+                        match prompt_validated_base_url(&theme, &http, Some(p.base), true).await? {
+                            Some(v) => v,
+                            None => return Ok(()),
+                        }
+                    }
+                }
+            }
+        }
+        None => {
+            match prompt_validated_base_url(&theme, &http, cfg.base_url.as_deref(), true).await? {
+                Some(v) => v,
+                None => return Ok(()),
+            }
+        }
     };
-    let entered = Password::with_theme(&theme)
-        .with_prompt(key_prompt)
-        .allow_empty_password(true)
-        .interact()?;
-    if !entered.trim().is_empty() {
-        cfg.api_key = Some(entered.trim().to_string());
+    cfg.base_url = Some(base.clone());
+
+    let keys_url = preset.map(|p| p.keys_url);
+    match prompt_validated_api_key(&theme, &http, &base, cfg.api_key.as_deref(), keys_url).await? {
+        Some((key, fetched)) => {
+            cfg.api_key = Some(key);
+            if !fetched.is_empty() {
+                infos = fetched;
+            }
+        }
+        None => return Ok(()),
+    }
+
+    // The key check already fetched the list — offering it here saves a redundant round-trip and
+    // means a fresh connection lands on a working model instead of whatever was configured before.
+    if !infos.is_empty() && yn(&theme, "Pick a model now?", true)? {
+        pick_model_from(&theme, cfg, &infos, preset.map(|p| p.sample_model))?;
+    }
+    Ok(())
+}
+
+/// Present `infos` as a picker and store the choice (plus its reported context window). Esc keeps the
+/// current model. The last row is a manual-id escape hatch for a model the provider doesn't list.
+fn pick_model_from(
+    theme: &ColorfulTheme,
+    cfg: &mut cli_config::CliConfig,
+    infos: &[client::ModelInfo],
+    sample_model: Option<&str>,
+) -> Result<()> {
+    let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
+    let mut items: Vec<String> = infos
+        .iter()
+        .map(|m| match m.context_length {
+            Some(n) => format!("{}  ({} ctx)", m.id, n),
+            None => m.id.clone(),
+        })
+        .collect();
+    items.push(CUSTOM_MODEL_ITEM.to_string());
+    let pick = match Select::with_theme(theme)
+        .with_prompt("Model (Esc keeps current)")
+        .items(&items)
+        .default(model_default_index(&ids, cfg.model.as_deref()))
+        .interact_opt()?
+    {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+    if pick < infos.len() {
+        cfg.model = Some(infos[pick].id.clone());
+        // Provider-reported window when it gave one, else clear it so the HUD uses its heuristic
+        // rather than keeping the PREVIOUS model's number, which would be wrong for this one.
+        cfg.model_context_window = infos[pick].context_length;
+    } else {
+        let mut mi = Input::<String>::with_theme(theme).with_prompt("Model id");
+        if let Some(s) = cfg
+            .model
+            .clone()
+            .or_else(|| sample_model.map(str::to_string))
+        {
+            mi = mi.default(s);
+        }
+        let m = mi.allow_empty(true).interact_text()?;
+        if !m.trim().is_empty() {
+            cfg.model = Some(m.trim().to_string());
+            cfg.model_context_window = None; // custom id → heuristic
+        }
     }
     Ok(())
 }
@@ -10270,33 +10788,264 @@ async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
     Ok(())
 }
 
-/// Section editor: the Tavily web-search key (`-` clears, Enter keeps).
-fn config_edit_websearch(cfg: &mut cli_config::CliConfig) -> Result<()> {
+/// What the user decided about one search key.
+enum ReachKeyEdit {
+    /// Store this key (already proven, or kept deliberately despite an unverifiable check).
+    Set(String),
+    /// Remove the stored key (`-`).
+    Cleared,
+    /// Leave whatever is stored alone (empty entry, or gave up).
+    Unchanged,
+}
+
+/// Ask for one web-search key and verify it with a real (minimal) search before accepting it.
+///
+/// `check` runs the provider-specific probe. A REJECTED key re-prompts — that is the whole point of
+/// this loop, since a bad search key otherwise sits in the config until the agent's first search
+/// fails mid-task. An UNREACHABLE result does not re-prompt by default: the key may be perfectly
+/// good and only the network at fault, so blaming the user's paste would be wrong.
+///
+/// Keys are entered VISIBLY, same reasoning as the API key: a pasted secret you can't see is a
+/// truncated paste you can't spot, and it lands in a plaintext config either way.
+async fn prompt_validated_reach_key<F, Fut>(
+    theme: &ColorfulTheme,
+    label: &str,
+    keys_url: &str,
+    current: Option<&str>,
+    check: F,
+) -> Result<ReachKeyEdit>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = crate::agent::reach::search::KeyCheck>,
+{
+    println!("  {}", style(format!("get a key: {keys_url}")).dim());
+    loop {
+        let prompt = match current {
+            Some(k) => format!(
+                "{label} key (current {} — Enter keeps, `-` clears)",
+                cli_config::mask(k)
+            ),
+            None => format!("{label} key (Enter to skip)"),
+        };
+        let entered = Input::<String>::with_theme(theme)
+            .with_prompt(prompt)
+            .allow_empty(true)
+            .interact_text()?;
+        let entered = entered.trim().to_string();
+        if entered.is_empty() {
+            return Ok(ReachKeyEdit::Unchanged);
+        }
+        if entered == "-" {
+            return Ok(ReachKeyEdit::Cleared);
+        }
+
+        let verdict = spin_while(
+            &format!("verifying the {label} key"),
+            check(entered.clone()),
+        )
+        .await;
+        match verdict {
+            crate::agent::reach::search::KeyCheck::Ok(n) => {
+                line_ok(&format!("{label} key works — {n} results for a test query"));
+                return Ok(ReachKeyEdit::Set(entered));
+            }
+            crate::agent::reach::search::KeyCheck::Rejected(why) => {
+                line_bad(&why);
+                if !yn(theme, "Enter a different key?", true)? {
+                    return Ok(ReachKeyEdit::Unchanged);
+                }
+            }
+            crate::agent::reach::search::KeyCheck::Unreachable(why) => {
+                line_warn(&format!("could not verify it — {why}"));
+                if yn(theme, "Keep this key anyway?", true)? {
+                    return Ok(ReachKeyEdit::Set(entered));
+                }
+                if !yn(theme, "Enter a different key?", true)? {
+                    return Ok(ReachKeyEdit::Unchanged);
+                }
+            }
+        }
+    }
+}
+
+/// Section editor: the web-search keys (Tavily, and Jina as a fallback), each verified live.
+///
+/// Both are optional, but `web_search` is KEYED-ONLY: with neither key the tool returns an
+/// "add a key" error rather than degrading, so the section says that up front instead of letting the
+/// user discover it from a failed search.
+async fn config_edit_websearch(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let theme = ui_theme();
-    let cur_tavily = cfg.reach.as_ref().and_then(|r| r.tavily_api_key.clone());
-    let tavily_prompt = match cur_tavily.as_deref() {
-        Some(k) => format!(
-            "Tavily key (current {} — Enter keeps, `-` clears)",
-            cli_config::mask(k)
-        ),
-        None => "Tavily API key for web_search (free at tavily.com; Enter to skip)".to_string(),
-    };
     println!(
         "{}",
-        style("web_search needs a Tavily key — env AIZEN_TAVILY_API_KEY overrides this.").dim()
+        style("web_search is keyed-only: without a key it returns an error rather than guessing.")
+            .dim()
     );
-    let tavily_in = Password::with_theme(&theme)
-        .with_prompt(tavily_prompt)
-        .allow_empty_password(true)
-        .interact()?;
-    let tavily_in = tavily_in.trim();
-    if !tavily_in.is_empty() {
-        let reach = cfg.reach.get_or_insert_with(Default::default);
-        reach.tavily_api_key = if tavily_in == "-" {
+    // Say when the environment is in charge — otherwise editing this and seeing no change is baffling.
+    for (var, what) in [
+        ("AIZEN_TAVILY_API_KEY", "Tavily"),
+        ("TAVILY_API_KEY", "Tavily"),
+        ("AIZEN_JINA_API_KEY", "Jina"),
+        ("JINA_API_KEY", "Jina"),
+    ] {
+        if std::env::var(var).is_ok_and(|v| !v.trim().is_empty()) {
+            line_warn(&format!(
+                "${var} is set — it overrides the {what} key saved here"
+            ));
+        }
+    }
+
+    let cur_tavily = cfg.reach.as_ref().and_then(|r| r.tavily_api_key.clone());
+    let edit = prompt_validated_reach_key(
+        &theme,
+        "Tavily",
+        "https://app.tavily.com (free tier)",
+        cur_tavily.as_deref(),
+        |k| async move { crate::agent::reach::search::check_tavily_key(&k).await },
+    )
+    .await?;
+    match edit {
+        ReachKeyEdit::Set(k) => {
+            cfg.reach
+                .get_or_insert_with(Default::default)
+                .tavily_api_key = Some(k)
+        }
+        ReachKeyEdit::Cleared => {
+            cfg.reach
+                .get_or_insert_with(Default::default)
+                .tavily_api_key = None
+        }
+        ReachKeyEdit::Unchanged => {}
+    }
+
+    let cur_jina = cfg.reach.as_ref().and_then(|r| r.jina_api_key.clone());
+    // Only worth offering when there's a reason to: as a fallback next to Tavily, or as the only
+    // backend when Tavily is absent.
+    if cur_jina.is_some()
+        || yn(
+            &theme,
+            "Add a Jina key too? (a search fallback + a better page reader)",
+            cur_tavily.is_none(),
+        )?
+    {
+        let edit = prompt_validated_reach_key(
+            &theme,
+            "Jina",
+            "https://jina.ai/reader (free tier)",
+            cur_jina.as_deref(),
+            |k| async move { crate::agent::reach::search::check_jina_key(&k).await },
+        )
+        .await?;
+        match edit {
+            ReachKeyEdit::Set(k) => {
+                cfg.reach.get_or_insert_with(Default::default).jina_api_key = Some(k)
+            }
+            ReachKeyEdit::Cleared => {
+                cfg.reach.get_or_insert_with(Default::default).jina_api_key = None
+            }
+            ReachKeyEdit::Unchanged => {}
+        }
+    }
+    Ok(())
+}
+
+/// One-line Memory summary for the hub row: what recall is doing right now.
+fn memory_hint(cfg: &cli_config::CliConfig) -> String {
+    let learn = if cfg.memory_auto_learn.unwrap_or(true) {
+        "auto-learn on"
+    } else {
+        "auto-learn off"
+    };
+    // Report the tier that will ACTUALLY run, not the flag: `settings()` already folds in the cargo
+    // feature, the env override, and whether a model exists on disk.
+    let tier = if memory::settings().enable_dense {
+        "lexical + dense"
+    } else {
+        "lexical"
+    };
+    format!("{learn} · {tier}")
+}
+
+/// Section editor: memory — what gets learned, and which retrieval tiers run.
+///
+/// The dense half is reported before it is offered, because three independent things decide whether
+/// semantic recall runs at all (the `dense` cargo feature, an installed model, `AIZEN_MEM_DENSE`), and
+/// a menu that hid that would let someone "pick a model" on a build that can never use one.
+fn config_edit_memory(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+
+    cfg.memory_auto_learn = Some(yn(
+        &theme,
+        "Auto-learn durable facts from each turn?",
+        cfg.memory_auto_learn.unwrap_or(true),
+    )?);
+
+    // ── dense (semantic) recall status ──
+    let dense_built = cfg!(feature = "dense");
+    let models = memory::embed::list_local_models();
+    let active = memory::settings().enable_dense;
+
+    if !dense_built {
+        line_warn("this build has no semantic backend — recall is lexical only");
+        println!(
+            "  {}",
+            style("(a `--features dense` build adds embedding-based recall for paraphrases)").dim()
+        );
+        return Ok(());
+    }
+    if let Ok(v) = std::env::var("AIZEN_MEM_DENSE") {
+        line_warn(&format!(
+            "$AIZEN_MEM_DENSE={v} overrides the dense decision below"
+        ));
+    }
+    if models.is_empty() {
+        line_warn("no embedding model installed — dense recall is off");
+        println!(
+            "  {}",
+            style("get one with: aizen memory model-download").dim()
+        );
+        return Ok(());
+    }
+    if active {
+        line_ok("dense recall is on");
+    } else {
+        line_warn("dense recall is off");
+    }
+
+    // Which model, out of what is actually on disk. Auto is first so the default choice stays
+    // "whatever discovery ranks best" rather than freezing today's pick into the config file.
+    let current = cfg.embed_model.clone();
+    let mut items = vec![format!(
+        "auto — best installed ({})",
+        memory::embed::discover_local_model()
+            .map(|c| c.name)
+            .unwrap_or_else(|| "none".into())
+    )];
+    for m in &models {
+        items.push(format!("{}  ({})", m.name, m.source));
+    }
+    let default = current
+        .as_deref()
+        .and_then(|c| models.iter().position(|m| m.name == c).map(|i| i + 1))
+        .unwrap_or(0);
+    if let Some(pick) = Select::with_theme(&theme)
+        .with_prompt("Embedding model (Esc keeps current)")
+        .items(&items)
+        .default(default)
+        .interact_opt()?
+    {
+        // 0 = auto ⇒ clear the pin so discovery decides again.
+        cfg.embed_model = if pick == 0 {
             None
         } else {
-            Some(tavily_in.to_string())
+            Some(models[pick - 1].name.clone())
         };
+        if let Some(name) = cfg.embed_model.clone() {
+            if std::env::var("AIZEN_EMBED_MODEL").is_ok_and(|v| !v.trim().is_empty()) {
+                line_warn(&format!(
+                    "$AIZEN_EMBED_MODEL is set — it overrides this choice of {name}"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -10327,11 +11076,8 @@ fn config_edit_session(cfg: &mut cli_config::CliConfig) -> Result<()> {
         "Auto-learn skills from completed tasks?",
         cfg.auto_skill_learn.unwrap_or(true),
     )?);
-    cfg.memory_auto_learn = Some(yn(
-        &theme,
-        "Auto-learn memory (durable facts) from each turn?",
-        cfg.memory_auto_learn.unwrap_or(true),
-    )?);
+    // `memory_auto_learn` deliberately lives in the Memory section instead of here: it belongs with
+    // the retrieval knobs it feeds, and asking for it twice would let the two prompts disagree.
     cfg.persona_evolve = Some(yn(
         &theme,
         "Persona evolution (learn a voice over time)?",
@@ -10520,89 +11266,89 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
     };
 
     step("Connection");
-    // 1) base URL
-    let mut base_in =
-        Input::<String>::with_theme(&theme).with_prompt("Base URL (OpenAI-compatible)");
-    if let Some(cur) = cfg.base_url.clone() {
-        base_in = base_in.default(cur);
-    }
-    let base = base_in.interact_text().context("reading base URL")?;
-    let base = base.trim().trim_end_matches('/').to_string();
-    if base.is_empty() {
-        anyhow::bail!("base URL is required");
-    }
+    let http = http_client()?;
+    // 1) provider → base URL. A preset carries the right version suffix already; a custom URL is
+    //    checked (and re-asked) until it answers as a models endpoint.
+    let preset = prompt_provider(&theme, cfg.base_url.as_deref())?;
+    let (base, mut infos) = match preset {
+        Some(p) => {
+            let check = spin_while(
+                &format!("checking {}", p.base),
+                client::check_endpoint(&http, p.base, None),
+            )
+            .await;
+            match check {
+                client::EndpointCheck::Ok(infos) => {
+                    line_ok(&format!("reachable — {} models", infos.len()));
+                    (p.base.to_string(), infos)
+                }
+                client::EndpointCheck::Auth(_) => {
+                    line_ok("reachable (needs a key — next step)");
+                    (p.base.to_string(), Vec::new())
+                }
+                other => {
+                    let what = match &other {
+                        client::EndpointCheck::NotFound(d) => format!("no model list there ({d})"),
+                        client::EndpointCheck::Unreachable(d) => {
+                            format!("could not reach it ({d})")
+                        }
+                        client::EndpointCheck::Http(c, d) => format!("HTTP {c} ({d})"),
+                        _ => unreachable!(),
+                    };
+                    line_warn(&format!("{} — {what}", p.label));
+                    if yn(&theme, "Use this URL anyway?", true)? {
+                        (p.base.to_string(), Vec::new())
+                    } else {
+                        prompt_validated_base_url(&theme, &http, Some(p.base), false)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("base URL is required"))?
+                    }
+                }
+            }
+        }
+        // `allow_skip: false` — first-run setup cannot proceed without an endpoint, so an empty entry
+        // re-asks rather than silently leaving the install unconfigured.
+        None => prompt_validated_base_url(&theme, &http, cfg.base_url.as_deref(), false)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("base URL is required"))?,
+    };
     cfg.base_url = Some(base.clone());
 
-    // 2) API key — hidden as you type; blank keeps the current one
-    let key_prompt = match cfg.api_key.as_deref() {
-        Some(k) => format!("API key (current {} — Enter to keep)", cli_config::mask(k)),
-        None => "API key".to_string(),
-    };
-    let entered = Password::with_theme(&theme)
-        .with_prompt(key_prompt)
-        .allow_empty_password(true)
-        .interact()
-        .context("reading API key")?;
-    if !entered.trim().is_empty() {
-        cfg.api_key = Some(entered.trim().to_string());
-    }
-    if cfg.api_key.is_none() {
-        anyhow::bail!("API key is required");
+    // 2) API key — verified against the endpoint before it's accepted, and visible while typing so a
+    //    truncated paste is obvious.
+    let (key, fetched) = prompt_validated_api_key(
+        &theme,
+        &http,
+        &base,
+        cfg.api_key.as_deref(),
+        preset.map(|p| p.keys_url),
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("API key is required"))?;
+    cfg.api_key = Some(key);
+    if !fetched.is_empty() {
+        infos = fetched;
     }
 
     step("Model & context");
-    // 3) fetch + pick a model (arrow-key Select, with a custom-id escape hatch)
-    let http = http_client()?;
-    print!("{} {base} … ", style("Fetching models from").dim());
-    std::io::Write::flush(&mut std::io::stdout()).ok();
-    match client::fetch_models_info(&http, &base, cfg.api_key.as_deref().unwrap()).await {
-        Ok(infos) if !infos.is_empty() => {
-            println!("{}", style(format!("ok ({} found)", infos.len())).dim());
-            let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
-            let mut items: Vec<String> = ids.clone();
-            items.push(CUSTOM_MODEL_ITEM.to_string());
-            let pick = Select::with_theme(&theme)
-                .with_prompt("Pick a model")
-                .items(&items)
-                .default(model_default_index(&ids, cfg.model.as_deref()))
-                .interact()
-                .context("picking a model")?;
-            if pick < infos.len() {
-                cfg.model = Some(infos[pick].id.clone());
-                cfg.model_context_window = infos[pick].context_length; // auto when reported, else heuristic
-            } else {
-                let m: String = Input::with_theme(&theme)
-                    .with_prompt("Model id")
-                    .interact_text()?;
-                if !m.trim().is_empty() {
-                    cfg.model = Some(m.trim().to_string());
-                    cfg.model_context_window = None; // custom id → heuristic
-                }
-            }
+    // 3) pick a model from the list the key check already fetched — no second round-trip.
+    if infos.is_empty() {
+        line_warn("the endpoint listed no models — enter an id manually");
+        let mut mi = Input::<String>::with_theme(&theme).with_prompt("Model id");
+        if let Some(s) = cfg
+            .model
+            .clone()
+            .or_else(|| preset.map(|p| p.sample_model.to_string()))
+        {
+            mi = mi.default(s);
         }
-        other => {
-            match other {
-                Ok(_) => println!("{}", style("no models returned.").dim()),
-                Err(e) => {
-                    println!("{}", style(format!("failed: {e}")).red());
-                    eprintln!(
-                        "{}",
-                        style("(the key or URL may be wrong — you can still set a model manually)")
-                            .dim()
-                    );
-                }
-            }
-            let mut mi =
-                Input::<String>::with_theme(&theme).with_prompt("Enter a model id manually");
-            if let Some(cur) = cfg.model.clone() {
-                mi = mi.default(cur);
-            }
-            let m = mi.allow_empty(true).interact_text()?;
-            if !m.trim().is_empty() {
-                cfg.model = Some(m.trim().to_string());
-                cfg.model_context_window = None; // manual id, no provider metadata → heuristic
-            }
+        let m = mi.interact_text().context("reading a model id")?;
+        if !m.trim().is_empty() {
+            cfg.model = Some(m.trim().to_string());
+            cfg.model_context_window = None; // manual id, no provider metadata → heuristic
         }
+    } else {
+        pick_model_from(&theme, cfg, &infos, preset.map(|p| p.sample_model))?;
     }
     if cfg.model.is_none() {
         anyhow::bail!("a model is required (run `aizen models` to list them)");
@@ -10645,34 +11391,37 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
         _ => None, // "auto"/blank/garbage → detect-or-heuristic
     };
 
-    // Web search key (Tavily) — web_search is KEYED-ONLY now, so without a key it can't search.
-    // Hidden as you type; blank keeps the current one; a lone `-` clears it back to unset.
+    // Web search key (Tavily) — web_search is KEYED-ONLY, so without a key it can't search at all.
+    // Optional here (Enter skips): a fresh install should be usable before the user has gone and
+    // signed up for anything. When a key IS given it gets verified with a real search, same as the
+    // section editor.
     step("Web search");
-    let cur_tavily = cfg.reach.as_ref().and_then(|r| r.tavily_api_key.clone());
-    let tavily_prompt = match cur_tavily.as_deref() {
-        Some(k) => format!(
-            "Tavily key (current {} — Enter keeps, `-` clears)",
-            cli_config::mask(k)
-        ),
-        None => "Tavily API key for web_search (free at tavily.com; Enter to skip)".to_string(),
-    };
     println!(
         "{}",
-        style("web_search needs a Tavily key — env AIZEN_TAVILY_API_KEY overrides this.").dim()
+        style("Optional. web_search is keyed-only — skip now and add one later with `/config`.")
+            .dim()
     );
-    let tavily_in = Password::with_theme(&theme)
-        .with_prompt(tavily_prompt)
-        .allow_empty_password(true)
-        .interact()
-        .context("reading Tavily key")?;
-    let tavily_in = tavily_in.trim();
-    if !tavily_in.is_empty() {
-        let reach = cfg.reach.get_or_insert_with(Default::default);
-        reach.tavily_api_key = if tavily_in == "-" {
-            None
-        } else {
-            Some(tavily_in.to_string())
-        };
+    let cur_tavily = cfg.reach.as_ref().and_then(|r| r.tavily_api_key.clone());
+    let edit = prompt_validated_reach_key(
+        &theme,
+        "Tavily",
+        "https://app.tavily.com (free tier)",
+        cur_tavily.as_deref(),
+        |k| async move { crate::agent::reach::search::check_tavily_key(&k).await },
+    )
+    .await?;
+    match edit {
+        ReachKeyEdit::Set(k) => {
+            cfg.reach
+                .get_or_insert_with(Default::default)
+                .tavily_api_key = Some(k)
+        }
+        ReachKeyEdit::Cleared => {
+            cfg.reach
+                .get_or_insert_with(Default::default)
+                .tavily_api_key = None
+        }
+        ReachKeyEdit::Unchanged => {}
     }
 
     step("Behavior");
@@ -10924,7 +11673,7 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
             outcome.iters
         ),
         StopReason::MaxIters => eprintln!(
-            "\n[stopped: hit the step limit ({} steps) — the task may be incomplete]",
+            "\n[stopped: step budget exhausted after {} steps, including the automatic continuations — the task may be incomplete]",
             outcome.iters
         ),
         StopReason::VerificationFailed => eprintln!(
@@ -12148,6 +12897,53 @@ mod tests {
         ]
     }
 
+    /// The `/v1` hint fires only when the URL genuinely lacks a version segment. Both directions
+    /// matter: no hint on an already-versioned URL (suggesting `/v1/v1` sends the user in circles),
+    /// and a hint whenever the last segment is not `v<digits>` — `/api` and `/openai` are paths, not
+    /// versions, which is exactly the case that leaves people stuck on a 404 with nothing to try.
+    #[test]
+    fn version_suffix_hint_only_when_actually_missing() {
+        for already in [
+            "https://api.openai.com/v1",
+            "https://api.openai.com/v1/",
+            "https://api.groq.com/openai/v1",
+            "http://localhost:11434/v1",
+            "https://example.test/v2",
+            "https://example.test/V3",
+            // Google-style: a version with a trailing qualifier is still a version. Suggesting
+            // `/v1beta/v1` would send the user to a path that certainly doesn't exist.
+            "https://generativelanguage.googleapis.com/v1beta",
+        ] {
+            assert_eq!(
+                missing_version_suffix(already),
+                None,
+                "{already} is already versioned"
+            );
+        }
+        for (input, want) in [
+            ("https://api.openai.com", "https://api.openai.com/v1"),
+            ("https://api.openai.com/", "https://api.openai.com/v1"),
+            (
+                "https://api.groq.com/openai",
+                "https://api.groq.com/openai/v1",
+            ),
+            ("http://localhost:11434", "http://localhost:11434/v1"),
+            // `v` with no digits is a path segment, not a version.
+            ("https://example.test/v", "https://example.test/v/v1"),
+            // `vN` needs the digit FIRST — `vbeta` is just a path.
+            (
+                "https://example.test/vbeta",
+                "https://example.test/vbeta/v1",
+            ),
+        ] {
+            assert_eq!(
+                missing_version_suffix(input).as_deref(),
+                Some(want),
+                "{input} should be offered {want}"
+            );
+        }
+    }
+
     /// `/compact` used to `await` its summarizer call bare inside the REPL loop: no token armed, so
     /// `turn_in_flight()` was false and Esc merely cleared the draft, while the REPL sat blocked in
     /// the await consuming nothing. A hung endpoint froze the app until the 300s read timeout. The
@@ -12550,6 +13346,35 @@ mod tests {
         assert!(
             hour_ago.contains('h') || hour_ago.contains("hour"),
             "real age renders: {hour_ago}"
+        );
+    }
+
+    /// The compact age is a COLUMN, so its width is the contract: three cells, always. The verbose
+    /// `fmt_session_age` is right for a status line and wrong here — "future timestamp (clock skew)"
+    /// is 30 characters of prose sitting in front of the only field the user reads.
+    #[test]
+    fn compact_age_always_fits_three_cells() {
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        // In order: unreadable, now, skewed into the future, 5m, 19h, 62d, epoch (years).
+        for ms in [
+            None,
+            Some(now_ms),
+            Some(now_ms + 3_600_000),
+            Some(now_ms.saturating_sub(5 * 60_000)),
+            Some(now_ms.saturating_sub(19 * 3_600_000)),
+            Some(now_ms.saturating_sub(62 * 86_400_000)),
+            Some(0),
+        ] {
+            let s = fmt_session_age_compact(ms);
+            assert!(
+                s.chars().count() <= 3 && !s.is_empty(),
+                "{ms:?} → {s:?} must fit the 3-cell column"
+            );
+        }
+        assert_eq!(fmt_session_age_compact(None), "?");
+        assert_eq!(
+            fmt_session_age_compact(Some(now_ms.saturating_sub(19 * 3_600_000))),
+            "19h"
         );
     }
 

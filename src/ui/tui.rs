@@ -2594,6 +2594,8 @@ pub fn slash_takes_stdin(input: &str) -> bool {
             | "tg"
             | "serve"
             | "sessions"
+            | "import" // same dialoguer Select as /sessions — without this the input thread eats
+            // its arrow keys and the picker can't page or move
             | "model" // dialoguer Select owns stdin → park the keyboard thread (mirrors /sessions)
     )
         // `/timemachine` (and its `timeline`/`tm` aliases) is one command: it always opens the
@@ -3085,6 +3087,9 @@ mod tests {
     fn slash_parking_only_claims_direct_stdin_owners() {
         assert!(slash_takes_stdin("config"));
         assert!(slash_takes_stdin("sessions"));
+        // `/import` was missing here while `/sessions` — the same dialoguer Select — was listed, so
+        // the input thread kept the keyboard and the import picker could not be paged.
+        assert!(slash_takes_stdin("import"));
         assert!(slash_takes_stdin("effort"));
         assert!(!slash_takes_stdin("effort status"));
         assert!(slash_takes_stdin("timemachine"));

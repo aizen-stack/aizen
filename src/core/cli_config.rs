@@ -118,6 +118,14 @@ pub struct CliConfig {
     /// Core promotion always stays human-gated. `None` ⇒ default ON. `Some(false)` ⇒ disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_auto_learn: Option<bool>,
+    /// Dense (semantic) retrieval model for memory recall: a directory name under
+    /// `~/.aizen/models/`, or an absolute path to a model2vec model dir. `None` ⇒ auto-detect
+    /// (see `memory::embed::discover_local_model`). `AIZEN_EMBED_MODEL` overrides this.
+    ///
+    /// Only meaningful on a `--features dense` build; a default build carries no semantic backend, so
+    /// the field is stored but inert there rather than silently changing retrieval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_model: Option<String>,
     /// Unified approval level for agent tools. `None` ⇒ `ask` (safe default). `smart` auto-runs
     /// read-only-shaped shell commands; `yolo` pre-authorizes destructive tools after the hard floor.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -192,15 +192,204 @@ pub struct ModelInfo {
     pub context_length: Option<usize>,
 }
 
+/// Does `base_url` point at Anthropic's own API host?
+///
+/// Anthropic exposes an OpenAI-compatible surface at `https://api.anthropic.com/v1/`, so the chat
+/// path needs nothing special — `authorization: Bearer` is supported there. But `GET /v1/models` is
+/// the NATIVE endpoint and authenticates with `x-api-key` + `anthropic-version`; a Bearer-only
+/// request gets a 401 that looks exactly like a wrong key. Since the model list is what config
+/// validation uses to prove a key works, that false 401 would make a perfectly good Anthropic key
+/// unusable in setup.
+///
+/// Matched on host, not on a substring of the whole URL, so a proxy whose PATH mentions anthropic
+/// (`https://gw.example.com/anthropic/v1`) is not misread as first-party.
+pub fn is_anthropic_endpoint(base_url: &str) -> bool {
+    let after_scheme = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    let host = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .split('@') // strip any userinfo
+        .next_back()
+        .unwrap_or("")
+        .split(':') // strip the port
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    host == "api.anthropic.com" || host.ends_with(".api.anthropic.com")
+}
+
+/// Attach auth for `base_url`: always Bearer (what every OpenAI-compatible gateway wants), plus
+/// Anthropic's native pair when the host is theirs. Sending both is safe — each side ignores the
+/// header it doesn't use — and it means one code path serves both wire dialects.
+fn with_provider_auth(
+    rb: reqwest::RequestBuilder,
+    base_url: &str,
+    api_key: &str,
+) -> reqwest::RequestBuilder {
+    let rb = rb.bearer_auth(api_key);
+    if is_anthropic_endpoint(base_url) {
+        rb.header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        rb
+    }
+}
+
+/// What a one-shot endpoint check found. The point of the split is that the three failures need
+/// DIFFERENT fixes from the user, and a single "it didn't work" string can't say which: a bad host is
+/// a base-URL problem, a 401 is a key problem, and a 404 usually means the `/v1` suffix is missing.
+#[derive(Debug)]
+pub enum EndpointCheck {
+    /// Reachable and authenticated. Carries the model list so a caller can offer it immediately.
+    Ok(Vec<ModelInfo>),
+    /// Reachable, but the credential was rejected (401/403) — re-ask for the key, not the URL.
+    Auth(String),
+    /// Reachable, but no model list at this path (404/405) — almost always a missing `/v1`.
+    NotFound(String),
+    /// No HTTP response at all: DNS, TLS, connection refused, timeout. The URL itself is suspect.
+    Unreachable(String),
+    /// Any other HTTP status. Reported verbatim rather than guessed at.
+    Http(u16, String),
+}
+
+/// One-shot `GET {base}/models`, classified — the validation behind interactive setup.
+///
+/// Deliberately NOT `send_with_retry`: this runs while a human waits, and retrying a 401 three times
+/// with backoff just makes a wrong key take eight seconds to report. Pass a short-timeout client.
+/// `api_key` is optional so a base URL can be checked before a key exists — an endpoint that answers
+/// 401 without credentials has still proven it is reachable and speaks the right protocol.
+///
+/// When a key IS supplied, a 200 from `/models` is not accepted as proof on its own: many gateways
+/// serve their model list unauthenticated, so the key is additionally checked against the endpoint
+/// that actually matters — see [`chat_auth_rejection`].
+pub async fn check_endpoint(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> EndpointCheck {
+    check_endpoint_with_deadline(client, base_url, api_key, CHAT_AUTH_PROBE_TIMEOUT).await
+}
+
+/// [`check_endpoint`] with the key-probe deadline injected, so a test can assert the timeout path
+/// without holding a real connection open for the production 20s.
+async fn check_endpoint_with_deadline(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+    probe_deadline: std::time::Duration,
+) -> EndpointCheck {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut rb = client.get(&url);
+    if let Some(k) = api_key {
+        rb = with_provider_auth(rb, base_url, k);
+    }
+    let resp = match rb.send().await {
+        Ok(r) => r,
+        // Strip the reqwest chain down to its root: the outer layers repeat the URL the user just
+        // typed, and the cause ("dns error", "connection refused") is the actionable part.
+        Err(e) => {
+            let root = std::error::Error::source(&e)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| e.to_string());
+            return EndpointCheck::Unreachable(root);
+        }
+    };
+    let status = resp.status();
+    let code = status.as_u16();
+    if status.is_success() {
+        let infos = match parse_models_body(resp).await {
+            Ok(infos) => infos,
+            // A 200 that isn't a model list means this path isn't a models endpoint, even though
+            // something answered — same user-facing fix as a 404.
+            Err(e) => return EndpointCheck::NotFound(e.to_string()),
+        };
+        // A 200 here does NOT prove the key: plenty of gateways (kizeai among them) serve `/models`
+        // to anyone, so a corrupted key sails through validation and only fails on the first real
+        // turn. When we have a key, confirm it on the endpoint that enforces auth.
+        if let Some(k) = api_key {
+            let probe_model = infos.first().map(|m| m.id.as_str()).unwrap_or("gpt-4o-mini");
+            if let Some(detail) =
+                chat_auth_rejection(client, base_url, k, probe_model, probe_deadline).await
+            {
+                return EndpointCheck::Auth(detail);
+            }
+        }
+        return EndpointCheck::Ok(infos);
+    }
+    let detail = snippet_of(resp.text().await.unwrap_or_default());
+    match code {
+        401 | 403 => EndpointCheck::Auth(detail),
+        404 | 405 => EndpointCheck::NotFound(detail),
+        _ => EndpointCheck::Http(code, detail),
+    }
+}
+
+/// Deadline for the key-confirmation probe below. A rejection is a single fast round-trip (an
+/// upstream 401 needs no model work), so this only has to cover network latency — not generation.
+const CHAT_AUTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Does `{base}/chat/completions` reject this key? `Some(detail)` on a 401/403, `None` otherwise.
+///
+/// The point is to catch a bad credential that `GET /models` waved through, so ONLY an explicit auth
+/// rejection counts. Every other outcome — 400 for a model this account can't use, 404 on an odd
+/// path, a timeout, a transport error — returns `None`, because none of them prove the key is wrong
+/// and a false "bad key" here would send the user off to re-paste a credential that was fine.
+///
+/// Kept as cheap as possible: one token, and the reply is discarded unread.
+///
+/// Independently deadlined. Callers pass the shared client, whose read timeout is sized for a full
+/// streamed turn (300s) — far too long to hold up interactive setup if a gateway stalls. A key that
+/// is genuinely bad answers 401 immediately; anything slower is not worth waiting on, since a
+/// timeout here means "unproven", not "bad".
+async fn chat_auth_rejection(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    deadline: std::time::Duration,
+) -> Option<String> {
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 1,
+        "messages": [{ "role": "user", "content": "." }],
+    });
+    let send = with_provider_auth(client.post(&url), base_url, api_key)
+        .json(&body)
+        .send();
+    let resp = tokio::time::timeout(deadline, send)
+        .await
+        .ok()? // deadline hit ⇒ unproven
+        .ok()?; // transport error ⇒ unproven
+    match resp.status().as_u16() {
+        401 | 403 => Some(snippet_of(resp.text().await.unwrap_or_default())),
+        _ => None,
+    }
+}
+
+/// First line, ≤200 chars — provider error bodies are often a full HTML page or a deep JSON blob,
+/// and neither belongs in a prompt the user is reading between keystrokes.
+fn snippet_of(body: String) -> String {
+    let first = body.trim().lines().next().unwrap_or("").trim().to_string();
+    if first.chars().count() > 200 {
+        let cut: String = first.chars().take(200).collect();
+        format!("{cut}…")
+    } else {
+        first
+    }
+}
+
 /// Lightweight reachability probe for the TUI health chip: a single `GET {base}/models` with **no**
 /// retry/backoff (unlike [`fetch_models_info`]). Callers should pass a short-timeout client so a dead
 /// endpoint fails fast. Success = 2xx (body is discarded). Failures surface as the same
 /// `upstream returned HTTP {status}: …` / transport error shapes [`classify_api_error`] already knows.
 pub async fn probe_models(client: &reqwest::Client, base_url: &str, api_key: &str) -> Result<()> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
-        .bearer_auth(api_key)
+    let resp = with_provider_auth(client.get(&url), base_url, api_key)
         .send()
         .await
         .context("health probe request failed")?;
@@ -220,6 +409,16 @@ pub async fn fetch_models_info(
     base_url: &str,
     api_key: &str,
 ) -> Result<Vec<ModelInfo>> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let resp = send_with_retry(|| with_provider_auth(client.get(&url), base_url, api_key)).await?;
+    parse_models_body(resp).await
+}
+
+/// Parse a `/models` response body into [`ModelInfo`]s. Split out of [`fetch_models_info`] so the
+/// interactive [`check_endpoint`] can reuse the exact same schema tolerance instead of re-deriving
+/// it — a validator that accepts a narrower set of providers than the real fetch would reject
+/// endpoints that actually work.
+async fn parse_models_body(resp: reqwest::Response) -> Result<Vec<ModelInfo>> {
     #[derive(Deserialize)]
     struct ModelsResp {
         #[serde(default)]
@@ -240,13 +439,15 @@ pub async fn fetch_models_info(
         context_window: Option<usize>,
         #[serde(default)]
         max_context_length: Option<usize>,
+        // Anthropic's native `/v1/models` names it `max_input_tokens`. Without this the Claude models
+        // would all fall back to the name heuristic even though the provider stated the real number.
+        #[serde(default)]
+        max_input_tokens: Option<usize>,
         // OpenRouter nests it here too: `top_provider.context_length`.
         #[serde(default)]
         top_provider: Option<TopProvider>,
     }
 
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let resp = send_with_retry(|| client.get(&url).bearer_auth(api_key)).await?;
     let parsed: ModelsResp = resp.json().await.context("parsing models response")?;
     Ok(parsed
         .data
@@ -256,6 +457,7 @@ pub async fn fetch_models_info(
                 .context_length
                 .or(m.context_window)
                 .or(m.max_context_length)
+                .or(m.max_input_tokens)
                 .or_else(|| m.top_provider.and_then(|t| t.context_length))
                 .filter(|&n| n > 0);
             ModelInfo {
@@ -1478,6 +1680,32 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_endpoint_is_matched_on_host_not_substring() {
+        // First-party, with and without a path/port/scheme variation.
+        for b in [
+            "https://api.anthropic.com/v1",
+            "https://api.anthropic.com/v1/",
+            "https://API.Anthropic.COM/v1",
+            "http://api.anthropic.com:443/v1",
+        ] {
+            assert!(is_anthropic_endpoint(b), "{b} is first-party Anthropic");
+        }
+        // A proxy that merely MENTIONS anthropic in its path is NOT first-party. Getting this wrong
+        // would attach `x-api-key` + `anthropic-version` to a third-party gateway, and would make the
+        // check misreport which dialect the endpoint speaks.
+        for b in [
+            "https://gw.example.com/anthropic/v1",
+            "https://openrouter.ai/api/v1",
+            "https://api.anthropic.com.evil.test/v1",
+            "http://localhost:11434/v1",
+        ] {
+            assert!(!is_anthropic_endpoint(b), "{b} must not be first-party");
+        }
+        // A subdomain of the real host still is.
+        assert!(is_anthropic_endpoint("https://eu.api.anthropic.com/v1"));
+    }
+
+    #[test]
     fn cache_enabled_auto_and_forced() {
         assert!(cache_enabled(None, "opus-4-8"), "AUTO on for Anthropic");
         assert!(!cache_enabled(None, "gpt-4o"), "AUTO off for non-Anthropic");
@@ -1686,5 +1914,144 @@ mod tests {
         let calls = acc.finish();
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].id.is_empty(), "a missing id must be synthesized");
+    }
+
+    /// A one-request-per-connection stub gateway. `models_status`/`chat_status` let a test model the
+    /// shape that actually bit us: a gateway that serves `/models` to anyone but enforces auth on
+    /// `/chat/completions`.
+    async fn stub_gateway(models_status: u16, chat_status: u16) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (status, body) = if req.contains("/chat/completions") {
+                    match chat_status {
+                        200 => (200, r#"{"choices":[{"message":{"content":"ok"}}]}"#.to_string()),
+                        c => (c, r#"{"error":{"message":"Invalid API key"}}"#.to_string()),
+                    }
+                } else {
+                    match models_status {
+                        200 => (200, r#"{"object":"list","data":[{"id":"m1"}]}"#.to_string()),
+                        c => (c, r#"{"error":{"message":"nope"}}"#.to_string()),
+                    }
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (base, handle)
+    }
+
+    /// The regression: a gateway that hands out its model list unauthenticated must NOT let a bad
+    /// key pass config validation. Before the chat-probe, this returned `Ok` and the user only found
+    /// out on their first real turn — which reads as "the endpoint and key are right but it doesn't
+    /// work".
+    #[tokio::test]
+    async fn open_models_list_does_not_certify_a_key_the_chat_path_rejects() {
+        let (base, srv) = stub_gateway(200, 401).await;
+        let http = reqwest::Client::new();
+        let got = check_endpoint(&http, &base, Some("sk-corrupted")).await;
+        srv.abort();
+        assert!(
+            matches!(got, EndpointCheck::Auth(_)),
+            "a 401 on /chat/completions must surface as Auth, got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_both_endpoints_accept_still_validates() {
+        let (base, srv) = stub_gateway(200, 200).await;
+        let http = reqwest::Client::new();
+        let got = check_endpoint(&http, &base, Some("sk-good")).await;
+        srv.abort();
+        match got {
+            EndpointCheck::Ok(infos) => assert_eq!(infos.len(), 1, "the model list is carried back"),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// Only 401/403 counts. A 400 (e.g. the probe model isn't enabled for this account) must not be
+    /// reported as a bad key, or we'd send the user off to re-paste a credential that was fine.
+    #[tokio::test]
+    async fn a_non_auth_chat_failure_does_not_condemn_the_key() {
+        let (base, srv) = stub_gateway(200, 400).await;
+        let http = reqwest::Client::new();
+        let got = check_endpoint(&http, &base, Some("sk-good")).await;
+        srv.abort();
+        assert!(
+            matches!(got, EndpointCheck::Ok(_)),
+            "a 400 proves nothing about the key, got {got:?}"
+        );
+    }
+
+    /// A gateway that accepts the connection and then says nothing must not hang interactive setup:
+    /// the probe has its own deadline (the shared client's read timeout is sized for a streamed turn),
+    /// and a timeout means "unproven", never "bad key".
+    #[tokio::test]
+    async fn a_stalled_chat_probe_times_out_without_condemning_the_key() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        // Answer /models, then accept the chat connection and never reply.
+        let srv = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut held = Vec::new();
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if String::from_utf8_lossy(&buf[..n]).contains("/chat/completions") {
+                    held.push(sock); // hold it open, send nothing
+                    continue;
+                }
+                let body = r#"{"object":"list","data":[{"id":"m1"}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let http = reqwest::Client::new();
+        // A short injected deadline: the production 20s would just make this test slow, and what
+        // matters is that the deadline is enforced at all and classified as inconclusive.
+        let got = check_endpoint_with_deadline(
+            &http,
+            &base,
+            Some("sk-unknown"),
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        srv.abort();
+        assert!(
+            matches!(got, EndpointCheck::Ok(_)),
+            "a stalled probe is inconclusive, not a rejection, got {got:?}"
+        );
+    }
+
+    /// With no key there is nothing to certify, so the base-URL-only check must stay a single request
+    /// and keep classifying purely on the model list.
+    #[tokio::test]
+    async fn base_url_only_check_skips_the_chat_probe() {
+        let (base, srv) = stub_gateway(200, 401).await;
+        let http = reqwest::Client::new();
+        let got = check_endpoint(&http, &base, None).await;
+        srv.abort();
+        assert!(
+            matches!(got, EndpointCheck::Ok(_)),
+            "no key ⇒ reachability only, got {got:?}"
+        );
     }
 }

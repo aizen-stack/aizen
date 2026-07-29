@@ -308,6 +308,89 @@ async fn tavily(
         .collect())
 }
 
+/// Verdict of checking a CANDIDATE key — one the user just pasted, which is not in the config or the
+/// environment yet. That's why this can't reuse `probe_tavily`/`probe_jina_search`: those read the
+/// SAVED key, so during setup they'd validate the old key (or none) instead of the new one.
+///
+/// The split matters because the two failures need different things from the user: a rejected key
+/// means re-paste it, while an unreachable API means the key might be perfectly good and only the
+/// network is at fault — re-asking for it there would be blaming them for our own connectivity.
+#[derive(Debug)]
+pub(crate) enum KeyCheck {
+    /// The provider accepted the key. Carries the result count so the UI can prove it really searched.
+    Ok(usize),
+    /// The provider answered and said no (401/403, or a 429 that means this key is out of quota).
+    Rejected(String),
+    /// No usable answer: DNS, TLS, timeout, or an unexpected status. The key is unproven, not wrong.
+    Unreachable(String),
+}
+
+/// Validate a candidate Tavily key with one real (minimal) search.
+///
+/// Classified by STATUS rather than by matching on `tavily()`'s error strings: those strings are
+/// user-facing prose, and a validator that greps them would silently start reporting "unreachable"
+/// the day someone rewords an error message.
+pub(crate) async fn check_tavily_key(key: &str) -> KeyCheck {
+    let c = match http::client() {
+        Ok(c) => c,
+        Err(e) => return KeyCheck::Unreachable(e.to_string()),
+    };
+    let body = serde_json::json!({ "query": "aizen key check", "max_results": 1 });
+    let headers = [("Authorization", format!("Bearer {key}"))];
+    let f = match http::post_json(&c, "https://api.tavily.com/search", &headers, &body).await {
+        Ok(f) => f,
+        Err(e) => return KeyCheck::Unreachable(http::snippet(&e.to_string())),
+    };
+    match f.status {
+        // 429 is grouped with auth on PURPOSE: an exhausted free-tier key cannot serve a search, so
+        // telling the user "looks fine" would be a lie they'd discover on their first real query.
+        401 | 403 => KeyCheck::Rejected(format!("Tavily rejected the key (HTTP {})", f.status)),
+        429 => KeyCheck::Rejected(
+            "Tavily rate limit (HTTP 429) — the key is valid but its quota is exhausted".into(),
+        ),
+        s if (200..300).contains(&s) => {
+            let n = serde_json::from_slice::<serde_json::Value>(&f.body)
+                .ok()
+                .and_then(|v| v["results"].as_array().map(|a| a.len()))
+                .unwrap_or(0);
+            KeyCheck::Ok(n)
+        }
+        s => KeyCheck::Unreachable(format!("HTTP {s}: {}", http::snippet(&f.text()))),
+    }
+}
+
+/// Validate a candidate Jina key. Same classification rules as [`check_tavily_key`].
+pub(crate) async fn check_jina_key(key: &str) -> KeyCheck {
+    let c = match http::client() {
+        Ok(c) => c,
+        Err(e) => return KeyCheck::Unreachable(e.to_string()),
+    };
+    let url = format!("https://s.jina.ai/?q={}", urlencode("aizen key check"));
+    let headers = [
+        ("Authorization", format!("Bearer {key}")),
+        ("Accept", "application/json".to_string()),
+        ("X-Respond-With", "no-content".to_string()),
+    ];
+    let f = match http::get(&c, &url, &headers).await {
+        Ok(f) => f,
+        Err(e) => return KeyCheck::Unreachable(http::snippet(&e.to_string())),
+    };
+    match f.status {
+        401 | 403 => KeyCheck::Rejected(format!("Jina rejected the key (HTTP {})", f.status)),
+        429 => KeyCheck::Rejected(
+            "Jina rate limit (HTTP 429) — the key is valid but its quota is exhausted".into(),
+        ),
+        s if (200..300).contains(&s) => {
+            let n = serde_json::from_slice::<serde_json::Value>(&f.body)
+                .ok()
+                .and_then(|v| v["data"].as_array().map(|a| a.len()))
+                .unwrap_or(0);
+            KeyCheck::Ok(n)
+        }
+        s => KeyCheck::Unreachable(format!("HTTP {s}: {}", http::snippet(&f.text()))),
+    }
+}
+
 pub(crate) async fn probe_tavily() -> super::Probe {
     let Some(key) = super::tavily_key() else {
         return super::Probe::Off(

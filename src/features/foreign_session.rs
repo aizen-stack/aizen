@@ -51,44 +51,58 @@ pub struct ForeignSession {
     pub cwd: String,
     pub mtime_ms: Option<u64>,
     pub turns: usize,
-    /// First human prompt in the file, truncated for the picker row. Empty when there isn't one
-    /// (a meta-only or tool-only transcript) — the row still shows, just without a preview.
+    /// First human-typed prompt in the file — the row's subject line — truncated for one row.
+    /// Harness envelope (command caveats, `<environment_context>`, hook output) is skipped rather
+    /// than captioned, so this is empty only when the transcript genuinely has no human turn.
     pub first_prompt: String,
 }
 
 impl ForeignSession {
-    /// Picker row label: `[claude] · 12m · 142 turns · "rewrite the auth handler"`. The recorded
-    /// `cwd` is shown only when it differs from the project root (a subdir launch), so a same-root
-    /// transcript stays clean while a subdir one names where it was run from.
-    pub fn row(&self, age: fn(Option<u64>) -> String) -> String {
-        let preview = if self.first_prompt.is_empty() {
-            String::from("(no prompt recorded)")
+    /// Width of the fixed left gutter: `{age:>3}  {tag:<6}` + one trailing space.
+    const GUTTER: usize = 3 + 2 + 6 + 1;
+
+    /// Picker row: a narrow fixed gutter, then the subject.
+    ///
+    /// ```text
+    ///  1m   claude  commit đi
+    /// 58m   claude  clone repos này về
+    /// 62d   codex   update the chunk boundaries
+    /// ```
+    ///
+    /// `max_width` is the terminal width. Every row is CLIPPED to it, which is the difference between
+    /// a list you can read and one you can't: dialoguer wraps an over-long item onto a second line, so
+    /// one long subject shifts every row below it and the column alignment — the thing that makes 240
+    /// rows scannable — collapses for the whole page.
+    ///
+    /// The gutter is padded so the subjects start at the same column and the eye can run straight
+    /// down them. Ages are compact for the same reason: `19 hour(s) ago` and `1 min ago` differ by six
+    /// characters, and that difference lands in front of the only column that matters.
+    pub fn row(&self, age: impl Fn(Option<u64>) -> String, max_width: usize) -> String {
+        let subject = if self.first_prompt.is_empty() {
+            "(no subject)"
         } else {
-            format!("“{}”", self.first_prompt)
+            &self.first_prompt
         };
-        let cwd_note = if self.cwd.is_empty() {
-            String::new()
-        } else {
-            // The discover filter already confirmed this cwd belongs to the project; the note only
-            // earns its place when it adds info beyond "the project root".
-            let leaf = std::path::Path::new(&self.cwd)
+        let mut tail = subject.to_string();
+        // A subdir launch is worth naming; `discover` blanks cwd when it IS the project root, so this
+        // marks the genuinely unusual row instead of every row.
+        if !self.cwd.is_empty() {
+            if let Some(leaf) = std::path::Path::new(&self.cwd)
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("");
-            if !leaf.is_empty() {
-                format!(" · from {leaf}")
-            } else {
-                String::new()
+            {
+                tail.push_str(&format!("  ({leaf})"));
             }
-        };
-        format!(
-            "[{}] · {} · {} turns · {}{}",
-            self.cli.tag(),
-            age(self.mtime_ms),
-            self.turns,
-            preview,
-            cwd_note
-        )
+        }
+        let room = max_width.saturating_sub(Self::GUTTER);
+        if room >= 8 && tail.chars().count() > room {
+            tail = tail
+                .chars()
+                .take(room.saturating_sub(1))
+                .collect::<String>()
+                + "…";
+        }
+        format!("{:>3}  {:<6} {}", age(self.mtime_ms), self.cli.tag(), tail)
     }
 }
 
@@ -159,9 +173,16 @@ pub fn discover(project_root: &std::path::Path) -> Vec<ForeignSession> {
     discover_codex(&codex_root, project_root, &mut out);
 
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let proj = match_key(project_root);
     for s in &mut out {
         // Clamp future stamps (clock skew from a VM resume) so one skewed file can't pin the top.
         s.mtime_ms = s.mtime_ms.map(|ms| ms.min(now_ms));
+        // A cwd that IS the project root tells the user nothing — every row would carry the same
+        // note. Blank it here (one comparison, once) so `row` can print it unconditionally and only
+        // a genuine subdir launch shows up as one.
+        if norm_key(std::path::Path::new(&s.cwd)) == proj {
+            s.cwd.clear();
+        }
     }
     // Newest first; ties break by path so the sort is total and stable.
     out.sort_by(|a, b| {
@@ -227,10 +248,10 @@ fn read_claude_row(
             continue;
         }
         if first_prompt.is_none() && v.get("type").and_then(|t| t.as_str()) == Some("user") {
-            if let Some(text) = claude_human_text(&v) {
-                if !text.trim().is_empty() {
-                    first_prompt = Some(truncate(&text, 60));
-                }
+            // Keep scanning past envelope-only turns: `/compact`, hook output, and command caveats
+            // all arrive as `user` lines, so the FIRST one is routinely not a prompt at all.
+            if let Some(text) = claude_human_text(&v).as_deref().and_then(prompt_subject) {
+                first_prompt = Some(truncate(&text, 60));
             }
         }
         if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
@@ -373,10 +394,13 @@ fn read_codex_row(
                 .and_then(|r| r.as_str())
                 == Some("user")
         {
-            if let Some(text) = codex_message_text(v.get("payload").unwrap_or(&v)) {
-                if !text.trim().is_empty() {
-                    first_prompt = Some(truncate(&text, 60));
-                }
+            // Codex leads every session with an `<environment_context>` user item, so the first
+            // user message is ALWAYS envelope — skip past it to the real prompt.
+            if let Some(text) = codex_message_text(v.get("payload").unwrap_or(&v))
+                .as_deref()
+                .and_then(prompt_subject)
+            {
+                first_prompt = Some(truncate(&text, 60));
             }
         }
         // Turn count: assistant OR user message parts (tool calls are separate response_items).
@@ -432,6 +456,59 @@ fn codex_message_text(payload: &serde_json::Value) -> Option<String> {
         None
     } else {
         Some(out)
+    }
+}
+
+/// Tags the foreign CLIs wrap around text THEY injected into a user turn. None of it was typed by
+/// the person, so none of it is a subject line: a picker full of
+/// `<local-command-caveat>Caveat: The messages below were gener…` tells you nothing about which
+/// conversation you're looking at, and every row looks identical.
+const ENVELOPE_TAGS: &[&str] = &[
+    "local-command-caveat",
+    "local-command-stdout",
+    "local-command-stderr",
+    "command-name",
+    "command-message",
+    "command-args",
+    "environment_context",
+    "system-reminder",
+    "user-prompt-submit-hook",
+    "instructions",
+];
+
+/// The human-typed subject of a prompt, or `None` when the text is pure harness envelope.
+///
+/// Strips each `<tag>…</tag>` block (and an unclosed `<tag>` opener, which is what a truncated scan
+/// leaves behind), then any leftover standalone `<…>` line. Whatever survives is what the person
+/// actually wrote; if nothing survives, the caller keeps scanning for the next user line rather than
+/// captioning the row with a machine's words.
+fn prompt_subject(text: &str) -> Option<String> {
+    let mut s = text.to_string();
+    for tag in ENVELOPE_TAGS {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        loop {
+            let Some(start) = s.find(&open) else { break };
+            let end = match s[start..].find(&close) {
+                Some(rel) => start + rel + close.len(),
+                // Unclosed opener: the block runs to the end of what we have.
+                None => s.len(),
+            };
+            s.replace_range(start..end, " ");
+        }
+    }
+    // A line that is nothing but one tag (e.g. a bare `<cwd>…</cwd>` left by a nested envelope).
+    let kept: Vec<&str> = s
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !(l.starts_with('<') && l.ends_with('>')))
+        .collect();
+    let joined = kept.join(" ");
+    let joined = joined.trim();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined.to_string())
     }
 }
 
@@ -1192,6 +1269,157 @@ mod tests {
         assert!(found
             .iter()
             .all(|s| s.cli == Cli::Claude || s.cli == Cli::Codex));
+    }
+
+    // ── picker row ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn envelope_only_prompts_have_no_subject() {
+        // Every one of these arrives as a `user` line but was written by the harness, not the person.
+        assert_eq!(
+            prompt_subject("<local-command-caveat>Caveat: The messages below were generated by the user while running local commands.</local-command-caveat>"),
+            None
+        );
+        assert_eq!(
+            prompt_subject("<environment_context>\n  <cwd>C:\\Users\\admin\\Desktop</cwd>\n</environment_context>"),
+            None
+        );
+        // A truncated scan leaves an UNCLOSED opener; it must still be recognized as envelope.
+        assert_eq!(
+            prompt_subject("<local-command-caveat>Caveat: The messages below were gener"),
+            None
+        );
+    }
+
+    #[test]
+    fn subject_survives_when_a_real_prompt_is_wrapped_in_envelope() {
+        assert_eq!(
+            prompt_subject(
+                "<local-command-caveat>Caveat: blah</local-command-caveat>\nfix the auth handler"
+            )
+            .as_deref(),
+            Some("fix the auth handler")
+        );
+        assert_eq!(
+            prompt_subject("just a normal prompt").as_deref(),
+            Some("just a normal prompt")
+        );
+    }
+
+    #[test]
+    fn first_prompt_skips_envelope_turns_and_finds_the_real_one() {
+        let home = tmp_home("subject-scan");
+        let f = home.join(".claude/projects/x/s.jsonl");
+        write_jsonl(
+            &f,
+            &[
+                // Turn 1 is pure caveat — the shape that made every row in the picker identical.
+                r#"{"type":"user","message":{"role":"user","content":"<local-command-caveat>Caveat: The messages below were generated by the user while running local commands.</local-command-caveat>"},"cwd":"C:\\Repo"}"#,
+                r#"{"type":"user","message":{"role":"user","content":"<command-name>/compact</command-name>"},"cwd":"C:\\Repo"}"#,
+                r#"{"type":"user","message":{"role":"user","content":"rewrite the auth handler"},"cwd":"C:\\Repo"}"#,
+            ],
+        );
+        let row = read_claude_row(&f, std::path::Path::new(r"C:\Repo")).unwrap();
+        assert_eq!(row.first_prompt, "rewrite the auth handler");
+    }
+
+    #[test]
+    fn codex_first_prompt_skips_the_environment_context_item() {
+        let home = tmp_home("codex-subject");
+        let f = home.join(".codex/sessions/2026/01/01/c.jsonl");
+        write_jsonl(
+            &f,
+            &[
+                r#"{"type":"session_meta","payload":{"cwd":"C:\\Repo"}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>C:\\Repo</cwd>\n</environment_context>"}]}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"clone repos này về"}]}}"#,
+            ],
+        );
+        let row = read_codex_row(&f, std::path::Path::new(r"C:\Repo")).unwrap();
+        assert_eq!(row.first_prompt, "clone repos này về");
+    }
+
+    #[test]
+    fn row_is_gutter_plus_subject_and_drops_the_root_cwd_note() {
+        // A transcript launched from the project root: the note would repeat on every row, so
+        // `discover` blanks it and the row is age + tag + subject only.
+        let at_root = ForeignSession {
+            cli: Cli::Claude,
+            path: std::path::PathBuf::from("/x/s.jsonl"),
+            cwd: String::new(),
+            mtime_ms: None,
+            turns: 4143,
+            first_prompt: "rewrite the auth handler".into(),
+        };
+        let r = at_root.row(|_| "1m".to_string(), 100);
+        assert_eq!(r, " 1m  claude rewrite the auth handler");
+        assert!(
+            !r.contains("turns"),
+            "turn count is noise in a 240-row list: {r}"
+        );
+        // A SUBDIR launch still earns its note — that is information the subject can't carry.
+        let in_sub = ForeignSession {
+            cwd: "/repo/crates/core".into(),
+            ..at_root.clone()
+        };
+        assert!(in_sub.row(|_| "1m".to_string(), 100).contains("(core)"));
+    }
+
+    #[test]
+    fn rows_line_up_and_never_exceed_the_given_width() {
+        // Two rows whose ages differ in length must still start their subject at the same column:
+        // that shared column is what lets 240 rows be scanned vertically.
+        let mk = |age: &'static str, subject: &str| {
+            ForeignSession {
+                cli: Cli::Codex,
+                path: std::path::PathBuf::from("/x/s.jsonl"),
+                cwd: String::new(),
+                mtime_ms: None,
+                turns: 0,
+                first_prompt: subject.to_string(),
+            }
+            .row(move |_| age.to_string(), 40)
+        };
+        let a = mk("1m", "alpha");
+        let b = mk("62d", "beta");
+        assert_eq!(
+            a.find("alpha"),
+            b.find("beta"),
+            "subjects must share a column:\n{a}\n{b}"
+        );
+        // Over-long subjects are clipped, not wrapped — a wrapped item shifts every row below it.
+        let long = mk("1m", &"x".repeat(200));
+        assert!(long.chars().count() <= 40, "len {}", long.chars().count());
+        assert!(long.ends_with('…'), "{long}");
+        // Multi-byte subjects clip by CHARS, not bytes (a byte slice here would panic mid-codepoint).
+        let viet = mk("1m", &"đường".repeat(50));
+        assert!(viet.chars().count() <= 40);
+    }
+
+    #[test]
+    fn discover_blanks_cwd_only_when_it_is_the_project_root() {
+        let home = tmp_home("cwd-blank");
+        let _env = ForeignHome::pin(&home);
+        write_jsonl(
+            &home.join(".claude/projects/x/root.jsonl"),
+            &[r#"{"type":"user","message":{"role":"user","content":"a"},"cwd":"C:\\Repo"}"#],
+        );
+        write_jsonl(
+            &home.join(".claude/projects/x/sub.jsonl"),
+            &[r#"{"type":"user","message":{"role":"user","content":"b"},"cwd":"C:\\Repo\\sub"}"#],
+        );
+        let found = discover(std::path::Path::new(r"C:\Repo"));
+        assert_eq!(found.len(), 2);
+        let root = found
+            .iter()
+            .find(|s| s.path.ends_with("root.jsonl"))
+            .unwrap();
+        let sub = found
+            .iter()
+            .find(|s| s.path.ends_with("sub.jsonl"))
+            .unwrap();
+        assert!(root.cwd.is_empty(), "root cwd should be blanked");
+        assert!(!sub.cwd.is_empty(), "subdir cwd carries information");
     }
 
     #[test]

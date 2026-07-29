@@ -7,6 +7,104 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+### Added
+- **Setup verifies the connection instead of trusting it.** `/config` → Connection and first-run setup
+  now check each step against the live endpoint before accepting it:
+  - A **provider picker** (OpenAI · Anthropic · OpenRouter · Groq · DeepSeek · Ollama · Custom
+    gateway) fills in a base URL that already carries the right version path, plus a link to where
+    that provider's keys live. The Custom-gateway row prints the endpoint you are already on when it
+    matches no preset, so a self-hosted or proxy user sees their own URL instead of only everyone
+    else's.
+    Anthropic is reachable because it serves an OpenAI-compatible surface at
+    `https://api.anthropic.com/v1/`; its native `GET /v1/models` wants `x-api-key` +
+    `anthropic-version`, which is now sent alongside the Bearer token when the host is theirs.
+  - A **base URL is probed before the key is asked for**, so a bad URL is never mistaken for a bad
+    key. A 404 on `{base}/models` also gets diagnosed: when the URL has no `v<N>` segment, the `/v1`
+    form is offered as the next default. `/v1beta` counts as versioned — suggesting `/v1beta/v1` would
+    point at nothing.
+  - An **API key is verified and re-asked on rejection**. Only a 401/403 re-prompts; an unreachable
+    endpoint says so and offers to keep the key, since the key may be fine and only the network at
+    fault.
+  - **Web-search keys (Tavily, Jina) are verified with a real search.** A rejected key re-prompts, and
+    an exhausted-quota 429 counts as rejected — a key that cannot serve a search is not "fine".
+  - A **spinner** runs during each check, and each step reports its own verdict.
+- **`/config` → Memory**, a section of its own: auto-learn, which retrieval tiers actually run, and
+  which embedding model to use (or `auto`). It reports the tier that will really run rather than the
+  config flag, since the cargo feature, `AIZEN_MEM_DENSE`, and whether a model is installed all get a
+  vote. New `embed_model` config field, overridden by `AIZEN_EMBED_MODEL`. `config show` gained the
+  matching Memory section and now lists the Jina key too.
+
+### Changed
+- **API keys are visible while you type them** (setup, Connection, and the search keys). A masked
+  field hides a truncated paste or a stray newline, and the value is one keystroke from a plaintext
+  config file either way — so the echo was buying nothing. Stored keys are still masked everywhere
+  they are displayed back.
+- `memory_auto_learn` moved from the Session section to Memory, so it is asked once, next to the
+  retrieval knobs it feeds.
+
+### Fixed
+- **The agent stopped mid-task instead of finishing it.** Three independent holes in the top-level
+  loop, all of which surfaced the same way — partial work handed back with "say continue to carry
+  on". A fix landed for sub-agents earlier; the loop the REPL actually drives still had all three.
+  - **The step cap cut off runs that were still working.** Exhausting the budget granted one
+    extension (25 → 50 steps) and then hard-stopped, synthesizing a "here's how far I got" summary.
+    A large but *healthy* task — one producing new evidence every turn — was ended by a step counter
+    rather than by anything about the task. It now grants itself another `max_iters` worth (up to
+    `max_continuations`, default 3) when the run is neither stalled nor looping, injecting a
+    `[continue]` turn that says to carry on from where it is rather than restart or re-plan. Bounded
+    by `auto_extend_to + max_continuations × max_iters`: a run that goes flat or starts repeating
+    itself loses the grant immediately, so "don't stop early" cannot become "never stop".
+  - **The stall guard ended runs with work still declared open.** A few turns without new evidence
+    stopped the run even when the model's own todo list still held pending items — abandoning
+    exactly the work it had said was unfinished. With an open plan it now spends one bounded recovery
+    (`max_stall_recoveries`, default 1) demanding a genuinely different approach; the ledger keeps
+    what it had already ruled out, so a re-read cannot pose as fresh evidence. Going flat a second
+    time still stops.
+  - **One transient API error discarded the whole turn.** The top level ran with zero retries on the
+    reasoning that the user is right there to re-ask — but a 429/5xx twenty steps in threw away all
+    twenty. It now absorbs a small number (2, versus 4 for unwatched sub-agents, since each attempt
+    prints a retry line and reads as progress rather than a hang). Permanent 4xx still fails fast.
+  Continuation alone does not cover a model that stops early *on its own* — the loop sees a clean
+  `Done` — so both system prompts gained a persistence clause: a large task is a reason to keep
+  working, and a plan or an outline is not a result.
+- **The Hugging Face cache was never scanned on Windows.** `scan_hf_cache` reached
+  `~/.cache/huggingface/hub` only through `$HOME`, which does not exist on Windows outside a POSIX
+  shell — so a model another tool had already downloaded sat there unseen. The home lookup is now
+  `USERPROFILE` then `HOME` (matching `aizen_home()`), and the root list follows the precedence
+  `huggingface_hub` documents: `HF_HUB_CACHE` → `HF_HOME/hub` → `XDG_CACHE_HOME/huggingface/hub` →
+  `<home>/.cache/huggingface/hub`. The old `%LOCALAPPDATA%/huggingface/hub` entry is gone: HF uses
+  `~/.cache` on all three platforms, so that path pointed at a directory nothing ever creates.
+- **A dense build with no model no longer degrades recall.** `settings().enable_dense` tracked only
+  the cargo feature, but with no model2vec model installed the embedder falls back to the
+  non-semantic `HashEmbedder` — which then got fused into RRF. Worse, the query gate admits the dense
+  tier precisely when lexical coverage is LOW, so the hash embedder was mixed in exactly on the
+  ambiguous queries where it does the most damage (the P6 bench measured literal-slice precision
+  dropping 0.667 → 0.200). Dense now defaults on only when the feature is built AND a model is
+  actually present; `AIZEN_MEM_DENSE` still overrides both ways.
+- **Model weights are loaded once per process instead of once per search.**
+  `StaticModel::from_pretrained` reads and parses the entire `model.safetensors` (512 MB for
+  `potion-multilingual-128M`), and the embedder was constructed on every search — both memory
+  retrieval and code retrieval, so twice a turn. The load is now memoized on the weights file's
+  identity (path + mtime + length). Discovery itself is still uncached, so a model downloaded
+  mid-session is picked up on the next search, and a model replaced in place is reloaded rather than
+  served stale.
+
+- **`/import` could not be navigated.** `import` was missing from the one table that decides whether
+  a slash command owns stdin, while `/sessions` — the same dialoguer picker — was listed. So the
+  retained TUI's input thread kept the keyboard and the picker's arrow keys never reached it: with 240
+  transcripts across 9 pages, the list could not be paged at all.
+- **Every `/import` row described the harness instead of the conversation.** The subject was taken
+  from the first `user` line, but the foreign CLIs write their own text into user turns — so rows read
+  `<local-command-caveat>Caveat: The messages below were gener…` (Claude, after any `/compact` or `!`
+  command) or `<environment_context> <cwd>C:\Users\…` (Codex, which leads every session with one).
+  Envelope turns are now skipped to find what the person actually typed. The row also dropped the turn
+  count and the `from <dir>` note that repeated identically on all 240 rows — a subject you can
+  recognize is the only column that helps you pick, so it gets the width.
+
+### Added
+- `AIZEN_EMBED_MODEL` accepts an absolute path to a model directory, not just a name to look up under
+  `~/.aizen/models/`. For a model on a shared drive or outside both search trees.
+
 ### Changed
 - **One brand, everywhere: every `NEXTGEN_*` / `NG_*` name is now `AIZEN_*`.** The rebrand had only
   reached the paths — the environment variables, the internal API and a pile of doc comments still

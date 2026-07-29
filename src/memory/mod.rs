@@ -1824,26 +1824,34 @@ pub fn cmd_health() -> Result<()> {
 }
 
 /// Settings accessor (verified-good defaults). `AIZEN_MEM_FUZZY=1` opts the Jaro-Winkler bridge in
-/// (default OFF). The dense tier (P6) is ON by default on a `--features dense` build (the one with a
-/// real semantic backend, where the bench proved gated fusion wins) and OFF on a default build (only
-/// the non-semantic `HashEmbedder` → enabling it there is pure overhead). `AIZEN_MEM_DENSE` overrides
-/// either way (`=0/off` disables, `=1/on` forces on).
+/// (default OFF). The dense tier (P6) is ON by default only when BOTH hold: this is a
+/// `--features dense` build, AND a model2vec model is actually installed — a dense build with no
+/// model would otherwise fuse the non-semantic `HashEmbedder` into RRF and lose precision (see the
+/// comment on `enable_dense` below). `AIZEN_MEM_DENSE` overrides either way (`=0/off` disables,
+/// `=1/on` forces on regardless of what is on disk).
 pub fn settings() -> MemorySettings {
     let mut s = MemorySettings::default();
     if env_on("AIZEN_MEM_FUZZY") {
         s.enable_fuzzy = true;
     }
-    // Dense tier (P6): ON by default ONLY on a `--features dense` build — that's the one carrying a
-    // real semantic backend, and the bench proved gated fusion earns its keep there (paraphrase
-    // recall +0.231 with negligible literal-slice noise). A default build has only the non-semantic
-    // `HashEmbedder`, so enabling dense there is pure overhead for no gain → it stays OFF. Either
-    // way `AIZEN_MEM_DENSE` overrides: `=0/off` kills it on a dense build, `=1` forces the plumbing
-    // path on a default build (integration tests). The gate itself (`dense_gate_coverage`) still
-    // means a confident literal query never pays the dense cost.
-    s.enable_dense = cfg!(feature = "dense");
-    if let Some(v) = env_flag("AIZEN_MEM_DENSE") {
-        s.enable_dense = v;
-    }
+    // Dense tier (P6): ON by default ONLY on a `--features dense` build that can actually LOAD a
+    // model. The feature flag alone is not enough, and this is the whole point of the second
+    // condition: `default_dense_embedder()` degrades to `HashEmbedder` when no model2vec model is
+    // installed, so a feature-only default fused that NON-SEMANTIC embedder into RRF. Worse, the
+    // query gate (`dense_gate_coverage`) admits dense precisely when BM25 coverage is LOW — i.e. the
+    // hash embedder got mixed in exactly on the ambiguous queries where it can do the most damage.
+    // The P6 bench measured that wrong fusion dropping literal-slice precision 0.667 → 0.200. With
+    // no model, the lexical floor alone is strictly better, so dense stays OFF.
+    //
+    // `AIZEN_MEM_DENSE` still overrides both directions and is checked FIRST, so `=1` keeps forcing
+    // the plumbing path on a default build (integration tests) without needing a model on disk.
+    s.enable_dense = match env_flag("AIZEN_MEM_DENSE") {
+        Some(v) => v,
+        // Cheap-first: the `cfg!` is a compile-time constant, so `&&` short-circuits and a default
+        // build never pays for the FS scan. On a dense build this is a few `read_dir`s plus small
+        // `config.json` reads — the same discovery the embedder is about to do anyway.
+        None => cfg!(feature = "dense") && embed::discover_local_model().is_some(),
+    };
     s
 }
 
@@ -1871,20 +1879,31 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn settings_dense_defaults_to_the_feature_and_env_overrides_both_ways() {
-        // P6: `settings().enable_dense` tracks the `dense` cargo feature by default (ON only where a
-        // real semantic backend exists), and `AIZEN_MEM_DENSE` overrides in EITHER direction. Guard
-        // the process-global env with the home lock so we don't race other env-touching tests.
+    fn settings_dense_needs_both_the_feature_and_a_model_and_env_overrides_both_ways() {
+        // `enable_dense` requires the `dense` feature AND an installed model2vec model: with the
+        // feature but no model, `default_dense_embedder()` degrades to the non-semantic
+        // `HashEmbedder`, and fusing THAT into RRF cost literal precision 0.667 → 0.200 in the P6
+        // bench. `AIZEN_MEM_DENSE` overrides in EITHER direction and is checked first, so forcing
+        // the plumbing path needs no model on disk. Guard the process-global env with the home lock
+        // so we don't race other env-touching tests.
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("AIZEN_MEM_DENSE");
-        // unset → mirrors the build: ON with `--features dense`, OFF otherwise.
-        assert_eq!(settings().enable_dense, cfg!(feature = "dense"));
-        // explicit ON forces the plumbing path even on a default build.
+        // Unset → the conjunction. Stated as the conjunction rather than as `cfg!(dense)` alone:
+        // on a dense build the answer legitimately depends on what this machine has installed, and
+        // asserting the feature flag alone is what pinned the OLD (wrong) policy.
+        assert_eq!(
+            settings().enable_dense,
+            cfg!(feature = "dense") && embed::discover_local_model().is_some()
+        );
+        // A default build has no semantic backend at all, so the default must be OFF outright.
+        #[cfg(not(feature = "dense"))]
+        assert!(!settings().enable_dense);
+        // explicit ON forces the plumbing path even on a default build with no model.
         std::env::set_var("AIZEN_MEM_DENSE", "1");
         assert!(settings().enable_dense);
-        // explicit OFF kills it even on a `--features dense` build.
+        // explicit OFF kills it even on a `--features dense` build with a model present.
         std::env::set_var("AIZEN_MEM_DENSE", "off");
         assert!(!settings().enable_dense);
         std::env::remove_var("AIZEN_MEM_DENSE");

@@ -528,13 +528,27 @@ pub fn models_dir() -> PathBuf {
     aizen_home().join("models")
 }
 
-/// The dense embedding model name (a subdir of `models_dir()`), overridable via env.
+/// The dense embedding model: a subdir name of `models_dir()`, or an absolute path to a model dir.
+///
+/// Precedence `AIZEN_EMBED_MODEL` → the saved `embed_model` in cli-config → the benched default.
+/// The env var stays on top so a one-off `AIZEN_EMBED_MODEL=… aizen …` still wins over the file, and
+/// the file exists so the `/config` Memory section can make a durable choice instead of asking the
+/// user to keep an env var set forever.
+///
+/// No recursion risk in reading cli-config from here: `cli_config::load` only reaches back into
+/// `config_path()` → `aizen_home()`, neither of which consults this function.
 #[allow(dead_code)] // used by `--features dense` (model2vec loader); inert in the default build
 pub fn embed_model_name() -> String {
     std::env::var("AIZEN_EMBED_MODEL")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            crate::core::cli_config::load()
+                .embed_model
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
         // potion-base-8M (English static, ~30MB) — the P6 CI bench (dense-bench.yml) measured it
         // LIFTING paraphrase recall@5 more than the ~18x-larger multilingual model (+0.231 vs
         // +0.154) on the bilingual En-Vi fixtures, so it's the default. `AIZEN_EMBED_MODEL` overrides.
