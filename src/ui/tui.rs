@@ -413,6 +413,34 @@ fn start_ticker() {
     });
 }
 
+/// Service a status-panel command on the INPUT THREAD while a turn is in flight. Returns true when the
+/// command was fully handled here and must NOT be queued.
+///
+/// This is the fourth mid-turn entry point, for exactly the same reason `>` steer and `?` aside are
+/// the second and third: the REPL's turn `select!` polls only the turn future and the cancel channel,
+/// so an ordinary queued slash command is not dequeued until the turn ENDS. For this one command that
+/// makes it useless twice over — a stop that lands after the run it targeted has already finished is
+/// no stop at all, and a self-refreshing activity panel you can only open once the fan-out is over has
+/// nothing left to show.
+///
+/// Servicing it here is safe precisely because it touches nothing the REPL owns: reading the
+/// orchestration registry and raising a cancel flag are both process-global and lock-guarded, and the
+/// overlay is already driven from this thread — it is the one that closes it on Esc. While IDLE the
+/// command stays on the queue, where suspend/park semantics remain the REPL's business.
+fn handle_status_command_inline(name: &str, arg: &str) -> bool {
+    if !turn_in_flight() || !crate::agent::orchestration::is_status_command(&name.to_lowercase()) {
+        return false;
+    }
+    if let Some(note) = crate::agent::orchestration::try_stop_command(arg) {
+        note_line(&theme::muted(note).to_string());
+        return true;
+    }
+    // A bare `/workflows`: open the live panel from here. A `false` return (no retained backend — a
+    // pipe/CI, or the box is currently suspended for a menu) falls through to the queue rather than
+    // printing over a surface this thread does not own.
+    retained_overlay_open_live("Activity", crate::agent::orchestration::format_status)
+}
+
 /// What the user submitted from the input box.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Submission {
@@ -1249,9 +1277,19 @@ fn crossterm_to_console_key(ev: crossterm::event::KeyEvent) -> Option<Key> {
     })
 }
 
+/// Is screen cell (`col`, `row`) inside `rect`? Saturating throughout so a rect flush against the
+/// right/bottom edge can't wrap into a false miss.
+fn hit(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
+    col >= rect.x
+        && col < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
 /// Phase 3 mouse handler for the retained backend: wheel scroll, text selection (drag + copy-on-
-/// release), and scrollbar thumb drag. Mutates `selecting` / `dragging_scrollbar` so state survives
-/// across successive mouse events. No-ops harmlessly when geometry is empty (first frame).
+/// release), right-click Copy menu, and scrollbar thumb drag. Mutates `selecting` /
+/// `dragging_scrollbar` so state survives across successive mouse events. No-ops harmlessly when
+/// geometry is empty (first frame).
 fn handle_retained_mouse(
     kind: crossterm::event::MouseEventKind,
     col: u16,
@@ -1283,14 +1321,35 @@ fn handle_retained_mouse(
         MouseEventKind::ScrollUp => retained::scroll(-3),
         MouseEventKind::ScrollDown => retained::scroll(3),
         MouseEventKind::Down(MouseButton::Left) => {
+            // The right-click Copy menu floats above everything, so it is hit-tested FIRST — a click
+            // on it must copy rather than start a new selection underneath it. `live_selection` is
+            // read (not `selecting`, which is `take()`n on mouse-up while the highlight stays up),
+            // so the text copied is exactly the text still painted.
+            if let Some(m) = retained::context_menu_rect() {
+                let on_menu = hit(m, col, row);
+                retained::close_context_menu();
+                if on_menu {
+                    if let Some(sel) = retained::live_selection() {
+                        let text = retained::extract_selection_text(sel);
+                        if !text.is_empty() {
+                            let ok = copy_to_os_clipboard(&text);
+                            note_copied(&text, ok);
+                        }
+                    }
+                    // The highlight stays: the copy is confirmed by the note, and keeping it lets a
+                    // second copy (or a wider drag from the same anchor) follow without re-selecting.
+                    *dragging_scrollbar = false;
+                    *selecting = None;
+                    return;
+                }
+                // A click anywhere else dismisses the menu and then lands normally, which is what a
+                // click-away is expected to do — falling through means it also starts a selection or
+                // hits the jump button, rather than being eaten as a "close the menu" no-op.
+            }
             // Floating "jump to bottom" button takes priority: a click anywhere on it lands the
             // viewport back on the live tail (only present while scrolled up off the tail).
             if let Some(b) = retained::jump_button_rect() {
-                if col >= b.x
-                    && col < b.x.saturating_add(b.width)
-                    && row >= b.y
-                    && row < b.y.saturating_add(b.height)
-                {
+                if hit(b, col, row) {
                     *dragging_scrollbar = false;
                     *selecting = None;
                     retained::clear_selection();
@@ -1312,6 +1371,12 @@ fn handle_retained_mouse(
                 retained::scroll_to(desired.min(max_start));
             } else if in_transcript {
                 *dragging_scrollbar = false;
+                // Starting a fresh selection dismisses any menu unconditionally. The hit-test above
+                // only sees a menu the render thread has already PUBLISHED, so a click landing in the
+                // same frame as the right-click that opened it would otherwise fall through to here
+                // and leave the box drawn over the new selection. Every other click path reaches
+                // `clear_selection` (which closes the menu); this is the one that doesn't.
+                retained::close_context_menu();
                 let line = start.saturating_add(row.saturating_sub(area.y) as usize);
                 let c = col.saturating_sub(area.x) as usize;
                 let sel = retained::SelectionRange {
@@ -1409,21 +1474,65 @@ fn handle_retained_mouse(
                 }
             }
         }
+        // Right-click over a highlight offers an explicit "Copy" button. The drag-release above
+        // already copies silently, but that is invisible — there is no way to tell it happened, and
+        // no way to ask for it again without re-dragging. This is the discoverable path.
+        //
+        // Gated on there BEING a selection: a menu whose only item is Copy has nothing to offer
+        // otherwise, and popping an inert box on every right-click in the transcript would be noise.
+        // `live_selection` is the mirror of what is painted — `selecting` is already `take()`n by the
+        // mouse-up above, so it is `None` at exactly the moment someone reaches for the right button.
+        MouseEventKind::Down(MouseButton::Right) => {
+            if in_transcript && retained::live_selection().is_some() {
+                retained::open_context_menu(col, row);
+            } else if retained::context_menu_rect().is_some() {
+                // Right-click with nothing selected (or outside the transcript) dismisses an open
+                // menu rather than leaving it stranded.
+                retained::close_context_menu();
+            }
+        }
         _ => {}
     }
 }
 
-/// Copy selected transcript text to the OS clipboard. DESKTOP-ONLY: `arboard` is target-gated to
-/// Windows/macOS (Linux would need X11/Wayland libs at runtime, breaking the headless static binary
-/// — see Cargo.toml), so on Linux this is a no-op and selection copy silently does nothing there.
+/// Copy selected transcript text to the OS clipboard, reporting whether it actually landed.
+///
+/// DESKTOP-ONLY: `arboard` is target-gated to Windows/macOS (Linux would need X11/Wayland libs at
+/// runtime, breaking the headless static binary — see Cargo.toml), so on Linux this is a no-op.
+/// It returns `bool` rather than `()` so the explicit right-click Copy can confirm honestly instead
+/// of printing "copied" on a platform where nothing was: a silent no-op is survivable for the
+/// incidental drag-release copy, but a button the user deliberately clicked must not lie.
 #[cfg(any(windows, target_os = "macos"))]
-fn copy_to_os_clipboard(text: &str) {
-    if let Ok(mut cb) = arboard::Clipboard::new() {
-        let _ = cb.set_text(text.to_string());
+fn copy_to_os_clipboard(text: &str) -> bool {
+    match arboard::Clipboard::new() {
+        Ok(mut cb) => cb.set_text(text.to_string()).is_ok(),
+        Err(_) => false,
     }
 }
 #[cfg(not(any(windows, target_os = "macos")))]
-fn copy_to_os_clipboard(_text: &str) {}
+fn copy_to_os_clipboard(_text: &str) -> bool {
+    false
+}
+
+/// Confirm (or honestly deny) an explicit right-click copy with one dim transcript line.
+///
+/// Routed through `note_line`, never `eprintln!`: a raw write behind the render thread's back lands
+/// inside a retained frame and corrupts it, because ratatui's cell diff compares against its own
+/// last frame and never sees the foreign text.
+fn note_copied(text: &str, ok: bool) {
+    let msg = if ok {
+        let chars = text.chars().count();
+        let rows = text.lines().count().max(1);
+        if rows > 1 {
+            format!("· copied {chars} chars ({rows} lines)")
+        } else {
+            format!("· copied {chars} chars")
+        }
+    } else {
+        "· clipboard unavailable on this platform — nothing copied".to_string()
+    };
+    note_line(&style(msg).dim().to_string());
+}
 
 fn input_loop(
     sub_tx: UnboundedSender<Submission>,
@@ -1728,6 +1837,13 @@ fn input_loop(
                 repaint();
                 if let Some(name) = pick {
                     history.push(format!("/{name}"));
+                    // Resolving `/wo` from the palette must reach the same mid-turn path a fully
+                    // typed `/workflows` does, or the panel would open live only for whoever types
+                    // the whole name. No argument can ride this branch (the palette hides itself the
+                    // moment a space is typed), so the stop verb is unreachable here by construction.
+                    if handle_status_command_inline(&name, "") {
+                        continue;
+                    }
                     if sub_tx.send(Submission::Slash(name)).is_err() {
                         return;
                     }
@@ -1760,7 +1876,29 @@ fn input_loop(
                     // with the routing character removed, so the model never sees the `>` marker.
                     line = rest.trim().to_string();
                 }
+                // `?` PREFIX = ASIDE: a quick side question answered on a SEPARATE worker thread
+                // without perturbing the turn in flight (no history mutation, no cancel, no WORKING).
+                // Only meaningful WHILE a turn runs — an aside beside idle is just an ordinary
+                // question, so we gate on `turn_in_flight()` and otherwise fall through with the
+                // marker stripped. A refused aside (no worker / blank / oversized) also falls through,
+                // so the text is delivered either way and the model never sees the `?`. Not offered
+                // for a vision message (an image belongs to the main turn).
+                else if let Some(rest) =
+                    trimmed.strip_prefix('?').filter(|_| images == 0)
+                {
+                    if turn_in_flight() && crate::core::aside::ask(rest) {
+                        continue;
+                    }
+                    line = rest.trim().to_string();
+                }
                 if let Some(cmd) = trimmed.strip_prefix('/').filter(|_| images == 0) {
+                    let (name, arg) = match cmd.split_once(char::is_whitespace) {
+                        Some((n, a)) => (n, a.trim()),
+                        None => (cmd, ""),
+                    };
+                    if handle_status_command_inline(name, arg) {
+                        continue;
+                    }
                     // No park decision here either (see the pick branch): if this command opens a
                     // menu, the REPL's `suspend()` raises KEYBOARD_PARKED and the loop head stands
                     // down — whenever that actually happens, including after a turn finishes.
@@ -2251,6 +2389,7 @@ pub fn retained_overlay_open(title: impl Into<String>, text: impl Into<String>) 
         return false;
     }
     RETAINED_INFO_OVERLAY.store(true, Ordering::Relaxed);
+    RETAINED_OVERLAY_GEN.fetch_add(1, Ordering::Relaxed);
     retained::open_overlay(retained::OverlaySnapshot {
         title: title.into(),
         lines: text.into().lines().map(str::to_string).collect(),
@@ -2260,8 +2399,43 @@ pub fn retained_overlay_open(title: impl Into<String>, text: impl Into<String>) 
     true
 }
 
+/// Generation counter for the informational overlay. Bumped on every open/close so a live refresher
+/// from a previous `/workflows` can tell it has been superseded and exit — without this, opening the
+/// panel twice would leave two threads writing the same surface.
+static RETAINED_OVERLAY_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Open an informational overlay that RE-READS itself while it stays up.
+///
+/// `/workflows` shows elapsed times; a one-shot snapshot froze them the moment the panel opened, so a
+/// fan-out you were watching appeared stuck at whatever second you happened to press the key. The
+/// refresher republishes the body (never re-opens it — see `Command::UpdateOverlay`, which preserves
+/// scroll) and stops as soon as the panel closes or another overlay takes its place.
+pub fn retained_overlay_open_live(
+    title: impl Into<String>,
+    refresh: impl Fn() -> String + Send + 'static,
+) -> bool {
+    if !retained_overlay_open(title, refresh()) {
+        return false;
+    }
+    let gen = RETAINED_OVERLAY_GEN.load(Ordering::Relaxed);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(900));
+        // Three ways to become obsolete: the panel was closed, a different overlay was opened, or the
+        // render thread went away (suspend/shutdown). Any of them ends this thread.
+        if !RETAINED_INFO_OVERLAY.load(Ordering::Relaxed)
+            || RETAINED_OVERLAY_GEN.load(Ordering::Relaxed) != gen
+            || !retained::is_running()
+        {
+            return;
+        }
+        retained::update_overlay(refresh().lines().map(str::to_string).collect());
+    });
+    true
+}
+
 pub fn retained_overlay_close() {
     RETAINED_INFO_OVERLAY.store(false, Ordering::Relaxed);
+    RETAINED_OVERLAY_GEN.fetch_add(1, Ordering::Relaxed);
     if retained::is_running() {
         retained::close_overlay();
         repaint_force();

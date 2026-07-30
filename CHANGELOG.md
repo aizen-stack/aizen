@@ -5,6 +5,119 @@ All notable changes to **Aizen** (`aizen`) — the pure-Rust agentic coding CLI.
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
+## [0.5.2] — 2026-07-30
+
+### Added
+- **A delegated run now has a deadline, not just a step budget.** Every budget in the agent loop counted
+  STEPS, and steps are not time: a `task` dispatch is bounded at 150 steps by default (480 at
+  `max_steps: 80`), but each step may legitimately spend minutes — a 300s model call, a 120s
+  `shell_run` — so a dispatch always finished with no answer to *by when*. `AgentConfig::deadline` and
+  `StopReason::Deadline` answer it: one hour per dispatch by default, `AIZEN_SUBAGENT_WALL_SECS` to
+  change it (floor 60s, `0` opts out), applied to `task` children and workflow children alike. Three
+  details are what make it a real ceiling rather than a suggestion. It is checked at the **loop
+  boundary**, not imposed as an outer `tokio::time::timeout` — an outer timeout drops the future
+  wherever it happens to be suspended, mid-`spawn_blocking` with a write already on disk, discarding
+  both the transcript and any record of what changed; reaching the boundary means the current step
+  completes, is recorded, and the run ends the same orderly way Esc does. The budget is one absolute
+  instant computed **once per dispatch**, so the continuation loop re-enters with the same deadline
+  instead of three budgets multiplying into three times the ceiling. And a deadline is never resumable,
+  because a continuation would restart the clock. The cost, sized for deliberately: overshoot is bounded
+  by the longest single step, not by zero. No synthesis call on that path either — writing a summary
+  would cost one more model call on top of an already-blown ceiling, so the caller labels the partial
+  work from the stop reason instead.
+- **`/workflows stop <#id|name>` ends one sub-agent and leaves the rest running.** Esc is
+  all-or-nothing by design, so a fan-out with one child wedged behind a slow model call left no option
+  but to kill the whole turn. Cancellation is now a tree: `TurnCancel::child()` derives a token the
+  parent can cancel but which cannot cancel the parent, so Esc still cascades to every descendant while
+  a targeted stop reaches exactly one row. A numeric needle is an exact id match (`#3` never also stops
+  `#30`); anything else is a case-insensitive substring of a row's name or label. A row that matched but
+  published no stop handle is reported as such rather than as "nothing matched", which would send you
+  hunting for a typo that isn't there.
+- **The `/workflows` panel refreshes itself while it is open.** A one-shot snapshot froze the elapsed
+  times at whatever second you pressed the key, so a fan-out you were watching looked stuck. The body is
+  now republished every 900ms without re-opening the overlay, which preserves your scroll position; a
+  generation counter retires the refresher as soon as the panel closes or another overlay replaces it, so
+  two panels can never write the same surface. Long runs read `2h05m` instead of `125m00s`, and run ids
+  print as the short `#3` you can actually retype.
+- **`/workflows` and `/workflows stop` work *during* a turn.** The REPL's turn `select!` polls only the
+  turn future and the cancel channel, so a queued slash command isn't dequeued until the turn ends —
+  which makes this particular command useless twice over: a stop that lands after its target finished is
+  no stop, and a live activity panel you can only open once the fan-out is over has nothing to show. Both
+  are now serviced on the input thread, which is safe precisely because they touch nothing the REPL owns.
+- **`?` prefix: a side question that does not disturb the turn in flight.** `? what does this flag do`
+  is answered by a separate long-lived worker from a read-only snapshot of the live conversation, in one
+  tool-less call, printed dim beside the main stream. It never mutates history, never arms cancel, never
+  flips the working flag — the running turn is oblivious. The endpoint is resolved per question, so a
+  `/model` switch mid-session is honored. Refused or unavailable, the text falls through as an ordinary
+  message with the marker stripped, so nothing is ever swallowed.
+- **Right-click a highlight to copy it.** Drag-release already copied, but silently — no way to tell it
+  happened and no way to ask again without re-dragging. The menu only appears when there is a selection
+  to copy, and the confirmation line reports what actually landed: `copy_to_os_clipboard` returns a
+  result now, so on a platform where the clipboard is a no-op a button you deliberately clicked says so
+  instead of claiming success.
+
+### Changed
+- **The concurrent sub-agent cap is derived from the machine instead of pinned at 5.** The old constant
+  was one number for every box. The gate now bands off the core count (2..=16), `AIZEN_MAX_SUBAGENTS` or
+  `max_parallel_subagents` override it, and only a 64 disaster-ceiling is absolute. The per-call cap on
+  `workflow` rises 5 → 32 to match: the model requests as many tasks as the work needs, and the gate
+  bounds how many run *at once* — extra tasks queue into the next chunk rather than being refused.
+- **A sub-agent spawn line says what the child was sent to do.** `task` and `workflow` had no arm in the
+  tool-target formatter, so they fell through to the generic argument dump and rendered a clip of escaped
+  JSON (`{"prompt":"Investigate the retai…`). A child runs quiet for minutes and only its merged result
+  comes back, so that line is the only place its subject ever appears. It now reads `coder · cwd-audit`
+  — the model's own `label` when it passed one, else the prompt's opening line — and the role is spelled
+  out rather than left implicit, because read-only versus write-capable is the one thing the *who* half
+  carries. A fan-out names its first two children and marks the rest. The `/workflows` board uses the
+  same clipper, so one task cannot appear under two different names on two surfaces.
+- **A workflow child's model call has the same deadline as a `task` child's.** None of a child's budgets
+  count time, and `join_all` has no per-task timeout, so one call that never returned stalled the entire
+  chunk — every sibling done and the fan-out still producing nothing. An elapsed call is now an ordinary
+  error that lands as a failed task while its siblings and the synthesis carry on.
+
+### Fixed
+- **A `>` steer typed while a turn was starting up fell into the post-turn queue.** Two flags disagreed
+  for the whole of a turn's prep: `turn_in_flight()` reads the armed cancel token and was already true,
+  while the steering mailbox was armed ~150 lines later, just before the working flag flipped. The `>`
+  prefix asks the mailbox, so a steer typed during `@file` expansion, prompt-lane rebuild, or retrieval
+  was refused and queued — and retrieval is the slow part, so the window was widest on exactly the big
+  tasks worth steering. The mailbox is now opened in the same breath as the cancel token. What makes that
+  safe is a guard: prep has three early exits (an unconfigured endpoint, a `#remember`/`!shell` input, an
+  Esc during prep) that never reach the end-of-turn disarm, and a mailbox left armed with no turn behind
+  it would accept steers into a slot nothing drains — silently eating input, strictly worse than queueing
+  it. The guard closes the mailbox on every exit path and re-queues anything the turn never took.
+- **An edit could fail with "resource is busy … transaction.lock" while no other aizen was running and
+  the lock file was absent from disk.** All three observations were consistent, and none of them pointed
+  at the cause: an OS advisory lock lives on an open **handle**, not on the path, so it is invisible in a
+  directory listing, deleting the file cannot release it, and it can be held by a stranded thread inside
+  the very process reporting the error. The holder was an unbounded internal `git` child from an earlier
+  turn — `Command::output()` blocks until every pipe reaches EOF, and on Windows a grandchild that
+  outlives its parent keeps the inherited write end open, so EOF may never arrive. Every git spawn in the
+  Time Machine is now deadline-bounded (120s, `AIZEN_GIT_OP_TIMEOUT_SECS`) with its process tree
+  contained, which converts a permanent strand into an ordinary error that unwinds through `Drop` and
+  frees the lock. The stdin-fed spawns start their pipe drains *before* writing, closing a second latent
+  deadlock where a child emitting more than one pipe buffer while we were still writing would block us
+  and itself forever. Lock acquisition observes the turn's cancel token, so Esc during contention returns
+  at once instead of waiting out the 15s timeout. And when contention does happen, the error explains
+  where the lock actually lives and what to do — a fail-closed gate must not also be a dead end.
+- **Checkpoint reads no longer corrupt non-UTF-8 files.** The bounded runner decoded child output
+  lossily, which is correct for a shell command's text but silently rewrites every invalid byte to U+FFFD
+  — and `git cat-file blob` output *is* file content, as `-z` output is NUL-delimited paths. Bounded
+  execution now has a byte-exact form, and the lossy one is a thin wrapper over it so a fix reaches both.
+- **A request that never returns can no longer hang for the life of the process.** `read_timeout` only
+  fires when the socket goes byte-silent, so a gateway that keeps a connection warm with keepalives or a
+  trickle of SSE comments could hold a request open indefinitely without tripping it. A 1800s absolute
+  ceiling now sits under every request as a backstop — far larger than any legitimate turn, so it never
+  fights a long streamed answer.
+- **`/import` offered transcripts from unrelated sibling projects.** The project filter treated an
+  ancestor of the checkout as a match, which reads symmetric and is wrong: the project root is already
+  resolved to the checkout's toplevel, so a shallower recorded directory lies outside the boundary by
+  construction and can only name marker-less parents. Measured on this developer's own history, 18
+  transcripts were offered for one checkout of which 9 were ancestor over-matches — six recorded in the
+  home directory, three in a parent folder holding five unrelated siblings. The cost was not just a noisy
+  picker: importing an over-matched transcript stamps this project's provenance onto a conversation from
+  another one, and that stamp cannot be undone.
+
 ## [0.5.1] — 2026-07-30
 
 ### Added

@@ -57,6 +57,12 @@ struct Entry {
     started_unix: u64,
     finished_unix: Option<u64>,
     parent: Option<u64>,
+    /// This run's OWN cancellation token, when the spawner armed one ([`Track::arm_stop`]).
+    ///
+    /// It is a `child()` of the turn token, never the turn token itself — that distinction is the
+    /// whole point. Cancelling this stops one sub-agent; the turn, its parent workflow, and its
+    /// siblings keep running. `None` for rows nobody offered a stop handle for.
+    cancel: Option<crate::core::cancel::TurnCancel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,8 +229,13 @@ fn remote_row(m: &RunManifest) -> String {
         format!(" — {}", m.detail)
     };
     format!(
-        "  {mark} [{}] {}{}  · {}s{} · pid {}\n",
-        m.kind, m.name, label, elapsed, detail, m.pid
+        "  {mark} [{}] {}{}  · {}{} · pid {}\n",
+        m.kind,
+        m.name,
+        label,
+        fmt_secs(elapsed),
+        detail,
+        m.pid
     )
 }
 
@@ -340,6 +351,17 @@ impl Track {
             .unwrap_or_else(|e| e.into_inner())
             .set_phase(self.id, phase, detail);
     }
+
+    /// Publish a stop handle for this run, so `/workflows stop <id>` can cancel it alone.
+    ///
+    /// The token MUST be a `TurnCancel::child()` of whatever the run inherited, never the inherited
+    /// token itself — arming the turn token here would turn a request to stop one sub-agent into Esc.
+    pub fn arm_stop(&self, token: crate::core::cancel::TurnCancel) {
+        let mut g = store().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = g.live.iter_mut().find(|e| e.id == self.id) {
+            e.cancel = Some(token);
+        }
+    }
 }
 
 impl Drop for Track {
@@ -374,6 +396,7 @@ fn start(
         started_unix: now,
         finished_unix: None,
         parent,
+        cancel: None,
     };
     persist_manifest(&e);
     store()
@@ -422,14 +445,120 @@ pub fn live_count() -> usize {
     store().lock().unwrap_or_else(|e| e.into_inner()).live.len()
 }
 
-fn fmt_elapsed(started: Instant, finished: Option<Instant>) -> String {
-    let end = finished.unwrap_or_else(Instant::now);
-    let secs = end.saturating_duration_since(started).as_secs();
+/// Format a run duration for a status row. Three tiers so the unit is always meaningful at a glance:
+/// `42s`, `7m03s`, `2h05m`. Without the hour tier a long fan-out read `125m00s` — correct, but the
+/// reader has to do the division to learn it has been going for two hours.
+pub(crate) fn fmt_secs(secs: u64) -> String {
     if secs < 60 {
         format!("{secs}s")
-    } else {
+    } else if secs < 3600 {
         format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
     }
+}
+
+fn fmt_elapsed(started: Instant, finished: Option<Instant>) -> String {
+    let end = finished.unwrap_or_else(Instant::now);
+    fmt_secs(end.saturating_duration_since(started).as_secs())
+}
+
+/// The short, typeable form of a run id. Ids embed the pid in their high 32 bits (so two aizen
+/// windows never collide in a shared manifest dir), which makes the full value a 20-digit number
+/// nobody will retype into a stop command. The low half is a per-process counter starting at 1.
+fn short_handle(id: u64) -> String {
+    format!("#{}", id & 0xffff_ffff)
+}
+
+/// Outcome of a [`cancel_matching`] request.
+pub struct CancelReport {
+    /// Live rows whose own token was cancelled.
+    pub cancelled: usize,
+    /// Live rows that matched but published no stop handle — reported separately so the caller can
+    /// say "matched but can't be stopped" instead of the misleading "nothing matched".
+    pub unstoppable: usize,
+}
+
+/// Cancel the live runs matching `needle`, which is either a short handle (`#3`, `3`) or a
+/// case-insensitive substring of a row's name or label (`t1`, `reviewer`, `parser`).
+///
+/// Only the matched runs stop: each row's token is a child of the turn's, so the orchestrating turn
+/// and every sibling keep going. This is the gap Esc could not fill — Esc cancels the whole turn.
+pub fn cancel_matching(needle: &str) -> CancelReport {
+    let needle = needle.trim();
+    let as_num = needle.trim_start_matches('#').parse::<u64>().ok();
+    let lower = needle.to_lowercase();
+    let mut tokens = Vec::new();
+    let mut unstoppable = 0usize;
+    {
+        let g = store().lock().unwrap_or_else(|e| e.into_inner());
+        for e in g.live.iter().filter(|e| {
+            match as_num {
+                // A numeric needle is an EXACT id match (short or full form). Never substring: `#3`
+                // must not also stop `#30`.
+                Some(n) => e.id == n || (e.id & 0xffff_ffff) == n,
+                None => {
+                    !lower.is_empty()
+                        && (e.name.to_lowercase().contains(&lower)
+                            || e.label.to_lowercase().contains(&lower))
+                }
+            }
+        }) {
+            match &e.cancel {
+                Some(t) => tokens.push(t.clone()),
+                None => unstoppable += 1,
+            }
+        }
+    }
+    // Cancel outside the store lock: `cancel()` walks the token's own child tree and takes its locks,
+    // and a stopped child's loop immediately reaches for the store to mark itself finished.
+    let cancelled = tokens.len();
+    for t in tokens {
+        t.cancel();
+    }
+    CancelReport {
+        cancelled,
+        unstoppable,
+    }
+}
+
+/// Names that open the status panel. One source of truth: the REPL's slash dispatch matches on this,
+/// and the input thread uses it to recognise a mid-turn stop request before the command is queued.
+pub fn is_status_command(name: &str) -> bool {
+    matches!(name, "workflows" | "workflow" | "wf" | "agents-status")
+}
+
+/// Interpret a `/workflows` argument as a stop request and carry it out, returning the line to show.
+/// `None` means it wasn't a stop request and the caller should open the panel instead.
+///
+/// Parsing AND execution live here together so the two call sites — the REPL's slash handler (idle)
+/// and the input thread (mid-turn, where the submission queue is not being drained) — cannot drift
+/// into reporting the same action differently.
+pub fn try_stop_command(arg: &str) -> Option<String> {
+    let mut words = arg.split_whitespace();
+    let verb = words.next()?.to_ascii_lowercase();
+    if !matches!(verb.as_str(), "stop" | "kill" | "cancel") {
+        return None;
+    }
+    let Some(needle) = words.next() else {
+        return Some("usage: /workflows stop <#id|name>  (ids are shown in the panel)".to_string());
+    };
+    let report = cancel_matching(needle);
+    Some(if report.cancelled > 0 {
+        format!(
+            "✓ stop: requested for {} run(s) matching {needle:?} — siblings keep running",
+            report.cancelled
+        )
+    } else if report.unstoppable > 0 {
+        // Matched, but the spawner published no handle. Say that rather than "not found", which would
+        // send the user hunting for a typo that isn't there.
+        format!(
+            "stop: {} matching run(s) have no stop handle (marked `no-stop`) — Esc cancels the whole turn",
+            report.unstoppable
+        )
+    } else {
+        format!("stop: no running row matches {needle:?} — open /workflows for live ids")
+    })
 }
 
 fn phase_mark(p: Phase) -> &'static str {
@@ -501,7 +630,8 @@ pub fn format_status() -> String {
     }
 
     out.push_str(
-        "\n\nTips: `task` = one sub-agent · `workflow` = fan-out ≤5 + synthesize/verify\n\
+        "\n\nStop ONE run: `/workflows stop #<id>` (or a name fragment) — Esc cancels the whole turn\n\
+         Tips: `task` = one sub-agent · `workflow` = parallel fan-out + synthesize/verify\n\
          CLI: `aizen workflow <spec.json>` · specialists: `aizen agents list`",
     );
     out
@@ -521,9 +651,20 @@ fn format_row(e: &Entry) -> String {
     } else {
         format!(" — {}", e.detail)
     };
-    let parent = e.parent.map(|p| format!(" ←#{p}")).unwrap_or_default();
+    let parent = e
+        .parent
+        .map(|p| format!(" ←{}", short_handle(p)))
+        .unwrap_or_default();
+    // The handle leads the row: it is the argument to `/workflows stop`, and a stop command is only
+    // usable if the thing you type is visible next to the thing you want to stop. Rows with no stop
+    // handle armed are marked so the panel never advertises a control that would not work.
+    let handle = short_handle(e.id);
+    let stoppable = match (e.phase, e.cancel.is_some()) {
+        (Phase::Running | Phase::Synthesizing, false) => " ·no-stop",
+        _ => "",
+    };
     format!(
-        "  {mark} [{tag}] {}{label}  · {elapsed}{detail}{parent}\n",
+        "  {mark} {handle}{stoppable} [{tag}] {}{label}  · {elapsed}{detail}{parent}\n",
         e.name
     )
 }
@@ -583,6 +724,100 @@ mod tests {
                 .any(|e| e.id == id && e.phase == Phase::Failed),
             "drop → Failed in history; status was:\n{s}"
         );
+    }
+
+    #[test]
+    fn elapsed_reaches_for_hours_before_the_minute_count_gets_absurd() {
+        assert_eq!(fmt_secs(0), "0s");
+        assert_eq!(fmt_secs(59), "59s");
+        assert_eq!(fmt_secs(60), "1m00s");
+        assert_eq!(fmt_secs(3599), "59m59s");
+        // The reason this tier exists: a two-hour fan-out used to read `120m00s`.
+        assert_eq!(fmt_secs(7200), "2h00m");
+        assert_eq!(fmt_secs(7 * 3600 + 5 * 60 + 9), "7h05m");
+    }
+
+    #[test]
+    fn a_row_shows_the_handle_you_would_type_to_stop_it() {
+        let t = start_task("coder · rewrite the parser");
+        let handle = short_handle(t.id());
+        let s = format_status();
+        assert!(
+            s.contains(&handle),
+            "the stop handle must be visible next to the row; got:\n{s}"
+        );
+        // No token armed yet → the panel must not advertise a stop that would fail.
+        assert!(s.contains("·no-stop"), "unarmed row marked no-stop:\n{s}");
+        t.arm_stop(crate::core::cancel::TurnCancel::new());
+        t.finish_ok("done");
+    }
+
+    #[test]
+    fn stop_by_handle_cancels_only_that_row() {
+        let turn = crate::core::cancel::TurnCancel::new();
+        let a = start_task("coder · task A");
+        let b = start_task("coder · task B");
+        let (tok_a, tok_b) = (turn.child(), turn.child());
+        a.arm_stop(tok_a.clone());
+        b.arm_stop(tok_b.clone());
+
+        let report = cancel_matching(&short_handle(a.id()));
+
+        assert_eq!(report.cancelled, 1, "exactly the matched row");
+        assert_eq!(report.unstoppable, 0);
+        assert!(tok_a.is_cancelled(), "target stops");
+        assert!(!tok_b.is_cancelled(), "sibling keeps running");
+        assert!(!turn.is_cancelled(), "the turn keeps running");
+        a.finish_err("stopped");
+        b.finish_ok("done");
+    }
+
+    #[test]
+    fn a_numeric_handle_never_matches_by_prefix() {
+        // `#3` must not also stop `#30`: ids are exact, only names are substring-matched.
+        let t = start_task("coder · exact match check");
+        let armed = crate::core::cancel::TurnCancel::new();
+        t.arm_stop(armed.clone());
+        let short = t.id() & 0xffff_ffff;
+        let report = cancel_matching(&format!("{}", short * 10 + 7));
+        assert_eq!(report.cancelled, 0, "a longer number is a different run");
+        assert!(!armed.is_cancelled());
+        t.finish_ok("done");
+    }
+
+    #[test]
+    fn a_matched_row_with_no_handle_is_reported_separately() {
+        // Otherwise "0 cancelled" reads as "you typed the id wrong".
+        let t = start_task("planner · unarmed row");
+        let report = cancel_matching(&short_handle(t.id()));
+        assert_eq!(report.cancelled, 0);
+        assert_eq!(report.unstoppable, 1);
+        t.finish_ok("done");
+    }
+
+    #[test]
+    fn only_a_stop_verb_is_intercepted_as_a_stop() {
+        // The input thread routes on this while a turn runs: anything that is NOT a stop must fall
+        // through to "open the panel", and a bare `/workflows` must never be read as a stop.
+        assert!(try_stop_command("").is_none());
+        assert!(try_stop_command("   ").is_none());
+        assert!(try_stop_command("tree").is_none(), "unknown verb → panel");
+
+        for verb in ["stop", "kill", "cancel", "STOP", "Kill"] {
+            let note = try_stop_command(verb).expect("recognised as a stop request");
+            assert!(note.starts_with("usage:"), "no target named: {note}");
+        }
+    }
+
+    #[test]
+    fn status_command_aliases_match_the_repl_dispatch() {
+        // Both surfaces route on this one predicate; a drift here would make the mid-turn panel open
+        // for `/workflows` but not for `/wf`.
+        for name in ["workflows", "workflow", "wf", "agents-status"] {
+            assert!(is_status_command(name), "{name} must be recognised");
+        }
+        assert!(!is_status_command("work"), "/work is a different command");
+        assert!(!is_status_command("team"));
     }
 
     #[test]

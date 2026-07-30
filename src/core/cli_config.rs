@@ -102,7 +102,9 @@ pub struct CliConfig {
     /// `roles.oracle` when configured). `None` ⇒ OFF (costs a turn per editing task).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_review: Option<bool>,
-    /// Concurrent sub-agent cap for parallel read-only `task` dispatches. `None` ⇒ 3 (clamp 1..=5).
+    /// Concurrent sub-agent cap for parallel read-only `task` dispatches and `workflow` fan-out.
+    /// `None` ⇒ machine-derived from the core count (band 2..=16); `Some(n)` pins it. Env
+    /// `AIZEN_MAX_SUBAGENTS` overrides both. All clamped to a 64 disaster-ceiling — no hard 5 any more.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_parallel_subagents: Option<usize>,
     /// Register the `workflow` fan-out tool. `None` ⇒ auto (only when specialist agents are

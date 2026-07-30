@@ -7,9 +7,12 @@
 //! so a flat bounded fan-out captures the value at a fraction of the orchestrator cost. Anything
 //! requiring real dependencies is reachable serially via the `task` tool.
 //!
-//! Concurrency is bounded to `MAX_PARALLEL` (chunked). Unlike the `task` tool (which bridges
-//! sync→async because `Tool::execute` is sync), the workflow runs directly in the async command
-//! path, so it fans out with plain `join_all` — no `block_in_place`.
+//! Concurrency is bounded to the process-global sub-agent cap (see
+//! `task_tool::max_parallel_subagents_pub` — machine-derived from the core count, overridable by
+//! env/config), chunked. Unlike the `task` tool (which bridges sync→async because `Tool::execute`
+//! is sync), the workflow runs directly in the async command path, so it fans out with plain
+//! `join_all` — no `block_in_place`. The model decides how many tasks to request; the gate only
+//! limits how many run AT ONCE.
 //!
 //! Honesty note (không bịa đặt): the synthesis model is the configured model unless the spec
 //! overrides it (`synthesis.model`). We do NOT auto-"escalate to a stronger tier" — the CLI is
@@ -24,9 +27,6 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
-/// Max sub-agents running at once (matches the parallel-tool cap; conservative for a CLI).
-const MAX_PARALLEL: usize = 5;
-
 /// Per-child step budget (mirrors `task` default `max_steps=15`). Workflow children are narrower
 /// than a top-level agent — keep them from burning the full 25/50 default.
 const CHILD_MAX_ITERS: usize = 15;
@@ -38,8 +38,8 @@ const CHILD_TRANSIENT_RETRIES: usize = 4;
 /// Fresh step budgets a STILL-PROGRESSING workflow child may be granted after its auto-extend is
 /// spent, instead of returning partial work as `status: "max-iters"` (see
 /// `AgentConfig::max_continuations`). Smaller than the top level's: children are meant to be narrow,
-/// and up to `MAX_PARALLEL` of them run at once, so the worst case is bounded by
-/// `MAX_PARALLEL × (CHILD_AUTO_EXTEND + CHILD_CONTINUATIONS × CHILD_MAX_ITERS)`.
+/// and up to the process-global cap of them run at once, so the worst case is bounded by
+/// `cap × (CHILD_AUTO_EXTEND + CHILD_CONTINUATIONS × CHILD_MAX_ITERS)`.
 const CHILD_CONTINUATIONS: usize = 2;
 
 /// Cap each child's summary before stuffing it into the synthesis prompt (chars). Prevents 5 verbose
@@ -151,7 +151,7 @@ async fn run_workflow_with_cancel(
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     // Honest width: reserve one global slot per concurrent child (shared with in-REPL `task` calls).
-    let want = MAX_PARALLEL.min(spec.tasks.len());
+    let want = crate::agent::task_tool::max_parallel_subagents_pub().min(spec.tasks.len());
     let slots = crate::agent::task_tool::SubagentSlot::acquire_up_to(want);
     if slots.is_empty() {
         bail!("sub-agent concurrency limit reached — retry when running tasks finish");
@@ -314,12 +314,13 @@ pub(crate) fn task_is_writer(role: &str, agent: Option<&str>) -> bool {
     matches!(role, "coder" | "tester")
 }
 
-/// Fan the tasks out, bounded to `MAX_PARALLEL` via chunking — shared by the CLI runner and the
-/// model-callable `workflow` tool (see `workflow_tool.rs`).
+/// Fan the tasks out, bounded to the process-global sub-agent cap via chunking — shared by the CLI
+/// runner and the model-callable `workflow` tool (see `workflow_tool.rs`).
 ///
 /// `max_parallel` bounds the chunk size: both CLI and tool paths pass the number of sub-agent slots
 /// they actually reserved (`SubagentSlot::acquire_up_to`), so a fan-out never runs more concurrent
-/// children than the process-global cap allows. Clamped to `1..=MAX_PARALLEL`.
+/// children than the process-global cap allows. Clamped to `1..=max_parallel_subagents_pub()` (the
+/// machine-derived cap; env/config can raise it, only `HARD_CEILING` is absolute).
 ///
 /// Cooperative cancel: if Esc is pressed mid-fan-out, remaining chunks are skipped (already-running
 /// children stop at their next loop boundary via `StopReason::Cancelled`).
@@ -367,7 +368,7 @@ async fn fan_out_tracked(
     parent: Option<u64>,
     cancel: crate::core::cancel::TurnCancel,
 ) -> Vec<TaskOutcome> {
-    let width = max_parallel.clamp(1, MAX_PARALLEL);
+    let width = max_parallel.clamp(1, crate::agent::task_tool::max_parallel_subagents_pub());
     let mut results: Vec<TaskOutcome> = Vec::with_capacity(tasks.len());
     for chunk in tasks.chunks(width) {
         if cancel.is_cancelled() {
@@ -439,12 +440,12 @@ pub(crate) async fn run_workflow_collect(
         .canonicalize()
         .context("canonicalizing cwd")?;
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    // Reserve ONE global sub-agent slot per concurrent child (bounded by both the workflow's own
-    // MAX_PARALLEL and the number of tasks), so a fan-out is accounted against the process-global
-    // cap at its real width — not as a single slot for the whole call. The reserved slots are held
-    // for the duration of the fan-out and released on drop; the fan-out chunks at exactly the width
-    // we secured. An empty reservation (gate already full) is a soft error.
-    let want = MAX_PARALLEL.min(spec.tasks.len());
+    // Reserve ONE global sub-agent slot per concurrent child (bounded by both the process-global
+    // sub-agent cap and the number of tasks), so a fan-out is accounted against the global cap at
+    // its real width — not as a single slot for the whole call. The reserved slots are held for the
+    // duration of the fan-out and released on drop; the fan-out chunks at exactly the width we
+    // secured. An empty reservation (gate already full) is a soft error.
+    let want = crate::agent::task_tool::max_parallel_subagents_pub().min(spec.tasks.len());
     let slots = crate::agent::task_tool::SubagentSlot::acquire_up_to(want);
     if slots.is_empty() {
         bail!("sub-agent concurrency limit reached — retry when running tasks finish");
@@ -640,16 +641,41 @@ async fn run_one_task(
         let base = base.clone();
         let key = key.clone();
         let model = model_s.clone();
-        async move { chat_with_tools(&client, &base, &key, &model, &msgs, &defs).await }
+        async move {
+            // Same wall-clock deadline as a `task` child (see
+            // `task_tool::SUBAGENT_CALL_TIMEOUT`): none of this child's budgets count TIME, so a
+            // call that never returns would park its slot — and, because `join_all` below has no
+            // per-task timeout, stall the entire chunk with no result and no error. An elapsed
+            // deadline is an ordinary `Err`, which `run_one_task` records as a failed task while
+            // its siblings and the synthesis still run.
+            let deadline = crate::agent::task_tool::subagent_call_timeout();
+            match tokio::time::timeout(
+                deadline,
+                chat_with_tools(&client, &base, &key, &model, &msgs, &defs),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "model call exceeded {}s with no response (set AIZEN_SUBAGENT_CALL_SECS to \
+                     raise the limit)",
+                    deadline.as_secs()
+                )),
+            }
+        }
     };
     // Mirror `task` budgets: narrow step cap, bounded auto-extend, no nested todo recitation.
     // Verify gate OFF: concurrent cargo checks thrash the same build lock (top-level verifies).
     // Checkpoint: keep pre-edit once for writers (Time Machine safety) but skip per-edit stamps
     // across parallel children — N children × each-edit would spam the store.
     let is_writer = !crate::agent::task_tool::dispatch_is_read_only(&registry);
+    // A DERIVED token per child, so `/workflows stop #<id>` can end ONE child of a fan-out while its
+    // siblings and the pending synthesis carry on. Esc still stops everything: cancellation flows down
+    // from the turn token this was derived from (see `TurnCancel::child`). Armed on the board below.
+    let own_cancel = cancel.child();
     let cfg = AgentConfig {
         approval_mode,
-        cancel,
+        cancel: own_cancel.clone(),
         // Inherit the parent turn's conversation identity so a workflow child's tool bodies (e.g.
         // browser) scope to the SAME conversation as the orchestrating turn. `default` on the CLI
         // `run_workflow` path, which has no conversation thread — matching the pre-context behavior.
@@ -675,6 +701,12 @@ async fn run_one_task(
         // process-global todo list, which belongs to the orchestrating turn, not this child.
         max_continuations: CHILD_CONTINUATIONS,
         max_stall_recoveries: 0,
+        // WALL-CLOCK ceiling per child, same knob as a `task` dispatch. It matters MORE here than
+        // there: `join_all` below has no per-task timeout, so one child still grinding holds up the
+        // whole chunk's synthesis — every sibling can be done and the fan-out still produces nothing.
+        // A child that hits the ceiling becomes `status: "deadline"` in the synthesis input, so the
+        // rest of the work is reported instead of waiting on the slowest one indefinitely.
+        deadline: crate::agent::task_tool::subagent_wall_deadline(),
         // Sub-agents leave context_window 0 (no tool-result clearing) — workflow children are short.
         // enable_lsp default true is fine; tools only appear if registered in the sub-agent registry.
         ..AgentConfig::default()
@@ -685,9 +717,31 @@ async fn run_one_task(
     // agents run. Emit a start + finish line per task into the transcript (only under the sticky
     // TUI — the CLI path prints its own eprintln status and isn't TUI-active, so no double lines).
     // Also register on the process-global orchestration board for `/workflows`.
-    let child_track =
-        crate::agent::orchestration::start_workflow_child(parent, &task.id, label.as_str());
-    wf_trace(&format!("⋯ {} ({label}) running…", task.id));
+    // `task.id` is positional (`t1`, `refute-3`) — it identifies a row but says nothing about the
+    // work, and `label` only names the ROLE. With N children running silently and concurrently, a
+    // trace of `⋯ t1 (reviewer) running…` gives the user no way to tell them apart, so carry each
+    // child's own subject. Same clipper as the `workflow` spawn line, so one task cannot appear
+    // under two different names on two surfaces.
+    let subject = crate::agent::subagent_subject(
+        &serde_json::json!({"prompt": task.prompt.as_str()}),
+        44,
+    );
+    let child_track = crate::agent::orchestration::start_workflow_child(
+        parent,
+        &task.id,
+        // The board's own row already prints the id; spend its label on role + subject.
+        if subject.is_empty() {
+            label.clone()
+        } else {
+            format!("{label} · {subject}")
+        },
+    );
+    child_track.arm_stop(own_cancel);
+    if subject.is_empty() {
+        wf_trace(&format!("⋯ {} ({label}) running…", task.id));
+    } else {
+        wf_trace(&format!("⋯ {} ({label}) {subject} …", task.id));
+    }
 
     match run_agent(chat, &cfg, &registry, &system, &task.prompt).await {
         Ok(o) => {
@@ -699,6 +753,7 @@ async fn run_one_task(
                 // Unreachable: workflow sub-agents have no `clarify` tool (nobody to answer).
                 StopReason::AwaitingInput(_) => "awaiting-input",
                 StopReason::Cancelled => "cancelled",
+                StopReason::Deadline => "deadline",
             };
             let ok = status == "done";
             let detail = format!("{status} [{} step(s)]", o.iters);

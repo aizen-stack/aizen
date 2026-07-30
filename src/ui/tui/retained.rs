@@ -263,6 +263,9 @@ struct AppState {
     /// Absolute (line, col) selection in the flat wrapped-line space. Drawn reversed; cleared on a
     /// plain click outside the range / Esc.
     selection: Option<SelectionRange>,
+    /// Right-click "Copy" menu, when one is up. Opened only while a selection exists, so the menu
+    /// can never offer to copy nothing.
+    context_menu: Option<ContextMenu>,
     metrics: metrics::FrameMetrics,
     cache: RenderCache,
     /// When `Some(idx)`, the idle screensaver is up: the render thread cover-encodes card `idx` to its
@@ -284,6 +287,18 @@ pub(super) struct SelectionRange {
     pub anchor_col: usize,
     pub cursor_line: usize,
     pub cursor_col: usize,
+}
+
+/// Where the right-click "Copy" menu was asked for, in screen cells. The menu is clamped into the
+/// transcript area at draw time, so this is a request rather than a final position — a right-click
+/// in the bottom-right corner still gets a fully visible box.
+///
+/// It deliberately does NOT carry the selection it will copy. The input thread owns that (it is the
+/// thread that reads the clipboard action), and duplicating it here would let the two drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ContextMenu {
+    pub col: u16,
+    pub row: u16,
 }
 
 /// Geometry of the last transcript viewport — input thread maps mouse coords → (line, col).
@@ -322,6 +337,38 @@ pub(super) fn jump_button_rect() -> Option<Rect> {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     g.jump_button
+}
+
+/// Screen rect of the right-click Copy menu at last draw, or `None` when no menu is up. The input
+/// thread hit-tests a left-click against this, exactly as it does for [`jump_button_rect`].
+fn context_menu_rect_slot() -> &'static Mutex<Option<Rect>> {
+    static SLOT: OnceLock<Mutex<Option<Rect>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+pub(super) fn context_menu_rect() -> Option<Rect> {
+    *context_menu_rect_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The selection currently PAINTED, mirrored out of the render thread's `AppState` so the input
+/// thread can act on it without owning it.
+///
+/// The input thread's own `selecting` can NOT serve this purpose: it is `take()`n on mouse-up while
+/// the highlight deliberately stays on screen, so between releasing the drag and the next click —
+/// precisely when someone reaches for the right button — it is `None` even though text is visibly
+/// selected. This mirror is written only by [`set_selection`] / [`clear_selection`], the same two
+/// calls that change the highlight, so it cannot disagree with what is on screen.
+fn live_selection_slot() -> &'static Mutex<Option<SelectionRange>> {
+    static SLOT: OnceLock<Mutex<Option<SelectionRange>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+pub(super) fn live_selection() -> Option<SelectionRange> {
+    *live_selection_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Extract plain text covering `sel` from the last drawn plain rows. Empty if nothing is selected
@@ -414,6 +461,7 @@ impl AppState {
             focused: true,
             plan_id: None,
             selection: None,
+            context_menu: None,
             metrics: metrics::FrameMetrics::default(),
             cache: RenderCache::default(),
             screensaver: None,
@@ -542,6 +590,12 @@ enum Command {
     Health(HealthKind),
     Tick,
     OpenOverlay(OverlaySnapshot),
+    /// Replace the OPEN overlay's body while preserving the reader's scroll position. Distinct from
+    /// `OpenOverlay` on purpose: a live panel (`/workflows`) re-publishes itself about once a second,
+    /// and re-opening would yank the view back to the top on every refresh — unreadable while you are
+    /// paging through the history section. Ignored when no overlay is up, so a refresh that races the
+    /// Esc that closed the panel can't resurrect it.
+    UpdateOverlay(Vec<String>),
     CloseOverlay,
     Scroll(i32),
     /// Jump the transcript so absolute wrapped-line `start` is at the top of the viewport
@@ -557,6 +611,10 @@ enum Command {
     SetSelection(SelectionRange),
     /// Drop the current selection highlight.
     ClearSelection,
+    /// Show the right-click "Copy" menu at these screen cells (clamped into the transcript at draw).
+    OpenContextMenu(ContextMenu),
+    /// Dismiss the right-click menu.
+    CloseContextMenu,
     Focus(bool),
     /// Throw away ratatui's belief about what is on screen and repaint every cell from the block
     /// buffer (Ctrl-L). The recovery hatch for the one failure ratatui's cell diff cannot see: text
@@ -795,11 +853,42 @@ pub(super) fn set_health(kind: HealthKind) {
 }
 
 pub(super) fn set_selection(sel: SelectionRange) {
+    // Mirror BEFORE queueing: the mirror is read by the input thread (right-click), and the command
+    // queue is drained asynchronously by the render thread. Writing it here makes "what is selected"
+    // true the instant the selection changes rather than one frame later.
+    *live_selection_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(sel);
     send(Command::SetSelection(sel));
 }
 
 pub(super) fn clear_selection() {
+    *live_selection_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    // A menu with nothing to copy is dead weight, so `ClearSelection` also closes it in the render
+    // thread — drop the hit-test rect here for the same reason `close_context_menu` does, or an Esc
+    // that clears a selection would leave a rect that keeps swallowing the next click.
+    *context_menu_rect_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
     send(Command::ClearSelection);
+}
+
+/// Open the right-click Copy menu at `col`/`row` (screen cells). Callers open it only when a
+/// selection exists — see `handle_retained_mouse`.
+pub(super) fn open_context_menu(col: u16, row: u16) {
+    send(Command::OpenContextMenu(ContextMenu { col, row }));
+}
+
+pub(super) fn close_context_menu() {
+    // Clear the hit-test rect here too, not just in the render thread: a click that dismisses the
+    // menu is immediately followed by more clicks, and a stale rect would keep swallowing them until
+    // the next frame lands.
+    *context_menu_rect_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    send(Command::CloseContextMenu);
 }
 
 /// Jump the transcript viewport so absolute wrapped-line `start` is at the top (scrollbar drag).
@@ -833,6 +922,11 @@ pub(super) fn tick() {
 
 pub(super) fn open_overlay(overlay: OverlaySnapshot) {
     send(Command::OpenOverlay(overlay));
+}
+
+/// Refresh an already-open overlay's body in place, keeping the reader's scroll offset.
+pub(super) fn update_overlay(lines: Vec<String>) {
+    send(Command::UpdateOverlay(lines));
 }
 
 pub(super) fn close_overlay() {
@@ -1169,6 +1263,14 @@ fn apply_command(state: &mut AppState, cmd: Command) {
             state.input.overlay = Some(overlay);
             state.overlay_scroll = 0; // a fresh overlay starts at the top
         }
+        Command::UpdateOverlay(lines) => {
+            if let Some(o) = state.input.overlay.as_mut() {
+                o.lines = lines;
+                // `overlay_scroll` is deliberately untouched — `draw_overlay` re-clamps it against the
+                // new content height, so a panel that shrank snaps to its last page instead of leaving
+                // the viewport parked past the end.
+            }
+        }
         Command::CloseOverlay => {
             state.input.overlay = None;
             state.overlay_scroll = 0;
@@ -1224,7 +1326,15 @@ fn apply_command(state: &mut AppState, cmd: Command) {
         }
         Command::Screensaver(card) => state.screensaver = card,
         Command::SetSelection(sel) => state.selection = Some(sel),
-        Command::ClearSelection => state.selection = None,
+        // Dropping the highlight closes the menu with it: a "Copy" button whose selection is gone
+        // would copy nothing, and leaving it on screen after the highlight vanished reads as a stuck
+        // frame. Every path that clears a selection therefore dismisses the menu for free.
+        Command::ClearSelection => {
+            state.selection = None;
+            state.context_menu = None;
+        }
+        Command::OpenContextMenu(m) => state.context_menu = Some(m),
+        Command::CloseContextMenu => state.context_menu = None,
         Command::Focus(v) => state.focused = v,
         // Lifecycle + `Redraw` carry no AppState change: they are handled by `render_loop`, which owns
         // the `TerminalSession` (`Redraw` sets `force_clear` so the next draw is unconditional).
@@ -1245,6 +1355,16 @@ fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         // draw_overlay clamps the requested scroll against the overlay's own visible height and
         // returns the value actually used, so a stored offset past the end snaps back next frame.
         state.overlay_scroll = draw_overlay(frame, area, &overlay, state.overlay_scroll);
+    }
+    // The Copy menu paints LAST so it sits above the transcript and the overlay both — it is the
+    // surface the pointer is currently on, and a box the user just summoned must not appear behind
+    // something else. Its hit-test rect is published every frame (including `None`), so a menu that
+    // stopped being drawn stops swallowing clicks on the very frame it disappears.
+    let menu_rect = state
+        .context_menu
+        .and_then(|m| draw_context_menu(frame, chunks[0], m));
+    if let Ok(mut slot) = context_menu_rect_slot().lock() {
+        *slot = menu_rect;
     }
 }
 
@@ -1727,6 +1847,56 @@ fn draw_overlay(
     clamped
 }
 
+/// Label on the right-click menu's only button. Padded so the highlight reads as a button rather
+/// than as stray reversed text.
+const COPY_LABEL: &str = " Copy ";
+
+/// Where the Copy menu box goes for a right-click at `menu`, or `None` when `area` is too small to
+/// hold one. Pure so the clamping is testable without a terminal backend.
+///
+/// The box is offered one cell right-and-below the pointer so it doesn't sit under the cursor, then
+/// pulled back inside `area` when that would overflow. Without the clamp a right-click near the
+/// bottom-right corner puts most of the box off-screen, leaving a Copy button that cannot be clicked
+/// — the one position where a context menu is most likely to be used.
+fn context_menu_layout(area: Rect, menu: ContextMenu) -> Option<Rect> {
+    let width = console::measure_text_width(COPY_LABEL) as u16 + 2; // + borders
+    let height = 3; // top border, label row, bottom border
+    if area.width < width || area.height < height {
+        return None;
+    }
+    // Both maxima are ≥ the area origin because of the size check above.
+    let max_x = area.x + area.width - width;
+    let max_y = area.y + area.height - height;
+    let x = menu.col.saturating_add(1).clamp(area.x, max_x);
+    let y = menu.row.saturating_add(1).clamp(area.y, max_y);
+    Some(Rect::new(x, y, width, height))
+}
+
+/// Paint the right-click Copy menu, returning the rect actually drawn so the input thread can
+/// hit-test a click against it.
+fn draw_context_menu(frame: &mut Frame<'_>, area: Rect, menu: ContextMenu) -> Option<Rect> {
+    let rect = context_menu_layout(area, menu)?;
+    // `Clear` first: the menu floats over live transcript text, and without wiping the cells the
+    // box borders blend into whatever was underneath.
+    frame.render_widget(Clear, rect);
+    let block = FrameBlock::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT_DIM)));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            COPY_LABEL,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Indexed(crate::ui::theme::ACCENT))
+                .add_modifier(Modifier::BOLD),
+        ))),
+        inner,
+    );
+    Some(rect)
+}
+
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
@@ -1746,14 +1916,16 @@ fn render_assistant_rows(raw: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
-/// Format a run time for the result line: `· 940ms` under a second, `· 1.2s` otherwise. Sub-second
-/// times keep millisecond resolution; longer runs show one decimal of seconds so a slow call reads
-/// at a glance. Empty string for `None` (unknown — restored transcripts / eager-adopted parallel).
+/// Format a run time for the result line: `· 940ms` under a second, `· 1.2s` under a minute, then
+/// `· 7m03s` / `· 2h05m`. Sub-second times keep millisecond resolution; the minute/hour tiers exist
+/// because a sub-agent dispatch is a single tool call that can run for hours, and `· 7203.4s` makes
+/// the reader do the division. Empty for `None` (unknown — restored transcripts / eager-adopted).
 fn fmt_elapsed(ms: Option<u64>) -> String {
     match ms {
         None => String::new(),
         Some(ms) if ms < 1000 => format!(" · {ms}ms"),
-        Some(ms) => format!(" · {:.1}s", ms as f64 / 1000.0),
+        Some(ms) if ms < 60_000 => format!(" · {:.1}s", ms as f64 / 1000.0),
+        Some(ms) => format!(" · {}", crate::agent::orchestration::fmt_secs(ms / 1000)),
     }
 }
 
@@ -2260,6 +2432,142 @@ mod tests {
         apply_command(&mut state, Command::CloseOverlay);
         apply_command(&mut state, Command::Scroll(-2));
         assert_eq!(state.scroll_from_tail, 5);
+    }
+
+    /// `/workflows` republishes itself about once a second so its elapsed times tick. If a refresh
+    /// re-opened the overlay it would yank the reader back to the top every second — unusable while
+    /// paging through the history section. `UpdateOverlay` swaps the body and leaves scroll alone.
+    #[test]
+    fn a_live_overlay_refresh_keeps_the_readers_scroll_position() {
+        let mut state = AppState::new("intro", "status");
+        apply_command(
+            &mut state,
+            Command::OpenOverlay(OverlaySnapshot {
+                title: "Activity".into(),
+                lines: (0..40).map(|i| format!("row {i} · 3s")).collect(),
+                selected: None,
+                hint: "Esc/q close".into(),
+            }),
+        );
+        apply_command(&mut state, Command::Scroll(-12));
+        assert_eq!(state.overlay_scroll, 12);
+
+        apply_command(
+            &mut state,
+            Command::UpdateOverlay((0..40).map(|i| format!("row {i} · 4s")).collect()),
+        );
+
+        assert_eq!(state.overlay_scroll, 12, "the reader's position survives");
+        let overlay = state.input.overlay.as_ref().expect("still open");
+        assert!(overlay.lines[0].ends_with("4s"), "body was refreshed");
+        assert_eq!(overlay.title, "Activity", "title/hint are not disturbed");
+        assert_eq!(overlay.hint, "Esc/q close");
+    }
+
+    /// A refresh that races the Esc which closed the panel must not resurrect it: the refresher thread
+    /// sleeps between publishes, so one in-flight update after the close is entirely ordinary.
+    #[test]
+    fn a_refresh_arriving_after_close_does_not_reopen_the_overlay() {
+        let mut state = AppState::new("intro", "status");
+        apply_command(
+            &mut state,
+            Command::OpenOverlay(OverlaySnapshot {
+                title: "Activity".into(),
+                lines: vec!["row".into()],
+                selected: None,
+                hint: String::new(),
+            }),
+        );
+        apply_command(&mut state, Command::CloseOverlay);
+        apply_command(&mut state, Command::UpdateOverlay(vec!["late".into()]));
+        assert!(state.input.overlay.is_none(), "stays closed");
+    }
+
+    /// The per-tool result line carries a sub-agent dispatch's whole runtime, and that can be hours.
+    /// `· 7203.4s` is correct and unreadable; the minute/hour tiers exist for exactly that row.
+    #[test]
+    fn tool_row_time_gains_minute_and_hour_tiers() {
+        assert_eq!(fmt_elapsed(None), "");
+        assert_eq!(fmt_elapsed(Some(940)), " · 940ms");
+        assert_eq!(fmt_elapsed(Some(1_250)), " · 1.2s");
+        assert_eq!(fmt_elapsed(Some(59_900)), " · 59.9s");
+        assert_eq!(fmt_elapsed(Some(60_000)), " · 1m00s");
+        assert_eq!(fmt_elapsed(Some(7_203_400)), " · 2h00m");
+    }
+
+    /// A right-click in the bottom-right corner is exactly where a naive `x+1, y+1` placement puts
+    /// most of the box off-screen — leaving a Copy button that cannot be clicked at the position a
+    /// context menu is most likely to be used from.
+    #[test]
+    fn copy_menu_is_clamped_fully_inside_the_transcript_area() {
+        let area = Rect::new(0, 0, 40, 20);
+        let fits = |r: Rect| {
+            r.x >= area.x
+                && r.y >= area.y
+                && r.x + r.width <= area.x + area.width
+                && r.y + r.height <= area.y + area.height
+        };
+
+        // Middle of the area: offered one cell down-right of the pointer so the box isn't under it.
+        let mid = context_menu_layout(area, ContextMenu { col: 10, row: 5 }).unwrap();
+        assert_eq!((mid.x, mid.y), (11, 6));
+        assert!(fits(mid));
+
+        // Bottom-right corner: pulled back inside instead of overflowing.
+        let corner = context_menu_layout(area, ContextMenu { col: 39, row: 19 }).unwrap();
+        assert!(fits(corner), "corner menu escaped the area: {corner:?}");
+        assert_eq!(corner.x + corner.width, area.width, "flush to the right edge");
+        assert_eq!(corner.y + corner.height, area.height, "flush to the bottom");
+
+        // A non-zero origin (the transcript never starts at 0,0 once a footer exists) is respected.
+        let offset_area = Rect::new(4, 3, 40, 20);
+        let off = context_menu_layout(offset_area, ContextMenu { col: 4, row: 3 }).unwrap();
+        assert!(off.x >= 4 && off.y >= 3, "clamped to the area origin: {off:?}");
+
+        // A viewport too small to hold the box draws nothing rather than a clipped, unclickable one.
+        assert!(context_menu_layout(Rect::new(0, 0, 3, 20), ContextMenu { col: 0, row: 0 }).is_none());
+        assert!(context_menu_layout(Rect::new(0, 0, 40, 2), ContextMenu { col: 0, row: 0 }).is_none());
+    }
+
+    /// Losing the highlight must take the menu with it. A "Copy" button whose selection is gone would
+    /// copy nothing, so every path that clears a selection (Esc, click-away, the jump button) has to
+    /// dismiss the menu — which is why `ClearSelection` does it rather than each caller remembering.
+    #[test]
+    fn clearing_the_selection_also_closes_the_copy_menu() {
+        let mut state = AppState::new("intro", "status");
+        let sel = SelectionRange {
+            anchor_line: 1,
+            anchor_col: 0,
+            cursor_line: 1,
+            cursor_col: 4,
+        };
+        apply_command(&mut state, Command::SetSelection(sel));
+        apply_command(
+            &mut state,
+            Command::OpenContextMenu(ContextMenu { col: 5, row: 5 }),
+        );
+        assert!(state.context_menu.is_some());
+
+        apply_command(&mut state, Command::ClearSelection);
+        assert!(state.selection.is_none());
+        assert!(
+            state.context_menu.is_none(),
+            "a menu offering to copy nothing must not survive the highlight"
+        );
+
+        // Closing the menu on its own leaves the highlight alone — copying should not deselect.
+        apply_command(&mut state, Command::SetSelection(sel));
+        apply_command(
+            &mut state,
+            Command::OpenContextMenu(ContextMenu { col: 5, row: 5 }),
+        );
+        apply_command(&mut state, Command::CloseContextMenu);
+        assert!(state.context_menu.is_none());
+        assert_eq!(
+            state.selection,
+            Some(sel),
+            "dismissing the menu keeps the selection"
+        );
     }
 
     #[test]

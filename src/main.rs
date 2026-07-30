@@ -4848,6 +4848,35 @@ impl Drop for TurnCancelGuard {
     }
 }
 
+/// Closes the steering mailbox on every exit path, re-queueing anything the turn never picked up.
+///
+/// Pairs with [`TurnCancelGuard`], and for the same reason: the mailbox is now armed BEFORE the turn's
+/// prep (so a steer typed during retrieval reaches the run instead of the queue), and prep has several
+/// early `continue`s — an unconfigured endpoint, a `#remember`/`!shell` input, an Esc during prep. A
+/// mailbox left armed past one of those would accept steers into a slot nothing drains: the input
+/// thread would see `is_armed()` and hand over a message that then sat there until some later turn
+/// armed it again and `arm()`'s clear discarded it. Silently eating user input is worse than queueing
+/// it, which is what makes this guard the thing that licenses arming early at all.
+///
+/// Leftovers come back as ordinary submissions so a steer typed in the last instants of a turn runs as
+/// the next one rather than vanishing. Idempotent: the normal end-of-turn path disarms explicitly, so
+/// this fires on an already-empty, already-closed mailbox and does nothing.
+struct SteerMailboxGuard(tokio::sync::mpsc::UnboundedSender<tui::Submission>);
+
+impl Drop for SteerMailboxGuard {
+    fn drop(&mut self) {
+        for leftover in crate::core::steer::disarm() {
+            if self
+                .0
+                .send(tui::Submission::Chat(leftover, Vec::new()))
+                .is_ok()
+            {
+                tui::note_submission_enqueued();
+            }
+        }
+    }
+}
+
 /// Run a slash command's network call as INTERRUPTIBLE work. `None` means the user pressed Esc.
 ///
 /// Slash handlers that call the model (`/compact`, `/handoff`) used to `await` straight inside the
@@ -4989,6 +5018,10 @@ async fn run_menu_sticky() -> Result<()> {
     spawn_health_poller();
     spawn_reconcile_pass();
     let mut input = tui::spawn_input();
+    // Off-to-the-side Q&A: a long-lived worker answers `?`-prefixed questions on its OWN thread,
+    // reading a read-only snapshot of the live conversation, WITHOUT touching the turn in flight
+    // (no history mutation, no cancel, no WORKING). See `core::aside`.
+    spawn_aside_worker(http.clone());
 
     loop {
         let sub = match input.submissions.recv().await {
@@ -5060,6 +5093,20 @@ async fn run_menu_sticky() -> Result<()> {
                 let turn_cancel = crate::core::cancel::TurnCancel::new();
                 tui::arm_cancel(turn_cancel.clone());
                 let _cancel_guard = TurnCancelGuard(turn_cancel.clone());
+                // OPEN THE STEERING MAILBOX IN THE SAME BREATH, for the same window and the same
+                // reason. This used to sit ~150 lines below, just before `set_working(true)`, which
+                // made the two flags disagree for the whole prep span above: `turn_in_flight()` reads
+                // the ARMED TOKEN and was already true, while `steer::is_armed()` was still false. The
+                // input thread's `>` prefix (and Alt+Enter) asks the mailbox, so every steer typed
+                // during prep was refused and fell through to the post-turn queue — the user sees the
+                // turn starting, types `> also do X`, and watches it queue instead. Retrieval is the
+                // slow part of prep, so the window was widest exactly on the big tasks worth steering.
+                //
+                // The guard is what makes arming this early safe: three `continue`s below abort prep,
+                // and a mailbox left armed with no turn behind it would swallow steers into a slot
+                // nothing drains.
+                crate::core::steer::arm();
+                let _steer_guard = SteerMailboxGuard(input.inject.clone());
                 // Input-box affordances on a typed message (skipped for a vision message): `#remember`
                 // / `!shell-escape` run no turn; a normal message has its `@file`·`` !`cmd` `` expanded.
                 let echo_src = line.clone();
@@ -5203,9 +5250,7 @@ async fn run_menu_sticky() -> Result<()> {
                     cli_config::clear_effort_override();
                     continue;
                 }
-                // Open the steering mailbox for this turn: Alt+Enter now hands a message to the RUNNING
-                // loop (folded in at its next step) instead of the post-turn queue.
-                crate::core::steer::arm();
+                // (The steering mailbox was armed with the cancel token, before prep — see there.)
                 while input.cancel.try_recv().is_ok() {} // drain any stale wake-up
                                                          // A quiet "here we go" line: the whimsical working verb ("✦ Pondering…") prints ONCE
                                                          // into the scrolling transcript at turn start, so each run opens on a fresh word —
@@ -5331,10 +5376,14 @@ async fn run_menu_sticky() -> Result<()> {
                 };
                 tui::set_working(false);
                 tui::disarm_cancel(&turn_cancel);
-                // Close the steering mailbox. Anything typed in the last instants of the turn (after
-                // the loop's final drain) comes back here rather than vanishing — re-inject it as an
-                // ordinary submission so it runs as the next turn. On Esc the `None` arm below flushes
-                // the queue, which is the right call there: stop means stop.
+                // Close the steering mailbox HERE, on the normal path, so leftovers are re-injected
+                // before `seal_turn` and in order. Anything typed in the last instants of the turn
+                // (after the loop's final drain) comes back rather than vanishing. On Esc the `None`
+                // arm below flushes the queue, which is the right call there: stop means stop.
+                //
+                // `_steer_guard` is the BACKSTOP, not a duplicate: it covers the prep-window
+                // `continue`s and a panic, which never reach this line. `disarm` is idempotent
+                // (second call yields nothing), so whichever runs first wins and the other is a no-op.
                 for leftover in crate::core::steer::disarm() {
                     let _ = input
                         .inject
@@ -7074,6 +7123,13 @@ fn surface_abnormal_stop(outcome: &AgentOutcome) {
         // wiring slip rather than a real state — still say something instead of swallowing it.
         StopReason::Cancelled => format!("⚠ stopped: cancelled after {} step(s).", outcome.iters),
         StopReason::AwaitingInput(q) => format!("❓ {q}"),
+        // Only reachable if a wall-clock budget was set on this run (no top-level default), so name
+        // the knob — otherwise the user cannot tell a deadline from a step limit or a crash.
+        StopReason::Deadline => format!(
+            "⚠ stopped: wall-clock budget reached after {} step(s) — the task may be incomplete. \
+             Say \"continue\" to carry on, or raise AIZEN_SUBAGENT_WALL_SECS.",
+            outcome.iters
+        ),
     };
     let painted = theme::err(line).to_string();
     if tui::active() {
@@ -7623,10 +7679,21 @@ async fn slash_tools(_arg: &str) {
     tui::emit_line(&agent::toolsets::format_config_status());
 }
 
-async fn slash_workflows(_arg: &str) {
-    let status = agent::orchestration::format_status();
-    if !tui::retained_overlay_open("Activity", &status) {
-        tui::emit_line(&status);
+/// `/workflows` — live multi-agent activity. In retained mode the panel REFRESHES itself (elapsed
+/// times tick while you watch); on a pipe/CI it degrades to a single printed snapshot.
+///
+/// `/workflows stop <id>` cancels one running row without touching the rest of the turn: Esc is
+/// all-or-nothing (it cancels the whole turn), so a fan-out with one child stuck behind a slow model
+/// call previously left the user no choice but to kill everything.
+async fn slash_workflows(arg: &str) {
+    // Shared with the input thread's mid-turn fast path, so an idle stop and a mid-turn stop cannot
+    // report the same action differently.
+    if let Some(note) = agent::orchestration::try_stop_command(arg) {
+        tui::emit_line(&theme::muted(note).to_string());
+        return;
+    }
+    if !tui::retained_overlay_open_live("Activity", agent::orchestration::format_status) {
+        tui::emit_line(&agent::orchestration::format_status());
     }
 }
 
@@ -10252,11 +10319,24 @@ fn resolve_base_key(base_url: Option<String>, api_key: Option<String>) -> Result
     Ok((base_url, api_key))
 }
 
+/// Absolute floor under EVERY request this client makes, streaming included.
+///
+/// `read_timeout` is not a backstop on its own: it only fires when the socket goes BYTE-silent, so a
+/// gateway that keeps a connection warm (keepalive frames, a slow trickle of SSE comments) can hold a
+/// request open forever without ever tripping it. Callers layer their own tighter, purpose-shaped
+/// deadlines on top (the SSE inter-event watchdog, the sub-agent per-call deadline); this exists so a
+/// path nobody has enumerated yet still cannot hang for the lifetime of the process.
+///
+/// Deliberately far larger than any legitimate single turn — it must never fight a long streamed
+/// answer, only cap the pathological case.
+const HTTP_REQUEST_CEILING: std::time::Duration = std::time::Duration::from_secs(1800);
+
 fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("aizen/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(15))
         .read_timeout(std::time::Duration::from_secs(300))
+        .timeout(HTTP_REQUEST_CEILING)
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()
         .context("building HTTP client")
@@ -10400,6 +10480,78 @@ fn spawn_health_poller() {
                 Err(_) => tui::HealthKind::Down,
             };
             tui::set_health(kind);
+        }
+    });
+}
+
+/// Spawn the long-lived off-to-the-side Q&A worker. It owns an unbounded channel (armed into
+/// `core::aside`) and answers `?`-prefixed questions one at a time, WITHOUT touching the turn in
+/// flight: it clones the read-only live-conversation snapshot, makes ONE tool-less model call, and
+/// prints the answer through `tui::emit_line` (which the retained renderer serializes with the main
+/// stream on its single render thread, so a mid-turn aside can never corrupt the frame). It never
+/// mutates `history`, never arms cancel, never flips `WORKING` — the running turn is oblivious.
+///
+/// Errors are shown inline and swallowed: a failed side question must never take down the worker
+/// (which would silently disable the feature for the rest of the session) nor the REPL.
+fn spawn_aside_worker(http: reqwest::Client) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    crate::core::aside::arm(tx);
+    tokio::spawn(async move {
+        while let Some(question) = rx.recv().await {
+            // Resolve the endpoint fresh per question: the user may have switched models with
+            // `/model` since the worker was spawned, and an aside should follow that choice.
+            let (base_url, api_key, model) = match resolve_endpoint(None, None, None) {
+                Ok(t) => t,
+                Err(_) => {
+                    tui::emit_line(
+                        &style("  ⁇ side question skipped — no model configured (/config).")
+                            .dim()
+                            .to_string(),
+                    );
+                    continue;
+                }
+            };
+            // Read-only snapshot of the live conversation (kept current DURING the turn via
+            // `on_progress`); cloned so we never hold the lock across the await.
+            let snapshot = live_history_slot()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let msgs = crate::core::aside::build_messages(&snapshot, &question);
+            // Echo the question so the answer has a visible anchor in the transcript (dim, with a
+            // `⁇` glyph, so it reads as an out-of-band aside distinct from a `❯` user turn).
+            tui::emit_line(
+                &style(format!("  ⁇ {question}"))
+                    .color256(theme::MUTED)
+                    .to_string(),
+            );
+            // ONE tool-less, non-streaming call. Empty tool slice ⇒ no tools offered.
+            match client::chat_with_tools(&http, &base_url, &api_key, &model, &msgs, &[]).await {
+                Ok(turn) => {
+                    let answer = turn.content.unwrap_or_default();
+                    if answer.trim().is_empty() {
+                        tui::emit_line(
+                            &style("  ⁇ (no answer)").dim().to_string(),
+                        );
+                    } else {
+                        let shown = crate::ui::markdown::render_plain_blocks(answer.trim());
+                        // Prefix every line dimly so the whole aside block reads as a margin note
+                        // beside the main work, not as the model's task output.
+                        for line in shown.lines() {
+                            tui::emit_line(
+                                &style(format!("  {line}")).color256(theme::MUTED).to_string(),
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tui::emit_line(
+                        &style(format!("  ⁇ side question failed: {e}"))
+                            .color256(theme::WARN)
+                            .to_string(),
+                    );
+                }
+            }
         }
     });
 }
@@ -12513,6 +12665,14 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
             "\n[stopped: cancelled by user after {} step(s)]",
             outcome.iters
         ),
+        // A top-level run sets no wall-clock budget (the user is watching and owns Esc), so this is
+        // effectively unreachable here — but the match must be total, and if a caller ever does set
+        // one, saying "time" rather than "steps" is the difference between a useful message and a
+        // misleading one.
+        StopReason::Deadline => eprintln!(
+            "\n[stopped: wall-clock budget reached after {} step(s) — the task may be incomplete]",
+            outcome.iters
+        ),
     }
     Ok(())
 }
@@ -13725,6 +13885,51 @@ mod tests {
     /// matter: no hint on an already-versioned URL (suggesting `/v1/v1` sends the user in circles),
     /// and a hint whenever the last segment is not `v<digits>` — `/api` and `/openai` are paths, not
     /// versions, which is exactly the case that leaves people stuck on a 404 with nothing to try.
+    /// The steering mailbox must never stay armed past a turn that never ran.
+    ///
+    /// `steer::arm()` now fires with the cancel token, BEFORE prep, so a `> also do X` typed during
+    /// retrieval reaches the running turn instead of the post-turn queue. That earlier arming is only
+    /// safe because `SteerMailboxGuard` closes the mailbox on the paths that abort prep (an
+    /// unconfigured endpoint, a `#remember`/`!shell` input, an Esc during prep) and so never reach the
+    /// explicit disarm at the end of a turn. Left armed, the input thread would keep accepting steers
+    /// into a slot nothing drains, and the next turn's `arm()` would clear them — user input silently
+    /// eaten, which is strictly worse than the queueing this whole change was fixing.
+    #[test]
+    fn the_steer_guard_closes_the_mailbox_and_requeues_what_the_turn_never_took() {
+        let _lock = crate::core::steer::test_lock();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<tui::Submission>();
+
+        crate::core::steer::arm();
+        assert!(crate::core::steer::push("also update the README"));
+        {
+            let _guard = SteerMailboxGuard(tx.clone());
+        } // prep aborts here: the guard is the only thing that gets to run
+
+        assert!(
+            !crate::core::steer::is_armed(),
+            "a mailbox left armed would accept steers nothing will ever drain"
+        );
+        let got = rx
+            .try_recv()
+            .expect("the un-consumed steer must come back as a submission, not vanish");
+        assert_eq!(
+            got,
+            tui::Submission::Chat("also update the README".into(), Vec::new()),
+            "it re-enters as an ordinary message so it runs as the next turn"
+        );
+
+        // Idempotent: the normal end-of-turn path disarms explicitly, so on that path the guard fires
+        // afterwards on an already-closed mailbox. That has to be a no-op, not a second delivery of a
+        // message the user sent once.
+        {
+            let _guard = SteerMailboxGuard(tx.clone());
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a second disarm must not re-deliver the same steer"
+        );
+    }
+
     #[test]
     fn version_suffix_hint_only_when_actually_missing() {
         for already in [

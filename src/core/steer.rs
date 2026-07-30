@@ -132,17 +132,26 @@ pub fn format_injection(steers: &[String]) -> String {
 /// Marker prefix for a steering injection.
 pub const PREFIX: &str = "[user-steering]";
 
+/// Serialize every test that touches the process-global mailbox.
+///
+/// Crate-visible rather than private to the test module below, because the REPL-side guard that
+/// CLOSES the mailbox lives in `main.rs` (it needs the submission sender to re-queue leftovers) and
+/// its test drives the same globals. Two locks would not serialize them against each other.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex as StdMutex, OnceLock};
 
     /// The mailbox is process-global, so these tests must not interleave.
     fn guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        test_lock()
     }
 
     fn reset() {

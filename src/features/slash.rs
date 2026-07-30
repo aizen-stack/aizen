@@ -127,8 +127,8 @@ const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "workflows",
-        description: "show live multi-agent activity",
-        argument_hint: "",
+        description: "show live multi-agent activity (self-refreshing); stop one run",
+        argument_hint: "[stop <#id|name>]",
     },
     Builtin {
         name: "team",

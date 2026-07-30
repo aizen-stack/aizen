@@ -4,9 +4,11 @@
 //! to be narrated serially through `task`. This tool exposes the same bounded fan-out with two
 //! modes, keeping control flow in CODE and content in the model (the workflows-over-agents rule):
 //!
-//! - `fanout`: run ≤5 tasks concurrently, then one synthesis pass (mixture-of-agents). At most ONE
-//!   `coder` task per call — parallel writers in one repo race edits and build locks; the fan-out
-//!   is for READS (investigate/review/test in parallel), the write stays singular.
+//! - `fanout`: run tasks concurrently (you decide how many), then one synthesis pass
+//!   (mixture-of-agents). At most ONE `coder` task per call — parallel writers in one repo race
+//!   edits and build locks; the fan-out is for READS (investigate/review/test in parallel), the
+//!   write stays singular. The gate limits how many run AT ONCE (machine-derived, see
+//!   `task_tool::max_parallel_subagents_pub`); extra tasks queue and run in the next chunk.
 //! - `verify`: the adversarial-refuter preset — each finding gets a read-only reviewer explicitly
 //!   prompted to REFUTE it (industrially measured at ~0.93 accuracy filtering false positives).
 //!   No synthesis: the per-finding verdicts return raw.
@@ -77,8 +79,8 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                 .and_then(|v| v.as_array())
                 .filter(|a| !a.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("fanout mode requires a non-empty 'tasks' array"))?;
-            if tasks_in.len() > 5 {
-                bail!("workflow caps at 5 tasks per call (got {})", tasks_in.len());
+            if tasks_in.len() > 32 {
+                bail!("workflow caps at 32 tasks per call (got {})", tasks_in.len());
             }
             let mut tasks = Vec::new();
             for (i, t) in tasks_in.iter().enumerate() {
@@ -130,9 +132,9 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                 .ok_or_else(|| {
                     anyhow::anyhow!("verify mode requires a non-empty 'findings' array")
                 })?;
-            if findings.len() > 5 {
+            if findings.len() > 32 {
                 bail!(
-                    "verify caps at 5 findings per call (got {})",
+                    "verify caps at 32 findings per call (got {})",
                     findings.len()
                 );
             }
@@ -170,18 +172,19 @@ impl Tool for WorkflowTool {
         "workflow"
     }
     fn description(&self) -> &str {
-        "Run several sub-agents CONCURRENTLY (deterministic fan-out; ≤5). mode=fanout: independent \
-         tasks in parallel + one synthesized answer — for multi-angle investigation/review (at most \
-         ONE coder task; writes stay singular). mode=verify: adversarially re-check findings — each \
-         finding gets a read-only refuter, verdicts return per finding. For a single sub-task use \
-         `task` instead."
+        "Run several sub-agents CONCURRENTLY (deterministic fan-out). Request as many tasks as the \
+         work needs — the harness limits how many run AT ONCE based on the machine. mode=fanout: \
+         independent tasks in parallel + one synthesized answer — for multi-angle \
+         investigation/review (at most ONE coder task; writes stay singular). mode=verify: \
+         adversarially re-check findings — each finding gets a read-only refuter, verdicts return \
+         per finding. For a single sub-task use `task` instead."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "mode": {"type": "string", "enum": ["fanout", "verify"], "description": "fanout: run tasks in parallel and synthesize · verify: refute findings adversarially"},
-                "tasks": {"type": "array", "maxItems": 5, "description": "fanout mode: the tasks to run concurrently", "items": {"type": "object", "properties": {
+                "tasks": {"type": "array", "maxItems": 32, "description": "fanout mode: the tasks to run concurrently (request what the work needs; the harness bounds concurrent width by machine)", "items": {"type": "object", "properties": {
                     "id": {"type": "string"},
                     "prompt": {"type": "string", "description": "complete, self-contained task"},
                     "role": {"type": "string", "enum": ["coder", "planner", "reviewer", "tester"]},
@@ -189,7 +192,7 @@ impl Tool for WorkflowTool {
                     "model": {"type": "string"}
                 }, "required": ["prompt"], "additionalProperties": false}},
                 "synthesis": {"type": "string", "description": "fanout mode: optional merge instruction"},
-                "findings": {"type": "array", "maxItems": 5, "items": {"type": "string"}, "description": "verify mode: claims to refute, each self-contained with file:line evidence"}
+                "findings": {"type": "array", "maxItems": 32, "items": {"type": "string"}, "description": "verify mode: claims to refute, each self-contained with file:line evidence"}
             },
             "required": ["mode"],
             "additionalProperties": false
@@ -310,12 +313,22 @@ mod tests {
             build_spec(&serde_json::json!({"mode": "dag"})).is_err(),
             "unknown mode"
         );
+        // The per-call cap is now 32 (the model requests what the work needs; concurrent WIDTH is
+        // bounded separately by the machine-derived gate). A batch under the cap is accepted…
         let six: Vec<_> = (0..6)
             .map(|i| serde_json::json!({"prompt": format!("t{i}"), "role": "reviewer"}))
             .collect();
         assert!(
-            build_spec(&serde_json::json!({"mode": "fanout", "tasks": six})).is_err(),
-            "cap 5"
+            build_spec(&serde_json::json!({"mode": "fanout", "tasks": six})).is_ok(),
+            "6 read-only tasks are under the 32 cap → accepted"
+        );
+        // …and only an absurd batch past the disaster-stop cap is rejected.
+        let too_many: Vec<_> = (0..33)
+            .map(|i| serde_json::json!({"prompt": format!("t{i}"), "role": "reviewer"}))
+            .collect();
+        assert!(
+            build_spec(&serde_json::json!({"mode": "fanout", "tasks": too_many})).is_err(),
+            "cap 32"
         );
     }
 
