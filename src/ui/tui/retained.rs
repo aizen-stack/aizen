@@ -277,6 +277,21 @@ struct AppState {
     /// is ~tens of ms, so we reuse it across idle repaints and only re-encode when the card or the
     /// terminal's pixel geometry changes (e.g. a window resize while the screensaver is up).
     screensaver_cache: Option<(usize, u32, u32, String)>,
+    /// Ultimate mode ON → the input box (prompt arrow + framing rules) recolours to the reserved gold,
+    /// tying it to the `✦ ultimate` chip. Pushed via `Command::Ultimate` (never read from disk in the
+    /// draw path — `cli_config::load()` hits the filesystem and this runs at ~9fps).
+    ultimate: bool,
+    /// The whimsical fallback verb ("Pondering") shown in the working caption BETWEEN tool steps — the
+    /// "idle" half of the hybrid caption. Refreshed from `tui::next_work_verb()` when a turn starts and
+    /// each time the last running tool completes, so successive quiet stretches surface fresh words.
+    work_verb: String,
+    /// The caption currently being typed out beside the working spinner. Either a running tool's action
+    /// ("Reading retained.rs") or `work_verb` when nothing is running. Reset (`work_reveal = 0`) whenever
+    /// this target changes so the typewriter re-runs on the new text.
+    work_caption: String,
+    /// How many chars of `work_caption` are revealed so far — advanced one per animation tick for the
+    /// typewriter effect, clamped to the caption length.
+    work_reveal: usize,
 }
 
 /// Absolute character selection over the flat list of wrapped transcript rows.
@@ -311,6 +326,9 @@ struct TranscriptGeom {
     /// Plain (SGR-stripped) wrapped rows of the full transcript at last draw — used to extract the
     /// selected text on mouse-up without re-rendering on the input thread.
     plain_rows: Vec<String>,
+    /// Raw rendered rows WITH SGR colour codes — used by the hyperlink injector to re-print link
+    /// spans baked inside OSC 8 sequences after `terminal.draw()`. Parallel to `plain_rows`.
+    sgr_rows: Vec<String>,
     /// Screen rect of the floating "jump to bottom" button, present only while the transcript is
     /// scrolled up off the tail. `None` when at the tail (button hidden). The input thread hit-tests
     /// a left-click against this before anything else so the button lands the viewport back on tail.
@@ -466,6 +484,20 @@ impl AppState {
             cache: RenderCache::default(),
             screensaver: None,
             screensaver_cache: None,
+            ultimate: false,
+            work_verb: String::new(),
+            work_caption: String::new(),
+            work_reveal: 0,
+        }
+    }
+
+    /// Point the working caption at `text` (a tool action or the whimsical verb). Resets the reveal
+    /// counter only when the text actually changes, so the typewriter replays on a new caption but a
+    /// re-assert of the same one doesn't stutter back to the first character.
+    fn set_work_caption(&mut self, text: String) {
+        if self.work_caption != text {
+            self.work_caption = text;
+            self.work_reveal = 0;
         }
     }
 
@@ -585,6 +617,14 @@ enum Command {
     Input(InputSnapshot),
     Working(bool),
     Status(String),
+    /// Set the working caption target (a running tool's action, or a whimsical verb between steps).
+    /// The typewriter reveal restarts whenever the text changes; a re-assert of the same text is a
+    /// no-op so it doesn't stutter back to the first character. Passing an empty string clears it back
+    /// to the whimsical `work_verb`.
+    WorkCaption(String),
+    /// Ultimate mode toggled — recolour the input box (gold ON, moonlight OFF). Pushed from the
+    /// `/ultimate` handler and once at activation, never read from disk in the draw path.
+    Ultimate(bool),
     Context(u16),
     /// Idle `● ready` chip colour/label — green/yellow/red based on the last `/models` probe.
     Health(HealthKind),
@@ -844,6 +884,19 @@ pub(super) fn set_status(status: &str) {
     send(Command::Status(status.to_string()));
 }
 
+/// Recolour the input box to gold (ultimate ON) or back to moonlight. Pushed once when the mode
+/// toggles — never polled in the draw path (`cli_config::load()` reads the filesystem and the footer
+/// repaints at ~9fps).
+pub(super) fn set_ultimate(on: bool) {
+    send(Command::Ultimate(on));
+}
+
+/// Set the working caption target — a running tool's action ("Reading retained.rs") or the whimsical
+/// verb between steps. The typewriter reveal replays only when the text actually changes.
+pub(super) fn set_work_caption(text: &str) {
+    send(Command::WorkCaption(text.to_string()));
+}
+
 pub(super) fn set_context(permille: u16) {
     send(Command::Context(permille.min(1000)));
 }
@@ -1098,6 +1151,12 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if state.working && state.focused {
                     state.frame = state.frame.wrapping_add(1);
+                    // Advance the typewriter on idle ticks too, so the caption keeps typing during a
+                    // quiet stretch (a long tool call) when no command arrives to drive it.
+                    let len = state.work_caption.chars().count();
+                    if state.work_reveal < len {
+                        state.work_reveal += 1;
+                    }
                     dirty = true;
                 }
                 // Idle resize: the render below only runs when `dirty`, so a terminal resized while
@@ -1193,6 +1252,23 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     }
                     let started = Instant::now();
                     let _ = s.terminal.draw(|frame| draw(frame, &mut state));
+                    // Inject OSC 8 hyperlinks AFTER terminal.draw() — post-draw so ratatui's cell
+                    // diff never sees the escape sequences and can't overwrite them next frame.
+                    // Pattern is identical to the screensaver sixel blitter (`blit_screensaver`).
+                    {
+                        let g = transcript_geom_slot()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let out = s.terminal.backend_mut();
+                        crate::ui::links::inject_hyperlinks(
+                            out,
+                            &g.sgr_rows,
+                            &g.plain_rows,
+                            g.start,
+                            g.visible,
+                            g.area,
+                        );
+                    }
                     let rows = state
                         .blocks
                         .iter()
@@ -1251,14 +1327,39 @@ fn apply_command(state: &mut AppState, cmd: Command) {
         Command::Working(working) => {
             state.working = working;
             state.working_since = working.then(Instant::now);
-            if !working {
+            if working {
+                // A fresh turn opens on a new whimsical verb, and the caption starts on it (typed from
+                // scratch) until the first tool call renames it to a concrete action.
+                state.work_verb = crate::ui::tui::next_work_verb().to_string();
+                state.set_work_caption(state.work_verb.clone());
+            } else {
                 state.frame = 0;
+                state.work_caption.clear();
+                state.work_reveal = 0;
             }
         }
         Command::Status(status) => state.input.status = status,
+        Command::WorkCaption(text) => {
+            // Empty ⇒ fall back to the whimsical verb (a tool finished, nothing else running yet).
+            let target = if text.is_empty() {
+                state.work_verb.clone()
+            } else {
+                text
+            };
+            state.set_work_caption(target);
+        }
+        Command::Ultimate(on) => state.ultimate = on,
         Command::Context(v) => state.ctx_permille = v,
         Command::Health(h) => state.health = h,
-        Command::Tick => state.frame = state.frame.wrapping_add(1),
+        Command::Tick => {
+            state.frame = state.frame.wrapping_add(1);
+            // Type one more character of the working caption per tick (the typewriter). Clamped to the
+            // caption length so a fully-revealed caption just holds with its blinking caret.
+            let len = state.work_caption.chars().count();
+            if state.work_reveal < len {
+                state.work_reveal += 1;
+            }
+        }
         Command::OpenOverlay(overlay) => {
             state.input.overlay = Some(overlay);
             state.overlay_scroll = 0; // a fresh overlay starts at the top
@@ -1403,16 +1504,30 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let content_width = area.width.saturating_sub(2).max(8);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut plain_rows: Vec<String> = Vec::new();
+    let mut sgr_rows: Vec<String> = Vec::new();
     for block in &state.blocks {
         let rows = state.cache.get_or_render(block, content_width);
         for row in rows {
             plain_rows.push(console::strip_ansi_codes(&row).into_owned());
+            sgr_rows.push(row.clone());
             lines.push(styled_row(block.kind, row));
         }
     }
     // Apply selection reverse highlight before scrolling into the viewport.
     if let Some(sel) = state.selection {
         apply_selection_highlight(&mut lines, sel);
+    }
+    // The working indicator rides the BOTTOM of the transcript (Claude-CLI style) rather than a HUD
+    // pill: a brand-pulse spinner (the ✦ mark breathing to ✧) + a typewriter caption that reads the
+    // agent's current action ("Reading retained.rs") or a whimsical verb between steps. Blue caption
+    // (the aizen link-blue) so it reads as "live status", not transcript prose. Appended after the
+    // selection highlight so a drag can't accidentally reverse-video the spinner; it counts toward
+    // `total` so the tail-follow keeps it pinned to the last row as output streams.
+    if state.working {
+        for (plain, styled) in working_line(state) {
+            plain_rows.push(plain);
+            lines.push(styled);
+        }
     }
     let total = lines.len();
     let visible = area.height as usize;
@@ -1477,6 +1592,7 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
             total,
             area,
             plain_rows,
+            sgr_rows,
             jump_button,
         };
     }
@@ -1567,6 +1683,60 @@ fn styled_row(kind: BlockKind, row: String) -> Line<'static> {
     }
 }
 
+/// The brand-pulse spinner glyphs: the ✦ mark "breathing" to its hollow twin ✧ and back. Both are
+/// safe across fonts (unlike braille), and the two-frame pulse ties the working indicator to the
+/// `✦ ultimate` / synthesizing brand mark rather than a generic spinner.
+const PULSE: [&str; 2] = ["✦", "✧"];
+
+/// Build the working line(s) shown at the bottom of the transcript while a turn is in flight: a
+/// brand-pulse spinner + a typewriter-revealed caption in the aizen link-blue, then a blinking caret.
+///
+/// Returns `(plain, styled)` pairs so the caller can push both the mouse-mapping plain row and the
+/// coloured `Line`. One visual row today, but a Vec keeps the door open for a wrapped caption.
+///
+/// The caption reveal (`work_reveal`) is advanced by the ticker/timeout, so this fn is pure over the
+/// current state — it just slices `work_caption` to the revealed prefix and appends the caret.
+fn working_line(state: &AppState) -> Vec<(String, Line<'static>)> {
+    use crate::ui::theme;
+    let glyph = PULSE[state.frame % PULSE.len()];
+    // Reveal the first `work_reveal` chars of the caption (char-, not byte-, indexed so multibyte
+    // captions never split mid-codepoint). A caret rides the end: solid while still typing, and
+    // blinking (on the ✦ half of the pulse) once fully revealed — a quiet "still alive" heartbeat.
+    let revealed: String = state
+        .work_caption
+        .chars()
+        .take(state.work_reveal)
+        .collect();
+    let done = state.work_reveal >= state.work_caption.chars().count();
+    // Caret chỉ hiện trong khi đang gõ — khi đã gõ xong thì spinner ✦⇄✧ đã đủ "nhịp sống",
+    // caret nhấp nháy thêm vào trông rối mắt.
+    let caret = if !done { "▏" } else { "" };
+    let elapsed = state
+        .working_since
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+    // `spinner · caption▏         12s · Esc to stop` — spinner in moonlight (the structural brand
+    // colour), caption in link-blue (live status, distinct from grey transcript prose), the elapsed
+    // clock + stop hint faint at the tail so they inform without pulling the eye.
+    let spans = vec![
+        Span::styled(
+            format!("{glyph} "),
+            Style::default().fg(Color::Indexed(theme::ACCENT)),
+        ),
+        Span::styled(revealed, Style::default().fg(Color::Indexed(theme::LINK))),
+        Span::styled(
+            caret.to_string(),
+            Style::default().fg(Color::Indexed(theme::LINK)),
+        ),
+        Span::styled(
+            format!("   {elapsed}s · Esc to stop"),
+            Style::default().fg(Color::Indexed(theme::FAINT)),
+        ),
+    ];
+    let plain: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    vec![(plain, Line::from(spans))]
+}
+
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     if area.height < FOOTER_ROWS || area.width == 0 {
         return;
@@ -1581,27 +1751,25 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         ])
         .split(area);
     let width = area.width as usize;
-    let elapsed = state
-        .working_since
-        .map(|t| t.elapsed().as_secs())
-        .unwrap_or(0);
-    // Right of the HUD row: working pill while the agent runs, else coloured health chip + a
-    // compact context meter `⟦▓▓░░…⟧ N%`. Green = OK, yellow =
-    // slow/transient, red = permanent unavailability, muted = still checking.
+    // Input-box accent: gold while ultimate mode is ON (tying the box to the `✦ ultimate` chip so the
+    // heightened mode is unmistakable at a glance), the usual moonlight silver otherwise. Drives the
+    // `❯` prompt arrow and both framing rules. `state.ultimate` is pushed via `Command::Ultimate`
+    // (never a per-frame disk read).
+    let box_accent = if state.ultimate {
+        crate::ui::theme::WARN
+    } else {
+        crate::ui::theme::ACCENT_DIM
+    };
+    // Right of the HUD row: a coloured health chip + a compact context meter `⟦▓▓░░…⟧ N%`.
+    // (Elapsed time / spinner moved to the transcript's working line — see `working_line`.)
+    // Green = OK, yellow = slow/transient, red = permanent unavailability, muted = still checking.
+    // The "working" state is NO LONGER shown here — it rides the bottom of the transcript now (a
+    // Claude-CLI-style spinner + typewriter caption, see `working_line`), so the HUD stays a calm
+    // status strip whether or not a turn is in flight.
     //
     // Built as spans (not a single pre-coloured string) so the bar can take its own fill colour
     // independent of the health dot.
-    let right_spans: Vec<Span<'static>> = if state.working {
-        const STAR: [&str; 6] = ["✶", "✷", "✸", "✹", "✺", "✻"];
-        vec![Span::styled(
-            format!(
-                "{} working · {}s · Esc to stop",
-                STAR[state.frame % STAR.len()],
-                elapsed
-            ),
-            Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT)),
-        )]
-    } else {
+    let right_spans: Vec<Span<'static>> = {
         let pm = state.ctx_permille.min(1000);
         let pct = (pm as f64 / 10.0).round() as u16;
         // Compact bar (6 cells) so it fits beside model/status on typical widths; colour tracks fill.
@@ -1645,7 +1813,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(
         Paragraph::new(Line::styled(
             rule.clone(),
-            Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT_DIM)),
+            Style::default().fg(Color::Indexed(box_accent)),
         )),
         rows[1],
     );
@@ -1682,7 +1850,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let mut prompt_spans = vec![Span::styled(
         "❯ ",
         Style::default()
-            .fg(Color::Indexed(crate::ui::theme::ACCENT))
+            .fg(Color::Indexed(box_accent))
             .add_modifier(Modifier::BOLD),
     )];
     if !imgtag.is_empty() {
@@ -1703,7 +1871,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(
         Paragraph::new(Line::styled(
             rule,
-            Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT_DIM)),
+            Style::default().fg(Color::Indexed(box_accent)),
         )),
         rows[3],
     );
@@ -1736,21 +1904,16 @@ fn input_line(state: &AppState, budget: usize) -> (String, usize) {
         };
         return (console::truncate_str(&ph, budget, "…").into_owned(), 0);
     }
-    // Only collapse to a "N lines pasted" chip for a genuinely large paste — match the classic
-    // renderer's `>= 5 lines` threshold (tui.rs). A short multi-line draft (e.g. one char then
-    // Shift+Enter) stays inline: turning a two-line note into a misleading "2 lines pasted" chip
-    // is exactly the bug we're fixing.
+    // Khi draft có ≥5 dòng (paste lớn), vẫn hiện prefix compact `↵N ·` để báo hiệu,
+    // nhưng KHÔNG ẩn toàn bộ text — window quanh cursor vẫn hiện bình thường để người
+    // dùng thấy những gì vừa gõ thêm. Trước đây trả về chip cứng nên text bị ẩn.
     let nlines = state.input.draft.iter().filter(|&&c| c == '\n').count() + 1;
-    if nlines >= 5 {
-        let text: String = state.input.draft.iter().collect();
-        let n = text.lines().count().max(1);
-        let chip = format!("↵ {n} lines pasted");
-        let w = console::measure_text_width(&chip);
-        return (
-            console::truncate_str(&chip, budget, "…").into_owned(),
-            w.min(budget),
-        );
-    }
+    let paste_prefix = if nlines >= 5 {
+        format!("↵{nlines} · ")
+    } else {
+        String::new()
+    };
+    let prefix_w = console::measure_text_width(&paste_prefix);
     let cursor = state.input.cursor.min(state.input.draft.len());
     // The input box is a single physical row, so render an embedded newline as a visible `↵`
     // glyph (width 1) rather than a raw `\n` that ratatui can't lay out on one line.
@@ -1762,11 +1925,13 @@ fn input_line(state: &AppState, budget: usize) -> (String, usize) {
         }
     };
     let cellw = |c: char| console::measure_text_width(&disp(c).to_string()).max(1);
+    // Budget for the text window shrinks by the paste prefix (e.g. `↵12 · `) so both fit on one row.
+    let text_budget = budget.saturating_sub(prefix_w);
     let mut start = cursor;
     let mut caret = 0usize;
     while start > 0 {
         let cw = cellw(state.input.draft[start - 1]);
-        if caret + cw > budget.saturating_sub(1) {
+        if caret + cw > text_budget.saturating_sub(1) {
             break;
         }
         start -= 1;
@@ -1776,13 +1941,14 @@ fn input_line(state: &AppState, budget: usize) -> (String, usize) {
     let mut used = 0usize;
     for &c in &state.input.draft[start..] {
         let cw = cellw(c);
-        if used + cw > budget {
+        if used + cw > text_budget {
             break;
         }
         shown.push(disp(c));
         used += cw;
     }
-    (shown, caret)
+    // Prepend the paste-count prefix and offset the cursor position past it.
+    (format!("{paste_prefix}{shown}"), prefix_w + caret)
 }
 
 /// Draw the informational overlay, applying `scroll` (rows hidden above the top) clamped so the last
@@ -1907,14 +2073,25 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn render_assistant_rows(raw: &str, width: usize) -> Vec<String> {
-    // Keep SGR: the markdown renderer emits the moonlight gutter, code-box borders, and syntax
-    // highlight as colour codes — `sanitize_keep_sgr` preserves them (dropping only cursor moves)
-    // and `ansi_spans` turns them into styled spans at draw time.
-    sanitize_keep_sgr(&crate::ui::markdown::render_retained(raw, width.max(24)))
+    // ONE renderer for both surfaces. The live turn (streaming) and the replayed transcript
+    // (`agent::replay_transcript` → `MarkdownStream`) must produce byte-identical output, or the same
+    // message looks different when re-opened than when first shown. So feed the whole raw block through
+    // `MarkdownStream` here too — the block is cached by `content_hash`, so re-parsing the full body on
+    // each width/content change is the same trip `replay_transcript` makes, with none of the
+    // incremental-splice risk an in-place streaming parser would carry.
+    //
+    // Keep SGR: the renderer emits the moonlight gutter, code-box borders, and syntax highlight as
+    // colour codes — `sanitize_keep_sgr` preserves them (dropping only cursor moves) and `ansi_spans`
+    // turns them into styled spans at draw time.
+    let mut md = crate::ui::markdown::MarkdownStream::new(true, width.max(24));
+    let mut rendered = md.push(&format!("{raw}\n"));
+    rendered.push_str(&md.finish());
+    sanitize_keep_sgr(&rendered)
         .split('\n')
         .map(str::to_string)
         .collect()
 }
+
 
 /// Format a run time for the result line: `· 940ms` under a second, `· 1.2s` under a minute, then
 /// `· 7m03s` / `· 2h05m`. Sub-second times keep millisecond resolution; the minute/hour tiers exist
@@ -2320,13 +2497,18 @@ mod tests {
 
     #[test]
     fn large_multiline_draft_uses_paste_chip() {
+        // Fix: paste lớn vẫn hiện prefix compact `↵N ·` + text quanh cursor, KHÔNG ẩn toàn bộ
+        // draft bằng chip cứng. Người dùng vừa paste vừa gõ thêm phải thấy những gì họ gõ.
         let mut state = AppState::new("intro", "status");
         state.input.draft = "a\nb\nc\nd\ne".chars().collect();
         state.input.cursor = state.input.draft.len();
 
         let (shown, _) = input_line(&state, 40);
 
-        assert_eq!(shown, "↵ 5 lines pasted");
+        // Phải có prefix báo số dòng.
+        assert!(shown.starts_with("↵5 · "), "paste prefix missing: {shown:?}");
+        // Text thật (ký tự cuối draft là 'e') vẫn hiện sau prefix.
+        assert!(shown.contains('e'), "draft text must follow the prefix: {shown:?}");
     }
 
     #[test]
@@ -2382,6 +2564,118 @@ mod tests {
         let _ = cache.get_or_render(&block, 40);
         let _ = cache.get_or_render(&block, 20);
         assert_eq!(cache.misses, 3);
+    }
+
+    #[test]
+    fn assistant_rows_consume_inline_code_backticks() {
+        // Regression guard for the live/replay parity fix: the live retained path now renders the
+        // active assistant block through the SAME `MarkdownStream` the replay path uses, instead of
+        // the old pulldown-cmark `render_retained`. The old renderer left inline `` `code` `` as
+        // literal backticks (`line.push('`')`); `MarkdownStream`'s `inline()` consumes them and tints
+        // the span. Backtick-stripping is the one divergence observable WITHOUT a colour terminal —
+        // under `console`'s test default (no TTY ⇒ SGR suppressed) both renderers drop `**` markers,
+        // so bold is not distinguishable here, but the literal backtick is. If the two renderers ever
+        // split again, this breaks.
+        let code = render_assistant_rows("call `foo()` now", 40).join("\n");
+        assert!(
+            !code.contains('`'),
+            "inline code backticks must be consumed, not shown literally: {code:?}"
+        );
+        assert!(
+            code.contains("foo()"),
+            "the code text itself must survive: {code:?}"
+        );
+    }
+
+    #[test]
+    fn working_caption_types_out_then_holds() {
+        // The typewriter: `Working(true)` seeds a whimsical verb and starts the reveal at zero, each
+        // tick exposes one more char, and the reveal CLAMPS at the caption length (it must not run past
+        // the end and start slicing nothing, nor keep incrementing forever).
+        let mut state = AppState::new("intro", "status");
+        apply_command(&mut state, Command::Working(true));
+        assert!(!state.work_caption.is_empty(), "a turn seeds a verb");
+        assert_eq!(state.work_reveal, 0, "reveal starts from scratch");
+
+        let len = state.work_caption.chars().count();
+        for _ in 0..len {
+            apply_command(&mut state, Command::Tick);
+        }
+        assert_eq!(state.work_reveal, len, "one char per tick, fully revealed");
+        // Extra ticks must not overshoot.
+        for _ in 0..5 {
+            apply_command(&mut state, Command::Tick);
+        }
+        assert_eq!(state.work_reveal, len, "reveal clamps at the caption length");
+
+        // The rendered line shows the whole caption plus the elapsed clock + stop hint.
+        let (plain, _) = working_line(&state).remove(0);
+        assert!(
+            plain.contains(&state.work_caption),
+            "the revealed caption must appear: {plain:?}"
+        );
+        assert!(
+            plain.contains("Esc to stop"),
+            "the stop hint rides the working line now: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn tool_caption_replaces_verb_then_falls_back() {
+        // The hybrid caption: a tool call re-points it at a concrete action (restarting the reveal so
+        // the new text types out), and an empty `WorkCaption` — what `emit_tool_result` sends when the
+        // call ends — falls back to the whimsical verb rather than freezing on the finished action.
+        let mut state = AppState::new("intro", "status");
+        apply_command(&mut state, Command::Working(true));
+        let verb = state.work_verb.clone();
+        apply_command(&mut state, Command::Tick); // reveal 1 char of the verb
+
+        apply_command(&mut state, Command::WorkCaption("Reading retained.rs".into()));
+        assert_eq!(state.work_caption, "Reading retained.rs");
+        assert_eq!(state.work_reveal, 0, "a new caption retypes from scratch");
+
+        // Re-asserting the SAME caption must not stutter the reveal back to zero.
+        apply_command(&mut state, Command::Tick);
+        apply_command(&mut state, Command::WorkCaption("Reading retained.rs".into()));
+        assert_eq!(state.work_reveal, 1, "same text ⇒ reveal is preserved");
+
+        apply_command(&mut state, Command::WorkCaption(String::new()));
+        assert_eq!(state.work_caption, verb, "empty falls back to the verb");
+    }
+
+    #[test]
+    fn working_line_only_rides_the_transcript_while_working() {
+        // The working indicator moved OUT of the HUD and onto the transcript tail. It must appear only
+        // while a turn is in flight — and `Working(false)` must clear the caption so no stale "Reading
+        // …" row lingers under the finished answer.
+        let mut state = AppState::new("intro", "status");
+        apply_command(&mut state, Command::Working(true));
+        apply_command(&mut state, Command::WorkCaption("Run cargo test".into()));
+        assert!(state.working, "turn in flight");
+
+        apply_command(&mut state, Command::Working(false));
+        assert!(!state.working);
+        assert!(
+            state.work_caption.is_empty() && state.work_reveal == 0,
+            "finishing a turn clears the caption, leaving no stale row"
+        );
+    }
+
+    #[test]
+    fn ultimate_recolours_the_input_box_to_gold() {
+        // `/ultimate` recolours the input box framing to the reserved gold so the heightened mode is
+        // unmistakable, and toggling back returns it to moonlight. The state is PUSHED (never read from
+        // disk in the draw path, which runs at ~9fps).
+        let mut state = AppState::new("intro", "status");
+        assert!(!state.ultimate, "moonlight by default");
+
+        apply_command(&mut state, Command::Ultimate(true));
+        assert!(state.ultimate);
+        apply_command(&mut state, Command::Ultimate(false));
+        assert!(!state.ultimate, "toggling off returns to moonlight");
+        // Guard the palette choice itself: gold must stay distinct from the default silver, or the
+        // recolour would be invisible.
+        assert_ne!(crate::ui::theme::WARN, crate::ui::theme::ACCENT_DIM);
     }
 
     #[test]

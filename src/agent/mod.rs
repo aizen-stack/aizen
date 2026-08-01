@@ -2917,6 +2917,13 @@ fn workflow_target(args: &serde_json::Value) -> String {
 /// Open a tool-call line (mockup shape `⚙ <name>   <target>`), returning the `seq` so the result can
 /// update the same line in place under retained. Shared by the serial + eager-adoption paths.
 fn emit_tool_call(name: &str, args: &serde_json::Value) -> u64 {
+    // Point the working caption (the typewriter line at the transcript bottom) at this tool's human
+    // action ("Reading retained.rs", "Run cargo test") — the hybrid caption's "concrete" half. When a
+    // tool has no English mapping, leave the caption on whatever whimsical verb is showing rather than
+    // typing out a raw tool slug. `emit_tool_result` clears it back to the verb when the call ends.
+    if let Some(action) = tool_action(name, args) {
+        crate::ui::tui::set_work_caption(&action);
+    }
     crate::ui::tui::tool_call_begin(tool_icon(), name, &tool_target(name, args))
 }
 
@@ -2950,6 +2957,10 @@ fn emit_tool_result(
     if ok && !out.trim_start().starts_with("error:") && is_edit_tool(name) {
         emit_edit_diff(&tool_target(name, args), out);
     }
+    // The concrete action is done; drop the caption back to the whimsical verb (empty string ⇒
+    // `work_verb`) so a quiet stretch between tools reads "Pondering…" rather than freezing on the
+    // last tool's action. A new tool call re-points it the moment it starts.
+    crate::ui::tui::set_work_caption("");
 }
 
 fn is_edit_tool(name: &str) -> bool {

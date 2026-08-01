@@ -5,6 +5,36 @@ All notable changes to **Aizen** (`aizen`) — the pure-Rust agentic coding CLI.
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
+## [0.5.4] — 2026-08-01
+
+### Fixed
+- **Live streaming now renders identically to replayed sessions.** The retained TUI previously used
+  a separate `render_retained` renderer (pulldown-cmark) for assistant blocks while they streamed,
+  but `MarkdownStream` for replay — so bold, inline code, and the moonlight gutter all looked
+  different live than when you reopened the session. Both paths now share a single `MarkdownStream`
+  renderer; the dead `render_retained` (~230 lines) and its orphaned pulldown-cmark import are removed.
+- **Input box no longer hides text after a large paste.** When ≥5 lines were pasted the box
+  collapsed to a static `"↵ N lines pasted"` chip, hiding anything typed afterward. It now shows a
+  compact `↵N ·` prefix alongside a live window around the cursor — paste then keep typing normally.
+
+### Added
+- **Working spinner moves to the transcript bottom (Claude-CLI style).** The `✦⇄✧` brand-pulse
+  spinner and a typewriter caption now appear at the bottom of the chat transcript while the agent
+  works — `✦ Reading retained.rs  12s · Esc to stop`. The caption shows the current tool action
+  ("Reading …", "Run cargo test") or a whimsical verb ("Pondering…", "Distilling…") between steps,
+  typing out one character per tick. The old HUD working pill is removed; the HUD stays calm always.
+- **Ultimate mode gold input box.** Activating `/ultimate` recolours the `❯` prompt arrow and both
+  framing rules to gold, tying the visual cue to the `✦ ultimate` chip. Reverts to moonlight silver
+  when deactivated.
+- **`@` file picker overlay.** Typing `@` in the input box opens a file-completion overlay (mirrors
+  the `/` command palette): ↑↓ to navigate, Tab or Enter to complete, Esc to close. Shows the top 12
+  matching files from the project filtered by the prefix after `@`. The underlying `@file` inline
+  expansion on submit was already present; this adds the real-time picker UI.
+- **OSC 8 hyperlinks in the transcript.** URLs (`https://…`) and file paths with known extensions
+  (`src/foo.rs`, relative paths containing `/`) are wrapped in OSC 8 terminal hyperlinks after each
+  draw — Ctrl+Click opens the URL in the browser or the file in Explorer (Windows Terminal 1.19+,
+  WezTerm, iTerm2). Injected post-draw via `backend_mut()` so ratatui's cell model is unaffected.
+
 ## [0.5.3] — 2026-08-01
 
 ### Fixed

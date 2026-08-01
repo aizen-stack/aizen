@@ -4963,6 +4963,7 @@ async fn run_menu_sticky() -> Result<()> {
     if !tui::activate(&intro, &status_text(&history, &model_label)) {
         return run_menu_plain().await;
     }
+    tui::set_ultimate(cli_config::ultimate_enabled()); // open the input box in the right colour (gold if ultimate)
     install_exit_flush_handler(); // flush the live chat if the terminal window is closed (Windows ✕)
     {
         let (main, notes) = identity_banner();
@@ -5260,17 +5261,8 @@ async fn run_menu_sticky() -> Result<()> {
                 }
                 // (The steering mailbox was armed with the cancel token, before prep — see there.)
                 while input.cancel.try_recv().is_ok() {} // drain any stale wake-up
-                                                         // A quiet "here we go" line: the whimsical working verb ("✦ Pondering…") prints ONCE
-                                                         // into the scrolling transcript at turn start, so each run opens on a fresh word —
-                                                         // instead of the verb cycling in the cramped HUD pill. This path only runs under the
-                                                         // sticky TUI (already a TTY); silenced with tips off (`AIZEN_NO_TIPS`).
-                if !cli_config::branded_flag("NO_TIPS") {
-                    tui::emit_line(
-                        &style(format!("✦ {}…", tui::next_work_verb()))
-                            .color256(splash::ACCENT)
-                            .to_string(),
-                    );
-                }
+                // NOTE: the "✦ Pondering…" turn-start verb is now the bottom-of-transcript working
+                // line (see `working_line` in retained.rs) — no separate emit needed here.
                 // Arm LAST: the keyboard thread only queues a cancel once WORKING is true, so flipping
                 // it after the clear+drain guarantees no Esc meant for THIS turn gets swallowed in the
                 // arming window.
@@ -8851,6 +8843,10 @@ async fn handle_slash(
                 Ok(_) => tui::emit_line(&style("ultimate OFF — effort back to auto-detect, no orchestration nudge.").dim().to_string()),
                 Err(e) => tui::emit_line(&format!("{} {e}", style("ultimate:").red())),
             }
+            // Recolour the input box to match: gold framing while ultimate is ON (mirrors the
+            // `✦ ultimate` status chip), moonlight when OFF. Reflects the effective state — an
+            // env-forced ON wins over the toggle, so read it back rather than trusting `now`.
+            tui::set_ultimate(cli_config::ultimate_enabled());
             if std::env::var("AIZEN_ULTIMATE").is_ok() {
                 tui::emit_line(&style("(note: AIZEN_ULTIMATE is set in your environment — it forces ultimate ON regardless of this toggle)").dim().to_string());
             }

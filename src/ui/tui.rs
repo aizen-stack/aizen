@@ -130,6 +130,89 @@ fn slash_matches(draft: &[char]) -> Vec<crate::features::slash::SlashCommand> {
         .collect()
 }
 
+/// File completions for the `@` picker. Fires when the draft contains `@<prefix>` at the cursor
+/// (word boundary, not inside an email). Returns at most 12 matching paths relative to cwd,
+/// sorted: exact-prefix matches first, then fuzzy. Empty when no `@` token is at the cursor.
+fn at_matches(draft: &[char]) -> Vec<String> {
+    // Find the last `@` that is at a word boundary (preceded by whitespace or start-of-draft).
+    // We search backward from the cursor end so typing more chars narrows the list in real time.
+    let s: String = draft.iter().collect();
+    // Locate the last `@` preceded by start or whitespace.
+    let at_pos = s
+        .char_indices()
+        .rev()
+        .find(|&(i, c)| {
+            c == '@' && (i == 0 || s[..i].chars().last().map_or(true, |p| p.is_whitespace()))
+        })
+        .map(|(i, _)| i);
+    let at_pos = match at_pos {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    // The prefix is everything after the `@` up to the end of draft (cursor always at end for this).
+    let prefix: String = s[at_pos + 1..].chars().take_while(|c| !c.is_whitespace()).collect();
+    // Avoid triggering on obvious non-path patterns like `@everyone`.
+    // We return results even for an empty prefix (show recent/top files) but cap at 12.
+    const LIMIT: usize = 12;
+    let root = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    // Walk up to ~2000 entries from cwd, collect relative paths that match the prefix.
+    let mut matches: Vec<String> = Vec::new();
+    let lower_prefix = prefix.to_lowercase();
+    // Use WalkDir-equivalent via std::fs recursive helper — no new dep.
+    fn collect_files(dir: &std::path::Path, root: &std::path::Path, depth: u8, out: &mut Vec<String>) {
+        if depth == 0 { return; }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let ft = match entry.file_type() { Ok(t) => t, Err(_) => continue };
+            // Skip hidden dirs and known noise dirs.
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') || matches!(name_str.as_ref(), "target" | "node_modules" | "__pycache__") {
+                continue;
+            }
+            if ft.is_file() {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            } else if ft.is_dir() {
+                collect_files(&path, root, depth - 1, out);
+            }
+            if out.len() >= 2000 { return; }
+        }
+    }
+    let mut all_files: Vec<String> = Vec::new();
+    collect_files(&root, &root, 4, &mut all_files);
+
+    if lower_prefix.is_empty() {
+        // No prefix yet — show the most recently-modified files (up to LIMIT).
+        // Simple heuristic: just take the first LIMIT from the walk (already breadth-first-ish).
+        matches = all_files.into_iter().take(LIMIT).collect();
+    } else {
+        // Exact prefix matches first, then substring matches.
+        let exact: Vec<_> = all_files
+            .iter()
+            .filter(|p| p.to_lowercase().contains(&lower_prefix))
+            .cloned()
+            .collect();
+        // Sort: paths whose filename starts with prefix first.
+        let mut scored: Vec<(usize, &String)> = exact
+            .iter()
+            .map(|p| {
+                let fname = p.rsplit('/').next().unwrap_or(p);
+                let score = if fname.to_lowercase().starts_with(&lower_prefix) { 0 } else { 1 };
+                (score, p)
+            })
+            .collect();
+        scored.sort_by_key(|(s, _)| *s);
+        matches = scored.into_iter().map(|(_, p)| p.clone()).take(LIMIT).collect();
+    }
+    matches
+}
+
 /// Whether a direct retained informational overlay (`/workflows`, later panels) is open.
 static RETAINED_INFO_OVERLAY: AtomicBool = AtomicBool::new(false);
 
@@ -465,6 +548,8 @@ struct Render {
     status: String,
     /// Highlighted row in the live slash palette (index into the current matches; 0 = nearest box).
     palette_sel: usize,
+    /// Highlighted row in the `@file` picker (index into current file matches; 0 = top item).
+    at_sel: usize,
     /// `/model` overlay above the footer (replaces the slash palette while open).
     model_menu_active: bool,
     model_menu_sel: usize,
@@ -492,6 +577,7 @@ fn render() -> &'static Mutex<Render> {
             images: 0,
             status: String::new(),
             palette_sel: 0,
+            at_sel: 0,
             model_menu_active: false,
             model_menu_sel: 0,
             model_menu_rows: Vec::new(),
@@ -1037,6 +1123,24 @@ pub fn set_status(status: &str) {
     }
 }
 
+/// Recolour the retained input box for ultimate mode (gold ON, moonlight OFF). No-op on the classic
+/// path (it has no persistent box to recolour). Called once when `/ultimate` toggles and once at
+/// activation so the box opens in the right colour.
+pub fn set_ultimate(on: bool) {
+    if retained::is_running() {
+        retained::set_ultimate(on);
+    }
+}
+
+/// Point the working caption (the typewriter line beside the bottom-of-transcript spinner) at a
+/// concrete action, e.g. "Reading retained.rs". An empty string falls back to the whimsical verb.
+/// No-op off the retained path. The reveal replays only when the text actually changes.
+pub fn set_work_caption(text: &str) {
+    if retained::is_running() {
+        retained::set_work_caption(text);
+    }
+}
+
 /// Handles to drive the REPL from the background input thread.
 pub struct InputHandles {
     /// Submissions (chat / slash / quit), in the order the user pressed Enter.
@@ -1140,16 +1244,27 @@ fn retained_input_snapshot() -> retained::InputSnapshot {
             hint: "↑↓/PgUp/PgDn scroll · Esc/q close".to_string(),
         })
     } else {
-        let matches = slash_matches(&r.draft);
-        (!matches.is_empty()).then(|| retained::OverlaySnapshot {
-            title: "commands".to_string(),
-            lines: matches
-                .iter()
-                .map(|c| format!("/{}  ·  {}", c.name, c.description))
-                .collect(),
-            selected: Some(r.palette_sel.min(matches.len().saturating_sub(1))),
-            hint: "↑↓ pick · Tab complete · Enter run".to_string(),
-        })
+        // `@` file picker — takes priority over slash palette (you can't type both at once).
+        let at = at_matches(&r.draft);
+        if !at.is_empty() {
+            Some(retained::OverlaySnapshot {
+                title: "files".to_string(),
+                lines: at.iter().map(|p| format!("@{p}")).collect(),
+                selected: Some(r.at_sel.min(at.len().saturating_sub(1))),
+                hint: "↑↓ pick · Tab complete · Enter attach · Esc close".to_string(),
+            })
+        } else {
+            let matches = slash_matches(&r.draft);
+            (!matches.is_empty()).then(|| retained::OverlaySnapshot {
+                title: "commands".to_string(),
+                lines: matches
+                    .iter()
+                    .map(|c| format!("/{}  ·  {}", c.name, c.description))
+                    .collect(),
+                selected: Some(r.palette_sel.min(matches.len().saturating_sub(1))),
+                hint: "↑↓ pick · Tab complete · Enter run".to_string(),
+            })
+        }
     };
     retained::InputSnapshot {
         draft: r.draft.clone(),
@@ -1815,6 +1930,27 @@ fn input_loop(
                 repaint();
             }
             Key::Enter => {
+                // If the `@` file picker is open, Enter completes the file (same as Tab) instead of
+                // submitting — the user can then continue typing or hit Enter again to send.
+                {
+                    let at = {
+                        let r = render().lock().unwrap();
+                        let m = at_matches(&r.draft);
+                        (!m.is_empty()).then(|| (m[r.at_sel.min(m.len() - 1)].clone(), draft_at_prefix_start(&r.draft)))
+                    };
+                    if let Some((path, at_start)) = at {
+                        let mut r = render().lock().unwrap();
+                        let pre: String = r.draft[..at_start].iter().collect();
+                        let new_draft = format!("{pre}@{path} ");
+                        r.draft = new_draft.chars().collect();
+                        r.cursor = r.draft.len();
+                        r.at_sel = 0;
+                        drop(r);
+                        hist_idx = None;
+                        repaint();
+                        continue;
+                    }
+                }
                 let (line, images, pick) = {
                     let mut r = render().lock().unwrap();
                     let line: String = r.draft.iter().collect();
@@ -1951,8 +2087,27 @@ fn input_loop(
                 }
             }
             Key::Tab => {
-                // Complete the highlighted slash command into the draft (with a trailing space so
-                // you can type args); this also closes the palette.
+                // Tab completes the highlighted `@file` picker entry, or the slash palette.
+                // For `@file`: replace the `@<prefix>` token at the end of draft with the chosen path.
+                let at = {
+                    let r = render().lock().unwrap();
+                    let m = at_matches(&r.draft);
+                    (!m.is_empty()).then(|| (m[r.at_sel.min(m.len() - 1)].clone(), draft_at_prefix_start(&r.draft)))
+                };
+                if let Some((path, at_start)) = at {
+                    let mut r = render().lock().unwrap();
+                    // Replace `@<prefix>` with the chosen path + space.
+                    let pre: String = r.draft[..at_start].iter().collect();
+                    let new_draft = format!("{pre}@{path} ");
+                    r.draft = new_draft.chars().collect();
+                    r.cursor = r.draft.len();
+                    r.at_sel = 0;
+                    drop(r);
+                    hist_idx = None;
+                    repaint();
+                    continue;
+                }
+                // Fall through to slash completion.
                 let name = {
                     let r = render().lock().unwrap();
                     let m = slash_matches(&r.draft);
@@ -2062,6 +2217,19 @@ fn input_loop(
                 repaint();
             }
             Key::ArrowUp => {
+                // `@` file picker takes priority — ↑ moves up the file list.
+                let at_len = { at_matches(&render().lock().unwrap().draft).len() };
+                if at_len > 0 {
+                    let mut r = render().lock().unwrap();
+                    if retained::is_active() {
+                        r.at_sel = r.at_sel.saturating_sub(1);
+                    } else if r.at_sel + 1 < at_len {
+                        r.at_sel += 1;
+                    }
+                    drop(r);
+                    repaint();
+                    continue;
+                }
                 // While the slash palette is open, ↑/↓ move the highlight over the FULL match list. The
                 // two backends stack the list in OPPOSITE directions: classic draws index 0 nearest the
                 // box (list climbs UP, so ↑ = index+1), retained's overlay draws index 0 at the TOP
@@ -2089,6 +2257,19 @@ fn input_loop(
                 recall_history_prev(&mut hist_idx, &mut draft_saved, &history);
             }
             Key::ArrowDown => {
+                // `@` file picker ↓.
+                let at_len = { at_matches(&render().lock().unwrap().draft).len() };
+                if at_len > 0 {
+                    let mut r = render().lock().unwrap();
+                    if retained::is_active() {
+                        if r.at_sel + 1 < at_len { r.at_sel += 1; }
+                    } else {
+                        r.at_sel = r.at_sel.saturating_sub(1);
+                    }
+                    drop(r);
+                    repaint();
+                    continue;
+                }
                 let pal = {
                     let r = render().lock().unwrap();
                     slash_matches(&r.draft).len()
@@ -2115,6 +2296,22 @@ fn input_loop(
 }
 
 // ── pending clipboard image attachments (set by Ctrl-O in the input thread, drained on submit) ──
+
+/// Find the char index in `draft` where the last `@<prefix>` token starts (the `@` character
+/// position). Used to replace the partial token with the completed path on Tab/Enter.
+fn draft_at_prefix_start(draft: &[char]) -> usize {
+    let s: String = draft.iter().collect();
+    s.char_indices()
+        .rev()
+        .find(|&(i, c)| {
+            c == '@' && (i == 0 || s[..i].chars().last().map_or(true, |p| p.is_whitespace()))
+        })
+        .map(|(i, _)| {
+            // convert byte offset back to char index
+            s[..i].chars().count()
+        })
+        .unwrap_or(draft.len())
+}
 fn pending_images() -> &'static Mutex<Vec<String>> {
     static P: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
     P.get_or_init(|| Mutex::new(Vec::new()))
