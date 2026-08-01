@@ -636,6 +636,17 @@ pub fn goal_backoff_ms(attempt: u32) -> u64 {
     backoff_ms(attempt, BASE_MS, CAP_MS)
 }
 
+/// Full-jitter backoff (ms) for an INTERACTIVE turn's loop-level retry — a person is sitting there
+/// watching. Base 300ms, cap 4s: the whole ~10-attempt chain lands around ~30–40s total (enough for
+/// a gateway to recover from a 429/5xx blip), while no SINGLE wait ever reaches the 30s that
+/// `goal_backoff_ms` allows — a lone 30s pause reads as a hang, which is exactly the feel this avoids.
+/// `goal_backoff_ms` stays higher-ceilinged for `/goal`, which runs long with nobody watching.
+pub fn interactive_backoff_ms(attempt: u32) -> u64 {
+    const BASE_MS: u64 = 300;
+    const CAP_MS: u64 = 4_000;
+    backoff_ms(attempt, BASE_MS, CAP_MS)
+}
+
 /// Models that rejected `reasoning_effort` with a 400 THIS SESSION. Populated reactively — never
 /// guessed from the model name (a name heuristic would mis-serve every gateway that renames models).
 /// The first time a provider 400s on the field we record the model here, so every later turn strips
@@ -1580,6 +1591,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn interactive_backoff_is_faster_than_goal() {
+        // The whole point of splitting the two: an interactive turn (someone waiting) must never sit
+        // in a lone 30s pause — that reads as a hang. Goal mode (nobody watching, runs long) keeps the
+        // higher ceiling. Pin BOTH the absolute cap and the relative ordering so a future edit to
+        // either constant can't quietly collapse them back together.
+        for attempt in 0..12 {
+            let iv = interactive_backoff_ms(attempt);
+            assert!(
+                iv <= 4_000,
+                "interactive delay {iv} (attempt {attempt}) exceeded its 4s cap — a lone pause this \
+                 long is the hang feel this split exists to remove"
+            );
+        }
+        // At a high attempt both have saturated: interactive at 4s, goal at 30s. Compare CEILINGS
+        // (not the jittered draw) so the assertion is deterministic.
+        let iv_ceil = backoff_ceiling_ms(6, 300, 4_000);
+        let goal_ceil = backoff_ceiling_ms(6, 500, 30_000);
+        assert_eq!(iv_ceil, 4_000, "interactive saturates at 4s");
+        assert_eq!(goal_ceil, 30_000, "goal saturates at 30s");
+        assert!(
+            iv_ceil < goal_ceil,
+            "interactive must back off faster than goal ({iv_ceil} vs {goal_ceil})"
+        );
     }
 
     #[test]

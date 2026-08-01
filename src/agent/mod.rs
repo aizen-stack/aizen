@@ -1295,7 +1295,11 @@ where
                                 .map(|s| s.trim().is_empty())
                                 .unwrap_or(true);
                         if empty_200 && (attempt as usize) < cfg.max_transient_retries {
-                            let delay = crate::llm::client::goal_backoff_ms(attempt);
+                            // INTERACTIVE backoff (fast, cap 4s), not `goal_backoff_ms` (cap 30s):
+                            // someone is watching this turn, so a whole ~10-retry chain must stay
+                            // inside ~30–40s total rather than let one late attempt stall 30s. Goal
+                            // mode's branch above keeps the slow-but-patient backoff on purpose.
+                            let delay = crate::llm::client::interactive_backoff_ms(attempt);
                             attempt += 1;
                             if !cfg.quiet {
                                 retry_line(
@@ -1332,7 +1336,9 @@ where
                             }
                             return Err(e);
                         }
-                        let delay = crate::llm::client::goal_backoff_ms(attempt);
+                        // INTERACTIVE backoff here too (see the empty-200 branch above): the ordinary
+                        // path reports to a waiting user, so it retries fast and then fails cleanly.
+                        let delay = crate::llm::client::interactive_backoff_ms(attempt);
                         attempt += 1;
                         if !cfg.quiet {
                             retry_line(
@@ -7617,6 +7623,64 @@ mod tests {
             out.final_text.as_deref(),
             Some("finished despite the blip"),
             "the transient error must not discard the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_mode_retries_transient_past_the_old_default_then_reports() {
+        // The interactive REPL now sets max_transient_retries=10 (Claude-CLI-style: ride out a
+        // gateway blip, then report clearly — never hang). Two facts to pin, both on the ORDINARY
+        // path (goal: None), because that is where a person is watching:
+        //   (a) the budget is honoured PAST the old default of 2 — a run that recovers after more
+        //       than two blips still succeeds (the whole point of raising it);
+        //   (b) blips that OUTLAST the budget end with the error, not an infinite spin.
+        //
+        // Both parts use SMALL failure counts on purpose: the retry sleeps are real wall-clock
+        // waits (`interactive_backoff_ms`, no paused-time test runtime available here), so a literal
+        // budget of 10 would sleep ~30s. Three failures already exceed the old default of 2, which
+        // is the regression this guards; the backoff's ceiling is unit-tested separately by
+        // `interactive_backoff_is_faster_than_goal`.
+        let r = registry();
+
+        // (a) three transient failures (one more than the old default), then the real turn.
+        let c = AgentConfig {
+            max_transient_retries: 10,
+            quiet: true,
+            ..cfg()
+        };
+        let mut three_then_ok: Vec<Result<ChatTurn>> = (0..3)
+            .map(|_| Err(anyhow::anyhow!("upstream returned HTTP 503: overloaded")))
+            .collect();
+        three_then_ok.push(Ok(final_turn("came back after the blips")));
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let out = run_agent_loop(scripted_results(three_then_ok), &c, &r, &mut messages)
+            .await
+            .unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(
+            out.final_text.as_deref(),
+            Some("came back after the blips"),
+            "three blips (past the old default of 2) must be ridden out, not cut short"
+        );
+
+        // (b) failures that never stop must terminate with the error once the budget is spent —
+        // a definitive report, not a hang. Small budget so the real backoff sleeps stay short.
+        let c_small = AgentConfig {
+            max_transient_retries: 3,
+            quiet: true,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let always_503 = scripted_results(
+            (0..8)
+                .map(|_| Err(anyhow::anyhow!("upstream returned HTTP 503: overloaded")))
+                .collect(),
+        );
+        assert!(
+            run_agent_loop(always_503, &c_small, &r, &mut messages)
+                .await
+                .is_err(),
+            "past the budget the loop reports the error rather than spinning forever"
         );
     }
 

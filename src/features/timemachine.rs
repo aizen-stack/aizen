@@ -1265,14 +1265,22 @@ fn run_git_bounded(cmd: &mut Command, what: &str) -> Result<Output> {
 /// Run a git `Command` that must be FED THROUGH STDIN, under the same deadline and tree containment
 /// as [`run_git_bounded`].
 ///
-/// `wait_with_output()` has no timeout, so the wait is rebuilt here. The pipe drains start BEFORE the
-/// stdin write, which also closes a latent deadlock in the original code: it wrote the whole input
-/// and only then called `wait_with_output`, so a child emitting more than one pipe buffer of output
-/// while we were still writing would block us and itself forever.
+/// `wait_with_output()` has no timeout, so the wait is rebuilt here. All three pipes are serviced on
+/// their OWN threads, which is what makes the deadline total rather than partial. Two deadlocks are
+/// closed by that, and both were live at some point in this function's history:
+///
+/// * The original code wrote the whole input and only then called `wait_with_output`, so a child
+///   emitting more than one pipe buffer of OUTPUT while we were still writing blocked us and itself
+///   forever. Starting the stdout/stderr drains first fixed that one.
+/// * Writing the input on THIS thread, ahead of the wait loop, reintroduced the mirror image on the
+///   INPUT side: a pipe buffer is ~64 KiB, so `write_all` of a larger payload blocks until the child
+///   drains it — and the deadline had not started counting yet, so nothing could break the tie. That
+///   is not hypothetical here: `unpack-objects` is fed a whole packfile (megabytes for any real
+///   checkpoint), while holding `transaction.lock`. The write now runs on its own thread, so the
+///   loop below is reached immediately and the deadline governs the write as well.
 ///
 /// The caller configures stdio: `stdin` MUST be piped; stdout/stderr may be piped or null.
 fn run_git_piped_bounded(cmd: &mut Command, stdin_bytes: &[u8], what: &str) -> Result<Output> {
-    use std::io::Write;
     let timeout = git_op_timeout();
     crate::core::proctree::prepare(cmd);
     let mut child = cmd
@@ -1285,17 +1293,21 @@ fn run_git_piped_bounded(cmd: &mut Command, stdin_bytes: &[u8], what: &str) -> R
     let oh = std::thread::spawn(move || read_pipe_bytes(out_pipe));
     let eh = std::thread::spawn(move || read_pipe_bytes(err_pipe));
 
-    // Feed stdin, then CLOSE it — git plumbing waits for EOF on its input before it will exit. A
-    // write error (child already gone) is deliberately not propagated yet: the exit code and stderr
-    // explain the real cause far better than "broken pipe".
-    let write_err = {
-        let mut stdin = child.stdin.take();
-        match stdin.as_mut() {
-            Some(pipe) => pipe.write_all(stdin_bytes).err(),
+    // Feed stdin on its own thread, then CLOSE it — git plumbing waits for EOF on its input before it
+    // will exit. A write error (child already gone) is deliberately not propagated as the primary
+    // failure: the exit code and stderr explain the real cause far better than "broken pipe".
+    let stdin = child.stdin.take();
+    let payload = stdin_bytes.to_vec();
+    let wh = std::thread::spawn(move || {
+        use std::io::Write;
+        let mut stdin = stdin;
+        let err = match stdin.as_mut() {
+            Some(pipe) => pipe.write_all(&payload).err(),
             None => None,
-        }
-        // `stdin` drops here, closing the pipe so the child sees EOF.
-    };
+        };
+        drop(stdin); // close the pipe so the child sees EOF
+        err
+    });
 
     let start = std::time::Instant::now();
     let mut timed_out = false;
@@ -1313,12 +1325,19 @@ fn run_git_piped_bounded(cmd: &mut Command, stdin_bytes: &[u8], what: &str) -> R
             Err(e) => return Err(e).with_context(|| format!("waiting for {what}")),
         }
     };
+    // Join the writer too: killing the tree unblocks a parked `write_all` (the read end is gone), so
+    // this returns promptly. `None` on a lapsed grace means the thread is still parked, which we treat
+    // as no reportable write error — the exit code below is the better story either way.
+    let write_err = crate::core::proctree::join_drain(wh, GIT_DRAIN_GRACE).0;
     let (stdout, _) = crate::core::proctree::join_drain(oh, GIT_DRAIN_GRACE);
     let (stderr, _) = crate::core::proctree::join_drain(eh, GIT_DRAIN_GRACE);
     if timed_out {
+        // Deliberately NOT "nothing was changed": a child killed mid-flight may already have written
+        // part of its work (`unpack-objects` lands loose objects as it goes). Saying otherwise would
+        // talk the reader out of the one check worth doing.
         bail!(
             "{what} exceeded {}s and was terminated (set AIZEN_GIT_OP_TIMEOUT_SECS to raise the \
-             limit); nothing was changed",
+             limit); it may have completed partially — run `aizen time doctor` to check the store",
             timeout.as_secs()
         );
     }
@@ -3176,6 +3195,59 @@ impl crate::agent::tools::Tool for CheckpointDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stdin payload LARGER than a pipe buffer, fed to a child that never reads it, must still
+    /// return at the deadline instead of parking this thread forever.
+    ///
+    /// This is a regression test for a bug introduced by the very fix that bounded these spawns.
+    /// `write_all` ran on the calling thread, ahead of the wait loop, so it blocked once the ~64 KiB
+    /// pipe buffer filled — and the deadline had not begun counting, so nothing could break the tie.
+    /// It mattered in production rather than in theory: `unpack-objects` is fed a whole packfile
+    /// (megabytes for any real checkpoint) while `transaction.lock` is held, which is precisely the
+    /// permanent-strand-holding-a-lock failure this module exists to prevent.
+    #[test]
+    fn a_child_that_never_reads_stdin_cannot_park_a_large_write() {
+        // 1 MiB: comfortably past any platform's pipe buffer, so `write_all` MUST block partway
+        // through unless the child drains it — and this child deliberately never does.
+        let payload = vec![b'x'; 1024 * 1024];
+        let mut cmd = if cfg!(windows) {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+            let mut c = Command::new(format!(
+                r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe"
+            ));
+            c.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 40"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "sleep 40"]);
+            c
+        };
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        std::env::set_var("AIZEN_GIT_OP_TIMEOUT_SECS", "2");
+        let start = std::time::Instant::now();
+        let res = run_git_piped_bounded(&mut cmd, &payload, "stdin-hostile child");
+        let elapsed = start.elapsed();
+        std::env::remove_var("AIZEN_GIT_OP_TIMEOUT_SECS");
+
+        assert!(
+            res.is_err(),
+            "a child killed at its deadline must report an error, not success"
+        );
+        assert!(
+            elapsed < Duration::from_secs(25),
+            "returned only after {elapsed:?} — the write blocked outside the deadline's reach"
+        );
+        // The message must not claim innocence: a child killed mid-flight may already have written
+        // part of its work, and telling the user otherwise talks them out of checking.
+        let msg = format!("{:#}", res.unwrap_err());
+        assert!(
+            !msg.contains("nothing was changed"),
+            "a killed child's partial work must not be described as no change: {msg}"
+        );
+    }
 
     fn mk(id: u32, parent: Option<u32>) -> Snapshot {
         Snapshot {

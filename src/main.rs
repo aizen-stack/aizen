@@ -1884,7 +1884,7 @@ async fn run_serve_turn(
     let summarize = move |msgs: Vec<Message>| {
         let ep = sum_ep.clone();
         async move {
-            client::chat_with_tools(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+            chore_chat(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
                 .await
                 .map(|t| t.content.unwrap_or_default())
         }
@@ -3881,7 +3881,7 @@ async fn persona_paste_interactive(history: &mut Vec<Message>, model: &str) -> R
     );
     let usr = Message::user(format!("Pasted character prompt:\n{pasted}"));
     println!("{}", style("distilling into a persona card…").dim());
-    let resp = client::chat_with_tools(&http, &base_url, &api_key, &model_id, &[sys, usr], &[])
+    let resp = chore_chat(&http, &base_url, &api_key, &model_id, &[sys, usr], &[])
         .await
         .context("model call failed")?;
     let content = resp.content.unwrap_or_default();
@@ -5237,6 +5237,14 @@ async fn run_menu_sticky() -> Result<()> {
                     enable_steering: true,
                     // Keep the exit-flush snapshot current DURING the turn, not just at its edges.
                     on_progress: Some(publish_live_history),
+                    // The user is sitting here waiting: retry a 429/5xx blip many times (like the
+                    // Claude CLI) before giving up, with FAST backoff (`interactive_backoff_ms`) so
+                    // the whole chain still fits in ~30–40s and then reports a clear error. 10 is a
+                    // CEILING, not a cost — a gateway that recovers on try 2 stops at 2, so the happy
+                    // path is unchanged. `/goal` does NOT take this branch (goal_mode retries
+                    // transient errors indefinitely — see agent/mod.rs), so raising this never
+                    // shortens a goal run.
+                    max_transient_retries: 10,
                     ..AgentConfig::default()
                 };
 
@@ -5315,7 +5323,7 @@ async fn run_menu_sticky() -> Result<()> {
                     let summarize = move |msgs: Vec<Message>| {
                         let ep = sum_ep.clone();
                         async move {
-                            client::chat_with_tools(
+                            chore_chat(
                                 http_ref,
                                 &ep.base_url,
                                 &ep.api_key,
@@ -5344,7 +5352,7 @@ async fn run_menu_sticky() -> Result<()> {
                             move |msgs: Vec<Message>| {
                                 let ep = ep.clone();
                                 async move {
-                                    client::chat_with_tools(
+                                    chore_chat(
                                         http_ref,
                                         &ep.base_url,
                                         &ep.api_key,
@@ -5748,6 +5756,12 @@ async fn run_menu_plain() -> Result<()> {
             // Same mid-turn snapshot as the sticky REPL: an abrupt close mid-turn keeps the work
             // done so far instead of only the question.
             on_progress: Some(publish_live_history),
+            // User is sitting here waiting: retry a 429/5xx blip many times (like Claude CLI) with
+            // FAST backoff (interactive_backoff_ms), so the whole chain stays inside ~30–40s then
+            // reports a clean error. `/goal` does NOT take this path (goal_mode is separate, retries
+            // transient forever) — see agent/mod.rs. This is only a CEILING: a blip that clears on
+            // retry 2 stops at 2, so the success path is not slowed.
+            max_transient_retries: 10,
             ..AgentConfig::default()
         };
         let http_ref = &http;
@@ -5778,7 +5792,7 @@ async fn run_menu_plain() -> Result<()> {
         let summarize = move |msgs: Vec<Message>| {
             let ep = sum_ep.clone();
             async move {
-                client::chat_with_tools(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+                chore_chat(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
                     .await
                     .map(|t| t.content.unwrap_or_default())
             }
@@ -5798,16 +5812,9 @@ async fn run_menu_plain() -> Result<()> {
                 move |msgs: Vec<Message>| {
                     let ep = ep.clone();
                     async move {
-                        client::chat_with_tools(
-                            http_ref,
-                            &ep.base_url,
-                            &ep.api_key,
-                            &ep.model,
-                            &msgs,
-                            &[],
-                        )
-                        .await
-                        .map(|t| t.content.unwrap_or_default())
+                        chore_chat(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+                            .await
+                            .map(|t| t.content.unwrap_or_default())
                     }
                 }
             });
@@ -5927,6 +5934,40 @@ async fn maybe_auto_compact(
     }
 }
 
+/// Wrap a background / chore model call in the SAME per-call wall-clock deadline a sub-agent gets
+/// ([`crate::agent::task_tool::subagent_call_timeout`], default 300s, `AIZEN_SUBAGENT_CALL_SECS`).
+///
+/// Every one of these is a NON-streaming `chat_with_tools` call — compaction / handoff summaries, the
+/// end-of-turn secretary, persona reflection, memory reconcile, the oracle reviewer, persona distill.
+/// None is streamed, so the streaming path's inter-event stall watchdog never applies; the shared
+/// client carries no total-request ceiling (removed so a long *streamed* turn isn't cut — see
+/// `http_client`); and `read_timeout` resets on every byte, so a gateway that keepalive-drips without
+/// ever finishing the body parks the background task (or, for the by-hand ones, the CLI) forever. A
+/// flat per-call cap is exactly right here — one call, one answer, no legitimate multi-minute stream.
+/// On timeout it returns an ordinary `Err`, which every caller already treats as best-effort.
+async fn chore_chat(
+    http: &reqwest::Client,
+    base: &str,
+    key: &str,
+    model: &str,
+    msgs: &[Message],
+    tools: &[ToolDef],
+) -> Result<client::ChatTurn> {
+    let deadline = crate::agent::task_tool::subagent_call_timeout();
+    match tokio::time::timeout(
+        deadline,
+        client::chat_with_tools(http, base, key, model, msgs, tools),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!(
+            "chore model call exceeded {}s with no response (raise AIZEN_SUBAGENT_CALL_SECS)",
+            deadline.as_secs()
+        )),
+    }
+}
+
 /// Is the `summarizer` role pointed at its OWN endpoint, or does it fall through to the main model?
 ///
 /// Decides the secretary's input ceiling. When it falls through, every chore call bills the model
@@ -6032,9 +6073,7 @@ async fn maybe_run_secretary(
     // number is cost per turn. Counting only successes would understate exactly the spend the gate
     // exists to control.
     memory::stats::note_secretary_call();
-    let resp = match client::chat_with_tools(http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
-        .await
-    {
+    let resp = match chore_chat(http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[]).await {
         Ok(t) => t,
         Err(_) => return, // best-effort; never disrupt the REPL
     };
@@ -6399,7 +6438,7 @@ async fn run_persona_reflection(
         persona::reflect::build_reflection_prompt(&persona.name, &persona.role, &episodes);
     // Chore-class synthesis call → billed to the summarizer role, like every other harness chore.
     let ep = summarizer_endpoint(base, key, model);
-    let resp = match client::chat_with_tools(
+    let resp = match chore_chat(
         http,
         &ep.base_url,
         &ep.api_key,
@@ -7467,7 +7506,7 @@ async fn compact_history(
     let summarize = move |msgs: Vec<Message>| {
         let ep = sum_ep.clone();
         async move {
-            client::chat_with_tools(http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+            chore_chat(http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
                 .await
                 .map(|t| t.content.unwrap_or_default())
         }
@@ -7493,7 +7532,7 @@ async fn handoff_now(history: &[Message], goal: &str) -> Result<String> {
     let ep = summarizer_endpoint(&base, &key, &model);
     let prompt = agent::compact::handoff_prompt(history, goal);
     let summary =
-        client::chat_with_tools(&http, &ep.base_url, &ep.api_key, &ep.model, &prompt, &[])
+        chore_chat(&http, &ep.base_url, &ep.api_key, &ep.model, &prompt, &[])
             .await?
             .content
             .unwrap_or_default();
@@ -10319,24 +10358,29 @@ fn resolve_base_key(base_url: Option<String>, api_key: Option<String>) -> Result
     Ok((base_url, api_key))
 }
 
-/// Absolute floor under EVERY request this client makes, streaming included.
+/// Why this client carries NO total-request `timeout`.
 ///
-/// `read_timeout` is not a backstop on its own: it only fires when the socket goes BYTE-silent, so a
-/// gateway that keeps a connection warm (keepalive frames, a slow trickle of SSE comments) can hold a
-/// request open forever without ever tripping it. Callers layer their own tighter, purpose-shaped
-/// deadlines on top (the SSE inter-event watchdog, the sub-agent per-call deadline); this exists so a
-/// path nobody has enumerated yet still cannot hang for the lifetime of the process.
+/// 0.5.2 added `.timeout(1800s)` here as "a backstop under any path nobody has enumerated". That was
+/// a bug, and the reason is worth keeping: reqwest's total timeout is applied "from when the request
+/// starts connecting until the response body has finished" — a whole-response deadline, not a
+/// header-phase one. This very client is what the REPL hands to `stream_chat_with_tools_eager` for
+/// every turn, so the ceiling did not merely cap pathological hangs: it cut off a HEALTHY stream that
+/// was still emitting tokens, 30 minutes in, losing the entire turn. A deep reasoning run with many
+/// tool calls reaches that legitimately.
 ///
-/// Deliberately far larger than any legitimate single turn — it must never fight a long streamed
-/// answer, only cap the pathological case.
-const HTTP_REQUEST_CEILING: std::time::Duration = std::time::Duration::from_secs(1800);
-
+/// The stall protection that a streaming path actually needs is shaped per-event, not per-response,
+/// and already exists in two layers: `read_timeout` below (the socket going byte-silent) and
+/// `llm::client`'s inter-event watchdog, which re-arms on every SSE event and so distinguishes "the
+/// gateway stopped writing" from "the answer is long". A total deadline cannot make that distinction,
+/// which is exactly why it is wrong here.
+///
+/// One-shot clients (health probe, update check, model discovery) DO set a total timeout — nothing
+/// they fetch streams, so "the whole response took too long" is a meaningful failure there.
 fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("aizen/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(15))
         .read_timeout(std::time::Duration::from_secs(300))
-        .timeout(HTTP_REQUEST_CEILING)
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()
         .context("building HTTP client")
@@ -10415,8 +10459,7 @@ fn spawn_reconcile_pass() {
                 Message::system(sys.to_string()),
                 Message::user(user.to_string()),
             ];
-            let fut =
-                client::chat_with_tools(&http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[]);
+            let fut = chore_chat(&http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[]);
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
                     .block_on(fut)
@@ -10526,7 +10569,25 @@ fn spawn_aside_worker(http: reqwest::Client) {
                     .to_string(),
             );
             // ONE tool-less, non-streaming call. Empty tool slice ⇒ no tools offered.
-            match client::chat_with_tools(&http, &base_url, &api_key, &model, &msgs, &[]).await {
+            //
+            // Wrapped in the SAME per-call deadline a sub-agent gets (`subagent_call_timeout`,
+            // default 300s, `AIZEN_SUBAGENT_CALL_SECS`): the shared client carries no total-request
+            // ceiling (removing that is what unblocks a legitimately long streamed turn — see
+            // `http_client`), and `chat_with_tools` reads its body with `.json().await`, outside any
+            // deadline. `read_timeout` resets on every byte, so a gateway that keepalive-drips
+            // without ever finishing the body would park this worker forever, silently killing the
+            // aside feature for the rest of the session. This is not a streamed answer, so a flat
+            // per-call cap is exactly right — no inter-event watchdog applies here.
+            let call = client::chat_with_tools(&http, &base_url, &api_key, &model, &msgs, &[]);
+            let deadline = crate::agent::task_tool::subagent_call_timeout();
+            let outcome = match tokio::time::timeout(deadline, call).await {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!(
+                    "side question timed out after {}s with no response",
+                    deadline.as_secs()
+                )),
+            };
+            match outcome {
                 Ok(turn) => {
                     let answer = turn.content.unwrap_or_default();
                     if answer.trim().is_empty() {
@@ -12720,7 +12781,7 @@ async fn run_memory_reconcile(apply: bool) -> Result<()> {
             Message::system(sys.to_string()),
             Message::user(user.to_string()),
         ];
-        let fut = client::chat_with_tools(&http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[]);
+        let fut = chore_chat(&http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[]);
         // The surrounding fn is async, but `batch_pass` is sync (so every rail in it stays unit
         // testable without a runtime). Blocking here is safe: this is a one-shot CLI command with
         // nothing else on the runtime waiting on us.
@@ -13881,10 +13942,158 @@ mod tests {
         ]
     }
 
+    /// A streaming turn must survive longer than any total-request deadline.
+    ///
+    /// 0.5.2 put `.timeout(1800s)` on the shared client as a catch-all backstop. reqwest applies that
+    /// "from when the request starts connecting until the response body has finished", and this same
+    /// client is what the REPL hands to `stream_chat_with_tools_eager` — so it did not cap only
+    /// pathological hangs, it cut off a HEALTHY stream still emitting tokens. The stall protection a
+    /// stream needs is per-event (`read_timeout` plus the inter-event watchdog in `llm::client`),
+    /// which can tell "gateway went quiet" from "answer is long"; a total deadline cannot.
+    ///
+    /// Two dead ends preceded this shape, both worth recording so nobody re-walks them:
+    /// * Timing `http_client()` against a slow fixture proves nothing. The real ceiling was 1800s, so
+    ///   any fixture short enough to run in a test suite passes with the bug reintroduced — verified,
+    ///   it did.
+    /// * `Client`'s `Debug` does not print the total timeout at all in reqwest 0.12 (it prints
+    ///   `read_timeout`, which merely CONTAINS the substring). A structural assertion is impossible.
+    ///
+    /// So this asserts the mechanism instead, on a client built exactly like the shared one but with
+    /// a deliberately tiny ceiling: a total deadline kills a body that is still arriving. That is the
+    /// behaviour the production client must not have, demonstrated in a second rather than half an
+    /// hour — and the paired run through the real `http_client()` shows the same fixture completing.
+    #[tokio::test]
+    async fn a_total_deadline_truncates_a_healthy_stream_but_the_shared_client_has_none() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Serve a body in slow chunks: still arriving after ~900ms, never byte-silent for long.
+        async fn slow_body_server() -> (String, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/stream", listener.local_addr().unwrap());
+            let h = tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 2048];
+                        let _ = sock.read(&mut buf).await;
+                        let _ = sock.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 12\r\nConnection: close\r\n\r\n",
+                        ).await;
+                        for _ in 0..6 {
+                            let _ = sock.write_all(b"ab").await;
+                            let _ = sock.flush().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        }
+                    });
+                }
+            });
+            (url, h)
+        }
+
+        // 1. The mechanism: a total deadline shorter than the body's span truncates it. Same builder
+        //    settings as production, so the ONLY difference under test is `.timeout()`.
+        let (url, srv) = slow_body_server().await;
+        let ceilinged = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_secs(300))
+            .timeout(std::time::Duration::from_millis(300))
+            .build()
+            .expect("build ceilinged client");
+        let cut = async { ceilinged.get(&url).send().await?.text().await }.await;
+        assert!(
+            cut.is_err(),
+            "a total-request deadline must kill a body still arriving — if this stops failing, \
+             reqwest changed and the premise of this test needs re-checking"
+        );
+
+        // 2. The production client, same fixture, must read it to completion.
+        let http = http_client().expect("build shared client");
+        let whole = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            http.get(&url).send().await?.text().await
+        })
+        .await
+        .expect("the request must not outlive the test guard")
+        .expect("a response that keeps arriving must not be cut off");
+        srv.abort();
+        assert_eq!(
+            whole, "abababababab",
+            "the whole slow body must arrive through the client the REPL streams turns with"
+        );
+    }
+
+    /// A background chore call (secretary, persona reflection, compaction, reconcile, handoff,
+    /// persona-distill) must be TIME-BOUNDED, not merely byte-bounded.
+    ///
+    /// Every one of those routes the NON-streaming `chat_with_tools`, whose only native guard is
+    /// reqwest's `read_timeout` — and that fires only when the socket goes BYTE-silent. A gateway that
+    /// accepts the POST and then keepalive-drips (or simply never writes the response body) leaves the
+    /// call parked forever: `read_timeout` keeps re-arming on the drip, and the shared client carries
+    /// no total-request ceiling (removing that is the Bug-1 fix above, deliberately). Before
+    /// `chore_chat` centralised the deadline, a single such hang silently killed the secretary /
+    /// compaction for the rest of the session with no error surfaced.
+    ///
+    /// This proves the mechanism on a server that ACCEPTS the connection and then never answers: only
+    /// a wall-clock deadline can end that, and `chore_chat` must return `Err` within it rather than
+    /// awaiting a byte that never comes. `AIZEN_SUBAGENT_CALL_SECS=1` shrinks the ceiling so the test
+    /// finishes in ~1s; the env lock keeps it from racing the other env-touching tests.
+    #[tokio::test]
+    async fn a_chore_call_against_a_silent_gateway_returns_err_not_a_permanent_park() {
+        use tokio::io::AsyncReadExt;
+
+        // A server that accepts, reads the request, and then holds the socket open forever without
+        // ever writing a response. `read_timeout` cannot fire (no bytes were promised then withheld
+        // mid-body — nothing is sent at all), so only the deadline can end the call.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let srv = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 2048];
+                let _ = sock.read(&mut buf).await; // drain the request line/headers, then stall
+                held.push(sock); // keep the socket alive; never write a byte back
+            }
+        });
+
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const K: &str = "AIZEN_SUBAGENT_CALL_SECS";
+        let prior = std::env::var(K).ok();
+        std::env::set_var(K, "1");
+
+        let http = http_client().expect("build shared client");
+        let msgs = [Message::user("ping".to_string())];
+
+        let started = std::time::Instant::now();
+        // The whole point: this awaits, at most, one deadline — never the silent socket forever.
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            chore_chat(&http, &base, "k", "m", &msgs, &[]),
+        )
+        .await
+        .expect("chore_chat must return on its OWN deadline, not park until the test guard fires");
+        let elapsed = started.elapsed();
+
+        match prior {
+            Some(v) => std::env::set_var(K, v),
+            None => std::env::remove_var(K),
+        }
+        srv.abort();
+
+        assert!(
+            out.is_err(),
+            "a chore call to a gateway that never answers must surface an Err, not hang"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the 1s ceiling must end the call promptly; took {elapsed:?} — if this blows past the \
+             deadline, chore_chat stopped bounding the call in time"
+        );
+    }
+
     /// The `/v1` hint fires only when the URL genuinely lacks a version segment. Both directions
     /// matter: no hint on an already-versioned URL (suggesting `/v1/v1` sends the user in circles),
     /// and a hint whenever the last segment is not `v<digits>` — `/api` and `/openai` are paths, not
     /// versions, which is exactly the case that leaves people stuck on a 404 with nothing to try.
+    ///
     /// The steering mailbox must never stay armed past a turn that never ran.
     ///
     /// `steer::arm()` now fires with the cancel token, BEFORE prep, so a `> also do X` typed during
