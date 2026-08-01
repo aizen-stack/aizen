@@ -5,6 +5,48 @@ All notable changes to **Aizen** (`aizen`) — the pure-Rust agentic coding CLI.
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
+## [0.5.3] — 2026-08-01
+
+### Fixed
+- **The shared HTTP client no longer caps a healthy streamed turn.** 0.5.2 added `.timeout(1800s)` to
+  the shared client as a catch-all backstop. reqwest applies that "from when the request starts
+  connecting until the response body has finished" — and this same client drives the REPL's streamed
+  turns, so it did not cap only pathological hangs, it cut off a long-but-healthy answer still emitting
+  tokens. The stall protection a stream actually needs is per-event (`read_timeout` plus the inter-event
+  watchdog in `llm::client`), which can tell "gateway went quiet" from "answer is long"; a total deadline
+  cannot. The ceiling is removed, and a regression test proves the shared client reads a slow body to
+  completion while a deliberately-ceilinged control client truncates it.
+- **A large `stdin` write to a git subprocess can no longer park while `transaction.lock` is held.** The
+  Time Machine's piped git helper wrote the whole payload from the calling thread before entering its
+  deadline loop; on a payload past the OS pipe buffer (~64 KB) that `write_all` blocks until the child
+  drains stdin, and if the child never does, the calling thread parks *while holding the transaction
+  lock* — the "edit blocked for 15s" strand. The write now runs on a spawned thread joined under the
+  same deadline, so a child that never reads can no longer freeze the lock holder.
+- **The Time Machine timeout message no longer claims "nothing was changed."** A git operation that
+  timed out mid-run may well have changed something; the bail now says the work may be partially done and
+  points at `aizen time doctor` to check, instead of a false all-clear.
+
+### Changed
+- **Every non-streaming background/chore model call is now bounded in wall-clock time.** The secretary,
+  persona reflection, all four compaction/summarize closures (serve, sticky REPL, plain REPL, `/compact`),
+  the self-review oracle, memory reconcile (both the background and CLI paths), `/handoff`, the
+  persona-distill call, and the aside `?` worker each routed the non-streaming `chat_with_tools`, whose
+  only native guard is reqwest's `read_timeout` — and that fires only when the socket goes BYTE-silent. A
+  gateway that accepts the POST and then keepalive-drips (or never writes the body at all) left the call
+  parked forever, silently killing that feature for the rest of the session with no error surfaced. A new
+  `chore_chat` helper wraps all of them in the same wall-clock deadline a sub-agent gets
+  (`subagent_call_timeout`, 300s, `AIZEN_SUBAGENT_CALL_SECS` to change). The two MAIN agent-loop `chat`
+  closures are deliberately left unwrapped — a flat cap there would re-introduce the streamed-turn bug
+  above on a legitimately long turn.
+- **Interactive turns now retry fast and report decisively; `/goal` still retries forever.** The ordinary
+  REPL branch shared `/goal`'s backoff, whose 30s ceiling meant a late retry could sit for half a minute
+  before reporting — the "it hangs" feeling. A new `interactive_backoff_ms` (base 300ms, cap 4s) backs
+  off fast, so a ~10-attempt chain lands around ~30–40s total with no single wait hitting 30s, and the
+  interactive retry budget is raised to 10 (a `⟳ transient: retry 7/10` counter, then a clear error) at
+  the two interactive REPL sites only. `/goal` keeps `goal_backoff_ms` (cap 30s) and its infinite
+  transient retries — it runs long with nobody watching. Sub-agent (4) and background/quiet (2) budgets
+  are unchanged, and permanent 4xx still reports immediately without wasting a retry.
+
 ## [0.5.2] — 2026-07-30
 
 ### Added
