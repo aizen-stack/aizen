@@ -130,6 +130,89 @@ fn slash_matches(draft: &[char]) -> Vec<crate::features::slash::SlashCommand> {
         .collect()
 }
 
+/// File completions for the `@` picker. Fires when the draft contains `@<prefix>` at the cursor
+/// (word boundary, not inside an email). Returns at most 12 matching paths relative to cwd,
+/// sorted: exact-prefix matches first, then fuzzy. Empty when no `@` token is at the cursor.
+fn at_matches(draft: &[char]) -> Vec<String> {
+    // Find the last `@` that is at a word boundary (preceded by whitespace or start-of-draft).
+    // We search backward from the cursor end so typing more chars narrows the list in real time.
+    let s: String = draft.iter().collect();
+    // Locate the last `@` preceded by start or whitespace.
+    let at_pos = s
+        .char_indices()
+        .rev()
+        .find(|&(i, c)| {
+            c == '@' && (i == 0 || s[..i].chars().last().map_or(true, |p| p.is_whitespace()))
+        })
+        .map(|(i, _)| i);
+    let at_pos = match at_pos {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    // The prefix is everything after the `@` up to the end of draft (cursor always at end for this).
+    let prefix: String = s[at_pos + 1..].chars().take_while(|c| !c.is_whitespace()).collect();
+    // Avoid triggering on obvious non-path patterns like `@everyone`.
+    // We return results even for an empty prefix (show recent/top files) but cap at 12.
+    const LIMIT: usize = 12;
+    let root = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    // Walk up to ~2000 entries from cwd, collect relative paths that match the prefix.
+    let mut matches: Vec<String> = Vec::new();
+    let lower_prefix = prefix.to_lowercase();
+    // Use WalkDir-equivalent via std::fs recursive helper — no new dep.
+    fn collect_files(dir: &std::path::Path, root: &std::path::Path, depth: u8, out: &mut Vec<String>) {
+        if depth == 0 { return; }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let ft = match entry.file_type() { Ok(t) => t, Err(_) => continue };
+            // Skip hidden dirs and known noise dirs.
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') || matches!(name_str.as_ref(), "target" | "node_modules" | "__pycache__") {
+                continue;
+            }
+            if ft.is_file() {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            } else if ft.is_dir() {
+                collect_files(&path, root, depth - 1, out);
+            }
+            if out.len() >= 2000 { return; }
+        }
+    }
+    let mut all_files: Vec<String> = Vec::new();
+    collect_files(&root, &root, 4, &mut all_files);
+
+    if lower_prefix.is_empty() {
+        // No prefix yet — show the most recently-modified files (up to LIMIT).
+        // Simple heuristic: just take the first LIMIT from the walk (already breadth-first-ish).
+        matches = all_files.into_iter().take(LIMIT).collect();
+    } else {
+        // Exact prefix matches first, then substring matches.
+        let exact: Vec<_> = all_files
+            .iter()
+            .filter(|p| p.to_lowercase().contains(&lower_prefix))
+            .cloned()
+            .collect();
+        // Sort: paths whose filename starts with prefix first.
+        let mut scored: Vec<(usize, &String)> = exact
+            .iter()
+            .map(|p| {
+                let fname = p.rsplit('/').next().unwrap_or(p);
+                let score = if fname.to_lowercase().starts_with(&lower_prefix) { 0 } else { 1 };
+                (score, p)
+            })
+            .collect();
+        scored.sort_by_key(|(s, _)| *s);
+        matches = scored.into_iter().map(|(_, p)| p.clone()).take(LIMIT).collect();
+    }
+    matches
+}
+
 /// Whether a direct retained informational overlay (`/workflows`, later panels) is open.
 static RETAINED_INFO_OVERLAY: AtomicBool = AtomicBool::new(false);
 
@@ -413,6 +496,34 @@ fn start_ticker() {
     });
 }
 
+/// Service a status-panel command on the INPUT THREAD while a turn is in flight. Returns true when the
+/// command was fully handled here and must NOT be queued.
+///
+/// This is the fourth mid-turn entry point, for exactly the same reason `>` steer and `?` aside are
+/// the second and third: the REPL's turn `select!` polls only the turn future and the cancel channel,
+/// so an ordinary queued slash command is not dequeued until the turn ENDS. For this one command that
+/// makes it useless twice over — a stop that lands after the run it targeted has already finished is
+/// no stop at all, and a self-refreshing activity panel you can only open once the fan-out is over has
+/// nothing left to show.
+///
+/// Servicing it here is safe precisely because it touches nothing the REPL owns: reading the
+/// orchestration registry and raising a cancel flag are both process-global and lock-guarded, and the
+/// overlay is already driven from this thread — it is the one that closes it on Esc. While IDLE the
+/// command stays on the queue, where suspend/park semantics remain the REPL's business.
+fn handle_status_command_inline(name: &str, arg: &str) -> bool {
+    if !turn_in_flight() || !crate::agent::orchestration::is_status_command(&name.to_lowercase()) {
+        return false;
+    }
+    if let Some(note) = crate::agent::orchestration::try_stop_command(arg) {
+        note_line(&theme::muted(note).to_string());
+        return true;
+    }
+    // A bare `/workflows`: open the live panel from here. A `false` return (no retained backend — a
+    // pipe/CI, or the box is currently suspended for a menu) falls through to the queue rather than
+    // printing over a surface this thread does not own.
+    retained_overlay_open_live("Activity", crate::agent::orchestration::format_status)
+}
+
 /// What the user submitted from the input box.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Submission {
@@ -437,6 +548,8 @@ struct Render {
     status: String,
     /// Highlighted row in the live slash palette (index into the current matches; 0 = nearest box).
     palette_sel: usize,
+    /// Highlighted row in the `@file` picker (index into current file matches; 0 = top item).
+    at_sel: usize,
     /// `/model` overlay above the footer (replaces the slash palette while open).
     model_menu_active: bool,
     model_menu_sel: usize,
@@ -464,6 +577,7 @@ fn render() -> &'static Mutex<Render> {
             images: 0,
             status: String::new(),
             palette_sel: 0,
+            at_sel: 0,
             model_menu_active: false,
             model_menu_sel: 0,
             model_menu_rows: Vec::new(),
@@ -1009,6 +1123,24 @@ pub fn set_status(status: &str) {
     }
 }
 
+/// Recolour the retained input box for ultimate mode (gold ON, moonlight OFF). No-op on the classic
+/// path (it has no persistent box to recolour). Called once when `/ultimate` toggles and once at
+/// activation so the box opens in the right colour.
+pub fn set_ultimate(on: bool) {
+    if retained::is_running() {
+        retained::set_ultimate(on);
+    }
+}
+
+/// Point the working caption (the typewriter line beside the bottom-of-transcript spinner) at a
+/// concrete action, e.g. "Reading retained.rs". An empty string falls back to the whimsical verb.
+/// No-op off the retained path. The reveal replays only when the text actually changes.
+pub fn set_work_caption(text: &str) {
+    if retained::is_running() {
+        retained::set_work_caption(text);
+    }
+}
+
 /// Handles to drive the REPL from the background input thread.
 pub struct InputHandles {
     /// Submissions (chat / slash / quit), in the order the user pressed Enter.
@@ -1112,16 +1244,27 @@ fn retained_input_snapshot() -> retained::InputSnapshot {
             hint: "↑↓/PgUp/PgDn scroll · Esc/q close".to_string(),
         })
     } else {
-        let matches = slash_matches(&r.draft);
-        (!matches.is_empty()).then(|| retained::OverlaySnapshot {
-            title: "commands".to_string(),
-            lines: matches
-                .iter()
-                .map(|c| format!("/{}  ·  {}", c.name, c.description))
-                .collect(),
-            selected: Some(r.palette_sel.min(matches.len().saturating_sub(1))),
-            hint: "↑↓ pick · Tab complete · Enter run".to_string(),
-        })
+        // `@` file picker — takes priority over slash palette (you can't type both at once).
+        let at = at_matches(&r.draft);
+        if !at.is_empty() {
+            Some(retained::OverlaySnapshot {
+                title: "files".to_string(),
+                lines: at.iter().map(|p| format!("@{p}")).collect(),
+                selected: Some(r.at_sel.min(at.len().saturating_sub(1))),
+                hint: "↑↓ pick · Tab complete · Enter attach · Esc close".to_string(),
+            })
+        } else {
+            let matches = slash_matches(&r.draft);
+            (!matches.is_empty()).then(|| retained::OverlaySnapshot {
+                title: "commands".to_string(),
+                lines: matches
+                    .iter()
+                    .map(|c| format!("/{}  ·  {}", c.name, c.description))
+                    .collect(),
+                selected: Some(r.palette_sel.min(matches.len().saturating_sub(1))),
+                hint: "↑↓ pick · Tab complete · Enter run".to_string(),
+            })
+        }
     };
     retained::InputSnapshot {
         draft: r.draft.clone(),
@@ -1249,9 +1392,19 @@ fn crossterm_to_console_key(ev: crossterm::event::KeyEvent) -> Option<Key> {
     })
 }
 
+/// Is screen cell (`col`, `row`) inside `rect`? Saturating throughout so a rect flush against the
+/// right/bottom edge can't wrap into a false miss.
+fn hit(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
+    col >= rect.x
+        && col < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
 /// Phase 3 mouse handler for the retained backend: wheel scroll, text selection (drag + copy-on-
-/// release), and scrollbar thumb drag. Mutates `selecting` / `dragging_scrollbar` so state survives
-/// across successive mouse events. No-ops harmlessly when geometry is empty (first frame).
+/// release), right-click Copy menu, and scrollbar thumb drag. Mutates `selecting` /
+/// `dragging_scrollbar` so state survives across successive mouse events. No-ops harmlessly when
+/// geometry is empty (first frame).
 fn handle_retained_mouse(
     kind: crossterm::event::MouseEventKind,
     col: u16,
@@ -1283,14 +1436,35 @@ fn handle_retained_mouse(
         MouseEventKind::ScrollUp => retained::scroll(-3),
         MouseEventKind::ScrollDown => retained::scroll(3),
         MouseEventKind::Down(MouseButton::Left) => {
+            // The right-click Copy menu floats above everything, so it is hit-tested FIRST — a click
+            // on it must copy rather than start a new selection underneath it. `live_selection` is
+            // read (not `selecting`, which is `take()`n on mouse-up while the highlight stays up),
+            // so the text copied is exactly the text still painted.
+            if let Some(m) = retained::context_menu_rect() {
+                let on_menu = hit(m, col, row);
+                retained::close_context_menu();
+                if on_menu {
+                    if let Some(sel) = retained::live_selection() {
+                        let text = retained::extract_selection_text(sel);
+                        if !text.is_empty() {
+                            let ok = copy_to_os_clipboard(&text);
+                            note_copied(&text, ok);
+                        }
+                    }
+                    // The highlight stays: the copy is confirmed by the note, and keeping it lets a
+                    // second copy (or a wider drag from the same anchor) follow without re-selecting.
+                    *dragging_scrollbar = false;
+                    *selecting = None;
+                    return;
+                }
+                // A click anywhere else dismisses the menu and then lands normally, which is what a
+                // click-away is expected to do — falling through means it also starts a selection or
+                // hits the jump button, rather than being eaten as a "close the menu" no-op.
+            }
             // Floating "jump to bottom" button takes priority: a click anywhere on it lands the
             // viewport back on the live tail (only present while scrolled up off the tail).
             if let Some(b) = retained::jump_button_rect() {
-                if col >= b.x
-                    && col < b.x.saturating_add(b.width)
-                    && row >= b.y
-                    && row < b.y.saturating_add(b.height)
-                {
+                if hit(b, col, row) {
                     *dragging_scrollbar = false;
                     *selecting = None;
                     retained::clear_selection();
@@ -1312,6 +1486,12 @@ fn handle_retained_mouse(
                 retained::scroll_to(desired.min(max_start));
             } else if in_transcript {
                 *dragging_scrollbar = false;
+                // Starting a fresh selection dismisses any menu unconditionally. The hit-test above
+                // only sees a menu the render thread has already PUBLISHED, so a click landing in the
+                // same frame as the right-click that opened it would otherwise fall through to here
+                // and leave the box drawn over the new selection. Every other click path reaches
+                // `clear_selection` (which closes the menu); this is the one that doesn't.
+                retained::close_context_menu();
                 let line = start.saturating_add(row.saturating_sub(area.y) as usize);
                 let c = col.saturating_sub(area.x) as usize;
                 let sel = retained::SelectionRange {
@@ -1409,21 +1589,65 @@ fn handle_retained_mouse(
                 }
             }
         }
+        // Right-click over a highlight offers an explicit "Copy" button. The drag-release above
+        // already copies silently, but that is invisible — there is no way to tell it happened, and
+        // no way to ask for it again without re-dragging. This is the discoverable path.
+        //
+        // Gated on there BEING a selection: a menu whose only item is Copy has nothing to offer
+        // otherwise, and popping an inert box on every right-click in the transcript would be noise.
+        // `live_selection` is the mirror of what is painted — `selecting` is already `take()`n by the
+        // mouse-up above, so it is `None` at exactly the moment someone reaches for the right button.
+        MouseEventKind::Down(MouseButton::Right) => {
+            if in_transcript && retained::live_selection().is_some() {
+                retained::open_context_menu(col, row);
+            } else if retained::context_menu_rect().is_some() {
+                // Right-click with nothing selected (or outside the transcript) dismisses an open
+                // menu rather than leaving it stranded.
+                retained::close_context_menu();
+            }
+        }
         _ => {}
     }
 }
 
-/// Copy selected transcript text to the OS clipboard. DESKTOP-ONLY: `arboard` is target-gated to
-/// Windows/macOS (Linux would need X11/Wayland libs at runtime, breaking the headless static binary
-/// — see Cargo.toml), so on Linux this is a no-op and selection copy silently does nothing there.
+/// Copy selected transcript text to the OS clipboard, reporting whether it actually landed.
+///
+/// DESKTOP-ONLY: `arboard` is target-gated to Windows/macOS (Linux would need X11/Wayland libs at
+/// runtime, breaking the headless static binary — see Cargo.toml), so on Linux this is a no-op.
+/// It returns `bool` rather than `()` so the explicit right-click Copy can confirm honestly instead
+/// of printing "copied" on a platform where nothing was: a silent no-op is survivable for the
+/// incidental drag-release copy, but a button the user deliberately clicked must not lie.
 #[cfg(any(windows, target_os = "macos"))]
-fn copy_to_os_clipboard(text: &str) {
-    if let Ok(mut cb) = arboard::Clipboard::new() {
-        let _ = cb.set_text(text.to_string());
+fn copy_to_os_clipboard(text: &str) -> bool {
+    match arboard::Clipboard::new() {
+        Ok(mut cb) => cb.set_text(text.to_string()).is_ok(),
+        Err(_) => false,
     }
 }
 #[cfg(not(any(windows, target_os = "macos")))]
-fn copy_to_os_clipboard(_text: &str) {}
+fn copy_to_os_clipboard(_text: &str) -> bool {
+    false
+}
+
+/// Confirm (or honestly deny) an explicit right-click copy with one dim transcript line.
+///
+/// Routed through `note_line`, never `eprintln!`: a raw write behind the render thread's back lands
+/// inside a retained frame and corrupts it, because ratatui's cell diff compares against its own
+/// last frame and never sees the foreign text.
+fn note_copied(text: &str, ok: bool) {
+    let msg = if ok {
+        let chars = text.chars().count();
+        let rows = text.lines().count().max(1);
+        if rows > 1 {
+            format!("· copied {chars} chars ({rows} lines)")
+        } else {
+            format!("· copied {chars} chars")
+        }
+    } else {
+        "· clipboard unavailable on this platform — nothing copied".to_string()
+    };
+    note_line(&style(msg).dim().to_string());
+}
 
 fn input_loop(
     sub_tx: UnboundedSender<Submission>,
@@ -1706,6 +1930,27 @@ fn input_loop(
                 repaint();
             }
             Key::Enter => {
+                // If the `@` file picker is open, Enter completes the file (same as Tab) instead of
+                // submitting — the user can then continue typing or hit Enter again to send.
+                {
+                    let at = {
+                        let r = render().lock().unwrap();
+                        let m = at_matches(&r.draft);
+                        (!m.is_empty()).then(|| (m[r.at_sel.min(m.len() - 1)].clone(), draft_at_prefix_start(&r.draft)))
+                    };
+                    if let Some((path, at_start)) = at {
+                        let mut r = render().lock().unwrap();
+                        let pre: String = r.draft[..at_start].iter().collect();
+                        let new_draft = format!("{pre}@{path} ");
+                        r.draft = new_draft.chars().collect();
+                        r.cursor = r.draft.len();
+                        r.at_sel = 0;
+                        drop(r);
+                        hist_idx = None;
+                        repaint();
+                        continue;
+                    }
+                }
                 let (line, images, pick) = {
                     let mut r = render().lock().unwrap();
                     let line: String = r.draft.iter().collect();
@@ -1728,6 +1973,13 @@ fn input_loop(
                 repaint();
                 if let Some(name) = pick {
                     history.push(format!("/{name}"));
+                    // Resolving `/wo` from the palette must reach the same mid-turn path a fully
+                    // typed `/workflows` does, or the panel would open live only for whoever types
+                    // the whole name. No argument can ride this branch (the palette hides itself the
+                    // moment a space is typed), so the stop verb is unreachable here by construction.
+                    if handle_status_command_inline(&name, "") {
+                        continue;
+                    }
                     if sub_tx.send(Submission::Slash(name)).is_err() {
                         return;
                     }
@@ -1760,7 +2012,29 @@ fn input_loop(
                     // with the routing character removed, so the model never sees the `>` marker.
                     line = rest.trim().to_string();
                 }
+                // `?` PREFIX = ASIDE: a quick side question answered on a SEPARATE worker thread
+                // without perturbing the turn in flight (no history mutation, no cancel, no WORKING).
+                // Only meaningful WHILE a turn runs — an aside beside idle is just an ordinary
+                // question, so we gate on `turn_in_flight()` and otherwise fall through with the
+                // marker stripped. A refused aside (no worker / blank / oversized) also falls through,
+                // so the text is delivered either way and the model never sees the `?`. Not offered
+                // for a vision message (an image belongs to the main turn).
+                else if let Some(rest) =
+                    trimmed.strip_prefix('?').filter(|_| images == 0)
+                {
+                    if turn_in_flight() && crate::core::aside::ask(rest) {
+                        continue;
+                    }
+                    line = rest.trim().to_string();
+                }
                 if let Some(cmd) = trimmed.strip_prefix('/').filter(|_| images == 0) {
+                    let (name, arg) = match cmd.split_once(char::is_whitespace) {
+                        Some((n, a)) => (n, a.trim()),
+                        None => (cmd, ""),
+                    };
+                    if handle_status_command_inline(name, arg) {
+                        continue;
+                    }
                     // No park decision here either (see the pick branch): if this command opens a
                     // menu, the REPL's `suspend()` raises KEYBOARD_PARKED and the loop head stands
                     // down — whenever that actually happens, including after a turn finishes.
@@ -1813,8 +2087,27 @@ fn input_loop(
                 }
             }
             Key::Tab => {
-                // Complete the highlighted slash command into the draft (with a trailing space so
-                // you can type args); this also closes the palette.
+                // Tab completes the highlighted `@file` picker entry, or the slash palette.
+                // For `@file`: replace the `@<prefix>` token at the end of draft with the chosen path.
+                let at = {
+                    let r = render().lock().unwrap();
+                    let m = at_matches(&r.draft);
+                    (!m.is_empty()).then(|| (m[r.at_sel.min(m.len() - 1)].clone(), draft_at_prefix_start(&r.draft)))
+                };
+                if let Some((path, at_start)) = at {
+                    let mut r = render().lock().unwrap();
+                    // Replace `@<prefix>` with the chosen path + space.
+                    let pre: String = r.draft[..at_start].iter().collect();
+                    let new_draft = format!("{pre}@{path} ");
+                    r.draft = new_draft.chars().collect();
+                    r.cursor = r.draft.len();
+                    r.at_sel = 0;
+                    drop(r);
+                    hist_idx = None;
+                    repaint();
+                    continue;
+                }
+                // Fall through to slash completion.
                 let name = {
                     let r = render().lock().unwrap();
                     let m = slash_matches(&r.draft);
@@ -1924,6 +2217,19 @@ fn input_loop(
                 repaint();
             }
             Key::ArrowUp => {
+                // `@` file picker takes priority — ↑ moves up the file list.
+                let at_len = { at_matches(&render().lock().unwrap().draft).len() };
+                if at_len > 0 {
+                    let mut r = render().lock().unwrap();
+                    if retained::is_active() {
+                        r.at_sel = r.at_sel.saturating_sub(1);
+                    } else if r.at_sel + 1 < at_len {
+                        r.at_sel += 1;
+                    }
+                    drop(r);
+                    repaint();
+                    continue;
+                }
                 // While the slash palette is open, ↑/↓ move the highlight over the FULL match list. The
                 // two backends stack the list in OPPOSITE directions: classic draws index 0 nearest the
                 // box (list climbs UP, so ↑ = index+1), retained's overlay draws index 0 at the TOP
@@ -1951,6 +2257,19 @@ fn input_loop(
                 recall_history_prev(&mut hist_idx, &mut draft_saved, &history);
             }
             Key::ArrowDown => {
+                // `@` file picker ↓.
+                let at_len = { at_matches(&render().lock().unwrap().draft).len() };
+                if at_len > 0 {
+                    let mut r = render().lock().unwrap();
+                    if retained::is_active() {
+                        if r.at_sel + 1 < at_len { r.at_sel += 1; }
+                    } else {
+                        r.at_sel = r.at_sel.saturating_sub(1);
+                    }
+                    drop(r);
+                    repaint();
+                    continue;
+                }
                 let pal = {
                     let r = render().lock().unwrap();
                     slash_matches(&r.draft).len()
@@ -1977,6 +2296,22 @@ fn input_loop(
 }
 
 // ── pending clipboard image attachments (set by Ctrl-O in the input thread, drained on submit) ──
+
+/// Find the char index in `draft` where the last `@<prefix>` token starts (the `@` character
+/// position). Used to replace the partial token with the completed path on Tab/Enter.
+fn draft_at_prefix_start(draft: &[char]) -> usize {
+    let s: String = draft.iter().collect();
+    s.char_indices()
+        .rev()
+        .find(|&(i, c)| {
+            c == '@' && (i == 0 || s[..i].chars().last().map_or(true, |p| p.is_whitespace()))
+        })
+        .map(|(i, _)| {
+            // convert byte offset back to char index
+            s[..i].chars().count()
+        })
+        .unwrap_or(draft.len())
+}
 fn pending_images() -> &'static Mutex<Vec<String>> {
     static P: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
     P.get_or_init(|| Mutex::new(Vec::new()))
@@ -2251,6 +2586,7 @@ pub fn retained_overlay_open(title: impl Into<String>, text: impl Into<String>) 
         return false;
     }
     RETAINED_INFO_OVERLAY.store(true, Ordering::Relaxed);
+    RETAINED_OVERLAY_GEN.fetch_add(1, Ordering::Relaxed);
     retained::open_overlay(retained::OverlaySnapshot {
         title: title.into(),
         lines: text.into().lines().map(str::to_string).collect(),
@@ -2260,8 +2596,43 @@ pub fn retained_overlay_open(title: impl Into<String>, text: impl Into<String>) 
     true
 }
 
+/// Generation counter for the informational overlay. Bumped on every open/close so a live refresher
+/// from a previous `/workflows` can tell it has been superseded and exit — without this, opening the
+/// panel twice would leave two threads writing the same surface.
+static RETAINED_OVERLAY_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Open an informational overlay that RE-READS itself while it stays up.
+///
+/// `/workflows` shows elapsed times; a one-shot snapshot froze them the moment the panel opened, so a
+/// fan-out you were watching appeared stuck at whatever second you happened to press the key. The
+/// refresher republishes the body (never re-opens it — see `Command::UpdateOverlay`, which preserves
+/// scroll) and stops as soon as the panel closes or another overlay takes its place.
+pub fn retained_overlay_open_live(
+    title: impl Into<String>,
+    refresh: impl Fn() -> String + Send + 'static,
+) -> bool {
+    if !retained_overlay_open(title, refresh()) {
+        return false;
+    }
+    let gen = RETAINED_OVERLAY_GEN.load(Ordering::Relaxed);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(900));
+        // Three ways to become obsolete: the panel was closed, a different overlay was opened, or the
+        // render thread went away (suspend/shutdown). Any of them ends this thread.
+        if !RETAINED_INFO_OVERLAY.load(Ordering::Relaxed)
+            || RETAINED_OVERLAY_GEN.load(Ordering::Relaxed) != gen
+            || !retained::is_running()
+        {
+            return;
+        }
+        retained::update_overlay(refresh().lines().map(str::to_string).collect());
+    });
+    true
+}
+
 pub fn retained_overlay_close() {
     RETAINED_INFO_OVERLAY.store(false, Ordering::Relaxed);
+    RETAINED_OVERLAY_GEN.fetch_add(1, Ordering::Relaxed);
     if retained::is_running() {
         retained::close_overlay();
         repaint_force();

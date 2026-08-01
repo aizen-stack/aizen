@@ -3,6 +3,7 @@
 //! logic lives here — this is the layer everything else is allowed to depend on.
 
 pub mod approval;
+pub mod aside;
 pub mod cancel;
 pub mod cli_config;
 pub mod config;

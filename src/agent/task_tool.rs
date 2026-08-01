@@ -29,6 +29,7 @@ use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// The stable sub-agent preamble (a `const` → byte-identical across invocations, so the CLI's
 /// own upstream prefix cache stays warm). Kept CLI-specific; not a copy of the extension's.
@@ -61,6 +62,78 @@ const CONTINUE_NUDGE: &str = "[continue] You reached your step budget and the di
 /// Transient model-call failures a sub-agent absorbs per turn before giving up (see
 /// `AgentConfig::max_transient_retries`). Unlike the top level, there is no user watching to re-ask.
 const SUBAGENT_TRANSIENT_RETRIES: usize = 4;
+
+/// WALL-CLOCK deadline for ONE sub-agent model call. Override with `AIZEN_SUBAGENT_CALL_SECS`.
+///
+/// Every other budget in this file counts STEPS; none of them counts time, so a single call that
+/// never returns is unbounded by all of them. That is not hypothetical: a sub-agent runs on the
+/// NON-streaming `chat_with_tools`, which has no inter-event stall watchdog (the streaming path's
+/// `stream_stall_timeout` does not apply), leaving only reqwest's `read_timeout` — and that fires
+/// only when the socket goes BYTE-silent, which a keepalive-warm gateway never does.
+///
+/// The cost of no deadline is not one lost sub-agent: the whole run sits inside `block_in_place`
+/// while holding a `SubagentSlot`, whose ONLY release is `Drop`. A call that never returns never
+/// drops, so the slot is held for the process lifetime and every later dispatch is refused with
+/// "concurrency limit reached" — the reported "sub-agents run forever and never produce a result".
+/// A deadline converts that permanent strand into an ordinary `Err`, which the existing error path
+/// already handles: it unwinds through `Drop`, freeing the slot, and the transient-retry logic
+/// (`SUBAGENT_TRANSIENT_RETRIES`) gets a chance to recover the step.
+///
+/// Sized for a legitimately slow large-context call on a loaded gateway, not for a fast one: too
+/// tight and a rare hang becomes frequent spurious failures.
+const SUBAGENT_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// [`SUBAGENT_CALL_TIMEOUT`], with an env override for slow gateways / CI.
+pub(crate) fn subagent_call_timeout() -> Duration {
+    std::env::var("AIZEN_SUBAGENT_CALL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(SUBAGENT_CALL_TIMEOUT)
+}
+
+/// WALL-CLOCK ceiling for a WHOLE dispatch — every continuation included. Override with
+/// `AIZEN_SUBAGENT_WALL_SECS` (`0` disables it entirely).
+///
+/// [`SUBAGENT_CALL_TIMEOUT`] bounds ONE call; this bounds the run. The two are not substitutes: with
+/// per-call deadlines in place a dispatch can no longer strand, but it is still bounded only in STEPS
+/// — default 25, auto-extended to 50, plus [`MAX_CONTINUATIONS`] fresh budgets, so ~150 steps (up to
+/// 480 at `max_steps: 80`). Every step returns, so the run always ends; nothing answers *by when*. At
+/// a legitimate ~20s per step that is roughly an hour, and a dispatch that quietly runs for hours is
+/// indistinguishable from the hang this file's other deadline was written to kill.
+///
+/// Deliberately generous rather than tight, because the failure modes are not symmetric: firing late
+/// costs some wasted minutes, while firing early destroys real work and mislabels a healthy run as
+/// pathological. Sized so only a genuinely runaway dispatch reaches it.
+///
+/// Delegated runs only — a top-level turn leaves `AgentConfig::deadline` at `None`. The user is
+/// watching there and owns Esc; a sub-agent runs `quiet` with nobody watching, which is exactly why
+/// it needs a ceiling it cannot talk its way past.
+const SUBAGENT_WALL_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// Floor for the [`SUBAGENT_WALL_TIMEOUT`] env override. A misconfigured `AIZEN_SUBAGENT_WALL_SECS=5`
+/// would make every dispatch fail before its first model call could return, which reads as a broken
+/// build rather than a tight budget.
+const SUBAGENT_WALL_FLOOR: Duration = Duration::from_secs(60);
+
+/// The absolute instant a dispatch starting NOW must stop by, or `None` when no ceiling applies.
+///
+/// Called once per dispatch and threaded through every continuation, so the ceiling covers the whole
+/// run rather than restarting with each fresh budget (see `is_resumable`, which must never resume a
+/// `Deadline`).
+pub(crate) fn subagent_wall_deadline() -> Option<std::time::Instant> {
+    let budget = match std::env::var("AIZEN_SUBAGENT_WALL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        // Explicit opt-out: a user who wants the old unbounded-in-time behavior can have it.
+        Some(0) => return None,
+        Some(n) => Duration::from_secs(n).max(SUBAGENT_WALL_FLOOR),
+        None => SUBAGENT_WALL_TIMEOUT,
+    };
+    Some(std::time::Instant::now() + budget)
+}
 
 /// Default step budget for a dispatch when the parent doesn't set `max_steps`. Matches the top-level
 /// default (25) rather than undercutting it: a sub-task is narrower in SCOPE, but the old 15 meant a
@@ -523,8 +596,25 @@ impl Tool for TaskTool {
             let key = key.clone();
             let model = model.clone();
             async move {
-                crate::llm::client::chat_with_tools(&client, &base, &key, &model, &msgs, &defs)
-                    .await
+                // DEADLINE, not just a step budget: see `SUBAGENT_CALL_TIMEOUT`. The timeout must
+                // wrap the call INSIDE this future — the whole loop runs under `block_in_place`
+                // below, and a timeout placed outside a blocking region cannot preempt it. An
+                // elapsed deadline becomes a normal `Err`, which releases the slot by unwinding
+                // through `Drop` and is eligible for the transient retry the loop already does.
+                let deadline = subagent_call_timeout();
+                match tokio::time::timeout(
+                    deadline,
+                    crate::llm::client::chat_with_tools(&client, &base, &key, &model, &msgs, &defs),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "model call exceeded {}s with no response (set AIZEN_SUBAGENT_CALL_SECS to \
+                         raise the limit)",
+                        deadline.as_secs()
+                    )),
+                }
             }
         };
 
@@ -533,13 +623,16 @@ impl Tool for TaskTool {
         // gate — which arms on the PARENT's own edit turns — never re-checks them. A read-only role
         // (planner/reviewer) makes no edits, so the gate would only spawn a needless `cargo check`.
         let sub_verify_gate = !dispatch_is_read_only(&registry);
-        let parent_cancel = crate::core::cancel::current().unwrap_or_default();
+        // A DERIVED token, not the parent's own: `/workflows stop #<id>` must be able to end this one
+        // dispatch while the orchestrating turn and any sibling dispatches carry on. Esc still reaches
+        // it, because cancellation flows down from the turn token (see `TurnCancel::child`).
+        let own_cancel = crate::core::cancel::current().unwrap_or_default().child();
         // Inherit the parent's conversation identity so a delegated sub-agent shares the same
         // per-conversation resource scope (e.g. the browser session), exactly as it inherits `cancel`.
         let parent_ctx = crate::core::exec_ctx::current().unwrap_or_default();
         let cfg = AgentConfig {
             approval_mode: self.approval_mode, // inherit parent approval tier transitively
-            cancel: parent_cancel,
+            cancel: own_cancel.clone(),
             exec_ctx: parent_ctx,
             quiet: true,                         // suppress nested progress trace
             enable_verify_gate: sub_verify_gate, // ON for write-capable roles; OFF for read-only (W14)
@@ -572,6 +665,11 @@ impl Tool for TaskTool {
             // process-global todo list, which is the PARENT's plan, not this child's ScopedTodo.
             max_continuations: 0,
             max_stall_recoveries: 0,
+            // WALL-CLOCK ceiling for the WHOLE dispatch. An absolute `Instant` computed ONCE here, so
+            // the continuation loop below re-enters with the SAME deadline rather than a fresh one —
+            // a per-continuation budget would let three budgets multiply into three times the ceiling,
+            // which is the bound this is meant to be. Steps say how MUCH work; this says by WHEN.
+            deadline: subagent_wall_deadline(),
             ..AgentConfig::default()
         };
 
@@ -588,7 +686,27 @@ impl Tool for TaskTool {
         }
 
         // Live status for `/workflows` — RAII so a panic mid-dispatch still leaves a terminal row.
-        let track = crate::agent::orchestration::start_task(&header_label);
+        // `header_label` is the MODEL-facing string (it rides the result header), and it names the
+        // subject only when the model chose to pass a `label`. A dispatch without one showed the
+        // board a bare role — `coder`, for minutes, with nothing about what it went off to do. Fall
+        // back to the prompt's opening line here (not in `header_label`: the result header should
+        // not grow a clip of the prompt the model itself wrote). Same helper as the spawn line, so
+        // one run cannot appear under two different names on two surfaces.
+        let board_label = match user_label {
+            Some(_) => header_label.clone(),
+            None => {
+                let subject = crate::agent::subagent_subject(args, 44);
+                if subject.is_empty() {
+                    header_label.clone()
+                } else {
+                    format!("{header_label} · {subject}")
+                }
+            }
+        };
+        let track = crate::agent::orchestration::start_task(board_label);
+        // Publish the stop handle only now that the row exists, so the panel never shows a row whose
+        // advertised handle isn't wired up yet.
+        track.arm_stop(own_cancel);
 
         // Bridge sync→async on the CURRENT runtime (same one the reqwest client was built on).
         // MUST run on a Tokio MULTI-THREAD worker thread — `block_in_place` panics on a
@@ -673,6 +791,7 @@ impl Tool for TaskTool {
             // but the match must be total.
             crate::agent::StopReason::AwaitingInput(_) => "stopped to ask (no interactive user)",
             crate::agent::StopReason::Cancelled => "cancelled by user",
+            crate::agent::StopReason::Deadline => "hit its time limit",
         };
         let body = outcome
             .final_text
@@ -753,6 +872,12 @@ fn stop_body_warning(stop: &crate::agent::StopReason) -> Option<&'static str> {
         crate::agent::StopReason::AwaitingInput(_) => Some(
             "[INCOMPLETE — the sub-agent stopped to ask a question that no interactive user can answer here.]",
         ),
+        // Says TIME rather than steps, and says nobody cancelled: a parent that reads "cancelled" or
+        // "step limit" would draw the wrong next move (re-ask the user vs. raise max_steps) when the
+        // actual fix is a longer deadline or a smaller dispatch.
+        crate::agent::StopReason::Deadline => Some(
+            "[INCOMPLETE — the sub-agent ran out of TIME (its wall-clock limit), not steps, and nobody cancelled it. The work below is whatever it had reached; it was cut off mid-task.]",
+        ),
     }
 }
 
@@ -765,6 +890,9 @@ fn stop_body_warning(stop: &crate::agent::StopReason) -> Option<&'static str> {
 /// - `Cancelled` — the user said stop. Never override that.
 /// - `AwaitingInput` — unreachable for a sub-agent (no `clarify` in any sub-registry: nobody to
 ///   answer), and resuming would loop on a question that can never be answered.
+/// - `Deadline` — MUST NOT resume, and this is the load-bearing case: the wall-clock limit exists to
+///   bound total time, so handing the run a fresh budget would restart the clock and make the limit
+///   unenforceable. A continuation here would silently undo the ceiling it just hit.
 fn is_resumable(stop: &crate::agent::StopReason, continuations_used: u32) -> bool {
     matches!(stop, crate::agent::StopReason::MaxIters) && continuations_used < MAX_CONTINUATIONS
 }
@@ -842,17 +970,47 @@ pub(crate) fn dispatch_is_read_only(r: &crate::agent::tools::ToolRegistry) -> bo
 /// from real OS/model resources, so the cap is global too).
 static ACTIVE_SUBAGENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The concurrent sub-agent cap: `max_parallel_subagents` config, default 3, clamped 1..=5.
+/// Absolute disaster-stop on concurrent sub-agents. NOT the old hard `5`: this only exists so a
+/// nonsense config/env value (or a machine reporting a huge core count) can't fan hundreds of model
+/// loops at one gateway. Real limiting is the machine-derived default below; the model itself
+/// decides how many tasks to request.
+const HARD_CEILING: usize = 64;
+
+/// Machine-derived default width when neither env nor config pins one. Sub-agents are network-bound
+/// (each waits on the gateway), so the core count is a sensible proxy for "how many in-flight calls
+/// this machine should juggle" — floored at 2 so even a 1-core box still fans out a little, capped
+/// at 16 so a many-core box doesn't blast a single gateway with 429s.
+fn machine_default_subagents() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, 16)
+}
+
+/// Env override for the concurrent sub-agent cap. Wins over config (power-user / test knob), same
+/// shape as the other `AIZEN_*` env knobs in `cli_config`. Clamped to `1..=HARD_CEILING`.
+const MAX_SUBAGENTS_ENV: &str = "AIZEN_MAX_SUBAGENTS";
+
+/// The concurrent sub-agent cap.
 fn max_parallel_subagents() -> usize {
     max_parallel_subagents_pub()
 }
 
 /// Public read of the concurrent sub-agent cap (for `/workflows` status).
+///
+/// Resolution order: `AIZEN_MAX_SUBAGENTS` env → `max_parallel_subagents` config → machine-derived
+/// default (`available_parallelism`, band 2..=16). Env and config may raise the cap ABOVE the old
+/// hard 5 — the only ceiling now is `HARD_CEILING`, a disaster-stop, not a product limit.
 pub(crate) fn max_parallel_subagents_pub() -> usize {
-    crate::core::cli_config::load()
-        .max_parallel_subagents
-        .unwrap_or(3)
-        .clamp(1, 5)
+    if let Ok(v) = std::env::var(MAX_SUBAGENTS_ENV) {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            return n.clamp(1, HARD_CEILING);
+        }
+    }
+    match crate::core::cli_config::load().max_parallel_subagents {
+        Some(n) => n.clamp(1, HARD_CEILING),
+        None => machine_default_subagents(),
+    }
 }
 
 /// How many sub-agent slots are currently held (process-global gate).
@@ -1177,12 +1335,18 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
+        // PIN THE CAP. The production default is now machine-derived (`available_parallelism`), so
+        // the assertions below would drift with the CI box's core count. The env knob wins over both
+        // config and the machine default (that precedence is exactly why it exists), so force cap=3
+        // here to keep this a deterministic gate test. Removed at the end (still under both locks).
+        std::env::set_var(MAX_SUBAGENTS_ENV, "3");
+
         // Drain any leftover slots from a panicked sibling test so this assertion is hermetic.
         while ACTIVE_SUBAGENTS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
             ACTIVE_SUBAGENTS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
 
-        // try_acquire: default cap is 3 — three slots acquire, the fourth refuses, a drop frees one.
+        // try_acquire: pinned cap is 3 — three slots acquire, the fourth refuses, a drop frees one.
         let a = SubagentSlot::try_acquire().expect("slot 1");
         let b = SubagentSlot::try_acquire().expect("slot 2");
         let c = SubagentSlot::try_acquire().expect("slot 3");
@@ -1213,6 +1377,46 @@ mod tests {
             "asking for fewer than the cap yields exactly that many"
         );
         drop(one);
+        std::env::remove_var(MAX_SUBAGENTS_ENV);
+    }
+
+    #[test]
+    fn cap_resolution_env_wins_and_clamps_to_hard_ceiling() {
+        // Same two-lock discipline as the gate test: the env knob is process-global, and
+        // `max_parallel_subagents_pub` reads config (which the sandbox tests repoint via AIZEN_HOME).
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // A sane env value is honoured verbatim (this is what lets the model's requested width through
+        // above the old hard 5).
+        std::env::set_var(MAX_SUBAGENTS_ENV, "12");
+        assert_eq!(max_parallel_subagents_pub(), 12, "env cap honoured as-is");
+
+        // A nonsense value can't blow past the disaster-stop.
+        std::env::set_var(MAX_SUBAGENTS_ENV, "100000");
+        assert_eq!(
+            max_parallel_subagents_pub(),
+            HARD_CEILING,
+            "env clamps down to the hard ceiling"
+        );
+
+        // 0 clamps up to the floor of 1 (never zero — that would deadlock every fan-out).
+        std::env::set_var(MAX_SUBAGENTS_ENV, "0");
+        assert_eq!(max_parallel_subagents_pub(), 1, "env clamps up to 1");
+
+        // Garbage env → fall through to config/machine default (not a panic, not zero).
+        std::env::set_var(MAX_SUBAGENTS_ENV, "not-a-number");
+        assert!(
+            max_parallel_subagents_pub() >= 1,
+            "garbage env falls through to a sane default"
+        );
+
+        std::env::remove_var(MAX_SUBAGENTS_ENV);
+
+        // The machine default itself stays inside its safety band regardless of the host core count.
+        let d = machine_default_subagents();
+        assert!((2..=16).contains(&d), "machine default in band 2..=16, got {d}");
     }
 
     #[test]
@@ -1269,9 +1473,16 @@ mod tests {
             VerificationFailed,
             Cancelled,
             AwaitingInput("q?".into()),
+            Deadline,
         ] {
             assert!(!is_resumable(&stop, 0), "{stop:?} must not be resumed");
         }
+        // Deadline is the load-bearing one: a continuation would restart the wall clock, so granting
+        // it here would make the time limit unenforceable no matter how much budget remains.
+        assert!(
+            !is_resumable(&Deadline, 0),
+            "a time-limited run must never earn a fresh budget — that restarts the clock"
+        );
     }
 
     #[test]
@@ -1285,13 +1496,87 @@ mod tests {
         assert!(v.contains("may be broken"), "{v}");
         // Everything else at least marks the work as partial, so a parent never builds on a
         // half-finished dispatch believing it finished.
-        for stop in [Divergence, MaxIters, Cancelled, AwaitingInput("q?".into())] {
+        for stop in [
+            Divergence,
+            MaxIters,
+            Cancelled,
+            AwaitingInput("q?".into()),
+            Deadline,
+        ] {
             let w = stop_body_warning(&stop).unwrap_or_else(|| panic!("{stop:?} must warn"));
             assert!(w.starts_with('['), "{stop:?} → {w}");
             assert!(
                 w.contains("INCOMPLETE") || w.contains("CANCELLED"),
                 "{stop:?} → {w}"
             );
+        }
+        // A deadline must not read like either of the two stops a parent would confuse it with: not
+        // "cancelled" (nobody pressed anything, so the parent would ask the user about a keypress that
+        // never happened) and not a step limit (whose fix is a bigger `max_steps`, not a longer clock).
+        let d = stop_body_warning(&Deadline).expect("a deadline must warn");
+        assert!(d.contains("TIME"), "must name time as the cause: {d}");
+        assert!(
+            d.contains("nobody cancelled"),
+            "must rule out a user cancel: {d}"
+        );
+        assert!(
+            !d.contains("step limit"),
+            "must not blame the step budget: {d}"
+        );
+    }
+
+    #[test]
+    fn the_dispatch_wall_clock_is_generous_bounded_and_opt_outable() {
+        // Env is process-global; share the lock every env-touching test in this crate uses.
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const K: &str = "AIZEN_SUBAGENT_WALL_SECS";
+        let prior = std::env::var(K).ok();
+
+        // Default: ON, and bounding the WHOLE dispatch — so it must exceed a single call's ceiling,
+        // otherwise the run would die before one legitimate slow call could even finish.
+        std::env::remove_var(K);
+        let d = subagent_wall_deadline().expect("a dispatch must be time-bounded by default");
+        let budget = d.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            budget > subagent_call_timeout(),
+            "the run ceiling must be larger than one call's: {budget:?}"
+        );
+        assert!(
+            budget <= SUBAGENT_WALL_TIMEOUT,
+            "never longer than the constant: {budget:?}"
+        );
+
+        // Explicit opt-out for anyone who wants the old unbounded-in-time behavior.
+        std::env::set_var(K, "0");
+        assert!(
+            subagent_wall_deadline().is_none(),
+            "0 must disable the ceiling outright"
+        );
+
+        // A floor, because the failure mode of a too-tight value is silent and confusing: every
+        // dispatch would die before its first model call returned, which reads as a broken build.
+        std::env::set_var(K, "5");
+        let tight = subagent_wall_deadline()
+            .expect("a tight value is still a ceiling")
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            tight >= SUBAGENT_WALL_FLOOR.saturating_sub(Duration::from_secs(2)),
+            "a too-small value must clamp up to the floor, got {tight:?}"
+        );
+
+        // Garbage falls back to the default rather than disabling the ceiling — a typo must not
+        // silently remove the bound.
+        std::env::set_var(K, "not-a-number");
+        assert!(
+            subagent_wall_deadline().is_some(),
+            "an unparseable value must not disable the ceiling"
+        );
+
+        match prior {
+            Some(v) => std::env::set_var(K, v),
+            None => std::env::remove_var(K),
         }
     }
 

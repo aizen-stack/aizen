@@ -153,13 +153,22 @@ fn norm_key(p: &std::path::Path) -> String {
     s.to_lowercase()
 }
 
-/// Does `recorded` cwd belong to `project_root`? True when either is an ancestor of the other —
-/// launching the foreign CLI from a SUBDIR of the repo still counts as "this project", and so does
-/// the foreign CLI having recorded the repo root while aizen is run from a subdir.
+/// Does `recorded` cwd belong to `project_root`? True when it IS the root or lives UNDER it —
+/// launching the foreign CLI from a SUBDIR of the repo still counts as "this project".
+///
+/// The reverse direction — a recorded cwd that is an ANCESTOR of the root — looks symmetric but is
+/// deliberately NOT a match. `config::project_root()` already resolves to the checkout's toplevel
+/// (git `--show-toplevel`, or the OUTERMOST VCS/manifest marker when git is unusable), so a cwd
+/// shallower than it lies outside the project boundary by construction; the only dirs it can name
+/// are marker-less parents. Honoring it made every transcript ever recorded in such a parent match
+/// every project beneath it — on this developer's machine a `~` launch matched all eight — which is
+/// the same collapse-everything-into-one-zone failure `project_root`'s home-bound walk exists to
+/// prevent. And the cost is not just a noisy picker: importing an over-matched transcript stamps
+/// THIS project's provenance onto a conversation from another one, and that stamp cannot be undone.
 fn cwd_matches(recorded: &str, project_root: &std::path::Path) -> bool {
     let rec = norm_key(std::path::Path::new(recorded));
     let proj = match_key(project_root);
-    rec == proj || rec.starts_with(&format!("{proj}/")) || proj.starts_with(&format!("{rec}/"))
+    rec == proj || rec.starts_with(&format!("{proj}/"))
 }
 
 /// Scan both foreign roots for transcripts whose recorded cwd belongs to `project_root`, newest
@@ -1269,6 +1278,33 @@ mod tests {
         assert!(found
             .iter()
             .all(|s| s.cli == Cli::Claude || s.cli == Cli::Codex));
+    }
+
+    /// The project filter is deliberately ONE-directional, and both directions are pinned here
+    /// because the symmetric version reads more natural and is wrong.
+    ///
+    /// Measured on the developer's real `~/.claude` + `~/.codex` before this was narrowed: 18 Claude
+    /// transcripts would have been offered for the aizen checkout, of which 9 were genuine and 9 were
+    /// ancestor over-matches (6 recorded in `~` itself, 3 in the parent `mini_project/` — a folder
+    /// that also holds nextgen, bot_banhang_tele and three aizen_* siblings). Codex added two more
+    /// from `mini_project` and one from `~`.
+    #[test]
+    fn cwd_filter_accepts_subdirs_and_rejects_ancestors() {
+        let root = std::path::Path::new(r"C:\Users\me\proj\aizen");
+        // Exact, including the drive-letter casing Claude and Codex disagree about.
+        assert!(cwd_matches(r"C:\Users\me\proj\aizen", root));
+        assert!(cwd_matches(r"c:\users\me\proj\aizen", root));
+        assert!(cwd_matches(r"C:\Users\me\proj\aizen\", root), "trailing sep");
+        // Launched from a subdir of the checkout — still this project.
+        assert!(cwd_matches(r"C:\Users\me\proj\aizen\crates\core", root));
+        // A PARENT of the checkout is not this project. `project_root` already resolved to the
+        // toplevel, so these can only be marker-less parents holding unrelated siblings.
+        assert!(!cwd_matches(r"C:\Users\me\proj", root), "parent dir");
+        assert!(!cwd_matches(r"C:\Users\me", root), "home dir");
+        // A sibling whose path is a string PREFIX of the root must not match either — the guard is
+        // the `/` in the prefix test, and dropping it would pull `aizen_be`/`aizen_web` in.
+        assert!(!cwd_matches(r"C:\Users\me\proj\aizen_be", root));
+        assert!(!cwd_matches(r"C:\Users\me\proj\aizen_web", root));
     }
 
     // ── picker row ────────────────────────────────────────────────────────────

@@ -129,30 +129,34 @@ pub fn terminate_tree(containment: &Containment) {
 /// arrives through `tx`, and a lapsed `recv_timeout` means the thread is still parked on a pipe that
 /// nobody is going to close. We then abandon it — a detached thread blocked in `read` costs one stack
 /// and exits if EOF ever arrives, which beats blocking the caller forever.
-pub fn join_drain(handle: std::thread::JoinHandle<String>, deadline: Duration) -> (String, bool) {
+pub fn join_drain<T: Send + Default + 'static>(
+    handle: std::thread::JoinHandle<T>,
+    deadline: Duration,
+) -> (T, bool) {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(handle.join().unwrap_or_default());
     });
     match rx.recv_timeout(deadline) {
-        Ok(text) => (text, false),
-        Err(_) => (String::new(), true),
+        Ok(value) => (value, false),
+        Err(_) => (T::default(), true),
     }
 }
 
-/// Read a pipe to a lossily-decoded string.
+/// Read a pipe to raw bytes — the byte-exact basis for both output shapes.
 ///
-/// Deliberately NOT `read_to_string`: that returns `Err` and leaves the buffer EMPTY at the first
-/// invalid UTF-8 byte, so on a non-English Windows the OEM-codepage output of `dir` and friends is
-/// dropped wholesale. Lossy decode keeps the structure and degrades only the odd byte.
-fn read_lossy<R: std::io::Read>(pipe: Option<R>) -> String {
+/// Deliberately `read_to_end` rather than `read_to_string`: the latter returns `Err` and leaves the
+/// buffer EMPTY at the first invalid UTF-8 byte, so on a non-English Windows the OEM-codepage output
+/// of `dir` and friends would be dropped wholesale. Callers that want text decode these bytes
+/// lossily (see [`output_bounded`]), which keeps the structure and degrades only the odd byte.
+fn read_raw<R: std::io::Read>(pipe: Option<R>) -> Vec<u8> {
     match pipe {
         Some(mut p) => {
             let mut bytes = Vec::new();
             let _ = p.read_to_end(&mut bytes);
-            String::from_utf8_lossy(&bytes).into_owned()
+            bytes
         }
-        None => String::new(),
+        None => Vec::new(),
     }
 }
 
@@ -165,6 +169,34 @@ pub struct BoundedOutput {
     pub timed_out: bool,
     /// A drain thread was still blocked at the grace deadline, so the text above may be short.
     pub output_truncated: bool,
+}
+
+/// What [`output_bounded_bytes`] came back with — identical to [`BoundedOutput`] but BYTE-EXACT.
+///
+/// Required by callers whose stdout is binary and must survive verbatim: `git cat-file blob` hands
+/// back file contents, and decoding those through `String::from_utf8_lossy` would replace every
+/// invalid byte with U+FFFD — silently corrupting any non-UTF-8 file a checkpoint restores or diffs.
+/// `-z`-separated git output has the same requirement (NUL-delimited, byte-exact paths).
+pub struct BoundedBytes {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// `None` when the command was killed at the deadline.
+    pub code: Option<i32>,
+    pub timed_out: bool,
+    /// A drain thread was still blocked at the grace deadline, so the output above may be short.
+    pub output_truncated: bool,
+}
+
+impl BoundedBytes {
+    /// Did the command exit successfully? (`false` for a timeout kill, which has no code — the
+    /// distinction matters: a killed child must never read as success.)
+    ///
+    /// Currently exercised only by this module's tests; production callers rebuild a real
+    /// `ExitStatus` from `code` instead (see `timemachine::run_git_bounded`).
+    #[allow(dead_code)]
+    pub fn success(&self) -> bool {
+        self.code == Some(0)
+    }
 }
 
 /// Run `cmd` to completion under a wall-clock deadline, with the whole process tree contained.
@@ -181,6 +213,26 @@ pub fn output_bounded(
     timeout: Duration,
     drain_grace: Duration,
 ) -> std::io::Result<BoundedOutput> {
+    let raw = output_bounded_bytes(cmd, timeout, drain_grace)?;
+    Ok(BoundedOutput {
+        stdout: String::from_utf8_lossy(&raw.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&raw.stderr).into_owned(),
+        code: raw.code,
+        timed_out: raw.timed_out,
+        output_truncated: raw.output_truncated,
+    })
+}
+
+/// [`output_bounded`] without the lossy decode: stdout/stderr come back as raw bytes.
+///
+/// Use this whenever the child's stdout is binary or delimiter-exact (`git cat-file blob`, any `-z`
+/// output). [`output_bounded`] is a thin lossy wrapper over this function, so both share one
+/// containment/deadline implementation — a fix here reaches every bounded caller.
+pub fn output_bounded_bytes(
+    cmd: &mut Command,
+    timeout: Duration,
+    drain_grace: Duration,
+) -> std::io::Result<BoundedBytes> {
     use std::process::Stdio;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -191,8 +243,8 @@ pub fn output_bounded(
 
     let out_pipe = child.stdout.take();
     let err_pipe = child.stderr.take();
-    let oh = std::thread::spawn(move || read_lossy(out_pipe));
-    let eh = std::thread::spawn(move || read_lossy(err_pipe));
+    let oh = std::thread::spawn(move || read_raw(out_pipe));
+    let eh = std::thread::spawn(move || read_raw(err_pipe));
 
     let start = std::time::Instant::now();
     let mut timed_out = false;
@@ -213,7 +265,7 @@ pub fn output_bounded(
 
     let (stdout, out_cut) = join_drain(oh, drain_grace);
     let (stderr, err_cut) = join_drain(eh, drain_grace);
-    Ok(BoundedOutput {
+    Ok(BoundedBytes {
         stdout,
         stderr,
         code,
@@ -487,6 +539,114 @@ mod tests {
         assert!(
             reader_finished_within(&rx, std::time::Duration::from_secs(15)),
             "pipe reader still blocked after tree-kill — a descendant kept the write end open"
+        );
+    }
+
+    /// `output_bounded_bytes` must hand back stdout VERBATIM.
+    ///
+    /// The Time Machine reads file contents through `git cat-file blob`, so a lossy UTF-8 decode
+    /// anywhere on that path silently rewrites every invalid byte to U+FFFD — corrupting any
+    /// non-UTF-8 file a checkpoint captures, diffs, or restores. This pins the guarantee that made
+    /// it safe to route the Time Machine's git calls through the bounded runner at all.
+    #[test]
+    fn bounded_bytes_preserves_invalid_utf8() {
+        // 0xFF is never valid UTF-8. Getting a child to emit one, portably, is fiddlier than it
+        // looks, and two earlier fixtures failed for reasons worth recording so nobody re-tries them:
+        // a PowerShell `[Console]::OpenStandardOutput().Write(…)` one-liner is refused outright by
+        // AMSI ("script contains malicious content"), and `cmd /C type "<path>"` mis-parses the
+        // quotes Rust adds around an argument containing them.
+        //
+        // So: write the byte to a file, then read it back through the platform's cat with the
+        // child's WORKING DIRECTORY set and the bare filename as its own argument. No path — and
+        // therefore no quoting — ever reaches the command line, and the generated filename has no
+        // spaces. `dir`/`file` are captured by value so each call gets an independent Command.
+        let dir = std::env::temp_dir();
+        let name = format!(
+            "aizen-proctree-bytes-{}-{}.bin",
+            std::process::id(),
+            crate::core::persist::unique_sequence()
+        );
+        std::fs::write(dir.join(&name), [0x41u8, 0xFF, 0x42]).expect("write fixture");
+        let emit = || -> Command {
+            let mut c = if cfg!(windows) {
+                // `type` is a cmd builtin, so cmd is unavoidable here — but with cwd set, the only
+                // arguments are the literal words `type` and the filename.
+                let mut c = Command::new("cmd");
+                c.arg("/C").arg("type").arg(&name);
+                c
+            } else {
+                let mut c = Command::new("cat");
+                c.arg(&name);
+                c
+            };
+            c.current_dir(&dir);
+            c
+        };
+        let mut cmd = emit();
+        let out = output_bounded_bytes(
+            &mut cmd,
+            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(2),
+        )
+        .expect("bounded run");
+        assert!(!out.timed_out, "trivial command must not hit the deadline");
+        // Precondition: the fixture actually produced output. Without this, an unlaunchable shell
+        // makes the byte assertion below fail for the wrong reason.
+        assert!(
+            !out.stdout.is_empty(),
+            "fixture produced no output (code={:?}, stderr={:?}) — the shell never ran, so this \
+             test proves nothing about byte fidelity",
+            out.code,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stdout.contains(&0xFF),
+            "raw 0xFF byte was not preserved (stdout={:?}) — a lossy decode crept back in",
+            out.stdout
+        );
+        // And the lossy wrapper must still be lossy, proving the two shapes are genuinely distinct
+        // — same fixture, so the only difference under test is the decode.
+        let mut cmd2 = emit();
+        let lossy = output_bounded(
+            &mut cmd2,
+            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(2),
+        )
+        .expect("bounded run");
+        assert!(
+            lossy.stdout.contains('\u{FFFD}'),
+            "the String wrapper should have replaced the invalid byte, got {:?}",
+            lossy.stdout
+        );
+        let _ = std::fs::remove_file(dir.join(&name));
+    }
+
+    /// The deadline must actually fire and report `timed_out`, converting a wedged child into a
+    /// RETURN rather than a permanent park. This is the property the whole lock fix rests on: a
+    /// caller holding `transaction.lock` can only release it by returning.
+    #[test]
+    fn bounded_run_returns_on_deadline_instead_of_blocking() {
+        // Reuse the MEASURED long-lived fixture rather than `ping`: this module's own notes record
+        // that `ping` dies with its wrapper here, and it may not even be on PATH — either way the
+        // child would exit immediately and the deadline would never be exercised.
+        let mut cmd = shell(&sleeper_command());
+        let start = std::time::Instant::now();
+        let out = output_bounded_bytes(
+            &mut cmd,
+            std::time::Duration::from_millis(700),
+            std::time::Duration::from_secs(2),
+        )
+        .expect("bounded run must return, not block");
+        let elapsed = start.elapsed();
+        assert!(
+            out.timed_out,
+            "a 40s command under a 0.7s deadline must report timed_out"
+        );
+        assert_eq!(out.code, None, "a killed child has no exit code");
+        assert!(!out.success(), "a timed-out run must not look successful");
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "returned only after {elapsed:?} — the deadline did not preempt the child"
         );
     }
 }

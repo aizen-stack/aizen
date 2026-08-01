@@ -1884,7 +1884,7 @@ async fn run_serve_turn(
     let summarize = move |msgs: Vec<Message>| {
         let ep = sum_ep.clone();
         async move {
-            client::chat_with_tools(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+            chore_chat(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
                 .await
                 .map(|t| t.content.unwrap_or_default())
         }
@@ -3881,7 +3881,7 @@ async fn persona_paste_interactive(history: &mut Vec<Message>, model: &str) -> R
     );
     let usr = Message::user(format!("Pasted character prompt:\n{pasted}"));
     println!("{}", style("distilling into a persona card…").dim());
-    let resp = client::chat_with_tools(&http, &base_url, &api_key, &model_id, &[sys, usr], &[])
+    let resp = chore_chat(&http, &base_url, &api_key, &model_id, &[sys, usr], &[])
         .await
         .context("model call failed")?;
     let content = resp.content.unwrap_or_default();
@@ -4848,6 +4848,35 @@ impl Drop for TurnCancelGuard {
     }
 }
 
+/// Closes the steering mailbox on every exit path, re-queueing anything the turn never picked up.
+///
+/// Pairs with [`TurnCancelGuard`], and for the same reason: the mailbox is now armed BEFORE the turn's
+/// prep (so a steer typed during retrieval reaches the run instead of the queue), and prep has several
+/// early `continue`s — an unconfigured endpoint, a `#remember`/`!shell` input, an Esc during prep. A
+/// mailbox left armed past one of those would accept steers into a slot nothing drains: the input
+/// thread would see `is_armed()` and hand over a message that then sat there until some later turn
+/// armed it again and `arm()`'s clear discarded it. Silently eating user input is worse than queueing
+/// it, which is what makes this guard the thing that licenses arming early at all.
+///
+/// Leftovers come back as ordinary submissions so a steer typed in the last instants of a turn runs as
+/// the next one rather than vanishing. Idempotent: the normal end-of-turn path disarms explicitly, so
+/// this fires on an already-empty, already-closed mailbox and does nothing.
+struct SteerMailboxGuard(tokio::sync::mpsc::UnboundedSender<tui::Submission>);
+
+impl Drop for SteerMailboxGuard {
+    fn drop(&mut self) {
+        for leftover in crate::core::steer::disarm() {
+            if self
+                .0
+                .send(tui::Submission::Chat(leftover, Vec::new()))
+                .is_ok()
+            {
+                tui::note_submission_enqueued();
+            }
+        }
+    }
+}
+
 /// Run a slash command's network call as INTERRUPTIBLE work. `None` means the user pressed Esc.
 ///
 /// Slash handlers that call the model (`/compact`, `/handoff`) used to `await` straight inside the
@@ -4934,6 +4963,7 @@ async fn run_menu_sticky() -> Result<()> {
     if !tui::activate(&intro, &status_text(&history, &model_label)) {
         return run_menu_plain().await;
     }
+    tui::set_ultimate(cli_config::ultimate_enabled()); // open the input box in the right colour (gold if ultimate)
     install_exit_flush_handler(); // flush the live chat if the terminal window is closed (Windows ✕)
     {
         let (main, notes) = identity_banner();
@@ -4989,6 +5019,10 @@ async fn run_menu_sticky() -> Result<()> {
     spawn_health_poller();
     spawn_reconcile_pass();
     let mut input = tui::spawn_input();
+    // Off-to-the-side Q&A: a long-lived worker answers `?`-prefixed questions on its OWN thread,
+    // reading a read-only snapshot of the live conversation, WITHOUT touching the turn in flight
+    // (no history mutation, no cancel, no WORKING). See `core::aside`.
+    spawn_aside_worker(http.clone());
 
     loop {
         let sub = match input.submissions.recv().await {
@@ -5060,6 +5094,20 @@ async fn run_menu_sticky() -> Result<()> {
                 let turn_cancel = crate::core::cancel::TurnCancel::new();
                 tui::arm_cancel(turn_cancel.clone());
                 let _cancel_guard = TurnCancelGuard(turn_cancel.clone());
+                // OPEN THE STEERING MAILBOX IN THE SAME BREATH, for the same window and the same
+                // reason. This used to sit ~150 lines below, just before `set_working(true)`, which
+                // made the two flags disagree for the whole prep span above: `turn_in_flight()` reads
+                // the ARMED TOKEN and was already true, while `steer::is_armed()` was still false. The
+                // input thread's `>` prefix (and Alt+Enter) asks the mailbox, so every steer typed
+                // during prep was refused and fell through to the post-turn queue — the user sees the
+                // turn starting, types `> also do X`, and watches it queue instead. Retrieval is the
+                // slow part of prep, so the window was widest exactly on the big tasks worth steering.
+                //
+                // The guard is what makes arming this early safe: three `continue`s below abort prep,
+                // and a mailbox left armed with no turn behind it would swallow steers into a slot
+                // nothing drains.
+                crate::core::steer::arm();
+                let _steer_guard = SteerMailboxGuard(input.inject.clone());
                 // Input-box affordances on a typed message (skipped for a vision message): `#remember`
                 // / `!shell-escape` run no turn; a normal message has its `@file`·`` !`cmd` `` expanded.
                 let echo_src = line.clone();
@@ -5190,6 +5238,14 @@ async fn run_menu_sticky() -> Result<()> {
                     enable_steering: true,
                     // Keep the exit-flush snapshot current DURING the turn, not just at its edges.
                     on_progress: Some(publish_live_history),
+                    // The user is sitting here waiting: retry a 429/5xx blip many times (like the
+                    // Claude CLI) before giving up, with FAST backoff (`interactive_backoff_ms`) so
+                    // the whole chain still fits in ~30–40s and then reports a clear error. 10 is a
+                    // CEILING, not a cost — a gateway that recovers on try 2 stops at 2, so the happy
+                    // path is unchanged. `/goal` does NOT take this branch (goal_mode retries
+                    // transient errors indefinitely — see agent/mod.rs), so raising this never
+                    // shortens a goal run.
+                    max_transient_retries: 10,
                     ..AgentConfig::default()
                 };
 
@@ -5203,21 +5259,10 @@ async fn run_menu_sticky() -> Result<()> {
                     cli_config::clear_effort_override();
                     continue;
                 }
-                // Open the steering mailbox for this turn: Alt+Enter now hands a message to the RUNNING
-                // loop (folded in at its next step) instead of the post-turn queue.
-                crate::core::steer::arm();
+                // (The steering mailbox was armed with the cancel token, before prep — see there.)
                 while input.cancel.try_recv().is_ok() {} // drain any stale wake-up
-                                                         // A quiet "here we go" line: the whimsical working verb ("✦ Pondering…") prints ONCE
-                                                         // into the scrolling transcript at turn start, so each run opens on a fresh word —
-                                                         // instead of the verb cycling in the cramped HUD pill. This path only runs under the
-                                                         // sticky TUI (already a TTY); silenced with tips off (`AIZEN_NO_TIPS`).
-                if !cli_config::branded_flag("NO_TIPS") {
-                    tui::emit_line(
-                        &style(format!("✦ {}…", tui::next_work_verb()))
-                            .color256(splash::ACCENT)
-                            .to_string(),
-                    );
-                }
+                // NOTE: the "✦ Pondering…" turn-start verb is now the bottom-of-transcript working
+                // line (see `working_line` in retained.rs) — no separate emit needed here.
                 // Arm LAST: the keyboard thread only queues a cancel once WORKING is true, so flipping
                 // it after the clear+drain guarantees no Esc meant for THIS turn gets swallowed in the
                 // arming window.
@@ -5270,7 +5315,7 @@ async fn run_menu_sticky() -> Result<()> {
                     let summarize = move |msgs: Vec<Message>| {
                         let ep = sum_ep.clone();
                         async move {
-                            client::chat_with_tools(
+                            chore_chat(
                                 http_ref,
                                 &ep.base_url,
                                 &ep.api_key,
@@ -5299,7 +5344,7 @@ async fn run_menu_sticky() -> Result<()> {
                             move |msgs: Vec<Message>| {
                                 let ep = ep.clone();
                                 async move {
-                                    client::chat_with_tools(
+                                    chore_chat(
                                         http_ref,
                                         &ep.base_url,
                                         &ep.api_key,
@@ -5331,10 +5376,14 @@ async fn run_menu_sticky() -> Result<()> {
                 };
                 tui::set_working(false);
                 tui::disarm_cancel(&turn_cancel);
-                // Close the steering mailbox. Anything typed in the last instants of the turn (after
-                // the loop's final drain) comes back here rather than vanishing — re-inject it as an
-                // ordinary submission so it runs as the next turn. On Esc the `None` arm below flushes
-                // the queue, which is the right call there: stop means stop.
+                // Close the steering mailbox HERE, on the normal path, so leftovers are re-injected
+                // before `seal_turn` and in order. Anything typed in the last instants of the turn
+                // (after the loop's final drain) comes back rather than vanishing. On Esc the `None`
+                // arm below flushes the queue, which is the right call there: stop means stop.
+                //
+                // `_steer_guard` is the BACKSTOP, not a duplicate: it covers the prep-window
+                // `continue`s and a panic, which never reach this line. `disarm` is idempotent
+                // (second call yields nothing), so whichever runs first wins and the other is a no-op.
                 for leftover in crate::core::steer::disarm() {
                     let _ = input
                         .inject
@@ -5699,6 +5748,12 @@ async fn run_menu_plain() -> Result<()> {
             // Same mid-turn snapshot as the sticky REPL: an abrupt close mid-turn keeps the work
             // done so far instead of only the question.
             on_progress: Some(publish_live_history),
+            // User is sitting here waiting: retry a 429/5xx blip many times (like Claude CLI) with
+            // FAST backoff (interactive_backoff_ms), so the whole chain stays inside ~30–40s then
+            // reports a clean error. `/goal` does NOT take this path (goal_mode is separate, retries
+            // transient forever) — see agent/mod.rs. This is only a CEILING: a blip that clears on
+            // retry 2 stops at 2, so the success path is not slowed.
+            max_transient_retries: 10,
             ..AgentConfig::default()
         };
         let http_ref = &http;
@@ -5729,7 +5784,7 @@ async fn run_menu_plain() -> Result<()> {
         let summarize = move |msgs: Vec<Message>| {
             let ep = sum_ep.clone();
             async move {
-                client::chat_with_tools(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+                chore_chat(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
                     .await
                     .map(|t| t.content.unwrap_or_default())
             }
@@ -5749,16 +5804,9 @@ async fn run_menu_plain() -> Result<()> {
                 move |msgs: Vec<Message>| {
                     let ep = ep.clone();
                     async move {
-                        client::chat_with_tools(
-                            http_ref,
-                            &ep.base_url,
-                            &ep.api_key,
-                            &ep.model,
-                            &msgs,
-                            &[],
-                        )
-                        .await
-                        .map(|t| t.content.unwrap_or_default())
+                        chore_chat(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+                            .await
+                            .map(|t| t.content.unwrap_or_default())
                     }
                 }
             });
@@ -5878,6 +5926,40 @@ async fn maybe_auto_compact(
     }
 }
 
+/// Wrap a background / chore model call in the SAME per-call wall-clock deadline a sub-agent gets
+/// ([`crate::agent::task_tool::subagent_call_timeout`], default 300s, `AIZEN_SUBAGENT_CALL_SECS`).
+///
+/// Every one of these is a NON-streaming `chat_with_tools` call — compaction / handoff summaries, the
+/// end-of-turn secretary, persona reflection, memory reconcile, the oracle reviewer, persona distill.
+/// None is streamed, so the streaming path's inter-event stall watchdog never applies; the shared
+/// client carries no total-request ceiling (removed so a long *streamed* turn isn't cut — see
+/// `http_client`); and `read_timeout` resets on every byte, so a gateway that keepalive-drips without
+/// ever finishing the body parks the background task (or, for the by-hand ones, the CLI) forever. A
+/// flat per-call cap is exactly right here — one call, one answer, no legitimate multi-minute stream.
+/// On timeout it returns an ordinary `Err`, which every caller already treats as best-effort.
+async fn chore_chat(
+    http: &reqwest::Client,
+    base: &str,
+    key: &str,
+    model: &str,
+    msgs: &[Message],
+    tools: &[ToolDef],
+) -> Result<client::ChatTurn> {
+    let deadline = crate::agent::task_tool::subagent_call_timeout();
+    match tokio::time::timeout(
+        deadline,
+        client::chat_with_tools(http, base, key, model, msgs, tools),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!(
+            "chore model call exceeded {}s with no response (raise AIZEN_SUBAGENT_CALL_SECS)",
+            deadline.as_secs()
+        )),
+    }
+}
+
 /// Is the `summarizer` role pointed at its OWN endpoint, or does it fall through to the main model?
 ///
 /// Decides the secretary's input ceiling. When it falls through, every chore call bills the model
@@ -5983,9 +6065,7 @@ async fn maybe_run_secretary(
     // number is cost per turn. Counting only successes would understate exactly the spend the gate
     // exists to control.
     memory::stats::note_secretary_call();
-    let resp = match client::chat_with_tools(http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
-        .await
-    {
+    let resp = match chore_chat(http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[]).await {
         Ok(t) => t,
         Err(_) => return, // best-effort; never disrupt the REPL
     };
@@ -6350,7 +6430,7 @@ async fn run_persona_reflection(
         persona::reflect::build_reflection_prompt(&persona.name, &persona.role, &episodes);
     // Chore-class synthesis call → billed to the summarizer role, like every other harness chore.
     let ep = summarizer_endpoint(base, key, model);
-    let resp = match client::chat_with_tools(
+    let resp = match chore_chat(
         http,
         &ep.base_url,
         &ep.api_key,
@@ -7074,6 +7154,13 @@ fn surface_abnormal_stop(outcome: &AgentOutcome) {
         // wiring slip rather than a real state — still say something instead of swallowing it.
         StopReason::Cancelled => format!("⚠ stopped: cancelled after {} step(s).", outcome.iters),
         StopReason::AwaitingInput(q) => format!("❓ {q}"),
+        // Only reachable if a wall-clock budget was set on this run (no top-level default), so name
+        // the knob — otherwise the user cannot tell a deadline from a step limit or a crash.
+        StopReason::Deadline => format!(
+            "⚠ stopped: wall-clock budget reached after {} step(s) — the task may be incomplete. \
+             Say \"continue\" to carry on, or raise AIZEN_SUBAGENT_WALL_SECS.",
+            outcome.iters
+        ),
     };
     let painted = theme::err(line).to_string();
     if tui::active() {
@@ -7411,7 +7498,7 @@ async fn compact_history(
     let summarize = move |msgs: Vec<Message>| {
         let ep = sum_ep.clone();
         async move {
-            client::chat_with_tools(http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+            chore_chat(http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
                 .await
                 .map(|t| t.content.unwrap_or_default())
         }
@@ -7437,7 +7524,7 @@ async fn handoff_now(history: &[Message], goal: &str) -> Result<String> {
     let ep = summarizer_endpoint(&base, &key, &model);
     let prompt = agent::compact::handoff_prompt(history, goal);
     let summary =
-        client::chat_with_tools(&http, &ep.base_url, &ep.api_key, &ep.model, &prompt, &[])
+        chore_chat(&http, &ep.base_url, &ep.api_key, &ep.model, &prompt, &[])
             .await?
             .content
             .unwrap_or_default();
@@ -7623,10 +7710,21 @@ async fn slash_tools(_arg: &str) {
     tui::emit_line(&agent::toolsets::format_config_status());
 }
 
-async fn slash_workflows(_arg: &str) {
-    let status = agent::orchestration::format_status();
-    if !tui::retained_overlay_open("Activity", &status) {
-        tui::emit_line(&status);
+/// `/workflows` — live multi-agent activity. In retained mode the panel REFRESHES itself (elapsed
+/// times tick while you watch); on a pipe/CI it degrades to a single printed snapshot.
+///
+/// `/workflows stop <id>` cancels one running row without touching the rest of the turn: Esc is
+/// all-or-nothing (it cancels the whole turn), so a fan-out with one child stuck behind a slow model
+/// call previously left the user no choice but to kill everything.
+async fn slash_workflows(arg: &str) {
+    // Shared with the input thread's mid-turn fast path, so an idle stop and a mid-turn stop cannot
+    // report the same action differently.
+    if let Some(note) = agent::orchestration::try_stop_command(arg) {
+        tui::emit_line(&theme::muted(note).to_string());
+        return;
+    }
+    if !tui::retained_overlay_open_live("Activity", agent::orchestration::format_status) {
+        tui::emit_line(&agent::orchestration::format_status());
     }
 }
 
@@ -8745,6 +8843,10 @@ async fn handle_slash(
                 Ok(_) => tui::emit_line(&style("ultimate OFF — effort back to auto-detect, no orchestration nudge.").dim().to_string()),
                 Err(e) => tui::emit_line(&format!("{} {e}", style("ultimate:").red())),
             }
+            // Recolour the input box to match: gold framing while ultimate is ON (mirrors the
+            // `✦ ultimate` status chip), moonlight when OFF. Reflects the effective state — an
+            // env-forced ON wins over the toggle, so read it back rather than trusting `now`.
+            tui::set_ultimate(cli_config::ultimate_enabled());
             if std::env::var("AIZEN_ULTIMATE").is_ok() {
                 tui::emit_line(&style("(note: AIZEN_ULTIMATE is set in your environment — it forces ultimate ON regardless of this toggle)").dim().to_string());
             }
@@ -10252,6 +10354,24 @@ fn resolve_base_key(base_url: Option<String>, api_key: Option<String>) -> Result
     Ok((base_url, api_key))
 }
 
+/// Why this client carries NO total-request `timeout`.
+///
+/// 0.5.2 added `.timeout(1800s)` here as "a backstop under any path nobody has enumerated". That was
+/// a bug, and the reason is worth keeping: reqwest's total timeout is applied "from when the request
+/// starts connecting until the response body has finished" — a whole-response deadline, not a
+/// header-phase one. This very client is what the REPL hands to `stream_chat_with_tools_eager` for
+/// every turn, so the ceiling did not merely cap pathological hangs: it cut off a HEALTHY stream that
+/// was still emitting tokens, 30 minutes in, losing the entire turn. A deep reasoning run with many
+/// tool calls reaches that legitimately.
+///
+/// The stall protection that a streaming path actually needs is shaped per-event, not per-response,
+/// and already exists in two layers: `read_timeout` below (the socket going byte-silent) and
+/// `llm::client`'s inter-event watchdog, which re-arms on every SSE event and so distinguishes "the
+/// gateway stopped writing" from "the answer is long". A total deadline cannot make that distinction,
+/// which is exactly why it is wrong here.
+///
+/// One-shot clients (health probe, update check, model discovery) DO set a total timeout — nothing
+/// they fetch streams, so "the whole response took too long" is a meaningful failure there.
 fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("aizen/", env!("CARGO_PKG_VERSION")))
@@ -10335,8 +10455,7 @@ fn spawn_reconcile_pass() {
                 Message::system(sys.to_string()),
                 Message::user(user.to_string()),
             ];
-            let fut =
-                client::chat_with_tools(&http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[]);
+            let fut = chore_chat(&http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[]);
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
                     .block_on(fut)
@@ -10400,6 +10519,96 @@ fn spawn_health_poller() {
                 Err(_) => tui::HealthKind::Down,
             };
             tui::set_health(kind);
+        }
+    });
+}
+
+/// Spawn the long-lived off-to-the-side Q&A worker. It owns an unbounded channel (armed into
+/// `core::aside`) and answers `?`-prefixed questions one at a time, WITHOUT touching the turn in
+/// flight: it clones the read-only live-conversation snapshot, makes ONE tool-less model call, and
+/// prints the answer through `tui::emit_line` (which the retained renderer serializes with the main
+/// stream on its single render thread, so a mid-turn aside can never corrupt the frame). It never
+/// mutates `history`, never arms cancel, never flips `WORKING` — the running turn is oblivious.
+///
+/// Errors are shown inline and swallowed: a failed side question must never take down the worker
+/// (which would silently disable the feature for the rest of the session) nor the REPL.
+fn spawn_aside_worker(http: reqwest::Client) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    crate::core::aside::arm(tx);
+    tokio::spawn(async move {
+        while let Some(question) = rx.recv().await {
+            // Resolve the endpoint fresh per question: the user may have switched models with
+            // `/model` since the worker was spawned, and an aside should follow that choice.
+            let (base_url, api_key, model) = match resolve_endpoint(None, None, None) {
+                Ok(t) => t,
+                Err(_) => {
+                    tui::emit_line(
+                        &style("  ⁇ side question skipped — no model configured (/config).")
+                            .dim()
+                            .to_string(),
+                    );
+                    continue;
+                }
+            };
+            // Read-only snapshot of the live conversation (kept current DURING the turn via
+            // `on_progress`); cloned so we never hold the lock across the await.
+            let snapshot = live_history_slot()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let msgs = crate::core::aside::build_messages(&snapshot, &question);
+            // Echo the question so the answer has a visible anchor in the transcript (dim, with a
+            // `⁇` glyph, so it reads as an out-of-band aside distinct from a `❯` user turn).
+            tui::emit_line(
+                &style(format!("  ⁇ {question}"))
+                    .color256(theme::MUTED)
+                    .to_string(),
+            );
+            // ONE tool-less, non-streaming call. Empty tool slice ⇒ no tools offered.
+            //
+            // Wrapped in the SAME per-call deadline a sub-agent gets (`subagent_call_timeout`,
+            // default 300s, `AIZEN_SUBAGENT_CALL_SECS`): the shared client carries no total-request
+            // ceiling (removing that is what unblocks a legitimately long streamed turn — see
+            // `http_client`), and `chat_with_tools` reads its body with `.json().await`, outside any
+            // deadline. `read_timeout` resets on every byte, so a gateway that keepalive-drips
+            // without ever finishing the body would park this worker forever, silently killing the
+            // aside feature for the rest of the session. This is not a streamed answer, so a flat
+            // per-call cap is exactly right — no inter-event watchdog applies here.
+            let call = client::chat_with_tools(&http, &base_url, &api_key, &model, &msgs, &[]);
+            let deadline = crate::agent::task_tool::subagent_call_timeout();
+            let outcome = match tokio::time::timeout(deadline, call).await {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!(
+                    "side question timed out after {}s with no response",
+                    deadline.as_secs()
+                )),
+            };
+            match outcome {
+                Ok(turn) => {
+                    let answer = turn.content.unwrap_or_default();
+                    if answer.trim().is_empty() {
+                        tui::emit_line(
+                            &style("  ⁇ (no answer)").dim().to_string(),
+                        );
+                    } else {
+                        let shown = crate::ui::markdown::render_plain_blocks(answer.trim());
+                        // Prefix every line dimly so the whole aside block reads as a margin note
+                        // beside the main work, not as the model's task output.
+                        for line in shown.lines() {
+                            tui::emit_line(
+                                &style(format!("  {line}")).color256(theme::MUTED).to_string(),
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tui::emit_line(
+                        &style(format!("  ⁇ side question failed: {e}"))
+                            .color256(theme::WARN)
+                            .to_string(),
+                    );
+                }
+            }
         }
     });
 }
@@ -12513,6 +12722,14 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
             "\n[stopped: cancelled by user after {} step(s)]",
             outcome.iters
         ),
+        // A top-level run sets no wall-clock budget (the user is watching and owns Esc), so this is
+        // effectively unreachable here — but the match must be total, and if a caller ever does set
+        // one, saying "time" rather than "steps" is the difference between a useful message and a
+        // misleading one.
+        StopReason::Deadline => eprintln!(
+            "\n[stopped: wall-clock budget reached after {} step(s) — the task may be incomplete]",
+            outcome.iters
+        ),
     }
     Ok(())
 }
@@ -12560,7 +12777,7 @@ async fn run_memory_reconcile(apply: bool) -> Result<()> {
             Message::system(sys.to_string()),
             Message::user(user.to_string()),
         ];
-        let fut = client::chat_with_tools(&http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[]);
+        let fut = chore_chat(&http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[]);
         // The surrounding fn is async, but `batch_pass` is sync (so every rail in it stays unit
         // testable without a runtime). Blocking here is safe: this is a one-shot CLI command with
         // nothing else on the runtime waiting on us.
@@ -13721,10 +13938,203 @@ mod tests {
         ]
     }
 
+    /// A streaming turn must survive longer than any total-request deadline.
+    ///
+    /// 0.5.2 put `.timeout(1800s)` on the shared client as a catch-all backstop. reqwest applies that
+    /// "from when the request starts connecting until the response body has finished", and this same
+    /// client is what the REPL hands to `stream_chat_with_tools_eager` — so it did not cap only
+    /// pathological hangs, it cut off a HEALTHY stream still emitting tokens. The stall protection a
+    /// stream needs is per-event (`read_timeout` plus the inter-event watchdog in `llm::client`),
+    /// which can tell "gateway went quiet" from "answer is long"; a total deadline cannot.
+    ///
+    /// Two dead ends preceded this shape, both worth recording so nobody re-walks them:
+    /// * Timing `http_client()` against a slow fixture proves nothing. The real ceiling was 1800s, so
+    ///   any fixture short enough to run in a test suite passes with the bug reintroduced — verified,
+    ///   it did.
+    /// * `Client`'s `Debug` does not print the total timeout at all in reqwest 0.12 (it prints
+    ///   `read_timeout`, which merely CONTAINS the substring). A structural assertion is impossible.
+    ///
+    /// So this asserts the mechanism instead, on a client built exactly like the shared one but with
+    /// a deliberately tiny ceiling: a total deadline kills a body that is still arriving. That is the
+    /// behaviour the production client must not have, demonstrated in a second rather than half an
+    /// hour — and the paired run through the real `http_client()` shows the same fixture completing.
+    #[tokio::test]
+    async fn a_total_deadline_truncates_a_healthy_stream_but_the_shared_client_has_none() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Serve a body in slow chunks: still arriving after ~900ms, never byte-silent for long.
+        async fn slow_body_server() -> (String, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/stream", listener.local_addr().unwrap());
+            let h = tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 2048];
+                        let _ = sock.read(&mut buf).await;
+                        let _ = sock.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 12\r\nConnection: close\r\n\r\n",
+                        ).await;
+                        for _ in 0..6 {
+                            let _ = sock.write_all(b"ab").await;
+                            let _ = sock.flush().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        }
+                    });
+                }
+            });
+            (url, h)
+        }
+
+        // 1. The mechanism: a total deadline shorter than the body's span truncates it. Same builder
+        //    settings as production, so the ONLY difference under test is `.timeout()`.
+        let (url, srv) = slow_body_server().await;
+        let ceilinged = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_secs(300))
+            .timeout(std::time::Duration::from_millis(300))
+            .build()
+            .expect("build ceilinged client");
+        let cut = async { ceilinged.get(&url).send().await?.text().await }.await;
+        assert!(
+            cut.is_err(),
+            "a total-request deadline must kill a body still arriving — if this stops failing, \
+             reqwest changed and the premise of this test needs re-checking"
+        );
+
+        // 2. The production client, same fixture, must read it to completion.
+        let http = http_client().expect("build shared client");
+        let whole = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            http.get(&url).send().await?.text().await
+        })
+        .await
+        .expect("the request must not outlive the test guard")
+        .expect("a response that keeps arriving must not be cut off");
+        srv.abort();
+        assert_eq!(
+            whole, "abababababab",
+            "the whole slow body must arrive through the client the REPL streams turns with"
+        );
+    }
+
+    /// A background chore call (secretary, persona reflection, compaction, reconcile, handoff,
+    /// persona-distill) must be TIME-BOUNDED, not merely byte-bounded.
+    ///
+    /// Every one of those routes the NON-streaming `chat_with_tools`, whose only native guard is
+    /// reqwest's `read_timeout` — and that fires only when the socket goes BYTE-silent. A gateway that
+    /// accepts the POST and then keepalive-drips (or simply never writes the response body) leaves the
+    /// call parked forever: `read_timeout` keeps re-arming on the drip, and the shared client carries
+    /// no total-request ceiling (removing that is the Bug-1 fix above, deliberately). Before
+    /// `chore_chat` centralised the deadline, a single such hang silently killed the secretary /
+    /// compaction for the rest of the session with no error surfaced.
+    ///
+    /// This proves the mechanism on a server that ACCEPTS the connection and then never answers: only
+    /// a wall-clock deadline can end that, and `chore_chat` must return `Err` within it rather than
+    /// awaiting a byte that never comes. `AIZEN_SUBAGENT_CALL_SECS=1` shrinks the ceiling so the test
+    /// finishes in ~1s; the env lock keeps it from racing the other env-touching tests.
+    #[tokio::test]
+    async fn a_chore_call_against_a_silent_gateway_returns_err_not_a_permanent_park() {
+        use tokio::io::AsyncReadExt;
+
+        // A server that accepts, reads the request, and then holds the socket open forever without
+        // ever writing a response. `read_timeout` cannot fire (no bytes were promised then withheld
+        // mid-body — nothing is sent at all), so only the deadline can end the call.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let srv = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 2048];
+                let _ = sock.read(&mut buf).await; // drain the request line/headers, then stall
+                held.push(sock); // keep the socket alive; never write a byte back
+            }
+        });
+
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const K: &str = "AIZEN_SUBAGENT_CALL_SECS";
+        let prior = std::env::var(K).ok();
+        std::env::set_var(K, "1");
+
+        let http = http_client().expect("build shared client");
+        let msgs = [Message::user("ping".to_string())];
+
+        let started = std::time::Instant::now();
+        // The whole point: this awaits, at most, one deadline — never the silent socket forever.
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            chore_chat(&http, &base, "k", "m", &msgs, &[]),
+        )
+        .await
+        .expect("chore_chat must return on its OWN deadline, not park until the test guard fires");
+        let elapsed = started.elapsed();
+
+        match prior {
+            Some(v) => std::env::set_var(K, v),
+            None => std::env::remove_var(K),
+        }
+        srv.abort();
+
+        assert!(
+            out.is_err(),
+            "a chore call to a gateway that never answers must surface an Err, not hang"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the 1s ceiling must end the call promptly; took {elapsed:?} — if this blows past the \
+             deadline, chore_chat stopped bounding the call in time"
+        );
+    }
+
     /// The `/v1` hint fires only when the URL genuinely lacks a version segment. Both directions
     /// matter: no hint on an already-versioned URL (suggesting `/v1/v1` sends the user in circles),
     /// and a hint whenever the last segment is not `v<digits>` — `/api` and `/openai` are paths, not
     /// versions, which is exactly the case that leaves people stuck on a 404 with nothing to try.
+    ///
+    /// The steering mailbox must never stay armed past a turn that never ran.
+    ///
+    /// `steer::arm()` now fires with the cancel token, BEFORE prep, so a `> also do X` typed during
+    /// retrieval reaches the running turn instead of the post-turn queue. That earlier arming is only
+    /// safe because `SteerMailboxGuard` closes the mailbox on the paths that abort prep (an
+    /// unconfigured endpoint, a `#remember`/`!shell` input, an Esc during prep) and so never reach the
+    /// explicit disarm at the end of a turn. Left armed, the input thread would keep accepting steers
+    /// into a slot nothing drains, and the next turn's `arm()` would clear them — user input silently
+    /// eaten, which is strictly worse than the queueing this whole change was fixing.
+    #[test]
+    fn the_steer_guard_closes_the_mailbox_and_requeues_what_the_turn_never_took() {
+        let _lock = crate::core::steer::test_lock();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<tui::Submission>();
+
+        crate::core::steer::arm();
+        assert!(crate::core::steer::push("also update the README"));
+        {
+            let _guard = SteerMailboxGuard(tx.clone());
+        } // prep aborts here: the guard is the only thing that gets to run
+
+        assert!(
+            !crate::core::steer::is_armed(),
+            "a mailbox left armed would accept steers nothing will ever drain"
+        );
+        let got = rx
+            .try_recv()
+            .expect("the un-consumed steer must come back as a submission, not vanish");
+        assert_eq!(
+            got,
+            tui::Submission::Chat("also update the README".into(), Vec::new()),
+            "it re-enters as an ordinary message so it runs as the next turn"
+        );
+
+        // Idempotent: the normal end-of-turn path disarms explicitly, so on that path the guard fires
+        // afterwards on an already-closed mailbox. That has to be a no-op, not a second delivery of a
+        // message the user sent once.
+        {
+            let _guard = SteerMailboxGuard(tx.clone());
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a second disarm must not re-deliver the same steer"
+        );
+    }
+
     #[test]
     fn version_suffix_hint_only_when_actually_missing() {
         for already in [

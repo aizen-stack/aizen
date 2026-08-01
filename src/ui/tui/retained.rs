@@ -263,6 +263,9 @@ struct AppState {
     /// Absolute (line, col) selection in the flat wrapped-line space. Drawn reversed; cleared on a
     /// plain click outside the range / Esc.
     selection: Option<SelectionRange>,
+    /// Right-click "Copy" menu, when one is up. Opened only while a selection exists, so the menu
+    /// can never offer to copy nothing.
+    context_menu: Option<ContextMenu>,
     metrics: metrics::FrameMetrics,
     cache: RenderCache,
     /// When `Some(idx)`, the idle screensaver is up: the render thread cover-encodes card `idx` to its
@@ -274,6 +277,21 @@ struct AppState {
     /// is ~tens of ms, so we reuse it across idle repaints and only re-encode when the card or the
     /// terminal's pixel geometry changes (e.g. a window resize while the screensaver is up).
     screensaver_cache: Option<(usize, u32, u32, String)>,
+    /// Ultimate mode ON → the input box (prompt arrow + framing rules) recolours to the reserved gold,
+    /// tying it to the `✦ ultimate` chip. Pushed via `Command::Ultimate` (never read from disk in the
+    /// draw path — `cli_config::load()` hits the filesystem and this runs at ~9fps).
+    ultimate: bool,
+    /// The whimsical fallback verb ("Pondering") shown in the working caption BETWEEN tool steps — the
+    /// "idle" half of the hybrid caption. Refreshed from `tui::next_work_verb()` when a turn starts and
+    /// each time the last running tool completes, so successive quiet stretches surface fresh words.
+    work_verb: String,
+    /// The caption currently being typed out beside the working spinner. Either a running tool's action
+    /// ("Reading retained.rs") or `work_verb` when nothing is running. Reset (`work_reveal = 0`) whenever
+    /// this target changes so the typewriter re-runs on the new text.
+    work_caption: String,
+    /// How many chars of `work_caption` are revealed so far — advanced one per animation tick for the
+    /// typewriter effect, clamped to the caption length.
+    work_reveal: usize,
 }
 
 /// Absolute character selection over the flat list of wrapped transcript rows.
@@ -286,6 +304,18 @@ pub(super) struct SelectionRange {
     pub cursor_col: usize,
 }
 
+/// Where the right-click "Copy" menu was asked for, in screen cells. The menu is clamped into the
+/// transcript area at draw time, so this is a request rather than a final position — a right-click
+/// in the bottom-right corner still gets a fully visible box.
+///
+/// It deliberately does NOT carry the selection it will copy. The input thread owns that (it is the
+/// thread that reads the clipboard action), and duplicating it here would let the two drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ContextMenu {
+    pub col: u16,
+    pub row: u16,
+}
+
 /// Geometry of the last transcript viewport — input thread maps mouse coords → (line, col).
 #[derive(Clone, Debug, Default)]
 struct TranscriptGeom {
@@ -296,6 +326,9 @@ struct TranscriptGeom {
     /// Plain (SGR-stripped) wrapped rows of the full transcript at last draw — used to extract the
     /// selected text on mouse-up without re-rendering on the input thread.
     plain_rows: Vec<String>,
+    /// Raw rendered rows WITH SGR colour codes — used by the hyperlink injector to re-print link
+    /// spans baked inside OSC 8 sequences after `terminal.draw()`. Parallel to `plain_rows`.
+    sgr_rows: Vec<String>,
     /// Screen rect of the floating "jump to bottom" button, present only while the transcript is
     /// scrolled up off the tail. `None` when at the tail (button hidden). The input thread hit-tests
     /// a left-click against this before anything else so the button lands the viewport back on tail.
@@ -322,6 +355,38 @@ pub(super) fn jump_button_rect() -> Option<Rect> {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     g.jump_button
+}
+
+/// Screen rect of the right-click Copy menu at last draw, or `None` when no menu is up. The input
+/// thread hit-tests a left-click against this, exactly as it does for [`jump_button_rect`].
+fn context_menu_rect_slot() -> &'static Mutex<Option<Rect>> {
+    static SLOT: OnceLock<Mutex<Option<Rect>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+pub(super) fn context_menu_rect() -> Option<Rect> {
+    *context_menu_rect_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The selection currently PAINTED, mirrored out of the render thread's `AppState` so the input
+/// thread can act on it without owning it.
+///
+/// The input thread's own `selecting` can NOT serve this purpose: it is `take()`n on mouse-up while
+/// the highlight deliberately stays on screen, so between releasing the drag and the next click —
+/// precisely when someone reaches for the right button — it is `None` even though text is visibly
+/// selected. This mirror is written only by [`set_selection`] / [`clear_selection`], the same two
+/// calls that change the highlight, so it cannot disagree with what is on screen.
+fn live_selection_slot() -> &'static Mutex<Option<SelectionRange>> {
+    static SLOT: OnceLock<Mutex<Option<SelectionRange>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+pub(super) fn live_selection() -> Option<SelectionRange> {
+    *live_selection_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Extract plain text covering `sel` from the last drawn plain rows. Empty if nothing is selected
@@ -414,10 +479,25 @@ impl AppState {
             focused: true,
             plan_id: None,
             selection: None,
+            context_menu: None,
             metrics: metrics::FrameMetrics::default(),
             cache: RenderCache::default(),
             screensaver: None,
             screensaver_cache: None,
+            ultimate: false,
+            work_verb: String::new(),
+            work_caption: String::new(),
+            work_reveal: 0,
+        }
+    }
+
+    /// Point the working caption at `text` (a tool action or the whimsical verb). Resets the reveal
+    /// counter only when the text actually changes, so the typewriter replays on a new caption but a
+    /// re-assert of the same one doesn't stutter back to the first character.
+    fn set_work_caption(&mut self, text: String) {
+        if self.work_caption != text {
+            self.work_caption = text;
+            self.work_reveal = 0;
         }
     }
 
@@ -537,11 +617,25 @@ enum Command {
     Input(InputSnapshot),
     Working(bool),
     Status(String),
+    /// Set the working caption target (a running tool's action, or a whimsical verb between steps).
+    /// The typewriter reveal restarts whenever the text changes; a re-assert of the same text is a
+    /// no-op so it doesn't stutter back to the first character. Passing an empty string clears it back
+    /// to the whimsical `work_verb`.
+    WorkCaption(String),
+    /// Ultimate mode toggled — recolour the input box (gold ON, moonlight OFF). Pushed from the
+    /// `/ultimate` handler and once at activation, never read from disk in the draw path.
+    Ultimate(bool),
     Context(u16),
     /// Idle `● ready` chip colour/label — green/yellow/red based on the last `/models` probe.
     Health(HealthKind),
     Tick,
     OpenOverlay(OverlaySnapshot),
+    /// Replace the OPEN overlay's body while preserving the reader's scroll position. Distinct from
+    /// `OpenOverlay` on purpose: a live panel (`/workflows`) re-publishes itself about once a second,
+    /// and re-opening would yank the view back to the top on every refresh — unreadable while you are
+    /// paging through the history section. Ignored when no overlay is up, so a refresh that races the
+    /// Esc that closed the panel can't resurrect it.
+    UpdateOverlay(Vec<String>),
     CloseOverlay,
     Scroll(i32),
     /// Jump the transcript so absolute wrapped-line `start` is at the top of the viewport
@@ -557,6 +651,10 @@ enum Command {
     SetSelection(SelectionRange),
     /// Drop the current selection highlight.
     ClearSelection,
+    /// Show the right-click "Copy" menu at these screen cells (clamped into the transcript at draw).
+    OpenContextMenu(ContextMenu),
+    /// Dismiss the right-click menu.
+    CloseContextMenu,
     Focus(bool),
     /// Throw away ratatui's belief about what is on screen and repaint every cell from the block
     /// buffer (Ctrl-L). The recovery hatch for the one failure ratatui's cell diff cannot see: text
@@ -786,6 +884,19 @@ pub(super) fn set_status(status: &str) {
     send(Command::Status(status.to_string()));
 }
 
+/// Recolour the input box to gold (ultimate ON) or back to moonlight. Pushed once when the mode
+/// toggles — never polled in the draw path (`cli_config::load()` reads the filesystem and the footer
+/// repaints at ~9fps).
+pub(super) fn set_ultimate(on: bool) {
+    send(Command::Ultimate(on));
+}
+
+/// Set the working caption target — a running tool's action ("Reading retained.rs") or the whimsical
+/// verb between steps. The typewriter reveal replays only when the text actually changes.
+pub(super) fn set_work_caption(text: &str) {
+    send(Command::WorkCaption(text.to_string()));
+}
+
 pub(super) fn set_context(permille: u16) {
     send(Command::Context(permille.min(1000)));
 }
@@ -795,11 +906,42 @@ pub(super) fn set_health(kind: HealthKind) {
 }
 
 pub(super) fn set_selection(sel: SelectionRange) {
+    // Mirror BEFORE queueing: the mirror is read by the input thread (right-click), and the command
+    // queue is drained asynchronously by the render thread. Writing it here makes "what is selected"
+    // true the instant the selection changes rather than one frame later.
+    *live_selection_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(sel);
     send(Command::SetSelection(sel));
 }
 
 pub(super) fn clear_selection() {
+    *live_selection_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    // A menu with nothing to copy is dead weight, so `ClearSelection` also closes it in the render
+    // thread — drop the hit-test rect here for the same reason `close_context_menu` does, or an Esc
+    // that clears a selection would leave a rect that keeps swallowing the next click.
+    *context_menu_rect_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
     send(Command::ClearSelection);
+}
+
+/// Open the right-click Copy menu at `col`/`row` (screen cells). Callers open it only when a
+/// selection exists — see `handle_retained_mouse`.
+pub(super) fn open_context_menu(col: u16, row: u16) {
+    send(Command::OpenContextMenu(ContextMenu { col, row }));
+}
+
+pub(super) fn close_context_menu() {
+    // Clear the hit-test rect here too, not just in the render thread: a click that dismisses the
+    // menu is immediately followed by more clicks, and a stale rect would keep swallowing them until
+    // the next frame lands.
+    *context_menu_rect_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    send(Command::CloseContextMenu);
 }
 
 /// Jump the transcript viewport so absolute wrapped-line `start` is at the top (scrollbar drag).
@@ -833,6 +975,11 @@ pub(super) fn tick() {
 
 pub(super) fn open_overlay(overlay: OverlaySnapshot) {
     send(Command::OpenOverlay(overlay));
+}
+
+/// Refresh an already-open overlay's body in place, keeping the reader's scroll offset.
+pub(super) fn update_overlay(lines: Vec<String>) {
+    send(Command::UpdateOverlay(lines));
 }
 
 pub(super) fn close_overlay() {
@@ -1004,6 +1151,12 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if state.working && state.focused {
                     state.frame = state.frame.wrapping_add(1);
+                    // Advance the typewriter on idle ticks too, so the caption keeps typing during a
+                    // quiet stretch (a long tool call) when no command arrives to drive it.
+                    let len = state.work_caption.chars().count();
+                    if state.work_reveal < len {
+                        state.work_reveal += 1;
+                    }
                     dirty = true;
                 }
                 // Idle resize: the render below only runs when `dirty`, so a terminal resized while
@@ -1099,6 +1252,23 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     }
                     let started = Instant::now();
                     let _ = s.terminal.draw(|frame| draw(frame, &mut state));
+                    // Inject OSC 8 hyperlinks AFTER terminal.draw() — post-draw so ratatui's cell
+                    // diff never sees the escape sequences and can't overwrite them next frame.
+                    // Pattern is identical to the screensaver sixel blitter (`blit_screensaver`).
+                    {
+                        let g = transcript_geom_slot()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let out = s.terminal.backend_mut();
+                        crate::ui::links::inject_hyperlinks(
+                            out,
+                            &g.sgr_rows,
+                            &g.plain_rows,
+                            g.start,
+                            g.visible,
+                            g.area,
+                        );
+                    }
                     let rows = state
                         .blocks
                         .iter()
@@ -1157,17 +1327,50 @@ fn apply_command(state: &mut AppState, cmd: Command) {
         Command::Working(working) => {
             state.working = working;
             state.working_since = working.then(Instant::now);
-            if !working {
+            if working {
+                // A fresh turn opens on a new whimsical verb, and the caption starts on it (typed from
+                // scratch) until the first tool call renames it to a concrete action.
+                state.work_verb = crate::ui::tui::next_work_verb().to_string();
+                state.set_work_caption(state.work_verb.clone());
+            } else {
                 state.frame = 0;
+                state.work_caption.clear();
+                state.work_reveal = 0;
             }
         }
         Command::Status(status) => state.input.status = status,
+        Command::WorkCaption(text) => {
+            // Empty ⇒ fall back to the whimsical verb (a tool finished, nothing else running yet).
+            let target = if text.is_empty() {
+                state.work_verb.clone()
+            } else {
+                text
+            };
+            state.set_work_caption(target);
+        }
+        Command::Ultimate(on) => state.ultimate = on,
         Command::Context(v) => state.ctx_permille = v,
         Command::Health(h) => state.health = h,
-        Command::Tick => state.frame = state.frame.wrapping_add(1),
+        Command::Tick => {
+            state.frame = state.frame.wrapping_add(1);
+            // Type one more character of the working caption per tick (the typewriter). Clamped to the
+            // caption length so a fully-revealed caption just holds with its blinking caret.
+            let len = state.work_caption.chars().count();
+            if state.work_reveal < len {
+                state.work_reveal += 1;
+            }
+        }
         Command::OpenOverlay(overlay) => {
             state.input.overlay = Some(overlay);
             state.overlay_scroll = 0; // a fresh overlay starts at the top
+        }
+        Command::UpdateOverlay(lines) => {
+            if let Some(o) = state.input.overlay.as_mut() {
+                o.lines = lines;
+                // `overlay_scroll` is deliberately untouched — `draw_overlay` re-clamps it against the
+                // new content height, so a panel that shrank snaps to its last page instead of leaving
+                // the viewport parked past the end.
+            }
         }
         Command::CloseOverlay => {
             state.input.overlay = None;
@@ -1224,7 +1427,15 @@ fn apply_command(state: &mut AppState, cmd: Command) {
         }
         Command::Screensaver(card) => state.screensaver = card,
         Command::SetSelection(sel) => state.selection = Some(sel),
-        Command::ClearSelection => state.selection = None,
+        // Dropping the highlight closes the menu with it: a "Copy" button whose selection is gone
+        // would copy nothing, and leaving it on screen after the highlight vanished reads as a stuck
+        // frame. Every path that clears a selection therefore dismisses the menu for free.
+        Command::ClearSelection => {
+            state.selection = None;
+            state.context_menu = None;
+        }
+        Command::OpenContextMenu(m) => state.context_menu = Some(m),
+        Command::CloseContextMenu => state.context_menu = None,
         Command::Focus(v) => state.focused = v,
         // Lifecycle + `Redraw` carry no AppState change: they are handled by `render_loop`, which owns
         // the `TerminalSession` (`Redraw` sets `force_clear` so the next draw is unconditional).
@@ -1245,6 +1456,16 @@ fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         // draw_overlay clamps the requested scroll against the overlay's own visible height and
         // returns the value actually used, so a stored offset past the end snaps back next frame.
         state.overlay_scroll = draw_overlay(frame, area, &overlay, state.overlay_scroll);
+    }
+    // The Copy menu paints LAST so it sits above the transcript and the overlay both — it is the
+    // surface the pointer is currently on, and a box the user just summoned must not appear behind
+    // something else. Its hit-test rect is published every frame (including `None`), so a menu that
+    // stopped being drawn stops swallowing clicks on the very frame it disappears.
+    let menu_rect = state
+        .context_menu
+        .and_then(|m| draw_context_menu(frame, chunks[0], m));
+    if let Ok(mut slot) = context_menu_rect_slot().lock() {
+        *slot = menu_rect;
     }
 }
 
@@ -1283,16 +1504,30 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let content_width = area.width.saturating_sub(2).max(8);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut plain_rows: Vec<String> = Vec::new();
+    let mut sgr_rows: Vec<String> = Vec::new();
     for block in &state.blocks {
         let rows = state.cache.get_or_render(block, content_width);
         for row in rows {
             plain_rows.push(console::strip_ansi_codes(&row).into_owned());
+            sgr_rows.push(row.clone());
             lines.push(styled_row(block.kind, row));
         }
     }
     // Apply selection reverse highlight before scrolling into the viewport.
     if let Some(sel) = state.selection {
         apply_selection_highlight(&mut lines, sel);
+    }
+    // The working indicator rides the BOTTOM of the transcript (Claude-CLI style) rather than a HUD
+    // pill: a brand-pulse spinner (the ✦ mark breathing to ✧) + a typewriter caption that reads the
+    // agent's current action ("Reading retained.rs") or a whimsical verb between steps. Blue caption
+    // (the aizen link-blue) so it reads as "live status", not transcript prose. Appended after the
+    // selection highlight so a drag can't accidentally reverse-video the spinner; it counts toward
+    // `total` so the tail-follow keeps it pinned to the last row as output streams.
+    if state.working {
+        for (plain, styled) in working_line(state) {
+            plain_rows.push(plain);
+            lines.push(styled);
+        }
     }
     let total = lines.len();
     let visible = area.height as usize;
@@ -1357,6 +1592,7 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
             total,
             area,
             plain_rows,
+            sgr_rows,
             jump_button,
         };
     }
@@ -1447,6 +1683,60 @@ fn styled_row(kind: BlockKind, row: String) -> Line<'static> {
     }
 }
 
+/// The brand-pulse spinner glyphs: the ✦ mark "breathing" to its hollow twin ✧ and back. Both are
+/// safe across fonts (unlike braille), and the two-frame pulse ties the working indicator to the
+/// `✦ ultimate` / synthesizing brand mark rather than a generic spinner.
+const PULSE: [&str; 2] = ["✦", "✧"];
+
+/// Build the working line(s) shown at the bottom of the transcript while a turn is in flight: a
+/// brand-pulse spinner + a typewriter-revealed caption in the aizen link-blue, then a blinking caret.
+///
+/// Returns `(plain, styled)` pairs so the caller can push both the mouse-mapping plain row and the
+/// coloured `Line`. One visual row today, but a Vec keeps the door open for a wrapped caption.
+///
+/// The caption reveal (`work_reveal`) is advanced by the ticker/timeout, so this fn is pure over the
+/// current state — it just slices `work_caption` to the revealed prefix and appends the caret.
+fn working_line(state: &AppState) -> Vec<(String, Line<'static>)> {
+    use crate::ui::theme;
+    let glyph = PULSE[state.frame % PULSE.len()];
+    // Reveal the first `work_reveal` chars of the caption (char-, not byte-, indexed so multibyte
+    // captions never split mid-codepoint). A caret rides the end: solid while still typing, and
+    // blinking (on the ✦ half of the pulse) once fully revealed — a quiet "still alive" heartbeat.
+    let revealed: String = state
+        .work_caption
+        .chars()
+        .take(state.work_reveal)
+        .collect();
+    let done = state.work_reveal >= state.work_caption.chars().count();
+    // Caret chỉ hiện trong khi đang gõ — khi đã gõ xong thì spinner ✦⇄✧ đã đủ "nhịp sống",
+    // caret nhấp nháy thêm vào trông rối mắt.
+    let caret = if !done { "▏" } else { "" };
+    let elapsed = state
+        .working_since
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+    // `spinner · caption▏         12s · Esc to stop` — spinner in moonlight (the structural brand
+    // colour), caption in link-blue (live status, distinct from grey transcript prose), the elapsed
+    // clock + stop hint faint at the tail so they inform without pulling the eye.
+    let spans = vec![
+        Span::styled(
+            format!("{glyph} "),
+            Style::default().fg(Color::Indexed(theme::ACCENT)),
+        ),
+        Span::styled(revealed, Style::default().fg(Color::Indexed(theme::LINK))),
+        Span::styled(
+            caret.to_string(),
+            Style::default().fg(Color::Indexed(theme::LINK)),
+        ),
+        Span::styled(
+            format!("   {elapsed}s · Esc to stop"),
+            Style::default().fg(Color::Indexed(theme::FAINT)),
+        ),
+    ];
+    let plain: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    vec![(plain, Line::from(spans))]
+}
+
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     if area.height < FOOTER_ROWS || area.width == 0 {
         return;
@@ -1461,27 +1751,25 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         ])
         .split(area);
     let width = area.width as usize;
-    let elapsed = state
-        .working_since
-        .map(|t| t.elapsed().as_secs())
-        .unwrap_or(0);
-    // Right of the HUD row: working pill while the agent runs, else coloured health chip + a
-    // compact context meter `⟦▓▓░░…⟧ N%`. Green = OK, yellow =
-    // slow/transient, red = permanent unavailability, muted = still checking.
+    // Input-box accent: gold while ultimate mode is ON (tying the box to the `✦ ultimate` chip so the
+    // heightened mode is unmistakable at a glance), the usual moonlight silver otherwise. Drives the
+    // `❯` prompt arrow and both framing rules. `state.ultimate` is pushed via `Command::Ultimate`
+    // (never a per-frame disk read).
+    let box_accent = if state.ultimate {
+        crate::ui::theme::WARN
+    } else {
+        crate::ui::theme::ACCENT_DIM
+    };
+    // Right of the HUD row: a coloured health chip + a compact context meter `⟦▓▓░░…⟧ N%`.
+    // (Elapsed time / spinner moved to the transcript's working line — see `working_line`.)
+    // Green = OK, yellow = slow/transient, red = permanent unavailability, muted = still checking.
+    // The "working" state is NO LONGER shown here — it rides the bottom of the transcript now (a
+    // Claude-CLI-style spinner + typewriter caption, see `working_line`), so the HUD stays a calm
+    // status strip whether or not a turn is in flight.
     //
     // Built as spans (not a single pre-coloured string) so the bar can take its own fill colour
     // independent of the health dot.
-    let right_spans: Vec<Span<'static>> = if state.working {
-        const STAR: [&str; 6] = ["✶", "✷", "✸", "✹", "✺", "✻"];
-        vec![Span::styled(
-            format!(
-                "{} working · {}s · Esc to stop",
-                STAR[state.frame % STAR.len()],
-                elapsed
-            ),
-            Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT)),
-        )]
-    } else {
+    let right_spans: Vec<Span<'static>> = {
         let pm = state.ctx_permille.min(1000);
         let pct = (pm as f64 / 10.0).round() as u16;
         // Compact bar (6 cells) so it fits beside model/status on typical widths; colour tracks fill.
@@ -1525,7 +1813,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(
         Paragraph::new(Line::styled(
             rule.clone(),
-            Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT_DIM)),
+            Style::default().fg(Color::Indexed(box_accent)),
         )),
         rows[1],
     );
@@ -1562,7 +1850,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let mut prompt_spans = vec![Span::styled(
         "❯ ",
         Style::default()
-            .fg(Color::Indexed(crate::ui::theme::ACCENT))
+            .fg(Color::Indexed(box_accent))
             .add_modifier(Modifier::BOLD),
     )];
     if !imgtag.is_empty() {
@@ -1583,7 +1871,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(
         Paragraph::new(Line::styled(
             rule,
-            Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT_DIM)),
+            Style::default().fg(Color::Indexed(box_accent)),
         )),
         rows[3],
     );
@@ -1616,21 +1904,16 @@ fn input_line(state: &AppState, budget: usize) -> (String, usize) {
         };
         return (console::truncate_str(&ph, budget, "…").into_owned(), 0);
     }
-    // Only collapse to a "N lines pasted" chip for a genuinely large paste — match the classic
-    // renderer's `>= 5 lines` threshold (tui.rs). A short multi-line draft (e.g. one char then
-    // Shift+Enter) stays inline: turning a two-line note into a misleading "2 lines pasted" chip
-    // is exactly the bug we're fixing.
+    // Khi draft có ≥5 dòng (paste lớn), vẫn hiện prefix compact `↵N ·` để báo hiệu,
+    // nhưng KHÔNG ẩn toàn bộ text — window quanh cursor vẫn hiện bình thường để người
+    // dùng thấy những gì vừa gõ thêm. Trước đây trả về chip cứng nên text bị ẩn.
     let nlines = state.input.draft.iter().filter(|&&c| c == '\n').count() + 1;
-    if nlines >= 5 {
-        let text: String = state.input.draft.iter().collect();
-        let n = text.lines().count().max(1);
-        let chip = format!("↵ {n} lines pasted");
-        let w = console::measure_text_width(&chip);
-        return (
-            console::truncate_str(&chip, budget, "…").into_owned(),
-            w.min(budget),
-        );
-    }
+    let paste_prefix = if nlines >= 5 {
+        format!("↵{nlines} · ")
+    } else {
+        String::new()
+    };
+    let prefix_w = console::measure_text_width(&paste_prefix);
     let cursor = state.input.cursor.min(state.input.draft.len());
     // The input box is a single physical row, so render an embedded newline as a visible `↵`
     // glyph (width 1) rather than a raw `\n` that ratatui can't lay out on one line.
@@ -1642,11 +1925,13 @@ fn input_line(state: &AppState, budget: usize) -> (String, usize) {
         }
     };
     let cellw = |c: char| console::measure_text_width(&disp(c).to_string()).max(1);
+    // Budget for the text window shrinks by the paste prefix (e.g. `↵12 · `) so both fit on one row.
+    let text_budget = budget.saturating_sub(prefix_w);
     let mut start = cursor;
     let mut caret = 0usize;
     while start > 0 {
         let cw = cellw(state.input.draft[start - 1]);
-        if caret + cw > budget.saturating_sub(1) {
+        if caret + cw > text_budget.saturating_sub(1) {
             break;
         }
         start -= 1;
@@ -1656,13 +1941,14 @@ fn input_line(state: &AppState, budget: usize) -> (String, usize) {
     let mut used = 0usize;
     for &c in &state.input.draft[start..] {
         let cw = cellw(c);
-        if used + cw > budget {
+        if used + cw > text_budget {
             break;
         }
         shown.push(disp(c));
         used += cw;
     }
-    (shown, caret)
+    // Prepend the paste-count prefix and offset the cursor position past it.
+    (format!("{paste_prefix}{shown}"), prefix_w + caret)
 }
 
 /// Draw the informational overlay, applying `scroll` (rows hidden above the top) clamped so the last
@@ -1727,6 +2013,56 @@ fn draw_overlay(
     clamped
 }
 
+/// Label on the right-click menu's only button. Padded so the highlight reads as a button rather
+/// than as stray reversed text.
+const COPY_LABEL: &str = " Copy ";
+
+/// Where the Copy menu box goes for a right-click at `menu`, or `None` when `area` is too small to
+/// hold one. Pure so the clamping is testable without a terminal backend.
+///
+/// The box is offered one cell right-and-below the pointer so it doesn't sit under the cursor, then
+/// pulled back inside `area` when that would overflow. Without the clamp a right-click near the
+/// bottom-right corner puts most of the box off-screen, leaving a Copy button that cannot be clicked
+/// — the one position where a context menu is most likely to be used.
+fn context_menu_layout(area: Rect, menu: ContextMenu) -> Option<Rect> {
+    let width = console::measure_text_width(COPY_LABEL) as u16 + 2; // + borders
+    let height = 3; // top border, label row, bottom border
+    if area.width < width || area.height < height {
+        return None;
+    }
+    // Both maxima are ≥ the area origin because of the size check above.
+    let max_x = area.x + area.width - width;
+    let max_y = area.y + area.height - height;
+    let x = menu.col.saturating_add(1).clamp(area.x, max_x);
+    let y = menu.row.saturating_add(1).clamp(area.y, max_y);
+    Some(Rect::new(x, y, width, height))
+}
+
+/// Paint the right-click Copy menu, returning the rect actually drawn so the input thread can
+/// hit-test a click against it.
+fn draw_context_menu(frame: &mut Frame<'_>, area: Rect, menu: ContextMenu) -> Option<Rect> {
+    let rect = context_menu_layout(area, menu)?;
+    // `Clear` first: the menu floats over live transcript text, and without wiping the cells the
+    // box borders blend into whatever was underneath.
+    frame.render_widget(Clear, rect);
+    let block = FrameBlock::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT_DIM)));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            COPY_LABEL,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Indexed(crate::ui::theme::ACCENT))
+                .add_modifier(Modifier::BOLD),
+        ))),
+        inner,
+    );
+    Some(rect)
+}
+
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
@@ -1737,23 +2073,36 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn render_assistant_rows(raw: &str, width: usize) -> Vec<String> {
-    // Keep SGR: the markdown renderer emits the moonlight gutter, code-box borders, and syntax
-    // highlight as colour codes — `sanitize_keep_sgr` preserves them (dropping only cursor moves)
-    // and `ansi_spans` turns them into styled spans at draw time.
-    sanitize_keep_sgr(&crate::ui::markdown::render_retained(raw, width.max(24)))
+    // ONE renderer for both surfaces. The live turn (streaming) and the replayed transcript
+    // (`agent::replay_transcript` → `MarkdownStream`) must produce byte-identical output, or the same
+    // message looks different when re-opened than when first shown. So feed the whole raw block through
+    // `MarkdownStream` here too — the block is cached by `content_hash`, so re-parsing the full body on
+    // each width/content change is the same trip `replay_transcript` makes, with none of the
+    // incremental-splice risk an in-place streaming parser would carry.
+    //
+    // Keep SGR: the renderer emits the moonlight gutter, code-box borders, and syntax highlight as
+    // colour codes — `sanitize_keep_sgr` preserves them (dropping only cursor moves) and `ansi_spans`
+    // turns them into styled spans at draw time.
+    let mut md = crate::ui::markdown::MarkdownStream::new(true, width.max(24));
+    let mut rendered = md.push(&format!("{raw}\n"));
+    rendered.push_str(&md.finish());
+    sanitize_keep_sgr(&rendered)
         .split('\n')
         .map(str::to_string)
         .collect()
 }
 
-/// Format a run time for the result line: `· 940ms` under a second, `· 1.2s` otherwise. Sub-second
-/// times keep millisecond resolution; longer runs show one decimal of seconds so a slow call reads
-/// at a glance. Empty string for `None` (unknown — restored transcripts / eager-adopted parallel).
+
+/// Format a run time for the result line: `· 940ms` under a second, `· 1.2s` under a minute, then
+/// `· 7m03s` / `· 2h05m`. Sub-second times keep millisecond resolution; the minute/hour tiers exist
+/// because a sub-agent dispatch is a single tool call that can run for hours, and `· 7203.4s` makes
+/// the reader do the division. Empty for `None` (unknown — restored transcripts / eager-adopted).
 fn fmt_elapsed(ms: Option<u64>) -> String {
     match ms {
         None => String::new(),
         Some(ms) if ms < 1000 => format!(" · {ms}ms"),
-        Some(ms) => format!(" · {:.1}s", ms as f64 / 1000.0),
+        Some(ms) if ms < 60_000 => format!(" · {:.1}s", ms as f64 / 1000.0),
+        Some(ms) => format!(" · {}", crate::agent::orchestration::fmt_secs(ms / 1000)),
     }
 }
 
@@ -2148,13 +2497,18 @@ mod tests {
 
     #[test]
     fn large_multiline_draft_uses_paste_chip() {
+        // Fix: paste lớn vẫn hiện prefix compact `↵N ·` + text quanh cursor, KHÔNG ẩn toàn bộ
+        // draft bằng chip cứng. Người dùng vừa paste vừa gõ thêm phải thấy những gì họ gõ.
         let mut state = AppState::new("intro", "status");
         state.input.draft = "a\nb\nc\nd\ne".chars().collect();
         state.input.cursor = state.input.draft.len();
 
         let (shown, _) = input_line(&state, 40);
 
-        assert_eq!(shown, "↵ 5 lines pasted");
+        // Phải có prefix báo số dòng.
+        assert!(shown.starts_with("↵5 · "), "paste prefix missing: {shown:?}");
+        // Text thật (ký tự cuối draft là 'e') vẫn hiện sau prefix.
+        assert!(shown.contains('e'), "draft text must follow the prefix: {shown:?}");
     }
 
     #[test]
@@ -2213,6 +2567,118 @@ mod tests {
     }
 
     #[test]
+    fn assistant_rows_consume_inline_code_backticks() {
+        // Regression guard for the live/replay parity fix: the live retained path now renders the
+        // active assistant block through the SAME `MarkdownStream` the replay path uses, instead of
+        // the old pulldown-cmark `render_retained`. The old renderer left inline `` `code` `` as
+        // literal backticks (`line.push('`')`); `MarkdownStream`'s `inline()` consumes them and tints
+        // the span. Backtick-stripping is the one divergence observable WITHOUT a colour terminal —
+        // under `console`'s test default (no TTY ⇒ SGR suppressed) both renderers drop `**` markers,
+        // so bold is not distinguishable here, but the literal backtick is. If the two renderers ever
+        // split again, this breaks.
+        let code = render_assistant_rows("call `foo()` now", 40).join("\n");
+        assert!(
+            !code.contains('`'),
+            "inline code backticks must be consumed, not shown literally: {code:?}"
+        );
+        assert!(
+            code.contains("foo()"),
+            "the code text itself must survive: {code:?}"
+        );
+    }
+
+    #[test]
+    fn working_caption_types_out_then_holds() {
+        // The typewriter: `Working(true)` seeds a whimsical verb and starts the reveal at zero, each
+        // tick exposes one more char, and the reveal CLAMPS at the caption length (it must not run past
+        // the end and start slicing nothing, nor keep incrementing forever).
+        let mut state = AppState::new("intro", "status");
+        apply_command(&mut state, Command::Working(true));
+        assert!(!state.work_caption.is_empty(), "a turn seeds a verb");
+        assert_eq!(state.work_reveal, 0, "reveal starts from scratch");
+
+        let len = state.work_caption.chars().count();
+        for _ in 0..len {
+            apply_command(&mut state, Command::Tick);
+        }
+        assert_eq!(state.work_reveal, len, "one char per tick, fully revealed");
+        // Extra ticks must not overshoot.
+        for _ in 0..5 {
+            apply_command(&mut state, Command::Tick);
+        }
+        assert_eq!(state.work_reveal, len, "reveal clamps at the caption length");
+
+        // The rendered line shows the whole caption plus the elapsed clock + stop hint.
+        let (plain, _) = working_line(&state).remove(0);
+        assert!(
+            plain.contains(&state.work_caption),
+            "the revealed caption must appear: {plain:?}"
+        );
+        assert!(
+            plain.contains("Esc to stop"),
+            "the stop hint rides the working line now: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn tool_caption_replaces_verb_then_falls_back() {
+        // The hybrid caption: a tool call re-points it at a concrete action (restarting the reveal so
+        // the new text types out), and an empty `WorkCaption` — what `emit_tool_result` sends when the
+        // call ends — falls back to the whimsical verb rather than freezing on the finished action.
+        let mut state = AppState::new("intro", "status");
+        apply_command(&mut state, Command::Working(true));
+        let verb = state.work_verb.clone();
+        apply_command(&mut state, Command::Tick); // reveal 1 char of the verb
+
+        apply_command(&mut state, Command::WorkCaption("Reading retained.rs".into()));
+        assert_eq!(state.work_caption, "Reading retained.rs");
+        assert_eq!(state.work_reveal, 0, "a new caption retypes from scratch");
+
+        // Re-asserting the SAME caption must not stutter the reveal back to zero.
+        apply_command(&mut state, Command::Tick);
+        apply_command(&mut state, Command::WorkCaption("Reading retained.rs".into()));
+        assert_eq!(state.work_reveal, 1, "same text ⇒ reveal is preserved");
+
+        apply_command(&mut state, Command::WorkCaption(String::new()));
+        assert_eq!(state.work_caption, verb, "empty falls back to the verb");
+    }
+
+    #[test]
+    fn working_line_only_rides_the_transcript_while_working() {
+        // The working indicator moved OUT of the HUD and onto the transcript tail. It must appear only
+        // while a turn is in flight — and `Working(false)` must clear the caption so no stale "Reading
+        // …" row lingers under the finished answer.
+        let mut state = AppState::new("intro", "status");
+        apply_command(&mut state, Command::Working(true));
+        apply_command(&mut state, Command::WorkCaption("Run cargo test".into()));
+        assert!(state.working, "turn in flight");
+
+        apply_command(&mut state, Command::Working(false));
+        assert!(!state.working);
+        assert!(
+            state.work_caption.is_empty() && state.work_reveal == 0,
+            "finishing a turn clears the caption, leaving no stale row"
+        );
+    }
+
+    #[test]
+    fn ultimate_recolours_the_input_box_to_gold() {
+        // `/ultimate` recolours the input box framing to the reserved gold so the heightened mode is
+        // unmistakable, and toggling back returns it to moonlight. The state is PUSHED (never read from
+        // disk in the draw path, which runs at ~9fps).
+        let mut state = AppState::new("intro", "status");
+        assert!(!state.ultimate, "moonlight by default");
+
+        apply_command(&mut state, Command::Ultimate(true));
+        assert!(state.ultimate);
+        apply_command(&mut state, Command::Ultimate(false));
+        assert!(!state.ultimate, "toggling off returns to moonlight");
+        // Guard the palette choice itself: gold must stay distinct from the default silver, or the
+        // recolour would be invisible.
+        assert_ne!(crate::ui::theme::WARN, crate::ui::theme::ACCENT_DIM);
+    }
+
+    #[test]
     fn pruning_keeps_whole_blocks() {
         let mut state = AppState::new("intro", "status");
         for i in 0..BLOCK_LIMIT + 20 {
@@ -2260,6 +2726,142 @@ mod tests {
         apply_command(&mut state, Command::CloseOverlay);
         apply_command(&mut state, Command::Scroll(-2));
         assert_eq!(state.scroll_from_tail, 5);
+    }
+
+    /// `/workflows` republishes itself about once a second so its elapsed times tick. If a refresh
+    /// re-opened the overlay it would yank the reader back to the top every second — unusable while
+    /// paging through the history section. `UpdateOverlay` swaps the body and leaves scroll alone.
+    #[test]
+    fn a_live_overlay_refresh_keeps_the_readers_scroll_position() {
+        let mut state = AppState::new("intro", "status");
+        apply_command(
+            &mut state,
+            Command::OpenOverlay(OverlaySnapshot {
+                title: "Activity".into(),
+                lines: (0..40).map(|i| format!("row {i} · 3s")).collect(),
+                selected: None,
+                hint: "Esc/q close".into(),
+            }),
+        );
+        apply_command(&mut state, Command::Scroll(-12));
+        assert_eq!(state.overlay_scroll, 12);
+
+        apply_command(
+            &mut state,
+            Command::UpdateOverlay((0..40).map(|i| format!("row {i} · 4s")).collect()),
+        );
+
+        assert_eq!(state.overlay_scroll, 12, "the reader's position survives");
+        let overlay = state.input.overlay.as_ref().expect("still open");
+        assert!(overlay.lines[0].ends_with("4s"), "body was refreshed");
+        assert_eq!(overlay.title, "Activity", "title/hint are not disturbed");
+        assert_eq!(overlay.hint, "Esc/q close");
+    }
+
+    /// A refresh that races the Esc which closed the panel must not resurrect it: the refresher thread
+    /// sleeps between publishes, so one in-flight update after the close is entirely ordinary.
+    #[test]
+    fn a_refresh_arriving_after_close_does_not_reopen_the_overlay() {
+        let mut state = AppState::new("intro", "status");
+        apply_command(
+            &mut state,
+            Command::OpenOverlay(OverlaySnapshot {
+                title: "Activity".into(),
+                lines: vec!["row".into()],
+                selected: None,
+                hint: String::new(),
+            }),
+        );
+        apply_command(&mut state, Command::CloseOverlay);
+        apply_command(&mut state, Command::UpdateOverlay(vec!["late".into()]));
+        assert!(state.input.overlay.is_none(), "stays closed");
+    }
+
+    /// The per-tool result line carries a sub-agent dispatch's whole runtime, and that can be hours.
+    /// `· 7203.4s` is correct and unreadable; the minute/hour tiers exist for exactly that row.
+    #[test]
+    fn tool_row_time_gains_minute_and_hour_tiers() {
+        assert_eq!(fmt_elapsed(None), "");
+        assert_eq!(fmt_elapsed(Some(940)), " · 940ms");
+        assert_eq!(fmt_elapsed(Some(1_250)), " · 1.2s");
+        assert_eq!(fmt_elapsed(Some(59_900)), " · 59.9s");
+        assert_eq!(fmt_elapsed(Some(60_000)), " · 1m00s");
+        assert_eq!(fmt_elapsed(Some(7_203_400)), " · 2h00m");
+    }
+
+    /// A right-click in the bottom-right corner is exactly where a naive `x+1, y+1` placement puts
+    /// most of the box off-screen — leaving a Copy button that cannot be clicked at the position a
+    /// context menu is most likely to be used from.
+    #[test]
+    fn copy_menu_is_clamped_fully_inside_the_transcript_area() {
+        let area = Rect::new(0, 0, 40, 20);
+        let fits = |r: Rect| {
+            r.x >= area.x
+                && r.y >= area.y
+                && r.x + r.width <= area.x + area.width
+                && r.y + r.height <= area.y + area.height
+        };
+
+        // Middle of the area: offered one cell down-right of the pointer so the box isn't under it.
+        let mid = context_menu_layout(area, ContextMenu { col: 10, row: 5 }).unwrap();
+        assert_eq!((mid.x, mid.y), (11, 6));
+        assert!(fits(mid));
+
+        // Bottom-right corner: pulled back inside instead of overflowing.
+        let corner = context_menu_layout(area, ContextMenu { col: 39, row: 19 }).unwrap();
+        assert!(fits(corner), "corner menu escaped the area: {corner:?}");
+        assert_eq!(corner.x + corner.width, area.width, "flush to the right edge");
+        assert_eq!(corner.y + corner.height, area.height, "flush to the bottom");
+
+        // A non-zero origin (the transcript never starts at 0,0 once a footer exists) is respected.
+        let offset_area = Rect::new(4, 3, 40, 20);
+        let off = context_menu_layout(offset_area, ContextMenu { col: 4, row: 3 }).unwrap();
+        assert!(off.x >= 4 && off.y >= 3, "clamped to the area origin: {off:?}");
+
+        // A viewport too small to hold the box draws nothing rather than a clipped, unclickable one.
+        assert!(context_menu_layout(Rect::new(0, 0, 3, 20), ContextMenu { col: 0, row: 0 }).is_none());
+        assert!(context_menu_layout(Rect::new(0, 0, 40, 2), ContextMenu { col: 0, row: 0 }).is_none());
+    }
+
+    /// Losing the highlight must take the menu with it. A "Copy" button whose selection is gone would
+    /// copy nothing, so every path that clears a selection (Esc, click-away, the jump button) has to
+    /// dismiss the menu — which is why `ClearSelection` does it rather than each caller remembering.
+    #[test]
+    fn clearing_the_selection_also_closes_the_copy_menu() {
+        let mut state = AppState::new("intro", "status");
+        let sel = SelectionRange {
+            anchor_line: 1,
+            anchor_col: 0,
+            cursor_line: 1,
+            cursor_col: 4,
+        };
+        apply_command(&mut state, Command::SetSelection(sel));
+        apply_command(
+            &mut state,
+            Command::OpenContextMenu(ContextMenu { col: 5, row: 5 }),
+        );
+        assert!(state.context_menu.is_some());
+
+        apply_command(&mut state, Command::ClearSelection);
+        assert!(state.selection.is_none());
+        assert!(
+            state.context_menu.is_none(),
+            "a menu offering to copy nothing must not survive the highlight"
+        );
+
+        // Closing the menu on its own leaves the highlight alone — copying should not deselect.
+        apply_command(&mut state, Command::SetSelection(sel));
+        apply_command(
+            &mut state,
+            Command::OpenContextMenu(ContextMenu { col: 5, row: 5 }),
+        );
+        apply_command(&mut state, Command::CloseContextMenu);
+        assert!(state.context_menu.is_none());
+        assert_eq!(
+            state.selection,
+            Some(sel),
+            "dismissing the menu keeps the selection"
+        );
     }
 
     #[test]

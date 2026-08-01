@@ -24,6 +24,23 @@ use std::time::Duration;
 const DEFAULT_KEEP: usize = 50;
 const LEDGER_SCHEMA: u32 = 2;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
+/// Wall-clock ceiling on ONE internal git invocation.
+///
+/// Every mutating Time Machine op holds `transaction.lock` (and a shared `store.lock`) across its git
+/// spawns — see `save_in`. An OS advisory lock lives on the open FILE HANDLE and is released only by
+/// `Drop`, so a git child that never reaches pipe EOF parks the thread, the guard never drops, and the
+/// byte range stays locked for the life of the process. The observable result was every subsequent
+/// edit failing after exactly `LOCK_TIMEOUT` with "resource is busy … transaction.lock", while the
+/// lock file appeared absent on disk and no other process was running — deleting the file could not
+/// help, because the lock was never in the file. Bounding the spawn converts that permanent strand
+/// into an ordinary `Err` that unwinds through `Drop` and frees the lock.
+///
+/// Sized generously: `add -A` + `write-tree` over a large worktree is legitimately slow. The point is
+/// that it is FINITE and well under no user's patience, not that it is short. Override with
+/// `AIZEN_GIT_OP_TIMEOUT_SECS`.
+const GIT_OP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Grace for draining a git child's pipes after it exits (or is killed at the deadline).
+const GIT_DRAIN_GRACE: Duration = Duration::from_secs(5);
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 /// Max agent-driven rewinds per agent run — enough to abandon a bad approach twice, not thrash.
 const MAX_RUN_REWINDS: u8 = 2;
@@ -605,8 +622,7 @@ impl RepoContext {
         } else {
             cmd.env_remove("GIT_INDEX_FILE");
         }
-        cmd.output()
-            .context("running internal git operation (is git installed?)")
+        run_git_bounded(&mut cmd, "internal git operation")
     }
 
     /// Probe the **source** repository for external filter drivers (not the private store).
@@ -624,8 +640,7 @@ impl RepoContext {
             .env_remove("GIT_INDEX_FILE")
             .env_remove("GIT_OBJECT_DIRECTORY")
             .args(args);
-        cmd.output()
-            .context("running source git probe (is git installed?)")
+        run_git_bounded(&mut cmd, "source git probe")
     }
 
     fn source_git<I, S>(&self, args: I) -> Result<String>
@@ -673,8 +688,19 @@ impl RepoContext {
         Ok(())
     }
 
+    /// Take the per-worktree metadata lock, observing the turn's cancel token.
+    ///
+    /// Cancel-aware rather than a blind 15s spin: the token is checked between non-blocking OS
+    /// attempts, so Esc during contention returns at once instead of making the user wait out
+    /// `LOCK_TIMEOUT` before the tool reports failure.
     fn lock(&self) -> Result<crate::core::repo_lock::RepoTxnLock> {
-        crate::core::repo_lock::RepoTxnLock::acquire(&self.lock_path(), LOCK_TIMEOUT)
+        let cancel = crate::core::cancel::current();
+        crate::core::repo_lock::RepoTxnLock::acquire_mode(
+            &self.lock_path(),
+            crate::core::repo_lock::LockMode::Exclusive,
+            LOCK_TIMEOUT,
+            cancel.as_ref(),
+        )
     }
 
     /// Repository-store lock path, shared by ALL linked worktrees (one level above the per-worktree
@@ -924,19 +950,14 @@ impl RepoContext {
         // object is present via `cat-file` (alternates) then write a thin local ref pin — objects
         // stay in alternates until `doctor_gc` optionally copies. For independence, use
         // `git unpack-objects` of a generated pack.
-        let mut pack = child
-            .spawn()
-            .context("starting private-store pack-objects")?;
-        use std::io::Write;
-        {
-            let stdin = pack.stdin.as_mut().context("pack-objects stdin")?;
-            writeln!(stdin, "{commit}")?;
-            // Terminate rev-list style input.
-            writeln!(stdin)?;
-        }
-        let pack_out = pack
-            .wait_with_output()
-            .context("running pack-objects for materialize")?;
+        // rev-list style input: the commit, then a blank line to terminate. Bounded so a wedged
+        // `pack-objects` cannot park this thread while `transaction.lock` is held.
+        let pack_input = format!("{commit}\n\n");
+        let pack_out = run_git_piped_bounded(
+            &mut child,
+            pack_input.as_bytes(),
+            "private-store pack-objects",
+        )?;
         if !pack_out.status.success() {
             // Fall back: object remains reachable via alternates. Migration still creates the ref;
             // independence is best-effort when pack-objects cannot run (e.g. empty tree edge).
@@ -958,16 +979,11 @@ impl RepoContext {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        let mut child = unpack
-            .spawn()
-            .context("starting unpack-objects for materialize")?;
-        {
-            let stdin = child.stdin.as_mut().context("unpack-objects stdin")?;
-            stdin.write_all(&pack_out.stdout)?;
-        }
-        let out = child
-            .wait_with_output()
-            .context("running unpack-objects for materialize")?;
+        let out = run_git_piped_bounded(
+            &mut unpack,
+            &pack_out.stdout,
+            "unpack-objects for materialize",
+        )?;
         if !out.status.success() {
             // Alternates still provide reachability; ref create below is enough for restore.
             let _ = self.git(None, ["cat-file", "-e", &format!("{commit}^{{commit}}")])?;
@@ -1127,11 +1143,9 @@ fn ensure_private_store(store_git_dir: &Path, common_git_dir: &Path) -> Result<(
                 store_git_dir.display()
             )
         })?;
-        let out = git_cmd()
-            .args(["init", "--bare", "-q"])
-            .arg(store_git_dir)
-            .output()
-            .context("initializing private time-machine store (is git installed?)")?;
+        let mut cmd = git_cmd();
+        cmd.args(["init", "--bare", "-q"]).arg(store_git_dir);
+        let out = run_git_bounded(&mut cmd, "initializing private time-machine store")?;
         if !out.status.success() {
             bail!(
                 "failed to initialize private time-machine store: {}",
@@ -1165,10 +1179,14 @@ fn ensure_private_store(store_git_dir: &Path, common_git_dir: &Path) -> Result<(
     }
 
     // Neutralize config inside the private store itself (no shared hooks/fsmonitor).
-    let _ = git_cmd()
-        .env("GIT_DIR", strip_windows_verbatim(store_git_dir))
-        .args(["config", "core.hooksPath", "hooks-disabled"])
-        .output();
+    // Best-effort (the `let _`), but still BOUNDED: a wedged git here would hang store setup, which
+    // runs on the pre-edit checkpoint path for every protected write.
+    {
+        let mut cmd = git_cmd();
+        cmd.env("GIT_DIR", strip_windows_verbatim(store_git_dir))
+            .args(["config", "core.hooksPath", "hooks-disabled"]);
+        let _ = run_git_bounded(&mut cmd, "disabling hooks in private store");
+    }
     let hooks_disabled = store_git_dir.join("hooks-disabled");
     let _ = fs::create_dir_all(&hooks_disabled);
     Ok(())
@@ -1207,6 +1225,163 @@ fn git_cmd() -> Command {
     }
 }
 
+/// Per-invocation git deadline, overridable for slow trees / CI. See [`GIT_OP_TIMEOUT`].
+fn git_op_timeout() -> Duration {
+    std::env::var("AIZEN_GIT_OP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(GIT_OP_TIMEOUT)
+}
+
+/// Run a fully-configured git `Command` under a wall-clock deadline, with its whole process tree
+/// contained, and shape the result like `Command::output()` so callers are unchanged.
+///
+/// This replaces every bare `cmd.output()` in this module. `Command::output()` blocks until every
+/// pipe reaches EOF, and on Windows a grandchild that outlives its parent keeps the inherited write
+/// end open, so EOF may never arrive — the caller then blocks forever WHILE HOLDING
+/// `transaction.lock` (see [`GIT_OP_TIMEOUT`] for the full failure chain). Bytes are preserved
+/// verbatim: `cat-file blob` output is file content, and `-z` output is NUL-delimited, so neither may
+/// go through a lossy UTF-8 decode.
+fn run_git_bounded(cmd: &mut Command, what: &str) -> Result<Output> {
+    let timeout = git_op_timeout();
+    let out = crate::core::proctree::output_bounded_bytes(cmd, timeout, GIT_DRAIN_GRACE)
+        .with_context(|| format!("running {what} (is git installed?)"))?;
+    if out.timed_out {
+        bail!(
+            "{what} exceeded {}s and was terminated (set AIZEN_GIT_OP_TIMEOUT_SECS to raise the \
+             limit); nothing was changed",
+            timeout.as_secs()
+        );
+    }
+    Ok(Output {
+        status: exit_status_from_code(out.code),
+        stdout: out.stdout,
+        stderr: out.stderr,
+    })
+}
+
+/// Run a git `Command` that must be FED THROUGH STDIN, under the same deadline and tree containment
+/// as [`run_git_bounded`].
+///
+/// `wait_with_output()` has no timeout, so the wait is rebuilt here. All three pipes are serviced on
+/// their OWN threads, which is what makes the deadline total rather than partial. Two deadlocks are
+/// closed by that, and both were live at some point in this function's history:
+///
+/// * The original code wrote the whole input and only then called `wait_with_output`, so a child
+///   emitting more than one pipe buffer of OUTPUT while we were still writing blocked us and itself
+///   forever. Starting the stdout/stderr drains first fixed that one.
+/// * Writing the input on THIS thread, ahead of the wait loop, reintroduced the mirror image on the
+///   INPUT side: a pipe buffer is ~64 KiB, so `write_all` of a larger payload blocks until the child
+///   drains it — and the deadline had not started counting yet, so nothing could break the tie. That
+///   is not hypothetical here: `unpack-objects` is fed a whole packfile (megabytes for any real
+///   checkpoint), while holding `transaction.lock`. The write now runs on its own thread, so the
+///   loop below is reached immediately and the deadline governs the write as well.
+///
+/// The caller configures stdio: `stdin` MUST be piped; stdout/stderr may be piped or null.
+fn run_git_piped_bounded(cmd: &mut Command, stdin_bytes: &[u8], what: &str) -> Result<Output> {
+    let timeout = git_op_timeout();
+    crate::core::proctree::prepare(cmd);
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("starting {what} (is git installed?)"))?;
+    let containment = crate::core::proctree::contain(&child);
+
+    let out_pipe = child.stdout.take();
+    let err_pipe = child.stderr.take();
+    let oh = std::thread::spawn(move || read_pipe_bytes(out_pipe));
+    let eh = std::thread::spawn(move || read_pipe_bytes(err_pipe));
+
+    // Feed stdin on its own thread, then CLOSE it — git plumbing waits for EOF on its input before it
+    // will exit. A write error (child already gone) is deliberately not propagated as the primary
+    // failure: the exit code and stderr explain the real cause far better than "broken pipe".
+    let stdin = child.stdin.take();
+    let payload = stdin_bytes.to_vec();
+    let wh = std::thread::spawn(move || {
+        use std::io::Write;
+        let mut stdin = stdin;
+        let err = match stdin.as_mut() {
+            Some(pipe) => pipe.write_all(&payload).err(),
+            None => None,
+        };
+        drop(stdin); // close the pipe so the child sees EOF
+        err
+    });
+
+    let start = std::time::Instant::now();
+    let mut timed_out = false;
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st.code(),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    crate::core::proctree::kill_tree(&mut child, &containment);
+                    timed_out = true;
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            Err(e) => return Err(e).with_context(|| format!("waiting for {what}")),
+        }
+    };
+    // Join the writer too: killing the tree unblocks a parked `write_all` (the read end is gone), so
+    // this returns promptly. `None` on a lapsed grace means the thread is still parked, which we treat
+    // as no reportable write error — the exit code below is the better story either way.
+    let write_err = crate::core::proctree::join_drain(wh, GIT_DRAIN_GRACE).0;
+    let (stdout, _) = crate::core::proctree::join_drain(oh, GIT_DRAIN_GRACE);
+    let (stderr, _) = crate::core::proctree::join_drain(eh, GIT_DRAIN_GRACE);
+    if timed_out {
+        // Deliberately NOT "nothing was changed": a child killed mid-flight may already have written
+        // part of its work (`unpack-objects` lands loose objects as it goes). Saying otherwise would
+        // talk the reader out of the one check worth doing.
+        bail!(
+            "{what} exceeded {}s and was terminated (set AIZEN_GIT_OP_TIMEOUT_SECS to raise the \
+             limit); it may have completed partially — run `aizen time doctor` to check the store",
+            timeout.as_secs()
+        );
+    }
+    if let Some(e) = write_err {
+        return Err(e).with_context(|| format!("writing input to {what}"));
+    }
+    Ok(Output {
+        status: exit_status_from_code(code),
+        stdout,
+        stderr,
+    })
+}
+
+/// Drain a child pipe to raw bytes on a worker thread (byte-exact: pack data and `-z` output).
+fn read_pipe_bytes<R: std::io::Read>(pipe: Option<R>) -> Vec<u8> {
+    match pipe {
+        Some(mut p) => {
+            let mut bytes = Vec::new();
+            let _ = p.read_to_end(&mut bytes);
+            bytes
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Rebuild an `ExitStatus` from a raw code so [`run_git_bounded`] can return a plain `Output`.
+///
+/// There is no portable constructor, so each platform uses its own `from_raw`. On Unix the raw value
+/// is a *wait status*, where the exit code occupies the high byte (`code << 8`) — passing the code
+/// directly would report every success as a signal death.
+fn exit_status_from_code(code: Option<i32>) -> std::process::ExitStatus {
+    let code = code.unwrap_or(1);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code as u32)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+}
+
 fn fnv1a64(s: &str) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     for b in s.as_bytes() {
@@ -1224,11 +1399,12 @@ where
     // Absence of a git executable is a TYPED error (GitMissing), not a spawn ENOENT dressed as a
     // repo problem — `save_protected_change`/`preflight` treat it as "checkpoints simply off"
     // instead of refusing every file edit on a machine without git.
-    let out = crate::core::gitx::command()?
-        .current_dir(root)
-        .args(args)
-        .output()
-        .context("running git (is git installed?)")?;
+    let mut cmd = crate::core::gitx::command()?;
+    cmd.current_dir(root).args(args);
+    // Bounded like every other git spawn here: this one runs during discovery, BEFORE any lock is
+    // taken, so a hang strands no lock — but it does park the turn's thread forever, which looks
+    // identical to a frozen agent. A deadline turns that into a reportable error.
+    let out = run_git_bounded(&mut cmd, "git repository probe")?;
     if !out.status.success() {
         bail!(
             "git repository probe failed: {}",
@@ -1395,17 +1571,18 @@ fn index_blob_bytes(ctx: &RepoContext, index: &Path) -> Result<u64> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut proc = child.spawn().context("starting cat-file --batch-check")?;
-    {
-        use std::io::Write;
-        let stdin = proc.stdin.as_mut().context("cat-file stdin")?;
-        for oid in &ordered {
-            writeln!(stdin, "{oid}")?;
-        }
+    // One newline-terminated oid per line. Bounded: this runs under `transaction.lock`, so a wedged
+    // `cat-file` must fail rather than park the thread and strand the lock for the whole session.
+    let mut batch_input = String::new();
+    for oid in &ordered {
+        batch_input.push_str(oid);
+        batch_input.push('\n');
     }
-    let out = proc
-        .wait_with_output()
-        .context("running cat-file --batch-check")?;
+    let out = run_git_piped_bounded(
+        &mut child,
+        batch_input.as_bytes(),
+        "cat-file --batch-check",
+    )?;
     if !out.status.success() {
         bail!(
             "internal git operation failed: {}",
@@ -1535,6 +1712,33 @@ fn no_repo_here(consequence: &str) -> String {
 /// while blaming "the pre-edit checkpoint".
 fn benign_no_checkpoint(e: &anyhow::Error) -> bool {
     e.to_string().contains("not a git repository") || crate::core::gitx::is_git_missing(e)
+}
+
+/// Actionable trailer for a checkpoint failure that blocked an edit, or `""` when the error already
+/// explains itself.
+///
+/// The gate is deliberately FAIL-CLOSED for a real checkpoint failure — an edit that lands with no
+/// pre-image has no rewind, so proceeding would trade a visible error for silent data risk. But
+/// "fail closed" must not mean "dead end", and one case was exactly that: a busy `transaction.lock`
+/// reported a path the user then found ABSENT on disk, with no aizen process running, and deleting
+/// the file changed nothing. All three observations are consistent, and the reason is that the lock
+/// is an OS byte-range lock bound to an open HANDLE, not to the path: it can only be held by a live
+/// process, it is invisible in the directory listing, and unlinking the path cannot release it.
+/// The holder was this same process — a thread stranded inside an unbounded `git` child from an
+/// earlier turn (now bounded; see [`GIT_OP_TIMEOUT`]). Naming that turns an impasse into one step.
+pub fn checkpoint_failure_hint(e: &anyhow::Error) -> String {
+    let busy = e
+        .chain()
+        .any(|c| c.downcast_ref::<crate::core::repo_lock::LockBusy>().is_some());
+    if !busy {
+        return String::new();
+    }
+    " — this lock is held on an open handle, not by the file on disk, so deleting it has no effect \
+     and an absent file does not mean it is free. It is most likely held by THIS aizen session (a \
+     stuck internal git call from an earlier turn). Run `aizen time doctor`, or restart this \
+     session to clear it; edits are refused rather than run unprotected because a change with no \
+     pre-edit checkpoint cannot be rewound."
+        .to_string()
 }
 
 /// Validate Time Machine metadata without capturing a tree. Kept for CLI diagnostics; protected
@@ -2992,6 +3196,59 @@ impl crate::agent::tools::Tool for CheckpointDiff {
 mod tests {
     use super::*;
 
+    /// A stdin payload LARGER than a pipe buffer, fed to a child that never reads it, must still
+    /// return at the deadline instead of parking this thread forever.
+    ///
+    /// This is a regression test for a bug introduced by the very fix that bounded these spawns.
+    /// `write_all` ran on the calling thread, ahead of the wait loop, so it blocked once the ~64 KiB
+    /// pipe buffer filled — and the deadline had not begun counting, so nothing could break the tie.
+    /// It mattered in production rather than in theory: `unpack-objects` is fed a whole packfile
+    /// (megabytes for any real checkpoint) while `transaction.lock` is held, which is precisely the
+    /// permanent-strand-holding-a-lock failure this module exists to prevent.
+    #[test]
+    fn a_child_that_never_reads_stdin_cannot_park_a_large_write() {
+        // 1 MiB: comfortably past any platform's pipe buffer, so `write_all` MUST block partway
+        // through unless the child drains it — and this child deliberately never does.
+        let payload = vec![b'x'; 1024 * 1024];
+        let mut cmd = if cfg!(windows) {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+            let mut c = Command::new(format!(
+                r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe"
+            ));
+            c.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 40"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "sleep 40"]);
+            c
+        };
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        std::env::set_var("AIZEN_GIT_OP_TIMEOUT_SECS", "2");
+        let start = std::time::Instant::now();
+        let res = run_git_piped_bounded(&mut cmd, &payload, "stdin-hostile child");
+        let elapsed = start.elapsed();
+        std::env::remove_var("AIZEN_GIT_OP_TIMEOUT_SECS");
+
+        assert!(
+            res.is_err(),
+            "a child killed at its deadline must report an error, not success"
+        );
+        assert!(
+            elapsed < Duration::from_secs(25),
+            "returned only after {elapsed:?} — the write blocked outside the deadline's reach"
+        );
+        // The message must not claim innocence: a child killed mid-flight may already have written
+        // part of its work, and telling the user otherwise talks them out of checking.
+        let msg = format!("{:#}", res.unwrap_err());
+        assert!(
+            !msg.contains("nothing was changed"),
+            "a killed child's partial work must not be described as no change: {msg}"
+        );
+    }
+
     fn mk(id: u32, parent: Option<u32>) -> Snapshot {
         Snapshot {
             id,
@@ -3006,6 +3263,37 @@ mod tests {
             coverage: Coverage::default(),
             recovery: false,
         }
+    }
+
+    /// A busy `transaction.lock` must produce an ACTIONABLE hint, and nothing else may.
+    ///
+    /// This error used to be a dead end: the user saw "the pre-edit checkpoint failed: resource is
+    /// busy …transaction.lock", found no other aizen process and no lock file on disk, and had no
+    /// way to learn that an OS lock lives on an open HANDLE — so it can be held by a stranded thread
+    /// in the very process reporting the error, and deleting the path cannot release it.
+    #[test]
+    fn lock_busy_gets_a_self_diagnosing_hint_and_other_errors_do_not() {
+        let busy = anyhow::Error::new(crate::core::repo_lock::LockBusy {
+            path: PathBuf::from("C:/x/transaction.lock"),
+            mode: crate::core::repo_lock::LockMode::Exclusive,
+            timeout: Duration::from_secs(15),
+        });
+        let hint = checkpoint_failure_hint(&busy);
+        assert!(!hint.is_empty(), "a lock-busy failure must explain itself");
+        for expected in ["handle", "restart"] {
+            assert!(
+                hint.to_ascii_lowercase().contains(expected),
+                "hint should mention {expected:?} so the user can act on it; got {hint:?}"
+            );
+        }
+
+        // An unrelated failure must stay clean — a hint about locks on a filter-driver refusal
+        // would send the reader chasing the wrong cause.
+        let other = anyhow::anyhow!("checkpoint refused: repository config defines external Git filter `filter.foo.clean`");
+        assert!(
+            checkpoint_failure_hint(&other).is_empty(),
+            "only lock contention earns the lock hint"
+        );
     }
 
     #[test]

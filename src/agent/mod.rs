@@ -356,8 +356,9 @@ pub fn build_top_level_system_prompt_bundle(
             "\n<ultimate_mode>\n\
              You are in ULTIMATE mode. Reason at maximum depth.\n\
              - When work decomposes into independent angles (multi-file investigation, multi-angle \
-             review, broad search, parallel research), PREFER the `workflow` tool (mode=fanout, ≤5 \
-             tasks) over serial `task` loops or doing it yourself. Keep writes singular (at most \
+             review, broad search, parallel research), PREFER the `workflow` tool (mode=fanout) \
+             over serial `task` loops or doing it yourself — request as many tasks as the work \
+             needs; the harness bounds how many run at once. Keep writes singular (at most \
              ONE coder/writer child); fan out the reads.\n\
              - When you have claims/findings to trust, use `workflow` mode=verify to adversarially \
              refute each one before committing to conclusions.\n\
@@ -540,6 +541,21 @@ pub struct AgentConfig {
     /// through every sub-agent spawn, so a boxed `dyn Fn` would cost both derives. `None` ⇒ no
     /// observer (sub-agents and workflow children: their transcripts aren't the user's session).
     pub on_progress: Option<fn(&[Message])>,
+    /// WALL-CLOCK ceiling for this whole run, checked at each loop boundary. `None` ⇒ steps only.
+    ///
+    /// Every other budget here counts STEPS, and steps are not time: `max_iters` + `auto_extend_to` +
+    /// `max_continuations` bound how many turns a run may take, but each of those turns may legitimately
+    /// spend minutes (a 300s model call, a 120s `shell_run`). A delegated dispatch is therefore bounded
+    /// but not *timely* — it always finishes, with no answer to "by when". This is the knob that answers
+    /// that, for callers who need one.
+    ///
+    /// Checked at the LOOP BOUNDARY rather than imposed as an outer `tokio::time::timeout`, and that
+    /// difference is the whole design: an outer timeout drops the future wherever it happens to be
+    /// suspended — mid-`spawn_blocking`, with a write already landed on disk — discarding both the
+    /// transcript and any record of what was changed. Reaching the boundary instead means the current
+    /// step completes, its result is recorded, and the run ends the same orderly way Esc does.
+    /// Consequence to size for: overshoot is bounded by the longest single step, not by zero.
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl Default for AgentConfig {
@@ -585,6 +601,7 @@ impl Default for AgentConfig {
             goal: None,
             enable_steering: false,
             on_progress: None,
+            deadline: None,
         }
     }
 }
@@ -608,6 +625,11 @@ pub enum StopReason {
     /// Nested sub-agents (`task` / `workflow` children) observe the same process-global flag and
     /// stop at their next loop boundary instead of running to max_iters.
     Cancelled,
+    /// [`AgentConfig::deadline`] elapsed. Distinct from `Cancelled` (nobody pressed anything — saying
+    /// "cancelled by user" would send the user looking for a keypress that never happened) and from
+    /// `MaxIters` (which `task_tool::is_resumable` grants a fresh budget for; a deadline that earned
+    /// continuations would not be a deadline). Never resumable.
+    Deadline,
 }
 
 #[derive(Debug)]
@@ -836,6 +858,23 @@ where
                 final_text: None,
                 iters: iter,
                 stop: StopReason::Cancelled,
+            });
+        }
+        // WALL-CLOCK CEILING (`cfg.deadline`), checked beside the cancel flag because it is the same
+        // kind of exit: the step that just finished is recorded, and no new work starts. NOT gated on
+        // `goal_mode` — goal mode deliberately ignores the STEP cap, but a caller who set an explicit
+        // wall-clock ceiling means it, and "runs until the goal is done" with no time bound is exactly
+        // the shape this field exists to bound.
+        //
+        // No `synthesize_final` here, unlike `MaxIters`: that costs another model call, which on this
+        // path can be a further 300s ON TOP of an already-elapsed ceiling — a deadline that overruns
+        // itself to write a summary isn't one. The caller reports the stop reason instead
+        // (`task_tool::stop_body_warning`), so the partial work is still labelled honestly.
+        if cfg.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return Ok(AgentOutcome {
+                final_text: None,
+                iters: iter,
+                stop: StopReason::Deadline,
             });
         }
         if !goal_mode && iter >= cap {
@@ -1256,7 +1295,11 @@ where
                                 .map(|s| s.trim().is_empty())
                                 .unwrap_or(true);
                         if empty_200 && (attempt as usize) < cfg.max_transient_retries {
-                            let delay = crate::llm::client::goal_backoff_ms(attempt);
+                            // INTERACTIVE backoff (fast, cap 4s), not `goal_backoff_ms` (cap 30s):
+                            // someone is watching this turn, so a whole ~10-retry chain must stay
+                            // inside ~30–40s total rather than let one late attempt stall 30s. Goal
+                            // mode's branch above keeps the slow-but-patient backoff on purpose.
+                            let delay = crate::llm::client::interactive_backoff_ms(attempt);
                             attempt += 1;
                             if !cfg.quiet {
                                 retry_line(
@@ -1293,7 +1336,9 @@ where
                             }
                             return Err(e);
                         }
-                        let delay = crate::llm::client::goal_backoff_ms(attempt);
+                        // INTERACTIVE backoff here too (see the empty-200 branch above): the ordinary
+                        // path reports to a waiting user, so it retries fast and then fails cleanly.
+                        let delay = crate::llm::client::interactive_backoff_ms(attempt);
                         attempt += 1;
                         if !cfg.quiet {
                             retry_line(
@@ -2334,7 +2379,8 @@ async fn execute_calls(
                                         None
                                     }
                                     Err(e) => Some(format!(
-                                        "error: protected workspace change was not run because the pre-edit checkpoint failed: {e:#}"
+                                        "error: protected workspace change was not run because the pre-edit checkpoint failed: {e:#}{}",
+                                        crate::features::timemachine::checkpoint_failure_hint(&e)
                                     )),
                                 }
                             } else {
@@ -2779,6 +2825,12 @@ fn tool_target(name: &str, args: &serde_json::Value) -> String {
         n if n.ends_with("_search") || n == "search" => {
             first_line_clip(field("query").or_else(|| field("q")).unwrap_or(""), 40)
         }
+        // A sub-agent spawn is the ONE call whose target the user cannot infer from anywhere else:
+        // the child runs `quiet` for minutes and only its merged result comes back, so this line is
+        // the only place its subject ever appears. Falling through to the `_` arm below rendered a
+        // clip of escaped JSON (`{"prompt":"Investigate the retai…`) — the args dump, not a topic.
+        "task" => subagent_target(args),
+        "workflow" => workflow_target(args),
         _ => {
             // Unknown tool: fall back to the salient-arg trace so nothing renders bare.
             let t = tool_trace(name, args);
@@ -2791,9 +2843,87 @@ fn tool_target(name: &str, args: &serde_json::Value) -> String {
     }
 }
 
+/// The SUBJECT of a sub-agent dispatch — what it was sent to DO, in the caller's own words. The
+/// model's `label` tag first when it passed one (a deliberate short summary beats a clip of prose),
+/// else the opening line of the prompt. Deliberately excludes the WHO (role / specialist slug) so
+/// each caller can order the two for its own surface. Shared with `task_tool` so the spawn line and
+/// the `/workflows` board can never disagree about what a run is called.
+pub(crate) fn subagent_subject(args: &serde_json::Value, max: usize) -> String {
+    let field = |k: &str| args.get(k).and_then(|v| v.as_str());
+    let text = field("label")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| field("prompt"))
+        .unwrap_or("");
+    first_line_clip(text, max)
+}
+
+/// `⚙ task   <who> · <subject>`. Both halves earn their place: the slug/role says which sub-agent is
+/// running (a `reviewer` cannot edit; a `coder` can), the subject says what it was sent to do.
+fn subagent_target(args: &serde_json::Value) -> String {
+    let field = |k: &str| args.get(k).and_then(|v| v.as_str());
+    let who = field("agent")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        // Mirrors `resolve_dispatch`: absent/blank `role` runs as `coder`, so the line must say
+        // `coder` rather than go silent about a dispatch that CAN write.
+        .or_else(|| field("role").map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or("coder");
+    let subject = subagent_subject(args, 48);
+    if subject.is_empty() {
+        who.to_string()
+    } else {
+        format!("{who} · {subject}")
+    }
+}
+
+/// `⚙ workflow   <mode> · <n> tasks: <subject>, <subject>, …`. A bare count reads as one anonymous
+/// blob of work; the per-task subjects are what let the user tell the children apart while they run
+/// concurrently and silently. Only the first two fit on a line — `…` marks the rest, and `/workflows`
+/// lists them all.
+fn workflow_target(args: &serde_json::Value) -> String {
+    let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("fanout");
+    if mode == "verify" {
+        let n = args
+            .get("findings")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        return format!("verify · {n} finding{}", if n == 1 { "" } else { "s" });
+    }
+    let tasks: &[serde_json::Value] = args
+        .get("tasks")
+        .and_then(|v| v.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or_default();
+    let head = format!(
+        "{mode} · {} task{}",
+        tasks.len(),
+        if tasks.len() == 1 { "" } else { "s" }
+    );
+    let subjects: Vec<String> = tasks
+        .iter()
+        .map(|t| subagent_subject(t, 22))
+        .filter(|s| !s.is_empty())
+        .take(2)
+        .collect();
+    if subjects.is_empty() {
+        return head;
+    }
+    let more = if tasks.len() > subjects.len() { ", …" } else { "" };
+    format!("{head}: {}{more}", subjects.join(", "))
+}
+
 /// Open a tool-call line (mockup shape `⚙ <name>   <target>`), returning the `seq` so the result can
 /// update the same line in place under retained. Shared by the serial + eager-adoption paths.
 fn emit_tool_call(name: &str, args: &serde_json::Value) -> u64 {
+    // Point the working caption (the typewriter line at the transcript bottom) at this tool's human
+    // action ("Reading retained.rs", "Run cargo test") — the hybrid caption's "concrete" half. When a
+    // tool has no English mapping, leave the caption on whatever whimsical verb is showing rather than
+    // typing out a raw tool slug. `emit_tool_result` clears it back to the verb when the call ends.
+    if let Some(action) = tool_action(name, args) {
+        crate::ui::tui::set_work_caption(&action);
+    }
     crate::ui::tui::tool_call_begin(tool_icon(), name, &tool_target(name, args))
 }
 
@@ -2827,6 +2957,10 @@ fn emit_tool_result(
     if ok && !out.trim_start().starts_with("error:") && is_edit_tool(name) {
         emit_edit_diff(&tool_target(name, args), out);
     }
+    // The concrete action is done; drop the caption back to the whimsical verb (empty string ⇒
+    // `work_verb`) so a quiet stretch between tools reads "Pondering…" rather than freezing on the
+    // last tool's action. A new tool call re-points it the moment it starts.
+    crate::ui::tui::set_work_caption("");
 }
 
 fn is_edit_tool(name: &str) -> bool {
@@ -4287,8 +4421,10 @@ fn tool_trace(name: &str, args: &serde_json::Value) -> String {
 }
 
 /// First non-blank line of `s`, inner runs of whitespace collapsed, clipped to `max` chars with
-/// a `…` marker (and a `↵` hint if more lines followed). Char-safe.
-fn first_line_clip(s: &str, max: usize) -> String {
+/// a `…` marker (and a `↵` hint if more lines followed). Char-safe. `pub(crate)` so the workflow
+/// runner can label a child with its prompt's opening line using the SAME clipping the spawn line
+/// uses — two clippers would drift and show the same task under two different names.
+pub(crate) fn first_line_clip(s: &str, max: usize) -> String {
     let first = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let multiline = s.lines().filter(|l| !l.trim().is_empty()).count() > 1;
     let collapsed = first.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -4330,6 +4466,74 @@ mod tests {
         let line = tool_call_line("mystery_tool", &serde_json::json!({"foo": "bar"}));
         let plain = console::strip_ansi_codes(&line).to_string();
         assert!(plain.contains("mystery_tool"), "{plain:?}");
+    }
+
+    #[test]
+    fn spawn_line_names_the_subject_not_the_args_json() {
+        // The regression this guards: `task`/`workflow` had no arm in `tool_target`, so they fell to
+        // the `_` arm → `compact_args` → a 40-char clip of escaped JSON. A sub-agent runs silently
+        // for minutes, so this line is the ONLY place its topic ever appears.
+        let t = tool_target(
+            "task",
+            &serde_json::json!({"prompt": "Investigate the retained render thread\nmore detail"}),
+        );
+        assert!(t.contains("Investigate the retained render thread"), "{t:?}");
+        assert!(t.starts_with("coder"), "absent role defaults to coder: {t:?}");
+        assert!(!t.contains("prompt"), "no arg-name leakage: {t:?}");
+        assert!(!t.contains('{'), "no JSON dump: {t:?}");
+    }
+
+    #[test]
+    fn spawn_line_prefers_the_models_label_and_the_specialist_slug() {
+        // A `label` is a deliberate summary — better than a clip of the prompt's first line.
+        let t = tool_target(
+            "task",
+            &serde_json::json!({"prompt": "Read every call site and report", "label": "cwd-audit"}),
+        );
+        assert_eq!(t, "coder · cwd-audit");
+        // A resolvable `agent` slug supersedes `role` in `resolve_dispatch`; the line must agree.
+        let t = tool_target(
+            "task",
+            &serde_json::json!({"prompt": "check it", "agent": "code-reviewer", "role": "coder"}),
+        );
+        assert_eq!(t, "code-reviewer · check it");
+        // Read-only vs write-capable is the one thing the WHO half carries; keep it.
+        let t = tool_target("task", &serde_json::json!({"prompt": "x", "role": "reviewer"}));
+        assert!(t.starts_with("reviewer"), "{t:?}");
+    }
+
+    #[test]
+    fn workflow_spawn_line_counts_and_names_its_children() {
+        let t = tool_target(
+            "workflow",
+            &serde_json::json!({"mode": "fanout", "tasks": [
+                {"prompt": "read the parser", "role": "reviewer"},
+                {"prompt": "check the tests"},
+                {"prompt": "third one"}
+            ]}),
+        );
+        assert!(t.contains("3 tasks"), "{t:?}");
+        assert!(t.contains("read the parser"), "{t:?}");
+        assert!(t.contains("check the tests"), "{t:?}");
+        assert!(
+            t.contains('…') && !t.contains("third one"),
+            "only two subjects fit; the rest are marked, not dropped silently: {t:?}"
+        );
+        // verify mode carries findings, not tasks — and the count must read grammatically.
+        assert_eq!(
+            tool_target(
+                "workflow",
+                &serde_json::json!({"mode": "verify", "findings": ["a", "b", "c"]})
+            ),
+            "verify · 3 findings"
+        );
+        assert_eq!(
+            tool_target(
+                "workflow",
+                &serde_json::json!({"mode": "verify", "findings": ["a"]})
+            ),
+            "verify · 1 finding"
+        );
     }
 
     #[test]
@@ -4772,6 +4976,10 @@ mod tests {
             // script must not pick up a steer a steering test left behind.
             enable_steering: false,
             on_progress: None, // no live-history publishing in unit tests
+            // No wall-clock ceiling in unit tests: a scripted run is instant, so a deadline could only
+            // fire spuriously on a loaded CI box and turn an assertion about MaxIters/Divergence into a
+            // flake. The deadline tests set it explicitly.
+            deadline: None,
         }
     }
 
@@ -5819,6 +6027,100 @@ mod tests {
             out.iters, 6,
             "the ceiling is auto_extend_to + max_continuations * max_iters"
         );
+    }
+
+    #[tokio::test]
+    async fn an_elapsed_deadline_stops_before_spending_a_model_call() {
+        // The wall-clock ceiling is checked at the TOP of the loop, so a run whose deadline is already
+        // gone must not reach the gateway at all — the point is to stop spending, and a "deadline" that
+        // still buys one more 300s call is not one.
+        let r = registry();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let chat = move |_m: Vec<Message>, _d: Vec<ToolDef>| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(Ok(final_turn("should never be reached")))
+        };
+        let c = AgentConfig {
+            // `Instant` is monotonic, so a deadline captured now has necessarily elapsed by the time
+            // the loop reads the clock — no sleep needed to make this deterministic.
+            deadline: Some(std::time::Instant::now()),
+            ..cfg()
+        };
+        let out = run_agent(chat, &c, &r, "sys", "task").await.unwrap();
+        assert_eq!(out.stop, StopReason::Deadline);
+        assert_eq!(out.iters, 0);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "an elapsed deadline must not spend a model call"
+        );
+        // Deliberately NO synthesis on this path: writing a summary would cost one more call on top of
+        // an already-blown ceiling. The caller labels the partial work from the stop reason instead.
+        assert!(
+            out.final_text.is_none(),
+            "a deadline stop must not pay for a synthesis call"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deadline_cuts_a_healthy_run_that_still_has_steps_and_ignores_goal_mode() {
+        // The case the ceiling exists for: a run that is making genuine progress (fresh tool call every
+        // turn, so neither the divergence latch nor the stall guard fires) and has plenty of budget
+        // left. Steps alone would let it continue; only time stops it.
+        //
+        // Goal mode is armed on purpose. It bypasses the STEP cap by design ("run until the goal is
+        // done"), and that is exactly the shape that needs a wall clock — so the deadline check sits
+        // outside the `!goal_mode` guard, and this pins that.
+        let r = registry();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let chat = move |_m: Vec<Message>, _d: Vec<ToolDef>| {
+            let n = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                // A DISTINCT argument each turn: two identical calls would trip the divergence latch
+                // and stop the run for the wrong reason, hiding whether the deadline works at all.
+                Ok(tool_turn("echo", &format!(r#"{{"text":"step {n}"}}"#)))
+            }
+        };
+        let c = AgentConfig {
+            max_iters: 50,
+            auto_extend_to: 50,
+            goal: Some("keep going".into()),
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(300)),
+            ..cfg()
+        };
+        let out = run_agent(chat, &c, &r, "sys", "task").await.unwrap();
+        assert_eq!(
+            out.stop,
+            StopReason::Deadline,
+            "time must stop a healthy run even in goal mode, which ignores the step cap"
+        );
+        // Bounds are wide on purpose — this asserts the SHAPE (work happened, then time cut it), not a
+        // step count, so a loaded CI box changes the number without failing the test.
+        assert!(out.iters >= 1, "work should have happened before the cut");
+        assert!(
+            out.iters < 50,
+            "must stop on TIME with budget to spare, not by exhausting steps: {}",
+            out.iters
+        );
+    }
+
+    #[tokio::test]
+    async fn a_future_deadline_does_not_disturb_an_ordinary_run() {
+        // The knob must be inert until it fires: a generous ceiling has to leave a normal run
+        // byte-identical, otherwise enabling it by default would change every dispatch's behavior.
+        let r = registry();
+        let c = AgentConfig {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(3600)),
+            ..cfg()
+        };
+        let out = run_agent(scripted(vec![final_turn("done")]), &c, &r, "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.final_text.as_deref(), Some("done"));
     }
 
     #[tokio::test]
@@ -7332,6 +7634,64 @@ mod tests {
             out.final_text.as_deref(),
             Some("finished despite the blip"),
             "the transient error must not discard the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_mode_retries_transient_past_the_old_default_then_reports() {
+        // The interactive REPL now sets max_transient_retries=10 (Claude-CLI-style: ride out a
+        // gateway blip, then report clearly — never hang). Two facts to pin, both on the ORDINARY
+        // path (goal: None), because that is where a person is watching:
+        //   (a) the budget is honoured PAST the old default of 2 — a run that recovers after more
+        //       than two blips still succeeds (the whole point of raising it);
+        //   (b) blips that OUTLAST the budget end with the error, not an infinite spin.
+        //
+        // Both parts use SMALL failure counts on purpose: the retry sleeps are real wall-clock
+        // waits (`interactive_backoff_ms`, no paused-time test runtime available here), so a literal
+        // budget of 10 would sleep ~30s. Three failures already exceed the old default of 2, which
+        // is the regression this guards; the backoff's ceiling is unit-tested separately by
+        // `interactive_backoff_is_faster_than_goal`.
+        let r = registry();
+
+        // (a) three transient failures (one more than the old default), then the real turn.
+        let c = AgentConfig {
+            max_transient_retries: 10,
+            quiet: true,
+            ..cfg()
+        };
+        let mut three_then_ok: Vec<Result<ChatTurn>> = (0..3)
+            .map(|_| Err(anyhow::anyhow!("upstream returned HTTP 503: overloaded")))
+            .collect();
+        three_then_ok.push(Ok(final_turn("came back after the blips")));
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let out = run_agent_loop(scripted_results(three_then_ok), &c, &r, &mut messages)
+            .await
+            .unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(
+            out.final_text.as_deref(),
+            Some("came back after the blips"),
+            "three blips (past the old default of 2) must be ridden out, not cut short"
+        );
+
+        // (b) failures that never stop must terminate with the error once the budget is spent —
+        // a definitive report, not a hang. Small budget so the real backoff sleeps stay short.
+        let c_small = AgentConfig {
+            max_transient_retries: 3,
+            quiet: true,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let always_503 = scripted_results(
+            (0..8)
+                .map(|_| Err(anyhow::anyhow!("upstream returned HTTP 503: overloaded")))
+                .collect(),
+        );
+        assert!(
+            run_agent_loop(always_503, &c_small, &r, &mut messages)
+                .await
+                .is_err(),
+            "past the budget the loop reports the error rather than spinning forever"
         );
     }
 
