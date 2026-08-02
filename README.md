@@ -1,6 +1,7 @@
 <div align="center">
 
-<img width="260" height="242" alt="image" src="https://github.com/user-attachments/assets/742348fb-7095-4aa4-8c89-75f7cb324934" />
+![Uploading aizen.png…]()
+
 
 
 ### The terminal-native coding agent that actually *lives* on your machine.
