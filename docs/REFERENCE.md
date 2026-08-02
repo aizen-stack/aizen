@@ -312,7 +312,7 @@ Behavior worth knowing:
 
 ### `aizen workflow <spec.json>` — fan-out + synthesis
 Run several role-scoped sub-agents concurrently (bounded to 5), then merge their results into
-one answer (mixture-of-agents). See [examples/review.workflow.json](examples/review.workflow.json):
+one answer (mixture-of-agents). See [examples/review.workflow.json](../examples/review.workflow.json):
 ```bash
 aizen workflow examples/review.workflow.json
 ```
