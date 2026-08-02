@@ -969,6 +969,19 @@ struct AccCall {
     args: String,
 }
 
+/// Are these streamed `arguments` whole enough to RUN — i.e. do they parse as a JSON object?
+///
+/// The empty string is deliberately NOT complete. A genuinely argument-less call still streams
+/// `"{}"`; `""` only ever means "the arguments haven't arrived yet". Treating it as complete is what
+/// let a truncated fragment reach a tool as `{}` (see [`ToolCallAccumulator::snapshot`]).
+fn args_complete(raw: &str) -> bool {
+    let t = raw.trim();
+    !t.is_empty()
+        && serde_json::from_str::<serde_json::Value>(t)
+            .map(|v| v.is_object())
+            .unwrap_or(false)
+}
+
 impl ToolCallAccumulator {
     /// Merge a batch of fragments. Returns the calls whose arguments COMPLETED because a later
     /// slot started (the eager-execution trigger). The FINAL call only completes at stream end —
@@ -998,7 +1011,18 @@ impl ToolCallAccumulator {
                         k
                     }
                 }
-                None => d.index,
+                // An `arguments` fragment carries NO id (only the opening fragment does). If the
+                // provider also omits `index`, `d.index` defaults to 0 — so the second call's
+                // arguments would pour into slot 0 instead of the slot its id was rerouted to, both
+                // corrupting slot 0's JSON and bouncing `active` (which snapshots a half-built
+                // call). An id-less fragment belongs to the call currently streaming: the spec
+                // guarantees one call streams contiguously. Kept narrow (`index == 0` and an active
+                // slot that isn't 0) so compliant providers — where that fragment carries its real
+                // `index: 1` — are routed exactly as before.
+                None => match self.active {
+                    Some(a) if d.index == 0 && a != 0 => a,
+                    _ => d.index,
+                },
             };
             if let Some(prev) = self.active {
                 if prev != key {
@@ -1028,11 +1052,22 @@ impl ToolCallAccumulator {
         completed
     }
 
-    /// A clone of slot `key`'s call as accumulated so far (None when it has no name yet). The id
-    /// may still be empty here — eager adoption keys by POSITION, not id, so that's fine.
+    /// A clone of slot `key`'s call as accumulated so far (None when it has no name yet, or when its
+    /// arguments are not yet a WHOLE JSON object). The id may still be empty here — eager adoption
+    /// keys by POSITION, not id, so that's fine.
+    ///
+    /// The args-completeness check is what keeps a half-streamed call from being dispatched: the
+    /// "a fragment landed on another slot ⇒ the previous call is done" rule is only true for
+    /// providers that tag every fragment with an `index`. When one doesn't, an argument fragment
+    /// (which carries no `id`) defaults to index 0 and can bounce the active slot, snapshotting a
+    /// call whose `args` is still `""` or a partial `{"path":`. An empty string then reads as a
+    /// valid `{}` in `parse_call_args`, so the tool would run with NO ARGUMENTS and fail with
+    /// `missing required string arg` — while the transcript line, built later from the complete
+    /// call, showed the argument right there. Refusing to snapshot costs only the eager head start
+    /// (the call still runs normally in `execute_calls` with its full arguments).
     fn snapshot(&self, key: usize) -> Option<ToolCall> {
         let c = self.calls.get(&key)?;
-        if c.name.is_empty() {
+        if c.name.is_empty() || !args_complete(&c.args) {
             return None;
         }
         Some(ToolCall {
@@ -1798,6 +1833,90 @@ mod tests {
             msgs[1].cache_control.is_none(),
             "no history breakpoint when n < 3"
         );
+    }
+
+    #[test]
+    fn accumulator_does_not_complete_a_call_with_partial_args() {
+        // THE BUG: a call is only "done" once its arguments are whole. Slot 0's JSON is still open
+        // when slot 1 starts, so completing it would hand the executor `{"path":` — which
+        // `parse_call_args` cannot parse, or (when the fragment is empty) reads as `{}`, running the
+        // tool with NO arguments and failing with `missing required string arg` while the transcript
+        // line, built later from the full call, showed the argument plainly.
+        let mut acc = ToolCallAccumulator::default();
+        assert!(acc
+            .ingest(&[delta(0, Some("a"), Some("file_read"), Some(r#"{"path":"#))])
+            .is_empty());
+        // The rest of slot 0's arguments arrive (id-less, still the active call)…
+        assert!(acc
+            .ingest(&[delta(0, None, None, Some(r#""x.rs"}"#))])
+            .is_empty());
+        // …and only NOW, whole, does the next slot's start complete it.
+        let done = acc.ingest(&[delta(1, Some("b"), Some("file_glob"), Some("{}"))]);
+        assert_eq!(done.len(), 1, "a whole call completes");
+        assert_eq!(done[0].1.function.arguments, r#"{"path":"x.rs"}"#);
+
+        // And the failing shape: a call still mid-JSON when the next slot starts is NOT dispatched.
+        let mut acc = ToolCallAccumulator::default();
+        acc.ingest(&[delta(0, Some("a"), Some("file_read"), Some(r#"{"path":"#))]);
+        assert!(
+            acc.ingest(&[delta(1, Some("b"), Some("file_glob"), Some("{}"))])
+                .is_empty(),
+            "a half-streamed call must not be dispatched"
+        );
+    }
+
+    #[test]
+    fn accumulator_does_not_complete_a_call_with_empty_args() {
+        // An id+name opening fragment with no arguments yet: `""` is indistinguishable from "no
+        // arguments", and `parse_call_args` turns it into a valid `{}`. Never eager-dispatch it.
+        let mut acc = ToolCallAccumulator::default();
+        acc.ingest(&[delta(0, Some("a"), Some("web_fetch"), Some(""))]);
+        assert!(
+            acc.ingest(&[delta(1, Some("b"), Some("web_search"), Some("{}"))])
+                .is_empty(),
+            "empty args are 'not yet', not 'no arguments'"
+        );
+    }
+
+    #[test]
+    fn accumulator_routes_idless_fragments_to_the_active_slot() {
+        // An index-omitting provider: every fragment claims index 0. The second call's `id` reroutes
+        // it to a fresh slot, but its ARGUMENT fragments carry no id — they must follow the active
+        // slot rather than pouring back into slot 0 (which corrupted slot 0's JSON and left call #2
+        // argument-less).
+        let mut acc = ToolCallAccumulator::default();
+        acc.ingest(&[delta(0, Some("a"), Some("file_read"), Some(r#"{"path":"a.rs"}"#))]);
+        acc.ingest(&[delta(0, Some("b"), Some("web_fetch"), Some(""))]);
+        acc.ingest(&[delta(0, None, None, Some(r#"{"url":"#))]);
+        acc.ingest(&[delta(0, None, None, Some(r#""https://x.dev"}"#))]);
+        let calls = acc.finish();
+        assert_eq!(calls.len(), 2, "both calls survive");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"a.rs"}"#);
+        assert_eq!(
+            calls[1].function.arguments, r#"{"url":"https://x.dev"}"#,
+            "id-less argument fragments followed the active call"
+        );
+    }
+
+    #[test]
+    fn accumulator_still_completes_when_args_are_whole() {
+        // The eager fast path must survive the tightening: whole arguments + a later slot ⇒ complete.
+        let mut acc = ToolCallAccumulator::default();
+        acc.ingest(&[delta(0, Some("a"), Some("file_read"), Some(r#"{"path":"x.rs"}"#))]);
+        let done = acc.ingest(&[delta(1, Some("b"), Some("file_glob"), Some("{}"))]);
+        assert_eq!(done.len(), 1, "a complete call still dispatches early");
+        assert_eq!(done[0].1.function.arguments, r#"{"path":"x.rs"}"#);
+    }
+
+    #[test]
+    fn args_complete_accepts_only_whole_objects() {
+        assert!(args_complete("{}"), "an argument-less call streams `{{}}`");
+        assert!(args_complete(r#"{"a":1}"#));
+        assert!(!args_complete(""), "`\"\"` means 'not yet', never '{{}}'");
+        assert!(!args_complete("   "));
+        assert!(!args_complete(r#"{"a":"#), "truncated");
+        assert!(!args_complete("[1,2]"), "an array is not an args object");
+        assert!(!args_complete(r#""a string""#));
     }
 
     fn delta(

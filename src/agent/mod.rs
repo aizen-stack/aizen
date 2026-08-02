@@ -2151,9 +2151,31 @@ async fn execute_calls(
     let mut eager: std::collections::HashMap<usize, tokio::task::JoinHandle<String>> =
         eager.into_iter().collect();
     // Parse every call's arguments ONCE — used for the safety partition, the gate, and the body.
+    //
+    // Argument-shape slips are repaired HERE, before anything reads the arguments. That ordering
+    // matters: `safe`, `workspace_effect` and `workspace_target` all inspect the arguments, so a
+    // `{"file": …}` corrected to `{"path": …}` after the partition would be classified — and
+    // checkpointed — against arguments the tool never saw. One chokepoint, both execution arms, so
+    // every tool in the registry is covered by the same repair. Fixes are traced, not silent.
     let parsed: Vec<Result<serde_json::Value, String>> = calls
         .iter()
-        .map(|tc| parse_call_args(&tc.function.arguments))
+        .map(|tc| match parse_call_args(&tc.function.arguments) {
+            Ok(args) => {
+                let Some(tool) = registry.get(&tc.function.name) else {
+                    return Ok(args);
+                };
+                match tools::repair_args(&tool.parameters(), &args) {
+                    Some((fixed, what)) => {
+                        if !cfg.quiet {
+                            emit_trace(&format!("→ {}: {what}", tool.name()));
+                        }
+                        Ok(fixed)
+                    }
+                    None => Ok(args),
+                }
+            }
+            other => other,
+        })
         .collect();
     let safe: Vec<bool> = calls
         .iter()
@@ -2480,6 +2502,16 @@ pub fn eager_starter<'a>(
         if barrier_hit.load(Relaxed) {
             return None;
         }
+        // Eager execution is an OPTIMIZATION, never an obligation. Empty arguments here are almost
+        // always a fragment the accumulator has not finished filling, not the model's intent — and
+        // `parse_call_args` turns `""` into a valid `{}`, so running it would execute the tool with NO
+        // arguments and burn a whole round trip on `missing required string arg`. Skip the head start
+        // and let `execute_calls` run it with the complete arguments. NOTE: deliberately not setting
+        // `barrier_hit` — this call is fine, it is merely not ready yet, and tripping the barrier
+        // would strip the eager start from every call after it too.
+        if tc.function.arguments.trim().is_empty() {
+            return None;
+        }
         let ok = parse_call_args(&tc.function.arguments)
             .ok()
             .and_then(|args| {
@@ -2609,9 +2641,18 @@ fn run_tool_body(
         0
     };
     let started = std::time::Instant::now();
-    let out = match tool.execute(args) {
-        Ok(out) => out,
-        Err(e) => format!("error: {e}"),
+    // Unrepairable missing arguments: answer with the SCHEMA rather than a bare "missing arg 'x'".
+    // The model's next call is only as good as what this string tells it, and the per-tool messages
+    // name the key without saying what the tool actually accepts or what it just sent. Checked here,
+    // at the one point every tool's execution passes through, so the improvement is uniform.
+    let missing = tools::missing_required_strings(&tool.parameters(), args);
+    let out = if !missing.is_empty() {
+        tools::missing_args_error(tool.name(), &tool.parameters(), args, &missing)
+    } else {
+        match tool.execute(args) {
+            Ok(out) => out,
+            Err(e) => format!("error: {e}"),
+        }
     };
     let elapsed_ms = started.elapsed().as_millis() as u64;
     if !quiet {
@@ -7065,6 +7106,79 @@ mod tests {
             Some("EAGER_RESULT"),
             "sink mirrors the adopted result"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eager_starter_skips_empty_args_without_setting_barrier() {
+        let r = registry();
+        let c = cfg();
+        let starter = eager_starter(&r, &c);
+        // Empty arguments = a fragment that hasn't finished streaming. Running it would execute the
+        // tool with `{}` and waste a round trip on a missing-arg error.
+        assert!(
+            starter(0, &call("1", "echo", "")).is_none(),
+            "an argument-less fragment must not start early"
+        );
+        // …but it is NOT a barrier: the call is legitimate, just not ready, so later calls keep
+        // their head start. (Tripping the barrier here would silently disable eager execution for
+        // the rest of the response.)
+        let h = starter(1, &call("2", "echo", r#"{"text":"b"}"#));
+        assert!(h.is_some(), "a later valid call still starts eagerly");
+        assert_eq!(h.unwrap().await.unwrap(), "b");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execute_calls_repairs_a_misnamed_arg_before_dispatch() {
+        // `echo` requires `text`; the model sent `message`. One stray key, one missing required key
+        // ⇒ unambiguous, so the call should just work instead of costing a round trip.
+        let r = registry();
+        let calls = vec![call("1", "echo", r#"{"message":"hello"}"#)];
+        let mut sink: Vec<Message> = calls
+            .iter()
+            .map(|tc| Message::tool_result(tc.id.clone(), INTERRUPTED_TOOL_PLACEHOLDER.to_string()))
+            .collect();
+        let mut checkpointed = false;
+        let mut writer_lease = None;
+        let results = execute_calls(
+            &r,
+            &calls,
+            &cfg(),
+            &mut sink,
+            vec![],
+            &mut checkpointed,
+            &mut writer_lease,
+        )
+        .await;
+        assert_eq!(results[0].1, "hello", "the repaired arg reached the tool");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unrepairable_missing_args_get_a_schema_bearing_error() {
+        // Ambiguous (two strays) ⇒ no repair. The error must then TEACH: name the tool, state what it
+        // requires, and echo what was sent, so the retry is informed rather than another guess.
+        let r = registry();
+        let calls = vec![call("1", "echo", r#"{"a":"x","b":"y"}"#)];
+        let mut sink: Vec<Message> = calls
+            .iter()
+            .map(|tc| Message::tool_result(tc.id.clone(), INTERRUPTED_TOOL_PLACEHOLDER.to_string()))
+            .collect();
+        let mut checkpointed = false;
+        let mut writer_lease = None;
+        let results = execute_calls(
+            &r,
+            &calls,
+            &cfg(),
+            &mut sink,
+            vec![],
+            &mut checkpointed,
+            &mut writer_lease,
+        )
+        .await;
+        let out = &results[0].1;
+        assert!(out.starts_with("error: "), "{out}");
+        assert!(out.contains("echo"), "names the tool: {out}");
+        assert!(out.contains("text (string)"), "states the schema: {out}");
+        assert!(out.contains(r#""a":"x""#), "echoes what was sent: {out}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -164,6 +164,13 @@ impl ToolRegistry {
         self.tools.iter().map(|t| t.name().to_string()).collect()
     }
 
+    /// Every registered tool. Lets a test sweep the WHOLE surface (rather than a hand-listed
+    /// sample that silently stops covering tools added later).
+    #[cfg(test)]
+    pub fn tools(&self) -> impl Iterator<Item = &std::sync::Arc<dyn Tool>> {
+        self.tools.iter()
+    }
+
     /// Keep only tools for which `keep(name)` is true (Hermes `disabled_toolsets` filter).
     pub fn retain<F>(&mut self, mut keep: F)
     where
@@ -173,9 +180,347 @@ impl ToolRegistry {
     }
 }
 
+// ── schema-driven argument repair ───────────────────────────────────────────────
+//
+// A model that names an argument `q` instead of `query`, or wraps the whole object in `{"input": …}`,
+// costs a full round trip: the call fails with `missing required string arg`, the model reads the
+// error, and calls again. That is one wasted tool call plus one wasted assistant turn, per slip.
+//
+// These helpers close that loop by reading each tool's OWN `parameters()` schema, so every tool —
+// builtin, LSP, skills, MCP — is covered by one implementation, and a tool added later is covered
+// without touching this file. The alternative (per-tool alias lists, as `web_search::extract_queries`
+// does) cannot be replicated across ~40 tools and drifts from the schema the moment either side
+// changes.
+//
+// The rules only ever RESHAPE what the model sent; they never invent a value. Anything ambiguous is
+// left alone so the model gets a real error instead of a silently wrong call.
+
+/// A schema's `required` keys that are declared `type: "string"`.
+fn required_string_keys(schema: &Value) -> Vec<String> {
+    let props = schema.get("properties").and_then(Value::as_object);
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|req| {
+            req.iter()
+                .filter_map(Value::as_str)
+                .filter(|k| {
+                    // Absent `properties` entry ⇒ assume string: the key is required either way, and
+                    // a repair that hands it a string is still better than a missing-arg failure.
+                    props
+                        .and_then(|p| p.get(*k))
+                        .and_then(|s| s.get("type"))
+                        .and_then(Value::as_str)
+                        .map(|t| t == "string")
+                        .unwrap_or(true)
+                })
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Is this arg present AND usable as a non-empty string?
+fn has_usable_string(args: &Value, key: &str) -> bool {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// The `required` string keys `schema` demands that `args` does not usably supply.
+///
+/// Reads the schema directly, so it applies to every tool in the registry (and to MCP tools, whose
+/// server-provided schema passes through verbatim). A schema with no `required` array — an open MCP
+/// schema, or `web_search`, which enforces "query or queries" at runtime instead — yields an empty
+/// list, making every caller a no-op.
+pub fn missing_required_strings(schema: &Value, args: &Value) -> Vec<String> {
+    required_string_keys(schema)
+        .into_iter()
+        .filter(|k| !has_usable_string(args, k))
+        .collect()
+}
+
+/// Keys the schema declares in `properties`.
+fn declared_keys(schema: &Value) -> Vec<String> {
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|p| p.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// The single-key wrapper names models most often wrap a whole argument object in.
+const WRAPPER_KEYS: &[&str] = &["input", "args", "arguments", "parameters", "params", "kwargs"];
+
+/// Repair argument-shape slips that can be inferred WITH CERTAINTY. Returns the corrected arguments
+/// plus a short human description of what changed (for the trace line), or `None` when there is
+/// nothing to fix or the fix would be a guess.
+///
+/// Three rules, applied in order:
+///
+/// 1. **UNWRAP** — the whole object is nested under one wrapper key (`{"input": {"path": …}}`).
+///    Accepted only when the inner object satisfies the schema's required keys and the outer object
+///    has nothing else, so it cannot swallow a real single-argument call.
+/// 2. **ALIAS** — exactly ONE required string key is missing and the arguments carry exactly ONE
+///    undeclared string key. The one-to-one condition is what makes this safe: with two candidates on
+///    either side the mapping is a coin flip, so it is refused.
+/// 3. **COERCE** — a required string key is present but as a number/bool (stringified) or as a
+///    single-element string array (unwrapped). No information is created.
+///
+/// Deliberately NOT done: filling a missing key from a default, dropping undeclared keys (a strict
+/// gateway already rejected those upstream, and dropping could discard something meaningful), or
+/// renaming when the schema declares no `required`.
+pub fn repair_args(schema: &Value, args: &Value) -> Option<(Value, String)> {
+    let obj = args.as_object()?;
+    let required = required_string_keys(schema);
+    if required.is_empty() {
+        return None; // nothing to satisfy ⇒ nothing to repair
+    }
+    if required.iter().all(|k| has_usable_string(args, k)) {
+        return None; // already valid: the overwhelmingly common path, allocation-free
+    }
+
+    // ── rule 1: UNWRAP ────────────────────────────────────────────────────────
+    if obj.len() == 1 {
+        let (k, v) = obj.iter().next()?;
+        if WRAPPER_KEYS.contains(&k.as_str()) && v.is_object() {
+            let inner_ok = required.iter().all(|r| has_usable_string(v, r));
+            if inner_ok {
+                return Some((v.clone(), format!("unwrapped args from '{k}'")));
+            }
+        }
+    }
+
+    let declared = declared_keys(schema);
+    let mut fixed = obj.clone();
+    let mut notes: Vec<String> = Vec::new();
+
+    // ── rule 2: ALIAS ─────────────────────────────────────────────────────────
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|k| !has_usable_string(args, k))
+        .cloned()
+        .collect();
+    if missing.len() == 1 {
+        let strays: Vec<String> = obj
+            .iter()
+            .filter(|(k, v)| {
+                !declared.contains(*k)
+                    && v.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        if strays.len() == 1 {
+            let from = &strays[0];
+            let to = &missing[0];
+            if let Some(v) = fixed.remove(from) {
+                fixed.insert(to.clone(), v);
+                notes.push(format!("arg '{from}' → '{to}'"));
+            }
+        }
+    }
+
+    // ── rule 3: COERCE ────────────────────────────────────────────────────────
+    for key in &required {
+        if has_usable_string(&Value::Object(fixed.clone()), key) {
+            continue;
+        }
+        let coerced = match fixed.get(key) {
+            Some(Value::Number(n)) => Some(n.to_string()),
+            Some(Value::Bool(b)) => Some(b.to_string()),
+            Some(Value::Array(a)) if a.len() == 1 => a[0]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            _ => None,
+        };
+        if let Some(s) = coerced {
+            fixed.insert(key.clone(), Value::String(s));
+            notes.push(format!("arg '{key}' coerced to string"));
+        }
+    }
+
+    if notes.is_empty() {
+        return None;
+    }
+    Some((Value::Object(fixed), notes.join(", ")))
+}
+
+/// The model-facing error for a call whose missing arguments could not be repaired. Carries the tool
+/// name, what the schema actually requires, and what the model sent — so the retry is informed
+/// rather than a second guess. Shared by every tool via the executor, which is why the per-tool
+/// messages (`missing required string arg 'x'`) rarely surface any more.
+pub fn missing_args_error(tool: &str, schema: &Value, args: &Value, missing: &[String]) -> String {
+    let props = schema.get("properties").and_then(Value::as_object);
+    let spec = required_string_keys(schema)
+        .iter()
+        .map(|k| {
+            let ty = props
+                .and_then(|p| p.get(k))
+                .and_then(|s| s.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("string");
+            format!("{k} ({ty})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sent = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
+    let sent = if sent.chars().count() > 200 {
+        let mut t: String = sent.chars().take(197).collect();
+        t.push_str("...");
+        t
+    } else {
+        sent
+    };
+    format!(
+        "error: missing required arg{} {} for {tool} — required: {spec}. You sent: {sent}. \
+         Call again using those exact key names.",
+        if missing.len() == 1 { "" } else { "s" },
+        missing
+            .iter()
+            .map(|m| format!("'{m}'"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// `file_read`-shaped schema: one required string plus optional extras.
+    fn path_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "start": {"type": "integer"},
+                "number": {"type": "boolean"}
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        })
+    }
+
+    #[test]
+    fn repair_unwraps_a_wrapped_args_object() {
+        for wrapper in ["input", "args", "arguments", "parameters", "params", "kwargs"] {
+            let args = json!({wrapper: {"path": "a.rs"}});
+            let (fixed, what) = repair_args(&path_schema(), &args)
+                .unwrap_or_else(|| panic!("wrapper '{wrapper}' must unwrap"));
+            assert_eq!(fixed, json!({"path": "a.rs"}));
+            assert!(what.contains(wrapper), "note names the wrapper: {what}");
+        }
+    }
+
+    #[test]
+    fn repair_does_not_unwrap_when_the_inner_object_still_lacks_the_key() {
+        // `{"input": {...}}` that doesn't satisfy the schema is not a wrapper slip — leave it alone
+        // so the model gets a real error instead of a differently-broken call.
+        let args = json!({"input": {"nope": "a.rs"}});
+        assert!(repair_args(&path_schema(), &args).is_none());
+    }
+
+    #[test]
+    fn repair_maps_a_single_unknown_alias() {
+        let (fixed, what) = repair_args(&path_schema(), &json!({"file": "a.rs"})).unwrap();
+        assert_eq!(fixed, json!({"path": "a.rs"}));
+        assert!(what.contains("'file'") && what.contains("'path'"), "{what}");
+
+        // A different tool shape, same rule — this is why it isn't a per-tool alias table.
+        let query_schema = json!({
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"]
+        });
+        let (fixed, _) = repair_args(&query_schema, &json!({"q": "hermes"})).unwrap();
+        assert_eq!(fixed, json!({"query": "hermes"}));
+
+        // Declared optional args ride along untouched.
+        let (fixed, _) = repair_args(&path_schema(), &json!({"file": "a.rs", "start": 3})).unwrap();
+        assert_eq!(fixed, json!({"path": "a.rs", "start": 3}));
+    }
+
+    #[test]
+    fn repair_refuses_when_ambiguous() {
+        // TWO stray keys → which one is the path? Refuse rather than guess.
+        assert!(
+            repair_args(&path_schema(), &json!({"file": "a.rs", "dest": "b.rs"})).is_none(),
+            "two candidate strays must not be guessed"
+        );
+        // TWO missing required keys → a single stray cannot fill both.
+        let two = json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "body": {"type": "string"}},
+            "required": ["name", "body"]
+        });
+        assert!(
+            repair_args(&two, &json!({"title": "x"})).is_none(),
+            "two missing keys must not be guessed"
+        );
+    }
+
+    #[test]
+    fn repair_coerces_scalar_and_single_element_array() {
+        let (fixed, what) = repair_args(&path_schema(), &json!({"path": 123})).unwrap();
+        assert_eq!(fixed, json!({"path": "123"}));
+        assert!(what.contains("coerced"), "{what}");
+
+        let (fixed, _) = repair_args(&path_schema(), &json!({"path": ["a.rs"]})).unwrap();
+        assert_eq!(fixed, json!({"path": "a.rs"}));
+
+        // A multi-element array is a real disagreement about arity — not ours to resolve.
+        assert!(repair_args(&path_schema(), &json!({"path": ["a.rs", "b.rs"]})).is_none());
+    }
+
+    #[test]
+    fn repair_is_a_noop_for_valid_args() {
+        assert!(repair_args(&path_schema(), &json!({"path": "a.rs"})).is_none());
+        // No `required` (an open MCP schema, or web_search's runtime-enforced pair) ⇒ never repaired.
+        let open = json!({"type": "object", "additionalProperties": true});
+        assert!(repair_args(&open, &json!({"anything": 1})).is_none());
+        // Non-object arguments are not repairable.
+        assert!(repair_args(&path_schema(), &json!("just a string")).is_none());
+    }
+
+    #[test]
+    fn missing_required_strings_reports_only_unusable_keys() {
+        assert!(missing_required_strings(&path_schema(), &json!({"path": "a.rs"})).is_empty());
+        assert_eq!(
+            missing_required_strings(&path_schema(), &json!({})),
+            vec!["path".to_string()]
+        );
+        // Present but blank / wrong type still counts as missing.
+        assert_eq!(
+            missing_required_strings(&path_schema(), &json!({"path": "   "})),
+            vec!["path".to_string()]
+        );
+        assert_eq!(
+            missing_required_strings(&path_schema(), &json!({"path": 7})),
+            vec!["path".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_args_error_carries_the_schema_and_what_was_sent() {
+        let msg = missing_args_error(
+            "file_glob",
+            &json!({
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+                "required": ["pattern"]
+            }),
+            &json!({"glb": "**/*.rs"}),
+            &["pattern".to_string()],
+        );
+        assert!(msg.starts_with("error: "), "{msg}");
+        assert!(msg.contains("file_glob"), "names the tool: {msg}");
+        assert!(msg.contains("pattern (string)"), "states the schema: {msg}");
+        assert!(msg.contains(r#"{"glb":"**/*.rs"}"#), "echoes the args: {msg}");
+    }
 
     /// PINS the tokio behavior `block_for_tool` depends on: `block_in_place` + `Handle::block_on`
     /// must work unchanged INSIDE a `spawn_blocking` thread (context propagates; block_in_place is

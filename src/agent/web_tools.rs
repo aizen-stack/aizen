@@ -146,6 +146,7 @@ impl Tool for WebSearch {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "a single search query"},
+                "q": {"type": "string", "description": "alias for 'query'"},
                 "queries": {
                     "type": "array",
                     "items": {"type": "string"},

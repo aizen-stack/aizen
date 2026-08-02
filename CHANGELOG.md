@@ -5,6 +5,56 @@ All notable changes to **Aizen** (`aizen`) — the pure-Rust agentic coding CLI.
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
+## [0.5.6] — 2026-08-03
+
+A single bug wasted one tool round in most multi-step turns: the **first** call of a batch ran with
+no arguments and came back `error: missing required string arg`, and the model then repeated the
+identical call, which worked. It hit every tool family — `file_glob`, `file_read`, `web_search`,
+`web_fetch` — because the cause was in the streaming layer they all pass through, not in any tool.
+
+### Fixed
+- **A streamed tool call is no longer dispatched before its arguments finish arriving.** The
+  accumulator that reassembles `delta.tool_calls[]` treated "a fragment landed on a different slot"
+  as proof the previous call was complete. That rule breaks in two shapes that are common in
+  practice: a provider that omits `index` (the field is `#[serde(default)]`, so every fragment
+  reports slot 0), and an opening frame that carries only `id`+`name` with `arguments: ""`. Either
+  way a call was snapshotted with empty or half-written JSON. `""` then parsed as a perfectly valid
+  `{}`, so eager execution started the tool with **no arguments at all** — while the transcript row
+  rendered from the completed call and displayed the correct target. That asymmetry is exactly why
+  the failure looked impossible: `web_fetch github.com → missing required string arg 'url'` is a row
+  whose target came from one object and whose result came from another. A call is now only completed
+  when its arguments parse as a whole JSON object, and argument fragments that carry no `id` (per
+  spec, they don't) follow the call that is actively streaming rather than defaulting to slot 0.
+- **Eager execution refuses a call with empty arguments.** Independent of the above, as a guard
+  against other provider shapes. Eager start is an optimisation, not an obligation: a call whose
+  arguments haven't arrived is not a call the model asked to run empty, and running it can only
+  produce an error round. It falls through to normal execution with complete arguments. Skipping it
+  deliberately does **not** trip the eager barrier — one deferred call must not cost every later call
+  its head start.
+
+### Added
+- **Schema-driven argument repair for every tool.** Some models send the right value under a wrong
+  key, or wrap the whole object. Rather than an alias table per tool — which cannot keep up with ~40
+  builtins plus LSP, skills, and MCP — repair reads the tool's own `parameters()` schema at the one
+  chokepoint every dispatch passes through, so **new tools are covered the day they are added**.
+  Three rules, all shape-only, none inventing content: unwrap a single wrapper (`{"input":{…}}`,
+  `{"args":{…}}`, `{"parameters":{…}}`, …) when the inside satisfies the schema; map a stray key to a
+  missing one **only** when exactly one required key is absent and exactly one undeclared string key
+  is present (`{"q":…}` → `{"query":…}`, `{"file":…}` → `{"path":…}`); and coerce a number, bool, or
+  single-element array into the string the schema asks for. Anything ambiguous is left alone —
+  guessing wrong is worse than the error. Every repair prints (`→ file_read: arg 'file' → 'path'`),
+  so a model that keeps calling a tool wrong stays visible instead of being silently patched over.
+  A registry-wide test asserts that every tool's own valid shape passes through untouched.
+- **Missing-argument errors now carry the schema.** `error: missing required string arg 'pattern'`
+  told the model nothing about what the right key was called. It now reads
+  `missing required arg 'pattern' for file_glob — required: pattern (string). You sent:
+  {"glb":"**/*.rs"}. Call again using those exact key names.` — tool name, the required list, and
+  the arguments actually sent, which is what a retry needs to succeed on the second attempt rather
+  than the third.
+- **`web_search` declares `q`.** The handler had always accepted `q` as an alias for `query`, but the
+  schema set `additionalProperties: false` without declaring it, so a strict gateway rejected the
+  call before the tolerance could apply.
+
 ## [0.5.5] — 2026-08-02
 
 Supersedes 0.5.4, which shipped the OSC 8 hyperlink layer and the bottom-of-transcript spinner in a

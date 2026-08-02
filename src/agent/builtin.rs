@@ -3591,6 +3591,60 @@ mod tests {
     }
 
     #[test]
+    fn every_registered_tool_survives_repair_of_its_own_valid_shape() {
+        // The repair layer reads each tool's own schema, so every tool is covered by it — and the
+        // only way that claim stays true as tools are added is to check the WHOLE registry here.
+        // For every tool, build a VALID argument object from the schema's required keys (each string
+        // required key gets "x", each other-type key a fitting scalar) and assert `repair_args`
+        // returns None — i.e. the valid shape is untouched and nothing gets rewritten into an
+        // invalid one. A tool that can't even express a valid argument object (or whose repair
+        // renames something) fails loudly here, not in a user session.
+        let root = temp_root("repair-surface");
+        let reg = default_registry_in(&root);
+        for tool in reg.tools() {
+            let schema = tool.parameters();
+            let Some(req) = schema.get("required").and_then(Value::as_array) else {
+                continue; // no required keys ⇒ repair never fires
+            };
+            let mut args = serde_json::Map::new();
+            for key in req.iter().filter_map(Value::as_str) {
+                let ty = schema
+                    .get("properties")
+                    .and_then(|p| p.get(key))
+                    .and_then(|s| s.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("string");
+                let val = match ty {
+                    "integer" => Value::from(1),
+                    "number" => Value::from(1.0),
+                    "boolean" => Value::from(true),
+                    "array" => Value::Array(vec![Value::from("x")]),
+                    _ => Value::from("x"),
+                };
+                args.insert(key.to_string(), val);
+            }
+            let args = Value::Object(args);
+            let repaired = crate::agent::tools::repair_args(&schema, &args);
+            assert!(
+                repaired.is_none(),
+                "repair must be a no-op for {}'s own valid shape — it rewrote {:?}",
+                tool.name(),
+                repaired
+            );
+            // And the schema must not be lying about what it requires (a schema naming a key the
+            // tool can't read would leave the model unable to call it correctly).
+            let missing = crate::agent::tools::missing_required_strings(&schema, &args);
+            assert!(
+                missing.is_empty(),
+                "{} schema declares required {} but the constructed valid args miss {}",
+                tool.name(),
+                req.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "),
+                missing.join(", ")
+            );
+        }
+    }
+
+    #[test]
     fn format_memory_hits_respects_the_token_budget() {
         use crate::memory::store::{MemoryEntry, MemoryType};
         let hit = |id: &str, scope: Option<&str>| crate::memory::Hit {
