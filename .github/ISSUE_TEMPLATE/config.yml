@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/dawnofcd/aizen/security/advisories/new
+    url: https://github.com/aizen-stack/aizen/security/advisories/new
     about: Report security issues privately — never in a public issue.

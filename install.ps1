@@ -1,6 +1,6 @@
 # Aizen installer for Windows (PowerShell 5+).
 #
-#   irm https://raw.githubusercontent.com/dawnofcd/aizen/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/aizen-stack/aizen/main/install.ps1 | iex
 #
 # Downloads the latest optimized `aizen.exe` from GitHub Releases, drops it in
 # %LOCALAPPDATA%\Aizen (override with $env:AIZEN_INSTALL), and adds that folder
@@ -8,7 +8,7 @@
 
 $ErrorActionPreference = 'Stop'
 
-$Repo   = 'dawnofcd/aizen'
+$Repo   = 'aizen-stack/aizen'
 $Suffix = 'windows-x86_64.exe'
 $Dir    = if ($env:AIZEN_INSTALL) { $env:AIZEN_INSTALL } else { Join-Path $env:LOCALAPPDATA 'Aizen' }
 

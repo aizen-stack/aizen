@@ -1,0 +1,34 @@
+Aizen
+Copyright 2026 Aizen authors
+
+This product includes software developed by the Aizen authors
+(https://github.com/aizen-stack/aizen).
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--------------------------------------------------------------------------------
+
+Third-party dependencies
+
+Aizen links Rust crates from crates.io, each under its own license (predominantly
+MIT and Apache-2.0). Aizen does not vendor or redistribute their source in this
+repository; the authoritative list of dependencies and versions is Cargo.lock.
+
+To regenerate a full third-party attribution report:
+
+    cargo install cargo-about
+    cargo about generate about.hbs > THIRD-PARTY.html
+
+"Aizen" and the Aizen logo are trademarks of the Aizen authors. Section 6 of the
+Apache License, Version 2.0 does not grant permission to use them, except as
+required for reasonable and customary use in describing the origin of the work.

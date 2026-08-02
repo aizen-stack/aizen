@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
-const DEFAULT_REPO: &str = "dawnofcd/aizen";
+const DEFAULT_REPO: &str = "aizen-stack/aizen";
 const CHECK_TTL_SECS: u64 = 24 * 60 * 60;
 const MAX_BINARY_BYTES: u64 = 300 * 1024 * 1024;
 const HTTP_TIMEOUT_SECS: u64 = 120;

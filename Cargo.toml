@@ -3,7 +3,13 @@ name = "aizen"
 version = "0.5.5"
 edition = "2021"
 description = "Aizen first-party agentic coding CLI — OpenAI-compatible, hermes-style provider-agnostic API client"
-license-file = "LICENSE"
+license = "Apache-2.0"
+repository = "https://github.com/aizen-stack/aizen"
+homepage = "https://aizen-stack.vercel.app"
+documentation = "https://github.com/aizen-stack/aizen#readme"
+readme = "README.md"
+keywords = ["agent", "cli", "llm", "coding-assistant", "openai"]
+categories = ["command-line-utilities", "development-tools"]
 
 # The product brand is Aizen → `aizen` is the one and only command.
 [[bin]]

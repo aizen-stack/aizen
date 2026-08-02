@@ -19,7 +19,7 @@ Closes #
 - [ ] I ran `cargo fmt` and `cargo clippy` and cleared anything I introduced.
 - [ ] I added or updated tests for my change.
 - [ ] My change keeps the **pure-Rust single-static-binary** posture (no new C/native deps).
-- [ ] I agree to the [CLA](../blob/main/CLA.md) (the bot will guide first-time contributors).
+- [ ] My commits are **signed off** (`git commit -s`) per the [DCO](https://developercertificate.org/) — my contribution is licensed under [Apache-2.0](../blob/main/LICENSE).
 
 ## Notes for the reviewer
 
