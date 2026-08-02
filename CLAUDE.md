@@ -60,12 +60,17 @@ public  → https://github.com/dawnofcd/aizen.git         (PUBLIC — redirects 
 
 | Path | What |
 |---|---|
+| `README.md` | the short landing page — install, why, what it does. **Keep it under ~110 lines**; details go to `docs/REFERENCE.md`, not here |
+| `docs/REFERENCE.md` | the full manual: REPL surface, every command, self-hosting, MCP, browser, safety model |
 | `src/features/update.rs` | self-update; `DEFAULT_REPO` lives here |
 | `install.ps1` / `install.sh` | one-line installers; repo slug is hardcoded in both |
 | `.github/workflows/dco.yml` | DCO sign-off check (replaced the CLA bot) |
 | `dist/` | assets for the public download channel |
 | `docs/` | design + audit notes |
 | `bench-fixtures/` | fixtures for `aizen bench` |
+
+Links inside `docs/REFERENCE.md` that point at repo-root paths need a `../` prefix — it lives one
+level down.
 
 ## Build / verify
 
