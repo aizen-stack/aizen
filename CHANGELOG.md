@@ -5,6 +5,77 @@ All notable changes to **Aizen** (`aizen`) — the pure-Rust agentic coding CLI.
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
+## [0.5.5] — 2026-08-02
+
+Supersedes 0.5.4, which shipped the OSC 8 hyperlink layer and the bottom-of-transcript spinner in a
+state that misfired in ordinary use: links attached themselves to Vietnamese prose, and the working
+line drew a caret that read as a stuck second cursor. Both are fixed here, alongside two features
+0.5.4 did not have. **0.5.4 remains published and downloadable** — its binaries are unchanged; this
+is the version to install.
+
+### Fixed
+- **A line that merely STARTS with `/` is no longer swallowed as a command.** Every dispatch surface
+  did `strip_prefix('/')` and treated the remainder as a command name, so an XPath
+  (`/html/body/div[2]`), a POSIX path (`/usr/bin/python`), and prose (`/help... abcd`) were all
+  answered with "unknown command" instead of reaching the model. A single shared `slash::classify`
+  now decides, and all three surfaces (retained TUI, plain REPL, Telegram host bot) call it. The
+  shape rule — must start with a letter, then only `[A-Za-z0-9_:-]` — rejects every false-positive
+  class actually hit, deterministically rather than by guessing. A near-miss (`/claer`) prints
+  `did you mean /clear?` and **stops**: auto-running the nearest match would let one slipped
+  keystroke wipe a conversation. A command that takes no arguments followed by ≥2 words of prose
+  (`/model của aizen là gì?`) is read as a question about the model, not a request to open the
+  picker. The host bot applies only the shape gate, not the whole verdict, because its catch-all
+  deliberately runs an unrecognized name as a shell command and it has its own vocabulary
+  (`/sh`, `/cd`, `/pwd`) that isn't in the REPL catalog.
+- **Hyperlinks no longer attach to text that merely looks like a path.** 0.5.4 started a path scan at
+  any `/`, so every Vietnamese `và/hoặc` in the transcript grew a `file:///hoặc` link, as did
+  `and/or`, `parser/lexer`, `input/output` and `15.000/kg`. Two rules fix it: a path may only START
+  at a word boundary, and a path-shaped candidate is only linked **if that file actually exists on
+  disk** — existence is the one signal that separates a path from prose, because their shapes are
+  identical. Resolution is cached (bounded, short-TTL) so a steady screen costs zero syscalls at
+  render rate. UNC paths (`\\server\share`, `//server/share`) are refused in the shape layer, before
+  any syscall: probing one opens an SMB connection to a host named by model output, which can leak
+  Windows credentials. A URL split across two wrapped rows is rejoined and both halves are linked.
+- **The working line no longer draws a caret of its own.** It rendered a `▏` imitating a text cursor,
+  which misread badly: the terminal's real cursor is already visible a few rows below in the input
+  box (ratatui calls `show_cursor` on any frame that sets a cursor position, so the `Hide` at session
+  entry lasts exactly one frame), and when the caption was empty between tool steps the imitation
+  collapsed onto the spinner as `✦ ▏` — a second cursor apparently stuck to the glyph. The real one
+  stays: the input box genuinely accepts queued messages and Alt+↵ steering while a turn runs, so a
+  cursor there is correct. One cursor on screen is the right number.
+
+### Added
+- **`/config` → Sub-agents & roles.** Model, base URL, and API key for all four roles
+  (`subagent_default`, `summarizer`, `oracle`, `apply`) were reachable only by CLI flags — and only
+  `subagent_default` had any — with no way to read back what was stored. There is now a menu for
+  each, plus editors for the model→endpoint registry and per-specialist pins. The URL step **probes**
+  the endpoint instead of trusting it (a typo'd gateway used to surface as a failed dispatch in the
+  middle of an unrelated task) and, when the probe fails, says why and offers to save anyway. The key
+  step offers `env:VAR` indirection first, so a credential need never touch disk. When a probe
+  reaches a live endpoint the model step becomes a picker over that endpoint's real model list.
+- **`aizen config show` prints the roles it is holding.** A `Sub-agents & roles` section lists all
+  four roles and the registry. Literal keys are masked and `env:VAR` references print the variable
+  NAME with `✓`/`✗ (unset)` — enough to spot a forgotten `export` without the value ever appearing.
+  URL userinfo is redacted. The `oracle` row also shows self-review on/off, because configuring that
+  role is what switches self-review on.
+- **CLI flags for the three roles that had none:** `--summarizer-model/-base-url/-api-key-ref`,
+  and the same trio for `--oracle-` and `--apply-`. An empty value clears; clearing the last field of
+  the last role drops the `roles` object entirely rather than leaving `{}` behind.
+- **An agent card can carry its own gateway.** `base_url:` and `api_key_ref:` in a specialist's
+  frontmatter override the model→endpoint registry — the registry says where a model generally
+  lives, the card says where THIS specialist calls it, and the more specific statement wins.
+  `api_key_ref` is honoured **only** as `env:VAR`: cards live in `.claude/agents/`, a directory
+  people commit, so a literal key written there is treated as absent rather than used. An `env:VAR`
+  that isn't exported leaves the inherited key in place instead of blanking it — an unset variable is
+  a forgotten `export`, and sending an empty Authorization header would turn that into an opaque 401.
+- **The working spinner blooms instead of blinking.** The two-frame `✦⇄✧` pulse read as a blink; it
+  is now an eight-frame bloom `✦ ✶ ✷ ✹ ✺ ✹ ✷ ✶` that opens and closes back to the brand mark, so
+  every turn starts on `✦`. Every frame is one display cell — the caption sits immediately to its
+  right, so a double-width frame would shove the whole line sideways once per cycle. That constraint
+  rules out `✳` and `✴`, which are `Emoji=Yes` and get drawn two cells by an emoji font even though
+  their East_Asian_Width is Narrow; a width measurement does not catch this, so the test checks emoji
+  membership instead.
+
 ## [0.5.4] — 2026-08-01
 
 ### Fixed

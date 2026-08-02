@@ -2027,31 +2027,47 @@ fn input_loop(
                     }
                     line = rest.trim().to_string();
                 }
-                if let Some(cmd) = trimmed.strip_prefix('/').filter(|_| images == 0) {
-                    let (name, arg) = match cmd.split_once(char::is_whitespace) {
-                        Some((n, a)) => (n, a.trim()),
-                        None => (cmd, ""),
-                    };
-                    if handle_status_command_inline(name, arg) {
-                        continue;
+                // A leading `/` is not enough to make a line a command — an XPath, a POSIX path, or
+                // prose that merely starts with a slash (`/help... abcd`) used to be swallowed here
+                // and answered with "unknown command" instead of reaching the model. `slash::classify`
+                // is the single shared decision; all three dispatch surfaces call it.
+                match crate::features::slash::classify(&trimmed).filter_command(images == 0) {
+                    crate::features::slash::Verdict::Command { name, arg } => {
+                        if handle_status_command_inline(&name, &arg) {
+                            continue;
+                        }
+                        // Re-join name and arg: `handle_slash` re-splits, and the REPL's
+                        // `slash_is_interactive` check keys off the whole line.
+                        let cmd = if arg.is_empty() {
+                            name
+                        } else {
+                            format!("{name} {arg}")
+                        };
+                        // No park decision here either (see the pick branch): if this command opens
+                        // a menu, the REPL's `suspend()` raises KEYBOARD_PARKED and the loop head
+                        // stands down — whenever that actually happens, including after a turn ends.
+                        if sub_tx.send(Submission::Slash(cmd)).is_err() {
+                            return;
+                        }
+                        note_submission_enqueued();
                     }
-                    // No park decision here either (see the pick branch): if this command opens a
-                    // menu, the REPL's `suspend()` raises KEYBOARD_PARKED and the loop head stands
-                    // down — whenever that actually happens, including after a turn finishes.
-                    if sub_tx.send(Submission::Slash(cmd.to_string())).is_err() {
-                        return;
+                    // Close to a command but not one: say so and stop. Auto-running the nearest
+                    // match would let a slipped keystroke (`/claer`) wipe the conversation.
+                    crate::features::slash::Verdict::DidYouMean { typed, best } => {
+                        note_line(
+                            &theme::muted(format!("/{typed} — did you mean /{best}?")).to_string(),
+                        );
                     }
-                    note_submission_enqueued();
-                } else {
-                    // Image data URLs aren't carried here (the box only tracks a count); the REPL
-                    // resolves attachments — for now we forward the text and image count is folded in
-                    // by the caller via the clipboard buffer. We send just the text + an empty vec;
-                    // the clipboard images live in shared state drained by the caller.
-                    let imgs = take_pending_images();
-                    if sub_tx.send(Submission::Chat(line, imgs)).is_err() {
-                        return;
+                    crate::features::slash::Verdict::Chat => {
+                        // Image data URLs aren't carried here (the box only tracks a count); the
+                        // REPL resolves attachments — we forward the text and the clipboard images
+                        // live in shared state drained by the caller.
+                        let imgs = take_pending_images();
+                        if sub_tx.send(Submission::Chat(line, imgs)).is_err() {
+                            return;
+                        }
+                        note_submission_enqueued();
                     }
-                    note_submission_enqueued();
                 }
             }
             Key::Escape | Key::Char('\u{3}') | Key::Char('\u{4}') | Key::CtrlC => {

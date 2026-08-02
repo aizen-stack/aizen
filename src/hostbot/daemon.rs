@@ -380,10 +380,22 @@ async fn run_daemon<P: Platform>(platform: P) -> Result<()> {
         let trimmed = text.trim().to_string();
 
         // A `/command` → the dispatcher. `Some(reply)` = handled; `None` = fall through to the agent.
-        if trimmed.starts_with('/') {
-            let mut parts = trimmed[1..].splitn(2, char::is_whitespace);
-            let name = parts.next().unwrap_or("").trim().to_string();
-            let arg = parts.next().unwrap_or("").trim().to_string();
+        //
+        // A leading `/` is NOT sufficient: an XPath, a POSIX path, or prose that merely starts with
+        // one (`/help... abcd`) is a message, and used to be eaten here. We apply only the SHAPE
+        // gate from `slash::classify`, not the whole verdict — this surface has its own vocabulary
+        // (`/sh`, `/cd`, `/pwd`, `/bots`, …) that isn't in the REPL catalog, and `handle_command`'s
+        // catch-all deliberately runs an unrecognized name as a SHELL command. Classifying against
+        // the REPL catalog here would break both. The shape gate alone fixes the reported bug while
+        // leaving the bot's own dispatch semantics intact.
+        let slash_name = trimmed.strip_prefix('/').map(|rest| {
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            (
+                parts.next().unwrap_or("").trim().to_string(),
+                parts.next().unwrap_or("").trim().to_string(),
+            )
+        });
+        if let Some((name, arg)) = slash_name.filter(|(n, _)| crate::features::slash::looks_like_name(n)) {
             if let Some(reply) = handle_command(
                 &*platform,
                 &name,

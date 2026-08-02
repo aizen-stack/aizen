@@ -5068,6 +5068,8 @@ mod tests {
                 vibe: String::new(),
                 tools: vec![],
                 model: None,
+                base_url: None,
+                api_key_ref: None,
                 body: "b".into(),
                 division: None,
                 source: crate::agents::AgentSource::AizenHome,

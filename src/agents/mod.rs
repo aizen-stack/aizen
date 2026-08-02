@@ -20,6 +20,8 @@
 //! emoji: 🔍                      # cosmetic
 //! tools: Read, Grep, Edit, Bash  # OPTIONAL — absent ⇒ default coder scope (read/edit/shell)
 //! model: claude-opus-4-8         # OPTIONAL — per-specialist model override
+//! base_url: https://api.x.ai/v1  # OPTIONAL — the gateway that model lives on (beats the registry)
+//! api_key_ref: env:XAI_KEY       # OPTIONAL — `env:VAR` ONLY; a literal key here is ignored
 //! ---
 //! You are a meticulous code reviewer. …the specialist system prompt…
 //! ```
@@ -85,6 +87,13 @@ pub struct AgentDef {
     pub tools: Vec<String>,
     /// Optional `model:` override for the dispatched sub-agent.
     pub model: Option<String>,
+    /// Optional `base_url:` — the gateway this specialist's model actually lives on. Overrides the
+    /// model→endpoint registry (the CARD wins), and inherits the caller's endpoint when absent.
+    pub base_url: Option<String>,
+    /// Optional `api_key_ref:` — **`env:VAR` indirection only**. A card lives in `.claude/agents/`,
+    /// a directory people commit; a literal key written here is a leaked key, so [`parse_markdown`]
+    /// drops anything that isn't `env:…` rather than honouring it.
+    pub api_key_ref: Option<String>,
     /// The specialist system prompt (markdown body).
     pub body: String,
     /// The immediate parent dir (the "division", lowercased), e.g. `engineering`. `None` at the root.
@@ -112,6 +121,22 @@ fn parse_list(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Accept an `api_key_ref` frontmatter value ONLY in its `env:VAR` indirection form.
+///
+/// Agent cards are markdown files under `.claude/agents/` and `.aizen/agents/` — including the two
+/// PROJECT dirs, which live inside the repository and get committed. Honouring a literal key there
+/// would turn "pin a model on this specialist" into a way to commit a credential without noticing.
+/// So a literal is treated as ABSENT (the dispatch falls back to the registry/parent key) rather
+/// than being used. `env:VAR` keeps the secret in the environment, never on disk.
+fn env_ref_only(raw: &str) -> Option<String> {
+    let v = raw.trim();
+    // `env:` with a non-empty variable name; anything else (a bare key, `env:`) is refused.
+    v.strip_prefix("env:")
+        .map(str::trim)
+        .filter(|var| !var.is_empty())
+        .map(|var| format!("env:{var}"))
+}
+
 /// Parse one agent's markdown (frontmatter + body). Path-agnostic: `division`/`source`/`source_path`
 /// are placeholders here and filled by the directory walk. `fallback_name` is used when there's no
 /// `name:` (the file stem, or a URL filename on install). Public so the install path can reuse it.
@@ -135,6 +160,12 @@ pub fn parse_markdown(content: &str, fallback_name: &str) -> AgentDef {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        base_url: fm
+            .get("base_url")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        api_key_ref: fm.get("api_key_ref").and_then(env_ref_only),
         body: fm.body,
         division: None,
         source: AgentSource::AizenHome, // overwritten by the walk (never observed otherwise)
@@ -422,14 +453,39 @@ pub fn delete_home(slug: &str) -> Result<bool> {
     Ok(removed)
 }
 
-/// Set (or clear, with `model=None`) the `model:` frontmatter field of an installed agent card,
-/// rewriting the file IN PLACE at its source path so a project card stays a project card. Other
-/// frontmatter fields + the body are preserved. Returns the path written. Errors if the slug
-/// doesn't resolve or the card has no frontmatter fence to edit.
-///
-/// This is the write side of "assign a model to a sub-agent": the pinned model then routes through
-/// [`crate::core::cli_config::endpoint_for_model`] at dispatch, so it carries its own gateway.
+/// Set (or clear, with `model=None`) the `model:` frontmatter field of an installed agent card.
+/// Thin wrapper over [`set_endpoint`] — kept as its own name because `/agents set-model` and
+/// `aizen agents set-model` are the model-only surface and shouldn't have to spell out three
+/// nested options to say "leave the endpoint fields alone".
 pub fn set_model(slug: &str, model: Option<&str>) -> Result<PathBuf> {
+    set_endpoint(
+        slug,
+        Some(model.map(str::to_string)),
+        None,
+        None,
+    )
+}
+
+/// Rewrite an installed agent card's endpoint frontmatter IN PLACE at its source path (so a project
+/// card stays a project card). Other frontmatter fields + the body are preserved. Returns the path
+/// written. Errors if the slug doesn't resolve or the card has no frontmatter fence to edit.
+///
+/// Each argument is a two-level option so one call can express three different intents per field:
+/// `None` = leave this field exactly as it is, `Some(None)` = remove it, `Some(Some(v))` = set it.
+/// Without the outer level, "don't touch" and "clear" would be indistinguishable.
+///
+/// This is the write side of "assign a model/gateway to a sub-agent": at dispatch the pinned model
+/// routes through [`crate::core::cli_config::endpoint_for_model`], and `base_url`/`api_key_ref` here
+/// then override that registry result (the card wins — see `task_tool::resolve_dispatch`).
+///
+/// `api_key_ref` is stored verbatim, but [`parse_markdown`] only HONOURS the `env:VAR` form, so a
+/// literal key written by hand into a committed card is inert rather than dangerous.
+pub fn set_endpoint(
+    slug: &str,
+    model: Option<Option<String>>,
+    base_url: Option<Option<String>>,
+    api_key_ref: Option<Option<String>>,
+) -> Result<PathBuf> {
     let def = load(slug).with_context(|| format!("no agent named '{slug}'"))?;
     let path = def.source_path.clone();
     let raw =
@@ -442,15 +498,25 @@ pub fn set_model(slug: &str, model: Option<&str>) -> Result<PathBuf> {
         );
     }
     let mut fields = fm.fields.clone();
-    match model.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(m) => {
-            fields.insert("model".to_string(), m.to_string());
+    // An empty/whitespace value is treated as a clear, so callers can pass through a blank prompt
+    // entry without having to special-case it into `Some(None)` themselves.
+    let mut apply = |key: &str, edit: Option<Option<String>>| {
+        if let Some(v) = edit {
+            match v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(s) => {
+                    fields.insert(key.to_string(), s.to_string());
+                }
+                None => {
+                    fields.remove(key);
+                }
+            }
         }
-        None => {
-            fields.remove("model");
-        }
-    }
+    };
+    apply("model", model);
+    apply("base_url", base_url);
+    apply("api_key_ref", api_key_ref);
     // Pin the conventional agency-agents field order; unknown fields follow sorted (serialize's rule).
+    // The two endpoint fields sit next to `model` because they describe the same decision.
     let out = frontmatter::serialize(
         &fields,
         &fm.body,
@@ -462,6 +528,8 @@ pub fn set_model(slug: &str, model: Option<&str>) -> Result<PathBuf> {
             "vibe",
             "tools",
             "model",
+            "base_url",
+            "api_key_ref",
         ],
     );
     std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
@@ -1056,6 +1124,75 @@ mod tests {
 
             // Unknown slug errors (never writes a stray file).
             assert!(set_model("nope", Some("x")).is_err());
+        });
+    }
+
+    #[test]
+    fn card_api_key_ref_only_accepts_env_indirection() {
+        // A literal key in a card is a key someone is about to commit. Parsing must drop it, so the
+        // dispatch falls back to the registry/parent key instead of honouring a leaked credential.
+        let literal = parse_markdown(
+            "---\nname: L\nmodel: m\napi_key_ref: sk-live-abcdef123456\n---\nbody",
+            "l",
+        );
+        assert_eq!(
+            literal.api_key_ref, None,
+            "a literal key must be refused at parse time, not carried into the dispatch"
+        );
+        // The `env:` form is kept, normalized, and survives odd spacing.
+        let env = parse_markdown(
+            "---\nname: E\napi_key_ref:   env:  XAI_KEY  \n---\nbody",
+            "e",
+        );
+        assert_eq!(env.api_key_ref.as_deref(), Some("env:XAI_KEY"));
+        // `env:` with no variable after it is not a reference either.
+        let empty = parse_markdown("---\nname: N\napi_key_ref: env:\n---\nbody", "n");
+        assert_eq!(empty.api_key_ref, None);
+    }
+
+    #[test]
+    fn set_endpoint_roundtrip_preserves_body_and_field_order() {
+        with_sandbox("setendpoint", |root| {
+            write_file(
+                &root.join(".aizen/agents"),
+                "rev.md",
+                "---\nname: Rev\ndescription: reviews\nzzz_custom: keep-me\n---\nYou review code.",
+            );
+            let path = set_endpoint(
+                "rev",
+                Some(Some("grok-4".into())),
+                Some(Some("https://api.x.ai/v1".into())),
+                Some(Some("env:XAI_KEY".into())),
+            )
+            .unwrap();
+
+            let def = load("rev").unwrap();
+            assert_eq!(def.model.as_deref(), Some("grok-4"));
+            assert_eq!(def.base_url.as_deref(), Some("https://api.x.ai/v1"));
+            assert_eq!(def.api_key_ref.as_deref(), Some("env:XAI_KEY"));
+            assert_eq!(def.description, "reviews", "other fields preserved");
+            assert_eq!(def.body.trim(), "You review code.", "body preserved");
+
+            // The two endpoint fields must sit right after `model` in the canonical order — they
+            // describe the same decision, and a card is read by humans.
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let at = |k: &str| raw.find(k).unwrap_or_else(|| panic!("{k} missing from {raw}"));
+            assert!(
+                at("model:") < at("base_url:") && at("base_url:") < at("api_key_ref:"),
+                "endpoint fields follow `model` in order, got:\n{raw}"
+            );
+            assert!(raw.contains("zzz_custom:"), "unknown field kept");
+
+            // `None` leaves a field alone; `Some(None)` clears just that one.
+            set_endpoint("rev", None, Some(None), None).unwrap();
+            let def = load("rev").unwrap();
+            assert_eq!(def.base_url, None, "base_url cleared");
+            assert_eq!(def.model.as_deref(), Some("grok-4"), "model untouched");
+            assert_eq!(
+                def.api_key_ref.as_deref(),
+                Some("env:XAI_KEY"),
+                "api_key_ref untouched"
+            );
         });
     }
 

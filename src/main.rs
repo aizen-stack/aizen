@@ -712,6 +712,39 @@ enum ConfigCmd {
         /// key. Empty clears. (`roles.subagent_default.api_key_ref`.)
         #[arg(long)]
         subagent_api_key_ref: Option<String>,
+        /// Model for compaction/handoff summaries (`roles.summarizer`) — the classic cheap-model
+        /// slot. Empty clears.
+        #[arg(long)]
+        summarizer_model: Option<String>,
+        /// Base URL for the summarizer endpoint (`roles.summarizer.base_url`). Empty clears.
+        #[arg(long)]
+        summarizer_base_url: Option<String>,
+        /// API-key reference for the summarizer endpoint: `env:VAR` (preferred) or a literal key.
+        /// Empty clears. (`roles.summarizer.api_key_ref`.)
+        #[arg(long)]
+        summarizer_api_key_ref: Option<String>,
+        /// Model for the self-review reviewer (`roles.oracle`) — a stronger model is the point.
+        /// NOTE: configuring this role also TURNS SELF-REVIEW ON unless `self_review` says otherwise.
+        /// Empty clears.
+        #[arg(long)]
+        oracle_model: Option<String>,
+        /// Base URL for the oracle endpoint (`roles.oracle.base_url`). Empty clears.
+        #[arg(long)]
+        oracle_base_url: Option<String>,
+        /// API-key reference for the oracle endpoint: `env:VAR` (preferred) or a literal key.
+        /// Empty clears. (`roles.oracle.api_key_ref`.)
+        #[arg(long)]
+        oracle_api_key_ref: Option<String>,
+        /// Model for the reserved fast-apply edit role (`roles.apply`; config-only today). Empty clears.
+        #[arg(long)]
+        apply_model: Option<String>,
+        /// Base URL for the apply endpoint (`roles.apply.base_url`). Empty clears.
+        #[arg(long)]
+        apply_base_url: Option<String>,
+        /// API-key reference for the apply endpoint: `env:VAR` (preferred) or a literal key.
+        /// Empty clears. (`roles.apply.api_key_ref`.)
+        #[arg(long)]
+        apply_api_key_ref: Option<String>,
         /// Register a model→endpoint mapping so a sub-agent pinned to that model carries its own
         /// gateway. Format: `model[,base_url=URL][,api_key_ref=env:VAR|KEY]` (repeatable). A bare
         /// model id with no fields, or `model,clear`, removes the entry.
@@ -5647,24 +5680,49 @@ async fn run_menu_plain() -> Result<()> {
         // Slash command, or a typed input-box affordance (`#remember` / `!shell` / `@file`·`` !`cmd` ``).
         // Both are skipped when an image is attached — that's a vision message, sent verbatim.
         if images.is_empty() {
-            if let Some(rest) = line.strip_prefix('/') {
-                // Bare `/` (+ Enter) → arrow-key command picker; `/cmd` runs directly.
-                let outcome = if rest.trim().is_empty() {
-                    slash_menu(&mut history, &mut model_label).await
-                } else {
-                    handle_slash(rest, &mut history, &mut model_label).await
-                };
-                match outcome {
+            // Bare `/` (+ Enter) → arrow-key command picker. Checked before `classify`, which reads
+            // a lone slash as ordinary text (a message may legitimately begin with one).
+            if line.trim() == "/" {
+                match slash_menu(&mut history, &mut model_label).await {
                     SlashOutcome::Quit => break,
-                    // A custom command expanded to a prompt → run it as a chat turn (not re-preprocessed).
                     SlashOutcome::Submit(prompt) => line = prompt,
                     SlashOutcome::Continue => continue,
                 }
             } else {
-                typed_src = line.clone();
-                match preprocess_input(&line) {
-                    InputPre::Handled => continue, // #remember / !shell-escape — no turn
-                    InputPre::Send(expanded) => line = expanded,
+                // A leading `/` alone doesn't make a line a command — see `slash::classify`. Shared
+                // with the retained input box and the host bot so the three cannot drift.
+                match features::slash::classify(&line) {
+                    features::slash::Verdict::Command { name, arg } => {
+                        let rest = if arg.is_empty() {
+                            name
+                        } else {
+                            format!("{name} {arg}")
+                        };
+                        match handle_slash(&rest, &mut history, &mut model_label).await {
+                            SlashOutcome::Quit => break,
+                            // A custom command expanded to a prompt → run it as a chat turn (not
+                            // re-preprocessed).
+                            SlashOutcome::Submit(prompt) => line = prompt,
+                            SlashOutcome::Continue => continue,
+                        }
+                    }
+                    // Near-miss: suggest and stop. Auto-running the closest match would let a
+                    // slipped keystroke (`/claer`) wipe the conversation.
+                    features::slash::Verdict::DidYouMean { typed, best } => {
+                        tui::emit_line(
+                            &style(format!("/{typed} — did you mean /{best}?"))
+                                .dim()
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                    features::slash::Verdict::Chat => {
+                        typed_src = line.clone();
+                        match preprocess_input(&line) {
+                            InputPre::Handled => continue, // #remember / !shell-escape — no turn
+                            InputPre::Send(expanded) => line = expanded,
+                        }
+                    }
                 }
             }
         }
@@ -10667,6 +10725,42 @@ fn apply_model_endpoint(cfg: &mut cli_config::CliConfig, spec: &str) -> Result<(
     Ok(())
 }
 
+/// Apply one role's `--<role>-model/-base-url/-api-key-ref` trio to `roles`.
+///
+/// `None` leaves a field alone; an EMPTY string clears it (the documented way to undo a setting
+/// without hand-editing JSON). When every field of the role ends up cleared, the role object itself
+/// is dropped so the saved config doesn't accumulate `"oracle": {}` husks — which matters beyond
+/// tidiness, because `role_configured("oracle")` (and therefore self-review) keys off presence.
+fn apply_role_flags(
+    roles: &mut cli_config::RolesConfig,
+    role: &str,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_key_ref: Option<String>,
+) {
+    if model.is_none() && base_url.is_none() && api_key_ref.is_none() {
+        return;
+    }
+    let slot = match role {
+        "summarizer" => &mut roles.summarizer,
+        "subagent_default" => &mut roles.subagent_default,
+        "oracle" => &mut roles.oracle,
+        "apply" => &mut roles.apply,
+        _ => return,
+    };
+    let mut rc = slot.take().unwrap_or_default();
+    let set = |field: &mut Option<String>, v: Option<String>| {
+        if let Some(s) = v {
+            let s = s.trim();
+            *field = (!s.is_empty()).then(|| s.to_string());
+        }
+    };
+    set(&mut rc.model, model);
+    set(&mut rc.base_url, base_url);
+    set(&mut rc.api_key_ref, api_key_ref);
+    *slot = (rc.model.is_some() || rc.base_url.is_some() || rc.api_key_ref.is_some()).then_some(rc);
+}
+
 async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
     let cmd = match cmd {
         Some(c) => c,
@@ -10700,8 +10794,38 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             subagent_model,
             subagent_base_url,
             subagent_api_key_ref,
+            summarizer_model,
+            summarizer_base_url,
+            summarizer_api_key_ref,
+            oracle_model,
+            oracle_base_url,
+            oracle_api_key_ref,
+            apply_model,
+            apply_base_url,
+            apply_api_key_ref,
             model_endpoint,
         } => {
+            // (role, model, base_url, api_key_ref) — one table so the emptiness guard below and the
+            // apply loop further down can never disagree about which flags exist.
+            let role_flags = [
+                (
+                    "subagent_default",
+                    subagent_model,
+                    subagent_base_url,
+                    subagent_api_key_ref,
+                ),
+                (
+                    "summarizer",
+                    summarizer_model,
+                    summarizer_base_url,
+                    summarizer_api_key_ref,
+                ),
+                ("oracle", oracle_model, oracle_base_url, oracle_api_key_ref),
+                ("apply", apply_model, apply_base_url, apply_api_key_ref),
+            ];
+            let any_role_flag = role_flags
+                .iter()
+                .any(|(_, m, b, k)| m.is_some() || b.is_some() || k.is_some());
             if base_url.is_none()
                 && api_key.is_none()
                 && model.is_none()
@@ -10725,9 +10849,7 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                 && adaptive_effort.is_none()
                 && disabled_toolsets.is_none()
                 && enabled_toolsets.is_none()
-                && subagent_model.is_none()
-                && subagent_base_url.is_none()
-                && subagent_api_key_ref.is_none()
+                && !any_role_flag
                 && model_endpoint.is_empty()
             {
                 anyhow::bail!("nothing to set — pass at least one supported --flag (including --timemachine-keep / --timemachine-max-files / --timemachine-max-bytes / --timemachine-max-file-bytes)");
@@ -10826,31 +10948,14 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             if let Some(v) = enabled_toolsets {
                 cfg.enabled_toolsets = parse_toolset_list(&v);
             }
-            // Sub-agent default endpoint (`roles.subagent_default`): set any of model/base_url/
-            // api_key_ref; an empty string CLEARS that field. Editing any sub-field materializes the
-            // `roles` + `subagent_default` objects; clearing every field drops `subagent_default`.
-            if subagent_model.is_some()
-                || subagent_base_url.is_some()
-                || subagent_api_key_ref.is_some()
-            {
+            // Per-role endpoints (`roles.*`): set any of model/base_url/api_key_ref; an empty string
+            // CLEARS that field. Editing any sub-field materializes the `roles` object; clearing
+            // every field of every role drops it again.
+            if any_role_flag {
                 let mut roles = cfg.roles.take().unwrap_or_default();
-                let mut sd = roles.subagent_default.take().unwrap_or_default();
-                let apply = |slot: &mut Option<String>, v: Option<String>| {
-                    if let Some(s) = v {
-                        let s = s.trim();
-                        *slot = if s.is_empty() {
-                            None
-                        } else {
-                            Some(s.to_string())
-                        };
-                    }
-                };
-                apply(&mut sd.model, subagent_model);
-                apply(&mut sd.base_url, subagent_base_url);
-                apply(&mut sd.api_key_ref, subagent_api_key_ref);
-                roles.subagent_default =
-                    (sd.model.is_some() || sd.base_url.is_some() || sd.api_key_ref.is_some())
-                        .then_some(sd);
+                for (role, model, base_url, api_key_ref) in role_flags {
+                    apply_role_flags(&mut roles, role, model, base_url, api_key_ref);
+                }
                 cfg.roles = roles.has_any().then_some(roles);
             }
             // Model→endpoint registry: each `--model-endpoint` is `model[,base_url=URL][,api_key_ref=…]`;
@@ -10921,16 +11026,7 @@ fn print_config(cfg: &cli_config::CliConfig) {
     };
     // A base URL shouldn't carry credentials, but if one embeds `user:pass@`, `config show` must
     // not print it in the clear — redact the userinfo before display (host/path stay visible).
-    let redact_url = |u: &str| -> String {
-        match url::Url::parse(u) {
-            Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
-                let _ = parsed.set_username("•••");
-                let _ = parsed.set_password(None);
-                parsed.to_string()
-            }
-            _ => u.to_string(),
-        }
-    };
+    let redact_url = |u: &str| -> String { redact_url_userinfo(u) };
 
     // ── Endpoint ──
     section("Endpoint");
@@ -10967,6 +11063,12 @@ fn print_config(cfg: &cli_config::CliConfig) {
             format!("{}  {}", unset(), theme::faint("· run /model")),
         ),
     }
+
+    // ── Sub-agents & roles ──
+    // Printed even when nothing is configured: the whole point of this section is that `config set
+    // --subagent-model …` used to write into a file NOTHING displayed, so there was no way to confirm
+    // a setting had landed short of opening the JSON.
+    print_roles_section(cfg);
 
     // ── Session ──
     section("Session");
@@ -11116,6 +11218,128 @@ fn print_config(cfg: &cli_config::CliConfig) {
         theme::accent(cfg.response_visuals().to_string()).to_string(),
     );
     println!();
+}
+
+/// A base URL shouldn't carry credentials, but if one embeds `user:pass@`, any display path must not
+/// print it in the clear — redact the userinfo before display (host/path stay visible).
+fn redact_url_userinfo(u: &str) -> String {
+    match url::Url::parse(u) {
+        Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+            let _ = parsed.set_username("•••");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        _ => u.to_string(),
+    }
+}
+
+/// Render one role's `api_key_ref` for display, NEVER its value.
+///
+/// Two shapes, deliberately different: `env:VAR` prints the VARIABLE NAME plus whether that variable
+/// is actually set right now, because the failure this catches is a forgotten `export` — you need to
+/// see `env:OPENAI_KEY ✗ unset` to know why sub-agents are 401-ing. A literal key prints through
+/// [`cli_config::mask`], same as the main key.
+fn role_key_display(api_key_ref: Option<&str>) -> Option<String> {
+    let raw = api_key_ref.map(str::trim).filter(|s| !s.is_empty())?;
+    Some(match raw.strip_prefix("env:").map(str::trim) {
+        Some(var) if !var.is_empty() => {
+            if std::env::var(var).ok().is_some_and(|v| !v.trim().is_empty()) {
+                format!("env:{var} {}", theme::ok("✓"))
+            } else {
+                format!("env:{var} {}", theme::warn("✗ unset"))
+            }
+        }
+        // `env:` with nothing after it, or a literal key.
+        _ => cli_config::mask(raw),
+    })
+}
+
+/// One `Sub-agents & roles` row: `model · base_url · key`, with each absent field simply omitted so
+/// a role that only pins a model reads as one short line instead of three "not set" clauses.
+fn role_row_value(rc: Option<&cli_config::RoleModelConfig>) -> String {
+    let Some(rc) = rc else {
+        return format!(
+            "{}  {}",
+            theme::faint("— not set").italic(),
+            theme::faint("· uses the main endpoint")
+        );
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(m) = rc.model.as_deref().filter(|s| !s.trim().is_empty()) {
+        parts.push(theme::accent(m).to_string());
+    }
+    if let Some(u) = rc.base_url.as_deref().filter(|s| !s.trim().is_empty()) {
+        parts.push(theme::link(redact_url_userinfo(u)).to_string());
+    }
+    if let Some(k) = role_key_display(rc.api_key_ref.as_deref()) {
+        parts.push(k);
+    }
+    if parts.is_empty() {
+        return format!(
+            "{}  {}",
+            theme::faint("— not set").italic(),
+            theme::faint("· uses the main endpoint")
+        );
+    }
+    parts.join(&format!(" {} ", theme::faint("·")))
+}
+
+/// The `Sub-agents & roles` panel: per-role endpoints plus the model→endpoint registry.
+///
+/// `oracle` carries an extra note because configuring it is not just "pick a model" — `self_review()`
+/// falls back to `role_configured("oracle")`, so setting this role is what TURNS SELF-REVIEW ON. A
+/// reader who doesn't know that would set an oracle model and be surprised by the extra review turn.
+fn print_roles_section(cfg: &cli_config::CliConfig) {
+    println!(
+        "\n  {} {}",
+        theme::accent("◆"),
+        theme::accent("Sub-agents & roles").bold()
+    );
+    let row = |key: &str, val: String| println!("    {}  {val}", theme::muted(format!("{key:<10}")));
+    let roles = cfg.roles.as_ref();
+    row(
+        "subagent",
+        role_row_value(roles.and_then(|r| r.subagent_default.as_ref())),
+    );
+    row(
+        "summarizer",
+        role_row_value(roles.and_then(|r| r.summarizer.as_ref())),
+    );
+    let oracle = roles.and_then(|r| r.oracle.as_ref());
+    row(
+        "oracle",
+        format!(
+            "{}  {}",
+            role_row_value(oracle),
+            if cfg.self_review.unwrap_or(oracle.is_some()) {
+                theme::ok("· self-review ● on").to_string()
+            } else {
+                theme::faint("· self-review ○ off").to_string()
+            }
+        ),
+    );
+    row("apply", role_row_value(roles.and_then(|r| r.apply.as_ref())));
+    match cfg.model_endpoints.as_deref().filter(|l| !l.is_empty()) {
+        Some(list) => {
+            let names: Vec<&str> = list.iter().map(|e| e.model.as_str()).collect();
+            row(
+                "registry",
+                format!(
+                    "{}  {}",
+                    theme::accent(format!("{} model(s) mapped", list.len())),
+                    theme::faint(format!("· {}", names.join(", ")))
+                ),
+            );
+        }
+        None => row(
+            "registry",
+            format!(
+                "{}  {}",
+                theme::faint("— empty").italic(),
+                theme::faint("· pinned models use the caller's gateway")
+            ),
+        ),
+    }
 }
 
 fn fmt_bytes(bytes: u64) -> String {
@@ -11547,6 +11771,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
         let items = vec![
             format!("Connection      · api key {key_h}"),
             format!("Model & context · {model_h}"),
+            format!("Sub-agents      · {}", subagent_hint(&cfg)),
             format!("Web search      · tavily {tavily_h}"),
             format!("Memory          · {}", memory_hint(&cfg)),
             format!("Session         · compact {compact_h}"),
@@ -11565,17 +11790,18 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             Some(i) => i,
             None => break,
         };
-        // Sections 0..=7 edit + save; 8 shows the panel; 9 (or Esc) exits.
+        // Sections 0..=8 edit + save; 9 shows the panel; 10 (or Esc) exits.
         let edited = match pick {
             0 => config_edit_connection(&mut cfg).await,
             1 => config_edit_model(&mut cfg).await,
-            2 => config_edit_websearch(&mut cfg).await,
-            3 => config_edit_memory(&mut cfg),
-            4 => config_edit_session(&mut cfg),
-            5 => config_edit_reasoning(&mut cfg),
-            6 => config_edit_approval(&mut cfg),
-            7 => config_edit_display(&mut cfg),
-            8 => {
+            2 => config_edit_subagents(&mut cfg).await,
+            3 => config_edit_websearch(&mut cfg).await,
+            4 => config_edit_memory(&mut cfg),
+            5 => config_edit_session(&mut cfg),
+            6 => config_edit_reasoning(&mut cfg),
+            7 => config_edit_approval(&mut cfg),
+            8 => config_edit_display(&mut cfg),
+            9 => {
                 print_config(&cfg);
                 continue;
             }
@@ -11719,6 +11945,542 @@ fn pick_model_from(
             cfg.model_context_window = None; // custom id → heuristic
         }
     }
+    Ok(())
+}
+
+/// One-line menu hint for the Sub-agents row: what a dispatched sub-agent runs on today.
+fn subagent_hint(cfg: &cli_config::CliConfig) -> String {
+    let model = cfg
+        .roles
+        .as_ref()
+        .and_then(|r| r.subagent_default.as_ref())
+        .and_then(|s| s.model.clone())
+        .unwrap_or_else(|| "main model".to_string());
+    let mapped = cfg.model_endpoints.as_deref().map_or(0, <[_]>::len);
+    let extra_roles = cfg.roles.as_ref().map_or(0, |r| {
+        usize::from(r.summarizer.is_some())
+            + usize::from(r.oracle.is_some())
+            + usize::from(r.apply.is_some())
+    });
+    let mut s = model;
+    if mapped > 0 {
+        s.push_str(&format!(" · {mapped} mapped"));
+    }
+    if extra_roles > 0 {
+        s.push_str(&format!(" · {extra_roles} role(s)"));
+    }
+    s
+}
+
+/// The four routable roles, in menu order: (config key, menu label, what it actually does).
+const ROLE_ROWS: [(&str, &str, &str); 4] = [
+    (
+        "subagent_default",
+        "Sub-agent default",
+        "the model `task` dispatches run on",
+    ),
+    (
+        "summarizer",
+        "Summarizer",
+        "compaction + handoff summaries (a cheap-fast model fits)",
+    ),
+    (
+        "oracle",
+        "Oracle",
+        "the self-review reviewer — SETTING THIS TURNS SELF-REVIEW ON",
+    ),
+    (
+        "apply",
+        "Apply",
+        "reserved for a fast-apply edit model (config-only today)",
+    ),
+];
+
+fn role_slot<'a>(
+    roles: &'a mut cli_config::RolesConfig,
+    role: &str,
+) -> &'a mut Option<cli_config::RoleModelConfig> {
+    match role {
+        "summarizer" => &mut roles.summarizer,
+        "oracle" => &mut roles.oracle,
+        "apply" => &mut roles.apply,
+        _ => &mut roles.subagent_default,
+    }
+}
+
+fn role_get<'a>(
+    cfg: &'a cli_config::CliConfig,
+    role: &str,
+) -> Option<&'a cli_config::RoleModelConfig> {
+    let r = cfg.roles.as_ref()?;
+    match role {
+        "summarizer" => r.summarizer.as_ref(),
+        "oracle" => r.oracle.as_ref(),
+        "apply" => r.apply.as_ref(),
+        _ => r.subagent_default.as_ref(),
+    }
+}
+
+/// Section editor: per-role endpoints, the model→endpoint registry, and per-specialist pins.
+///
+/// This is the surface the config layer never had. `roles.*` and `model_endpoints` have been
+/// resolvable since they were added, but the only ways to WRITE them were `config set` flags and
+/// hand-editing JSON — and nothing displayed them back, so there was no way to confirm a setting had
+/// taken. Everything here edits values that already existed; none of it is new config shape.
+async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    loop {
+        let mut items: Vec<String> = ROLE_ROWS
+            .iter()
+            .map(|(key, label, _)| {
+                let cur = role_get(cfg, key)
+                    .map(|rc| {
+                        let mut bits: Vec<String> = Vec::new();
+                        if let Some(m) = rc.model.as_deref() {
+                            bits.push(m.to_string());
+                        }
+                        if rc.base_url.is_some() {
+                            bits.push("own url".into());
+                        }
+                        if rc.api_key_ref.is_some() {
+                            bits.push("own key".into());
+                        }
+                        if bits.is_empty() {
+                            "not set".into()
+                        } else {
+                            bits.join(" · ")
+                        }
+                    })
+                    .unwrap_or_else(|| "main endpoint".to_string());
+                format!("{label:<22}· {cur}")
+            })
+            .collect();
+        items.push(format!(
+            "{:<22}· {} entr(ies)",
+            "Model → endpoint map",
+            cfg.model_endpoints.as_deref().map_or(0, <[_]>::len)
+        ));
+        let installed = crate::agents::list().len();
+        items.push(format!(
+            "{:<22}· {installed} specialist(s) installed",
+            "Per-agent pin"
+        ));
+        items.push("Back".to_string());
+
+        let pick = match Select::with_theme(&theme)
+            .with_prompt("Sub-agents & roles (Esc when done)")
+            .items(&items)
+            .default(0)
+            .interact_opt()?
+        {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        match pick {
+            i if i < ROLE_ROWS.len() => {
+                let (key, label, what) = ROLE_ROWS[i];
+                println!("  {}", style(what).dim());
+                config_edit_one_role(cfg, key, label).await?;
+            }
+            i if i == ROLE_ROWS.len() => config_edit_model_registry(cfg).await?,
+            i if i == ROLE_ROWS.len() + 1 => config_edit_agent_pins().await?,
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// Ask for a base URL for a role/registry entry and PROBE it before accepting.
+///
+/// Returns `(url, models)` — the model list is a by-product of the probe worth keeping, because it
+/// turns the next step from "type a model id correctly from memory" into a picker. An empty entry
+/// means "inherit the main endpoint" and returns `None`.
+///
+/// A failed probe does NOT block saving. The endpoint may be down, behind a VPN, or simply not
+/// expose `/models`; refusing the value would make this menu unusable in exactly those cases. It
+/// warns with the real reason and asks — the same shape `config_edit_connection` uses for an
+/// unreachable preset.
+async fn prompt_probed_base_url(
+    theme: &ColorfulTheme,
+    http: &reqwest::Client,
+    current: Option<&str>,
+    inherit_label: &str,
+) -> Result<Option<(String, Vec<client::ModelInfo>)>> {
+    let mut input = Input::<String>::with_theme(theme)
+        .with_prompt(format!("Base URL (empty = {inherit_label}, `-` clears)"))
+        .allow_empty(true);
+    if let Some(c) = current {
+        input = input.default(c.to_string());
+    }
+    let raw = input.interact_text()?;
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "-" {
+        return Ok(None);
+    }
+    let url = raw.trim_end_matches('/').to_string();
+    let check = spin_while(
+        &format!("checking {url}"),
+        client::check_endpoint(http, &url, None),
+    )
+    .await;
+    match check {
+        client::EndpointCheck::Ok(infos) => {
+            line_ok(&format!("reachable — {} models", infos.len()));
+            Ok(Some((url, infos)))
+        }
+        client::EndpointCheck::Auth(_) => {
+            line_ok("reachable (needs a key — next step)");
+            Ok(Some((url, Vec::new())))
+        }
+        other => {
+            let what = match &other {
+                client::EndpointCheck::NotFound(d) => {
+                    match missing_version_suffix(&url) {
+                        Some(fixed) => format!("no model list there — most endpoints need a version path, e.g. {fixed}"),
+                        None => format!("no model list there ({d})"),
+                    }
+                }
+                client::EndpointCheck::Unreachable(d) => format!("could not reach it ({d})"),
+                client::EndpointCheck::Http(c, d) => format!("HTTP {c} ({d})"),
+                _ => unreachable!("Ok/Auth handled above"),
+            };
+            line_warn(&what);
+            if yn(theme, "Save this URL anyway?", false)? {
+                Ok(Some((url, Vec::new())))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Ask how a role/entry should authenticate. `env:VAR` is offered first and by default: it keeps the
+/// secret out of `cli-config.json`, and the resolver already understands the indirection.
+///
+/// Returns `Some(value)` to store, or `None` to inherit the main key.
+fn prompt_api_key_ref(theme: &ColorfulTheme, current: Option<&str>) -> Result<Option<String>> {
+    let opts = [
+        "env:VAR — read from an environment variable (recommended)",
+        "paste a key — stored in cli-config.json",
+        "inherit the main endpoint's key",
+    ];
+    let default_idx = match current {
+        Some(c) if c.starts_with("env:") => 0,
+        Some(_) => 1,
+        None => 2,
+    };
+    let pick = match Select::with_theme(theme)
+        .with_prompt("API key (Esc keeps current)")
+        .items(&opts)
+        .default(default_idx)
+        .interact_opt()?
+    {
+        Some(i) => i,
+        None => return Ok(current.map(str::to_string)),
+    };
+    match pick {
+        0 => {
+            let mut input = Input::<String>::with_theme(theme).with_prompt("Environment variable");
+            if let Some(v) = current.and_then(|c| c.strip_prefix("env:")) {
+                input = input.default(v.to_string());
+            }
+            let var = input.allow_empty(true).interact_text()?;
+            let var = var.trim().trim_start_matches("env:").trim();
+            if var.is_empty() {
+                return Ok(None);
+            }
+            // Say so now rather than at dispatch time: an unset variable resolves to the inherited
+            // key, which looks like the setting silently did nothing.
+            if std::env::var(var).ok().filter(|v| !v.trim().is_empty()).is_none() {
+                line_warn(&format!(
+                    "{var} isn't set in this shell — until it is, this role falls back to the main key"
+                ));
+            }
+            Ok(Some(format!("env:{var}")))
+        }
+        1 => {
+            let key: String = Input::with_theme(theme)
+                .with_prompt("API key")
+                .allow_empty(true)
+                .interact_text()?;
+            let key = key.trim();
+            Ok((!key.is_empty()).then(|| key.to_string()))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Pick a model from a probed list, or type one. Unlike [`pick_model_from`] this returns the choice
+/// instead of writing `cfg.model`, because a role's model must not touch the main model.
+fn prompt_role_model(
+    theme: &ColorfulTheme,
+    infos: &[client::ModelInfo],
+    current: Option<&str>,
+) -> Result<Option<String>> {
+    if !infos.is_empty() {
+        let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
+        let mut items: Vec<String> = ids.clone();
+        items.push(CUSTOM_MODEL_ITEM.to_string());
+        items.push("‹ inherit the main model ›".to_string());
+        let pick = match Select::with_theme(theme)
+            .with_prompt("Model (Esc keeps current)")
+            .items(&items)
+            .default(model_default_index(&ids, current))
+            .interact_opt()?
+        {
+            Some(i) => i,
+            None => return Ok(current.map(str::to_string)),
+        };
+        if pick < ids.len() {
+            return Ok(Some(ids[pick].clone()));
+        }
+        if pick == ids.len() + 1 {
+            return Ok(None);
+        }
+    }
+    let mut input = Input::<String>::with_theme(theme)
+        .with_prompt("Model id (empty = inherit the main model)")
+        .allow_empty(true);
+    if let Some(c) = current {
+        input = input.default(c.to_string());
+    }
+    let m = input.interact_text()?;
+    let m = m.trim();
+    Ok((!m.is_empty() && m != "-").then(|| m.to_string()))
+}
+
+/// Edit one role end-to-end: URL (probed) → key → model (picked from the probe when possible).
+async fn config_edit_one_role(
+    cfg: &mut cli_config::CliConfig,
+    role: &str,
+    label: &str,
+) -> Result<()> {
+    let theme = ui_theme();
+    let http = http_client()?;
+    let cur = role_get(cfg, role).cloned().unwrap_or_default();
+
+    println!("  {}", style(format!("— {label} —")).dim());
+    let probed = prompt_probed_base_url(
+        &theme,
+        &http,
+        cur.base_url.as_deref(),
+        "inherit the main endpoint",
+    )
+    .await?;
+    let (base_url, mut infos) = match probed {
+        Some((u, i)) => (Some(u), i),
+        None => (None, Vec::new()),
+    };
+    let api_key_ref = prompt_api_key_ref(&theme, cur.api_key_ref.as_deref())?;
+
+    // With a URL and a key in hand, re-fetch so the model picker lists what THIS endpoint serves
+    // rather than the main one's catalogue.
+    if infos.is_empty() {
+        if let Some(url) = base_url.as_deref() {
+            let key = api_key_ref
+                .as_deref()
+                .and_then(|k| match k.strip_prefix("env:") {
+                    Some(var) => std::env::var(var.trim()).ok(),
+                    None => Some(k.to_string()),
+                })
+                .or_else(|| cfg.api_key.clone())
+                .unwrap_or_default();
+            if !key.is_empty() {
+                if let Ok(fetched) =
+                    spin_while("fetching models", client::fetch_models_info(&http, url, &key)).await
+                {
+                    infos = fetched;
+                }
+            }
+        }
+    }
+    let model = prompt_role_model(&theme, &infos, cur.model.as_deref())?;
+
+    let mut roles = cfg.roles.take().unwrap_or_default();
+    let slot = role_slot(&mut roles, role);
+    *slot = (model.is_some() || base_url.is_some() || api_key_ref.is_some()).then_some(
+        cli_config::RoleModelConfig {
+            model,
+            base_url,
+            api_key_ref,
+        },
+    );
+    cfg.roles = roles.has_any().then_some(roles);
+    Ok(())
+}
+
+/// Edit the model→endpoint registry: the table that lets a model name carry its own gateway, so a
+/// specialist pinned to another provider's model reaches THAT provider.
+async fn config_edit_model_registry(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    let http = http_client()?;
+    loop {
+        let list = cfg.model_endpoints.clone().unwrap_or_default();
+        let mut items: Vec<String> = list
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}  → {}{}",
+                    e.model,
+                    e.base_url.as_deref().unwrap_or("(caller's url)"),
+                    e.api_key_ref
+                        .as_deref()
+                        .map(|k| if k.starts_with("env:") {
+                            format!(" · {k}")
+                        } else {
+                            " · own key".to_string()
+                        })
+                        .unwrap_or_default()
+                )
+            })
+            .collect();
+        items.push("＋ add a model mapping".to_string());
+        items.push("Back".to_string());
+        let pick = match Select::with_theme(&theme)
+            .with_prompt("Model → endpoint (Esc when done)")
+            .items(&items)
+            .default(items.len().saturating_sub(2))
+            .interact_opt()?
+        {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        if pick == items.len() - 1 {
+            return Ok(());
+        }
+        if pick < list.len() {
+            let existing = &list[pick];
+            let action = match Select::with_theme(&theme)
+                .with_prompt(format!("{} (Esc cancels)", existing.model))
+                .items(&["edit", "remove"])
+                .default(0)
+                .interact_opt()?
+            {
+                Some(a) => a,
+                None => continue,
+            };
+            if action == 1 {
+                apply_model_endpoint(cfg, &format!("{},clear", existing.model))?;
+                line_ok(&format!("removed {}", existing.model));
+                continue;
+            }
+        }
+        // Add, or edit-in-place (same prompts; the model id is pre-filled when editing).
+        let editing = (pick < list.len()).then(|| list[pick].clone());
+        let mut mi = Input::<String>::with_theme(&theme).with_prompt("Model id");
+        if let Some(e) = &editing {
+            mi = mi.default(e.model.clone());
+        }
+        let model = mi.allow_empty(true).interact_text()?;
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            continue;
+        }
+        let probed = prompt_probed_base_url(
+            &theme,
+            &http,
+            editing.as_ref().and_then(|e| e.base_url.as_deref()),
+            "inherit the caller's url",
+        )
+        .await?;
+        let api_key_ref =
+            prompt_api_key_ref(&theme, editing.as_ref().and_then(|e| e.api_key_ref.as_deref()))?;
+        let base_url = probed.map(|(u, _)| u);
+        let mut out = cfg.model_endpoints.take().unwrap_or_default();
+        out.retain(|e| e.model != model);
+        if base_url.is_some() || api_key_ref.is_some() {
+            out.push(cli_config::ModelEndpoint {
+                model: model.clone(),
+                base_url,
+                api_key_ref,
+            });
+            line_ok(&format!("mapped {model}"));
+        } else {
+            // Both fields empty would be a no-op entry that only adds noise to `config show`.
+            line_warn(&format!("{model} has no url or key — entry dropped"));
+        }
+        cfg.model_endpoints = (!out.is_empty()).then_some(out);
+    }
+}
+
+/// Pin a model (and optionally a gateway) onto ONE installed specialist card.
+///
+/// Writes frontmatter, not `cli-config.json`, so it lives with the agent and travels with the repo
+/// when the card is project-local. That is also why the key option here is `env:VAR` only — those
+/// directories get committed.
+async fn config_edit_agent_pins() -> Result<()> {
+    let theme = ui_theme();
+    let all = crate::agents::list();
+    if all.is_empty() {
+        line_warn("no specialists installed — `aizen agents install msitarzewski/agency-agents`");
+        return Ok(());
+    }
+    let items: Vec<String> = all
+        .iter()
+        .map(|d| {
+            format!(
+                "{:<24}· {}{}",
+                d.slug(),
+                d.model.as_deref().unwrap_or("(sub-agent default)"),
+                d.base_url
+                    .as_deref()
+                    .map(|u| format!(" · {u}"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect();
+    let pick = match Select::with_theme(&theme)
+        .with_prompt("Pin a specialist (Esc when done)")
+        .items(&items)
+        .default(0)
+        .interact_opt()?
+    {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+    let def = &all[pick];
+
+    let mut mi = Input::<String>::with_theme(&theme)
+        .with_prompt("Model id (empty = use the sub-agent default, `-` clears)")
+        .allow_empty(true);
+    if let Some(m) = def.model.as_deref() {
+        mi = mi.default(m.to_string());
+    }
+    let model = mi.interact_text()?;
+    let model = model.trim();
+
+    let mut ui = Input::<String>::with_theme(&theme)
+        .with_prompt("Base URL (empty = use the model→endpoint map, `-` clears)")
+        .allow_empty(true);
+    if let Some(u) = def.base_url.as_deref() {
+        ui = ui.default(u.to_string());
+    }
+    let base = ui.interact_text()?;
+    let base = base.trim().trim_end_matches('/');
+
+    let mut ki = Input::<String>::with_theme(&theme)
+        .with_prompt("API key env var (empty = inherit, `-` clears) — env only, cards get committed")
+        .allow_empty(true);
+    if let Some(v) = def.api_key_ref.as_deref().and_then(|k| k.strip_prefix("env:")) {
+        ki = ki.default(v.to_string());
+    }
+    let var = ki.interact_text()?;
+    let var = var.trim().trim_start_matches("env:").trim();
+
+    // `-` means clear, empty means leave alone — matching the prompt text above.
+    let edit = |s: &str| -> Option<Option<String>> {
+        match s {
+            "" => None,
+            "-" => Some(None),
+            v => Some(Some(v.to_string())),
+        }
+    };
+    let path = crate::agents::set_endpoint(
+        &def.slug(),
+        edit(model),
+        edit(base),
+        edit(var).map(|v| v.map(|s| format!("env:{s}"))),
+    )?;
+    line_ok(&format!("wrote {}", path.display()));
     Ok(())
 }
 
@@ -13929,6 +14691,110 @@ fn finish_install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A role's key must never reach the screen in the clear.
+    ///
+    /// The two shapes are deliberately different. `env:VAR` prints the VARIABLE NAME plus whether it
+    /// resolves right now — the failure this catches is a forgotten `export`, which otherwise looks
+    /// exactly like "the setting didn't save". A literal key goes through `mask()` like the main one.
+    #[test]
+    fn role_key_display_masks_literals_and_names_env_vars() {
+        let literal = role_key_display(Some("sk-live-super-secret-value")).unwrap();
+        assert!(
+            !literal.contains("super-secret-value"),
+            "a literal key must be masked, got {literal}"
+        );
+        assert!(literal.contains("***"), "masked form expected, got {literal}");
+
+        std::env::set_var("AIZEN_TEST_ROLE_KEY_SET", "some-value");
+        let present = role_key_display(Some("env:AIZEN_TEST_ROLE_KEY_SET")).unwrap();
+        assert!(
+            present.contains("AIZEN_TEST_ROLE_KEY_SET"),
+            "the variable NAME is the useful part, got {present}"
+        );
+        assert!(
+            !present.contains("some-value"),
+            "the variable's VALUE must never be printed, got {present}"
+        );
+        assert!(present.contains('✓'), "a resolvable var reads as ok");
+        std::env::remove_var("AIZEN_TEST_ROLE_KEY_SET");
+
+        std::env::remove_var("AIZEN_TEST_ROLE_KEY_UNSET");
+        let missing = role_key_display(Some("env:AIZEN_TEST_ROLE_KEY_UNSET")).unwrap();
+        assert!(
+            missing.contains("unset"),
+            "an unexported var must say so — that's the whole point, got {missing}"
+        );
+
+        assert_eq!(role_key_display(None), None);
+        assert_eq!(role_key_display(Some("   ")), None);
+    }
+
+    #[test]
+    fn role_row_value_omits_absent_fields() {
+        assert!(
+            role_row_value(None).contains("not set"),
+            "an unconfigured role says so"
+        );
+        // An all-empty struct is still "not set" — an empty husk shouldn't read as configured.
+        assert!(role_row_value(Some(&cli_config::RoleModelConfig::default())).contains("not set"));
+
+        let only_model = cli_config::RoleModelConfig {
+            model: Some("cheap-fast".into()),
+            ..Default::default()
+        };
+        let rendered = console::strip_ansi_codes(&role_row_value(Some(&only_model))).to_string();
+        assert_eq!(
+            rendered, "cheap-fast",
+            "a model-only role is one word, not three 'not set' clauses"
+        );
+    }
+
+    /// `--<role>-*` flags: `None` leaves a field alone, an EMPTY string clears it, and clearing the
+    /// last field drops the role object — which matters because `role_configured("oracle")` (and so
+    /// self-review) keys off presence, not contents.
+    #[test]
+    fn apply_role_flags_sets_clears_then_drops_the_role() {
+        let mut roles = cli_config::RolesConfig::default();
+        apply_role_flags(
+            &mut roles,
+            "oracle",
+            Some("strong-model".into()),
+            Some("https://oracle/v1".into()),
+            None,
+        );
+        let o = roles.oracle.as_ref().expect("oracle materialized");
+        assert_eq!(o.model.as_deref(), Some("strong-model"));
+        assert_eq!(o.base_url.as_deref(), Some("https://oracle/v1"));
+        assert_eq!(o.api_key_ref, None);
+        assert!(roles.has_any());
+
+        // A `None` for every field is a no-op, not a wipe.
+        apply_role_flags(&mut roles, "oracle", None, None, None);
+        assert_eq!(
+            roles.oracle.as_ref().unwrap().model.as_deref(),
+            Some("strong-model"),
+            "passing no flags must not clear an existing setting"
+        );
+
+        // Empty strings clear individual fields; emptying them all drops the role entirely.
+        apply_role_flags(&mut roles, "oracle", Some(String::new()), None, None);
+        assert_eq!(roles.oracle.as_ref().unwrap().model, None, "model cleared");
+        assert!(roles.oracle.is_some(), "base_url still holds the role open");
+        apply_role_flags(&mut roles, "oracle", None, Some("  ".into()), None);
+        assert!(
+            roles.oracle.is_none(),
+            "an all-empty role is removed, not left as a husk"
+        );
+        assert!(!roles.has_any());
+
+        // Each role writes to its own slot.
+        apply_role_flags(&mut roles, "summarizer", Some("cheap".into()), None, None);
+        apply_role_flags(&mut roles, "apply", Some("fast".into()), None, None);
+        assert_eq!(roles.summarizer.unwrap().model.as_deref(), Some("cheap"));
+        assert_eq!(roles.apply.unwrap().model.as_deref(), Some("fast"));
+        assert!(roles.oracle.is_none() && roles.subagent_default.is_none());
+    }
 
     fn models() -> Vec<String> {
         vec![

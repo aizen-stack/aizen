@@ -370,6 +370,36 @@ pub(super) fn context_menu_rect() -> Option<Rect> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Where `draw_footer` last asked ratatui to park the input caret (`frame.set_cursor_position`).
+///
+/// ratatui shows and positions the caret as the FINAL step of `draw`
+/// (`apply_buffer_with_cursor`), so the hyperlink injector — which runs after that and moves the
+/// cursor around to overprint spans — has to put it back. Published every frame from the draw
+/// thread, read by the injector call site just below.
+fn caret_slot() -> &'static Mutex<Option<(u16, u16)>> {
+    static SLOT: OnceLock<Mutex<Option<(u16, u16)>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn last_caret() -> Option<(u16, u16)> {
+    *caret_slot().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Screen rects painted OVER the transcript at last draw (overlay panel, Copy menu). The hyperlink
+/// injector must not print link text into these — it writes at absolute coordinates after the frame
+/// is composited, so anything floating above the transcript would be scribbled on.
+fn occluders_slot() -> &'static Mutex<Vec<Rect>> {
+    static SLOT: OnceLock<Mutex<Vec<Rect>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn last_occluders() -> Vec<Rect> {
+    occluders_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// The selection currently PAINTED, mirrored out of the render thread's `AppState` so the input
 /// thread can act on it without owning it.
 ///
@@ -1256,18 +1286,22 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     // diff never sees the escape sequences and can't overwrite them next frame.
                     // Pattern is identical to the screensaver sixel blitter (`blit_screensaver`).
                     {
+                        // Snapshot occluders + caret BEFORE taking the geometry lock, so all four
+                        // pieces describe the frame that was just drawn.
+                        let occluders = last_occluders();
+                        let caret = last_caret();
                         let g = transcript_geom_slot()
                             .lock()
                             .unwrap_or_else(|e| e.into_inner());
+                        let ctx = crate::ui::links::InjectCtx {
+                            start: g.start,
+                            visible: g.visible,
+                            area: g.area,
+                            occluders,
+                            caret,
+                        };
                         let out = s.terminal.backend_mut();
-                        crate::ui::links::inject_hyperlinks(
-                            out,
-                            &g.sgr_rows,
-                            &g.plain_rows,
-                            g.start,
-                            g.visible,
-                            g.area,
-                        );
+                        crate::ui::links::inject_hyperlinks(out, &g.sgr_rows, &g.plain_rows, &ctx);
                     }
                     let rows = state
                         .blocks
@@ -1452,10 +1486,16 @@ fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         .split(area);
     draw_transcript(frame, chunks[0], state);
     draw_footer(frame, chunks[1], state);
+    // Rects floating ABOVE the transcript this frame. Collected here (rather than inferred later)
+    // because only the draw pass knows what was actually painted — the post-draw hyperlink injector
+    // writes at absolute coordinates and would otherwise print over them.
+    let mut occluders: Vec<Rect> = Vec::new();
     if let Some(overlay) = state.input.overlay.clone() {
         // draw_overlay clamps the requested scroll against the overlay's own visible height and
         // returns the value actually used, so a stored offset past the end snaps back next frame.
-        state.overlay_scroll = draw_overlay(frame, area, &overlay, state.overlay_scroll);
+        let (scroll, rect) = draw_overlay(frame, area, &overlay, state.overlay_scroll);
+        state.overlay_scroll = scroll;
+        occluders.push(rect);
     }
     // The Copy menu paints LAST so it sits above the transcript and the overlay both — it is the
     // surface the pointer is currently on, and a box the user just summoned must not appear behind
@@ -1464,8 +1504,14 @@ fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     let menu_rect = state
         .context_menu
         .and_then(|m| draw_context_menu(frame, chunks[0], m));
+    if let Some(r) = menu_rect {
+        occluders.push(r);
+    }
     if let Ok(mut slot) = context_menu_rect_slot().lock() {
         *slot = menu_rect;
+    }
+    if let Ok(mut slot) = occluders_slot().lock() {
+        *slot = occluders;
     }
 }
 
@@ -1518,11 +1564,12 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         apply_selection_highlight(&mut lines, sel);
     }
     // The working indicator rides the BOTTOM of the transcript (Claude-CLI style) rather than a HUD
-    // pill: a brand-pulse spinner (the ✦ mark breathing to ✧) + a typewriter caption that reads the
-    // agent's current action ("Reading retained.rs") or a whimsical verb between steps. Blue caption
-    // (the aizen link-blue) so it reads as "live status", not transcript prose. Appended after the
-    // selection highlight so a drag can't accidentally reverse-video the spinner; it counts toward
-    // `total` so the tail-follow keeps it pinned to the last row as output streams.
+    // pill: a brand-bloom spinner (the ✦ mark opening out through ✶✷✹✺ and back) + a typewriter
+    // caption that reads the agent's current action ("Reading retained.rs") or a whimsical verb
+    // between steps. Blue caption (the aizen link-blue) so it reads as "live status", not transcript
+    // prose. Appended after the selection highlight so a drag can't accidentally reverse-video the
+    // spinner; it counts toward `total` so the tail-follow keeps it pinned to the last row as output
+    // streams.
     if state.working {
         for (plain, styled) in working_line(state) {
             plain_rows.push(plain);
@@ -1683,51 +1730,66 @@ fn styled_row(kind: BlockKind, row: String) -> Line<'static> {
     }
 }
 
-/// The brand-pulse spinner glyphs: the ✦ mark "breathing" to its hollow twin ✧ and back. Both are
-/// safe across fonts (unlike braille), and the two-frame pulse ties the working indicator to the
-/// `✦ ultimate` / synthesizing brand mark rather than a generic spinner.
-const PULSE: [&str; 2] = ["✦", "✧"];
+/// The brand-bloom spinner: the ✦ mark opening out through stars of growing radius and closing back.
+/// A ping-pong, so the cycle returns to ✦ — and since `Working(false)` resets `frame` to 0, every turn
+/// OPENS on the brand mark rather than mid-bloom.
+///
+/// Two properties are load-bearing, not decoration:
+///
+///  - **Every frame renders one display cell.** The caption sits immediately to the right, so a
+///    2-cell frame shoves it sideways once per cycle. This rules out the otherwise-obvious ✳
+///    (U+2733) and ✴ (U+2734): both are `Emoji=Yes`, so a terminal resolving them through an emoji
+///    font paints them double-width. Their `East_Asian_Width` is Narrow, so a width measurement
+///    does NOT catch this — `bloom_frames_never_render_two_cells_wide` checks emoji membership,
+///    not width, for exactly that reason.
+///  - **No braille.** U+28xx is the universal CLI spinner; wearing it would trade the ✦ brand (shared
+///    with the `✦ ultimate` chip and the synthesizing phase mark) for anonymity.
+///
+/// 8 frames at the ~110ms working tick ⇒ a ~880ms bloom, which is deliberately close to the classic
+/// 10×80ms braille rotation — fast enough to read as motion, slow enough not to flicker. That timing
+/// is why the spinner does NOT need its own clock: it shares the typewriter's tick (see
+/// [`AppState::work_reveal`]) at a rate that happens to suit both.
+const BLOOM: [&str; 8] = ["✦", "✶", "✷", "✹", "✺", "✹", "✷", "✶"];
 
 /// Build the working line(s) shown at the bottom of the transcript while a turn is in flight: a
-/// brand-pulse spinner + a typewriter-revealed caption in the aizen link-blue, then a blinking caret.
+/// brand-bloom spinner + a typewriter-revealed caption in the aizen link-blue, then the elapsed clock.
 ///
 /// Returns `(plain, styled)` pairs so the caller can push both the mouse-mapping plain row and the
 /// coloured `Line`. One visual row today, but a Vec keeps the door open for a wrapped caption.
 ///
 /// The caption reveal (`work_reveal`) is advanced by the ticker/timeout, so this fn is pure over the
-/// current state — it just slices `work_caption` to the revealed prefix and appends the caret.
+/// current state — it just slices `work_caption` to the revealed prefix.
 fn working_line(state: &AppState) -> Vec<(String, Line<'static>)> {
     use crate::ui::theme;
-    let glyph = PULSE[state.frame % PULSE.len()];
+    let glyph = BLOOM[state.frame % BLOOM.len()];
     // Reveal the first `work_reveal` chars of the caption (char-, not byte-, indexed so multibyte
-    // captions never split mid-codepoint). A caret rides the end: solid while still typing, and
-    // blinking (on the ✦ half of the pulse) once fully revealed — a quiet "still alive" heartbeat.
+    // captions never split mid-codepoint).
     let revealed: String = state
         .work_caption
         .chars()
         .take(state.work_reveal)
         .collect();
-    let done = state.work_reveal >= state.work_caption.chars().count();
-    // Caret chỉ hiện trong khi đang gõ — khi đã gõ xong thì spinner ✦⇄✧ đã đủ "nhịp sống",
-    // caret nhấp nháy thêm vào trông rối mắt.
-    let caret = if !done { "▏" } else { "" };
     let elapsed = state
         .working_since
         .map(|t| t.elapsed().as_secs())
         .unwrap_or(0);
-    // `spinner · caption▏         12s · Esc to stop` — spinner in moonlight (the structural brand
-    // colour), caption in link-blue (live status, distinct from grey transcript prose), the elapsed
-    // clock + stop hint faint at the tail so they inform without pulling the eye.
+    // `spinner caption   12s · Esc to stop` — spinner in moonlight (the structural brand colour),
+    // caption in link-blue (live status, distinct from grey transcript prose), the elapsed clock +
+    // stop hint faint at the tail so they inform without pulling the eye.
+    //
+    // NO drawn caret rides the caption. A `▏` here used to imitate a text cursor, which misread
+    // badly for two reasons: the terminal's REAL cursor is already visible (ratatui's
+    // `apply_buffer_with_cursor` calls `show_cursor` whenever a frame sets a position, so the
+    // `Hide` in `TerminalSession::enter` lasts exactly one frame) and it blinks a few rows below in
+    // the input box — and when the caption was empty between tool steps the imitation collapsed
+    // onto the spinner as `✦ ▏`, reading as a second cursor stuck to the glyph. The bloom is the
+    // liveness signal; one cursor on screen is the correct number.
     let spans = vec![
         Span::styled(
             format!("{glyph} "),
             Style::default().fg(Color::Indexed(theme::ACCENT)),
         ),
         Span::styled(revealed, Style::default().fg(Color::Indexed(theme::LINK))),
-        Span::styled(
-            caret.to_string(),
-            Style::default().fg(Color::Indexed(theme::LINK)),
-        ),
         Span::styled(
             format!("   {elapsed}s · Esc to stop"),
             Style::default().fg(Color::Indexed(theme::FAINT)),
@@ -1880,7 +1942,12 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .saturating_add(2)
         .saturating_add(imgtag_w as u16)
         .saturating_add(cursor_off as u16);
-    frame.set_cursor_position((cursor_x.min(rows[2].right().saturating_sub(1)), rows[2].y));
+    let caret = (cursor_x.min(rows[2].right().saturating_sub(1)), rows[2].y);
+    frame.set_cursor_position(caret);
+    // Publish it so the post-draw hyperlink injector can restore the caret after moving the cursor.
+    if let Ok(mut slot) = caret_slot().lock() {
+        *slot = Some(caret);
+    }
 }
 
 fn input_line(state: &AppState, budget: usize) -> (String, usize) {
@@ -1959,7 +2026,7 @@ fn draw_overlay(
     area: Rect,
     overlay: &OverlaySnapshot,
     scroll: usize,
-) -> usize {
+) -> (usize, Rect) {
     let width = area.width.saturating_sub(4).min(84).max(20);
     let height = (overlay.lines.len() as u16 + 4)
         .min(area.height.saturating_sub(2))
@@ -2010,7 +2077,7 @@ fn draw_overlay(
             .scroll((clamped.min(u16::MAX as usize) as u16, 0)),
         inner,
     );
-    clamped
+    (clamped, rect)
 }
 
 /// Label on the right-click menu's only button. Padded so the highlight reads as a button rather
@@ -2585,6 +2652,164 @@ mod tests {
             code.contains("foo()"),
             "the code text itself must survive: {code:?}"
         );
+    }
+
+    /// Codepoints in the Dingbats block (U+2700..U+27BF) carrying `Emoji=Yes` in Unicode's
+    /// `emoji-data.txt`. They default to TEXT presentation, so `unicode-width` — which reads
+    /// East_Asian_Width, a different table — reports them as 1 cell and waves them through. But a
+    /// terminal that resolves them through its emoji font (Windows Terminal with Segoe UI Emoji in
+    /// the fallback chain does exactly this) paints them 2 cells wide. That is the failure mode a
+    /// width assertion cannot see, so the spinner alphabet is checked against this list instead.
+    const DINGBAT_EMOJI: &[char] = &[
+        '\u{2702}', '\u{2705}', '\u{2708}', '\u{2709}', '\u{270A}', '\u{270B}', '\u{270C}',
+        '\u{270D}', '\u{270F}', '\u{2712}', '\u{2714}', '\u{2716}', '\u{271D}', '\u{2721}',
+        '\u{2728}', '\u{2733}', '\u{2734}', '\u{2744}', '\u{2747}', '\u{274C}', '\u{274E}',
+        '\u{2753}', '\u{2754}', '\u{2755}', '\u{2757}', '\u{2763}', '\u{2764}', '\u{2795}',
+        '\u{2796}', '\u{2797}', '\u{27A1}', '\u{27B0}', '\u{27BF}',
+    ];
+
+    #[test]
+    fn bloom_frames_never_render_two_cells_wide() {
+        // THE constraint on the spinner alphabet. The caption is drawn immediately right of the
+        // glyph, so a frame that measures 2 cells shoves the whole line sideways once per cycle —
+        // a visible horizontal twitch, not a subtle one.
+        //
+        // The obvious picks for a "star bloom" are exactly the trap: ✳ (U+2733) and ✴ (U+2734) sit
+        // mid-sequence by shape, and BOTH are `Emoji=Yes`. Note the ordering of the two assertions
+        // below — the width check ALONE is not enough and would pass on those two, because their
+        // East_Asian_Width is Narrow. The deny-list is what actually keeps them out.
+        for f in BLOOM {
+            assert_eq!(
+                f.chars().count(),
+                1,
+                "frame {f:?} must be a single char — a variation selector or ZWJ sequence flips \
+                 renderers into emoji presentation, and thus double-width"
+            );
+            let c = f.chars().next().unwrap();
+            assert!(
+                !DINGBAT_EMOJI.contains(&c),
+                "frame {f:?} (U+{:04X}) is Emoji=Yes: a terminal resolving it through an emoji \
+                 font draws it 2 cells and the caption jumps sideways once per cycle",
+                c as u32
+            );
+            assert_eq!(
+                console::measure_text_width(f),
+                1,
+                "spinner frame {f:?} must be exactly one cell wide"
+            );
+        }
+    }
+
+    #[test]
+    fn bloom_opens_on_the_brand_mark_and_ping_pongs() {
+        // Two things the sequence must do, both user-visible:
+        //  1. `Working(false)` zeroes `frame`, so frame 0 is what every turn OPENS on — it has to be
+        //     the ✦ brand mark, not an arbitrary mid-bloom star.
+        //  2. The tail mirrors the head (ping-pong), so the cycle CLOSES back toward ✦ instead of
+        //     snapping from the widest star straight to the mark.
+        assert_eq!(BLOOM[0], "✦", "a turn must open on the brand mark");
+        assert_eq!(
+            BLOOM.len() % 2,
+            0,
+            "an odd length can't mirror cleanly around its peak"
+        );
+        let peak = BLOOM.len() / 2;
+        for i in 1..peak {
+            assert_eq!(
+                BLOOM[peak - i],
+                BLOOM[peak + i],
+                "frame {} and {} must mirror for the bloom to close symmetrically",
+                peak - i,
+                peak + i
+            );
+        }
+        // No braille anywhere: U+2800..=U+28FF is the generic-CLI spinner block, and wearing it
+        // would trade the ✦ brand (shared with the `✦ ultimate` chip) for anonymity.
+        for f in BLOOM {
+            let c = f.chars().next().unwrap();
+            assert!(
+                !('\u{2800}'..='\u{28FF}').contains(&c),
+                "frame {f:?} is braille — that's the look this spinner exists to avoid"
+            );
+        }
+    }
+
+    #[test]
+    fn working_line_advances_glyph_with_the_frame_counter() {
+        // The spinner shares the typewriter's tick (no second clock), so a `Tick` must move BOTH.
+        // Guards against a future "let's give the spinner its own timer" refactor silently pinning
+        // the glyph to frame 0 while the caption keeps typing.
+        let mut state = AppState::new("intro", "status");
+        apply_command(&mut state, Command::Working(true));
+        state.set_work_caption("Reading retained.rs".to_string());
+
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..BLOOM.len() {
+            let (plain, _) = working_line(&state).remove(0);
+            let glyph = plain.chars().next().unwrap();
+            seen.insert(glyph);
+            apply_command(&mut state, Command::Tick);
+        }
+        // A full cycle shows every DISTINCT frame; the ping-pong reuses ✶/✷/✹, so 8 frames render 5.
+        let distinct: std::collections::BTreeSet<char> =
+            BLOOM.iter().map(|f| f.chars().next().unwrap()).collect();
+        assert_eq!(
+            seen, distinct,
+            "one full cycle must render every distinct bloom frame"
+        );
+        assert!(seen.len() > 2, "a 2-glyph blink is what we replaced");
+    }
+
+    #[test]
+    fn working_line_draws_no_caret_of_its_own() {
+        // The working line must NOT imitate a text cursor. The terminal's real cursor is already on
+        // screen — ratatui's `apply_buffer_with_cursor` calls `show_cursor()` for any frame that sets
+        // a position, so `draw_footer`'s `set_cursor_position` re-shows it every frame and the `Hide`
+        // in `TerminalSession::enter` survives exactly one. A second, drawn caret reads as a stray
+        // blinking cursor, and worst of all when the caption is empty between tool steps: it collapsed
+        // onto the glyph as `✦ ▏`, looking like a cursor stuck to the spinner.
+        //
+        // Checked in three states, because the old code only drew the caret while `!done` — testing
+        // just the settled state would have passed against the very bug this guards.
+        let mut state = AppState::new("intro", "status");
+        apply_command(&mut state, Command::Working(true));
+        state.set_work_caption("Reading retained.rs".to_string());
+
+        // 1. mid-typewriter
+        apply_command(&mut state, Command::Tick);
+        apply_command(&mut state, Command::Tick);
+        let (typing, _) = working_line(&state).remove(0);
+        assert!(
+            !typing.contains('▏'),
+            "no drawn caret while typing: {typing:?}"
+        );
+
+        // 2. fully revealed
+        for _ in 0..state.work_caption.chars().count() {
+            apply_command(&mut state, Command::Tick);
+        }
+        let (settled, _) = working_line(&state).remove(0);
+        assert!(
+            !settled.contains('▏'),
+            "no drawn caret once settled: {settled:?}"
+        );
+
+        // 3. empty caption — the case that produced `✦ ▏`.
+        state.work_caption.clear();
+        state.work_reveal = 0;
+        let (empty, _) = working_line(&state).remove(0);
+        assert!(
+            !empty.contains('▏'),
+            "an empty caption must not collapse a caret onto the spinner: {empty:?}"
+        );
+        // The spinner and clock still render — this removed a caret, not the line. (Frame-agnostic:
+        // by now the bloom has advanced well past frame 0.)
+        let head = empty.chars().next().unwrap().to_string();
+        assert!(
+            BLOOM.contains(&head.as_str()),
+            "a bloom frame still leads the line: {empty:?}"
+        );
+        assert!(empty.contains("Esc to stop"), "clock survives: {empty:?}");
     }
 
     #[test]

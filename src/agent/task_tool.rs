@@ -409,11 +409,49 @@ impl TaskTool {
         }
     }
 
+    /// Let a specialist CARD override the gateway its model runs on, per field, on top of whatever
+    /// [`Self::resolve_endpoint`] already worked out. The card wins over the model→endpoint registry:
+    /// the registry says "this model generally lives here", the card says "this specialist calls it
+    /// there", and the more specific statement is the card's.
+    ///
+    /// `api_key_ref` is honoured only in its `env:VAR` form (enforced upstream in
+    /// [`crate::agents::parse_markdown`], re-checked here so a hand-built `AgentDef` can't slip a
+    /// literal through). A variable that ISN'T SET leaves the resolved key untouched rather than
+    /// blanking it — an unexported var is a forgotten `export`, and answering it with an empty
+    /// Authorization header turns that into an opaque 401 instead of just using the inherited key.
+    fn apply_card_endpoint(
+        ep: &mut crate::core::cli_config::ResolvedEndpoint,
+        def: &crate::agents::AgentDef,
+    ) {
+        if let Some(url) = def.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            ep.base_url = url.to_string();
+        }
+        if let Some(var) = def
+            .api_key_ref
+            .as_deref()
+            .map(str::trim)
+            .and_then(|r| r.strip_prefix("env:"))
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            if let Some(key) = std::env::var(var).ok().filter(|v| !v.trim().is_empty()) {
+                ep.api_key = key;
+            }
+        }
+    }
+
     /// Resolve a dispatch from the tool args. A non-empty `agent` slug that [`crate::agents::load`]
     /// resolves takes the SPECIALIST path; otherwise (no `agent`, or an unknown one) it falls back to
-    /// the existing `role` path unchanged. Model precedence: explicit `model` arg > `def.model`
-    /// (specialist path only) > `roles.subagent_default` > the parent model. The resolved model is
-    /// then routed through the model-endpoint registry, so its base_url/api_key follow the model.
+    /// the existing `role` path unchanged.
+    ///
+    /// Precedence, highest first:
+    /// ```text
+    /// model:    arg `model` > card `model:` > roles.subagent_default > parent
+    /// base_url: card `base_url:`    > env AIZEN_MODEL_<M>_BASE_URL > model_endpoints > roles.subagent_default > parent
+    /// api_key:  card `api_key_ref:` > env AIZEN_MODEL_<M>_API_KEY  > model_endpoints > roles.subagent_default > parent
+    /// ```
+    /// The model is resolved first and routed through the model-endpoint registry (so its gateway
+    /// follows it), then the card's own endpoint fields override that result.
     pub(crate) fn resolve_dispatch(&self, args: &Value) -> Dispatch {
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let arg_model = args
@@ -431,7 +469,9 @@ impl TaskTool {
                 .filter(|s| !s.is_empty())
             {
                 if let Some(def) = crate::agents::load(slug) {
-                    let ep = self.resolve_endpoint(arg_model.clone().or_else(|| def.model.clone()));
+                    let mut ep =
+                        self.resolve_endpoint(arg_model.clone().or_else(|| def.model.clone()));
+                    Self::apply_card_endpoint(&mut ep, &def);
                     let registry = crate::agent::builtin::agent_registry(&def, &self.root);
                     let system = build_agent_subagent_prompt(
                         &def,
@@ -1668,6 +1708,8 @@ mod tests {
             vibe: String::new(),
             tools: tools.iter().map(|s| s.to_string()).collect(),
             model: model.map(str::to_string),
+            base_url: None,
+            api_key_ref: None,
             body: body.to_string(),
             division: None,
             source: crate::agents::AgentSource::AizenHome,
@@ -2004,6 +2046,101 @@ mod tests {
             "AIZEN_HOME",
             "AIZEN_HOME",
             "AIZEN_PROJECT_ROOT",
+        ] {
+            std::env::remove_var(v);
+        }
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
+    /// The card is more specific than the registry: the registry says where a model generally lives,
+    /// the card says where THIS specialist calls it. So the card wins — per field.
+    #[test]
+    fn card_endpoint_beats_model_registry() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sandbox = std::env::temp_dir().join(format!("aizen-card-ep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        std::env::set_var("USERPROFILE", &sandbox);
+        std::env::set_var("HOME", &sandbox);
+        std::env::set_var("AIZEN_HOME", sandbox.join(".aizen"));
+        std::env::set_var("AIZEN_PROJECT_ROOT", sandbox.join("proj"));
+        std::env::set_var("AIZEN_TEST_CARD_KEY", "key-from-env");
+        std::env::remove_var("AIZEN_TEST_CARD_MISSING");
+
+        // The registry maps `shared-model` to gateway A…
+        crate::core::cli_config::save(&crate::core::cli_config::CliConfig {
+            model_endpoints: Some(vec![crate::core::cli_config::ModelEndpoint {
+                model: "shared-model".into(),
+                base_url: Some("https://registry-gateway/v1".into()),
+                api_key_ref: Some("registry-key".into()),
+            }]),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let dir = sandbox.join(".aizen/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |file: &str, body: &str| std::fs::write(dir.join(file), body).unwrap();
+        // …but this card names gateway B and its own env-backed key.
+        write(
+            "override.md",
+            "---\nname: Override\nmodel: shared-model\nbase_url: https://card-gateway/v1\napi_key_ref: env:AIZEN_TEST_CARD_KEY\n---\nspecialist body",
+        );
+        // A card pinning only a model must behave exactly as before this feature existed.
+        write(
+            "plain.md",
+            "---\nname: Plain\nmodel: shared-model\n---\nspecialist body",
+        );
+        // An `env:VAR` that isn't exported must not blank the key.
+        write(
+            "missing.md",
+            "---\nname: Missing\nmodel: shared-model\napi_key_ref: env:AIZEN_TEST_CARD_MISSING\n---\nbody",
+        );
+        // A literal key in a card is dropped at parse time, so the registry key still applies.
+        write(
+            "literal.md",
+            "---\nname: Literal\nmodel: shared-model\napi_key_ref: sk-leaked-into-git\n---\nbody",
+        );
+
+        let t = tool(0); // parent endpoint: http://localhost / "k" / model "m"
+
+        let d = t.resolve_dispatch(&serde_json::json!({"prompt": "x", "agent": "override"}));
+        assert_eq!(d.model, "shared-model");
+        assert_eq!(
+            d.base_url, "https://card-gateway/v1",
+            "the card's base_url must beat the registry entry for the same model"
+        );
+        assert_eq!(
+            d.api_key, "key-from-env",
+            "the card's env-backed key must beat the registry key"
+        );
+
+        let plain = t.resolve_dispatch(&serde_json::json!({"prompt": "x", "agent": "plain"}));
+        assert_eq!(
+            (plain.base_url.as_str(), plain.api_key.as_str()),
+            ("https://registry-gateway/v1", "registry-key"),
+            "a model-only card still resolves through the registry (no regression)"
+        );
+
+        let missing = t.resolve_dispatch(&serde_json::json!({"prompt": "x", "agent": "missing"}));
+        assert_eq!(
+            missing.api_key, "registry-key",
+            "an unset env var falls back to the resolved key — never an empty Authorization header"
+        );
+
+        let literal = t.resolve_dispatch(&serde_json::json!({"prompt": "x", "agent": "literal"}));
+        assert_eq!(
+            literal.api_key, "registry-key",
+            "a literal api_key_ref in a committed card must be inert"
+        );
+
+        for v in [
+            "USERPROFILE",
+            "HOME",
+            "AIZEN_HOME",
+            "AIZEN_PROJECT_ROOT",
+            "AIZEN_TEST_CARD_KEY",
         ] {
             std::env::remove_var(v);
         }
