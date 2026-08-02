@@ -1,6 +1,6 @@
 <div align="center">
 
-<img width="802" height="746" alt="aizen" src="https://github.com/user-attachments/assets/4e38d4f9-29af-4a97-af0e-2c7dd7bdf697" />
+
 
 
 
