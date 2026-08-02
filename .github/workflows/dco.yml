@@ -1,0 +1,65 @@
+name: dco
+
+# Aizen is Apache-2.0 and takes contributions under the inbound=outbound rule in Section 5 of the
+# license — there is NO CLA. We only ask contributors to certify authorship with the Developer
+# Certificate of Origin (https://developercertificate.org/) by signing off their commits:
+#
+#     git commit -s -m "your message"
+#
+# This job checks every commit in the PR carries a `Signed-off-by:` trailer.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check Signed-off-by on every commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          missing=0
+          # Only inspect commits introduced by this PR.
+          for sha in $(git rev-list "$BASE_SHA..$HEAD_SHA"); do
+            author_email=$(git show -s --format='%ae' "$sha")
+            author_name=$(git show -s --format='%an' "$sha")
+            expected="Signed-off-by: ${author_name} <${author_email}>"
+            if git show -s --format='%B' "$sha" | grep -qiF "$expected"; then
+              echo "ok   $(git show -s --format='%h %s' "$sha")"
+            else
+              echo "FAIL $(git show -s --format='%h %s' "$sha")"
+              echo "     expected trailer: $expected"
+              missing=1
+            fi
+          done
+
+          if [ "$missing" -ne 0 ]; then
+            cat <<'EOF'
+
+          One or more commits are missing a matching Signed-off-by trailer.
+
+          Fix the most recent commit:
+              git commit --amend -s --no-edit && git push --force-with-lease
+
+          Fix every commit in the branch:
+              git rebase --signoff origin/main && git push --force-with-lease
+
+          By signing off you certify the Developer Certificate of Origin
+          (https://developercertificate.org/) — that you wrote the patch or
+          otherwise have the right to submit it under Apache-2.0.
+          EOF
+            exit 1
+          fi
+
+          echo "All commits are signed off."

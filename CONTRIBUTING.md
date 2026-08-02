@@ -1,30 +1,43 @@
 # Contributing to Aizen
 
-Thanks for wanting to help. Aizen is **source-available under the
-[PolyForm Noncommercial License 1.0.0](LICENSE)** — you can read, run, and modify it for any
-noncommercial purpose, and contributions are welcome under the terms below.
+Thanks for wanting to help. Aizen is **open source under the
+[Apache License 2.0](LICENSE)** — you can use, modify, and redistribute it freely, including
+commercially, and contributions are welcome under the terms below.
 
 ## Before you start
 
-- **Search existing [issues](https://github.com/dawnofcd/aizen/issues)** before opening a new one —
+- **Search existing [issues](https://github.com/aizen-stack/aizen/issues)** before opening a new one —
   it may already be reported or in progress.
 - For anything bigger than a small fix, **open an issue first** and describe what you want to do.
   A quick "here's the plan" saves everyone a rejected PR.
 - Small, focused PRs get reviewed faster than large sweeping ones. One logical change per PR.
 
-## The CLA (required, one time)
+## Licensing of contributions (no CLA)
 
-Because Aizen is dual-licensed — noncommercial to the public, with a separate commercial license
-available from the maintainer — every contributor must agree to the **[Contributor License
-Agreement](CLA.md)** once, before their first PR can be merged.
+There is **no CLA to sign**. Aizen relies on the inbound=outbound rule in
+**[Section 5 of the Apache License 2.0](LICENSE)**:
 
-You don't sign anything by hand. The first time you open a PR, a bot comments with a link; you reply
-with the exact sentence it asks for, and your agreement is recorded. After that, all future PRs are
-covered automatically.
+> Unless You explicitly state otherwise, any Contribution intentionally submitted for inclusion in
+> the Work by You to the Licensor shall be under the terms and conditions of this License, without
+> any additional terms or conditions.
 
-In short, the CLA says: **you keep the copyright to your contribution, but you grant the maintainer a
-broad license to use it — including in the commercial edition.** Read [CLA.md](CLA.md) for the full
-text.
+In plain terms: **you keep the copyright to your contribution**, and by opening a PR you license it
+to the project under Apache-2.0 — the same license everyone else receives. That includes the patent
+grant in §3.
+
+We ask you to certify authorship with the
+[Developer Certificate of Origin](https://developercertificate.org/) by signing off each commit:
+
+```bash
+git commit -s -m "fix scrollbar drift"
+```
+
+That appends a `Signed-off-by:` line. It is a statement that you wrote the patch, or otherwise have
+the right to submit it under Apache-2.0.
+
+**Do not submit code you don't have the right to relicense** — no copy-paste from GPL/AGPL projects,
+no code owned by an employer without their permission, and no LLM output you haven't reviewed and
+can stand behind.
 
 ## Development setup
 
@@ -54,7 +67,7 @@ Requirements:
 4. Run `cargo test --bin aizen` and make sure it's **green**.
 5. Run `cargo fmt` and `cargo clippy` and clear anything you introduced.
 6. Commit with a clear message (imperative mood: "fix scrollbar drift", not "fixed stuff").
-7. Push and open a PR against `dawnofcd/aizen:main`. Fill in the PR template.
+7. Push and open a PR against `aizen-stack/aizen:main`. Fill in the PR template.
 
 ## What gets merged
 
@@ -63,7 +76,7 @@ Requirements:
 - ✅ Docs, comments, and test-coverage improvements.
 - ❌ Changes that add a C/native dependency or break the single-static-binary posture.
 - ❌ Large unsolicited rewrites or style-only churn across unrelated files.
-- ❌ Anything without the CLA agreed.
+- ❌ Code you don't have the right to license under Apache-2.0, or commits without a DCO sign-off.
 
 ## Reporting security issues
 

@@ -14,8 +14,8 @@ terminal — one that reads and edits your code, runs your shell, verifies its o
 
 <br/>
 
-[![Latest release](https://img.shields.io/github/v/release/dawnofcd/aizen?style=for-the-badge&label=release&color=6c5ce7)](https://github.com/dawnofcd/aizen/releases/latest)
-[![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm%20Noncommercial-00b894?style=for-the-badge)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/aizen-stack/aizen?style=for-the-badge&label=release&color=6c5ce7)](https://github.com/aizen-stack/aizen/releases/latest)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-00b894?style=for-the-badge)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-e17055?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 
 ![Windows](https://img.shields.io/badge/Windows-0078D6?style=flat-square&logo=windows&logoColor=white)
@@ -28,9 +28,9 @@ terminal — one that reads and edits your code, runs your shell, verifies its o
 
 ---
 
-> **This is the private source repo.** The command is **`aizen`**. The public download channel
-> (prebuilt binaries + install scripts) is generated from [`dist/`](dist/) — edit docs there for
-> what users see. This README is the full developer reference.
+> **Apache-2.0 licensed.** The command is **`aizen`**. This README is the full reference —
+> features, every command, the safety model, and how to self-host. Prebuilt binaries for Windows,
+> Linux, and macOS are on the [releases page](https://github.com/aizen-stack/aizen/releases/latest).
 
 
 
@@ -111,19 +111,19 @@ That's it — after `aizen config`, every command works with **zero env vars**. 
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/dawnofcd/aizen/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/aizen-stack/aizen/main/install.ps1 | iex
 ```
 
 ```bash
 # Linux / macOS
-curl -fsSL https://raw.githubusercontent.com/dawnofcd/aizen/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/aizen-stack/aizen/main/install.sh | sh
 ```
 
 Then open a new terminal and run `aizen config`. (Override the install dir with `$env:AIZEN_INSTALL`
 on Windows or `$AIZEN_INSTALL` on Unix. The Windows `.exe` is unsigned — if SmartScreen warns, choose
 *More info → Run anyway*.)
 
-**Or download a binary by hand** from the [latest release](https://github.com/dawnofcd/aizen/releases/latest):
+**Or download a binary by hand** from the [latest release](https://github.com/aizen-stack/aizen/releases/latest):
 
 | Platform | Asset |
 |---|---|
@@ -141,7 +141,7 @@ the next terminal you open.
 **Or build from source** (any platform with a Rust toolchain):
 
 ```bash
-cargo install --git https://github.com/dawnofcd/Aizen_agent   # → aizen on your PATH
+cargo install --git https://github.com/aizen-stack/aizen   # → aizen on your PATH
 # or, from a clone:
 cargo build --release      # → target/release/aizen (one static binary)
 cargo test                 # unit + harness tests (no network)
@@ -722,11 +722,15 @@ cron` schedules unattended runs (model pinned at create time). Outbound `notify`
 Slack / generic webhook) and the two-way bots are all managed from the **`/apps`** hub.
 
 ## License
-Aizen is **source-available**, not open source, under the
-[PolyForm Noncommercial License 1.0.0](LICENSE).
+Aizen is **open source** under the [Apache License 2.0](LICENSE).
 
-You may read, run, modify, and share the source **for any noncommercial purpose** — personal
-projects, study, research, and use by nonprofit/educational/government organizations. **Commercial
-use is not permitted** under this license.
+You may use, modify, and distribute it freely — including **commercially** — subject to the
+conditions in the license: keep the license and copyright notices, state your changes, and pass
+along the [NOTICE](NOTICE) file. The license also carries an **express patent grant** (§3), which
+terminates for anyone who initiates patent litigation over the Work.
 
-Want to use Aizen commercially? Reach out for a separate commercial license.
+"Aizen" and the Aizen logo are trademarks of the Aizen authors; per §6 the license does not grant
+trademark rights, so a fork must not present itself as Aizen.
+
+Releases up to and including **v0.5.5** were published under the PolyForm Noncommercial License
+1.0.0; everything from the relicensing commit onward is Apache-2.0.
