@@ -1,6 +1,6 @@
 <div align="center">
 
-<img width="400" height="400" alt="aizen" src="https://github.com/user-attachments/assets/4e38d4f9-29af-4a97-af0e-2c7dd7bdf697" />
+<img width="200" height="200" alt="aizen" src="https://github.com/user-attachments/assets/4e38d4f9-29af-4a97-af0e-2c7dd7bdf697" />
 
 ### The terminal-native coding agent that actually *lives* on your machine.
 
