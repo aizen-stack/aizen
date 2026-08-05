@@ -232,12 +232,19 @@ pub fn build_system_prompt_bundle(
 /// ~1.1K tokens saved per spawn, and personal facts never leak into task context) and NO
 /// `<agents>` / auto `<project_context>` (top-level-only concerns). `include_project_context`
 /// opts a role in explicitly — build/test conventions are exactly what coder/tester need.
+///
+/// `task` is the sub-agent's assignment, when the caller has it. A sub-agent is spawned for ONE
+/// stated job, and unlike the REPL it gets no cached prefix to amortize a broad index across turns —
+/// every spawn re-bills the whole prompt. So when the task is known, the index is narrowed to the
+/// procedures that actually cover it ([`crate::skills::gated_index`]); `None` keeps the full
+/// applicable list, which is the right default when there is nothing to narrow against.
 pub fn build_subagent_base_prompt(
     cwd: &str,
     os: &str,
     date: &str,
     model: &str,
     include_project_context: bool,
+    task: Option<&str>,
 ) -> String {
     let base = match prompt_tier_for(
         model,
@@ -252,7 +259,7 @@ pub fn build_subagent_base_prompt(
         "cwd: {cwd}\nos: {os}\ndate: {date}\nmodel: {model}\n"
     ));
     s.push_str("</environment>\n");
-    if let Some(idx) = crate::skills::prompt_index() {
+    if let Some(idx) = crate::skills::gated_index(task) {
         s.push_str("\n<skills>\n");
         s.push_str(&idx);
         s.push_str("\n</skills>\n");
@@ -398,6 +405,12 @@ pub struct AgentConfig {
     /// alongside `cancel`, so tool bodies read this turn's identity instead of whatever the driver
     /// thread last set process-globally. Delegated children inherit the parent's context.
     pub exec_ctx: crate::core::exec_ctx::ExecutionContext,
+    /// The directory this run's relative paths resolve against, and the repo whose writer lease is
+    /// taken before an edit. `None` ⇒ the process cwd (the REPL / one-shot CLI, where cwd IS the
+    /// project). Set per-lane by the `serve` daemon: lanes run concurrently, so a process-global cwd
+    /// would let one bot's `/cd` silently move another bot's edits — and, worse, make two lanes take
+    /// the writer lease on the same discovered root.
+    pub workspace_root: Option<std::path::PathBuf>,
     /// Suppress the stderr progress trace (tests set this).
     pub quiet: bool,
     /// Run a fast typecheck/build (cargo check / tsc) once after an editing run, before
@@ -558,6 +571,21 @@ pub struct AgentConfig {
     pub deadline: Option<std::time::Instant>,
 }
 
+impl AgentConfig {
+    /// The directory this run resolves relative paths against and takes its writer lease on:
+    /// `workspace_root` when a lane pinned one, else the process cwd. Canonicalized, because the
+    /// lease keys workspaces by identity — two spellings of one path must not read as two repos.
+    /// Falls back to `.` only when cwd itself is unreadable (a deleted directory), matching the
+    /// prior behaviour at every call site.
+    pub fn effective_root(&self) -> std::path::PathBuf {
+        self.workspace_root
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .and_then(|p| p.canonicalize().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    }
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -568,6 +596,7 @@ impl Default for AgentConfig {
             approval_mode: crate::core::approval::ApprovalMode::Ask,
             cancel: crate::core::cancel::TurnCancel::new(),
             exec_ctx: crate::core::exec_ctx::ExecutionContext::default(),
+            workspace_root: None,
             quiet: false,
             enable_verify_gate: true,
             verify_gate_timeout_secs: 90,
@@ -1428,10 +1457,9 @@ where
                 // the repo from the write target for exactly this reason — the gate must match, or it
                 // typechecks the wrong tree (or finds no manifest and skips verification silently).
                 // `verify_root` walks up from the edit dir to the nearest project manifest; falling
-                // back to cwd only when this run never named an edit path (e.g. shell-only edits).
-                let cwd = std::env::current_dir()
-                    .and_then(|p| p.canonicalize())
-                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                // back to this run's own root only when it never named an edit path (e.g. shell-only
+                // edits) — the lane's root under `serve`, the process cwd everywhere else.
+                let cwd = cfg.effective_root();
                 let gate_dir = last_edit_dir
                     .as_deref()
                     .and_then(verify_gate::verify_root)
@@ -2309,9 +2337,10 @@ async fn execute_calls(
                                         | crate::agent::tools::WorkspaceEffect::OpaqueWorkspace
                                 ) || tool.name() == "checkpoint_rewind")
                             {
-                                let cwd = std::env::current_dir()
-                                    .and_then(|p| p.canonicalize())
-                                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                                // The lane's own root, not the process cwd: `serve` runs lanes
+                                // concurrently, so a cwd read here would take the lease on whichever
+                                // directory another lane happened to be working in.
+                                let cwd = cfg.effective_root();
                                 // 15s, not 5: transient contention (another aizen instance, an
                                 // autosave, the parallel test suite) must WAIT, not fail the edit
                                 // with a lease error the user can't act on. Esc still interrupts —
@@ -2612,7 +2641,7 @@ fn gate_and_approve(
     if tool.is_destructive()
         && !cfg.approval_mode.approves_all()
         && !smart_allow
-        && !approve(tool.name(), args)
+        && !approve(tool.name(), args, cfg)
     {
         return Some("error: the user declined this action".to_string());
     }
@@ -2923,7 +2952,10 @@ fn subagent_target(args: &serde_json::Value) -> String {
 /// concurrently and silently. Only the first two fit on a line — `…` marks the rest, and `/workflows`
 /// lists them all.
 fn workflow_target(args: &serde_json::Value) -> String {
-    let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("fanout");
+    let mode = args
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("fanout");
     if mode == "verify" {
         let n = args
             .get("findings")
@@ -2951,7 +2983,11 @@ fn workflow_target(args: &serde_json::Value) -> String {
     if subjects.is_empty() {
         return head;
     }
-    let more = if tasks.len() > subjects.len() { ", …" } else { "" };
+    let more = if tasks.len() > subjects.len() {
+        ", …"
+    } else {
+        ""
+    };
     format!("{head}: {}{more}", subjects.join(", "))
 }
 
@@ -4247,7 +4283,10 @@ pub fn truncate_result(s: &str, max: usize) -> String {
 /// subsystem's `confirm_core`): scripts/CI never auto-run a destructive tool. EXCEPTION: under the
 /// `aizen serve` daemon (non-TTY but Telegram-connected), route the approval to the owner's phone
 /// (inline ✓/✗) instead of denying — this is the unattended "approve rm -rf from your phone" path.
-fn approve(tool: &str, args: &serde_json::Value) -> bool {
+///
+/// `cfg` supplies the LANE the prompt belongs to: `serve` runs lanes concurrently, so the reply must
+/// go back to the bot+chat that asked, not to whichever lane last wrote the process-global route.
+fn approve(tool: &str, args: &serde_json::Value, cfg: &AgentConfig) -> bool {
     use std::io::{IsTerminal, Write};
     crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::AwaitingApproval);
     struct RestorePhase;
@@ -4276,10 +4315,13 @@ fn approve(tool: &str, args: &serde_json::Value) -> bool {
         {
             let prompt = format!("{tool} {}", compact_args(args));
             // Bridge to the async approval on the current (multi-thread) runtime; the serve poll
-            // loop runs on another worker and delivers the callback.
+            // loop runs on another worker and delivers the callback. The route comes from THIS
+            // turn's context — under concurrent lanes the process-global one belongs to whoever
+            // started a turn most recently, which is not necessarily us.
+            let route = cfg.exec_ctx.approval_route();
             if let Some(v) = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(
-                    crate::hostbot::platforms::telegram::request_approval(&prompt),
+                    crate::hostbot::platforms::telegram::request_approval_on(&prompt, route),
                 )
             }) {
                 return v;
@@ -4486,6 +4528,64 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    // ── per-lane workspace root ────────────────────────────────────────────
+    #[test]
+    fn effective_root_falls_back_to_cwd_when_no_lane_pinned_one() {
+        // The REPL / one-shot CLI never sets `workspace_root`, and MUST keep resolving against the
+        // process cwd exactly as before this field existed.
+        let cfg = AgentConfig::default();
+        assert_eq!(cfg.workspace_root, None, "default pins no root");
+        let expected = std::env::current_dir()
+            .and_then(|p| p.canonicalize())
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        assert_eq!(cfg.effective_root(), expected);
+    }
+
+    #[test]
+    fn effective_root_prefers_the_lane_root_over_cwd() {
+        // The whole point under `serve`: two lanes run concurrently, so the root must come from the
+        // config the lane owns — never from a process-wide cwd another lane could have moved.
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp dir canonicalizes");
+        let cfg = AgentConfig {
+            workspace_root: Some(dir.clone()),
+            ..AgentConfig::default()
+        };
+        assert_eq!(cfg.effective_root(), dir);
+        assert_ne!(
+            cfg.effective_root(),
+            std::env::current_dir().unwrap().canonicalize().unwrap(),
+            "the lane root wins; cwd is the repo root while tests run"
+        );
+    }
+
+    #[test]
+    fn two_lane_configs_resolve_to_their_own_roots() {
+        // The failure this prevents: lane B taking the workspace writer lease on lane A's repo,
+        // where `HELD` reentrancy would hand it an EMPTY lease and let both write at once.
+        let a = std::env::temp_dir().canonicalize().unwrap();
+        let b = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let cfg_a = AgentConfig {
+            workspace_root: Some(a.clone()),
+            ..AgentConfig::default()
+        };
+        let cfg_b = AgentConfig {
+            workspace_root: Some(b.clone()),
+            ..AgentConfig::default()
+        };
+        assert_eq!(cfg_a.effective_root(), a);
+        assert_eq!(cfg_b.effective_root(), b);
+        assert_ne!(cfg_a.effective_root(), cfg_b.effective_root());
+    }
+
+    #[test]
+    fn a_default_config_carries_no_approval_route() {
+        // `approve` prefers the context route and falls back to the platform global. A default
+        // config must therefore not claim a lane, or a REPL prompt would try to answer on Telegram.
+        assert_eq!(AgentConfig::default().exec_ctx.approval_route(), None);
+    }
+
     // ── display: the ◆ call line + ⎿ result summary ─────────────────────────
     #[test]
     fn tool_call_line_shows_raw_name_then_target() {
@@ -4518,8 +4618,14 @@ mod tests {
             "task",
             &serde_json::json!({"prompt": "Investigate the retained render thread\nmore detail"}),
         );
-        assert!(t.contains("Investigate the retained render thread"), "{t:?}");
-        assert!(t.starts_with("coder"), "absent role defaults to coder: {t:?}");
+        assert!(
+            t.contains("Investigate the retained render thread"),
+            "{t:?}"
+        );
+        assert!(
+            t.starts_with("coder"),
+            "absent role defaults to coder: {t:?}"
+        );
         assert!(!t.contains("prompt"), "no arg-name leakage: {t:?}");
         assert!(!t.contains('{'), "no JSON dump: {t:?}");
     }
@@ -4539,7 +4645,10 @@ mod tests {
         );
         assert_eq!(t, "code-reviewer · check it");
         // Read-only vs write-capable is the one thing the WHO half carries; keep it.
-        let t = tool_target("task", &serde_json::json!({"prompt": "x", "role": "reviewer"}));
+        let t = tool_target(
+            "task",
+            &serde_json::json!({"prompt": "x", "role": "reviewer"}),
+        );
         assert!(t.starts_with("reviewer"), "{t:?}");
     }
 
@@ -4974,6 +5083,7 @@ mod tests {
             approval_mode: crate::core::approval::ApprovalMode::Ask,
             cancel: crate::core::cancel::TurnCancel::new(),
             exec_ctx: crate::core::exec_ctx::ExecutionContext::default(),
+            workspace_root: None,
             quiet: true,
             enable_verify_gate: false,
             verify_gate_timeout_secs: 90,
@@ -6235,9 +6345,10 @@ mod tests {
         // ending the run abandons work it declared unfinished. One bounded recovery turn is spent
         // demanding a different approach; if the run goes flat AGAIN, it stops for real.
         let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        todo::set(vec![
-            todo::Todo::new("still-open", todo::Status::InProgress),
-        ]);
+        todo::set(vec![todo::Todo::new(
+            "still-open",
+            todo::Status::InProgress,
+        )]);
         let r = registry();
         let c = AgentConfig {
             max_iters: 30,
@@ -9181,21 +9292,17 @@ mod tests {
         let root = std::env::temp_dir().join(format!("aizen-tlp-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        std::env::set_var("USERPROFILE", &root);
-        std::env::set_var("HOME", &root);
-        std::env::set_var("AIZEN_HOME", root.join(".aizen"));
-        std::env::set_var("AIZEN_HOME", root.join(".aizen"));
-        std::env::set_var("AIZEN_PROJECT_ROOT", root.join("proj"));
+        // RESTORE on drop, don't delete: clearing USERPROFILE/HOME leaves the process with no home,
+        // which silently disables every "stop below the user's home" guard for whatever test runs
+        // next. See `EnvGuard`.
+        let _env = crate::core::config::EnvGuard::set([
+            ("USERPROFILE", root.clone()),
+            ("HOME", root.clone()),
+            ("AIZEN_HOME", root.join(".aizen")),
+            ("AIZEN_PROJECT_ROOT", root.join("proj")),
+        ]);
         let out = f(&root);
-        for v in [
-            "USERPROFILE",
-            "HOME",
-            "AIZEN_HOME",
-            "AIZEN_HOME",
-            "AIZEN_PROJECT_ROOT",
-        ] {
-            std::env::remove_var(v);
-        }
+        drop(_env);
         let _ = std::fs::remove_dir_all(&root);
         out
     }
@@ -9234,7 +9341,7 @@ mod tests {
             response_visuals_prompt_block(crate::core::cli_config::ResponseVisuals::Off).is_none()
         );
 
-        let sub = build_subagent_base_prompt("/w", "linux", "2026-06-20", "m", false);
+        let sub = build_subagent_base_prompt("/w", "linux", "2026-06-20", "m", false, None);
         assert!(
             !sub.contains("<response_visuals"),
             "sub-agents must not pay the visual contract tax"

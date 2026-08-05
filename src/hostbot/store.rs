@@ -36,6 +36,10 @@ fn bots_path() -> PathBuf {
     hostbot_dir().join("bots.json")
 }
 
+fn lanes_path() -> PathBuf {
+    hostbot_dir().join("lanes.json")
+}
+
 // ── hosted bots (bots.json) ──────────────────────────────────────────────────────────
 
 /// One EXTRA bot hosted by the daemon (moved here from `cli_config::TelegramBot`). Each has its own
@@ -57,6 +61,121 @@ pub struct HostedBot {
     /// (the frozen core) stays global, so the owner's memory is shared, "driven by default".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
+    /// This bot answers to its OWN owner instead of inheriting the primary's allowlist.
+    ///
+    /// The default (`false`) is what a private-chat setup wants: a private chat id EQUALS the owner's
+    /// user id, identical across every bot they own, so inheriting is both correct and convenient.
+    /// Set `true` to hand a sub-bot to somebody else: it then boots with an empty allowlist in pairing
+    /// mode and only the chat that answers its code can drive it. Note what this does NOT change —
+    /// the bot still runs shell commands on THIS machine, so a paired stranger holds real power; it
+    /// exists so the *primary* owner's chats aren't also exposed on that bot.
+    #[serde(default)]
+    pub own_owner: bool,
+    /// Which host runs this bot, matched against `core::device` (hostname, or the stable device id).
+    /// `None` ⇒ any host may run it (the single-machine default, and what every existing file says).
+    /// Telegram allows exactly ONE `getUpdates` poller per token, so two machines starting the same
+    /// bot is not a redundancy win — it's a 409 fight. Naming the host is how a fleet divides them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+/// Per-lane settings — one entry per hosted-bot route, INCLUDING the primary `"default"`.
+///
+/// Why this is a separate file from `bots.json`: that file is identity (token, owner, persona) and is
+/// rewritten when bots are added or removed; this one is per-conversation *preferences* a chat
+/// changes constantly via `/cd`, `/model`, `/effort`. Keeping them apart means a `/cd` can never
+/// rewrite a token, and the primary bot — which has no `bots.json` entry at all — still gets lanes.
+///
+/// Every field is `None` ⇒ "inherit the process-wide config", so an absent file (every install before
+/// this feature) behaves exactly as it did when these commands wrote `cli-config.json` globally.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct LaneSettings {
+    /// Route this applies to (`"default"` for the primary bot).
+    pub route: String,
+    /// Working directory for this lane's agent + `/sh`. `None` ⇒ the process cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `low`|`medium`|`high`|`xhigh`|`max`, or `"off"` to send no effort field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ultimate: Option<bool>,
+}
+
+/// Load every lane's settings. Missing / corrupt file ⇒ `vec![]` (all lanes inherit the global config).
+pub fn load_lanes() -> Vec<LaneSettings> {
+    match std::fs::read_to_string(lanes_path()) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// One lane's settings, or an all-`None` default when it has never set anything.
+pub fn load_lane(route: &str) -> LaneSettings {
+    load_lanes()
+        .into_iter()
+        .find(|l| l.route == route)
+        .unwrap_or_else(|| LaneSettings {
+            route: route.to_string(),
+            ..LaneSettings::default()
+        })
+}
+
+/// Read-modify-write ONE lane under the store lock, creating its entry if absent. Locked because
+/// concurrent lanes each persist their own settings into the same file.
+pub fn update_lane<T>(
+    route: &str,
+    mutate: impl FnOnce(&mut LaneSettings) -> Result<T>,
+) -> Result<T> {
+    let path = lanes_path();
+    let lock_path = crate::core::workspace_txn::store_lock("hostbot", "lanes");
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        std::time::Duration::from_secs(5),
+    )?;
+    let mut lanes: Vec<LaneSettings> = match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    if !lanes.iter().any(|l| l.route == route) {
+        lanes.push(LaneSettings {
+            route: route.to_string(),
+            ..LaneSettings::default()
+        });
+    }
+    let entry = lanes
+        .iter_mut()
+        .find(|l| l.route == route)
+        .expect("just inserted");
+    let result = mutate(entry)?;
+    let json = serde_json::to_string_pretty(&lanes)?;
+    crate::core::persist::atomic_write_owner_only(&path, (json + "\n").as_bytes())?;
+    Ok(result)
+}
+
+/// Forget a lane's settings (a removed bot). Best-effort: a failure leaves a harmless stale entry
+/// that the next `update_lane` on that route would simply reuse.
+pub fn drop_lane(route: &str) {
+    let path = lanes_path();
+    let lock_path = crate::core::workspace_txn::store_lock("hostbot", "lanes");
+    let Ok(_lock) = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        std::time::Duration::from_secs(5),
+    ) else {
+        return;
+    };
+    let mut lanes: Vec<LaneSettings> = match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => return,
+    };
+    lanes.retain(|l| l.route != route);
+    if let Ok(json) = serde_json::to_string_pretty(&lanes) {
+        let _ = crate::core::persist::atomic_write_owner_only(&path, (json + "\n").as_bytes());
+    }
 }
 
 /// Load the hosted-bot list. A missing / unreadable / corrupt file → `vec![]` (never fails — a fresh
@@ -205,6 +324,47 @@ pub fn drop_route_sessions(platform: &str, route: &str) {
     }
 }
 
+/// Days a session file is kept after its last write before startup GC removes it.
+const SESSION_TTL_DAYS: u64 = 30;
+
+/// Remove session files untouched for `SESSION_TTL_DAYS`, returning how many were dropped.
+///
+/// A long-lived daemon accumulates one file per chat that ever messaged it, forever — each holding
+/// conversation text. This bounds both the directory and how long a stranger's message is retained.
+/// Best-effort and silent: `mtime` is unavailable on some filesystems, and a daemon must not fail to
+/// start over housekeeping. Override the window with `AIZEN_SESSION_TTL_DAYS` (`0` disables GC).
+pub fn gc_sessions() -> usize {
+    let days = std::env::var("AIZEN_SESSION_TTL_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(SESSION_TTL_DAYS);
+    if days == 0 {
+        return 0;
+    }
+    let max_age = std::time::Duration::from_secs(days * 24 * 60 * 60);
+    let Ok(entries) = std::fs::read_dir(sessions_dir()) else {
+        return 0;
+    };
+    let mut dropped = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(age) = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+        else {
+            continue; // unknown mtime (or a clock skew making it "in the future") ⇒ keep it
+        };
+        if age > max_age && std::fs::remove_file(&path).is_ok() {
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,12 +394,16 @@ mod tests {
                 token: Some("t1".into()),
                 allowed_chat_ids: vec![],
                 persona: None,
+                own_owner: false,
+                host: None,
             },
             HostedBot {
                 name: "ops".into(),
                 token: Some("t2".into()),
                 allowed_chat_ids: vec![7, 9],
                 persona: Some("Aria".into()),
+                own_owner: true,
+                host: Some("vps-2".into()),
             },
         ];
         save_bots(&bots).unwrap();
@@ -247,8 +411,164 @@ mod tests {
         assert_eq!(round.len(), 2);
         assert_eq!(round[0].name, "work");
         assert_eq!(round[0].persona, None);
+        assert!(!round[0].own_owner);
+        assert_eq!(round[0].host, None);
         assert_eq!(round[1].allowed_chat_ids, vec![7, 9]);
         assert_eq!(round[1].persona.as_deref(), Some("Aria"));
+        assert!(round[1].own_owner, "own_owner survives a round trip");
+        assert_eq!(round[1].host.as_deref(), Some("vps-2"));
+    }
+
+    #[test]
+    fn a_bots_file_written_before_these_fields_existed_still_loads() {
+        // Back-compat is the whole reason both new fields are `#[serde(default)]`: an install from
+        // before this change must keep hosting its bots, with the old inherit-the-owner behaviour.
+        let (_g, _home) = with_temp_home();
+        let legacy = r#"[{"name":"work","token":"t1","allowed_chat_ids":[5]}]"#;
+        std::fs::write(bots_path(), legacy).unwrap();
+        let round = load_bots();
+        assert_eq!(round.len(), 1, "legacy file parses");
+        assert_eq!(round[0].name, "work");
+        assert!(
+            !round[0].own_owner,
+            "absent own_owner means inherit, the pre-existing behaviour"
+        );
+        assert_eq!(
+            round[0].host, None,
+            "absent host means any machine may run it"
+        );
+    }
+
+    #[test]
+    fn a_lane_with_no_entry_inherits_everything() {
+        // No lanes.json (every install before this feature) ⇒ all-None ⇒ every command falls back to
+        // the process-wide config exactly as it did when these wrote `cli-config.json`.
+        let (_g, _home) = with_temp_home();
+        let lane = load_lane("default");
+        assert_eq!(lane.route, "default");
+        assert_eq!(lane.cwd, None);
+        assert_eq!(lane.model, None);
+        assert_eq!(lane.effort, None);
+        assert_eq!(lane.approval, None);
+        assert_eq!(lane.ultimate, None);
+    }
+
+    #[test]
+    fn lane_settings_are_per_route_and_do_not_bleed() {
+        // The bug this prevents: bot A's `/cd` moving bot B's working directory, which is what a
+        // process-wide `set_current_dir` did.
+        let (_g, _home) = with_temp_home();
+        update_lane("default", |l| {
+            l.cwd = Some(PathBuf::from("/srv/projA"));
+            l.model = Some("model-a".into());
+            Ok(())
+        })
+        .unwrap();
+        update_lane("work", |l| {
+            l.cwd = Some(PathBuf::from("/srv/projB"));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(load_lane("default").cwd, Some(PathBuf::from("/srv/projA")));
+        assert_eq!(load_lane("work").cwd, Some(PathBuf::from("/srv/projB")));
+        assert_eq!(
+            load_lane("work").model,
+            None,
+            "a model pinned on `default` must NOT apply to `work`"
+        );
+        assert_eq!(load_lanes().len(), 2);
+    }
+
+    #[test]
+    fn update_lane_edits_in_place_without_dropping_siblings() {
+        let (_g, _home) = with_temp_home();
+        update_lane("a", |l| {
+            l.model = Some("m1".into());
+            Ok(())
+        })
+        .unwrap();
+        update_lane("b", |l| {
+            l.model = Some("m2".into());
+            Ok(())
+        })
+        .unwrap();
+        update_lane("a", |l| {
+            l.effort = Some("max".into());
+            Ok(())
+        })
+        .unwrap();
+
+        let a = load_lane("a");
+        assert_eq!(a.model.as_deref(), Some("m1"), "existing field preserved");
+        assert_eq!(a.effort.as_deref(), Some("max"), "new field added");
+        assert_eq!(
+            load_lane("b").model.as_deref(),
+            Some("m2"),
+            "sibling intact"
+        );
+    }
+
+    #[test]
+    fn drop_lane_removes_only_that_route() {
+        let (_g, _home) = with_temp_home();
+        update_lane("keep", |l| {
+            l.model = Some("m".into());
+            Ok(())
+        })
+        .unwrap();
+        update_lane("gone", |l| {
+            l.model = Some("m".into());
+            Ok(())
+        })
+        .unwrap();
+        drop_lane("gone");
+        let lanes = load_lanes();
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].route, "keep");
+    }
+
+    #[test]
+    fn gc_keeps_fresh_sessions_and_can_be_disabled() {
+        // Files just written are far inside any retention window, so GC must not touch them — an
+        // over-eager sweep here silently erases live conversations.
+        let (_g, _home) = with_temp_home();
+        let msgs = vec![Message::user("hi")];
+        save_session("telegram", "default", "1", &msgs).unwrap();
+        save_session("telegram", "work", "2", &msgs).unwrap();
+        assert_eq!(gc_sessions(), 0, "fresh files survive");
+        assert_eq!(load_sessions("telegram").len(), 2);
+
+        // `0` disables GC entirely, for an operator who wants unbounded history.
+        std::env::set_var("AIZEN_SESSION_TTL_DAYS", "0");
+        assert_eq!(gc_sessions(), 0);
+        std::env::remove_var("AIZEN_SESSION_TTL_DAYS");
+        assert_eq!(
+            load_sessions("telegram").len(),
+            2,
+            "nothing was dropped either way"
+        );
+    }
+
+    #[test]
+    fn gc_drops_sessions_past_the_window() {
+        // A daemon running for months otherwise keeps one file per chat that ever messaged it,
+        // forever — each holding conversation text.
+        let (_g, _home) = with_temp_home();
+        save_session("telegram", "old", "9", &[Message::user("ancient")]).unwrap();
+        assert_eq!(load_sessions("telegram").len(), 1);
+        // A one-day window plus a backdated mtime is the portable way to test this without waiting.
+        std::env::set_var("AIZEN_SESSION_TTL_DAYS", "1");
+        let path = session_path("telegram", "old", "9");
+        let two_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60);
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_modified(two_days_ago).unwrap();
+        drop(f);
+
+        assert_eq!(gc_sessions(), 1, "the stale file was dropped");
+        assert!(load_sessions("telegram").is_empty());
+        std::env::remove_var("AIZEN_SESSION_TTL_DAYS");
     }
 
     #[test]

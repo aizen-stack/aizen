@@ -458,12 +458,7 @@ pub fn delete_home(slug: &str) -> Result<bool> {
 /// `aizen agents set-model` are the model-only surface and shouldn't have to spell out three
 /// nested options to say "leave the endpoint fields alone".
 pub fn set_model(slug: &str, model: Option<&str>) -> Result<PathBuf> {
-    set_endpoint(
-        slug,
-        Some(model.map(str::to_string)),
-        None,
-        None,
-    )
+    set_endpoint(slug, Some(model.map(str::to_string)), None, None)
 }
 
 /// Rewrite an installed agent card's endpoint frontmatter IN PLACE at its source path (so a project
@@ -675,21 +670,16 @@ mod tests {
         let root = std::env::temp_dir().join(format!("aizen-agents-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        std::env::set_var("USERPROFILE", &root);
-        std::env::set_var("HOME", &root);
-        std::env::set_var("AIZEN_HOME", root.join(".aizen"));
-        std::env::set_var("AIZEN_HOME", root.join(".aizen"));
-        std::env::set_var("AIZEN_PROJECT_ROOT", root.join("proj"));
+        // RESTORE on drop — deleting USERPROFILE/HOME disables home-boundary guards process-wide for
+        // whatever test runs next. See `EnvGuard`.
+        let _env = crate::core::config::EnvGuard::set([
+            ("USERPROFILE", root.clone()),
+            ("HOME", root.clone()),
+            ("AIZEN_HOME", root.join(".aizen")),
+            ("AIZEN_PROJECT_ROOT", root.join("proj")),
+        ]);
         let out = f(&root);
-        for v in [
-            "USERPROFILE",
-            "HOME",
-            "AIZEN_HOME",
-            "AIZEN_HOME",
-            "AIZEN_PROJECT_ROOT",
-        ] {
-            std::env::remove_var(v);
-        }
+        drop(_env);
         let _ = std::fs::remove_dir_all(&root);
         out
     }
@@ -1176,7 +1166,10 @@ mod tests {
             // The two endpoint fields must sit right after `model` in the canonical order — they
             // describe the same decision, and a card is read by humans.
             let raw = std::fs::read_to_string(&path).unwrap();
-            let at = |k: &str| raw.find(k).unwrap_or_else(|| panic!("{k} missing from {raw}"));
+            let at = |k: &str| {
+                raw.find(k)
+                    .unwrap_or_else(|| panic!("{k} missing from {raw}"))
+            };
             assert!(
                 at("model:") < at("base_url:") && at("base_url:") < at("api_key_ref:"),
                 "endpoint fields follow `model` in order, got:\n{raw}"

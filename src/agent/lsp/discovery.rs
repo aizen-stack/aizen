@@ -393,6 +393,10 @@ mod tests {
     fn no_manifest_anywhere_returns_none() {
         // A bare temp dir whose ancestors (…/Temp, …, C:\ or /) hold no Cargo.toml → no root → no
         // server. This is the "open at a generic/huge folder, index nothing" guarantee.
+        // Same cross-test home hazard as `detect_by_dir_and_by_file` — serialize on the same lock.
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = sandbox("none");
         assert!(resolve_workspace_root(&dir, &["Cargo.toml"]).is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -400,6 +404,13 @@ mod tests {
 
     #[test]
     fn detect_by_dir_and_by_file() {
+        // `is_forbidden_root` reads USERPROFILE/HOME at call time, and several suites elsewhere point
+        // those at their own sandbox while they run. Without this lock `detect` here can observe
+        // another test's home, mistake our temp root for it, and return None — a cross-test flake
+        // that only ever appeared in the full suite, never when this test ran alone.
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = sandbox("detect");
         std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
         let src = root.join("src");
@@ -462,6 +473,12 @@ mod tests {
 
     #[test]
     fn home_dir_is_forbidden() {
+        // Reads USERPROFILE/HOME twice — once here, once inside `is_forbidden_root` — so it must hold
+        // the env lock: another suite repointing home between the two reads made this fail
+        // intermittently in full runs. Same hazard as `detect_by_dir_and_by_file`.
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(home) = home_dir() {
             if home.exists() {
                 assert!(

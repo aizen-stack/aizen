@@ -15,26 +15,49 @@
 //! `ExecutionContext` for the turn, seeds it into the thread-local inside the same closure that seeds
 //! the cancel token, and [`crate::core::convo::active()`] prefers it over the process-global slot.
 //!
-//! # Migration scaffold (plan P1-A)
+//! # What lives here, and what deliberately does not
 //!
-//! The context currently carries only the conversation id — the sole cross-hop reader today. Persona
-//! override, per-turn reasoning-effort, and the Telegram approval route are also per-turn state, but
-//! they are read on the DRIVER thread that sets them (not inside a tool body), so moving them here is
-//! defense-in-depth against future turn interleaving rather than a live fix. They migrate onto this
-//! struct field-by-field: add the field, seed it at the turn boundary, and switch the corresponding
-//! accessor to prefer [`current`] before its process-global — never a big-bang cutover.
+//! The context carries per-turn facts whose reader would otherwise have to consult a process-global:
+//! the conversation id (read by the browser session registry inside a tool body) and the approval
+//! route (read by the approval gate on the driver). Both are read far from where they are set.
+//!
+//! Two other per-turn facts are deliberately NOT here, because they already have a direct owner and a
+//! second copy would just be a second source of truth to keep in sync:
+//!   * the workspace root → `AgentConfig::workspace_root`, read via `AgentConfig::effective_root`;
+//!   * the reasoning-effort tier → passed explicitly to `client::chat_with_tools_effort`.
+//!
+//! How to READ each field, which differs by where the code runs:
+//!   * inside a tool body (`spawn_blocking` worker) → [`current`], seeded by the executor;
+//!   * on the driver (the approval gate) → through `AgentConfig::exec_ctx`, because the driver never
+//!     pushes itself onto the thread-local stack.
+//!
+//! Every field is `Option`: `None` means "no per-turn override — fall back to the process-global /
+//! config value", which is exactly what the REPL and one-shot CLI paths want.
 
 use crate::core::convo::ConversationId;
 use std::cell::RefCell;
 use std::sync::Arc;
 
+/// Where a destructive-op approval prompt for THIS turn should be delivered: the hosted-bot route
+/// (sub-bot name) and the platform chat id, rendered as a string so this stays platform-agnostic
+/// (Telegram `i64`, Discord `u64`). The Telegram platform maps `route` back to that bot's token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRoute {
+    pub route: String,
+    pub chat: String,
+}
+
 /// Immutable per-turn identity. Cheap to clone (one `Arc` bump); shared by a top-level turn and every
 /// delegated sub-agent that inherits it.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Inner {
     /// The conversation this turn serves — a REPL session slug, or a `serve`
     /// `platform:route:chat` triple. Scopes per-conversation resources (the browser session).
-    conversation: ConversationId,
+    conversation: Option<ConversationId>,
+    /// Persona this turn speaks as, layered over the global `config.persona`. `None` ⇒ the global one.
+    persona: Option<String>,
+    /// Where an approval prompt goes this turn. `None` ⇒ the platform's process-global fallback.
+    approval_route: Option<ApprovalRoute>,
 }
 
 /// Cloneable handle to one turn's execution context. Threaded through [`crate::agent::AgentConfig`]
@@ -45,12 +68,54 @@ pub struct ExecutionContext(Arc<Inner>);
 impl ExecutionContext {
     /// Build a context for a turn serving `conversation`.
     pub fn new(conversation: ConversationId) -> Self {
-        Self(Arc::new(Inner { conversation }))
+        Self(Arc::new(Inner {
+            conversation: Some(conversation),
+            ..Inner::default()
+        }))
     }
 
-    /// The conversation this turn serves.
+    /// The conversation this turn serves. Read by `convo::active()`, which the browser session
+    /// registry consults — hence the same `cfg` gate that module carries.
+    #[cfg(any(feature = "browser", test))]
     pub fn conversation(&self) -> ConversationId {
-        self.0.conversation.clone()
+        self.0
+            .conversation
+            .clone()
+            .unwrap_or_else(|| ConversationId::new("default"))
+    }
+
+    // ── per-turn overrides ────────────────────────────────────────────────────────────
+    //
+    // Builders take `self` and return a new `Arc` rather than mutating: the context is shared with
+    // already-spawned tool bodies, so an in-place edit would retroactively change a running turn's
+    // view. Chain them at the turn boundary, before the context is handed to `AgentConfig`.
+
+    fn with(&self, f: impl FnOnce(&mut Inner)) -> Self {
+        let mut next = Inner {
+            conversation: self.0.conversation.clone(),
+            persona: self.0.persona.clone(),
+            approval_route: self.0.approval_route.clone(),
+        };
+        f(&mut next);
+        Self(Arc::new(next))
+    }
+
+    /// Pin the persona this turn speaks as (`None` ⇒ fall back to the global `config.persona`).
+    pub fn with_persona(&self, persona: Option<String>) -> Self {
+        self.with(|i| i.persona = persona)
+    }
+    /// The turn's persona override, if any.
+    pub fn persona(&self) -> Option<String> {
+        self.0.persona.clone()
+    }
+
+    /// Pin where an approval prompt for this turn is delivered.
+    pub fn with_approval_route(&self, route: Option<ApprovalRoute>) -> Self {
+        self.with(|i| i.approval_route = route)
+    }
+    /// The turn's approval route, if any.
+    pub fn approval_route(&self) -> Option<ApprovalRoute> {
+        self.0.approval_route.clone()
     }
 }
 
@@ -133,5 +198,72 @@ mod tests {
             current().is_none(),
             "outer context popped after the outermost scope"
         );
+    }
+
+    #[test]
+    fn a_fresh_context_carries_no_overrides() {
+        // Every per-turn field defaults to "no override" so the REPL / one-shot CLI keeps reading
+        // its process-global exactly as before. This is what makes P0 a no-behavior-change change.
+        let ctx = ExecutionContext::new(ConversationId::new("repl:main"));
+        assert_eq!(ctx.persona(), None);
+        assert_eq!(ctx.approval_route(), None);
+    }
+
+    #[test]
+    fn each_override_round_trips_and_leaves_the_others_alone() {
+        let base = ExecutionContext::new(ConversationId::new("telegram:work:7"));
+        let ctx = base
+            .with_persona(Some("Aria".into()))
+            .with_approval_route(Some(ApprovalRoute {
+                route: "work".into(),
+                chat: "7".into(),
+            }));
+
+        assert_eq!(ctx.persona().as_deref(), Some("Aria"));
+        assert_eq!(ctx.approval_route().unwrap().route, "work");
+        assert_eq!(ctx.approval_route().unwrap().chat, "7");
+        // Chaining must not drop the identity the whole context is keyed on.
+        assert_eq!(ctx.conversation().as_str(), "telegram:work:7");
+    }
+
+    #[test]
+    fn a_builder_does_not_mutate_the_context_already_handed_out() {
+        // The context is shared with tool bodies that may already be running. A builder returns a
+        // NEW Arc, so a later override can't retroactively change a turn in flight.
+        let original = ExecutionContext::new(ConversationId::new("repl:main"));
+        let derived = original.with_persona(Some("Aria".into()));
+        assert_eq!(original.persona(), None, "original is untouched");
+        assert_eq!(derived.persona().as_deref(), Some("Aria"));
+    }
+
+    #[test]
+    fn two_lane_contexts_stay_independent_on_one_thread() {
+        // The concurrency case this whole module exists for: two hosted-bot lanes must never read
+        // each other's approval route, or one bot's ✓/✗ prompt lands in the other bot's chat.
+        let a = ExecutionContext::new(ConversationId::new("telegram:default:1"))
+            .with_approval_route(Some(ApprovalRoute {
+                route: "default".into(),
+                chat: "1".into(),
+            }));
+        let b = ExecutionContext::new(ConversationId::new("telegram:work:2")).with_approval_route(
+            Some(ApprovalRoute {
+                route: "work".into(),
+                chat: "2".into(),
+            }),
+        );
+        with_current(a.clone(), || {
+            assert_eq!(
+                current().unwrap().approval_route().unwrap().route,
+                "default"
+            );
+            with_current(b.clone(), || {
+                assert_eq!(current().unwrap().approval_route().unwrap().route, "work");
+            });
+            assert_eq!(
+                current().unwrap().approval_route().unwrap().route,
+                "default",
+                "lane A's route is restored when lane B's scope ends"
+            );
+        });
     }
 }

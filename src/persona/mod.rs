@@ -140,7 +140,18 @@ pub fn load(name: &str) -> Option<Persona> {
     None
 }
 
+/// Where a replaced persona card or a retired character's self-memory goes.
+pub fn archive_dir() -> PathBuf {
+    personas_dir().join(".archive")
+}
+
 /// Create or overwrite a persona; returns the file path.
+///
+/// An overwrite ARCHIVES the previous card first. `save` is reachable from `persona_create` (which
+/// documents itself as "create or overwrite") and from `/persona → New`, so before this a re-created
+/// character silently destroyed the old card — the one write path in the three subsystems with no
+/// recoverable trace. `.archive` holds a directory, and `read_dir_personas` only reads `*.md`
+/// directly under `personas_dir`, so archived cards never re-appear in `list()`.
 pub fn save(name: &str, role: &str, voice: &str, body: &str) -> Result<PathBuf> {
     let name = name.trim();
     if name.is_empty() {
@@ -166,22 +177,94 @@ pub fn save(name: &str, role: &str, voice: &str, body: &str) -> Result<PathBuf> 
         &lock_path,
         std::time::Duration::from_secs(5),
     )?;
+    // Inside the lock: the check and the move must not race another writer of the same card.
+    if path.exists() {
+        let adir = archive_dir();
+        if std::fs::create_dir_all(&adir).is_ok() {
+            // `unique_in` suffixes on collision, so each successive overwrite keeps its own copy
+            // instead of the newest one flattening the history.
+            let dest = crate::memory::bloat::caps::unique_in(&adir, &sanitize_name(name));
+            let _ = std::fs::rename(&path, &dest);
+        }
+    }
     crate::core::persist::atomic_write_owner_only(&path, text.as_bytes())?;
     Ok(path)
 }
 
-/// Delete a persona by name (and its self-memory directory). `Ok(true)` if a file was removed.
+/// Retired persona cards, for a restore picker.
+pub fn list_archive() -> Vec<Persona> {
+    let mut out = read_dir_personas(&archive_dir());
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Bring a retired persona card back. A collision is an error — the name is the key `config.persona`
+/// and the self-memory directory are both keyed on.
+pub fn restore(name: &str) -> Result<PathBuf> {
+    let slug = sanitize_name(name);
+    let src = archive_dir().join(format!("{slug}.md"));
+    if !src.exists() {
+        bail!("no retired persona '{name}' to restore");
+    }
+    let dest = path_for(name);
+    if dest.exists() {
+        bail!(
+            "a live persona named '{name}' already exists ({}) — rename or delete it first",
+            dest.display()
+        );
+    }
+    std::fs::create_dir_all(personas_dir())?;
+    std::fs::rename(&src, &dest).with_context(|| format!("restoring {}", src.display()))?;
+    Ok(dest)
+}
+
+/// Delete a persona by name (and archive its self-memory). `Ok(true)` if a card was removed.
+///
+/// The character's accumulated experience follows it out of the live set — but is ARCHIVED, not
+/// erased. `self_mem::prune` already archives evicted items rather than deleting them, so a
+/// `remove_dir_all` here was the harshest path in a subsystem that is otherwise recoverable
+/// throughout: dozens of turns of episodes and reflected insights, gone on one menu keystroke.
 pub fn delete(name: &str) -> Result<bool> {
+    let slug = sanitize_name(name);
     let p = path_for(name);
     let removed_card = if p.exists() {
-        std::fs::remove_file(&p).with_context(|| format!("removing {}", p.display()))?;
+        let adir = archive_dir();
+        if std::fs::create_dir_all(&adir).is_ok() {
+            let dest = crate::memory::bloat::caps::unique_in(&adir, &slug);
+            let _ = std::fs::rename(&p, &dest);
+        }
+        // Fall back to a plain remove only if archiving could not take the file.
+        if p.exists() {
+            std::fs::remove_file(&p).with_context(|| format!("removing {}", p.display()))?;
+        }
         true
     } else {
         false
     };
-    // The character is gone → its accumulated experience goes with it.
-    let _ = std::fs::remove_dir_all(self_mem::self_dir(&sanitize_name(name)));
+    archive_self_mem(&slug);
     Ok(removed_card)
+}
+
+/// Move a character's whole self-memory dir aside instead of deleting it. Best-effort: a character
+/// with no self-memory (or an un-renameable dir) is not an error — the card is what `delete` is
+/// about.
+fn archive_self_mem(slug: &str) {
+    let src = self_mem::self_dir(slug);
+    if !src.exists() {
+        return;
+    }
+    let adir = archive_dir();
+    if std::fs::create_dir_all(&adir).is_err() {
+        return;
+    }
+    let mut dest = adir.join(format!("{slug}.self"));
+    for n in 2..10_000 {
+        if !dest.exists() {
+            break;
+        }
+        dest = adir.join(format!("{slug}-{n}.self"));
+    }
+    let _ = std::fs::rename(&src, &dest);
 }
 
 /// A per-turn persona override, layered OVER the global `config.persona`. The host-bot daemon
@@ -194,18 +277,55 @@ pub fn delete(name: &str) -> Result<bool> {
 /// core) stays global, so memory is always the primary agent's, never per-bot.
 static PERSONA_OVERRIDE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
-/// Pin (or clear with `None`) the per-turn persona override. Called by the serve daemon around each
-/// turn; `None` restores the global `config.persona`.
+/// Pin (or clear with `None`) the process-global persona override.
+///
+/// PREFER [`with_override`], which scopes the override to one synchronous block and restores the
+/// prior value. This bare setter leaves the override armed until someone clears it, which under the
+/// `serve` daemon's concurrent lanes means the NEXT lane to build a prompt inherits it. Kept for
+/// tests, which drive it deterministically on one thread.
+#[cfg(test)]
 pub fn set_override(name: Option<String>) {
     *PERSONA_OVERRIDE.lock().unwrap() = name;
 }
 
-/// The effective persona name: the per-turn override wins over the global `config.persona`.
+/// The effective persona name, most specific first: this turn's execution context (set per lane),
+/// then the process-global per-turn override, then the global `config.persona`.
 fn effective_name() -> Option<String> {
+    if let Some(name) = crate::core::exec_ctx::current().and_then(|c| c.persona()) {
+        return Some(name);
+    }
     if let Some(name) = PERSONA_OVERRIDE.lock().unwrap().clone() {
         return Some(name);
     }
     crate::core::cli_config::load().persona
+}
+
+/// Serializes [`with_override`] so two concurrent lanes can't interleave set → build → restore.
+static OVERRIDE_GATE: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+/// Run a SYNCHRONOUS closure with `name` as the active persona, restoring the prior value after.
+///
+/// Why not the thread-local [`crate::core::exec_ctx`]: system-prompt assembly runs on a lane's async
+/// driver, and a tokio task may migrate between worker threads across an `.await` — a thread-local
+/// pinned before one await is not guaranteed to be visible after it. So the driver path pins the
+/// process-global instead and holds `OVERRIDE_GATE` for the whole (fast, allocation-only) build, which
+/// makes set → read → restore atomic with respect to other lanes.
+///
+/// `f` must not await, and must not itself call this function (the gate is not reentrant).
+pub fn with_override<T>(name: Option<String>, f: impl FnOnce() -> T) -> T {
+    let _gate = OVERRIDE_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    let prior = PERSONA_OVERRIDE.lock().unwrap().clone();
+    *PERSONA_OVERRIDE.lock().unwrap() = name;
+    // Restore even if `f` panics: a poisoned persona override would silently mis-voice every later
+    // turn in the process, which is far worse than the panic itself.
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            *PERSONA_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = self.0.take();
+        }
+    }
+    let _restore = Restore(prior);
+    f()
 }
 
 /// The currently-active persona (per-turn override, else config `persona = "<name>"`), if loadable.
@@ -303,6 +423,57 @@ mod tests {
     }
 
     #[test]
+    fn with_override_restores_the_prior_value() {
+        with_home("scoped-override", || {
+            set_override(None);
+            assert_eq!(effective_name(), None, "no persona configured in temp home");
+            let seen = with_override(Some("Aria".into()), effective_name);
+            assert_eq!(seen.as_deref(), Some("Aria"), "override visible inside");
+            assert_eq!(
+                effective_name(),
+                None,
+                "restored on exit — a lane must not leave its persona armed for the next turn"
+            );
+        });
+    }
+
+    #[test]
+    fn with_override_restores_even_on_panic() {
+        // A panic inside prompt assembly must not leave the process mis-voiced for every later turn.
+        with_home("panic-override", || {
+            set_override(Some("Base".into()));
+            let r = std::panic::catch_unwind(|| {
+                with_override(Some("Aria".into()), || panic!("boom"));
+            });
+            assert!(r.is_err(), "the panic propagated");
+            assert_eq!(
+                effective_name().as_deref(),
+                Some("Base"),
+                "the Drop guard restored the prior override"
+            );
+            set_override(None);
+        });
+    }
+
+    #[test]
+    fn sequential_overrides_do_not_bleed_into_each_other() {
+        // Two lanes taking the gate one after the other: neither may see the other's persona.
+        // (Not nested — `with_override` holds a non-reentrant gate, so nesting would deadlock.)
+        with_home("sequential-override", || {
+            set_override(None);
+            assert_eq!(
+                with_override(Some("LaneA".into()), effective_name).as_deref(),
+                Some("LaneA")
+            );
+            assert_eq!(
+                with_override(Some("LaneB".into()), effective_name).as_deref(),
+                Some("LaneB")
+            );
+            assert_eq!(effective_name(), None, "both released the override");
+        });
+    }
+
+    #[test]
     fn save_load_round_trip() {
         with_home("rt", || {
             save(
@@ -317,6 +488,55 @@ mod tests {
             assert_eq!(p.role, "a sharp mentor");
             assert_eq!(p.voice, "concise, warm");
             assert_eq!(p.body, "You value clarity.");
+        });
+    }
+
+    /// `save` is create-OR-OVERWRITE and is reachable from `persona_create`, so an overwrite used to
+    /// destroy the previous card outright — the only write path in memory/skill/persona with no
+    /// recoverable trace. Each overwrite now keeps its own archived copy.
+    #[test]
+    fn overwriting_a_persona_archives_the_previous_card() {
+        with_home("perarch", || {
+            save("Aria", "a mentor", "warm", "v1 body").unwrap();
+            save("Aria", "a coach", "blunt", "v2 body").unwrap();
+
+            assert_eq!(load("Aria").unwrap().body, "v2 body", "live card is newest");
+            let arch = list_archive();
+            assert_eq!(arch.len(), 1, "the replaced card is kept");
+            assert_eq!(arch[0].body, "v1 body");
+            assert_eq!(arch[0].role, "a mentor", "full frontmatter survives");
+            assert_eq!(list().len(), 1, "archived cards never re-enter list()");
+
+            // A third save keeps BOTH earlier copies rather than flattening them.
+            save("Aria", "a guide", "calm", "v3 body").unwrap();
+            assert_eq!(list_archive().len(), 2);
+        });
+    }
+
+    /// Deleting a character archives its self-memory instead of `remove_dir_all`-ing it. `prune`
+    /// already archived evicted items, so a hard cascade here was the harshest path in an otherwise
+    /// recoverable subsystem — dozens of turns of episodes gone on one keystroke.
+    #[test]
+    fn deleting_a_persona_archives_its_self_memory() {
+        with_home("perdel", || {
+            save("Kira", "an engineer", "direct", "Kira body").unwrap();
+            self_mem::save_insight("kira", "I should verify before claiming", 9).unwrap();
+            assert_eq!(self_mem::counts("kira").1, 1, "insight written");
+
+            assert!(delete("Kira").unwrap());
+            assert!(load("Kira").is_none(), "card left the live set");
+            assert_eq!(
+                self_mem::counts("kira"),
+                (0, 0),
+                "self-memory left the live set too"
+            );
+            assert!(
+                archive_dir().join("kira.self").is_dir(),
+                "…but is archived, not erased"
+            );
+            // The card itself is restorable.
+            restore("Kira").unwrap();
+            assert_eq!(load("Kira").unwrap().body, "Kira body");
         });
     }
 

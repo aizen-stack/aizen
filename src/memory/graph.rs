@@ -190,6 +190,29 @@ pub fn record_coretrieval(ids: &[&str], today: &str) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// Namespace prefix for a skill node. Memory ids come from [`crate::memory::store::slugify`], which
+/// emits only `[a-z0-9-]`, so a `:` can never appear in one — the prefix is collision-proof by
+/// construction, and an older `graph.tsv` (whose rows are all bare memory ids) keeps loading
+/// unchanged. Verified against a real store: 0 of 243 ids and 0 of 189 edge endpoints contain `:`.
+pub const SKILL_PREFIX: &str = "skill:";
+/// Namespace prefix for a persona self-memory node (insight or episode).
+pub const PERSONA_PREFIX: &str = "persona:";
+
+/// Graph node id for a skill, keyed on the same sanitized name `skill_load` resolves on.
+pub fn node_skill(name: &str) -> String {
+    format!("{SKILL_PREFIX}{}", crate::skills::sanitize_name(name))
+}
+
+/// Graph node id for one persona self-memory item.
+pub fn node_persona(persona_slug: &str, item_id: &str) -> String {
+    format!("{PERSONA_PREFIX}{persona_slug}/{item_id}")
+}
+
+/// Whether `id` is a plain memory-fact node (no namespace prefix).
+fn is_memory_node(id: &str) -> bool {
+    !id.contains(':')
+}
+
 /// The strongest current associations of `id`: neighbor ids ranked by *effective* (decayed) edge
 /// weight, best first, capped at `k`. Edges whose decayed weight has faded below `floor` are
 /// excluded so a long-dead link never resurfaces. Empty when the fact has no live associations.
@@ -226,16 +249,41 @@ pub fn neighbors(id: &str, today: &str, k: usize, floor: f64) -> Vec<(String, f6
     out
 }
 
-/// Drop every edge with an endpoint not in `live` (a fact was hard-deleted / never existed). Called
+/// Neighbors of `id` restricted to one namespace — e.g. "which SKILLS co-fire with this fact?".
+///
+/// This is the read side of the cross-kind link: the facts recalled for the current turn name the
+/// skills that historically mattered alongside them, which is a different and better question than
+/// "which skill is used most overall".
+pub fn neighbors_of_kind(
+    id: &str,
+    prefix: &str,
+    today: &str,
+    k: usize,
+    floor: f64,
+) -> Vec<(String, f64)> {
+    // Ask for more than `k` before filtering: the top-k overall may be all one kind.
+    let mut out: Vec<(String, f64)> = neighbors(id, today, k.saturating_mul(8).max(32), floor)
+        .into_iter()
+        .filter(|(n, _)| n.starts_with(prefix))
+        .collect();
+    out.truncate(k);
+    out
+}
+
+/// Drop every edge with a dangling MEMORY endpoint (a fact was hard-deleted / never existed). Called
 /// from the maintenance pass so the graph can't accumulate dangling links to gone facts. Returns
 /// how many edges were pruned. No-op (and no write) when nothing dangles.
+///
+/// Namespaced endpoints (`skill:`, `persona:`) are NOT checked against `live` — that set holds memory
+/// ids only, so treating a skill node as dangling would delete every cross-kind edge on the first
+/// maintenance pass, silently undoing the link the moment it was built. Those namespaces own their
+/// own lifecycles (a retired skill is archived, not erased, and may be restored under the same name),
+/// so an unresolvable one simply fades by decay like any unused edge.
 pub fn prune(live: &HashSet<String>, today: &str) -> anyhow::Result<usize> {
     let edges = load();
     let before = edges.len();
-    let kept: Vec<Edge> = edges
-        .into_iter()
-        .filter(|e| live.contains(&e.a) && live.contains(&e.b))
-        .collect();
+    let ok = |id: &String| !is_memory_node(id) || live.contains(id);
+    let kept: Vec<Edge> = edges.into_iter().filter(|e| ok(&e.a) && ok(&e.b)).collect();
     let pruned = before - kept.len();
     if pruned > 0 {
         save(kept, today)?;
@@ -363,6 +411,79 @@ mod tests {
             assert_eq!(n[0].0, "b");
             // idempotent: nothing left to prune
             assert_eq!(prune(&live, "2026-07-01").unwrap(), 0);
+        });
+    }
+
+    /// Cross-kind nodes must survive the maintenance pass. `live` holds MEMORY ids only, so checking
+    /// a `skill:`/`persona:` endpoint against it would delete every cross-kind edge on the first
+    /// prune — silently undoing the link the moment it was built. This is the regression that would
+    /// make the whole feature look like it "just doesn't work" a day later.
+    #[test]
+    fn prune_keeps_namespaced_endpoints_it_cannot_resolve() {
+        with_temp_home("prunens", || {
+            record_coretrieval(&["a", "b"], "2026-07-01").unwrap();
+            record_coretrieval(&[&node_skill("Win Build"), "a"], "2026-07-01").unwrap();
+            record_coretrieval(&[&node_persona("kira", "in-x"), "a"], "2026-07-01").unwrap();
+            record_coretrieval(&["a", "gone"], "2026-07-01").unwrap();
+
+            let live: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+            // Only the dangling MEMORY edge goes.
+            assert_eq!(prune(&live, "2026-07-01").unwrap(), 1);
+
+            let skills = neighbors_of_kind("a", SKILL_PREFIX, "2026-07-01", 5, 0.0);
+            assert_eq!(skills.len(), 1, "skill edge survived prune");
+            assert_eq!(skills[0].0, "skill:win-build");
+            let personas = neighbors_of_kind("a", PERSONA_PREFIX, "2026-07-01", 5, 0.0);
+            assert_eq!(personas.len(), 1, "persona edge survived prune");
+            assert_eq!(personas[0].0, "persona:kira/in-x");
+            assert_eq!(prune(&live, "2026-07-01").unwrap(), 0, "idempotent");
+        });
+    }
+
+    /// The namespace cannot collide with a memory id: `slugify` emits only `[a-z0-9-]`, so a `:` is
+    /// unreachable there. That is what lets an older `graph.tsv` (all bare ids) load unchanged.
+    #[test]
+    fn namespaced_nodes_can_never_look_like_a_memory_id() {
+        for raw in [
+            "Win Build",
+            "skill:already",
+            "  spaces  ",
+            "Ké Hoạch",
+            "a/b\\c",
+            "",
+        ] {
+            let n = node_skill(raw);
+            assert!(n.starts_with(SKILL_PREFIX));
+            assert!(!is_memory_node(&n), "{n} must not read as a memory id");
+            // A memory id built from the same text never contains ':'.
+            assert!(
+                !crate::memory::store::slugify(raw).contains(':'),
+                "slugify must stay collision-free"
+            );
+        }
+        assert!(is_memory_node("prefers-pnpm"), "plain ids stay plain");
+    }
+
+    /// `neighbors_of_kind` must not be starved by a top-k that is all one kind — the whole point is
+    /// answering "which SKILLS relate to this fact" even when many facts rank above them.
+    #[test]
+    fn kind_filter_looks_past_the_plain_top_k() {
+        with_temp_home("kindfilter", || {
+            // 30 fact-fact co-fires on "seed", each stronger than the single skill edge.
+            for i in 0..30 {
+                for d in ["2026-07-01", "2026-07-02", "2026-07-03"] {
+                    record_coretrieval(&["seed", &format!("f{i}")], d).unwrap();
+                }
+            }
+            record_coretrieval(&["seed", &node_skill("rare")], "2026-07-03").unwrap();
+
+            // The plain top-3 is all facts…
+            let top = neighbors("seed", "2026-07-03", 3, 0.0);
+            assert!(top.iter().all(|(n, _)| is_memory_node(n)));
+            // …yet the skill is still findable.
+            let sk = neighbors_of_kind("seed", SKILL_PREFIX, "2026-07-03", 3, 0.0);
+            assert_eq!(sk.len(), 1, "skill edge must not be crowded out");
+            assert_eq!(sk[0].0, "skill:rare");
         });
     }
 

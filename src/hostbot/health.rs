@@ -72,9 +72,34 @@ pub struct Heartbeat {
     /// Which chat platform this daemon hosts (`telegram` / `discord`).
     #[serde(default)]
     pub platform: String,
+    /// Which MACHINE wrote it — the hostname label, plus the stable device id. A fleet's heartbeats
+    /// often land in a shared or synced home directory, where a bare pid says nothing about whose
+    /// daemon it describes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device: String,
+    /// Lanes live / mid-turn when this was written (see `hostbot::lane`). Informational: the verdict
+    /// still turns on `state`, but "busy 900s · 3 lanes" is what makes a slow daemon diagnosable.
+    #[serde(default)]
+    pub lanes: usize,
+    #[serde(default)]
+    pub busy_lanes: usize,
 }
 
-/// `~/.aizen/hostbot/heartbeat.json`. Same 0700 dir as the bot tokens and sessions.
+/// `~/.aizen/hostbot/heartbeat-{platform}.json`. Per platform because one machine can host BOTH a
+/// Telegram and a Discord daemon: they used to share a single file and overwrite each other, so
+/// `--health` reported whichever wrote last regardless of which one the probe meant.
+pub fn heartbeat_path_for(platform: &str) -> PathBuf {
+    let slug: String = platform
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    super::store::hostbot_dir().join(format!("heartbeat-{slug}.json"))
+}
+
+/// The pre-split path. Still READ (so a probe keeps working across an upgrade, and a daemon from an
+/// older binary is still visible), never written.
 pub fn heartbeat_path() -> PathBuf {
     super::store::hostbot_dir().join("heartbeat.json")
 }
@@ -108,8 +133,13 @@ fn env_secs(var: &str) -> Option<u64> {
 /// write a health file. `since` is carried forward while the state is unchanged, so a `busy` record
 /// keeps pointing at when the turn actually started.
 pub fn beat(platform: &str, state: State) {
+    beat_lanes(platform, state, 0, 0)
+}
+
+/// As [`beat`], recording how many lanes exist and how many are mid-turn.
+pub fn beat_lanes(platform: &str, state: State, lanes: usize, busy_lanes: usize) {
     let now = now_secs();
-    let since = match read() {
+    let since = match read_for(platform) {
         Some(prev) if prev.state == state.as_str() && prev.pid == std::process::id() => {
             if prev.since == 0 {
                 now
@@ -119,28 +149,55 @@ pub fn beat(platform: &str, state: State) {
         }
         _ => now,
     };
+    let dev = crate::core::device::current();
     let hb = Heartbeat {
         ts: now,
         since,
         state: state.as_str().to_string(),
         pid: std::process::id(),
         platform: platform.to_string(),
+        host: dev.label.clone(),
+        device: dev.id.clone(),
+        lanes,
+        busy_lanes,
     };
     if let Ok(bytes) = serde_json::to_vec_pretty(&hb) {
-        let _ = crate::core::persist::atomic_write_owner_only(&heartbeat_path(), &bytes);
+        let _ =
+            crate::core::persist::atomic_write_owner_only(&heartbeat_path_for(platform), &bytes);
     }
 }
 
-/// Read the record, or `None` when absent/corrupt (no daemon has run, or it's mid-write).
+/// Read this platform's record, falling back to the pre-split shared file so a probe still sees a
+/// daemon started by an older binary during a rolling upgrade.
+pub fn read_for(platform: &str) -> Option<Heartbeat> {
+    if let Some(hb) = read_path(&heartbeat_path_for(platform)) {
+        return Some(hb);
+    }
+    read_path(&heartbeat_path()).filter(|hb| hb.platform.is_empty() || hb.platform == platform)
+}
+
+/// Read whichever record exists — used by `--health` with no platform named.
 pub fn read() -> Option<Heartbeat> {
-    let s = std::fs::read_to_string(heartbeat_path()).ok()?;
+    for p in ["telegram", "discord"] {
+        if let Some(hb) = read_path(&heartbeat_path_for(p)) {
+            return Some(hb);
+        }
+    }
+    read_path(&heartbeat_path())
+}
+
+fn read_path(path: &std::path::Path) -> Option<Heartbeat> {
+    let s = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&s).ok()
 }
 
-/// Remove the record on a clean exit, so a stopped daemon reads as "not running" rather than as a
-/// stale live one. Best-effort.
+/// Remove this platform's record on a clean exit, plus the legacy shared one a daemon that upgraded
+/// mid-life may have left behind (a probe reading it would report a daemon that no longer exists).
 pub fn clear() {
     let _ = std::fs::remove_file(heartbeat_path());
+    for p in ["telegram", "discord"] {
+        let _ = std::fs::remove_file(heartbeat_path_for(p));
+    }
 }
 
 impl Heartbeat {
@@ -152,7 +209,8 @@ impl Heartbeat {
         let age = now.saturating_sub(self.ts);
         match self.state.as_str() {
             "busy" => {
-                let running = now.saturating_sub(if self.since == 0 { self.ts } else { self.since });
+                let running =
+                    now.saturating_sub(if self.since == 0 { self.ts } else { self.since });
                 if running > max_busy {
                     Err(format!(
                         "busy on one turn for {running}s (limit {max_busy}s) — pid {} looks wedged",
@@ -203,9 +261,27 @@ pub fn run_health_check() -> bool {
             } else {
                 hb.platform.clone()
             };
+            // Name the machine in a fleet: several boxes each run a daemon, and "UNHEALTHY" is only
+            // actionable if you know which one it is.
+            let where_ = if hb.host.is_empty() {
+                String::new()
+            } else {
+                format!(" on {}", hb.host)
+            };
+            let lanes = if hb.lanes > 0 {
+                format!(" · {} lane(s), {} busy", hb.lanes, hb.busy_lanes)
+            } else {
+                String::new()
+            };
             match hb.verdict(now_secs(), max_idle_secs(), max_busy_secs()) {
-                Ok(msg) => (format!("aizen serve [{platform}] healthy — {msg}"), true),
-                Err(msg) => (format!("aizen serve [{platform}] UNHEALTHY — {msg}"), false),
+                Ok(msg) => (
+                    format!("aizen serve [{platform}]{where_} healthy — {msg}{lanes}"),
+                    true,
+                ),
+                Err(msg) => (
+                    format!("aizen serve [{platform}]{where_} UNHEALTHY — {msg}{lanes}"),
+                    false,
+                ),
             }
         }
     };
@@ -228,6 +304,10 @@ mod tests {
             state: state.to_string(),
             pid: 4242,
             platform: "telegram".into(),
+            host: "test-host".into(),
+            device: "dev-0000".into(),
+            lanes: 0,
+            busy_lanes: 0,
         }
     }
 
@@ -251,7 +331,10 @@ mod tests {
         );
         let err = h.verdict(3000, 90, 1800).unwrap_err();
         assert!(err.contains("wedged"), "{err}");
-        assert!(err.contains("2000s"), "reports how long it's been stuck: {err}");
+        assert!(
+            err.contains("2000s"),
+            "reports how long it's been stuck: {err}"
+        );
     }
 
     #[test]
@@ -288,8 +371,14 @@ mod tests {
         // A rolling upgrade can have an OLD binary probing a NEW daemon. Guessing "dead" there would
         // restart a healthy pod, so an unrecognized state is judged on plain freshness.
         let h = hb("draining", 1000, 1000);
-        assert!(h.verdict(1100, 90, 1800).is_ok(), "unknown but fresh → pass");
-        assert!(h.verdict(9000, 90, 1800).is_err(), "unknown and ancient → fail");
+        assert!(
+            h.verdict(1100, 90, 1800).is_ok(),
+            "unknown but fresh → pass"
+        );
+        assert!(
+            h.verdict(9000, 90, 1800).is_err(),
+            "unknown and ancient → fail"
+        );
     }
 
     #[test]
@@ -322,6 +411,87 @@ mod tests {
 
         clear();
         assert!(read().is_none(), "clear() makes it read as not running");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn two_platforms_on_one_machine_do_not_overwrite_each_other() {
+        // They used to share ONE file, so `--health` reported whichever daemon wrote last — a
+        // Telegram daemon's verdict could be answered by the Discord daemon's record.
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("aizen-hb-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AIZEN_HOME", &tmp);
+
+        beat("telegram", State::Busy);
+        beat("discord", State::Idle);
+        assert_eq!(read_for("telegram").unwrap().state, "busy");
+        assert_eq!(read_for("discord").unwrap().state, "idle");
+        assert_ne!(
+            heartbeat_path_for("telegram"),
+            heartbeat_path_for("discord"),
+            "each platform gets its own file"
+        );
+
+        clear();
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_legacy_shared_heartbeat_is_still_readable_after_upgrade() {
+        // Rolling upgrade: the running daemon is an OLD binary that wrote `heartbeat.json`, while the
+        // probe is the NEW binary. Failing to read it would report a healthy daemon as absent.
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("aizen-hb-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AIZEN_HOME", &tmp);
+
+        // Exactly the shape an older binary wrote — no host/device/lane fields at all.
+        let legacy = r#"{"ts":1000,"since":1000,"state":"idle","pid":7,"platform":"telegram"}"#;
+        std::fs::create_dir_all(heartbeat_path().parent().unwrap()).unwrap();
+        std::fs::write(heartbeat_path(), legacy).unwrap();
+
+        let hb = read_for("telegram").expect("legacy record is found");
+        assert_eq!(hb.pid, 7);
+        assert_eq!(hb.state, "idle");
+        assert_eq!(
+            hb.host, "",
+            "absent field defaults, does not fail the parse"
+        );
+        assert_eq!(hb.lanes, 0);
+
+        clear();
+        assert!(read().is_none(), "clear() removes the legacy file too");
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn beat_lanes_records_the_lane_counts_and_the_machine() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("aizen-hb-lanes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AIZEN_HOME", &tmp);
+
+        beat_lanes("telegram", State::Busy, 5, 2);
+        let hb = read_for("telegram").unwrap();
+        assert_eq!(hb.lanes, 5);
+        assert_eq!(hb.busy_lanes, 2);
+        assert!(!hb.host.is_empty(), "the machine identifies itself");
+        assert!(!hb.device.is_empty());
+
+        clear();
+        std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

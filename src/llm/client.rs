@@ -311,7 +311,10 @@ async fn check_endpoint_with_deadline(
         // to anyone, so a corrupted key sails through validation and only fails on the first real
         // turn. When we have a key, confirm it on the endpoint that enforces auth.
         if let Some(k) = api_key {
-            let probe_model = infos.first().map(|m| m.id.as_str()).unwrap_or("gpt-4o-mini");
+            let probe_model = infos
+                .first()
+                .map(|m| m.id.as_str())
+                .unwrap_or("gpt-4o-mini");
             if let Some(detail) =
                 chat_auth_rejection(client, base_url, k, probe_model, probe_deadline).await
             {
@@ -889,6 +892,29 @@ pub async fn chat_with_tools(
     messages: &[Message],
     tools: &[ToolDef],
 ) -> Result<ChatTurn> {
+    let effort = crate::core::cli_config::resolved_reasoning_effort(
+        crate::core::cli_config::load().reasoning_effort,
+    );
+    chat_with_tools_effort(client, base_url, api_key, model, messages, tools, effort).await
+}
+
+/// `chat_with_tools` with the `reasoning_effort` decided by the CALLER rather than read from the
+/// process-global override.
+///
+/// Concurrent `serve` lanes each carry their own effort tier: reading the global here would stamp
+/// whichever lane armed it last onto every in-flight request. The two-level `Option` matches
+/// [`crate::core::cli_config::resolved_reasoning_effort`] — `None` omits the field entirely, keeping
+/// the request byte-identical for providers that reject it.
+#[allow(clippy::option_option, clippy::too_many_arguments)]
+pub async fn chat_with_tools_effort(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    effort: Option<String>,
+) -> Result<ChatTurn> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let cfg = crate::core::cli_config::load();
     let mut msgs = messages.to_vec();
@@ -913,9 +939,7 @@ pub async fn chat_with_tools(
         },
         parallel_tool_calls: if tools.is_empty() { None } else { Some(true) },
         stream_options: None, // non-streaming responses carry `usage` natively
-        reasoning_effort: crate::core::cli_config::resolved_reasoning_effort(
-            cfg.reasoning_effort.clone(),
-        ),
+        reasoning_effort: effort,
     };
 
     let resp = send_chat(client, &url, api_key, body).await?;
@@ -1885,7 +1909,12 @@ mod tests {
         // slot rather than pouring back into slot 0 (which corrupted slot 0's JSON and left call #2
         // argument-less).
         let mut acc = ToolCallAccumulator::default();
-        acc.ingest(&[delta(0, Some("a"), Some("file_read"), Some(r#"{"path":"a.rs"}"#))]);
+        acc.ingest(&[delta(
+            0,
+            Some("a"),
+            Some("file_read"),
+            Some(r#"{"path":"a.rs"}"#),
+        )]);
         acc.ingest(&[delta(0, Some("b"), Some("web_fetch"), Some(""))]);
         acc.ingest(&[delta(0, None, None, Some(r#"{"url":"#))]);
         acc.ingest(&[delta(0, None, None, Some(r#""https://x.dev"}"#))]);
@@ -1902,7 +1931,12 @@ mod tests {
     fn accumulator_still_completes_when_args_are_whole() {
         // The eager fast path must survive the tightening: whole arguments + a later slot ⇒ complete.
         let mut acc = ToolCallAccumulator::default();
-        acc.ingest(&[delta(0, Some("a"), Some("file_read"), Some(r#"{"path":"x.rs"}"#))]);
+        acc.ingest(&[delta(
+            0,
+            Some("a"),
+            Some("file_read"),
+            Some(r#"{"path":"x.rs"}"#),
+        )]);
         let done = acc.ingest(&[delta(1, Some("b"), Some("file_glob"), Some("{}"))]);
         assert_eq!(done.len(), 1, "a complete call still dispatches early");
         assert_eq!(done[0].1.function.arguments, r#"{"path":"x.rs"}"#);
@@ -2075,7 +2109,10 @@ mod tests {
     /// A one-request-per-connection stub gateway. `models_status`/`chat_status` let a test model the
     /// shape that actually bit us: a gateway that serves `/models` to anyone but enforces auth on
     /// `/chat/completions`.
-    async fn stub_gateway(models_status: u16, chat_status: u16) -> (String, tokio::task::JoinHandle<()>) {
+    async fn stub_gateway(
+        models_status: u16,
+        chat_status: u16,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -2089,7 +2126,10 @@ mod tests {
                 let req = String::from_utf8_lossy(&buf[..n]).to_string();
                 let (status, body) = if req.contains("/chat/completions") {
                     match chat_status {
-                        200 => (200, r#"{"choices":[{"message":{"content":"ok"}}]}"#.to_string()),
+                        200 => (
+                            200,
+                            r#"{"choices":[{"message":{"content":"ok"}}]}"#.to_string(),
+                        ),
                         c => (c, r#"{"error":{"message":"Invalid API key"}}"#.to_string()),
                     }
                 } else {
@@ -2132,7 +2172,9 @@ mod tests {
         let got = check_endpoint(&http, &base, Some("sk-good")).await;
         srv.abort();
         match got {
-            EndpointCheck::Ok(infos) => assert_eq!(infos.len(), 1, "the model list is carried back"),
+            EndpointCheck::Ok(infos) => {
+                assert_eq!(infos.len(), 1, "the model list is carried back")
+            }
             other => panic!("expected Ok, got {other:?}"),
         }
     }

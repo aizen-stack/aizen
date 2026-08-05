@@ -13,6 +13,73 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 pub(crate) static TEST_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Set env vars for a test and RESTORE their prior values on drop.
+///
+/// The obvious teardown — `remove_var` for each key — is wrong for `USERPROFILE`/`HOME`, and the bug
+/// it caused was subtle enough to hunt twice. Several helpers point those at a sandbox and then
+/// delete them, so after the first such test the process has NO home at all. Code that treats "no
+/// home" as "no home boundary" then loses its guard: `lsp::discovery::is_forbidden_root` returns
+/// false for every directory, so a walk that should stop below the user profile climbs past it and
+/// claims whatever manifest sits there. That produced a failure in an unrelated test, in a different
+/// module, only in a full parallel run — and pointed the blame at a stray `~/package.json` rather
+/// than at the teardown.
+///
+/// Restoring the prior value (including "was absent") keeps a test's mutation from outliving it.
+#[cfg(test)]
+pub(crate) struct EnvGuard {
+    saved: Vec<(String, Option<std::ffi::OsString>)>,
+}
+
+#[cfg(test)]
+impl EnvGuard {
+    /// Snapshot `keys`, then apply `set`. Keys in `set` need not appear in `keys`.
+    pub(crate) fn set<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        let mut saved = Vec::new();
+        for (k, v) in vars {
+            let key = k.as_ref().to_string_lossy().to_string();
+            if !saved.iter().any(|(s, _): &(String, _)| *s == key) {
+                saved.push((key, std::env::var_os(k.as_ref())));
+            }
+            std::env::set_var(k.as_ref(), v.as_ref());
+        }
+        Self { saved }
+    }
+
+    /// Snapshot `keys` and remove them, restoring on drop. For tests that need a var ABSENT.
+    pub(crate) fn unset<I, K>(keys: I) -> Self
+    where
+        I: IntoIterator<Item = K>,
+        K: AsRef<std::ffi::OsStr>,
+    {
+        let mut saved = Vec::new();
+        for k in keys {
+            saved.push((
+                k.as_ref().to_string_lossy().to_string(),
+                std::env::var_os(k.as_ref()),
+            ));
+            std::env::remove_var(k.as_ref());
+        }
+        Self { saved }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (k, v) in self.saved.drain(..) {
+            match v {
+                Some(val) => std::env::set_var(&k, val),
+                None => std::env::remove_var(&k),
+            }
+        }
+    }
+}
+
 /// Resolve the home root: `AIZEN_HOME` (legacy `AIZEN_HOME`) else `USERPROFILE`/`HOME`/cwd +
 /// `/.aizen`. When no env override is set, a pre-rebrand `~/.aizen` is migrated to `~/.aizen`
 /// on first use (atomic same-parent rename) so memory/personas/soul/config carry over. The fn
@@ -141,6 +208,15 @@ pub fn graph_disabled() -> bool {
 /// the corpus), but *reading* it into results waits until the bench proves net recall value.
 pub fn graph_expand_enabled() -> bool {
     !graph_disabled() && env_flag("AIZEN_GRAPH_EXPAND")
+}
+
+/// Opt-IN switch for ranking the always-on `<skills>` index by graph affinity to the facts recalled
+/// this turn — i.e. "which procedure historically fired alongside what we're talking about now",
+/// instead of "which procedure is used most overall". Default OFF for the same reason as
+/// [`graph_expand_enabled`]: the cross-kind edges are always recorded, but letting them reorder what
+/// the model sees waits until a bench shows it beats the plain usage ordering.
+pub fn skill_graph_rank_enabled() -> bool {
+    !graph_disabled() && env_flag("AIZEN_SKILL_GRAPH_RANK")
 }
 
 /// FNV-1a 64-bit — tiny local hash for the project-slug stable key (core must not depend on

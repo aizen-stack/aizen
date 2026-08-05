@@ -2,14 +2,21 @@
 //!
 //! `aizen serve` (Telegram) and `aizen discord serve` (Discord) each run ONE platform per process, so
 //! the daemon is generic over `P: Platform` and monomorphized per platform — no `dyn`, no `async-trait`
-//! dep (plain AFIT, stable since Rust 1.75). Adding WhatsApp/Slack/Matrix later = one new file under
-//! `platforms/` that `impl Platform`, plus a one-line `pub mod`. The daemon loop never changes.
+//! dep. Adding WhatsApp/Slack/Matrix later = one new file under `platforms/` that `impl Platform`.
+//!
+//! Async methods are written as `-> impl Future<Output = …> + Send` (RPITIT) rather than `async fn`,
+//! because the daemon `tokio::spawn`s one task PER CONVERSATION: a plain `async fn` in a trait makes
+//! no `Send` promise, so its future can't cross a task boundary. Implementors write
+//! `fn f(&self, …) -> impl Future<…> + Send { async move { … } }`; the `+ Send` is the whole point and
+//! must not be dropped — doing so breaks every lane spawn with an error pointing at the daemon rather
+//! than at the platform that caused it.
 //!
 //! Platform-specific powers (inline approval buttons, multi-bot hosting) are trait methods with a
 //! default "unsupported" impl: Telegram overrides them, Discord inherits the defaults, and the shared
 //! command dispatcher gates on `supports_*` so `/addbot` is naturally Telegram-only.
 
 use anyhow::{bail, Result};
+use std::future::Future;
 use tokio::sync::mpsc::Sender;
 
 /// One rendered reply piece. Rich platforms also carry a content-equivalent plain fallback.
@@ -49,11 +56,13 @@ pub struct BotInfo {
     pub name: String,
     pub username: String,
     pub chats: usize,
+    /// Free-text health note, shown only when it isn't the normal state — e.g. a 409 conflict from a
+    /// second machine polling the same token. `None` ⇒ nothing to report.
+    pub note: Option<String>,
 }
 
 /// The contract a chat platform fulfils to be hosted by the daemon. `Send + Sync + 'static` so it can
-/// live in an `Arc` shared with spawned listener tasks.
-#[allow(async_fn_in_trait)] // generic (monomorphized) use only — no dyn, so no Send-bound footgun.
+/// live in an `Arc` shared with spawned listener tasks and with one task per conversation.
 pub trait Platform: Send + Sync + 'static {
     /// The platform's chat/channel id type (Telegram `i64`, Discord `u64`). `Display`/`FromStr` let the
     /// session store round-trip it through a self-describing JSON file (no id type baked into a path).
@@ -74,7 +83,7 @@ pub trait Platform: Send + Sync + 'static {
 
     /// Spawn the listener(s) (poll loop / gateway). Each allowed inbound message → `tx`. Returns once
     /// listeners are launched (they run in the background); an error means the platform can't start.
-    async fn start(&self, tx: Sender<Inbound<Self::Chat>>) -> Result<()>;
+    fn start(&self, tx: Sender<Inbound<Self::Chat>>) -> impl Future<Output = Result<()>> + Send;
 
     /// Render a reply for this platform. Discord/plain platforms inherit this unformatted default.
     fn render_reply(&self, raw: &str) -> Vec<Outbound> {
@@ -82,31 +91,40 @@ pub trait Platform: Send + Sync + 'static {
     }
 
     /// Send a rendered piece. Rich platforms override this to select parse mode + fail-open fallback.
-    async fn send_outbound(
+    fn send_outbound(
         &self,
         route: &str,
         chat: Self::Chat,
         outbound: &Outbound,
-    ) -> Result<()> {
-        self.send(route, chat, &outbound.text).await
+    ) -> impl Future<Output = Result<()>> + Send {
+        async move { self.send(route, chat, &outbound.text).await }
     }
 
     /// Start/finish one ephemeral working message. Unsupported platforms inherit no-op lifecycle.
-    async fn start_status(&self, _route: &str, _chat: Self::Chat) -> Result<Option<StatusHandle>> {
-        Ok(None)
+    fn start_status(
+        &self,
+        _route: &str,
+        _chat: Self::Chat,
+    ) -> impl Future<Output = Result<Option<StatusHandle>>> + Send {
+        async { Ok(None) }
     }
-    async fn finish_status(
+    fn finish_status(
         &self,
         _route: &str,
         _chat: Self::Chat,
         _status: Option<StatusHandle>,
         _failed: bool,
-    ) -> Result<()> {
-        Ok(())
+    ) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
     }
 
     /// Send a reply on sub-bot `route` to `chat`.
-    async fn send(&self, route: &str, chat: Self::Chat, text: &str) -> Result<()>;
+    fn send(
+        &self,
+        route: &str,
+        chat: Self::Chat,
+        text: &str,
+    ) -> impl Future<Output = Result<()>> + Send;
 
     // ── optional capabilities (Discord inherits the "no" defaults) ──────────────────────────────
 
@@ -125,17 +143,22 @@ pub trait Platform: Send + Sync + 'static {
         false
     }
     /// Validate `token`, persist + hot-spawn a new bot on `route`=`name`. Returns its @username.
-    async fn add_bot(
+    ///
+    /// `own_owner`: pair the bot with its OWN owner rather than inheriting the primary's allowlist —
+    /// what you want when handing a bot to somebody else. Note it still runs commands on this
+    /// machine, so its owner holds real power; the flag only keeps the primary's chats off it.
+    fn add_bot(
         &self,
         _name: &str,
         _token: &str,
+        _own_owner: bool,
         _tx: &Sender<Inbound<Self::Chat>>,
-    ) -> Result<String> {
-        bail!("hosting extra bots is only supported on Telegram")
+    ) -> impl Future<Output = Result<String>> + Send {
+        async { bail!("hosting extra bots is only supported on Telegram") }
     }
     /// Stop + forget a hosted bot.
-    async fn remove_bot(&self, _name: &str) -> Result<()> {
-        bail!("hosting extra bots is only supported on Telegram")
+    fn remove_bot(&self, _name: &str) -> impl Future<Output = Result<()>> + Send {
+        async { bail!("hosting extra bots is only supported on Telegram") }
     }
     /// Snapshot of currently hosted bots (for `/bots`).
     fn list_bots(&self) -> Vec<BotInfo> {

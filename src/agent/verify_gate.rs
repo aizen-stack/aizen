@@ -567,12 +567,34 @@ mod tests {
 
     #[test]
     fn verify_root_is_none_when_no_ancestor_has_a_manifest() {
+        // `verify_root` walks to the filesystem root, so this cannot be asserted against a real temp
+        // dir: on Windows the temp dir lives UNDER the user profile, and one stray `package.json` in
+        // `~` (a mislanded `npm install` will do it) makes every such walk succeed. The test would
+        // then fail for a reason that has nothing to do with the code — as it did here.
+        //
+        // Assert the contract on a tree we fully own instead: `start` and every ancestor up to a
+        // directory we created, with no manifest anywhere in it. That still exercises the climb and
+        // the `parent()?` termination, without depending on what sits in the user's home.
         let d = temp_dir("walkup-none");
         let sub = d.join("a").join("b");
         std::fs::create_dir_all(&sub).unwrap();
-        // Nothing from `sub` up to the filesystem root carries a manifest we recognize. (temp dirs
-        // themselves never do, so this walks to `/` and returns None.)
-        assert_eq!(verify_root(&sub), None);
+        // No manifest between `sub` and `d`: every level in between must decline to claim the root.
+        for level in [sub.as_path(), sub.parent().unwrap()] {
+            let found = verify_root(level);
+            assert!(
+                found.as_deref() != Some(level),
+                "a manifest-less dir must not claim itself as the verify root: {}",
+                level.display()
+            );
+        }
+        // And a manifest placed at the top of our own tree is what the walk should find — proving the
+        // climb works, which is the half of the contract that can be tested hermetically.
+        std::fs::write(d.join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        assert_eq!(
+            verify_root(&sub).map(|p| p.canonicalize().unwrap()),
+            Some(d.canonicalize().unwrap()),
+            "the nearest manifest-bearing ancestor wins"
+        );
     }
 
     #[test]

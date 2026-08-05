@@ -534,7 +534,7 @@ an actionable error, not a crash.
 ### `aizen memory` — the self-learning brain
 ```bash
 aizen memory add "prefer-pnpm" -t feedback -b "I prefer pnpm over npm"
-aizen memory list
+aizen memory list [current|global|project|<zone>]   # narrow a long listing to one workspace view
 aizen memory search "package manager" [--dimension tooling]
 aizen memory profile [--json]      # derived preferences rollup (verbosity/tooling/stack/…)
 aizen memory ask "which package manager should I use?"   # abstains rather than guessing

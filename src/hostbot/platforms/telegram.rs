@@ -326,12 +326,41 @@ pub fn parse_callback(data: &str) -> Option<(String, bool)> {
     }
 }
 
+/// Resolve a hosted bot's token by route name — how an `ExecutionContext`-carried approval route
+/// (which is platform-agnostic: `route` + a `Display`ed chat id) becomes a client. `None` when no
+/// daemon is running or the route names a bot that isn't hosted.
+fn token_for_route(route: &str) -> Option<String> {
+    let ctl = bot_control()?;
+    let bots = ctl.bots.lock().unwrap();
+    bots.get(route).map(|h| h.token.clone())
+}
+
 /// Ask the owner to approve something via Telegram. `Some(approved)` if Telegram handled it,
 /// `None` if not configured / no allowed chat. Deny on 5-minute timeout.
 pub async fn request_approval(prompt: &str) -> Option<bool> {
-    // Multi-bot serve pins the originating bot's (token, chat) so the approval returns to the SAME
-    // bot the request came from; otherwise fall back to the primary `configured()` bot.
-    let route = APPROVAL_ROUTE.lock().unwrap().clone();
+    request_approval_on(prompt, None).await
+}
+
+/// Ask for approval, delivering the prompt to an EXPLICIT lane when one is given.
+///
+/// Route resolution, most specific first:
+///   1. `lane` — the turn's own `(route, chat)` from its `ExecutionContext`. Authoritative under
+///      concurrent lanes, where the process-global slot belongs to whichever turn started last.
+///   2. `APPROVAL_ROUTE` — the serial daemon's per-turn pin (still correct when only one turn runs).
+///   3. the primary `configured()` bot — standalone `aizen agent`, no daemon.
+pub async fn request_approval_on(
+    prompt: &str,
+    lane: Option<crate::core::exec_ctx::ApprovalRoute>,
+) -> Option<bool> {
+    let explicit = lane.and_then(|l| {
+        let chat = l.chat.parse::<i64>().ok()?;
+        let token = token_for_route(&l.route)?;
+        Some((token, chat))
+    });
+    let route = match explicit {
+        Some(pair) => Some(pair),
+        None => APPROVAL_ROUTE.lock().unwrap().clone(),
+    };
     let (client, chat) = match route {
         Some((token, chat)) => (Client::new(token).ok()?, chat),
         None => {
@@ -510,6 +539,32 @@ impl Tool for TelegramAsk {
 /// short-lived + code-gated rather than "whoever messages first".
 const PAIRING_TIMEOUT_SECS: u64 = 600;
 
+/// Consecutive 409s before we call it a conflict rather than a restart overlap. One or two are normal
+/// when a daemon restarts (the old poller's long-poll is still draining); a third means a real fight.
+const CONFLICT_WARN_AFTER: u32 = 3;
+const CONFLICT_BACKOFF_BASE_SECS: u64 = 3;
+const CONFLICT_BACKOFF_MAX_SECS: u64 = 30;
+
+/// What a hosted bot's poller is currently doing — surfaced by `/bots` so a token being fought over
+/// by two machines is VISIBLE rather than an endless line in a log nobody reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BotState {
+    /// Polling normally.
+    #[default]
+    Live,
+    /// Losing a `getUpdates` race — another process (usually another machine) owns this token.
+    Conflict,
+}
+
+impl BotState {
+    pub fn label(self) -> &'static str {
+        match self {
+            BotState::Live => "live",
+            BotState::Conflict => "CONFLICT (another process polls this token)",
+        }
+    }
+}
+
 /// One hosted Telegram bot. `poll` is its `getUpdates` task — aborted on shutdown or `/rmbot`.
 /// `allowed` is shared (`Arc<Mutex>`) so pairing can add the owner live without respawning the loop.
 struct BotHandle {
@@ -520,6 +575,8 @@ struct BotHandle {
     /// Per-bot character. `None` (the primary "default", or an un-personad extra) ⇒ the global
     /// `config.persona` / the user's own agent identity. Only the `<persona>`/`<self>` blocks differ.
     persona: Option<String>,
+    /// Shared with the poll loop so `/bots` can report a live 409 fight.
+    state: Arc<Mutex<BotState>>,
     poll: JoinHandle<()>,
 }
 
@@ -548,13 +605,34 @@ pub struct TelegramPlatform {
     primary_token: String,
     /// The slash-command menu to publish (owned copy of the daemon's `SERVE_COMMANDS`).
     menu: Vec<(String, String)>,
+    /// Extra bots this process should host (`serve --bots a,b`). Empty ⇒ all of them that this host
+    /// is allowed to run. Lets a fleet split bots across machines without editing `bots.json` per box.
+    wanted: Vec<String>,
+}
+
+/// Does a bot pinned to `host` belong on THIS machine? `None` ⇒ unpinned, runs anywhere (the
+/// single-machine default). A pin matches either the hostname label or the stable device id, so an
+/// operator can write whichever is more readable.
+fn host_matches(host: Option<&str>) -> bool {
+    let Some(want) = host.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    let dev = crate::core::device::current();
+    want.eq_ignore_ascii_case(&dev.label) || want.eq_ignore_ascii_case(dev.id.as_str())
 }
 
 impl TelegramPlatform {
-    /// Build from `cli-config.json`'s `telegram` section. `menu` is the daemon's command surface
-    /// (published to each bot via `setMyCommands`). Only a TOKEN is required — an empty allowlist is
-    /// fine (the daemon then boots in pairing mode). Fails only if there's no token at all.
+    /// Build from `cli-config.json`'s `telegram` section, hosting every bot this machine may run.
+    /// `menu` is the daemon's command surface (published to each bot via `setMyCommands`). Only a
+    /// TOKEN is required — an empty allowlist is fine (the daemon then boots in pairing mode).
+    #[cfg(test)]
     pub fn from_config(menu: Vec<(String, String)>) -> Result<Self> {
+        Self::from_config_selecting(menu, Vec::new())
+    }
+
+    /// As `from_config`, but hosting only the named extra bots (`serve --bots a,b`). An empty list
+    /// means "every bot this host is allowed to run".
+    pub fn from_config_selecting(menu: Vec<(String, String)>, wanted: Vec<String>) -> Result<Self> {
         let cfg = cli_config::load().telegram.unwrap_or_default();
         let token = cfg.resolved_token().context(
             "no telegram bot token — run `aizen telegram setup` or `aizen serve --token <token>`",
@@ -564,6 +642,7 @@ impl TelegramPlatform {
             base_allowed: Arc::new(Mutex::new(cfg.allowed_chat_ids)),
             primary_token: token,
             menu,
+            wanted,
         })
     }
 
@@ -599,9 +678,15 @@ fn persist_owner(chat: i64) {
 }
 
 /// Build a client for `token`, publish its "/" menu, spawn its poll loop, and register it under
-/// `name`. Never fails (a bad token just yields username "?" + a poll loop that logs + backs off);
-/// callers that must reject a bad token (`do_add_bot`) validate with `get_me` first. `pairing` is
-/// `Some(code)` only for the primary bot when there's no owner yet.
+/// `name`. Returns the bot's @username.
+///
+/// This RETURNS AN ERROR instead of a placeholder username when the bot cannot actually be hosted —
+/// a bad token, or another process already polling it. The old placeholder (`"?"` / `"busy"`) was
+/// indistinguishable from success at the call site, so `/addbot` reported `✓ bot @busy live` for a
+/// bot that was never inserted into the registry and could never receive a message.
+///
+/// `pairing` is `Some(code)` when this bot has no owner yet and should accept an ownership claim.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_bot(
     bots: &Arc<Mutex<HashMap<String, BotHandle>>>,
     menu: &[(String, String)],
@@ -611,26 +696,25 @@ async fn spawn_bot(
     persona: Option<String>,
     pairing: Option<String>,
     tx: &Sender<Inbound<i64>>,
-) -> String {
-    let client = match Client::new(token.clone()) {
-        Ok(c) => c,
-        Err(_) => return "?".to_string(),
-    };
+) -> Result<String> {
+    let client = Client::new(token.clone()).context("building the Telegram HTTP client")?;
     let username = client.get_me().await.unwrap_or_else(|_| "?".to_string());
     let cmds: Vec<(&str, &str)> = menu.iter().map(|(c, d)| (c.as_str(), d.as_str())).collect();
     let _ = client.set_my_commands(&cmds).await;
     let client = Arc::new(client);
     let lock_path = crate::core::workspace_txn::resource_lock("telegram", &token);
-    let poll_lock = match crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+    let poll_lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
         &lock_path,
         Duration::from_millis(100),
-    ) {
-        Ok(lock) => lock,
-        Err(_) => {
-            eprintln!("[telegram] bot poller already owned by another Aizen process; refusing duplicate getUpdates");
-            return "busy".to_string();
-        }
-    };
+    )
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "another Aizen process on this machine is already polling this bot token — \
+             Telegram allows exactly one getUpdates poller per token. Stop that process, or host \
+             this bot from a different machine."
+        )
+    })?;
+    let state = Arc::new(Mutex::new(BotState::Live));
     let poll = spawn_bot_poll(
         name.clone(),
         client.clone(),
@@ -638,6 +722,7 @@ async fn spawn_bot(
         pairing,
         tx.clone(),
         poll_lock,
+        state.clone(),
     );
     bots.lock().unwrap().insert(
         name.clone(),
@@ -647,10 +732,11 @@ async fn spawn_bot(
             username: username.clone(),
             allowed,
             persona,
+            state,
             poll,
         },
     );
-    username
+    Ok(username)
 }
 
 /// Spawn one bot's long-poll loop. Pushes `Inbound { route: name, chat, text }` for allowed chats onto
@@ -668,15 +754,49 @@ fn spawn_bot_poll(
     pairing: Option<String>,
     tx: Sender<Inbound<i64>>,
     _poll_lock: crate::core::repo_lock::RepoTxnLock,
+    state: Arc<Mutex<BotState>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut offset = client.backlog_offset().await;
         let mut pairing = pairing;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(PAIRING_TIMEOUT_SECS);
+        // Consecutive 409s. Telegram permits exactly ONE getUpdates poller per token, so a sustained
+        // 409 means another process — very often the same bot started on a second machine — owns
+        // this token. The old code logged the raw error and retried every 3s forever: an endless log
+        // of a fight nobody was told about, with the two pollers stealing each other's updates.
+        let mut conflicts = 0u32;
         loop {
             let updates = match client.get_updates(offset, POLL_TIMEOUT_SECS).await {
-                Ok(u) => u,
+                Ok(u) => {
+                    if conflicts > 0 {
+                        eprintln!("[poll {name}] getUpdates recovered — this process owns the token again");
+                        conflicts = 0;
+                        *state.lock().unwrap() = BotState::Live;
+                    }
+                    u
+                }
                 Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("409") || msg.to_lowercase().contains("conflict") {
+                        conflicts += 1;
+                        if conflicts == CONFLICT_WARN_AFTER {
+                            *state.lock().unwrap() = BotState::Conflict;
+                            eprintln!(
+                                "[poll {name}] getUpdates 409 Conflict ×{conflicts} — another process is \
+                                 polling this bot token. Telegram allows exactly ONE poller per token, so \
+                                 the two steal each other's messages. Run this bot on ONE machine: pin it \
+                                 with the `host` field in hostbot/bots.json, or start each machine with \
+                                 `aizen serve --bots <names>`."
+                            );
+                        }
+                        // Back off progressively so a losing poller stops hammering the API: 3s, 6s,
+                        // … capped. A brief overlap during a restart still recovers quickly.
+                        let backoff = CONFLICT_BACKOFF_BASE_SECS
+                            .saturating_mul(conflicts.min(10) as u64)
+                            .min(CONFLICT_BACKOFF_MAX_SECS);
+                        tokio::time::sleep(Duration::from_secs(backoff)).await;
+                        continue;
+                    }
                     eprintln!("[poll {name}] {e}");
                     tokio::time::sleep(Duration::from_secs(3)).await;
                     continue;
@@ -742,15 +862,24 @@ fn spawn_bot_poll(
 
 // ── shared bot-registry ops (used by BOTH the `Platform` methods and the `bot_admin` tool) ──────
 
-/// Append/replace a hosted-bot entry in `bots.json` (token stored, allowlist inherited, no persona).
-fn add_bot_entry(name: &str, token: &str) -> Result<()> {
+/// Append/replace a hosted-bot entry in `bots.json` (token stored, no persona). `own_owner` decides
+/// whether it inherits the primary's allowlist or pairs with its own owner.
+fn add_bot_entry(name: &str, token: &str, own_owner: bool) -> Result<()> {
     store::update_bots(|list| {
+        // Preserve a host pin an operator set by hand: re-adding a bot shouldn't silently move it to
+        // whichever machine ran the command.
+        let host = list
+            .iter()
+            .find(|b| b.name == name)
+            .and_then(|b| b.host.clone());
         list.retain(|b| b.name != name);
         list.push(store::HostedBot {
             name: name.to_string(),
             token: Some(token.to_string()),
             allowed_chat_ids: Vec::new(),
             persona: None,
+            own_owner,
+            host,
         });
         Ok(())
     })
@@ -758,6 +887,12 @@ fn add_bot_entry(name: &str, token: &str) -> Result<()> {
 
 /// Validate `token`, persist it, then hot-spawn the bot into the running daemon. Shared by
 /// `Platform::add_bot` and `admin_add_bot` (daemon-running path).
+///
+/// `own_owner`: give the bot its OWN owner (boots in pairing mode) instead of inheriting a snapshot
+/// of the primary's allowlist.
+///
+/// If the spawn fails the `bots.json` entry is ROLLED BACK. Otherwise a bot that cannot run would be
+/// persisted and re-attempted on every restart, while the caller was told it went live.
 async fn do_add_bot(
     bots: &Arc<Mutex<HashMap<String, BotHandle>>>,
     base_allowed: &Arc<Mutex<Vec<i64>>>,
@@ -765,6 +900,7 @@ async fn do_add_bot(
     tx: &Sender<Inbound<i64>>,
     name: &str,
     token: &str,
+    own_owner: bool,
 ) -> Result<String> {
     if name == "default" {
         bail!(
@@ -788,21 +924,42 @@ async fn do_add_bot(
         .get_me()
         .await
         .context("Telegram rejected the token")?;
-    add_bot_entry(name, token)?;
-    // Inherit a SNAPSHOT of the primary allowlist (a private chat id == the owner's id across bots).
-    let allowed = Arc::new(Mutex::new(base_allowed.lock().unwrap().clone()));
-    spawn_bot(
+    add_bot_entry(name, token, own_owner)?;
+    // `own_owner` starts empty + pairing; otherwise inherit a SNAPSHOT of the primary allowlist (a
+    // private chat id == the owner's user id across all their bots).
+    let (ids, pairing) = if own_owner {
+        (Vec::new(), Some(gen_pairing_code()))
+    } else {
+        (base_allowed.lock().unwrap().clone(), None)
+    };
+    let allowed = Arc::new(Mutex::new(ids));
+    let spawned = spawn_bot(
         bots,
         menu,
         name.to_string(),
         token.to_string(),
         allowed,
         None,
-        None,
+        pairing.clone(),
         tx,
     )
     .await;
-    Ok(username)
+    match spawned {
+        Ok(_) => Ok(match pairing {
+            Some(code) => {
+                format!("{username} · pairing code {code} (its owner must send that code)")
+            }
+            None => username,
+        }),
+        Err(e) => {
+            // Undo the persisted entry so a bot that can't run doesn't come back every restart.
+            let _ = store::update_bots(|list| {
+                list.retain(|b| b.name != name);
+                Ok(())
+            });
+            Err(e)
+        }
+    }
 }
 
 /// Abort + forget a running bot, and drop its config + sessions. Shared by `Platform::remove_bot`.
@@ -829,10 +986,17 @@ fn do_list_bots(bots: &Arc<Mutex<HashMap<String, BotHandle>>>) -> Vec<BotInfo> {
     bots.lock()
         .unwrap()
         .iter()
-        .map(|(n, h)| BotInfo {
-            name: n.clone(),
-            username: h.username.clone(),
-            chats: h.allowed.lock().unwrap().len(),
+        .map(|(n, h)| {
+            let state = *h.state.lock().unwrap();
+            BotInfo {
+                name: n.clone(),
+                username: h.username.clone(),
+                chats: h.allowed.lock().unwrap().len(),
+                note: match state {
+                    BotState::Live => None,
+                    other => Some(other.label().to_string()),
+                },
+            }
         })
         .collect()
 }
@@ -891,7 +1055,8 @@ impl Platform for TelegramPlatform {
         } else {
             None
         };
-        // Primary bot is always "default"; extras inherit a snapshot of its allowlist.
+        // Primary bot is always "default". A failure here IS fatal: without the primary bot the
+        // daemon has no owner channel and nothing to serve.
         spawn_bot(
             &self.bots,
             &self.menu,
@@ -902,7 +1067,8 @@ impl Platform for TelegramPlatform {
             pairing,
             &tx,
         )
-        .await;
+        .await
+        .context("starting the primary Telegram bot")?;
         for b in store::load_bots() {
             let Some(token) = b.token.clone() else {
                 continue;
@@ -913,23 +1079,59 @@ impl Platform for TelegramPlatform {
             {
                 continue;
             }
-            let ids = if b.allowed_chat_ids.is_empty() {
-                self.base_allowed.lock().unwrap().clone()
+            // Host pinning: in a fleet each bot names the machine that polls it, because Telegram
+            // permits exactly ONE getUpdates poller per token. An unpinned bot runs anywhere.
+            if !host_matches(b.host.as_deref()) {
+                eprintln!(
+                    "[telegram] skipping \"{}\" — pinned to host {:?}, this is {:?}",
+                    b.name,
+                    b.host.as_deref().unwrap_or("any"),
+                    crate::core::device::current().label
+                );
+                continue;
+            }
+            if !self.wanted.is_empty() && !self.wanted.iter().any(|w| w == &b.name) {
+                continue; // `serve --bots a,b` selected a subset
+            }
+            // A bot with its own owner NEVER inherits the primary's chats: that inheritance is the
+            // convenience default for one owner's own bots, and would leak the primary's chats onto
+            // a bot handed to somebody else.
+            let (ids, pairing) = if b.own_owner {
+                if b.allowed_chat_ids.is_empty() {
+                    let code = gen_pairing_code();
+                    eprintln!(
+                        "{}",
+                        console::style(format!(
+                            "🔑 \"{}\" pairing code: {code} — its owner sends this to claim it (≤10 min).",
+                            b.name
+                        ))
+                        .bold()
+                    );
+                    (Vec::new(), Some(code))
+                } else {
+                    (b.allowed_chat_ids.clone(), None)
+                }
+            } else if b.allowed_chat_ids.is_empty() {
+                (self.base_allowed.lock().unwrap().clone(), None)
             } else {
-                b.allowed_chat_ids.clone()
+                (b.allowed_chat_ids.clone(), None)
             };
             let allowed = Arc::new(Mutex::new(ids));
-            spawn_bot(
+            // One bad extra bot must not stop the daemon: log and carry on with the rest.
+            if let Err(e) = spawn_bot(
                 &self.bots,
                 &self.menu,
                 b.name.clone(),
                 token,
                 allowed,
                 b.persona.clone(),
-                None,
+                pairing,
                 &tx,
             )
-            .await;
+            .await
+            {
+                eprintln!("[telegram] could not host \"{}\": {e}", b.name);
+            }
         }
         // Publish the live handles so the `bot_admin` agent tool can reach this running daemon.
         *BOT_CONTROL.lock().unwrap() = Some(Arc::new(BotControl {
@@ -1018,8 +1220,23 @@ impl Platform for TelegramPlatform {
         true
     }
 
-    async fn add_bot(&self, name: &str, token: &str, tx: &Sender<Inbound<i64>>) -> Result<String> {
-        do_add_bot(&self.bots, &self.base_allowed, &self.menu, tx, name, token).await
+    async fn add_bot(
+        &self,
+        name: &str,
+        token: &str,
+        own_owner: bool,
+        tx: &Sender<Inbound<i64>>,
+    ) -> Result<String> {
+        do_add_bot(
+            &self.bots,
+            &self.base_allowed,
+            &self.menu,
+            tx,
+            name,
+            token,
+            own_owner,
+        )
+        .await
     }
 
     async fn remove_bot(&self, name: &str) -> Result<()> {
@@ -1082,7 +1299,7 @@ async fn admin_set_primary(token: &str) -> Result<String> {
 /// Add a bot from the agent tool. `name == "default"` sets the PRIMARY bot's token (see
 /// `admin_set_primary`). Otherwise: if the daemon is running, hot-spawn it (via `BOT_CONTROL`);
 /// else just record it in `bots.json` for the next `serve`.
-async fn admin_add_bot(name: &str, token: &str) -> Result<String> {
+async fn admin_add_bot(name: &str, token: &str, own_owner: bool) -> Result<String> {
     if name == "default" {
         return admin_set_primary(token).await;
     }
@@ -1095,6 +1312,7 @@ async fn admin_add_bot(name: &str, token: &str) -> Result<String> {
                 &ctl.tx,
                 name,
                 token,
+                own_owner,
             )
             .await?;
             Ok(format!("hosting @{user} as \"{name}\" (live)"))
@@ -1106,7 +1324,7 @@ async fn admin_add_bot(name: &str, token: &str) -> Result<String> {
                 .get_me()
                 .await
                 .context("Telegram rejected the token")?;
-            add_bot_entry(name, token)?;
+            add_bot_entry(name, token, own_owner)?;
             Ok(format!(
                 "saved @{user} as \"{name}\" — it will start on the next `aizen serve`"
             ))
@@ -1190,7 +1408,8 @@ impl Tool for BotAdmin {
                 "action": {"type": "string", "enum": ["list", "add", "remove", "set_persona"]},
                 "name": {"type": "string", "description": "bot name (route). Required for add/remove/set_persona."},
                 "token": {"type": "string", "description": "@BotFather token. Required for add."},
-                "persona": {"type": "string", "description": "persona name for set_persona; omit to clear."}
+                "persona": {"type": "string", "description": "persona name for set_persona; omit to clear."},
+                "own_owner": {"type": "boolean", "description": "add: give this bot its own owner (it pairs with a code) instead of inheriting yours. Use when the bot is for somebody else."}
             },
             "required": ["action"],
             "additionalProperties": false
@@ -1218,6 +1437,7 @@ impl Tool for BotAdmin {
                             name: b.name,
                             username: "?".to_string(),
                             chats: 0,
+                            note: Some("not running (no daemon)".to_string()),
                         })
                         .collect(),
                 };
@@ -1245,7 +1465,11 @@ impl Tool for BotAdmin {
                     .get("token")
                     .and_then(|v| v.as_str())
                     .context("'add' needs a token")?;
-                block(async { admin_add_bot(name, token).await })
+                let own_owner = args
+                    .get("own_owner")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                block(async { admin_add_bot(name, token, own_owner).await })
             }
             "remove" => {
                 let name = name.context("'remove' needs a bot name")?;
@@ -1332,6 +1556,131 @@ mod tests {
         assert!(
             code.chars().all(|c| c.is_ascii_digit()),
             "digits only: {code}"
+        );
+    }
+
+    /// Pin `AIZEN_HOME` to a fresh tempdir. Shares the crate-wide lock like every HOME-mutating test.
+    fn with_temp_home<T>(tag: &str, f: impl FnOnce() -> T) -> T {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("aizen-tg-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("AIZEN_HOME", &dir);
+        let out = f();
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    #[test]
+    fn add_bot_entry_records_own_owner_and_keeps_a_hand_set_host() {
+        with_temp_home("add-entry", || {
+            add_bot_entry("work", "t1", false).unwrap();
+            let saved = store::load_bots();
+            assert_eq!(saved.len(), 1);
+            assert!(!saved[0].own_owner, "default inherits the primary's owner");
+            assert_eq!(saved[0].host, None);
+
+            // An operator pins the bot to a machine by hand…
+            store::update_bots(|list| {
+                list[0].host = Some("vps-1".into());
+                Ok(())
+            })
+            .unwrap();
+            // …and re-adding it (a token rotation) must NOT silently move it to this machine.
+            add_bot_entry("work", "t2", true).unwrap();
+            let saved = store::load_bots();
+            assert_eq!(saved.len(), 1, "re-add replaces rather than duplicates");
+            assert_eq!(saved[0].token.as_deref(), Some("t2"), "token rotated");
+            assert!(saved[0].own_owner, "own_owner updated");
+            assert_eq!(
+                saved[0].host.as_deref(),
+                Some("vps-1"),
+                "the host pin survives a re-add"
+            );
+        });
+    }
+
+    #[test]
+    fn an_unpinned_bot_runs_anywhere_and_a_foreign_pin_is_skipped() {
+        // Host pinning is what stops two machines fighting over one token (Telegram allows exactly
+        // one getUpdates poller per token — the second gets 409 forever).
+        assert!(host_matches(None), "unpinned ⇒ runs on any machine");
+        assert!(host_matches(Some("  ")), "blank pin is not a pin");
+        assert!(
+            host_matches(Some(&crate::core::device::current().label)),
+            "this machine's own hostname matches"
+        );
+        assert!(
+            host_matches(Some(crate::core::device::current().id.as_str())),
+            "the stable device id matches too"
+        );
+        assert!(
+            !host_matches(Some("some-other-machine-that-is-not-this-one")),
+            "a foreign pin is skipped, leaving that bot to its own host"
+        );
+    }
+
+    #[test]
+    fn host_match_is_case_insensitive() {
+        // Hostnames are case-insensitive in practice, and an operator typing `VPS-1` vs `vps-1`
+        // should not silently leave a bot unhosted.
+        let label = crate::core::device::current().label.to_uppercase();
+        assert!(host_matches(Some(&label)));
+    }
+
+    #[test]
+    fn the_wanted_list_selects_a_subset_and_empty_means_all() {
+        // `serve --bots a,b` is how a fleet divides bots across machines. The selection rule lives in
+        // `start`, so assert the predicate itself: empty ⇒ everything, otherwise exact membership.
+        let wanted: Vec<String> = vec!["work".into(), "ops".into()];
+        let selected = |w: &[String], name: &str| w.is_empty() || w.iter().any(|x| x == name);
+        assert!(selected(&wanted, "work"));
+        assert!(selected(&wanted, "ops"));
+        assert!(
+            !selected(&wanted, "other"),
+            "an unlisted bot is left to its own machine"
+        );
+        assert!(
+            selected(&[], "anything"),
+            "no --bots ⇒ host everything allowed"
+        );
+    }
+
+    #[test]
+    fn bot_state_labels_distinguish_live_from_a_token_fight() {
+        // `/bots` shows this text; a conflict must read as a problem, not as a normal state.
+        assert_eq!(BotState::default(), BotState::Live);
+        assert_eq!(BotState::Live.label(), "live");
+        assert!(
+            BotState::Conflict.label().contains("another process"),
+            "the label must say WHY it is not polling: {}",
+            BotState::Conflict.label()
+        );
+    }
+
+    #[test]
+    fn a_conflict_is_only_declared_after_a_restart_overlap_would_have_cleared() {
+        // One or two 409s are normal while a restarting daemon's old long-poll drains. Declaring a
+        // conflict on the first would cry wolf on every restart; the threshold is what makes the
+        // `/bots` warning trustworthy. Backoff must also stay bounded.
+        assert!(
+            CONFLICT_WARN_AFTER >= 2,
+            "a single 409 during a restart must not be called a conflict"
+        );
+        let at = |n: u32| {
+            CONFLICT_BACKOFF_BASE_SECS
+                .saturating_mul(n.min(10) as u64)
+                .min(CONFLICT_BACKOFF_MAX_SECS)
+        };
+        assert_eq!(at(1), CONFLICT_BACKOFF_BASE_SECS, "first retry is quick");
+        assert!(at(2) > at(1), "backoff grows");
+        assert_eq!(
+            at(1_000),
+            CONFLICT_BACKOFF_MAX_SECS,
+            "and is capped, so a losing poller never sleeps forever"
         );
     }
 }

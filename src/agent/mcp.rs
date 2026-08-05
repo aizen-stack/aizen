@@ -2609,13 +2609,17 @@ mod tests {
 
     #[test]
     fn load_config_absent_is_none() {
-        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap();
+        // `unwrap()` here made this test a casualty of any OTHER test that panicked while holding the
+        // lock: the mutex is poisoned, so this one reported PoisonError instead of its own result.
+        // Every other holder already recovers; this was the last one that didn't.
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("aizen-mcp-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::env::set_var("AIZEN_HOME", &tmp);
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &tmp)]);
         // No mcp.json in this fresh home.
         let _ = std::fs::remove_file(config_path());
         assert!(load_config().unwrap().is_none());
-        std::env::remove_var("AIZEN_HOME");
     }
 }

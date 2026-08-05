@@ -254,6 +254,7 @@ pub(crate) fn build_subagent_prompt(
     model: &str,
     date: &str,
     contract: Option<&TaskContract>,
+    task: Option<&str>,
 ) -> String {
     let cwd = root.display().to_string();
     let include_ctx = matches!(role, "coder" | "tester");
@@ -263,6 +264,7 @@ pub(crate) fn build_subagent_prompt(
         date,
         model,
         include_ctx,
+        task,
     );
     s.push('\n');
     s.push_str(SUBAGENT_PREAMBLE);
@@ -423,7 +425,12 @@ impl TaskTool {
         ep: &mut crate::core::cli_config::ResolvedEndpoint,
         def: &crate::agents::AgentDef,
     ) {
-        if let Some(url) = def.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(url) = def
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             ep.base_url = url.to_string();
         }
         if let Some(var) = def
@@ -460,6 +467,14 @@ impl TaskTool {
             .map(str::to_string);
         let contract = TaskContract::from_args(args);
         let expects = args.get("expects").filter(|v| v.is_object()).cloned();
+        // The assignment, used to narrow `<skills>` to what this one job needs. A spawn pays for its
+        // whole prompt with no cache to amortize it, so a broad index is cost the sub-agent's single
+        // stated task can tell us not to pay.
+        let task = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
 
         let mut d = 'resolved: {
             if let Some(slug) = args
@@ -501,7 +516,7 @@ impl TaskTool {
             let ep = self.resolve_endpoint(arg_model);
             let registry = crate::agent::builtin::role_registry(&role, &self.root);
             let system =
-                build_subagent_prompt(&role, &self.root, &ep.model, &date, Some(&contract));
+                build_subagent_prompt(&role, &self.root, &ep.model, &date, Some(&contract), task);
             Dispatch {
                 label: role,
                 registry,
@@ -1288,7 +1303,7 @@ mod tests {
     #[test]
     fn subagent_prompt_has_stable_preamble_and_role() {
         let root = std::env::temp_dir();
-        let p = build_subagent_prompt("reviewer", &root, "m", "2026-06-20", None);
+        let p = build_subagent_prompt("reviewer", &root, "m", "2026-06-20", None, None);
         assert!(p.contains("<subagent>"), "preamble present");
         assert!(p.contains("output_discipline"));
         assert!(p.contains("cannot dispatch further sub-agents"));
@@ -1456,7 +1471,10 @@ mod tests {
 
         // The machine default itself stays inside its safety band regardless of the host core count.
         let d = machine_default_subagents();
-        assert!((2..=16).contains(&d), "machine default in band 2..=16, got {d}");
+        assert!(
+            (2..=16).contains(&d),
+            "machine default in band 2..=16, got {d}"
+        );
     }
 
     #[test]
@@ -1472,7 +1490,7 @@ mod tests {
             c.max_steps, MAX_STEP_BUDGET,
             "an over-large budget clamps to the ceiling"
         );
-        let p = build_subagent_prompt("reviewer", &root, "m", "2026-06-20", Some(&c));
+        let p = build_subagent_prompt("reviewer", &root, "m", "2026-06-20", Some(&c), None);
         assert!(p.contains("<contract>"), "{p}");
         assert!(p.contains("boundaries: do not touch src/main.rs"));
         assert!(p.contains("expected_output: a findings list"));
@@ -1626,7 +1644,7 @@ mod tests {
         // large is the failure the continuation loop can't detect (it looks like a clean `Done`), so
         // the preamble has to forbid it explicitly.
         let root = std::env::temp_dir();
-        let p = build_subagent_prompt("coder", &root, "m", "2026-06-20", None);
+        let p = build_subagent_prompt("coder", &root, "m", "2026-06-20", None, None);
         assert!(p.contains("completeness:"), "completeness clause present");
         assert!(p.contains("finish the WHOLE dispatched task"));
         assert!(p.contains("never stop merely because the task is large"));
@@ -1938,11 +1956,14 @@ mod tests {
             "---\nname: Code Reviewer\nmodel: spec-model\n---\nreview diffs",
         )
         .unwrap();
-        std::env::set_var("USERPROFILE", &sandbox);
-        std::env::set_var("HOME", &sandbox);
-        std::env::set_var("AIZEN_HOME", sandbox.join(".aizen"));
-        std::env::set_var("AIZEN_HOME", sandbox.join(".aizen"));
-        std::env::set_var("AIZEN_PROJECT_ROOT", sandbox.join("proj"));
+        // RESTORE on drop — see `EnvGuard`: deleting USERPROFILE/HOME disables
+        // home-boundary guards for whatever test runs next.
+        let _env = crate::core::config::EnvGuard::set([
+            ("USERPROFILE", sandbox.clone()),
+            ("HOME", sandbox.clone()),
+            ("AIZEN_HOME", sandbox.join(".aizen")),
+            ("AIZEN_PROJECT_ROOT", sandbox.join("proj")),
+        ]);
 
         let t = tool(0); // parent model "m"
                          // Specialist path: a resolvable agent supersedes role, and def.model wins over the parent.
@@ -1980,15 +2001,7 @@ mod tests {
             "tester scope"
         );
 
-        for v in [
-            "USERPROFILE",
-            "HOME",
-            "AIZEN_HOME",
-            "AIZEN_HOME",
-            "AIZEN_PROJECT_ROOT",
-        ] {
-            std::env::remove_var(v);
-        }
+        drop(_env);
         let _ = std::fs::remove_dir_all(&sandbox);
     }
 
@@ -1999,11 +2012,14 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let sandbox = std::env::temp_dir().join(format!("aizen-disp-ep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&sandbox);
-        std::env::set_var("USERPROFILE", &sandbox);
-        std::env::set_var("HOME", &sandbox);
-        std::env::set_var("AIZEN_HOME", sandbox.join(".aizen"));
-        std::env::set_var("AIZEN_HOME", sandbox.join(".aizen"));
-        std::env::set_var("AIZEN_PROJECT_ROOT", sandbox.join("proj"));
+        // RESTORE on drop — see `EnvGuard`: deleting USERPROFILE/HOME disables
+        // home-boundary guards for whatever test runs next.
+        let _env = crate::core::config::EnvGuard::set([
+            ("USERPROFILE", sandbox.clone()),
+            ("HOME", sandbox.clone()),
+            ("AIZEN_HOME", sandbox.join(".aizen")),
+            ("AIZEN_PROJECT_ROOT", sandbox.join("proj")),
+        ]);
 
         // Register a model→endpoint entry: a sub-agent pinned to `other-model` runs on ITS gateway.
         crate::core::cli_config::save(&crate::core::cli_config::CliConfig {
@@ -2040,15 +2056,7 @@ mod tests {
         let d3 = t.resolve_dispatch(&serde_json::json!({"prompt": "x", "role": "planner"}));
         assert_eq!(d3.base_url, "http://localhost");
 
-        for v in [
-            "USERPROFILE",
-            "HOME",
-            "AIZEN_HOME",
-            "AIZEN_HOME",
-            "AIZEN_PROJECT_ROOT",
-        ] {
-            std::env::remove_var(v);
-        }
+        drop(_env);
         let _ = std::fs::remove_dir_all(&sandbox);
     }
 
@@ -2061,12 +2069,16 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let sandbox = std::env::temp_dir().join(format!("aizen-card-ep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&sandbox);
-        std::env::set_var("USERPROFILE", &sandbox);
-        std::env::set_var("HOME", &sandbox);
-        std::env::set_var("AIZEN_HOME", sandbox.join(".aizen"));
-        std::env::set_var("AIZEN_PROJECT_ROOT", sandbox.join("proj"));
-        std::env::set_var("AIZEN_TEST_CARD_KEY", "key-from-env");
-        std::env::remove_var("AIZEN_TEST_CARD_MISSING");
+        // RESTORE on drop — see `EnvGuard`: deleting USERPROFILE/HOME disables home-boundary guards
+        // for whatever test runs next.
+        let _env = crate::core::config::EnvGuard::set([
+            ("USERPROFILE", sandbox.clone()),
+            ("HOME", sandbox.clone()),
+            ("AIZEN_HOME", sandbox.join(".aizen")),
+            ("AIZEN_PROJECT_ROOT", sandbox.join("proj")),
+            ("AIZEN_TEST_CARD_KEY", "key-from-env".into()),
+        ]);
+        let _missing = crate::core::config::EnvGuard::unset(["AIZEN_TEST_CARD_MISSING"]);
 
         // The registry maps `shared-model` to gateway A…
         crate::core::cli_config::save(&crate::core::cli_config::CliConfig {
@@ -2135,15 +2147,8 @@ mod tests {
             "a literal api_key_ref in a committed card must be inert"
         );
 
-        for v in [
-            "USERPROFILE",
-            "HOME",
-            "AIZEN_HOME",
-            "AIZEN_PROJECT_ROOT",
-            "AIZEN_TEST_CARD_KEY",
-        ] {
-            std::env::remove_var(v);
-        }
+        drop(_missing);
+        drop(_env);
         let _ = std::fs::remove_dir_all(&sandbox);
     }
 }

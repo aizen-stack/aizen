@@ -130,6 +130,13 @@ enum Commands {
         /// `/healthz` to curl — and adding one would forfeit the run-behind-NAT property.
         #[arg(long)]
         health: bool,
+        /// Host only these extra bots (comma-separated names from `/addbot`), e.g.
+        /// `--bots work,ops`. Telegram allows exactly ONE poller per token, so running the same bot
+        /// on two machines is a 409 fight, not redundancy — this is how a fleet divides them. The
+        /// primary bot always runs. Also settable as `AIZEN_SERVE_BOTS`. Alternatively pin a bot to
+        /// a machine with the `host` field in `hostbot/bots.json`.
+        #[arg(long, value_delimiter = ',', env = "AIZEN_SERVE_BOTS")]
+        bots: Vec<String>,
     },
     /// Configure / test the Telegram bot integration.
     Telegram {
@@ -347,9 +354,14 @@ enum SkillCmd {
         #[arg(short, long)]
         body: Option<String>,
     },
-    /// Delete a skill.
+    /// Retire a skill (archived under `.archive/`, not erased — see `restore`).
     Delete {
         /// Skill name.
+        name: String,
+    },
+    /// Restore a retired skill by name.
+    Restore {
+        /// Skill name, as shown in `skill list`'s retired line.
         name: String,
     },
     /// Refine an existing skill's steps in place: archives the prior version, bumps the version,
@@ -431,6 +443,33 @@ enum PersonaCmd {
         /// Importance 0–10 (else auto-scored).
         #[arg(short, long)]
         importance: Option<u8>,
+    },
+    /// Retire one self-memory (insight/episode) by id — archived, not erased.
+    Forget {
+        /// The self-memory id, as shown by `persona self`.
+        id: String,
+        /// Persona name (else the active one).
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// Restore a retired self-memory by id.
+    #[command(name = "unforget")]
+    Unforget {
+        /// The self-memory id.
+        id: String,
+        /// Persona name (else the active one).
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// Retire a persona (card + its self-memory are archived, not erased).
+    Delete {
+        /// Persona name.
+        name: String,
+    },
+    /// Restore a retired persona card.
+    Restore {
+        /// Persona name.
+        name: String,
     },
     /// Print the assembled `<persona>` + `<self>` blocks the model actually sees.
     Block,
@@ -880,8 +919,10 @@ enum MemoryCmd {
     /// List all memories.
     List {
         /// Workspace view: all (default) | global | current | project | a zone slug.
-        #[arg(long)]
         scope: Option<String>,
+        /// Same as the positional form. Kept because the flag shipped first and scripts use it.
+        #[arg(long = "scope", value_name = "SCOPE", conflicts_with = "scope")]
+        scope_flag: Option<String>,
         /// Show the graveyard instead: facts a correction retired. `revive <id>` brings one back.
         #[arg(long)]
         superseded: bool,
@@ -1093,6 +1134,7 @@ async fn main() -> Result<()> {
             now,
             token,
             health,
+            bots,
         } => {
             // The probe answers FIRST and touches nothing else: it runs every few seconds for the
             // life of the container, so it must not load/rewrite config or start any subsystem.
@@ -1114,7 +1156,7 @@ async fn main() -> Result<()> {
             if install || uninstall {
                 hostbot::run_serve_service(install, uninstall, user, now).await
             } else {
-                hostbot::run_serve().await
+                hostbot::run_serve(bots).await
             }
         }
         Commands::Telegram { cmd } => run_telegram(cmd).await,
@@ -1809,6 +1851,7 @@ async fn run_agent_capture(
         model.to_string(),
         approval_mode,
         resolve_ctx_window(model).0,
+        None, // cwd IS the project on the CLI path
     )?;
     let cfg = AgentConfig {
         approval_mode,
@@ -1894,6 +1937,7 @@ async fn run_serve_turn(
         model.to_string(),
         approval_mode,
         resolve_ctx_window(model).0,
+        None, // cwd IS the project on the CLI path
     )?;
     let cfg = AgentConfig {
         approval_mode,
@@ -2325,8 +2369,10 @@ fn run_team(cmd: TeamCmd) -> Result<()> {
                 coop::unstage_plan(&plan)?;
                 println!(
                     "{}",
-                    style("review only — unstaged again, nothing was committed (add --yes to commit)")
-                        .dim()
+                    style(
+                        "review only — unstaged again, nothing was committed (add --yes to commit)"
+                    )
+                    .dim()
                 );
                 return Ok(());
             }
@@ -3722,20 +3768,39 @@ async fn skill_fetch_interactive() -> Result<()> {
     run_skill_fetch(url.trim(), None).await
 }
 
-/// Pick a skill to delete (Esc cancels).
+/// Pick a skill to retire (Esc cancels). Soft — the copy is archived, so `→ Restore` undoes it.
 fn skill_delete_interactive(skills: &[skill::Skill]) {
     let theme = ui_theme();
-    let names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
+    // Show usage in the picker too: the whole question at this prompt is "which one is dead weight",
+    // and a list of bare names cannot answer it. Cold skills sort FIRST for the same reason.
+    let mut order: Vec<&skill::Skill> = skills.iter().collect();
+    order.sort_by_key(|s| s.uses);
+    let names: Vec<String> = order.iter().map(|s| s.name.clone()).collect();
+    let labels: Vec<String> = order
+        .iter()
+        .map(|s| {
+            let uses = if s.uses > 0 {
+                format!("loaded {}×", s.uses)
+            } else {
+                "never loaded".into()
+            };
+            format!("{}  {}", s.name, style(uses).dim())
+        })
+        .collect();
     if let Ok(Some(i)) = Select::with_theme(&theme)
-        .with_prompt("Delete which skill? (Esc to cancel)")
-        .items(&names)
+        .with_prompt("Retire which skill? (archived, not erased — Esc to cancel)")
+        .items(&labels)
         .default(0)
         .interact_opt()
     {
         match skill::delete(&names[i]) {
             Ok(true) => println!(
                 "{}",
-                style(format!("deleted '{}'", names[i])).color256(splash::ACCENT)
+                style(format!(
+                    "retired '{}' — restorable from this menu",
+                    names[i]
+                ))
+                .color256(splash::ACCENT)
             ),
             Ok(false) => println!("{}", style("(already gone)").dim()),
             Err(e) => eprintln!("{} {e}", style("skill:").red()),
@@ -3750,6 +3815,15 @@ async fn skills_menu() -> Result<()> {
         let theme = ui_theme();
         let skills = skill::list();
         let n = skills.len();
+        // Align the name column and carry the two facts that decide keep/fix/drop: where the skill
+        // lives (a zone skill is invisible in other repos) and whether it has ever been loaded. The
+        // old `name — description` rows were ragged and silent on both.
+        let namew = skills
+            .iter()
+            .map(|s| s.name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(34);
         let mut items: Vec<String> = skills
             .iter()
             .map(|s| {
@@ -3758,7 +3832,22 @@ async fn skills_menu() -> Result<()> {
                 } else {
                     s.description.clone()
                 };
-                format!("{}  —  {}", s.name, style(d).dim())
+                let origin = match s.origin {
+                    skill::SkillOrigin::Global => "",
+                    skill::SkillOrigin::Project => " [project]",
+                    skill::SkillOrigin::Repo => " [repo]",
+                };
+                let uses = if s.uses > 0 {
+                    format!("{}×", s.uses)
+                } else {
+                    "cold".into()
+                };
+                let pad = " ".repeat(namew.saturating_sub(s.name.chars().count()));
+                format!(
+                    "{}{pad}  {}",
+                    s.name,
+                    style(format!("{uses:<5} {}{origin}", elide(&d, 64))).dim()
+                )
             })
             .collect();
         items.push("+ New skill".to_string());
@@ -3768,10 +3857,22 @@ async fn skills_menu() -> Result<()> {
             style("(marketplace)").dim()
         ));
         if n > 0 {
-            items.push("✗ Delete a skill".to_string());
+            items.push("✗ Retire a skill".to_string());
+        }
+        let retired = skill::list_archive();
+        if !retired.is_empty() {
+            items.push(format!(
+                "↩ Restore a retired skill  {}",
+                style(format!("({})", retired.len())).dim()
+            ));
         }
         items.push("Back".to_string());
-        let prompt = format!("Skills — {n} saved (Esc to go back)");
+        let cold = skills.iter().filter(|s| s.uses == 0).count();
+        let prompt = if cold > 0 {
+            format!("Skills — {n} saved, {cold} never loaded (Enter to read · Esc to go back)")
+        } else {
+            format!("Skills — {n} saved (Enter to read · Esc to go back)")
+        };
         let pick = match Select::with_theme(&theme)
             .with_prompt(prompt)
             .items(&items)
@@ -3797,9 +3898,33 @@ async fn skills_menu() -> Result<()> {
             }
         } else if n > 0 && pick == n + 3 {
             skill_delete_interactive(&skills);
+        } else if !retired.is_empty() && pick == n + 3 + usize::from(n > 0) {
+            skill_restore_interactive(&retired);
         } else {
             return Ok(()); // Back
         }
+    }
+}
+
+/// `/skills → Restore` — bring a retired skill back. Its counterpart is the soft retire above;
+/// without a restore path in the REPL the archive would only be reachable by hand-moving files.
+fn skill_restore_interactive(retired: &[skill::Skill]) {
+    let theme = ui_theme();
+    let names: Vec<String> = retired.iter().map(|s| s.name.clone()).collect();
+    let Ok(Some(i)) = Select::with_theme(&theme)
+        .with_prompt("Restore which retired skill? (Esc to cancel)")
+        .items(&names)
+        .default(0)
+        .interact_opt()
+    else {
+        return;
+    };
+    match skill::restore(&names[i]) {
+        Ok(_) => println!(
+            "{}",
+            style(format!("restored '{}'", names[i])).color256(splash::ACCENT)
+        ),
+        Err(e) => eprintln!("{} {e}", style("skill:").red()),
     }
 }
 
@@ -4038,6 +4163,9 @@ fn persona_self_view(slug: &str, name: &str) {
                 m.importance,
                 truncate_chars(m.body.trim(), 140)
             );
+            // The id is what `persona forget <id>` names. Without it printed here the retire path is
+            // unreachable in practice — ids are body-derived slugs nobody can guess.
+            println!("      {}", style(&m.id).dim());
         }
     }
     let episodes: Vec<&persona::self_mem::SelfMemory> = mems
@@ -4054,6 +4182,30 @@ fn persona_self_view(slug: &str, name: &str) {
                 truncate_chars(m.body.trim(), 120)
             );
         }
+    }
+    let (_, ins_n) = persona::self_mem::counts(slug);
+    if ins_n >= persona::self_mem::INSIGHT_CAP {
+        // At a saturated cap the eviction order can no longer make room: a wrong-but-important
+        // insight outranks it indefinitely, so say so and name the verb that fixes it.
+        println!(
+            "\n{}",
+            style(format!(
+                "insights are at the {} cap — `aizen persona forget <id>` retires one (archived)",
+                persona::self_mem::INSIGHT_CAP
+            ))
+            .dim()
+        );
+    }
+    let arch = persona::self_mem::list_archive(slug);
+    if !arch.is_empty() {
+        println!(
+            "{}",
+            style(format!(
+                "{} retired — `aizen persona unforget <id>` brings one back",
+                arch.len()
+            ))
+            .dim()
+        );
     }
 }
 
@@ -4206,16 +4358,36 @@ async fn personas_menu(history: &mut Vec<Message>, model: &str) -> Result<()> {
             "Delete a persona" => {
                 let names: Vec<String> = personas.iter().map(|p| p.name.clone()).collect();
                 if let Ok(Some(i)) = Select::with_theme(&theme)
-                    .with_prompt("Delete which persona? (Esc to cancel)")
+                    .with_prompt(
+                        "Retire which persona? (card + self-memory archived — Esc to cancel)",
+                    )
                     .items(&names)
                     .default(0)
                     .interact_opt()
                 {
                     match persona::delete(&names[i]) {
-                        Ok(true) => println!(
-                            "{}",
-                            style(format!("deleted '{}'", names[i])).color256(splash::ACCENT)
-                        ),
+                        Ok(true) => {
+                            // A retired character must not stay named as the active one.
+                            let mut cfg = cli_config::load();
+                            if cfg
+                                .persona
+                                .as_deref()
+                                .map(|p| skill::sanitize_name(p) == skill::sanitize_name(&names[i]))
+                                .unwrap_or(false)
+                            {
+                                cfg.persona = None;
+                                cli_config::save(&cfg)?;
+                                update_system_prompt(history, model);
+                            }
+                            println!(
+                                "{}",
+                                style(format!(
+                                    "retired '{}' — `aizen persona restore {}` brings it back",
+                                    names[i], names[i]
+                                ))
+                                .color256(splash::ACCENT)
+                            );
+                        }
                         Ok(false) => println!("{}", style("(already gone)").dim()),
                         Err(e) => eprintln!("{} {e}", style("persona:").red()),
                     }
@@ -4257,7 +4429,7 @@ async fn telegram_menu() -> Result<()> {
         0 => telegram_setup().await,
         1 => telegram_test().await,
         2 => telegram_status().await,
-        3 => hostbot::run_serve().await,
+        3 => hostbot::run_serve(Vec::new()).await, // interactive: host every bot this machine may run
         4 => telegram_disable(),
         _ => Ok(()),
     }
@@ -5190,7 +5362,6 @@ async fn run_menu_sticky() -> Result<()> {
                 }
                 model_label = model.clone();
                 migrate_legacy_prompt_lanes(&mut history, &model);
-                refresh_dynamic_prompt_lane(&mut history, &model);
                 // The rotating discoverability tip is emitted AFTER the turn finishes (see the
                 // success branch below) so it lands UNDER the model's final answer, not stranded
                 // above it at turn start.
@@ -5223,6 +5394,11 @@ async fn run_menu_sticky() -> Result<()> {
                 // `line` itself is unchanged → checkpoint / display / persisted history keep the
                 // clean user text.
                 let sent = fold_context_into_query(&line);
+                // AFTER the fold: recall seats this turn's ledger, and the `<skills>` lane ranks
+                // itself by affinity to exactly those facts. With `AIZEN_SKILL_GRAPH_RANK` unset the
+                // affinity map is empty, so the lane's BYTES are unchanged and the prefix cache above
+                // still holds — the reorder costs a cache miss only for someone who opts in.
+                refresh_dynamic_prompt_lane(&mut history, &model);
                 if images.is_empty() {
                     history.push(Message::user(sent));
                 } else {
@@ -5247,6 +5423,7 @@ async fn run_menu_sticky() -> Result<()> {
                     model.clone(),
                     approval_mode(),
                     resolve_ctx_window(&model).0,
+                    None, // cwd IS the project in the REPL
                 ) {
                     Ok(r) => r,
                     Err(e) => {
@@ -5294,11 +5471,11 @@ async fn run_menu_sticky() -> Result<()> {
                 }
                 // (The steering mailbox was armed with the cancel token, before prep — see there.)
                 while input.cancel.try_recv().is_ok() {} // drain any stale wake-up
-                // NOTE: the "✦ Pondering…" turn-start verb is now the bottom-of-transcript working
-                // line (see `working_line` in retained.rs) — no separate emit needed here.
-                // Arm LAST: the keyboard thread only queues a cancel once WORKING is true, so flipping
-                // it after the clear+drain guarantees no Esc meant for THIS turn gets swallowed in the
-                // arming window.
+                                                         // NOTE: the "✦ Pondering…" turn-start verb is now the bottom-of-transcript working
+                                                         // line (see `working_line` in retained.rs) — no separate emit needed here.
+                                                         // Arm LAST: the keyboard thread only queues a cancel once WORKING is true, so flipping
+                                                         // it after the clear+drain guarantees no Esc meant for THIS turn gets swallowed in the
+                                                         // arming window.
                 tui::set_working(true);
                 crate::core::recovery::set_phase(
                     crate::core::recovery::RecoveryPhase::WaitingModel,
@@ -5348,16 +5525,9 @@ async fn run_menu_sticky() -> Result<()> {
                     let summarize = move |msgs: Vec<Message>| {
                         let ep = sum_ep.clone();
                         async move {
-                            chore_chat(
-                                http_ref,
-                                &ep.base_url,
-                                &ep.api_key,
-                                &ep.model,
-                                &msgs,
-                                &[],
-                            )
-                            .await
-                            .map(|t| t.content.unwrap_or_default())
+                            chore_chat(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+                                .await
+                                .map(|t| t.content.unwrap_or_default())
                         }
                     };
                     // Optional oracle for self-review: only when `roles.oracle` is explicitly
@@ -5740,7 +5910,6 @@ async fn run_menu_plain() -> Result<()> {
         };
         model_label = model.clone();
         migrate_legacy_prompt_lanes(&mut history, &model);
-        refresh_dynamic_prompt_lane(&mut history, &model);
         // Per-turn reasoning-effort auto-detect (mirrors the sticky REPL): classify what the user
         // TYPED, not the expanded payload — see the sticky path for why. Falls back to the finalized
         // text when there is no typed source (vision message, or a slash command that expanded).
@@ -5756,6 +5925,10 @@ async fn run_menu_plain() -> Result<()> {
         // system lane) — see `fold_context_into_query`. `line` stays the original for persisted
         // history / display.
         let sent = fold_context_into_query(&line);
+        // AFTER the fold, never before: recall seats this turn's handle→id ledger, and the `<skills>`
+        // lane ranks itself by graph affinity to exactly those facts. Refreshing first meant the
+        // index was always built against the PREVIOUS turn's recall.
+        refresh_dynamic_prompt_lane(&mut history, &model);
         if images.is_empty() {
             history.push(Message::user(sent));
         } else {
@@ -5784,6 +5957,7 @@ async fn run_menu_plain() -> Result<()> {
             model.clone(),
             approval_mode(),
             resolve_ctx_window(&model).0,
+            None, // cwd IS the project in the REPL
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -6512,8 +6686,11 @@ async fn run_persona_reflection(
     }
     let mut saved = 0usize;
     for ins in &insights {
-        if persona::self_mem::save_insight(slug, &ins.text, ins.importance).is_ok() {
+        if let Ok(id) = persona::self_mem::save_insight(slug, &ins.text, ins.importance) {
             saved += 1;
+            // Cross-kind Hebbian edge: an insight distilled while these facts were in play is
+            // associated with them. Best-effort — a graph write never affects the reflection.
+            persona::self_mem::note_insight_cofire(slug, &id);
         }
     }
     if saved > 0 {
@@ -6533,9 +6710,25 @@ async fn run_persona_reflection(
 /// helper makes every call site say whether it is opening a fresh conversation (refresh/adopt) or
 /// merely rewriting lanes inside the current one (read the already-adopted bytes).
 fn system_prompt_bundle_with_core(model: &str, frozen: &str) -> agent::PromptBundle {
-    let cwd = std::env::current_dir()
+    system_prompt_bundle_in(model, frozen, None)
+}
+
+/// As `system_prompt_bundle_with_core`, but stating an EXPLICIT working directory in the prompt.
+/// The hostbot daemon passes its lane's cwd: the prompt tells the model where it is working, and
+/// under several concurrent bots the process cwd is not that answer for any of them.
+fn system_prompt_bundle_in(
+    model: &str,
+    frozen: &str,
+    root: Option<&std::path::Path>,
+) -> agent::PromptBundle {
+    let cwd = root
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| ".".to_string());
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string())
+        })
+        .unwrap_or_else(|| ".".to_string());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let mut bundle = agent::build_top_level_system_prompt_bundle(
         &cwd,
@@ -6568,6 +6761,25 @@ fn refreshed_system_prompt_bundle(model: &str) -> agent::PromptBundle {
 fn active_system_prompt_bundle(model: &str) -> agent::PromptBundle {
     let frozen = memory::active_frozen_core();
     system_prompt_bundle_with_core(model, &frozen)
+}
+
+/// The two bundle builders above, parameterized by the hostbot lane's working directory and persona.
+/// Both are needed together because the persona override must be armed for the (synchronous) prompt
+/// assembly and released immediately after — see `persona::with_override`.
+fn hostbot_prompt_bundle(
+    model: &str,
+    root: &std::path::Path,
+    persona: Option<String>,
+    boundary: bool,
+) -> agent::PromptBundle {
+    persona::with_override(persona, || {
+        let frozen = if boundary {
+            memory::refresh_frozen_core()
+        } else {
+            memory::active_frozen_core()
+        };
+        system_prompt_bundle_in(model, &frozen, Some(root))
+    })
 }
 
 /// Flattened active prompt for callers that still expect a single string.
@@ -6701,6 +6913,14 @@ fn fold_context_into_query(query: &str) -> String {
     // denominator ("live facts per turn") has to mean turns the user drove.
     memory::stats::note_turn();
     let mut out = fold_retrieval_into_query(query);
+    // Skills that actually fit THIS question, gated on the same coverage threshold as recall. The
+    // always-on `<skills>` index names every applicable procedure regardless of the request; this
+    // block is what makes the fitting ones salient without spending the system lane's byte-stable
+    // budget on the ones that don't. Folded ABOVE the code but BELOW the facts, matching the
+    // "standing truth → how-to → source" reading order.
+    if let Some(block) = skills::turn_block(query, skills::SKILL_TURN_BUDGET_TOKENS) {
+        out = format!("{block}\n\n{out}");
+    }
     if let Some((block, pairs)) = memory::recall_block(query, MEMORY_RECALL_BUDGET_TOKENS) {
         memory::pending::open_turn(pairs);
         out = format!("{block}\n\n{out}");
@@ -6708,7 +6928,7 @@ fn fold_context_into_query(query: &str) -> String {
     out
 }
 
-/// Drop recall blocks from user turns already in `history`.
+/// Drop per-turn context blocks (memory recall, gated skills) from user turns already in `history`.
 ///
 /// Each block was true for the turn it rode in on. Left in place they accumulate — ten turns of
 /// standing facts re-stated ten times — and, worse, an older block can contradict a newer one with
@@ -6718,9 +6938,11 @@ fn fold_context_into_query(query: &str) -> String {
 /// anyway: rewriting a user turn at any other time would break cache coverage for the whole tail,
 /// costing more than the tokens it saves.
 ///
-/// Matches on [`memory::RECALL_MARKER`] at the start of the content and cuts through the first blank
-/// line. Anything the user actually typed survives, including a message that merely mentions the
-/// phrase — the marker has to be at position 0, which only our own folding produces.
+/// Matches on [`memory::RECALL_MARKER`] / [`skills::SKILL_MARKER`] at the start of the content and
+/// cuts through the first blank line. Anything the user actually typed survives, including a message
+/// that merely mentions the phrase — a marker has to be at position 0, which only our own folding
+/// produces. Both are peeled in a loop because a turn carries them stacked (recall, then skills):
+/// removing the outer one promotes the inner one to position 0.
 fn strip_recall_blocks(history: &mut [Message]) {
     for m in history.iter_mut() {
         if m.role != "user" {
@@ -6729,10 +6951,28 @@ fn strip_recall_blocks(history: &mut [Message]) {
         let Some(content) = m.content.as_deref() else {
             continue;
         };
-        let stripped = memory::strip_recall_prefix(content);
-        if stripped.len() != content.len() {
-            m.content = Some(stripped.to_string());
+        let mut cur = content;
+        loop {
+            let next = strip_skill_prefix(memory::strip_recall_prefix(cur));
+            if next.len() == cur.len() {
+                break;
+            }
+            cur = next;
         }
+        if cur.len() != content.len() {
+            m.content = Some(cur.to_string());
+        }
+    }
+}
+
+/// Peel one leading gated-skill block, mirroring [`memory::strip_recall_prefix`].
+fn strip_skill_prefix(content: &str) -> &str {
+    if !content.starts_with(skills::SKILL_MARKER) {
+        return content;
+    }
+    match content.split_once("\n\n") {
+        Some((_, rest)) => rest,
+        None => content,
     }
 }
 
@@ -7170,6 +7410,47 @@ mod context_breakdown_tests {
         strip_recall_blocks(&mut history);
         assert_eq!(history[1].content.as_deref(), Some(typed));
     }
+
+    #[test]
+    fn strip_peels_stacked_recall_and_skill_blocks() {
+        // A gated turn carries both, recall outermost (see `fold_context_into_query`). Peeling only
+        // the outer one would leave the skill block welded to the user's words forever, so the stack
+        // has to unwind — that is why the strip loops instead of testing each marker once.
+        let typed = "deploy the staging service please";
+        let folded = format!(
+            "{} (may be stale…):\n[m1] (about you) prefers pnpm\n\n{} (call skill_load…):\n- deploy-vps: asked to deploy\n\n{typed}",
+            memory::RECALL_MARKER,
+            skills::SKILL_MARKER
+        );
+        let mut history = vec![
+            Message::system("lane"),
+            Message::user(folded),
+            // Skill block alone, no recall above it — the other stacking order must work too.
+            Message::user(format!(
+                "{} (call skill_load…):\n- deploy-vps: asked to deploy\n\nship it",
+                skills::SKILL_MARKER
+            )),
+        ];
+        strip_recall_blocks(&mut history);
+
+        assert_eq!(
+            history[1].content.as_deref(),
+            Some(typed),
+            "both blocks peeled, question kept"
+        );
+        assert_eq!(
+            history[2].content.as_deref(),
+            Some("ship it"),
+            "a lone skill block is peeled too"
+        );
+
+        strip_recall_blocks(&mut history);
+        assert_eq!(
+            history[1].content.as_deref(),
+            Some(typed),
+            "idempotent: a second compact must not eat the message"
+        );
+    }
 }
 
 /// Tell the user, unmistakably, when a turn ended for a reason that is NOT success.
@@ -7341,6 +7622,13 @@ fn preprocess_input(line: &str) -> InputPre {
 /// Run a user-typed `!cmd` shell escape in the working dir, capturing stdout+stderr (lossy-decode +
 /// `chcp 65001` like `shell_run` so non-English Windows output isn't dropped), capped for display.
 fn run_shell_escape(command: &str) -> String {
+    run_shell_escape_in(command, None)
+}
+
+/// As `run_shell_escape`, but in an EXPLICIT directory. The hostbot daemon passes its lane's cwd:
+/// several bots share one process, so `/sh` must run where that bot was told to work, not wherever
+/// the process happens to be. `None` ⇒ inherit the process cwd (the REPL's `!cmd`).
+fn run_shell_escape_in(command: &str, dir: Option<&std::path::Path>) -> String {
     use std::process::Command;
     use std::time::Duration;
     /// A `!cmd` escape runs on the REPL's own thread, so an unbounded wait freezes the entire UI —
@@ -7359,6 +7647,9 @@ fn run_shell_escape(command: &str) -> String {
         c.arg("-c").arg(command);
         c
     };
+    if let Some(dir) = dir {
+        cmd.current_dir(dir);
+    }
     match core::proctree::output_bounded(&mut cmd, ESCAPE_TIMEOUT, ESCAPE_DRAIN_GRACE) {
         Ok(o) => {
             let mut s = o.stdout;
@@ -7536,6 +7827,20 @@ fn truncate_chars(s: &str, max: usize) -> String {
     agent::compact::truncate_chars(s, max)
 }
 
+/// Shorten for a human-facing list: keep the head, mark the cut with an ellipsis.
+///
+/// NOT [`truncate_chars`], which appends `[+N chars]` — that suffix exists so a MODEL reading a
+/// truncated tool result knows content was withheld. In a listing it is noise the reader can't act
+/// on, and it costs the width the description needed.
+fn elide(s: &str, max: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let head: String = flat.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", head.trim_end())
+}
+
 /// Render conversation messages into a compact transcript (delegates to the shared compaction core).
 fn render_transcript(msgs: &[Message]) -> String {
     agent::compact::render_transcript(msgs)
@@ -7581,11 +7886,10 @@ async fn handoff_now(history: &[Message], goal: &str) -> Result<String> {
     }
     let ep = summarizer_endpoint(&base, &key, &model);
     let prompt = agent::compact::handoff_prompt(history, goal);
-    let summary =
-        chore_chat(&http, &ep.base_url, &ep.api_key, &ep.model, &prompt, &[])
-            .await?
-            .content
-            .unwrap_or_default();
+    let summary = chore_chat(&http, &ep.base_url, &ep.api_key, &ep.model, &prompt, &[])
+        .await?
+        .content
+        .unwrap_or_default();
     if summary.trim().is_empty() {
         anyhow::bail!("the model returned an empty handoff summary");
     }
@@ -7644,6 +7948,34 @@ fn slash_memory(arg: &str) -> Result<()> {
             memory::cmd_forget(rest)
         }
         "archive" => memory::cmd_archive_list(),
+        // The review queue is where mid-confidence learned facts wait for a human. It had a CLI but
+        // no REPL door, so the queue only ever grew — 29 items deep on this machine before anyone
+        // could see them. Same functions as `aizen memory review`, so the two can't drift.
+        "review" | "queue" => {
+            let (op, key) = match rest.split_once(char::is_whitespace) {
+                Some((o, k)) => (o.trim(), k.trim()),
+                None => (rest, ""),
+            };
+            match op {
+                "" => memory::cmd_review(None, None, false),
+                "promote" | "keep" | "accept" => {
+                    if key.is_empty() {
+                        anyhow::bail!("usage: /memory review promote <id>  (ids from `/memory review`)");
+                    }
+                    memory::cmd_review(Some(key.to_string()), None, false)
+                }
+                "drop" | "reject" => {
+                    if key.is_empty() {
+                        anyhow::bail!("usage: /memory review drop <id>  (ids from `/memory review`)");
+                    }
+                    memory::cmd_review(None, Some(key.to_string()), false)
+                }
+                "clear" => memory::cmd_review(None, None, true),
+                other => anyhow::bail!(
+                    "unknown: /memory review {other}  (try: review | review promote <id> | review drop <id> | review clear)"
+                ),
+            }
+        }
         "restore" => {
             if rest.is_empty() {
                 anyhow::bail!(
@@ -8055,7 +8387,10 @@ fn team_status_lines() -> Vec<String> {
             .dim(),
         ));
         if !m.task.is_empty() {
-            out.push(format!("      {}", style(&m.task).color256(theme::ACCENT_DIM)));
+            out.push(format!(
+                "      {}",
+                style(&m.task).color256(theme::ACCENT_DIM)
+            ));
         }
         let wt = v.worktree_label();
         if !m.branch.as_deref().unwrap_or("").is_empty() || !wt.is_empty() {
@@ -8099,9 +8434,11 @@ fn team_status_lines() -> Vec<String> {
         }
     }
     out.push(
-        style("/team diff <n> [-p] · /team files <n> · /team claims · /team commit <n> · /team done")
-            .dim()
-            .to_string(),
+        style(
+            "/team diff <n> [-p] · /team files <n> · /team claims · /team commit <n> · /team done",
+        )
+        .dim()
+        .to_string(),
     );
     out
 }
@@ -8347,7 +8684,11 @@ async fn slash_team_commit(rest: &str) {
         tui::emit_line(&format!("  {p}"));
     }
     if plan.paths.len() > 100 {
-        tui::emit_line(&style(format!("  … {} more", plan.paths.len() - 100)).dim().to_string());
+        tui::emit_line(
+            &style(format!("  … {} more", plan.paths.len() - 100))
+                .dim()
+                .to_string(),
+        );
     }
     if !plan.shared_paths.is_empty() {
         tui::emit_line(
@@ -8506,7 +8847,11 @@ fn slash_work(arg: &str) {
                         style(&w.branch).dim(),
                         note
                     ));
-                    tui::emit_line(&style(format!("      {}", w.path.display())).dim().to_string());
+                    tui::emit_line(
+                        &style(format!("      {}", w.path.display()))
+                            .dim()
+                            .to_string(),
+                    );
                 }
             }
             Err(e) => tui::emit_line(&format!("{} {e:#}", style("work:").red())),
@@ -8519,14 +8864,21 @@ fn slash_work(arg: &str) {
             match coop::work_new(rest) {
                 Ok(wt) => {
                     tui::emit_line(
-                        &style(format!("created worktree {} on {}", wt.path.display(), wt.branch))
-                            .color256(theme::OK)
-                            .to_string(),
+                        &style(format!(
+                            "created worktree {} on {}",
+                            wt.path.display(),
+                            wt.branch
+                        ))
+                        .color256(theme::OK)
+                        .to_string(),
                     );
                     tui::emit_line(
-                        &style(format!("open a new terminal there: cd {}", wt.path.display()))
-                            .dim()
-                            .to_string(),
+                        &style(format!(
+                            "open a new terminal there: cd {}",
+                            wt.path.display()
+                        ))
+                        .dim()
+                        .to_string(),
                     );
                 }
                 Err(e) => tui::emit_line(&format!("{} {e:#}", style("work new:").red())),
@@ -8543,7 +8895,11 @@ fn slash_work(arg: &str) {
                 }
             }
             if name.is_empty() {
-                tui::emit_line(&style("usage: /work remove <name> [--force]").dim().to_string());
+                tui::emit_line(
+                    &style("usage: /work remove <name> [--force]")
+                        .dim()
+                        .to_string(),
+                );
                 return;
             }
             match coop::work_remove(&name, force) {
@@ -8552,9 +8908,11 @@ fn slash_work(arg: &str) {
             }
         }
         other => tui::emit_line(
-            &style(format!("unknown /work subcommand '{other}' — list · new · remove"))
-                .dim()
-                .to_string(),
+            &style(format!(
+                "unknown /work subcommand '{other}' — list · new · remove"
+            ))
+            .dim()
+            .to_string(),
         ),
     }
 }
@@ -9037,7 +9395,7 @@ async fn handle_slash(
         }
         // `/serve` kept as a direct shortcut to the daemon (also reachable via the Telegram menu).
         "serve" => {
-            if let Err(e) = hostbot::run_serve().await {
+            if let Err(e) = hostbot::run_serve(Vec::new()).await {
                 eprintln!("{} {e}", style("serve:").red());
             }
         }
@@ -10645,16 +11003,16 @@ fn spawn_aside_worker(http: reqwest::Client) {
                 Ok(turn) => {
                     let answer = turn.content.unwrap_or_default();
                     if answer.trim().is_empty() {
-                        tui::emit_line(
-                            &style("  ⁇ (no answer)").dim().to_string(),
-                        );
+                        tui::emit_line(&style("  ⁇ (no answer)").dim().to_string());
                     } else {
                         let shown = crate::ui::markdown::render_plain_blocks(answer.trim());
                         // Prefix every line dimly so the whole aside block reads as a margin note
                         // beside the main work, not as the model's task output.
                         for line in shown.lines() {
                             tui::emit_line(
-                                &style(format!("  {line}")).color256(theme::MUTED).to_string(),
+                                &style(format!("  {line}"))
+                                    .color256(theme::MUTED)
+                                    .to_string(),
                             );
                         }
                     }
@@ -11243,7 +11601,10 @@ fn role_key_display(api_key_ref: Option<&str>) -> Option<String> {
     let raw = api_key_ref.map(str::trim).filter(|s| !s.is_empty())?;
     Some(match raw.strip_prefix("env:").map(str::trim) {
         Some(var) if !var.is_empty() => {
-            if std::env::var(var).ok().is_some_and(|v| !v.trim().is_empty()) {
+            if std::env::var(var)
+                .ok()
+                .is_some_and(|v| !v.trim().is_empty())
+            {
                 format!("env:{var} {}", theme::ok("✓"))
             } else {
                 format!("env:{var} {}", theme::warn("✗ unset"))
@@ -11295,7 +11656,8 @@ fn print_roles_section(cfg: &cli_config::CliConfig) {
         theme::accent("◆"),
         theme::accent("Sub-agents & roles").bold()
     );
-    let row = |key: &str, val: String| println!("    {}  {val}", theme::muted(format!("{key:<10}")));
+    let row =
+        |key: &str, val: String| println!("    {}  {val}", theme::muted(format!("{key:<10}")));
     let roles = cfg.roles.as_ref();
     row(
         "subagent",
@@ -11318,7 +11680,10 @@ fn print_roles_section(cfg: &cli_config::CliConfig) {
             }
         ),
     );
-    row("apply", role_row_value(roles.and_then(|r| r.apply.as_ref())));
+    row(
+        "apply",
+        role_row_value(roles.and_then(|r| r.apply.as_ref())),
+    );
     match cfg.model_endpoints.as_deref().filter(|l| !l.is_empty()) {
         Some(list) => {
             let names: Vec<&str> = list.iter().map(|e| e.model.as_str()).collect();
@@ -12133,12 +12498,12 @@ async fn prompt_probed_base_url(
         }
         other => {
             let what = match &other {
-                client::EndpointCheck::NotFound(d) => {
-                    match missing_version_suffix(&url) {
-                        Some(fixed) => format!("no model list there — most endpoints need a version path, e.g. {fixed}"),
-                        None => format!("no model list there ({d})"),
-                    }
-                }
+                client::EndpointCheck::NotFound(d) => match missing_version_suffix(&url) {
+                    Some(fixed) => format!(
+                        "no model list there — most endpoints need a version path, e.g. {fixed}"
+                    ),
+                    None => format!("no model list there ({d})"),
+                },
                 client::EndpointCheck::Unreachable(d) => format!("could not reach it ({d})"),
                 client::EndpointCheck::Http(c, d) => format!("HTTP {c} ({d})"),
                 _ => unreachable!("Ok/Auth handled above"),
@@ -12190,7 +12555,11 @@ fn prompt_api_key_ref(theme: &ColorfulTheme, current: Option<&str>) -> Result<Op
             }
             // Say so now rather than at dispatch time: an unset variable resolves to the inherited
             // key, which looks like the setting silently did nothing.
-            if std::env::var(var).ok().filter(|v| !v.trim().is_empty()).is_none() {
+            if std::env::var(var)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .is_none()
+            {
                 line_warn(&format!(
                     "{var} isn't set in this shell — until it is, this role falls back to the main key"
                 ));
@@ -12285,8 +12654,11 @@ async fn config_edit_one_role(
                 .or_else(|| cfg.api_key.clone())
                 .unwrap_or_default();
             if !key.is_empty() {
-                if let Ok(fetched) =
-                    spin_while("fetching models", client::fetch_models_info(&http, url, &key)).await
+                if let Ok(fetched) = spin_while(
+                    "fetching models",
+                    client::fetch_models_info(&http, url, &key),
+                )
+                .await
                 {
                     infos = fetched;
                 }
@@ -12382,8 +12754,10 @@ async fn config_edit_model_registry(cfg: &mut cli_config::CliConfig) -> Result<(
             "inherit the caller's url",
         )
         .await?;
-        let api_key_ref =
-            prompt_api_key_ref(&theme, editing.as_ref().and_then(|e| e.api_key_ref.as_deref()))?;
+        let api_key_ref = prompt_api_key_ref(
+            &theme,
+            editing.as_ref().and_then(|e| e.api_key_ref.as_deref()),
+        )?;
         let base_url = probed.map(|(u, _)| u);
         let mut out = cfg.model_endpoints.take().unwrap_or_default();
         out.retain(|e| e.model != model);
@@ -12458,9 +12832,15 @@ async fn config_edit_agent_pins() -> Result<()> {
     let base = base.trim().trim_end_matches('/');
 
     let mut ki = Input::<String>::with_theme(&theme)
-        .with_prompt("API key env var (empty = inherit, `-` clears) — env only, cards get committed")
+        .with_prompt(
+            "API key env var (empty = inherit, `-` clears) — env only, cards get committed",
+        )
         .allow_empty(true);
-    if let Some(v) = def.api_key_ref.as_deref().and_then(|k| k.strip_prefix("env:")) {
+    if let Some(v) = def
+        .api_key_ref
+        .as_deref()
+        .and_then(|k| k.strip_prefix("env:"))
+    {
         ki = ki.default(v.to_string());
     }
     let var = ki.interact_text()?;
@@ -13421,6 +13801,7 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         model.clone(),
         cli_approval,
         resolve_ctx_window(&model).0,
+        None, // cwd IS the project on the CLI path
     )?;
     let max = args.max_iters.unwrap_or(25).max(1);
     let cfg = AgentConfig {
@@ -13579,11 +13960,15 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             }
             memory::cmd_add(&name, &description, &mtype, body.trim())
         }
-        MemoryCmd::List { scope, superseded } => {
+        MemoryCmd::List {
+            scope,
+            scope_flag,
+            superseded,
+        } => {
             if superseded {
                 memory::cmd_list_superseded()
             } else {
-                memory::cmd_list(scope.as_deref())
+                memory::cmd_list(scope.or(scope_flag).as_deref())
             }
         }
         MemoryCmd::Revive { id } => memory::cmd_revive(&id),
@@ -13743,6 +14128,16 @@ fn run_persona(cmd: PersonaCmd) -> Result<()> {
                     p.name
                 );
             }
+            // Retired cards are recoverable, so say they exist — a soft delete nobody can see is
+            // indistinguishable from a hard one.
+            let retired = persona::list_archive();
+            if !retired.is_empty() {
+                let names: Vec<&str> = retired.iter().map(|p| p.name.as_str()).collect();
+                println!(
+                    "\nretired: {} — `aizen persona restore <name>` brings one back",
+                    names.join(", ")
+                );
+            }
             Ok(())
         }
         PersonaCmd::Show { name } => {
@@ -13807,6 +14202,30 @@ fn run_persona(cmd: PersonaCmd) -> Result<()> {
             persona_self_view(&slug, &label);
             Ok(())
         }
+        PersonaCmd::Forget { id, name } => {
+            let slug = match name {
+                Some(n) => skill::sanitize_name(&n),
+                None => persona::active_slug().ok_or_else(|| {
+                    anyhow::anyhow!("no active persona — pass --name or `aizen persona use <name>`")
+                })?,
+            };
+            persona::self_mem::forget(&slug, &id)?;
+            println!(
+                "retired self-memory '{id}' (archived — `aizen persona unforget {id}` restores it)"
+            );
+            Ok(())
+        }
+        PersonaCmd::Unforget { id, name } => {
+            let slug = match name {
+                Some(n) => skill::sanitize_name(&n),
+                None => persona::active_slug().ok_or_else(|| {
+                    anyhow::anyhow!("no active persona — pass --name or `aizen persona use <name>`")
+                })?,
+            };
+            persona::self_mem::restore(&slug, &id)?;
+            println!("restored self-memory '{id}'");
+            Ok(())
+        }
         PersonaCmd::Remember { text, importance } => {
             let slug = persona::active_slug().ok_or_else(|| {
                 anyhow::anyhow!("no active persona — `aizen persona use <name>` first")
@@ -13839,6 +14258,36 @@ fn run_persona(cmd: PersonaCmd) -> Result<()> {
                 Some(id) => println!("recorded episode '{id}' (importance {imp})"),
                 None => println!("(skipped — near-duplicate of a recent episode/insight)"),
             }
+            Ok(())
+        }
+        PersonaCmd::Delete { name } => {
+            if persona::delete(&name)? {
+                // Clear the active pointer too, or the config keeps naming a card that is gone.
+                let mut cfg = cli_config::load();
+                if cfg
+                    .persona
+                    .as_deref()
+                    .map(|p| skill::sanitize_name(p) == skill::sanitize_name(&name))
+                    .unwrap_or(false)
+                {
+                    cfg.persona = None;
+                    cli_config::save(&cfg)?;
+                    println!("retired persona '{name}' (was active — back to the default voice)");
+                } else {
+                    println!("retired persona '{name}'");
+                }
+                println!(
+                    "card + self-memory archived under {} — `aizen persona restore {name}`",
+                    persona::archive_dir().display()
+                );
+            } else {
+                println!("no persona named '{name}'");
+            }
+            Ok(())
+        }
+        PersonaCmd::Restore { name } => {
+            let p = persona::restore(&name)?;
+            println!("restored persona '{name}' → {}", p.display());
             Ok(())
         }
         PersonaCmd::Block => {
@@ -13917,6 +14366,15 @@ async fn run_skill(cmd: SkillCmd) -> Result<()> {
                 );
                 return Ok(());
             }
+            // Aligned columns, and the usage count as the triage signal: a skill the agent has never
+            // loaded is either mis-triggered (`when:` doesn't match how the task gets phrased) or not
+            // needed. Unaligned `name — description` gave no way to compare that across rows.
+            let namew = skills
+                .iter()
+                .map(|s| s.name.chars().count())
+                .max()
+                .unwrap_or(0)
+                .min(38);
             for s in &skills {
                 let d = if s.description.is_empty() {
                     &s.when
@@ -13928,23 +14386,55 @@ async fn run_skill(cmd: SkillCmd) -> Result<()> {
                     skill::SkillOrigin::Project => " [project]",
                     skill::SkillOrigin::Repo => " [repo]",
                 };
-                // Voyager provenance (v{N} · {M}× · updated …) — empty for a pristine, never-used v1.
-                let prov = skill::version_tag(s);
-                let prov = if prov.is_empty() {
-                    String::new()
+                let uses = if s.uses > 0 {
+                    format!("{}×", s.uses)
                 } else {
-                    format!("  ({prov})")
+                    "cold".to_string()
                 };
-                println!("{}{tag}{prov}  —  {}", s.name, d);
+                let pad = namew.saturating_sub(s.name.chars().count());
+                println!(
+                    "  {}{}  {:<5} {}{tag}",
+                    s.name,
+                    " ".repeat(pad),
+                    uses,
+                    elide(d, 92)
+                );
             }
+            let cold = skills.iter().filter(|s| s.uses == 0).count();
+            println!("\n{} skill(s)", skills.len());
+            if cold > 0 {
+                println!(
+                    "{}",
+                    style(format!(
+                        "{cold} cold (never loaded — check `when:` matches how you'd phrase the task)"
+                    ))
+                    .dim()
+                );
+            }
+            println!(
+                "{}",
+                style(
+                    "`skill show <name>` reads one · `skill refine <name>` rewrites the steps · \
+                     `skill delete <name>` retires (restorable)"
+                )
+                .dim()
+            );
             if all_zones {
                 let others = skill::list_other_zones();
                 if !others.is_empty() {
                     println!("\nother workspaces' zones (invisible here):");
                     for (zone, s) in &others {
-                        println!("{}  [p:{zone}]  —  {}", s.name, s.description);
+                        println!("  {}  [p:{zone}]  {}", s.name, elide(&s.description, 80));
                     }
                 }
+            }
+            let retired = skill::list_archive();
+            if !retired.is_empty() {
+                let names: Vec<&str> = retired.iter().map(|s| s.name.as_str()).collect();
+                println!(
+                    "\nretired: {} — `aizen skill restore <name>` brings one back",
+                    names.join(", ")
+                );
             }
             Ok(())
         }
@@ -13976,10 +14466,17 @@ async fn run_skill(cmd: SkillCmd) -> Result<()> {
         }
         SkillCmd::Delete { name } => {
             if skill::delete(&name)? {
-                println!("deleted '{name}'");
+                println!(
+                    "retired '{name}' (archived — `aizen skill restore {name}` brings it back)"
+                );
             } else {
                 println!("(no skill named '{name}')");
             }
+            Ok(())
+        }
+        SkillCmd::Restore { name } => {
+            let p = skill::restore(&name)?;
+            println!("restored '{name}' → {}", p.display());
             Ok(())
         }
         SkillCmd::Refine {
@@ -14692,6 +15189,50 @@ fn finish_install(
 mod tests {
     use super::*;
 
+    /// `memory list current` and `memory list --scope current` must mean the same thing.
+    ///
+    /// The REPL has always taken the scope positionally (`/memory list current`), so that is the form
+    /// muscle memory reaches for; the CLI accepted only the flag and answered a positional with
+    /// `error: unexpected argument 'current' found`, which reads as "scopes aren't supported" rather
+    /// than "wrong spelling". The flag stays because it shipped first and scripts pass it — hence
+    /// two fields, resolved to one value, and `conflicts_with` so passing both is a parse error
+    /// instead of one silently winning.
+    #[test]
+    fn memory_list_takes_its_scope_positionally_or_as_a_flag() {
+        let scope_of = |argv: &[&str]| -> Option<String> {
+            match Cli::try_parse_from(argv).expect("parse").command {
+                Some(Commands::Memory {
+                    cmd:
+                        MemoryCmd::List {
+                            scope, scope_flag, ..
+                        },
+                }) => scope.or(scope_flag),
+                other => panic!("expected `memory list`, got {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            scope_of(&["aizen", "memory", "list", "current"]).as_deref(),
+            Some("current"),
+            "the positional form is what the REPL teaches"
+        );
+        assert_eq!(
+            scope_of(&["aizen", "memory", "list", "--scope", "current"]).as_deref(),
+            Some("current"),
+            "the flag form shipped first and must keep working"
+        );
+        assert_eq!(
+            scope_of(&["aizen", "memory", "list"]),
+            None,
+            "no scope ⇒ the unfiltered view"
+        );
+        assert!(
+            Cli::try_parse_from(["aizen", "memory", "list", "current", "--scope", "global"])
+                .is_err(),
+            "two scopes at once is a mistake, not a precedence puzzle"
+        );
+    }
+
     /// A role's key must never reach the screen in the clear.
     ///
     /// The two shapes are deliberately different. `env:VAR` prints the VARIABLE NAME plus whether it
@@ -14704,7 +15245,10 @@ mod tests {
             !literal.contains("super-secret-value"),
             "a literal key must be masked, got {literal}"
         );
-        assert!(literal.contains("***"), "masked form expected, got {literal}");
+        assert!(
+            literal.contains("***"),
+            "masked form expected, got {literal}"
+        );
 
         std::env::set_var("AIZEN_TEST_ROLE_KEY_SET", "some-value");
         let present = role_key_display(Some("env:AIZEN_TEST_ROLE_KEY_SET")).unwrap();

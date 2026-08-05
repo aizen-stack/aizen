@@ -740,7 +740,14 @@ pub fn resolve_entry(id_or_name: &str) -> Result<MemoryEntry> {
 /// `resolve_entry` over an already-loaded set (so a caller with the entries in hand doesn't re-read
 /// the whole store, and tests can drive it without a temp home).
 pub fn resolve_in(entries: Vec<MemoryEntry>, id_or_name: &str) -> Result<MemoryEntry> {
-    let key = id_or_name.trim().to_lowercase();
+    // Listings print shortened ids with a trailing ellipsis (see `short_ids`). Copy-pasting one back
+    // must work, so strip the elision marker — it is display, not part of the identifier.
+    let key = id_or_name
+        .trim()
+        .trim_end_matches('…')
+        .trim_end_matches("...")
+        .trim()
+        .to_lowercase();
     if key.is_empty() {
         anyhow::bail!("no memory id given");
     }
@@ -789,13 +796,86 @@ fn zone_tag(e: &MemoryEntry) -> String {
     }
 }
 
+/// A short, unambiguous handle for an entry, for listings a human has to scan.
+///
+/// Full ids are body-derived slugs: measured on a real 243-entry store the median is 55 chars and
+/// the max is 60, so a listing is a wall of near-identical hyphenated prefixes and the description
+/// — the part that says what the fact IS — gets pushed past the terminal edge. This keeps the head
+/// and elides the rest, then re-lengthens ONLY where that would collide, so what is printed always
+/// resolves to exactly one entry. Every write path (`edit`/`forget`/`show`) accepts a unique
+/// substring, so the shortened form stays copy-pasteable.
+///
+/// Uniqueness is checked against `universe` — the WHOLE store — not just the rows being printed. A
+/// prefix unique among 20 shown rows can still be ambiguous against 243 stored ones, and
+/// [`resolve_in`] searches all of them; shortening against the visible page only would hand the user
+/// a handle that errors as "matches 2 memories".
+fn short_ids(
+    listed: &[&MemoryEntry],
+    universe: &[MemoryEntry],
+) -> std::collections::HashMap<String, String> {
+    const WANT: usize = 24;
+    let mut out = std::collections::HashMap::new();
+    for e in listed {
+        let mut n = WANT;
+        loop {
+            let cand: String = e.id.chars().take(n).collect();
+            // `resolve_in` matches by substring, so a prefix is only safe if no OTHER stored id
+            // contains it anywhere — not merely if no other id starts with it.
+            let clashes = universe.iter().filter(|o| o.id.contains(&cand)).count();
+            if clashes <= 1 || n >= e.id.chars().count() {
+                let shown = if n < e.id.chars().count() {
+                    format!("{cand}…")
+                } else {
+                    cand
+                };
+                out.insert(e.id.clone(), shown);
+                break;
+            }
+            n += 8;
+        }
+    }
+    out
+}
+
+/// The triage column: what a human needs to decide *keep / fix / drop* without opening the entry.
+///
+/// Measured on a real store, the signal that separates rows is CONFIRMED USE: 28/243 have it,
+/// 215 don't. So the tag marks what stands out — a fact the model actually cited, one the extractor
+/// was unsure of, or one nothing has ever touched — and stays BLANK for the unremarkable majority.
+/// An earlier cut printed `·unused` on 206 of 243 rows, which is a column of noise: a marker that
+/// fires on almost everything sorts nothing.
+fn triage_tag(e: &MemoryEntry) -> &'static str {
+    if e.confirmations > 0 {
+        return "used";
+    }
+    if e.confidence > 0.0 && e.confidence < 0.5 {
+        return "low?";
+    }
+    if e.reinforced == 0 {
+        return "cold";
+    }
+    ""
+}
+
 /// Enumerate what is stored, WITHOUT a search query — the answer to "what do you actually know
 /// about me?". Rendered as text (shared by the CLI's `memory list` and the agent's `memory_list`
 /// tool) so the human and the model always see the same inventory, addressed by the same ids.
 ///
 /// `mtype` filters to one kind; `archived` lists the recoverable archive instead of the live store.
-/// Entries are grouped by type and each line leads with the ID, because every write path
-/// (`edit`/`forget`/`supersede`) addresses the id, not the display name.
+/// Entries are grouped by type and each line leads with a (shortened, still-unique) ID, because
+/// every write path (`edit`/`forget`/`supersede`) addresses the id, not the display name.
+///
+/// The layout is built for TRIAGE — "which of these should I fix or drop?" — because that is the
+/// question a stored-fact listing exists to answer, and the previous one couldn't. Measured on a
+/// real 243-entry store it interleaved two types into 81 alternating `[user]`/`[project]` headers,
+/// led every row with a 55-char slug, and showed nothing about whether a fact had ever proved
+/// useful. Three changes, each aimed at one of those:
+///   - **group once, sort within.** Each type is emitted as ONE section, so the eye tracks a stable
+///     column instead of re-anchoring every other row.
+///   - **short ids** ([`short_ids`]), lengthened only on collision, so the description gets the
+///     width instead of the slug.
+///   - **a triage column** ([`triage_tag`]) carrying the two signals that decide the question:
+///     confirmed-in-use, and low extractor confidence.
 pub fn inventory(
     sel: &ScopeSel,
     mtype: Option<MemoryType>,
@@ -809,6 +889,9 @@ pub fn inventory(
         store::load_all()?
     };
     let superseded = all.iter().filter(|e| !e.is_active()).count();
+    // Kept whole: `short_ids` must test candidate prefixes against every stored id, not just the
+    // filtered page, because `resolve_in` will search all of them.
+    let universe = all.clone();
     let mut entries: Vec<MemoryEntry> = all
         .into_iter()
         // The archive is a graveyard: filtering it by `is_active` would hide superseded rows, which
@@ -822,8 +905,8 @@ pub fn inventory(
         let where_ = if archived { "the archive" } else { "this view" };
         return Ok(format!("(nothing stored in {where_})"));
     }
-    // Most-recently-touched first: what the store learned lately is what a "what do you know" question
-    // is usually about, and it keeps the truncated tail the least interesting part.
+    // Group by type FIRST, then most-recently-touched within each group. Sorting by date alone made
+    // the two types interleave, which is what produced 81 header switches for 243 rows.
     entries.sort_by(|a, b| {
         let key = |e: &MemoryEntry| {
             e.updated
@@ -831,14 +914,48 @@ pub fn inventory(
                 .or_else(|| e.created.clone())
                 .unwrap_or_default()
         };
-        key(b).cmp(&key(a)).then_with(|| a.id.cmp(&b.id))
+        a.mtype
+            .as_str()
+            .cmp(b.mtype.as_str())
+            .then_with(|| key(b).cmp(&key(a)))
+            .then_with(|| a.id.cmp(&b.id))
     });
     let shown = limit.min(total);
+    let listed: Vec<&MemoryEntry> = entries.iter().take(shown).collect();
+    let short = short_ids(&listed, &universe);
+    // Pad the id column so the descriptions line up — an unaligned left edge is most of why a long
+    // listing reads as noise. Padded BY HAND because `{:<w$}` counts bytes: the elision char is 3
+    // bytes, so format-width padding over-indents exactly the rows that were shortened.
+    //
+    // Width comes from the 90th percentile, NOT the max: ids only grow past the target when a prefix
+    // would be ambiguous, so on a real store 235 of 243 sat at 25 chars while two collision-widened
+    // ones reached 49 — and aligning to the max indented every row by the 24 columns those two
+    // needed. The few over-long rows push their own description right instead, which costs two
+    // ragged lines rather than a uniformly wasted column.
+    let mut widths: Vec<usize> = listed
+        .iter()
+        .map(|e| {
+            short
+                .get(&e.id)
+                .map_or(e.id.chars().count(), |s| s.chars().count())
+        })
+        .collect();
+    widths.sort_unstable();
+    let idw = widths
+        .get(widths.len().saturating_mul(9) / 10)
+        .copied()
+        .or_else(|| widths.last().copied())
+        .unwrap_or(0);
+    let pad = |s: &str| {
+        let n = idw.saturating_sub(s.chars().count());
+        format!("{s}{}", " ".repeat(n))
+    };
     let mut out = String::new();
     let mut last_type: Option<MemoryType> = None;
-    for e in entries.iter().take(shown) {
+    for e in &listed {
         if last_type != Some(e.mtype) {
-            out.push_str(&format!("\n[{}]\n", e.mtype.as_str()));
+            let n = listed.iter().filter(|o| o.mtype == e.mtype).count();
+            out.push_str(&format!("\n[{}]  {n}\n", e.mtype.as_str()));
             last_type = Some(e.mtype);
         }
         let desc = e.description_or_body_head();
@@ -846,12 +963,14 @@ pub fn inventory(
             Some(by) => format!(" (superseded by {by})"),
             None => String::new(),
         };
-        out.push_str(&format!(
-            "  {}{}{} — {desc}{sup}\n",
-            e.id,
-            zone_tag(e),
-            cat_tag(e)
-        ));
+        let id = short.get(&e.id).cloned().unwrap_or_else(|| e.id.clone());
+        let tag = triage_tag(e);
+        // Category and zone go AFTER the description, not before it. Leading with them pushed the
+        // description to a different column on every row (`[c:security-rule]` is 18 chars,
+        // `[c:command]` is 11, absent is 0), which defeats the alignment the id padding just bought —
+        // and the description is the field being scanned.
+        let meta = format!("{}{}", zone_tag(e), cat_tag(e));
+        out.push_str(&format!("  {}  {:<4} {desc}{sup}{meta}\n", pad(&id), tag,));
     }
     if shown < total {
         out.push_str(&format!(
@@ -859,11 +978,41 @@ pub fn inventory(
             total - shown
         ));
     }
+    // The footer is where triage starts: name the counts that suggest what to prune, and the verb
+    // that does it. A listing that reports only a total tells the reader nothing to act on.
+    let cold = listed
+        .iter()
+        .filter(|e| e.confirmations == 0 && e.reinforced == 0)
+        .count();
+    let lowconf = listed
+        .iter()
+        .filter(|e| e.confidence > 0.0 && e.confidence < 0.5)
+        .count();
+    let used = listed.iter().filter(|e| e.confirmations > 0).count();
     out.push_str(&format!("\n{total} stored"));
     if !archived && superseded > 0 {
         out.push_str(&format!(
             "; {superseded} superseded (hidden — `memory as-of <date>`)"
         ));
+    }
+    if !archived {
+        let mut hints = Vec::new();
+        if used > 0 {
+            hints.push(format!("{used} used"));
+        }
+        if cold > 0 {
+            hints.push(format!("{cold} cold"));
+        }
+        if lowconf > 0 {
+            hints.push(format!("{lowconf} low?"));
+        }
+        if !hints.is_empty() {
+            out.push_str(&format!("  ({})", hints.join(", ")));
+        }
+        out.push_str(
+            "\nused = the model cited it · cold = never recalled · low? = extractor unsure\
+             \n`memory show <id>` reads one · `memory edit <id> <text>` fixes · `memory forget <id>` retires (restorable)",
+        );
     }
     Ok(out.trim_start().to_string())
 }
@@ -1273,21 +1422,24 @@ pub fn cmd_review(promote: Option<String>, drop_key: Option<String>, clear: bool
         };
         let id = store::add_learned(&w)?;
         let _ = std::fs::remove_file(&item.path);
-        println!("promoted review item '{}' → store entry '{id}'", item.id);
+        tui::emit_line(&format!(
+            "promoted review item '{}' → store entry '{id}'",
+            item.id
+        ));
         return Ok(());
     }
 
     if queued.is_empty() {
-        println!("(review queue empty)");
+        tui::emit_line("(review queue empty)");
         return Ok(());
     }
     for e in &queued {
-        println!("[{:.2}] {} — {}", e.confidence, e.id, e.body);
+        tui::emit_line(&format!("[{:.2}] {} — {}", e.confidence, e.id, e.body));
     }
-    println!(
-        "\n{} item(s). Promote: `aizen memory review --promote <id>`; discard all: `aizen memory review --clear`",
+    tui::emit_line(&format!(
+        "\n{} item(s). Promote: `/memory review promote <id>`; discard all: `/memory review clear`",
         queued.len()
-    );
+    ));
     Ok(())
 }
 
@@ -1944,6 +2096,66 @@ mod tests {
         .unwrap();
     }
 
+    /// THE regression guard for cross-kind edges. Graph expansion resolves neighbor ids against the
+    /// fact store; a `skill:`/`persona:` node matches no entry, so it must fall out silently instead
+    /// of corrupting or truncating the hit list. If this ever breaks, every recall in the product
+    /// degrades — which is why the link ships with this test rather than a manual check.
+    #[test]
+    fn graph_expansion_ignores_cross_kind_nodes() {
+        with_recall_home("xkind", || {
+            seed_recallable(
+                "pnpm",
+                "the user prefers pnpm over npm for package installs",
+            );
+            let today = bloat::decay::today();
+            let all = store::load_all().unwrap();
+            let fact_id = all[0].id.clone();
+
+            // Wire the fact to a skill and a persona insight, as `skill_load`/reflection now do.
+            graph::record_coretrieval(
+                &[
+                    &fact_id,
+                    &graph::node_skill("win build"),
+                    &graph::node_persona("kira", "in-verify"),
+                ],
+                &today,
+            )
+            .unwrap();
+
+            let mut hits = search_filtered_scoped(
+                "does the user prefer pnpm or npm",
+                5,
+                None,
+                &ScopeSel::default_view(),
+            )
+            .unwrap();
+            assert!(!hits.is_empty(), "the seed fact must still be found");
+            let before = hits.len();
+
+            expand_with_graph(
+                &mut hits,
+                "does the user prefer pnpm",
+                5,
+                &ScopeSel::default_view(),
+            );
+
+            assert_eq!(
+                hits.len(),
+                before,
+                "cross-kind neighbors must add no phantom hits"
+            );
+            assert!(
+                hits.iter().all(|h| !h.entry.id.contains(':')),
+                "a namespaced node must never surface as a fact"
+            );
+            // And the cross-kind edges themselves are intact — expansion is read-only.
+            assert_eq!(
+                graph::neighbors_of_kind(&fact_id, graph::SKILL_PREFIX, &today, 5, 0.0).len(),
+                1
+            );
+        });
+    }
+
     #[test]
     fn recall_block_is_none_below_the_relevance_gate() {
         with_recall_home("gate", || {
@@ -2494,6 +2706,75 @@ mod tests {
             tokens: tokenize(text),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn short_ids_stay_resolvable_and_lengthen_only_on_collision() {
+        // Real ids are 55-char body-derived slugs, and near-identical prefixes are the norm — two
+        // facts about the same subject share their first 30+ chars. A shortened id that no longer
+        // resolves would silently break `show`/`edit`/`forget`, so this is the contract to pin.
+        let long_a = "aizen-be-runtime-upstream-endpoint-db-rwlock-atomic-update";
+        let long_b = "aizen-be-runtime-upstream-endpoint-ui-dashboard-save-trap";
+        let distinct = "git-bash-has-no-credential-helper-on-this-machine";
+        let all = vec![
+            entry(long_a, "one"),
+            entry(long_b, "two"),
+            entry(distinct, "three"),
+        ];
+        let listed: Vec<&MemoryEntry> = all.iter().collect();
+        let short = short_ids(&listed, &all);
+
+        // The distinct id shortens to the 24-char target.
+        let d = &short[distinct];
+        assert!(d.ends_with('…'), "a long distinct id is elided: {d}");
+        assert!(
+            d.chars().count() <= 25,
+            "elided to about the target width: {d}"
+        );
+
+        // The colliding pair had to grow PAST the shared prefix, or they'd be the same handle.
+        let a = &short[long_a];
+        let b = &short[long_b];
+        assert_ne!(a, b, "colliding ids must not render identically");
+        assert!(
+            a.chars().count() > 25 && b.chars().count() > 25,
+            "collision forced growth: {a} / {b}"
+        );
+
+        // Every rendered handle — ellipsis included, as a user would paste it — resolves to exactly
+        // the entry it was printed for.
+        for e in &all {
+            let shown = &short[&e.id];
+            let got = resolve_in(all.clone(), shown)
+                .unwrap_or_else(|err| panic!("'{shown}' must resolve: {err}"));
+            assert_eq!(got.id, e.id, "'{shown}' resolved to the wrong entry");
+        }
+    }
+
+    #[test]
+    fn triage_tag_marks_the_minority_and_stays_quiet_otherwise() {
+        // The tag exists to make outliers findable. If it fired on the common case it would be a
+        // column of noise — an earlier cut printed "unused" on 206 of 243 rows.
+        let mut used = entry("a", "x");
+        used.confirmations = 2;
+        assert_eq!(triage_tag(&used), "used");
+
+        let mut low = entry("b", "x");
+        low.confidence = 0.3;
+        low.reinforced = 1;
+        assert_eq!(triage_tag(&low), "low?");
+
+        let cold = entry("c", "x"); // never recalled, never confirmed
+        assert_eq!(triage_tag(&cold), "cold");
+
+        let mut ordinary = entry("d", "x");
+        ordinary.reinforced = 3;
+        ordinary.confidence = 0.8;
+        assert_eq!(
+            triage_tag(&ordinary),
+            "",
+            "the unremarkable majority gets no marker"
+        );
     }
 
     #[test]

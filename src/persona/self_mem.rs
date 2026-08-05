@@ -261,6 +261,26 @@ pub fn save_insight(persona_slug: &str, body: &str, importance: u8) -> Result<St
     Ok(id)
 }
 
+/// Wire a freshly-saved insight to the facts recalled while it was formed (Hebbian, cross-kind).
+///
+/// Best-effort and silent, like the fact-to-fact spine: no recall ledger this turn, or a disabled
+/// graph, simply means no signal. What it buys is the ability to ask later "which of this character's
+/// lessons belong to the situation we are in now" from the facts alone.
+pub fn note_insight_cofire(persona_slug: &str, insight_id: &str) {
+    if !crate::memory::graph::recording_enabled() {
+        return;
+    }
+    let facts = crate::memory::pending::current();
+    if facts.is_empty() {
+        return;
+    }
+    let node = crate::memory::graph::node_persona(persona_slug, insight_id);
+    let mut ids: Vec<&str> = vec![node.as_str()];
+    ids.extend(facts.iter().map(|p| p.id.as_str()));
+    let today = crate::memory::bloat::decay::today();
+    let _ = crate::memory::graph::record_coretrieval(&ids, &today);
+}
+
 fn normalize(s: &str) -> String {
     s.split_whitespace()
         .collect::<Vec<_>>()
@@ -270,15 +290,34 @@ fn normalize(s: &str) -> String {
 
 /// Token set for cheap near-dup (Jaccard). Short stopwords stripped so "the user asked hello"
 /// doesn't thrash on function words.
+///
+/// The list is BILINGUAL because the episodes are. With English stopwords only, two Vietnamese
+/// insights saying the same thing shared almost nothing but function words: measured across 40 real
+/// insights the highest pairwise Jaccard was 0.15 against a 0.75 threshold, so the dedup gate never
+/// fired and one idea accumulated a dozen near-identical copies. Stripping Vietnamese function words
+/// leaves the content words the comparison is actually about.
 fn content_tokens(s: &str) -> std::collections::HashSet<String> {
     const STOP: &[&str] = &[
+        // English
         "the", "a", "an", "i", "me", "my", "you", "your", "and", "or", "to", "of", "in", "on",
         "for", "is", "are", "was", "were", "it", "this", "that", "with", "as", "at", "be", "have",
         "has", "user", "asked", "answered", "directly", "via", "steps", "tool", "tools",
+        // Vietnamese — pronouns, copulas, prepositions, determiners, discourse particles. These are
+        // the words that dominate a short Vietnamese sentence, so leaving them in made every pair
+        // look 15% alike and no pair look 75% alike.
+        "tôi", "toi", "bạn", "ban", "anh", "em", "mình", "minh", "người", "nguoi", "dùng", "dung",
+        "là", "la", "và", "va", "của", "cua", "cho", "với", "voi", "khi", "một", "mot", "này",
+        "nay", "đó", "do", "được", "duoc", "có", "co", "không", "khong", "thì", "thi", "mà", "ma",
+        "nên", "nen", "cần", "can", "phải", "phai", "sẽ", "se", "đã", "da", "đang", "thay", "vì",
+        "vi", "để", "de", "các", "cac", "những", "nhung", "ở", "trong", "ra", "vào", "vao", "lại",
+        "lai", "rồi", "roi", "nữa", "nua", "hơn", "hon", "rất", "rat", "cũng", "cung", "chỉ",
+        "chi", "theo", "sau", "trước", "truoc", "hay", "hoặc", "hoac", "nếu", "neu", "bằng",
+        "bang", "về", "ve", "từ", "tu", "đến", "den", "gì", "gi", "nào", "nao", "sao", "thế",
+        "the", "việc", "viec", "cái", "cai",
     ];
     normalize(s)
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.len() >= 2 && !STOP.contains(t))
+        .filter(|t| t.chars().count() >= 2 && !STOP.contains(t))
         .map(str::to_string)
         .collect()
 }
@@ -582,6 +621,17 @@ fn rank(m: &SelfMemory, today: chrono::NaiveDate) -> f64 {
 
 /// The inner `<self>` block: **insight-first** (CoALA semantic / MemoryBank profile), then at most
 /// a couple of hot formative episodes. Capped at `max_tokens`. `None` when empty.
+///
+/// This rides the **dynamic system lane**, which carries its own cache breakpoint, so its steady-state
+/// cost is a cache read rather than fresh tokens. That is why it is deliberately NOT gated on the
+/// user's query the way [`crate::skills::turn_block`] and [`crate::memory::recall_block`] are: a
+/// per-turn selection here would rewrite lane 1 every turn and force the whole transcript after it
+/// to re-bill uncached, costing far more than a tighter block could save.
+///
+/// A redundancy gate was tried here and removed: measured across the 40 real insights of a saturated
+/// persona, the highest pairwise Jaccard was 0.455, so any threshold worth setting (≥0.5) collapsed
+/// zero pairs. Genuine near-duplicates in this store restate an idea in different words, which is an
+/// embedding question, not a token-overlap one. The honest fix is curation — see `persona insights`.
 pub fn self_block(persona_slug: &str, max_tokens: usize) -> Option<String> {
     let mems = list(persona_slug);
     if mems.is_empty() {
@@ -691,6 +741,64 @@ fn prune_kind(persona_slug: &str, kind: Kind, cap: usize) {
     }
 }
 
+/// Retire one self-memory by id — soft, into the same `.archive/` dir [`prune_kind`] uses.
+///
+/// The only way an insight left this store before now was [`prune_kind`] evicting the *lowest-ranked*
+/// one once the cap was already full. That makes the cap self-enforcing but leaves no way to remove a
+/// specific bad insight: a wrong-but-important one outranks the eviction order forever, and at a
+/// saturated 40/40 cap it also blocks the slot a better one would take. This is the missing verb —
+/// the same soft-delete-plus-restore contract memory facts and skills already have.
+pub fn forget(persona_slug: &str, id: &str) -> Result<PathBuf> {
+    let src = self_dir(persona_slug).join(format!("{id}.md"));
+    if !src.exists() {
+        anyhow::bail!("no self-memory '{id}' for persona '{persona_slug}'");
+    }
+    let adir = archive_dir(persona_slug);
+    fs::create_dir_all(&adir).with_context(|| format!("creating {}", adir.display()))?;
+    let dest = crate::memory::bloat::caps::unique_in(&adir, id);
+    fs::rename(&src, &dest).with_context(|| format!("retiring {}", src.display()))?;
+    Ok(dest)
+}
+
+/// Bring a retired self-memory back. Refuses to overwrite a live one — the id is what `forget` and
+/// the graph's `persona:` endpoints name, so two files answering to one id would be ambiguous.
+pub fn restore(persona_slug: &str, id: &str) -> Result<PathBuf> {
+    let src = archive_dir(persona_slug).join(format!("{id}.md"));
+    if !src.exists() {
+        anyhow::bail!("no retired self-memory '{id}' for persona '{persona_slug}'");
+    }
+    let dest = self_dir(persona_slug).join(format!("{id}.md"));
+    if dest.exists() {
+        anyhow::bail!("a live self-memory '{id}' already exists — retire it first");
+    }
+    fs::create_dir_all(self_dir(persona_slug)).ok();
+    fs::rename(&src, &dest).with_context(|| format!("restoring {}", src.display()))?;
+    Ok(dest)
+}
+
+/// Retired self-memories, newest first, for the review surface.
+pub fn list_archive(persona_slug: &str) -> Vec<SelfMemory> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(archive_dir(persona_slug)) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x.eq_ignore_ascii_case("md"))
+            != Some(true)
+        {
+            continue;
+        }
+        if let Some(m) = from_file(&p) {
+            out.push(m);
+        }
+    }
+    out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    out
+}
+
 /// Bodies of the most-recent *formative* episodes (oldest→newest) for the reflection pass.
 /// Noise episodes (importance < FORMATIVE_MIN) are excluded so reflection never distills "hello".
 pub fn recent_episode_bodies(persona_slug: &str, n: usize) -> Vec<String> {
@@ -758,6 +866,89 @@ mod tests {
         std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
         out
+    }
+
+    /// The dedup gate compares CONTENT words, so its stopword list has to cover the language the
+    /// episodes are written in. With English stopwords only, a Vietnamese restatement scored ~0.15
+    /// against a 0.75 threshold — the gate never fired and one idea piled up a dozen copies.
+    #[test]
+    fn vietnamese_function_words_do_not_hide_a_restatement() {
+        let a =
+            "Tôi nên làm việc chủ động, đi đến kết quả đã triển khai và kiểm chứng thay vì chỉ \
+                 giải thích cách làm; khi còn hạng mục dang dở, tôi cần tiếp tục hoàn thiện chúng \
+                 trước khi kết thúc.";
+        let restated = "Tôi nên làm việc chủ động và kiểm chứng kết quả, khi còn hạng mục dang dở \
+                        thì tôi cần tiếp tục hoàn thiện chúng trước khi kết thúc.";
+        let j = jaccard(&content_tokens(a), &content_tokens(restated));
+        assert!(
+            j >= 0.75,
+            "a restatement must reach the insight dedup threshold, got {j:.2}"
+        );
+
+        // Vietnamese pronouns/copulas carry no signal: two unrelated sentences built from them must
+        // NOT look alike, or the gate would start swallowing genuinely new insights.
+        let x = "Tôi cần chạy kiểm thử trước khi báo cáo kết quả.";
+        let y = "Tôi nên hỏi lại người dùng về phạm vi thay đổi.";
+        let ju = jaccard(&content_tokens(x), &content_tokens(y));
+        assert!(ju < 0.5, "unrelated sentences must stay apart, got {ju:.2}");
+
+        // Single-syllable Vietnamese words are multi-BYTE: a `len() >= 2` filter kept "ở"/"ừ" as
+        // tokens while dropping 2-char ASCII. The filter counts CHARS.
+        assert!(
+            !content_tokens("ở trong nhà").contains("ở"),
+            "one-char tokens are not content"
+        );
+    }
+
+    #[test]
+    fn forget_archives_an_insight_and_restore_brings_it_back() {
+        with_home("forget", || {
+            let id = save_insight("kira", "I should verify before reporting done", 9).unwrap();
+            assert_eq!(counts("kira").1, 1, "one insight live");
+
+            let archived = forget("kira", &id).expect("retire succeeds");
+            assert!(archived.exists(), "the file moved, it was not deleted");
+            assert_eq!(counts("kira").1, 0, "gone from the live set");
+            assert!(
+                !self_block("kira", 700)
+                    .unwrap_or_default()
+                    .contains("verify before reporting"),
+                "a retired insight leaves the always-on block"
+            );
+            assert_eq!(list_archive("kira").len(), 1, "listed as retired");
+
+            restore("kira", &id).expect("restore succeeds");
+            assert_eq!(counts("kira").1, 1, "back in the live set");
+            assert!(
+                self_block("kira", 700)
+                    .unwrap()
+                    .contains("verify before reporting"),
+                "and back in the block, verbatim"
+            );
+            assert!(list_archive("kira").is_empty());
+        });
+    }
+
+    #[test]
+    fn forget_refuses_unknown_ids_and_restore_refuses_to_collide() {
+        with_home("forget-edge", || {
+            assert!(
+                forget("kira", "nope").is_err(),
+                "retiring what isn't there is an error, not a silent no-op"
+            );
+            let id = save_insight("kira", "some durable lesson worth keeping", 8).unwrap();
+            forget("kira", &id).unwrap();
+            // A fresh insight can land on the same body-derived stem while the old one sits archived;
+            // restoring on top of it would leave two files answering to one id.
+            let again = save_insight("kira", "some durable lesson worth keeping", 8).unwrap();
+            if again == id {
+                assert!(
+                    restore("kira", &id).is_err(),
+                    "restore must not overwrite a live self-memory"
+                );
+            }
+            assert!(restore("kira", "never-existed").is_err());
+        });
     }
 
     #[test]

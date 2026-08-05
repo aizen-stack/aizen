@@ -5,6 +5,110 @@ All notable changes to **Aizen** (`aizen`) — the pure-Rust agentic coding CLI.
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
+## [0.5.7] — 2026-08-05
+
+Two things this release is about. **A hosted daemon now answers several conversations at once**
+instead of one at a time. And the **memory / skill / persona** trio — three stores that were
+supposed to reinforce each other — stopped being write-only-and-growing: two of the three had
+silently stopped recording, none could be curated, and the read path spent tokens on every turn
+whether or not the content bore on the question.
+
+### Fixed
+- **One slow chat no longer freezes every bot the daemon hosts.** `aizen serve` ran a single turn at
+  a time for the whole process, so a `cargo test` in one chat blocked every other chat and every
+  other bot behind it, for minutes — hosting several bots was cosmetic. Each `(bot, chat)` now owns a
+  queue and a worker (`src/hostbot/lane.rs`), and lanes on different working directories run in
+  parallel. Three things stay serialized on purpose, because parallelising them corrupts state
+  rather than speeding anything up: one turn at a time **per chat** (history is never written
+  twice), one writer **per workspace root** (`WorkspaceWriterLease` treats a second acquisition of
+  the same worktree as reentrant — correct for a parent and its sub-agent, silently fatal between
+  two unrelated lanes), and memory learning (one global store). A semaphore caps total concurrent
+  turns, since each can spawn a compiler.
+- **Per-lane `/cd`, `/model`, `/effort`, `/approval`.** These wrote the machine-wide
+  `cli-config.json`, so one chat's `/cd` moved every other chat. They now persist to
+  `hostbot/lanes.json`, keyed by route, with every field optional — an absent file behaves exactly
+  as before. Identity (`bots.json`: token, owner, persona) stays a separate file, so a `/cd` can
+  never rewrite a token.
+- **`--health` no longer reports the wrong daemon.** A Telegram and a Discord daemon on one machine
+  shared a single heartbeat file and overwrote each other. Now one record per platform, tagged with
+  the hostname and device id (heartbeats often land in a synced home directory, where a bare pid
+  says nothing about whose daemon it describes), plus live/mid-turn lane counts. The pre-split path
+  is still read, so a probe keeps working across a rolling upgrade.
+- **Skills and persona insights had stopped being written at all** — skills since 2026-07-26,
+  persona self-memory since 2026-07-28 (stuck at 40/40 episodes and 40/40 insights). Both come from
+  the same single model call as memory facts, and the JSON skeleton in the extractor prompt declared
+  all four sub-fields for `facts` but only the bare word `null` for `episode` and `skill`. The model
+  had to guess five field names it had never been shown; the parser requires them and returns `None`
+  when they are absent. Facts were never guessing, which is exactly why one of the three kept
+  working. The unit test passed a fully-shaped object, so it verified the parser and not whether the
+  prompt could teach that shape — the drift test added here reads the prompt itself.
+- **A long turn no longer starves the extractor of the transcript.** The injected fact block was
+  written first and the transcript got whatever budget survived. Measured on 107 real turns: 62% of
+  the turns that clear the tool-call gate exceed the 6000-char shared-model budget, peak 26,702
+  chars. The transcript now has a floor and the injected block loses its tail handles instead — a
+  fact is re-derivable from the user turn and the block itself, a **procedure exists nowhere but the
+  transcript**. Injected bodies are also capped at the same `MAX_FACT_CHARS` the facts themselves
+  obey (the largest stored entry is 4511 chars and was being inlined whole).
+- **Vietnamese near-duplicates stopped slipping past the persona dedup gate.** The stopword list was
+  English-only, so on real Vietnamese insights the highest pairwise Jaccard was 0.15 against a 0.75
+  threshold — the gate could not fire. One concept had accumulated 12 variants.
+- **A test-teardown bug that framed an innocent file.** Six helpers restored the environment by
+  *deleting* `USERPROFILE`/`HOME`. A process with no home makes `is_forbidden_root` false for every
+  directory, so a later walk climbs past the user profile — and the failure surfaced in an unrelated
+  test in a different module, only under a full parallel run. A Drop-based `EnvGuard` now restores
+  the previous value, including restoring "was absent". The earlier diagnosis blaming a stray
+  `~/package.json` was wrong; no file needs deleting.
+
+### Added
+- **The skill index is now chosen per turn instead of always-on.** Every applicable skill was named
+  on every turn — applicability (right OS, tools present) is not relevance (does this bear on what
+  was asked). A skill is named only when its `when:` trigger covers ≥34% of the query's tokens —
+  deliberately the same constant as the memory recall gate, since it is the same question over the
+  same tokenizer, and two different numbers would only mean one of them was unmeasured. Measured on
+  the real store: 642 tokens/turn → 0 for "fix the flaky parse test", 0 for "why is the build slow",
+  61 for "format the vietnamese thesis docx"; still fires at 0.75 for "push my local changes to
+  github". The block rides the **user turn**, not the system prompt: the dynamic system lane has its
+  own cache breakpoint, so a per-turn selection there would rewrite it every turn and re-bill the
+  whole transcript after it. For the same reason persona's block is deliberately **not** gated.
+  Sub-agents gate on their task text and fall back to the full index when nothing matches — a spawn
+  has no cache to amortize against, so a broad index is pure cost there.
+- **Curation verbs the three stores were missing.** `skill delete` is now a soft delete (archived,
+  `skill restore <name>` brings it back — the function existed with no CLI surface); a `skill_forget`
+  tool so the agent that learns a skill can also retire one; `persona forget <id>` / `unforget <id>`
+  for self-memories, which had no delete at all and so could only fill up; `persona save` versions
+  the previous card into `.archive/` instead of overwriting it, and `persona delete` archives the
+  self-memory directory rather than `remove_dir_all`-ing it.
+- **`/memory review` in the REPL.** `cmd_review` (list / promote / drop / clear) was fully
+  implemented and reachable only from the CLI, so a 29-item queue sat untouched. Its output moved
+  from `println!` to `tui::emit_line`, which is what makes it visible mid-chat under the retained
+  renderer.
+- **Cross-kind graph edges.** Endpoints take a namespace (`skill:`, `persona:`) so co-retrieval can
+  link a skill or an insight to the facts it fired alongside. Memory ids are `[a-z0-9-]` slugs, so
+  `:` cannot collide with one — verified against the real store (0 of 243 ids, 0 of 189 endpoints).
+  Old `graph.tsv` files load unchanged, and `expand_with_graph` iterates real entries so a namespaced
+  node it cannot resolve is skipped rather than corrupting recall. Graph-informed skill ranking is
+  behind `AIZEN_SKILL_GRAPH_RANK`, **default off**, pending a bench.
+
+### Changed
+- **`memory list` and `skill list` are laid out for triage** — deciding what to fix or drop is the
+  question these listings exist to answer, and neither could. `memory list` interleaved two types
+  into 81 alternating headers and led every row with a 55-char slug; it now groups each type once,
+  shortens ids to the first unique prefix (checked against the whole store, since `resolve_in`
+  matches by substring — the printed handle always resolves), and adds a triage column that marks
+  only the minority worth looking at: `used` (the model cited it), `cold` (never recalled), `low?`
+  (the extractor was unsure). Blank for the unremarkable majority — an earlier cut printed `unused`
+  on 206 of 243 rows, and a marker that fires on almost everything sorts nothing. `skill list` gains
+  an aligned name column, a load count, `cold` for never-loaded, and a footer that names the commands
+  that act on a row. Both footers name only commands that exist — the first draft of this hint
+  advertised three that didn't.
+- **`aizen memory list current` works.** The REPL has always taken the scope positionally, so that is
+  the form muscle memory reaches for; the CLI accepted only `--scope` and answered a positional with
+  `error: unexpected argument 'current' found`, which reads as "scopes aren't supported". Both forms
+  are accepted now; passing both at once is a parse error rather than a precedence puzzle.
+- **Session files are garbage-collected at startup.** A long-lived daemon kept one file per chat that
+  ever messaged it, forever, each holding conversation text. Files untouched for 30 days are removed
+  (`AIZEN_SESSION_TTL_DAYS`, `0` disables).
+
 ## [0.5.6] — 2026-08-03
 
 A single bug wasted one tool round in most multi-step turns: the **first** call of a batch ran with

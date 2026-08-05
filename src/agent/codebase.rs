@@ -2466,22 +2466,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let proj = base.join("proj");
         std::fs::create_dir_all(&proj).unwrap();
-        std::env::set_var("USERPROFILE", &base);
-        std::env::set_var("HOME", &base);
-        std::env::set_var("AIZEN_HOME", base.join(".aizen"));
-        std::env::set_var("AIZEN_HOME", base.join(".aizen"));
-        std::env::set_var("AIZEN_PROJECT_ROOT", &proj);
+        // RESTORE on drop — see `EnvGuard`: deleting USERPROFILE/HOME disables
+        // home-boundary guards for whatever test runs next.
+        let _env = crate::core::config::EnvGuard::set([
+            ("USERPROFILE", base.clone()),
+            ("HOME", base.clone()),
+            ("AIZEN_HOME", base.join(".aizen")),
+            ("AIZEN_PROJECT_ROOT", proj.clone()),
+        ]);
         // Kill the project-slug cache so a prior test's slug can't bleed through.
         let out = f(&proj);
-        for v in [
-            "USERPROFILE",
-            "HOME",
-            "AIZEN_HOME",
-            "AIZEN_HOME",
-            "AIZEN_PROJECT_ROOT",
-        ] {
-            std::env::remove_var(v);
-        }
+        drop(_env);
         let _ = std::fs::remove_dir_all(&base);
         out
     }

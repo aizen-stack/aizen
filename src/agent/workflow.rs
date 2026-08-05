@@ -619,7 +619,14 @@ async fn run_one_task(
         None => {
             let m = task.model.as_deref().unwrap_or(model);
             let ep = crate::core::cli_config::endpoint_for_model(m, &caller);
-            let system = build_subagent_prompt(&task.role, root, &ep.model, date, None);
+            let system = build_subagent_prompt(
+                &task.role,
+                root,
+                &ep.model,
+                date,
+                None,
+                Some(task.prompt.as_str()),
+            );
             (
                 task.role.clone(),
                 ep,
@@ -722,10 +729,8 @@ async fn run_one_task(
     // trace of `⋯ t1 (reviewer) running…` gives the user no way to tell them apart, so carry each
     // child's own subject. Same clipper as the `workflow` spawn line, so one task cannot appear
     // under two different names on two surfaces.
-    let subject = crate::agent::subagent_subject(
-        &serde_json::json!({"prompt": task.prompt.as_str()}),
-        44,
-    );
+    let subject =
+        crate::agent::subagent_subject(&serde_json::json!({"prompt": task.prompt.as_str()}), 44);
     let child_track = crate::agent::orchestration::start_workflow_child(
         parent,
         &task.id,

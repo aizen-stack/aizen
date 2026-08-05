@@ -1,13 +1,16 @@
-//! Process-global "active conversation" marker.
+//! Which conversation the running turn belongs to.
 //!
-//! Exactly ONE agent turn runs at a time within a process: the REPL is serial, the `serve` daemon
-//! handles inbound messages serially, and a turn's delegated sub-agents serialize on any tool that
-//! declares `is_concurrency_safe() == false` (the browser tools do). So a single slot naming the
-//! conversation currently being served is enough to scope per-conversation resources (e.g. the
-//! browser session) WITHOUT threading an id through every `Tool::execute` signature. Set at each
-//! turn boundary; read by resource registries that must not bleed state across conversations.
-
-use std::sync::RwLock;
+//! Per-conversation resources must not bleed between chats, so they key off [`active`]. Today the only
+//! such resource is the browser session and its `@ref`s, which is behind `--features browser` — hence
+//! the `cfg` gates below: in a default build nothing reads this, and an ungated `pub fn` would just be
+//! dead code claiming to be API.
+//!
+//! The authoritative answer is the turn's [`crate::core::exec_ctx::ExecutionContext`], seeded into a
+//! thread-local INSIDE the `spawn_blocking` closure that runs each tool body — that is the only value
+//! that stays correct when the `serve` daemon runs one lane per `(bot, chat)` CONCURRENTLY.
+//!
+//! The process-global slot below is the fallback for paths that never build a context: the REPL and
+//! one-shot CLI runs, where exactly one conversation exists per process anyway.
 
 /// Stable identity of one logical conversation: a REPL session slug, or a `serve`
 /// `platform:route:chat` triple. Cheap to clone; used as a `HashMap` key.
@@ -18,6 +21,7 @@ impl ConversationId {
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
+    #[cfg(any(feature = "browser", test))]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -29,19 +33,22 @@ impl std::fmt::Display for ConversationId {
     }
 }
 
-static ACTIVE: RwLock<Option<ConversationId>> = RwLock::new(None);
+#[cfg(any(feature = "browser", test))]
+static ACTIVE: std::sync::RwLock<Option<ConversationId>> = std::sync::RwLock::new(None);
 
-/// Mark the conversation currently being served (called at each turn boundary). `None` reverts to
-/// the shared default identity — right for a one-shot CLI invocation that has no persistent thread.
+/// Mark the conversation being served on paths that don't build an `ExecutionContext`.
+///
+/// NOT for the concurrent `serve` lanes: a process-global written by several lanes would name
+/// whichever turn started last. Those pass the id on their turn's context instead.
+#[cfg(any(feature = "browser", test))]
 pub fn set_active(id: Option<ConversationId>) {
     *ACTIVE.write().unwrap_or_else(|e| e.into_inner()) = id;
 }
 
-/// The conversation this turn serves. Prefers the thread-local [`crate::core::exec_ctx`] context
-/// pinned for the running turn — authoritative inside a tool body, which runs on a `spawn_blocking`
-/// worker thread where the process-global slot could otherwise reflect a DIFFERENT interleaved turn.
-/// Falls back to the process-global `ACTIVE` slot (the driver thread's view), then to a stable
-/// `"default"` identity when none is set (a single-shot CLI run). Never panics on a poisoned lock.
+/// The conversation this turn serves — the turn's own context when one is pinned (authoritative
+/// inside a tool body, and the only correct answer under concurrent lanes), else the process-global
+/// slot, else a stable `"default"`. Never panics on a poisoned lock.
+#[cfg(any(feature = "browser", test))]
 pub fn active() -> ConversationId {
     if let Some(ctx) = crate::core::exec_ctx::current() {
         return ctx.conversation();
@@ -56,6 +63,7 @@ pub fn active() -> ConversationId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::exec_ctx::{self, ExecutionContext};
 
     #[test]
     fn active_defaults_then_tracks_set() {
@@ -69,5 +77,28 @@ mod tests {
             "default",
             "clearing reverts to the shared default"
         );
+    }
+
+    #[test]
+    fn a_pinned_turn_context_wins_over_the_process_global() {
+        // The concurrency guarantee: a tool body running for lane B must see lane B's conversation
+        // even though lane A wrote the process-global slot most recently.
+        set_active(Some(ConversationId::new("telegram:laneA:1")));
+        exec_ctx::with_current(
+            ExecutionContext::new(ConversationId::new("telegram:laneB:2")),
+            || {
+                assert_eq!(
+                    active().as_str(),
+                    "telegram:laneB:2",
+                    "the running turn's own context is authoritative"
+                );
+            },
+        );
+        assert_eq!(
+            active().as_str(),
+            "telegram:laneA:1",
+            "outside the turn, the global slot answers again"
+        );
+        set_active(None);
     }
 }

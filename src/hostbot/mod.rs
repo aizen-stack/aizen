@@ -13,6 +13,7 @@
 
 mod daemon;
 pub mod health;
+pub mod lane;
 pub mod platform;
 pub mod platforms;
 mod service;

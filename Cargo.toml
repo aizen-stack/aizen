@@ -1,6 +1,6 @@
 [package]
 name = "aizen"
-version = "0.5.6"
+version = "0.5.7"
 edition = "2021"
 description = "Aizen first-party agentic coding CLI — OpenAI-compatible, hermes-style provider-agnostic API client"
 license = "Apache-2.0"

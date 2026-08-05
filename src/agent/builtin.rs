@@ -194,6 +194,7 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     r.register(Box::new(ShellRun::new(root.to_path_buf())));
     r.register(Box::new(SkillSave));
     register_skill_refine(&mut r);
+    register_skill_forget(&mut r);
     // Top-level only (NOT in role sub-agents) — the in-session list + process pool are shared, so a
     // sub-agent must not clobber them. `role_registry` builds its own list and never gets these.
     r.register(Box::new(crate::agent::todo::TodoWrite));
@@ -276,6 +277,15 @@ fn register_skill_refine(r: &mut ToolRegistry) {
     }
 }
 
+/// Advertise `skill_forget` only when at least one skill exists, and only at TOP LEVEL — the same
+/// posture as `memory_forget`: retiring a procedure is a curation decision about the user's own
+/// curriculum, which a focused sub-agent has no business making mid-task.
+fn register_skill_forget(r: &mut ToolRegistry) {
+    if crate::skills::has_any() {
+        r.register(Box::new(SkillForget));
+    }
+}
+
 /// The agentskill.sh marketplace tools (`skill_search`/`skill_install`) — ALWAYS available (their
 /// whole point is finding a skill when you have none locally). Every registry.
 fn register_skill_registry(r: &mut ToolRegistry) {
@@ -315,6 +325,11 @@ fn register_notify(r: &mut ToolRegistry) {
 ///
 /// `persona_create` lives ONLY here (the top-level user-facing path), never in `role_registry`:
 /// a coder/tester/reviewer sub-agent has no business minting characters.
+///
+/// `root`: the directory the file/shell tools resolve relative paths against. `None` ⇒ the process
+/// cwd (the REPL and one-shot CLI, where cwd IS the project). The `serve` daemon passes its LANE's
+/// own root, because lanes run concurrently — a cwd read would hand one bot the directory another
+/// bot happens to be working in.
 pub fn default_registry_with_task(
     client: reqwest::Client,
     base_url: String,
@@ -322,8 +337,14 @@ pub fn default_registry_with_task(
     model: String,
     approval_mode: crate::core::approval::ApprovalMode,
     context_window: usize,
+    root: Option<PathBuf>,
 ) -> Result<ToolRegistry> {
-    let root = resolve_root()?;
+    let root = match root {
+        // A lane-supplied root is canonicalized so the tools, the writer lease, and the checkpoint
+        // path all key off ONE spelling of the directory.
+        Some(r) => r.canonicalize().unwrap_or(r),
+        None => resolve_root()?,
+    };
     let mut r = default_registry_in(&root);
     r.register(Box::new(PersonaCreate));
     r.register(Box::new(crate::agent::task_tool::TaskTool::new(
@@ -1666,8 +1687,7 @@ impl Tool for FileRead {
             // one item from. Advisory — the full `view` still follows — and only when the symbol
             // tools it names are actually available (`is_code` + LSP on). Prepended so the model
             // sees it before committing to re-reading the same file next turn.
-            let is_code =
-                crate::agent::lsp::discovery::server_for_path(&resolved).is_some();
+            let is_code = crate::agent::lsp::discovery::server_for_path(&resolved).is_some();
             let lsp_on = crate::agent::lsp::LSP.is_enabled();
             let line_count = content.lines().count();
             if let Some(hint) = whole_file_symbol_hint(is_code, lsp_on, line_count) {
@@ -3337,6 +3357,11 @@ impl Tool for SkillLoad {
                 // useful skill floats to the top of the always-on index and survives its line cap.
                 // Best-effort: a bump failure (repo-shipped skill, or I/O) must never break the load.
                 let _ = crate::skills::record_use(name);
+                // Hebbian cross-kind link: this procedure fired alongside the facts recalled for the
+                // turn, so wire them together. That is what later lets the facts of a NEW turn name
+                // the skills that mattered last time — the "used together" signal is not derivable
+                // from either store's contents, exactly like the fact-to-fact edges.
+                crate::skills::note_skill_cofire(name);
                 Ok(crate::skills::render_loaded(&sk))
             }
             None => {
@@ -3449,6 +3474,52 @@ impl Tool for SkillRefine {
     }
 }
 
+// ── skill_forget ───────────────────────────────────────────────────────────────
+
+/// Retire a skill the curriculum has outgrown. The counterpart `skill_save`/`skill_refine` lacked:
+/// skills are minted AUTOMATICALLY by the end-of-turn secretary, so without a retire path the index
+/// only ever grows and a wrong or superseded procedure keeps costing prompt lines forever. Soft, like
+/// `memory_forget` — the file moves to `.archive/`, so this is reversible (`/skills` restores).
+struct SkillForget;
+impl Tool for SkillForget {
+    fn name(&self) -> &str {
+        "skill_forget"
+    }
+    fn description(&self) -> &str {
+        "Retire a saved skill that is wrong, obsolete, or superseded by another one — it leaves the \
+         <skills> index and stops being loadable. Reversible: the copy is archived, not erased. Use \
+         skill_refine instead when the procedure is still right but its steps need improving."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "the skill's name (from <skills>)"}
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        })
+    }
+    fn is_destructive(&self) -> bool {
+        true
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
+    fn execute(&self, args: &Value) -> Result<String> {
+        let name = str_arg(args, "name")?;
+        if crate::skills::delete(name)? {
+            Ok(format!(
+                "retired skill '{name}' (archived — restorable from /skills)"
+            ))
+        } else {
+            Ok(format!(
+                "no writable skill named '{name}' (repo-shipped skills are removed in the repo)"
+            ))
+        }
+    }
+}
+
 // ── persona_create ─────────────────────────────────────────────────────────────
 
 /// Mint (or overwrite) a character persona mid-chat and optionally become it. This is what lets
@@ -3527,6 +3598,27 @@ mod tests {
         dir.canonicalize().unwrap()
     }
 
+    /// The default registry keys every file/shell tool off ONE root. A lane passes its own, so this
+    /// pins that an explicit root is honoured verbatim (canonicalized) rather than silently falling
+    /// back to the process cwd — the regression that would let one bot edit another bot's project.
+    #[test]
+    fn registry_root_comes_from_the_caller_when_supplied() {
+        let root = temp_root("registry-root");
+        let resolved = root.canonicalize().unwrap();
+        assert_ne!(
+            resolved,
+            std::env::current_dir().unwrap().canonicalize().unwrap(),
+            "the temp root must differ from cwd or this test proves nothing"
+        );
+        // `default_registry_in` is the shared constructor both the None and Some(root) paths use;
+        // asserting on it avoids needing live model credentials in a unit test.
+        let r = default_registry_in(&resolved);
+        assert!(
+            r.names().iter().any(|n| n == "file_read"),
+            "registry built for an explicit root still carries the file tools"
+        );
+    }
+
     #[test]
     fn whole_file_symbol_hint_fires_only_for_long_source_with_lsp() {
         // Fires: long source file, LSP live, under the hard budget.
@@ -3558,7 +3650,12 @@ mod tests {
         let defs = default_registry_in(&root).defs();
         let mut rows: Vec<(String, usize)> = defs
             .iter()
-            .map(|d| (d.function.name.clone(), serde_json::to_string(d).unwrap().len()))
+            .map(|d| {
+                (
+                    d.function.name.clone(),
+                    serde_json::to_string(d).unwrap().len(),
+                )
+            })
             .collect();
         rows.sort_by(|a, b| b.1.cmp(&a.1));
 
@@ -3638,7 +3735,10 @@ mod tests {
                 missing.is_empty(),
                 "{} schema declares required {} but the constructed valid args miss {}",
                 tool.name(),
-                req.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "),
+                req.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 missing.join(", ")
             );
         }
@@ -4615,7 +4715,9 @@ mod tests {
         // Another window (or an external editor) rewrites it while we were thinking.
         std::fs::write(&p, "fn a() {}\nfn peer_work() {}\n").unwrap();
         let err = FileWrite::new(root.clone())
-            .execute(&serde_json::json!({"path": "shared.rs", "content": "fn a() { /* mine */ }\n"}))
+            .execute(
+                &serde_json::json!({"path": "shared.rs", "content": "fn a() { /* mine */ }\n"}),
+            )
             .expect_err("a stale whole-file overwrite must be refused");
         let msg = format!("{err:#}");
         assert!(msg.contains("overwrite conflict"), "{msg}");
@@ -4648,7 +4750,9 @@ mod tests {
             .execute(&serde_json::json!({"path": "mine.rs", "content": "two\n"}))
             .expect("first write: never read, nothing claims it");
         FileEdit::new(root.clone())
-            .execute(&serde_json::json!({"path": "mine.rs", "old_string": "two", "new_string": "three"}))
+            .execute(
+                &serde_json::json!({"path": "mine.rs", "old_string": "two", "new_string": "three"}),
+            )
             .expect("edit against a fresh read always works");
         FileWrite::new(root.clone())
             .execute(&serde_json::json!({"path": "mine.rs", "content": "four\n"}))
