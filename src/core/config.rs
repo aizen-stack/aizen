@@ -230,8 +230,29 @@ fn fnv1a64(s: &str) -> u64 {
     h
 }
 
-/// File/frontmatter-safe slug fragment: lowercase alnum, runs of the rest collapse to one `-`.
+/// File/frontmatter-safe slug fragment: lowercase ASCII words, `-` between them and nowhere else.
+///
+/// This is half of the zone key (`dirname-hex8`), so it names the directory holding a project's
+/// memory, skills and index. Folding through [`crate::core::slug`] means a checkout under an
+/// accented path gets a readable zone instead of a shredded one — `~/Dự án/aizen` keyed
+/// `d-n-aizen-…` before.
+///
+/// A dirname that is already plain ASCII produces the byte-identical fragment it always did, so no
+/// existing zone is re-keyed. For the accented minority the fragment does change; that is a re-key,
+/// and [`legacy_slug_candidates_for`] emits the pre-fold spelling so `aizen zone migrate` can still
+/// find and merge the old directory.
 fn slug_fragment(name: &str) -> String {
+    let s = crate::core::slug::slug_words(name, 24);
+    if s.is_empty() {
+        "project".to_string()
+    } else {
+        s
+    }
+}
+
+/// The pre-fold [`slug_fragment`] — kept verbatim so `zone migrate` can name the directory a
+/// non-ASCII checkout was keyed under before the fold. Not used for new keys.
+fn slug_fragment_prefold(name: &str) -> String {
     let mut s = String::new();
     let mut prev_dash = false;
     for c in name.trim().to_lowercase().chars() {
@@ -392,9 +413,14 @@ fn legacy_slug_candidates_for(
     }
     let mut out: Vec<String> = Vec::new();
     for (n, k) in pairs {
-        let s = slug_for_key(&n, &k);
-        if s != current && !out.contains(&s) {
-            out.push(s);
+        // Both spellings of the dirname fragment: today's folded one, and the pre-fold one an
+        // accented checkout was keyed under before `slug_fragment` folded. For an ASCII dirname the
+        // two are identical and the dedup below collapses them.
+        for frag in [slug_fragment(&n), slug_fragment_prefold(&n)] {
+            let s = format!("{frag}-{:08x}", fnv1a64(&k) as u32);
+            if s != current && !out.contains(&s) {
+                out.push(s);
+            }
         }
     }
     out

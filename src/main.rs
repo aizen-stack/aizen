@@ -342,6 +342,9 @@ enum SkillCmd {
         /// Skill name.
         name: String,
     },
+    /// Print the three folders skills are read from, with file counts. The `[project]`/`[repo]` tags
+    /// in `skill list` say which folder a skill came from but not where that folder IS.
+    Where,
     /// Add or overwrite a skill. The body comes from `--body` or stdin.
     Add {
         /// Skill name.
@@ -1059,6 +1062,9 @@ enum MemoryCmd {
     },
     /// Report what is structurally wrong (or merely invisible) in the store. Read-only.
     Doctor,
+    /// Print the folders the store lives in, with file counts — for editing or clearing out many
+    /// entries at once, which no per-id command can do.
+    Where,
     /// Show the three §8 health metrics per week of use (saturation, recall usefulness,
     /// contradictions found). Read-only; reads `stats.jsonl` + the learning audit.
     Health,
@@ -1094,6 +1100,10 @@ async fn main() -> Result<()> {
     // into the alternate screen or onto a frame with a restricted scroll region. Idempotent.
     crate::ui::tui::install_panic_hook();
     let cli = Cli::parse();
+    // Before ANY command touches the store: ids the old slugifier cut mid-word are re-slugged whole.
+    // Ahead of the `match` so the CLI paths (`memory list`, `memory show`) and the REPL see the same
+    // ids — see `run_id_migration_once`.
+    run_id_migration_once();
     let command = match cli.command {
         Some(c) => c,
         // Bare `ng` → the interactive landing menu (hermes-style).
@@ -2152,6 +2162,108 @@ fn redact_remote_url(url: &str) -> String {
     }
 }
 
+/// How many `*.md` files a store directory holds, and a `(not created yet)` note when it doesn't
+/// exist. Shared by both `where` reports so an absent folder never reads as an empty one.
+fn dir_count_line(label: &str, p: &std::path::Path, unit: &str) -> String {
+    if !p.exists() {
+        return format!("  {label:<8}: {}   (not created yet)", p.display());
+    }
+    let n = std::fs::read_dir(p)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
+                .count()
+        })
+        .unwrap_or(0);
+    format!("  {label:<8}: {}   {n} {unit}", p.display())
+}
+
+/// Where the memory store physically lives, per directory, with counts.
+///
+/// `memory list` names three commands and every one of them edits a SINGLE entry by id. Bulk work —
+/// deleting forty near-duplicates, fixing a wrong word across many facts — is a file-manager job, and
+/// until now the only place any path appeared was `memory show <id>`'s `file:` line, one entry at a
+/// time. Naming the review dir matters most: 29 queued candidates sat there unreadable because
+/// nothing said they were on disk at all.
+fn memory_where_report() -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{}",
+        dir_count_line("entries", &crate::core::config::entries_dir(), "fact(s)")
+    );
+    let _ = writeln!(
+        s,
+        "{}",
+        dir_count_line("review", &crate::core::config::review_dir(), "awaiting")
+    );
+    let _ = writeln!(
+        s,
+        "{}",
+        dir_count_line("archive", &crate::core::config::archive_dir(), "retired")
+    );
+    let graph = crate::core::config::graph_path();
+    let edges = std::fs::read_to_string(&graph)
+        .map(|r| r.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
+    let _ = writeln!(
+        s,
+        "  {:<8}: {}   {edges} edge(s)",
+        "graph",
+        graph.display()
+    );
+    let _ = writeln!(
+        s,
+        "  {:<8}: {}",
+        "core",
+        crate::core::config::style_path().display()
+    );
+    let _ = write!(
+        s,
+        "{}",
+        style(
+            "\nEdit or delete files directly — they are plain markdown with a frontmatter header.\n\
+             Re-run `aizen memory doctor` afterwards to catch anything left dangling."
+        )
+        .dim()
+    );
+    s
+}
+
+/// Where skills are read from — all three roots, because `skill list`'s `[project]`/`[repo]` tags
+/// say which root a row came from without saying where that root is, and auto-learned skills land in
+/// the zone dir whose slug (`p/admin-5296147b`) is not guessable from the project name.
+fn skill_where_report() -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{}",
+        dir_count_line("global", &crate::skills::skills_dir(), "skill(s)")
+    );
+    let _ = writeln!(
+        s,
+        "{}",
+        dir_count_line("zone", &crate::skills::project_zone_dir(), "skill(s)")
+    );
+    let _ = writeln!(
+        s,
+        "  {}",
+        style(format!(
+            "         ↑ auto-learned skills for zone {}",
+            crate::core::config::project_slug()
+        ))
+        .dim()
+    );
+    let _ = write!(
+        s,
+        "{}",
+        dir_count_line("repo", &crate::skills::project_skills_dir(), "skill(s)")
+    );
+    s
+}
+
 /// The identity card — one honest surface for the questions that previously had none: which
 /// root am I in, which zone does my memory go to, which git binary runs, where do sessions live.
 /// Shared verbatim by `aizen where` (println) and `/where` (tui::emit_line).
@@ -2228,6 +2340,12 @@ fn where_report() -> String {
     );
     let _ = writeln!(s, "codebase idx : {}{}", idx.display(), exists(&idx));
     let _ = writeln!(s, "sessions     : {}", sessions_dir().display());
+    if let Some(n) = sessions_with_secrets() {
+        let _ = writeln!(
+            s,
+            "⚠ secrets     : {n} saved transcript(s) contain credential-shaped text — a key pasted into a chat is stored verbatim. Open the folder above and edit or delete them."
+        );
+    }
     if let Some(l) = crate::features::zones::quick_legacy_probe() {
         let _ = writeln!(
             s,
@@ -2235,6 +2353,35 @@ fn where_report() -> String {
         );
     }
     s.trim_end().to_string()
+}
+
+/// How many saved transcripts hold credential-shaped text, or `None` when none do.
+///
+/// Names are guarded at derivation (see [`suggest_session_name`]), but a key pasted into a chat is
+/// still in that file's message text: a saved session is a verbatim transcript, and nothing redacts
+/// it on the way to disk. Deleting or rewriting a user's own conversation history is not a call this
+/// tool makes on its own, so `/where` reports the count and names the folder — the number is
+/// actionable, and the values are never printed.
+///
+/// Uses the vendor-prefix test, NOT the shape test that guards name derivation. Measured on the 27
+/// real transcripts here: prefix matches 12 strings, all real keys; shape matched 5170, of which 4026
+/// were ISO timestamps (long, mixed-case, letters and digits — indistinguishable from key material by
+/// shape alone). A warning that fires on every file teaches the user to ignore it.
+///
+/// Counts FILES, not occurrences: the useful signal is "which files do I need to open".
+fn sessions_with_secrets() -> Option<usize> {
+    let rd = std::fs::read_dir(sessions_dir()).ok()?;
+    let n = rd
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+        .filter(|e| {
+            std::fs::read_to_string(e.path()).is_ok_and(|raw| {
+                raw.split(|c: char| c.is_whitespace() || matches!(c, '"' | ',' | '\\'))
+                    .any(crate::core::slug::has_vendor_key_prefix)
+            })
+        })
+        .count();
+    (n > 0).then_some(n)
 }
 
 fn run_zone(cmd: ZoneCmd) -> Result<()> {
@@ -5155,6 +5302,39 @@ fn identity_banner() -> (String, Vec<String>) {
         ));
     }
     (main, notes)
+}
+
+/// Re-slug memory ids the old ASCII-only slugifier shredded (76% of a measured real store), once per
+/// home, before any command reads the store.
+///
+/// Called from `main` rather than the REPL banner: `aizen memory list` is a CLI path that never
+/// builds a banner, so migrating there would have left the two surfaces disagreeing about what an id
+/// is — the CLI printing shredded names while the REPL printed readable ones, and `memory show <id>`
+/// working with only one of them.
+///
+/// It renames the user's files without asking, which they chose; it does not do so silently, which
+/// they did not. The count and the old→new map's path go to stderr so a piped `memory list` stays
+/// machine-readable.
+fn run_id_migration_once() {
+    if let Some(rep) = crate::memory::migrate_ids::run_once_at_startup() {
+        if let Some(n) = rep.notice() {
+            eprintln!("{}", style(n).dim());
+        }
+        for w in rep.warnings.iter().take(3) {
+            eprintln!("{} {w}", style("⚠ memory id migration:").color256(theme::WARN));
+        }
+    }
+    // Persona self-memory filenames had the same defect, worse in proportion (45 of 89 files on the
+    // measured store) and less visible, because `/persona self` renders bodies rather than names.
+    // Separate pass, separate per-persona flag: a character created later still gets migrated.
+    if let Some(rep) = crate::persona::migrate_stems::run_once_at_startup() {
+        if let Some(n) = rep.notice() {
+            eprintln!("{}", style(n).dim());
+        }
+        for w in rep.warnings.iter().take(3) {
+            eprintln!("{} {w}", style("⚠ persona stem migration:").color256(theme::WARN));
+        }
+    }
 }
 
 /// Startup update housekeeping, shared by both REPL surfaces.
@@ -9556,6 +9736,20 @@ fn session_save_name_error(raw: &str) -> Option<&'static str> {
 /// Suggest a human-readable session name from the conversation's first user turn, so the "Save as"
 /// prompt comes PRE-FILLED with the topic (Enter to accept, or edit) instead of a blank box. A short
 /// hyphenated slug of the first few meaningful words + a date suffix to keep same-topic saves distinct.
+///
+/// Two properties this has to hold, both learned from what was on disk:
+///
+/// **No credential ever becomes a filename.** A key pasted as the first line of a chat used to pass
+/// straight through — any token of 2+ chars was kept — and the derived stem is not just written to
+/// disk but PRINTED by `/sessions`. A real machine had a session file named after a 40-char
+/// vendor-prefixed token. Secret-shaped tokens are dropped here, before the name exists.
+/// This is a name-derivation guard only; it does not redact the transcript body.
+///
+/// **ASCII whole words.** Names are folded through [`core::slug`] like every other id, so a
+/// Vietnamese topic reads as `nguoi-dung-giao-tiep` rather than carrying diacritics into a filename
+/// that then differs by normalization form between platforms. Folding happens per word, so no word
+/// is ever cut apart. Existing accented files stay loadable — [`sanitize_name`] is unchanged, so it
+/// still maps an on-disk name to itself.
 fn suggest_session_name(history: &[Message]) -> String {
     let date = chrono::Local::now().format("%m%d").to_string();
     let first = history
@@ -9571,18 +9765,18 @@ fn suggest_session_name(history: &[Message]) -> String {
         .trim();
     let words: Vec<String> = line
         .split_whitespace()
-        .map(|w| {
-            w.chars()
-                .filter(|c| c.is_alphanumeric())
-                .collect::<String>()
-                .to_lowercase()
-        })
-        .filter(|w| w.len() >= 2)
+        .filter(|w| !crate::core::slug::looks_like_credential(w))
+        // Intra-word punctuation is not a word boundary: `don't` is one word, so the apostrophe is
+        // deleted rather than folded to `-` (which would leave a one-letter `t` fragment — exactly
+        // the shredding this pass exists to remove).
+        .map(|w| w.replace(['\'', '\u{2019}', '\u{02BC}'], ""))
+        .map(|w| crate::core::slug::slug_words(&w, 40))
+        .filter(|w| w.chars().count() >= 2)
         .take(5)
         .collect();
     let slug = words.join("-");
     // Cap length so long first messages don't produce an unwieldy default.
-    let slug: String = slug.chars().take(40).collect();
+    let slug = crate::core::slug::truncate_at_word(&slug, 40);
     let slug = slug.trim_matches('-');
     if slug.is_empty() {
         format!("chat-{date}")
@@ -14057,6 +14251,10 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
         MemoryCmd::Compact => memory::cmd_compact(),
         MemoryCmd::Reconcile { apply } => run_memory_reconcile(apply).await,
         MemoryCmd::Doctor => memory::cmd_doctor(),
+        MemoryCmd::Where => {
+            println!("{}", memory_where_report());
+            Ok(())
+        }
         MemoryCmd::Health => memory::cmd_health(),
         MemoryCmd::Neighbors { id, k } => memory::cmd_neighbors(&id, k),
         MemoryCmd::ModelDownload { name } => memory::model_dl::download(name.as_deref())
@@ -14164,6 +14362,16 @@ fn run_persona(cmd: PersonaCmd) -> Result<()> {
                     names.join(", ")
                 );
             }
+            // Personas have no `where` sub-command of their own (one folder, no zoning), so the path
+            // goes here directly — the card and its `.self/` memory are plain files worth editing.
+            println!(
+                "{}",
+                style(format!(
+                    "\nfiles: {}   (`<name>.md` is the card, `<name>.self/` its memory)",
+                    persona::personas_dir().display()
+                ))
+                .dim()
+            );
             Ok(())
         }
         PersonaCmd::Show { name } => {
@@ -14441,7 +14649,8 @@ async fn run_skill(cmd: SkillCmd) -> Result<()> {
                 "{}",
                 style(
                     "`skill show <name>` reads one · `skill refine <name>` rewrites the steps · \
-                     `skill delete <name>` retires (restorable)"
+                     `skill delete <name>` retires (restorable)\n\
+                     `skill where` prints the three folders skills are read from"
                 )
                 .dim()
             );
@@ -14471,6 +14680,10 @@ async fn run_skill(cmd: SkillCmd) -> Result<()> {
             }
             None => anyhow::bail!("no skill named '{name}' (try `aizen skill list`)"),
         },
+        SkillCmd::Where => {
+            println!("{}", skill_where_report());
+            Ok(())
+        }
         SkillCmd::Add {
             name,
             description,
@@ -15257,6 +15470,74 @@ mod tests {
                 .is_err(),
             "two scopes at once is a mistake, not a precedence puzzle"
         );
+    }
+
+    /// The listings name only per-id verbs, so bulk editing needs the folder — and a folder that
+    /// does not exist yet has to say so rather than read as an empty one, which is the difference
+    /// between "nothing learned yet" and "look somewhere else".
+    #[test]
+    fn where_reports_name_every_store_and_flag_missing_dirs() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-whererep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+
+        let entries = crate::core::config::entries_dir();
+        std::fs::create_dir_all(&entries).unwrap();
+        std::fs::write(entries.join("a.md"), "---\nname: A\n---\nx").unwrap();
+        std::fs::write(entries.join("b.md"), "---\nname: B\n---\ny").unwrap();
+        // Not a fact — the count must not include it.
+        std::fs::write(entries.join("notes.txt"), "ignore me").unwrap();
+
+        let rep = memory_where_report();
+        assert!(rep.contains("2 fact(s)"), "{rep}");
+        assert!(
+            rep.contains(&entries.display().to_string()),
+            "entries path missing:\n{rep}"
+        );
+        // The review dir is the one that matters most — 29 queued items were invisible because
+        // nothing ever said they were on disk.
+        assert!(rep.contains("review"), "{rep}");
+        assert!(
+            rep.contains("(not created yet)"),
+            "an absent dir must not read as an empty one:\n{rep}"
+        );
+
+        // Skills live in THREE roots and the list's `[project]`/`[repo]` tags never say where.
+        let sk = skill_where_report();
+        for label in ["global", "zone", "repo"] {
+            assert!(sk.contains(label), "{label} root missing:\n{sk}");
+        }
+        assert!(
+            sk.contains(&crate::core::config::project_slug()),
+            "zone slug not spelled out:\n{sk}"
+        );
+
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Both `where` sub-commands have to be reachable, or the footers point at nothing.
+    #[test]
+    fn where_subcommands_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["aizen", "memory", "where"])
+                .expect("parse")
+                .command,
+            Some(Commands::Memory {
+                cmd: MemoryCmd::Where
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["aizen", "skill", "where"])
+                .expect("parse")
+                .command,
+            Some(Commands::Skill {
+                cmd: SkillCmd::Where
+            })
+        ));
     }
 
     /// A role's key must never reach the screen in the clear.
@@ -16697,6 +16978,64 @@ mod tests {
         assert_eq!(sanitize_name("NUL"), "session_NUL");
         assert_eq!(sanitize_name(""), "session");
         assert!(sanitize_name(&"a".repeat(200)).len() <= 80);
+    }
+
+    /// `sanitize_name` maps an EXISTING on-disk name to itself, so the accented session files already
+    /// saved stay loadable and deletable. Only name *derivation* folds to ASCII; changing this would
+    /// orphan every file saved before the fold.
+    #[test]
+    fn sanitize_name_keeps_accented_files_addressable() {
+        assert_eq!(sanitize_name("tại-sao-ổ-của-anh-0803"), "tại-sao-ổ-của-anh-0803");
+        assert_eq!(sanitize_name("anh-cần-em-viết-tài-0804"), "anh-cần-em-viết-tài-0804");
+    }
+
+    /// A pasted credential must never become a filename. The derived stem is written to disk AND
+    /// printed by `/sessions`, so a key on the first line used to end up displayed in the picker.
+    #[test]
+    fn suggested_name_drops_credential_shaped_tokens() {
+        let keyish = [
+            "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "tvly-dev-abc123def456ghi789jkl012mno",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123",
+        ];
+        for k in keyish {
+            let name = suggest_session_name(&[Message::user(&format!("{k}"))]);
+            assert!(
+                name.starts_with("chat-"),
+                "a lone key must fall back to the generic stem, got {name}"
+            );
+            let core: String = k.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+            assert!(
+                !name.contains(&core.to_lowercase()),
+                "key material reached the name: {name}"
+            );
+            // With surrounding prose the topic survives and only the key is dropped.
+            let mixed = suggest_session_name(&[Message::user(&format!("set my api key to {k}"))]);
+            assert!(mixed.starts_with("set-my-api-key"), "topic lost: {mixed}");
+            assert!(
+                !mixed.contains(&core.to_lowercase()),
+                "key material reached the name: {mixed}"
+            );
+        }
+    }
+
+    /// Derived names are ASCII whole words: a Vietnamese topic must not carry diacritics into a
+    /// filename, and must not be cut apart mid-word doing so.
+    #[test]
+    fn suggested_name_folds_vietnamese_into_whole_words() {
+        let name = suggest_session_name(&[Message::user("Người dùng giao tiếp bằng tiếng Việt")]);
+        assert!(
+            name.starts_with("nguoi-dung-giao-tiep-bang-"),
+            "expected folded whole words, got {name}"
+        );
+        assert!(name.is_ascii(), "diacritics reached the filename: {name}");
+        assert!(
+            name.split('-').filter(|w| w.chars().count() == 1).count() == 0,
+            "shredded into one-letter fragments: {name}"
+        );
+        // An apostrophe is intra-word punctuation, not a boundary: `don't` must not leave a `t`.
+        let en = suggest_session_name(&[Message::user("don't break the build please")]);
+        assert!(en.starts_with("dont-break-the-build"), "got {en}");
     }
 
     /// `elide` is what every human-facing listing shortens with, so its contract is asserted here

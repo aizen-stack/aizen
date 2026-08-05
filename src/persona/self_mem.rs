@@ -172,29 +172,104 @@ fn render(kind: Kind, importance: u8, created: &str, updated: &str, body: &str) 
     frontmatter::serialize(&fields, body, KEY_ORDER)
 }
 
-fn unique_path(dir: &Path, prefix: &str, body: &str) -> PathBuf {
-    // a short, stable-ish stem from the body's first words, uniquified on collision
-    let words: String = body
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                ' '
-            }
-        })
+/// Words worth putting in a filename — the boilerplate lead-in that [`format_episode_body`] stamps
+/// on every episode is not one of them.
+///
+/// Each body opens with its own type label (`correction: user redirected me — "…"`), so the first
+/// four or five words are identical across every episode of that kind. A stem taken from the head of
+/// the body therefore described the FORMAT, not the memory: 12 files on a real machine all read
+/// `ep-correction-user-redirected-me-todo`, distinguished only by a `-2`…`-12` counter. Dropping the
+/// label words lets the stem start where the content does.
+fn stem_source(body: &str) -> &str {
+    let b = body.trim_start();
+    for label in [
+        "correction: user redirected me —",
+        "preference: user wants —",
+        "work: handled",
+        "bond:",
+        "explicit:",
+        "remember:",
+    ] {
+        if let Some(rest) = b.strip_prefix(label) {
+            return rest.trim_start_matches([' ', '"', '—', '-']);
+        }
+    }
+    b
+}
+
+/// Words that carry no meaning in a filename. `[todo-poke]`-style scaffolding repeats across
+/// unrelated memories, so it would re-create the collision `stem_source` just removed.
+fn is_filler(word: &str) -> bool {
+    const FILLER: &[&str] = &[
+        "todo", "poke", "session", "todos", "are", "still", "incomplete", "you", "may", "not",
+        "finish", "yet", "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "is", "it",
+        "this", "that", "with", "i", "me", "my", "user", "va", "la", "cua", "co", "khong", "cac",
+    ];
+    FILLER.contains(&word)
+}
+
+/// The stem a body would be filed under: `<prefix>-<words>-<hash4>`, without the collision counter.
+///
+/// Split out of [`unique_path`] so `migrate_stems` can recompute the correct name for a file already
+/// on disk. Deterministic and side-effect-free — the same body always yields the same stem.
+pub(crate) fn stem_for(prefix: &str, body: &str) -> String {
+    let words: Vec<String> = crate::core::slug::slug_words(stem_source(body), usize::MAX)
+        .split('-')
+        .filter(|w| w.chars().count() >= 2 && !is_filler(w))
+        .take(6)
+        .map(str::to_string)
         .collect();
-    let slug: String = words
-        .split_whitespace()
-        .take(5)
-        .collect::<Vec<_>>()
-        .join("-");
+    let slug = words.join("-");
     let slug = if slug.is_empty() {
         "mem".to_string()
     } else {
-        slug
+        crate::core::slug::truncate_at_word(&slug, 48)
     };
-    let base = format!("{prefix}-{slug}");
+    // Content hash over the WHOLE body, so two memories sharing a lead-in still differ.
+    format!("{prefix}-{slug}-{:04x}", simple_hash(body.trim()) as u16)
+}
+
+/// What the migration needs from a file on disk: its kind and its body.
+pub(crate) struct MigrationRow {
+    pub is_insight: bool,
+    pub body: String,
+}
+
+/// Parse just enough of a self-memory file for `migrate_stems` to recompute its stem. `None` when
+/// there is no body to recompute from — inventing a name would be exactly the guess to avoid.
+pub(crate) fn parse_for_migration(raw: &str) -> Option<MigrationRow> {
+    let fm = frontmatter::parse(raw);
+    let body = fm.body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    let is_insight = fm
+        .get("kind")
+        .map(|k| k.trim().eq_ignore_ascii_case("insight"))
+        .unwrap_or(false);
+    Some(MigrationRow {
+        is_insight,
+        body: body.to_string(),
+    })
+}
+
+/// A filename for a new self-memory: `<prefix>-<words>-<hash4>.md`.
+///
+/// Two separate defects were fixed here, and they need different medicine:
+///
+/// 1. **Shredding.** The old stem tested one codepoint at a time against `is_ascii_alphanumeric`, so
+///    every accented letter became a word separator and cut inside words — 45 of 89 files on a real
+///    machine were named like `in-t-i-n-n-l-9`. Folding through [`crate::core::slug`] fixes that; it
+///    is the same helper the memory store and session names use.
+/// 2. **Collision.** Even with perfect folding, bodies that share a lead-in share a stem. Widening
+///    the word count would not fix it (the shared prefix just gets longer), so the stem skips the
+///    type label and filler, and a short content hash is appended. The hash makes the name unique by
+///    construction rather than by a `-2`…`-12` counter, so a stem now identifies ONE memory.
+///
+/// The collision loop stays as the last resort: a hash is 16 bits, and two memories that truly
+/// collide must still both be writable.
+fn unique_path(dir: &Path, prefix: &str, body: &str) -> PathBuf {
+    let base = stem_for(prefix, body);
     let first = dir.join(format!("{base}.md"));
     if !first.exists() {
         return first;
@@ -206,6 +281,16 @@ fn unique_path(dir: &Path, prefix: &str, body: &str) -> PathBuf {
         }
     }
     first
+}
+
+/// FNV-1a, folded to 32 bits — a filename disambiguator, not a security primitive.
+fn simple_hash(s: &str) -> u32 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (h ^ (h >> 32)) as u32
 }
 
 fn write(persona_slug: &str, kind: Kind, importance: u8, body: &str) -> Result<String> {
@@ -1188,6 +1273,97 @@ mod tests {
                 "the new eviction lands too"
             );
             assert_eq!(list("aria").len(), 0, "live set is empty at cap 0");
+        });
+    }
+
+    /// The shredding defect, asserted on the real body shape. 45 of 89 files on a live machine were
+    /// named like `in-t-i-n-n-l-9` because each accented letter tested false for
+    /// `is_ascii_alphanumeric` and became a separator.
+    #[test]
+    fn stem_folds_vietnamese_into_whole_words() {
+        with_home("stem-fold", || {
+            let dir = self_dir("aria");
+            fs::create_dir_all(&dir).unwrap();
+            let p = unique_path(&dir, "in", "Người dùng giao tiếp bằng tiếng Việt");
+            let stem = p.file_stem().unwrap().to_str().unwrap();
+            assert!(stem.is_ascii(), "diacritics reached the filename: {stem}");
+            assert!(
+                stem.starts_with("in-nguoi-dung-giao-tiep-bang-tieng"),
+                "expected folded whole words, got {stem}"
+            );
+            assert_eq!(
+                stem.split('-').filter(|w| w.chars().count() == 1).count(),
+                0,
+                "still shredded into one-letter fragments: {stem}"
+            );
+        });
+    }
+
+    /// The collision defect. Twelve real episodes shared the stem
+    /// `ep-correction-user-redirected-me-todo` because every body opens with the same type label and
+    /// the same `[todo-poke]` scaffolding — the distinguishing content came later. Widening the word
+    /// count would not help; the stem has to skip the boilerplate and carry a content hash.
+    #[test]
+    fn stems_differ_when_bodies_share_a_lead_in() {
+        with_home("stem-collide", || {
+            let dir = self_dir("aria");
+            fs::create_dir_all(&dir).unwrap();
+            let bodies = [
+                "correction: user redirected me — \"[todo-poke] Session todos are still incomplete — you may not finish yet. Incomplete: [>] Hoàn thiện landing page\"",
+                "correction: user redirected me — \"[todo-poke] Session todos are still incomplete — you may not finish yet. Incomplete: [>] Build and verify tsc\"",
+                "correction: user redirected me — \"[todo-poke] Session todos are still incomplete — you may not finish yet. Incomplete: [>] Điều tra import graph\"",
+            ];
+            let stems: Vec<String> = bodies
+                .iter()
+                .map(|b| {
+                    let p = unique_path(&dir, "ep", b);
+                    // Write it, so the next call sees the collision the old code papered over.
+                    fs::write(&p, "x").unwrap();
+                    p.file_stem().unwrap().to_str().unwrap().to_string()
+                })
+                .collect();
+            for s in &stems {
+                assert!(
+                    !s.contains("correction-user-redirected"),
+                    "the type label still dominates the stem: {s}"
+                );
+                // The counter suffix is the last resort, not the normal disambiguator.
+                assert!(
+                    !s.ends_with("-2") && !s.ends_with("-3"),
+                    "fell back to the collision counter: {s}"
+                );
+            }
+            let unique: std::collections::HashSet<&String> = stems.iter().collect();
+            assert_eq!(unique.len(), 3, "stems still collide: {stems:?}");
+            // Each stem reaches its own distinguishing content.
+            assert!(stems.iter().any(|s| s.contains("hoan-thien")), "{stems:?}");
+            assert!(stems.iter().any(|s| s.contains("build")), "{stems:?}");
+            assert!(stems.iter().any(|s| s.contains("dieu-tra")), "{stems:?}");
+        });
+    }
+
+    /// The same body must always produce the same stem, or a re-run would write a second copy of one
+    /// memory (and the near-dup gate is not a filename check).
+    #[test]
+    fn stem_is_stable_for_one_body() {
+        with_home("stem-stable", || {
+            let dir = self_dir("aria");
+            fs::create_dir_all(&dir).unwrap();
+            let a = unique_path(&dir, "in", "user prefers tabs over spaces");
+            let b = unique_path(&dir, "in", "user prefers tabs over spaces");
+            assert_eq!(a, b);
+        });
+    }
+
+    /// A body with nothing slugabble still gets a usable, unique filename.
+    #[test]
+    fn stem_falls_back_when_nothing_survives() {
+        with_home("stem-fallback", || {
+            let dir = self_dir("aria");
+            fs::create_dir_all(&dir).unwrap();
+            let p = unique_path(&dir, "ep", "!!! ???");
+            let stem = p.file_stem().unwrap().to_str().unwrap();
+            assert!(stem.starts_with("ep-mem-"), "got {stem}");
         });
     }
 }

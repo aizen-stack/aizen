@@ -178,22 +178,13 @@ impl SessionMem {
     }
 }
 
+/// A short readable id for a session note. Not a filename (this store is process-local), but the id
+/// is rendered into the prompt block the model reads and can be quoted back by the user, so it gets
+/// the same whole-word treatment as every other id: fold the accents off, then split on word
+/// boundaries. Testing `is_ascii_alphanumeric` per codepoint made every accented letter a separator,
+/// so a Vietnamese note came out as one-letter fragments.
 fn slug_id(body: &str) -> String {
-    let mut s = String::new();
-    let mut last_dash = true;
-    for c in body.chars() {
-        if c.is_ascii_alphanumeric() {
-            s.push(c.to_ascii_lowercase());
-            last_dash = false;
-        } else if !last_dash {
-            s.push('-');
-            last_dash = true;
-        }
-        if s.len() >= 40 {
-            break;
-        }
-    }
-    let s = s.trim_matches('-');
+    let s = crate::core::slug::slug_words(body, 40);
     if s.is_empty() {
         format!("n-{}", simple_hash(body))
     } else {

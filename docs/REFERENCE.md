@@ -412,6 +412,7 @@ pulls a skill's full steps on demand with the **`skill_load`** tool, and can per
 aizen skill add deploy-vps -d "ship over SSH" -w "asked to deploy"   # body from --body or stdin
 aizen skill fetch https://example.com/deploy-vps.md                  # pull a shared skill from a URL
 aizen skill list / show <name> / delete <name>
+aizen skill where                                                    # the three folders + counts
 ```
 
 Optional frontmatter narrows when a skill shows in the index: **`requires:`** (tool names — hidden
@@ -541,7 +542,40 @@ aizen memory ask "which package manager should I use?"   # abstains rather than 
 aizen memory learn "<a user turn>"  # free extraction → threat-scan → route → store
 aizen memory frozen                 # the always-on prompt-prefix core
 aizen memory style | review | as-of <date> | supersede <old> <new> | archive | restore <id> | compact
+aizen memory where                  # the folders + counts, for editing or clearing out many at once
 ```
+
+Ids are whole words. A fact named "Người dùng giao tiếp bằng tiếng Việt" files as
+`nguoi-dung-giao-tiep-bang-tieng-viet` — accents are folded off each letter, and `-` marks a word
+boundary and nothing else. An earlier slugifier tested one codepoint at a time, so every accented
+letter became a separator and cut inside words: the same name came out `ng-i-d-ng-giao-ti-p…`. Stores
+written by that version are re-slugged once, automatically, on the first run of a build that has this
+— the old→new table is left in `cli-memory/.id-migration-<date>.tsv`, and graph edges are re-pointed
+in the same pass. Set `AIZEN_NO_ID_MIGRATE=1` to skip it.
+
+The same rule now governs every name derived from free text — memory ids, `#remember` captures,
+persona self-memories, session saves, and the project zone key all share one implementation:
+
+| Surface | Where | Migrated? |
+|---|---|---|
+| memory entry id | `cli-memory/entries/` | yes — `.id-migration-<date>.tsv` |
+| `#remember` id | same | yes, same pass |
+| persona self-memory | `personas/<slug>.self/` | yes — `.stem-migration-<persona>-<date>.tsv` |
+| session save name | `sessions/` | no — existing files keep working, see below |
+| project zone key | `skills/p/<slug>`, index | only if the checkout path is non-ASCII |
+
+**Persona self-memories** get one extra thing: a short content hash on the end
+(`ep-hoan-thien-landing-install-tabs-os-85ed`). Every episode body opens with its own type label, so a
+stem taken from the first few words described the format rather than the memory — twelve files on one
+store all read `ep-correction-user-redirected-me-todo`, separated only by a counter. The stem now skips
+the label and carries a hash, so it identifies one memory.
+
+**Session names** are derived, not migrated. New saves fold to ASCII whole words; files already saved
+with accents keep their names and stay loadable, listable and deletable. Two guards on derivation:
+credential-shaped tokens are dropped before the name exists (a key pasted as the first line of a chat
+used to become the filename — and `/sessions` prints filenames), and a name is never cut mid-word.
+The credential guard covers name derivation only: it does not redact what is inside a saved transcript,
+so a key pasted into a chat is still in that file's message text.
 
 ### `aizen bench` — anti-oracle benches
 ```bash

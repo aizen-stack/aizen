@@ -5,6 +5,101 @@ All notable changes to **Aizen** (`aizen`) — the pure-Rust agentic coding CLI.
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
+## [Unreleased]
+
+### Fixed
+- **Memory ids were cut inside words, so 76% of a real store was unusable.** `slugify` tested one
+  codepoint at a time against `is_ascii_alphanumeric`, and every accented letter failed the test and
+  became a `-`. On a measured 243-entry store that left **185 (76%)** of ids looking like
+  `ng-i-d-ng-giao-ti-p-b-ng-ti-ng-vi-t`; the worst were readable as no word at all
+  (`ngd-ng-mucugihd-liv-ngukic`). That is not a cosmetic problem: the id is the only handle
+  `memory show|edit|forget` accepts, so an id nobody can read is a record nobody can address without
+  listing the whole store first. The bug was the ORDER, not the character set — the accent is now
+  folded off the letter *before* anything decides where a word ends, so the same name files as
+  `nguoi-dung-giao-tiep-bang-tieng-viet` and `-` means "word ended here" and nothing else. Ids stay
+  ASCII. `đ`/`Đ` are handled explicitly, since they are letters of the Vietnamese alphabet rather
+  than `d` plus a mark and no normalization form decomposes them — without that, `đường` would have
+  folded to `uong`. Truncation now backs up to the last whole word: a blind cut turned `tieng` into
+  `tien`, a different word, so a shortened id read as a fact about something else.
+  `memory` and `#remember` share one folding helper, so the two id-producing paths cannot drift.
+- **The same defect was live in three more places; all four now share one implementation.** Five
+  surfaces independently turn free text into a filename, and four of them had written the same broken
+  loop. `core::slug` is now the single definition of "a name a human can read and retype", so they
+  cannot drift apart again:
+  - **Persona self-memory** (`personas/<slug>.self/`) was the worst hit in proportion — **45 of 89
+    files (51%)** on a measured store, named `in-t-i-n-n-l-9` or `ep-work-handled-b-y-gi-3`. It stayed
+    invisible longer than the memory store because `/persona self` renders bodies, not filenames.
+  - **Session working memory** (`session_mem::slug_id`) — the ids never reach disk, but they are
+    rendered into the prompt block the model reads.
+  - **The project zone key** (`config::slug_fragment`, half of `dirname-hex8`) — latent rather than
+    observed: a checkout under an accented path keyed a zone like `d-n-aizen-…`. An ASCII dirname
+    produces the byte-identical fragment it always did, so no existing zone is re-keyed; for the
+    accented minority `aizen zone migrate` now also probes the pre-fold spelling so the old directory
+    is still found and merged.
+- **Persona self-memory filenames are re-slugged once, automatically** — the same mechanical pass as
+  the memory ids, recomputed from each file's own body (self-memories have no frontmatter `name`),
+  with the old→new map written to `personas/.stem-migration-<persona>-<date>.tsv` before the first
+  rename. `persona:<slug>/<id>` graph edges are re-pointed in the same pass; the measured store has
+  none, but `note_insight_cofire` can write them at any time, so the pass re-points rather than
+  assuming. Per-persona flag file, so a character created later still gets migrated on its own first
+  launch. Shares the `AIZEN_NO_ID_MIGRATE=1` opt-out.
+- **Twelve persona self-memories were indistinguishable from each other.** Every episode body opens
+  with its own type label (`correction: user redirected me — "…"`) plus, for todo nags, identical
+  `[todo-poke]` scaffolding — so a stem taken from the first five words described the FORMAT, not the
+  memory. Twelve files on a real store read `ep-correction-user-redirected-me-todo`, separated only by
+  a `-2`…`-12` counter. Widening the word count would not have helped (the shared prefix just gets
+  longer); the stem now skips the label and filler words and carries a short content hash, so it is
+  unique by construction and the `-N` counter is back to being a last resort.
+- **A pasted API key could become a session filename, and filenames are printed.**
+  `suggest_session_name` derives a name from the first line of the first user message and kept any
+  token of 2+ characters, so a key pasted as the opening line became the name of the file — which
+  `/sessions` renders on screen, `ls` shows, and every backup copies. A real machine had one: 40
+  characters, vendor prefix, no separators left after sanitizing. Credential-shaped tokens are now
+  dropped while the name is being derived, by vendor prefix (checked on the raw token, since stripping
+  separators first would erase the evidence) and by shape (length plus the character-class mixing that
+  random material shows and words do not). A key on its own falls back to the generic `chat-<date>`
+  stem; with prose around it the topic survives and only the key is dropped. This guards name
+  derivation only — it does not redact transcript bodies, and **4 of 27 transcripts on the measured
+  machine still contain key-shaped strings in their message text.**
+- **`aizen where` now says when saved transcripts contain keys.** The name guard above stops a key
+  becoming a *filename*, but a saved session is a verbatim transcript and nothing redacts what is
+  inside it. `/where` reports the file count and names the folder; it never prints a value, and it
+  does not touch the files — editing a user's own conversation history is their call. The scan uses
+  vendor key prefixes rather than the shape test that guards name derivation, and that distinction is
+  load-bearing: measured over the same 27 files, the shape test matched 5170 tokens of which **4026
+  were ISO timestamps** (long, mixed-case, letters and digits — indistinguishable from key material by
+  shape alone), which would have flagged 23 of 27 files and taught the user to ignore the warning.
+  Prefix matching flags 12 strings, all real keys, in 4 files.
+
+### Changed
+- **Session names are ASCII whole words, like every other id.** `suggest_session_name` used unicode
+  `is_alphanumeric`, so it was never shredded — but it kept diacritics, which meant a filename that
+  differs by normalization form between platforms. It now folds through the same helper, per word, so
+  no word is cut apart. `sanitize_name` is deliberately unchanged: it also has to map an *existing*
+  on-disk name to itself, and folding there would orphan the accented session files already saved.
+- **Ids already on disk are re-slugged once, automatically.** The new rule only helps facts written
+  from here on, so a store written by an older build is migrated on the first run of a build that has
+  this. It needs no model and makes no guesses: the display `name` in each file's frontmatter was
+  never mangled, only the filename, so the correct id is `slugify(name)` recomputed. The old→new
+  table is written to `cli-memory/.id-migration-<date>.tsv` **before the first rename**, since it is
+  the only route back to the previous names. `graph.tsv` endpoints are re-pointed in the same pass —
+  renaming the files alone would leave every edge aimed at an id that no longer exists and the
+  association layer would silently go dark. Cross-kind endpoints (`skill:`, `persona:`) pass through
+  untouched, `archive/` revision suffixes (`-r1`) survive, and collisions get a numeric suffix rather
+  than clobbering. Verified on a copy of a real store: 258 ids renamed, 187 edges re-pointed, **0
+  dangling endpoints**, no files lost. `AIZEN_NO_ID_MIGRATE=1` skips it; a flag file stops a second
+  pass. It renames files without asking — but not silently: the count and the map's path go to
+  stderr, so a piped `memory list` stays machine-readable.
+
+### Added
+- **`aizen memory where` and `aizen skill where`** — print the folders, with a file count each.
+  Nothing pointed a user at a directory before: the `memory list` footer named only the three
+  per-id verbs (`show`/`edit`/`forget`), and a path appeared just once, in `memory show <id>`, one
+  entry at a time. Opening the folder is the faster route when the job is editing or deleting many
+  records at once, and skills made this worse by living in **three** roots that the `[project]` and
+  `[repo]` tags only hinted at. A directory that does not exist yet says so, so absence never reads
+  as emptiness. `persona list` gained the same pointer inline, since personas have only one folder.
+
 ## [0.5.7] — 2026-08-05
 
 Two things this release is about. **A hosted daemon now answers several conversations at once**

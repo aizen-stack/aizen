@@ -21,6 +21,7 @@
 //! stream of episodes → periodic reflection into higher-level insights). Self-memory lives in a
 //! sibling `~/.aizen/personas/<slug>.self/` directory, so each character grows independently.
 
+pub mod migrate_stems;
 pub mod reflect;
 pub mod self_mem;
 pub mod soul;
