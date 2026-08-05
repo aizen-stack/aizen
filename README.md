@@ -105,8 +105,6 @@ That's the whole setup. No env vars, no config file to hand-edit.
 | Semantic Code Editing | ✅ | ⚠️ | ❌ | ⚠️ | ❌ | ⚠️ | ⚠️ |
 | Multi-Agent | ✅ | ⚠️ | ❌ | ❌ | ❌ | ✅ | ✅ |
 | Browser Automation | ✅ | ⚠️ | ❌ | ❌ | ❌ | ✅ | ✅ |
-| HTTP API | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ |
-| Desktop UI | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ |
 | Prompt Overhead* | ~14.6k tok | ~7.8k tok | - | - | - | - | ~16.8k tok |
 
 > **Notes**
