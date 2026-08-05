@@ -363,8 +363,25 @@ pub fn mtype_for(tier: Tier) -> MemoryType {
 ///
 /// Cut on a CHAR boundary, not a byte one — a Vietnamese fact would otherwise panic mid-codepoint,
 /// and preserving the user's language is the whole point of `text`.
+///
+/// Cut on a WORD boundary too. This name is not only displayed: `store::slugify` derives the entry's
+/// id from it, so a name ending in half a word ships that half-word into the filename — the real
+/// store had `…-la-khe-uoc-lam-viec-l`, where `l` is the start of `lâu` and reads as noise. Trailing
+/// punctuation goes with it, since `…giữ a,` would otherwise leave a dangling comma in the display.
 fn fact_name(text: &str) -> String {
-    text.chars().take(60).collect()
+    let head: String = text.chars().take(60).collect();
+    // Only back up if the cut actually landed inside the text; a short fact keeps its final word.
+    let trimmed = if text.chars().count() > 60 {
+        match head.rfind(char::is_whitespace) {
+            Some(i) if i > 0 => &head[..i],
+            _ => head.as_str(),
+        }
+    } else {
+        head.as_str()
+    };
+    trimmed
+        .trim_end_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+        .to_string()
 }
 
 /// What applying a secretary output actually did — for the one-line REPL notice and for tests.
@@ -827,6 +844,39 @@ mod tests {
         let vn = "người dùng luôn muốn trả lời bằng tiếng Việt, ngắn gọn, không vòng vo thêm nữa";
         assert!(fact_name(vn).chars().count() <= 60);
         assert!(!fact_name(vn).is_empty());
+    }
+
+    #[test]
+    fn fact_name_does_not_end_mid_word() {
+        // The real store had `agents-md-…-la-khe-uoc-lam-viec-l`: char 60 landed inside `lâu`, and
+        // `slugify` faithfully carried the orphan `l` into the id. The name must end on a word.
+        let vn = "AGENTS.md ở top level repo aizen_admin là khế ước làm việc lâu dài giữa hai bên";
+        let name = fact_name(vn);
+        assert!(name.chars().count() <= 60, "still capped: {name:?}");
+        assert!(name.ends_with("việc"), "backed up to a whole word: {name:?}");
+        // And the id derived from it inherits whole words only.
+        let id = crate::memory::store::slugify(&name);
+        assert!(
+            !id.split('-').next_back().is_some_and(|w| w.len() == 1),
+            "id must not end in an orphan letter: {id}"
+        );
+    }
+
+    #[test]
+    fn fact_name_keeps_a_short_fact_whole() {
+        // Backing up to a word boundary must not eat the last word of a fact that never hit the cap.
+        let s = "aizen dùng rustls";
+        assert_eq!(fact_name(s), s);
+    }
+
+    #[test]
+    fn fact_name_drops_the_punctuation_left_at_the_cut() {
+        let vn = "15songarmy có 2 biến thể build: `build:app` (PC/Tauri, giữ a2 nguyên vẹn) và web";
+        let name = fact_name(vn);
+        assert!(
+            !name.ends_with(',') && !name.ends_with(' '),
+            "no dangling separator: {name:?}"
+        );
     }
 
     // ── apply_facts (touches the real store, so it needs a temp home) ──────────
