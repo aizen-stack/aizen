@@ -76,7 +76,44 @@ That's the whole setup. No env vars, no config file to hand-edit.
   ⚙ shell_run     cargo test               ✓ 0 failed · 1.18s
                                            verify gate passed
 ```
+## Comparison
 
+> **Benchmark environment**
+>
+> - Windows 11 Pro (x64)
+> - Same machine
+> - Same provider
+> - Same model
+> - Same repository
+> - Same benchmark suite
+> - Measured on the listed versions only
+
+| Feature | **Aizen** | **OpenCode** | **Codex CLI** | **Gemini CLI** | **Aider** | **OpenHands** | **Hermes Agent** |
+|----------|:---------:|:------------:|:-------------:|:--------------:|:---------:|:-------------:|:----------------:|
+| Open Source | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Runtime | 🦀 Rust | Bun / TypeScript | Rust | TypeScript | Python | Python | Python |
+| License | Apache-2.0 | MIT | Apache-2.0 | Apache-2.0 | Apache-2.0 | MIT | MIT |
+| Standalone Binary | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Runtime Dependencies | **None** | None | None | Node.js | Python | Python + Docker | Python + Node |
+| Install Size | **33 MB** | 167 MB | - | - | - | - | 2.25 GB |
+| Startup Time | **13 ms** | 563 ms | - | - | - | - | 843 ms |
+| Peak RAM | **14 MB** | 194 MB | - | - | - | - | 77 MB |
+| OpenAI-Compatible APIs | ✅ | ✅ | ⚠️ | ❌ | ✅ | ✅ | ✅ |
+| Multi-Provider | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ |
+| MCP | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Persistent Memory | ✅ | ❌ | ⚠️ | ⚠️ | ❌ | ✅ | ✅ |
+| Semantic Code Editing | ✅ | ⚠️ | ❌ | ⚠️ | ❌ | ⚠️ | ⚠️ |
+| Multi-Agent | ✅ | ⚠️ | ❌ | ❌ | ❌ | ✅ | ✅ |
+| Browser Automation | ✅ | ⚠️ | ❌ | ❌ | ❌ | ✅ | ✅ |
+| HTTP API | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ |
+| Desktop UI | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ |
+| Prompt Overhead* | ~14.6k tok | ~7.8k tok | - | - | - | - | ~16.8k tok |
+
+> **Notes**
+>
+> - `-` = Not benchmarked yet.
+> - Prompt overhead = fixed system prompt + tool schemas before user input.
+> - Total token cost depends on the workflow, number of turns, and model, and should be benchmarked separately.
 | | |
 |---|---|
 | **Unified REPL** | One chat + agent loop, no mode switch. Live HUD: model · tokens · turn · `% context`. Markdown, tables, diagrams, image input. |
