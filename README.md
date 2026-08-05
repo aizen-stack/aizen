@@ -91,7 +91,7 @@ That's the whole setup. No env vars, no config file to hand-edit.
 | Feature | **Aizen** | **OpenCode** | **Codex CLI** | **Gemini CLI** | **Aider** | **OpenHands** | **Hermes Agent** |
 |----------|:---------:|:------------:|:-------------:|:--------------:|:---------:|:-------------:|:----------------:|
 | Open Source | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Runtime | 🦀 Rust | Bun / TypeScript | Rust | TypeScript | Python | Python | Python |
+| Runtime |  Rust | Bun / TypeScript | Rust | TypeScript | Python | Python | Python |
 | License | Apache-2.0 | MIT | Apache-2.0 | Apache-2.0 | Apache-2.0 | MIT | MIT |
 | Standalone Binary | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Runtime Dependencies | **None** | None | None | Node.js | Python | Python + Docker | Python + Node |
