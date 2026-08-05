@@ -553,6 +553,13 @@ written by that version are re-slugged once, automatically, on the first run of 
 — the old→new table is left in `cli-memory/.id-migration-<date>.tsv`, and graph edges are re-pointed
 in the same pass. Set `AIZEN_NO_ID_MIGRATE=1` to skip it.
 
+A fact's id comes from its display `name`, which is the first 60 characters of the fact — so that cut
+has to land on a word too. It used to cut anywhere: 73 entries on one store had names ending in a
+one- or two-letter fragment, and the id inherited it (`…-la-khe-uoc-lam-viec-l`, where `l` began
+`lâu`). New facts back the cut up to the last word; the names already written are left alone, since
+their bodies still hold the full text and a second automatic rewrite of a store belongs behind a
+command you type, not a startup pass.
+
 The same rule now governs every name derived from free text — memory ids, `#remember` captures,
 persona self-memories, session saves, and the project zone key all share one implementation:
 

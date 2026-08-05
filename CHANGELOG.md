@@ -7,6 +7,17 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+## [0.5.8] — 2026-08-05
+
+One theme: **a name is a handle, and four of the five places that build one were cutting words in
+half.** Testing a name one codepoint at a time against `is_ascii_alphanumeric` makes every accented
+letter fail, so it becomes a separator and splits the word it belonged to. Three quarters of a real
+memory store had ids nobody could read, and the id is the only thing `memory show|edit|forget`
+accepts. The accent is now folded off the letter *before* anything decides where a word ends, in one
+shared helper, and names already on disk are recomputed once. Two things fell out of the same work: a
+pasted API key can no longer become a filename, and `aizen where` says when a saved transcript still
+contains one.
+
 ### Fixed
 - **Memory ids were cut inside words, so 76% of a real store was unusable.** `slugify` tested one
   codepoint at a time against `is_ascii_alphanumeric`, and every accented letter failed the test and
@@ -22,6 +33,18 @@ development log lives in that monorepo's history.
   folded to `uong`. Truncation now backs up to the last whole word: a blind cut turned `tieng` into
   `tien`, a different word, so a shortened id read as a fact about something else.
   `memory` and `#remember` share one folding helper, so the two id-producing paths cannot drift.
+- **A learned fact's display name also ended mid-word — and the id is derived from it.** Found by
+  reading the migrated store rather than the code, which is why it is worth stating separately:
+  `fact_name` cut the head of a fact at 60 characters on a *char* boundary, so it never panicked, but
+  it cut straight through words. **73 of the same 243 names** end in a one- or two-character fragment,
+  and `slugify` faithfully carried that fragment into the filename —
+  `agents-md-…-la-khe-uoc-lam-viec-l`, where the `l` is the first letter of `lâu`. Folding accents
+  could not have caught this: by then the accent was gone and the orphan was legitimately ASCII. The
+  cut now backs up to the last whitespace and drops the punctuation left at the seam, so `…giữ a,`
+  no longer leaves a dangling comma in a listing either; a fact shorter than the cap keeps its final
+  word. **The 73 names already on disk are not rewritten** — their bodies still hold the full text so
+  recovering them is mechanical, but a second automatic pass over a user's data in one release should
+  be seen before it runs.
 - **The same defect was live in three more places; all four now share one implementation.** Five
   surfaces independently turn free text into a filename, and four of them had written the same broken
   loop. `core::slug` is now the single definition of "a name a human can read and retype", so they
@@ -70,6 +93,13 @@ development log lives in that monorepo's history.
   were ISO timestamps** (long, mixed-case, letters and digits — indistinguishable from key material by
   shape alone), which would have flagged 23 of 27 files and taught the user to ignore the warning.
   Prefix matching flags 12 strings, all real keys, in 4 files.
+- **`persona self` asked you to choose from a set it would not show you.** At the 40-insight cap the
+  view said "retire one" and then printed 10 of the 40 — and it is the only place a self-memory id
+  appears, so `persona forget <id>` had nothing to name. The hidden count is now always stated and
+  `--all` prints every id. Bodies render through `elide` rather than a truncator that appends
+  `[+73 chars]`: that suffix exists so a *model* reading a clipped tool result knows content was
+  withheld, but in a listing it is noise the reader cannot act on and it costs the width the text
+  needed.
 
 ### Changed
 - **Session names are ASCII whole words, like every other id.** `suggest_session_name` used unicode
