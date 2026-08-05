@@ -435,6 +435,9 @@ enum PersonaCmd {
     SelfMem {
         /// Persona name (else the active one).
         name: Option<String>,
+        /// Show every insight and episode, not just the head of each list.
+        #[arg(short, long)]
+        all: bool,
     },
     /// Record a free self-memory episode for the ACTIVE persona (no model call).
     Remember {
@@ -4123,6 +4126,16 @@ async fn persona_paste_interactive(history: &mut Vec<Message>, model: &str) -> R
 
 /// Show a character's accumulated self-memory (reflected insights + recent episodes).
 fn persona_self_view(slug: &str, name: &str) {
+    persona_self_view_n(slug, name, false);
+}
+
+/// As [`persona_self_view`]; `all` lifts the per-section head cut.
+///
+/// The head cut exists so a glance stays a glance, but at a saturated cap this view is ALSO the
+/// only place a self-memory id is printed, and `persona forget <id>` is the only way to make room.
+/// Showing 10 of 40 while advising "retire one" offers a choice out of a set the reader cannot see —
+/// so the hidden count is always stated, and `--all` prints the rest.
+fn persona_self_view_n(slug: &str, name: &str, all: bool) {
     let mut mems = persona::self_mem::list(slug);
     if mems.is_empty() {
         println!(
@@ -4156,16 +4169,27 @@ fn persona_self_view(slug: &str, name: &str) {
         .collect();
     if !insights.is_empty() {
         println!("\n{}", style("insights").dim());
-        for m in insights.iter().take(10) {
+        let shown = if all { insights.len() } else { 10 };
+        for m in insights.iter().take(shown) {
             println!(
                 "  {} [{}] {}",
                 style("★").color256(splash::ACCENT),
                 m.importance,
-                truncate_chars(m.body.trim(), 140)
+                elide(m.body.trim(), 140)
             );
             // The id is what `persona forget <id>` names. Without it printed here the retire path is
             // unreachable in practice — ids are body-derived slugs nobody can guess.
             println!("      {}", style(&m.id).dim());
+        }
+        if insights.len() > shown {
+            println!(
+                "  {}",
+                style(format!(
+                    "… {} more — `persona self {name} --all` lists every id",
+                    insights.len() - shown
+                ))
+                .dim()
+            );
         }
     }
     let episodes: Vec<&persona::self_mem::SelfMemory> = mems
@@ -4174,12 +4198,19 @@ fn persona_self_view(slug: &str, name: &str) {
         .collect();
     if !episodes.is_empty() {
         println!("\n{}", style("recent episodes").dim());
-        for m in episodes.iter().take(8) {
+        let shown = if all { episodes.len() } else { 8 };
+        for m in episodes.iter().take(shown) {
             println!(
                 "  {} [{}] {}",
                 style("·").dim(),
                 m.importance,
-                truncate_chars(m.body.trim(), 120)
+                elide(m.body.trim(), 120)
+            );
+        }
+        if episodes.len() > shown {
+            println!(
+                "  {}",
+                style(format!("… {} more", episodes.len() - shown)).dim()
             );
         }
     }
@@ -7822,16 +7853,11 @@ fn print_status_line(history: &[Message], model: &str) {
 /// How many trailing user turns to keep verbatim when compacting (the rest is summarized).
 const COMPACT_KEEP_TURNS: usize = agent::compact::KEEP_TURNS;
 
-/// Truncate to `max` chars with a `…[+N chars]` marker (delegates to the shared compaction core).
-fn truncate_chars(s: &str, max: usize) -> String {
-    agent::compact::truncate_chars(s, max)
-}
-
 /// Shorten for a human-facing list: keep the head, mark the cut with an ellipsis.
 ///
-/// NOT [`truncate_chars`], which appends `[+N chars]` — that suffix exists so a MODEL reading a
-/// truncated tool result knows content was withheld. In a listing it is noise the reader can't act
-/// on, and it costs the width the description needed.
+/// NOT [`agent::compact::truncate_chars`], which appends `[+N chars]` — that suffix exists so a
+/// MODEL reading a truncated tool result knows content was withheld. In a listing it is noise the
+/// reader can't act on, and it costs the width the description needed.
 fn elide(s: &str, max: usize) -> String {
     let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max {
@@ -14189,7 +14215,7 @@ fn run_persona(cmd: PersonaCmd) -> Result<()> {
             println!("persona cleared → default assistant voice");
             Ok(())
         }
-        PersonaCmd::SelfMem { name } => {
+        PersonaCmd::SelfMem { name, all } => {
             let slug = match name {
                 Some(n) => skill::sanitize_name(&n),
                 None => persona::active_slug().ok_or_else(|| {
@@ -14199,7 +14225,7 @@ fn run_persona(cmd: PersonaCmd) -> Result<()> {
             let label = persona::load(&slug)
                 .map(|p| p.name)
                 .unwrap_or_else(|| slug.clone());
-            persona_self_view(&slug, &label);
+            persona_self_view_n(&slug, &label, all);
             Ok(())
         }
         PersonaCmd::Forget { id, name } => {
@@ -16673,10 +16699,23 @@ mod tests {
         assert!(sanitize_name(&"a".repeat(200)).len() <= 80);
     }
 
+    /// `elide` is what every human-facing listing shortens with, so its contract is asserted here
+    /// rather than assumed: no marker beyond the ellipsis, and newlines flattened — a stored fact or
+    /// insight is multi-line, and one leaking into a row breaks the column alignment of every row
+    /// under it.
     #[test]
-    fn truncate_and_fmt_helpers() {
-        assert_eq!(truncate_chars("hello", 10), "hello");
-        assert!(truncate_chars("hello world", 5).starts_with("hello… [+"));
+    fn elide_and_fmt_helpers() {
+        assert_eq!(elide("hello", 10), "hello");
+        assert_eq!(elide("hello world", 8), "hello w…");
+        assert!(
+            !elide("hello world", 8).contains("[+"),
+            "the `[+N chars]` marker is for a MODEL reading a truncated tool result, not a listing"
+        );
+        assert_eq!(
+            elide("two\nlines  here", 40),
+            "two lines here",
+            "a multi-line body must flatten, or it breaks every column below it"
+        );
         assert_eq!(fmt_k(300), "300");
         assert_eq!(fmt_k(12_400), "12.4K");
     }
