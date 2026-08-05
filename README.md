@@ -102,7 +102,7 @@ browser tools, and the safety model in detail.
 |---------|:---------:|:------------:|:---------:|:-------------:|:----------------:|
 | Open Source | ✅ | ✅ | ✅ | ✅ | ✅ |
 | License | Apache-2.0 | MIT | Apache-2.0 | MIT | MIT |
-| Runtime | 🦀 Rust | Bun / TypeScript | Python | Python | Python |
+| Runtime |  Rust | Bun / TypeScript | Python | Python | Python |
 | Standalone Binary | ✅ | ✅ | ❌ | ❌ | ❌ |
 | Runtime Dependencies | **None** | None | Python | Python (+ Docker recommended) | Python + Node |
 | Multi-Provider | ✅ | ✅ | ✅ | ✅ | ✅ |
