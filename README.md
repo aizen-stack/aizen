@@ -87,61 +87,7 @@ That's the whole setup. No env vars, no config file to hand-edit.
 **→ [Full reference](docs/REFERENCE.md)** — every command, the REPL surface, self-hosting, MCP,
 browser tools, and the safety model in detail.
 
-## Comparison
-
-> **Benchmark environment for performance rows**
->
-> * Windows 11 Pro x64
-> * Same machine and disk
-> * Same benchmark session
-> * Measured on the listed versions only
-> * `—` means not benchmarked, not unsupported
-
-| Feature                       |                                **Aizen**                               |          **OpenCode**          |                **Aider**               |           **OpenHands**          |                   **Hermes Agent**                  |
-| ----------------------------- | :--------------------------------------------------------------------: | :----------------------------: | :------------------------------------: | :------------------------------: | :-------------------------------------------------: |
-| Open Source                   |                                    ✅                                   |                ✅               |                    ✅                   |                 ✅                |                          ✅                          |
-| License                       |                               Apache-2.0                               |               MIT              |               Apache-2.0               |                MIT               |                         MIT                         |
-| Runtime                       |                                **Rust**                                |        TypeScript + Bun        |                 Python                 |              Python              |                        Python                       |
-| Standalone Binary             |                             ✅ Single binary                            |      ✅ Precompiled binary      |                    ❌                   |                 ❌                |                          ❌                          |
-| Runtime Dependencies          |                                **None**                                |              None              |                 Python                 |          Python / Docker         |           Python + Node + additional tools          |
-| Install Size*                 |                              **33.2 MiB**                              |            167.2 MiB           |                    —                   |                 —                |                       2.25 GiB                      |
-| Startup Time*                 |                                **13 ms**                               |             563 ms             |                    —                   |                 —                |                        843 ms                       |
-| Peak RAM*                     |                              **14.2 MiB**                              |            194.1 MiB           |                    —                   |                 —                |                       76.9 MiB                      |
-| Model Support                 |                     Any OpenAI-compatible endpoint                     | 75+ providers and local models |             Multi-provider             |          Multi-provider          |          300+ models / compatible endpoints         |
-| Persistent Memory             |                       ✅ **BM25 memory subsystem**                      |       ❌ Rules files only       | ❌ No native long-term memory subsystem | ✅ Agent memory / workspace state | ✅ **FTS5 session search + curated memory + Honcho** |
-| Memory Structure              | Bi-temporal facts, learned profile, abstaining Q&A, co-retrieval graph |    `AGENTS.md` / rules files   |     Repository map and chat history    |     Workspace and agent state    |  Curated memories, session retrieval and user model |
-| Memory Across Sessions        |                                    ✅                                   |                ❌               |    ⚠️ Session / repository dependent   |                 ✅                |                          ✅                          |
-| Durable Agent Identity        |                         ✅ `SOUL.md` + personas                         |                ❌               |                    ❌                   |   ⚠️ Configurable agent prompts  |                     ✅ `SOUL.md`                     |
-| Codebase Retrieval            |                     ✅ BM25 memory + codebase index                     |  ⚠️ File search, grep and LSP  |            ✅ Repository map            |        ✅ Workspace search        |                ✅ FTS5 session search                |
-| LSP Integration               |                      ✅ **Built in and default ON**                     |    ⚠️ Built in, default OFF    |    ❌ No native LSP semantic editing    |     ⚠️ Environment dependent     |                ✅ Multiple LSP servers               |
-| Semantic Symbol Lookup        |                                    ✅                                   |           ⚠️ Partial           |                    ❌                   |                ⚠️                |                          ⚠️                         |
-| Semantic Code Editing         |                 ✅ **Replace or insert code by symbol**                 |    ⚠️ Primarily diagnostics    |       ❌ Text / diff-based editing      |         ⚠️ Tool-dependent        |                ⚠️ Diagnostics-focused               |
-| Symbol-Level Replace          |                           ✅ `symbol_replace`                           |           ❌ / limited          |                    ❌                   |                ⚠️                |                          ❌                          |
-| Post-Edit Diagnostics         |                                    ✅                                   |      ✅ When LSP is enabled     |          ⚠️ Via external tools         |                 ✅                |                          ✅                          |
-| Verify Before Completion      |                 ✅ Enforced typecheck gate in agent loop                |     ⚠️ Prompt / hook driven    |             ⚠️ Model driven            |          ⚠️ Agent driven         |                ⚠️ Agent / hook driven               |
-| Sub-Agents                    |                                    ✅                                   |                ✅               |                    ❌                   |                 ✅                |                          ✅                          |
-| Parallel Multi-Agent Workflow |                              ✅ `workflow`                              |       ⚠️ Task sub-agents       |                    ❌                   |                 ✅                |                          ✅                          |
-| Multi-Window Coordination     |                   ✅ Status, diff, claims and commits                   |                ❌               |                    ❌                   |        ⚠️ Workspace based        |            ⚠️ Kanban / task coordination            |
-| Git Worktree per Task         |                                    ✅                                   |                ❌               |                    ❌                   |                ⚠️                |                          ⚠️                         |
-| MCP                           |                       ✅ Stdio / HTTP + OAuth 2.1                       |            ✅ + OAuth           |          ⚠️ Version dependent          |                 ✅                |                  ✅ + tool filtering                 |
-| Checkpoints / Undo            |                        ✅ Git-backed time machine                       |      ✅ `/undo` and `/redo`     |          ✅ Git-based workflow          |                 ✅                |                    ✅ `/rollback`                    |
-| Browser Automation            |                       ✅ Optional CDP integration                       |       ⚠️ Via MCP / tools       |                ❌ Native                |                 ✅                |                     ✅ Playwright                    |
-| Scheduled Tasks               |                   ✅ OS scheduler, no daemon required                   |                ❌               |                    ❌                   |      ⚠️ Deployment dependent     |                   ✅ Built-in cron                   |
-| Remote Control                |                          Telegram and Discord                          |    ❌ Native chat integration   |                    ❌                   |    Web UI / remote deployment    |               20+ messaging platforms               |
-| HTTP API / Server             |                                    ❌                                   |                ✅               |                    ❌                   |                 ✅                |                          ✅                          |
-| Desktop / Web UI              |                             ❌ Terminal only                            |     ✅ Desktop, IDE and web     |             ❌ Terminal only            |             ✅ Web UI             |                  ✅ Desktop and web                  |
-| Fixed Prompt Overhead*        |                           ≈14.6k tokens fresh                          |          ≈7.8k tokens          |                    —                   |                 —                |                    ≈16.8k tokens                    |
-| Advertised Tools*             |                                 **43**                                 |               12               |                    —                   |                 —                |                          28                         |
-| Average Schema Size / Tool*   |                                **901 B**                               |             1,905 B            |                    —                   |                 —                |                       1,636 B                       |
-
-> **Notes**
->
-> * Performance and prompt measurements marked with `*` are local measurements from the tested versions and configurations.
-> * Aizen's prompt grows as persona, memory and skills accumulate.
-> * OpenCode has the smallest measured fixed prompt, while Aizen exposes a much larger built-in tool surface.
-> * “Semantic editing” means modifying code using symbols or language-server knowledge, not simply asking the model to search and replace text.
-> * Feature support may change between releases. Keep version numbers next to the benchmark in the README.
-
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/2aacc37c-8544-4946-9b4f-19cec98676ca" />
 
 ## Contributing
 
