@@ -87,7 +87,8 @@ That's the whole setup. No env vars, no config file to hand-edit.
 **→ [Full reference](docs/REFERENCE.md)** — every command, the REPL surface, self-hosting, MCP,
 browser tools, and the safety model in detail.
 
-<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/2aacc37c-8544-4946-9b4f-19cec98676ca" />
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/7ae1cf10-5785-462d-b6ff-b784470c9fc5" />
+
 
 ## Contributing
 
