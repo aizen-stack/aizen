@@ -105,29 +105,115 @@ pub struct PromptTokensDetails {
 /// `content` is serialized even when `None` (→ JSON `null`): an assistant turn that only
 /// emits tool calls is the canonical `{role:"assistant", content:null, tool_calls:[…]}`.
 ///
-/// `images` (data URLs) is NOT a wire field: it's a vision attachment. Serialization is HAND-WRITTEN
-/// (not derived) so that a user turn with images emits the OpenAI multimodal shape — `content` as a
-/// parts array `[{type:text,…},{type:image_url,image_url:{url}}]` — while every other turn keeps the
-/// plain-string (or `null`) `content`. Images live OUT of `content` on purpose: the `chars/4` token
-/// HUD + auto-compact count only `content`, so a multi-MB base64 image never inflates the gauge.
-#[derive(Debug, Clone, Deserialize)]
+/// `images` (data URLs) is NOT a plain wire field: it's a vision attachment. BOTH directions are
+/// hand-written so the two agree. A user turn with images serializes `content` as a parts array
+/// — `[{type:text,…},{type:image_url,image_url:{url}}]` — and [`Deserialize`] splits that array back
+/// apart. Images live OUT of `content` in memory on purpose: the `chars/4` token HUD + auto-compact
+/// count only `content`, so a multi-MB base64 image never inflates the gauge.
+#[derive(Debug, Clone)]
 pub struct Message {
     pub role: String,
-    #[serde(default)]
     pub content: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    /// Vision attachments as `data:<mime>;base64,…` URLs (user turns only). Never read from the wire
-    /// (`skip_deserializing`) and emitted via the custom `Serialize` below, not as a plain field.
-    #[serde(default, skip_deserializing)]
+    /// Vision attachments as `data:<mime>;base64,…` URLs (user turns only). Emitted via the custom
+    /// `Serialize` below as parts inside `content`, and recovered back OUT of those parts by the
+    /// custom `Deserialize` — see [`ContentField`].
     pub images: Vec<String>,
     /// Anthropic prompt-cache breakpoint, set on a stable message just before the volatile turn so
-    /// the provider caches the prefix up to here. Write-only (like `images`): emitted by the custom
-    /// `Serialize`, never read from the wire.
-    #[serde(default, skip_deserializing)]
+    /// the provider caches the prefix up to here. Write-only: emitted by the custom `Serialize`,
+    /// never read from the wire (a stale breakpoint from a saved transcript must not be replayed).
     pub cache_control: Option<CacheControl>,
+}
+
+/// The three shapes `content` legitimately takes on the wire and on disk: absent/`null`, a plain
+/// string, or an OpenAI multimodal parts array. The array arm is not merely provider compatibility —
+/// it is what OUR OWN [`Serialize`](Message::serialize) writes for a user turn carrying `images`.
+///
+/// Deserializing only `Option<String>` therefore made every transcript containing a pasted image
+/// unreadable BY THE PROGRAM THAT WROTE IT: `serde` failed on the array, `parse_session_bytes`
+/// returned `None`, and `/sessions` listed the conversation as "(unreadable)" forever. Round-tripping
+/// through this enum closes that asymmetry, and makes already-saved files load again with no
+/// migration — the data was never lost, only unparseable.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ContentField {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+/// One element of a multimodal `content` array. Unknown part types deserialize to `Other` and are
+/// dropped rather than failing the whole message: a provider adding a part kind (audio, video, file)
+/// must not make a saved conversation unreadable — the same failure this enum exists to fix.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlPart },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct ImageUrlPart {
+    url: String,
+}
+
+/// Mirror of the deserialized field set. `images`/`cache_control` are deliberately absent: images
+/// arrive inside `content` parts (see [`ContentField`]), and a cache breakpoint is per-request state
+/// that must be recomputed, never replayed from disk.
+#[derive(Deserialize)]
+struct MessageWire {
+    role: String,
+    #[serde(default)]
+    content: Option<ContentField>,
+    #[serde(default)]
+    tool_calls: Vec<ToolCall>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let wire = MessageWire::deserialize(de)?;
+        // Split the parts array back into the in-memory split the rest of the codebase relies on:
+        // text in `content`, image data URLs in `images`. Keeping images OUT of `content` is load
+        // bearing — the `chars/4` token HUD and auto-compact measure `content` only, so folding a
+        // multi-MB base64 URL into it would blow up both (see the struct doc above).
+        let (content, images) = match wire.content {
+            None => (None, Vec::new()),
+            Some(ContentField::Text(s)) => (Some(s), Vec::new()),
+            Some(ContentField::Parts(parts)) => {
+                let mut text = String::new();
+                let mut images = Vec::new();
+                for part in parts {
+                    match part {
+                        ContentPart::Text { text: t } => {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(&t);
+                        }
+                        ContentPart::ImageUrl { image_url } => images.push(image_url.url),
+                        ContentPart::Other => {}
+                    }
+                }
+                // An image-only turn serializes with no text part at all. Round-tripping it back to
+                // `Some("")` rather than `None` keeps the message shape stable across save/load.
+                (Some(text), images)
+            }
+        };
+        Ok(Message {
+            role: wire.role,
+            content,
+            tool_calls: wire.tool_calls,
+            tool_call_id: wire.tool_call_id,
+            images,
+            cache_control: None,
+        })
+    }
 }
 
 impl Serialize for Message {
@@ -334,6 +420,18 @@ pub struct RespMessage {
     /// gateways emit `stop`/`end_turn` alongside tool calls).
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
+    /// Dedicated reasoning channel some providers return INSTEAD of `content` (DeepSeek
+    /// `reasoning_content`, OpenRouter `reasoning`) — the same field the streaming [`Delta`] has
+    /// always read.
+    ///
+    /// This struct did NOT read it, so a reasoning-only reply deserialized to
+    /// `content: None, tool_calls: []` — which every caller classifies as an empty-200 provider
+    /// failure even though the model spoke. The asymmetry only bit SUB-AGENTS, because they are the
+    /// one caller that runs exclusively on the non-streaming path (`chat_with_tools`): the same
+    /// model answering the same way over the streaming path was fine. Read here so
+    /// [`crate::llm::client::chat_with_tools`] can fall back to it rather than report silence.
+    #[serde(default, alias = "reasoning")]
+    pub reasoning_content: Option<String>,
 }
 
 // ── streaming response (plain chat; tool-call delta reassembly is H5/v2) ──────
@@ -624,5 +722,61 @@ mod tests {
         assert_eq!(openai.cache_read(), 5);
         let none: Usage = serde_json::from_str(r#"{"prompt_tokens":10}"#).unwrap();
         assert_eq!(none.cache_read(), 0);
+    }
+
+    /// A message with vision attachments must survive its OWN serialization.
+    ///
+    /// It did not: `Serialize` wrote `content` as a multimodal parts array while `content` only
+    /// deserialized as `Option<String>`, so every saved conversation containing a pasted image was
+    /// rejected by its own reader and listed as "(unreadable)" in `/sessions` — permanently, with the
+    /// serde error swallowed. Two real transcripts on the maintainer's machine were dead this way.
+    #[test]
+    fn message_with_images_round_trips_through_its_own_serializer() {
+        let original = Message::user_with_images(
+            "what is in this screenshot?",
+            vec![
+                "data:image/png;base64,iVBORw0KGgo=".to_string(),
+                "data:image/jpeg;base64,/9j/4AAQ".to_string(),
+            ],
+        );
+        let json = serde_json::to_string(&original).unwrap();
+        // Guard the wire shape too: the provider contract is a parts array, and a "fix" that made
+        // this test pass by writing a plain string would silently break vision requests.
+        assert!(json.contains("image_url"), "wire shape is parts: {json}");
+
+        let back: Message = serde_json::from_str(&json).expect("must read what it wrote");
+        assert_eq!(back.role, "user");
+        assert_eq!(back.content.as_deref(), Some("what is in this screenshot?"));
+        assert_eq!(back.images, original.images);
+    }
+
+    /// The image-only case: no text part is emitted at all, so the array is images end to end.
+    #[test]
+    fn image_only_message_round_trips() {
+        let original =
+            Message::user_with_images("", vec!["data:image/png;base64,AAAA".to_string()]);
+        let json = serde_json::to_string(&original).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.content.as_deref(), Some(""));
+        assert_eq!(back.images, vec!["data:image/png;base64,AAAA".to_string()]);
+    }
+
+    /// Plain and null `content` keep working, and an unknown part type is dropped rather than
+    /// failing the whole message — the same "one new field makes a transcript unreadable" trap.
+    #[test]
+    fn plain_null_and_unknown_part_shapes_still_parse() {
+        let plain: Message = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
+        assert_eq!(plain.content.as_deref(), Some("hi"));
+        assert!(plain.images.is_empty());
+
+        let null: Message = serde_json::from_str(r#"{"role":"assistant","content":null}"#).unwrap();
+        assert_eq!(null.content, None);
+
+        let exotic: Message = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"text","text":"a"},{"type":"input_audio","input_audio":{"data":"x"}}]}"#,
+        )
+        .expect("an unknown part type must not sink the message");
+        assert_eq!(exotic.content.as_deref(), Some("a"));
+        assert!(exotic.images.is_empty());
     }
 }

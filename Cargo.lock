@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "aizen"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "arboard",

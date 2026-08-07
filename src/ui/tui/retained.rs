@@ -868,6 +868,20 @@ fn terminal_size_changed() -> bool {
     }
 }
 
+/// Refresh the published size from the real terminal without a ratatui frame.
+///
+/// The normal update rides on a paint (`autoresize` → `COLS`/`ROWS`), which cannot happen while the
+/// renderer is suspended for a dialoguer menu: `session` is `None`, so the idle-tick probe is skipped
+/// and the atomics keep their pre-menu values. Anything that lays itself out from `tui::width()`
+/// during the menu — `print_config`'s rule and right-aligned path — then draws at the OLD width. This
+/// is called on the way INTO a suspend (the size is still readable then) and again on the way out.
+fn publish_terminal_size() {
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        COLS.store(cols.max(20), Ordering::Relaxed);
+        ROWS.store(rows.max(8), Ordering::Relaxed);
+    }
+}
+
 fn send(cmd: Command) {
     let tx = runtime_slot()
         .lock()
@@ -1154,6 +1168,9 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 break;
             }
             Ok(Command::Suspend(ack)) => {
+                // Publish the size BEFORE giving up the screen: while suspended there is no frame to
+                // ride an `autoresize` on, and whatever draws inside the menu reads these atomics.
+                publish_terminal_size();
                 session.take();
                 let _ = ack.send(());
                 dirty = false;
@@ -1168,6 +1185,12 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     Err(_) => false,
                 };
                 let _ = ack.send(ok);
+                // Force a full clear, exactly as `Redraw` does. `enter()`'s `terminal.clear()` resets
+                // ratatui's own diff baseline, but the SCREEN may hold bytes no baseline knows about:
+                // a menu's leftover lines, or a raw print / spinner tick that landed during the
+                // suspend window. Without this those cells are never overwritten and survive into
+                // later frames — the "/config corrupted the layout" report.
+                force_clear = ok;
                 dirty = ok;
             }
             Ok(Command::Redraw) => {
@@ -1210,6 +1233,7 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     return;
                 }
                 Command::Suspend(ack) => {
+                    publish_terminal_size(); // see the blocking-recv arm above
                     session.take();
                     let _ = ack.send(());
                     dirty = false;
@@ -1224,6 +1248,7 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                         Err(_) => false,
                     };
                     let _ = ack.send(ok);
+                    force_clear = ok; // see the blocking-recv arm above
                     dirty = ok;
                 }
                 Command::Redraw => {
@@ -1764,11 +1789,7 @@ fn working_line(state: &AppState) -> Vec<(String, Line<'static>)> {
     let glyph = BLOOM[state.frame % BLOOM.len()];
     // Reveal the first `work_reveal` chars of the caption (char-, not byte-, indexed so multibyte
     // captions never split mid-codepoint).
-    let revealed: String = state
-        .work_caption
-        .chars()
-        .take(state.work_reveal)
-        .collect();
+    let revealed: String = state.work_caption.chars().take(state.work_reveal).collect();
     let elapsed = state
         .working_since
         .map(|t| t.elapsed().as_secs())
@@ -2158,7 +2179,6 @@ fn render_assistant_rows(raw: &str, width: usize) -> Vec<String> {
         .map(str::to_string)
         .collect()
 }
-
 
 /// Format a run time for the result line: `· 940ms` under a second, `· 1.2s` under a minute, then
 /// `· 7m03s` / `· 2h05m`. Sub-second times keep millisecond resolution; the minute/hour tiers exist
@@ -2573,9 +2593,15 @@ mod tests {
         let (shown, _) = input_line(&state, 40);
 
         // Phải có prefix báo số dòng.
-        assert!(shown.starts_with("↵5 · "), "paste prefix missing: {shown:?}");
+        assert!(
+            shown.starts_with("↵5 · "),
+            "paste prefix missing: {shown:?}"
+        );
         // Text thật (ký tự cuối draft là 'e') vẫn hiện sau prefix.
-        assert!(shown.contains('e'), "draft text must follow the prefix: {shown:?}");
+        assert!(
+            shown.contains('e'),
+            "draft text must follow the prefix: {shown:?}"
+        );
     }
 
     #[test]
@@ -2831,7 +2857,10 @@ mod tests {
         for _ in 0..5 {
             apply_command(&mut state, Command::Tick);
         }
-        assert_eq!(state.work_reveal, len, "reveal clamps at the caption length");
+        assert_eq!(
+            state.work_reveal, len,
+            "reveal clamps at the caption length"
+        );
 
         // The rendered line shows the whole caption plus the elapsed clock + stop hint.
         let (plain, _) = working_line(&state).remove(0);
@@ -2855,13 +2884,19 @@ mod tests {
         let verb = state.work_verb.clone();
         apply_command(&mut state, Command::Tick); // reveal 1 char of the verb
 
-        apply_command(&mut state, Command::WorkCaption("Reading retained.rs".into()));
+        apply_command(
+            &mut state,
+            Command::WorkCaption("Reading retained.rs".into()),
+        );
         assert_eq!(state.work_caption, "Reading retained.rs");
         assert_eq!(state.work_reveal, 0, "a new caption retypes from scratch");
 
         // Re-asserting the SAME caption must not stutter the reveal back to zero.
         apply_command(&mut state, Command::Tick);
-        apply_command(&mut state, Command::WorkCaption("Reading retained.rs".into()));
+        apply_command(
+            &mut state,
+            Command::WorkCaption("Reading retained.rs".into()),
+        );
         assert_eq!(state.work_reveal, 1, "same text ⇒ reveal is preserved");
 
         apply_command(&mut state, Command::WorkCaption(String::new()));
@@ -3035,17 +3070,28 @@ mod tests {
         // Bottom-right corner: pulled back inside instead of overflowing.
         let corner = context_menu_layout(area, ContextMenu { col: 39, row: 19 }).unwrap();
         assert!(fits(corner), "corner menu escaped the area: {corner:?}");
-        assert_eq!(corner.x + corner.width, area.width, "flush to the right edge");
+        assert_eq!(
+            corner.x + corner.width,
+            area.width,
+            "flush to the right edge"
+        );
         assert_eq!(corner.y + corner.height, area.height, "flush to the bottom");
 
         // A non-zero origin (the transcript never starts at 0,0 once a footer exists) is respected.
         let offset_area = Rect::new(4, 3, 40, 20);
         let off = context_menu_layout(offset_area, ContextMenu { col: 4, row: 3 }).unwrap();
-        assert!(off.x >= 4 && off.y >= 3, "clamped to the area origin: {off:?}");
+        assert!(
+            off.x >= 4 && off.y >= 3,
+            "clamped to the area origin: {off:?}"
+        );
 
         // A viewport too small to hold the box draws nothing rather than a clipped, unclickable one.
-        assert!(context_menu_layout(Rect::new(0, 0, 3, 20), ContextMenu { col: 0, row: 0 }).is_none());
-        assert!(context_menu_layout(Rect::new(0, 0, 40, 2), ContextMenu { col: 0, row: 0 }).is_none());
+        assert!(
+            context_menu_layout(Rect::new(0, 0, 3, 20), ContextMenu { col: 0, row: 0 }).is_none()
+        );
+        assert!(
+            context_menu_layout(Rect::new(0, 0, 40, 2), ContextMenu { col: 0, row: 0 }).is_none()
+        );
     }
 
     /// Losing the highlight must take the menu with it. A "Copy" button whose selection is gone would

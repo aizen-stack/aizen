@@ -20,9 +20,16 @@ pub struct Spinner {
 impl Spinner {
     /// Start a spinner with `label` (e.g. "thinking"). No-op (returns an inert handle) when stdout
     /// isn't a TTY, so it never interferes with piped/CI output.
+    ///
+    /// Also inert while the retained renderer owns the screen. A TTY check alone is not enough: this
+    /// spinner writes `\r` + `clear_line` straight to stdout FROM A BACKGROUND THREAD, so if it
+    /// outlives the suspended-menu window it scribbles over a live ratatui frame — cells the renderer
+    /// believes it owns, which then survive into later frames as the interleaved rows that read as
+    /// "the UI is corrupted". Callers inside a suspended menu (the config wizard's `spin_while`) lose
+    /// only the animation; the operation they were narrating still runs and still prints its verdict.
     pub fn start(label: &str) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        if !std::io::stdout().is_terminal() {
+        if !std::io::stdout().is_terminal() || crate::ui::tui::retained_running() {
             return Self { stop, handle: None };
         }
         let label = label.to_string();

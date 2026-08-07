@@ -12,6 +12,7 @@
 pub mod audit;
 pub mod consolidate;
 pub mod extract_free;
+pub mod match_text;
 pub mod reconcile;
 pub mod route;
 pub mod sanitize_facts;

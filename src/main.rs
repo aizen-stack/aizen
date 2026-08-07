@@ -203,6 +203,20 @@ enum Commands {
     /// (newer or older). The running terminal keeps the version it started with; the next terminal
     /// picks up the installed one.
     Update,
+    /// Show a byte breakdown of what every turn resends: the system prompt (static base +
+    /// environment + memory lanes) and the JSON tool schemas. Runs offline — no request is made.
+    #[command(name = "prompt-size")]
+    PromptSize {
+        /// Model id to size for (the prompt tier depends on it). Defaults to the configured model.
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Per-tool schema sizes, largest first.
+        #[arg(long)]
+        tools: bool,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
     /// Render the moonlit braille art scene (one frame) to the terminal.
     Art,
 }
@@ -1221,11 +1235,102 @@ async fn main() -> Result<()> {
         Commands::Apps { cmd } => run_apps(cmd).await,
         Commands::Agents { cmd } => run_agents(cmd).await,
         Commands::Update => features::update::run().await,
+        Commands::PromptSize { model, tools, json } => run_prompt_size(model, tools, json),
         Commands::Art => {
             crate::ui::moonscape::run();
             Ok(())
         }
     }
+}
+
+/// `aizen prompt-size` — byte breakdown of the per-turn fixed overhead (system prompt + tool
+/// schemas). Offline: builds the same lanes and the same registry a real turn would, then measures
+/// them. No request is made, so it costs nothing and works without a configured key.
+fn run_prompt_size(model: Option<String>, show_tools: bool, as_json: bool) -> Result<()> {
+    let model = model
+        .or_else(|| cli_config::load().model)
+        .unwrap_or_else(|| "gpt-4o".to_string());
+
+    // Same lanes a turn would send: static base + <environment> (stable) and the memory/persona
+    // blocks (dynamic). LSP is armed first so the registry advertises the symbolic-edit tools.
+    let bundle = active_system_prompt_bundle(&model);
+    arm_lsp_session();
+    let registry = agent::builtin::default_registry_with_task(
+        reqwest::Client::new(),
+        String::new(),
+        String::new(),
+        model.clone(),
+        crate::core::approval::ApprovalMode::Ask,
+        resolve_ctx_window(&model).0,
+        None,
+    )?;
+    let defs = registry.defs();
+    let tools_json = serde_json::to_string(&defs)?;
+
+    let stable = bundle.stable.len();
+    let dynamic = bundle.dynamic.len();
+    let prompt = stable + dynamic;
+    let tools_bytes = tools_json.len();
+    let total = prompt + tools_bytes;
+    // Rough: 4 bytes/token. The real count is tokenizer-specific — this is a budget, not a bill.
+    let tok = |b: usize| b / 4;
+
+    let mut per_tool: Vec<(usize, String)> = defs
+        .iter()
+        .map(|d| {
+            let n = serde_json::to_string(d).map(|s| s.len()).unwrap_or(0);
+            (n, d.function.name.clone())
+        })
+        .collect();
+    per_tool.sort_by(|a, b| b.0.cmp(&a.0));
+
+    if as_json {
+        let out = serde_json::json!({
+            "model": model,
+            "system_prompt": { "bytes": prompt, "stable_bytes": stable, "dynamic_bytes": dynamic },
+            "tools": { "count": defs.len(), "json_bytes": tools_bytes },
+            "fixed_total": { "bytes": total, "approx_tokens": tok(total) },
+            "per_tool": per_tool
+                .iter()
+                .map(|(n, name)| serde_json::json!({ "name": name, "bytes": n }))
+                .collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    let kb = |b: usize| format!("{:.1} KB", b as f64 / 1024.0);
+    println!("Prompt-size breakdown (model={model})\n");
+    println!("  System prompt        : {prompt:>8} B  ({})", kb(prompt));
+    println!(
+        "    stable  (base+env) : {stable:>8} B  ({})  \u{2190} cache-stable prefix",
+        kb(stable)
+    );
+    println!("    dynamic (memory)   : {dynamic:>8} B  ({})", kb(dynamic));
+    println!(
+        "  Tool schemas         : {tools_bytes:>8} B  ({}, {} tools, avg {} B)",
+        kb(tools_bytes),
+        defs.len(),
+        if defs.is_empty() {
+            0
+        } else {
+            tools_bytes / defs.len()
+        }
+    );
+    println!(
+        "  Fixed per turn       : {total:>8} B  ({}, ~{}k tokens)",
+        kb(total),
+        tok(total) / 1000
+    );
+    if show_tools {
+        println!("\n  Per tool, largest first:");
+        for (n, name) in &per_tool {
+            println!("    {n:>6} B  {name}");
+        }
+    } else {
+        println!("\n  (--tools for per-tool sizes, --json for machine output)");
+    }
+    Ok(())
 }
 
 /// `aizen apps …` — connect apps via the MCP registry.
@@ -2207,12 +2312,7 @@ fn memory_where_report() -> String {
     let edges = std::fs::read_to_string(&graph)
         .map(|r| r.lines().filter(|l| !l.trim().is_empty()).count())
         .unwrap_or(0);
-    let _ = writeln!(
-        s,
-        "  {:<8}: {}   {edges} edge(s)",
-        "graph",
-        graph.display()
-    );
+    let _ = writeln!(s, "  {:<8}: {}   {edges} edge(s)", "graph", graph.display());
     let _ = writeln!(
         s,
         "  {:<8}: {}",
@@ -3953,7 +4053,7 @@ fn skill_delete_interactive(skills: &[skill::Skill]) {
                 .color256(splash::ACCENT)
             ),
             Ok(false) => println!("{}", style("(already gone)").dim()),
-            Err(e) => eprintln!("{} {e}", style("skill:").red()),
+            Err(e) => tui::note_line(&format!("{} {e}", style("skill:").red())),
         }
     }
 }
@@ -4036,15 +4136,15 @@ async fn skills_menu() -> Result<()> {
             println!("\n{}", style(skill::render_loaded(&skills[pick])).dim()); // view, then loop
         } else if pick == n {
             if let Err(e) = skill_new_interactive() {
-                eprintln!("{} {e}", style("skill:").red());
+                tui::note_line(&format!("{} {e}", style("skill:").red()));
             }
         } else if pick == n + 1 {
             if let Err(e) = skill_fetch_interactive().await {
-                eprintln!("{} {e}", style("skill:").red());
+                tui::note_line(&format!("{} {e}", style("skill:").red()));
             }
         } else if pick == n + 2 {
             if let Err(e) = skill_search_interactive().await {
-                eprintln!("{} {e}", style("skill:").red());
+                tui::note_line(&format!("{} {e}", style("skill:").red()));
             }
         } else if n > 0 && pick == n + 3 {
             skill_delete_interactive(&skills);
@@ -4074,7 +4174,7 @@ fn skill_restore_interactive(retired: &[skill::Skill]) {
             "{}",
             style(format!("restored '{}'", names[i])).color256(splash::ACCENT)
         ),
-        Err(e) => eprintln!("{} {e}", style("skill:").red()),
+        Err(e) => tui::note_line(&format!("{} {e}", style("skill:").red())),
     }
 }
 
@@ -4483,12 +4583,12 @@ async fn personas_menu(history: &mut Vec<Message>, model: &str) -> Result<()> {
         match actions[pick - n].as_str() {
             "+ New persona" => {
                 if let Err(e) = persona_new_interactive() {
-                    eprintln!("{} {e}", style("persona:").red());
+                    tui::note_line(&format!("{} {e}", style("persona:").red()));
                 }
             }
             "Paste a character prompt → auto-create" => {
                 if let Err(e) = persona_paste_interactive(history, model).await {
-                    eprintln!("{} {e}", style("persona:").red());
+                    tui::note_line(&format!("{} {e}", style("persona:").red()));
                 }
             }
             a if a.starts_with("Evolution:") => {
@@ -4567,7 +4667,7 @@ async fn personas_menu(history: &mut Vec<Message>, model: &str) -> Result<()> {
                             );
                         }
                         Ok(false) => println!("{}", style("(already gone)").dim()),
-                        Err(e) => eprintln!("{} {e}", style("persona:").red()),
+                        Err(e) => tui::note_line(&format!("{} {e}", style("persona:").red())),
                     }
                 }
             }
@@ -5102,7 +5202,10 @@ async fn first_run_onboarding() {
 
     if let Err(e) = config_wizard().await {
         // A cancelled/failed wizard shouldn't abort the launch — fall through into the menu.
-        eprintln!("{} {e}", style("setup:").color256(crate::ui::theme::WARN));
+        tui::note_line(&format!(
+            "{} {e}",
+            style("setup:").color256(crate::ui::theme::WARN)
+        ));
         eprintln!(
             "{}",
             style("You can finish later with `aizen config`.").color256(crate::ui::theme::FAINT)
@@ -5122,7 +5225,10 @@ async fn first_run_onboarding() {
         .unwrap_or(false);
     if connect {
         if let Err(e) = apps_menu().await {
-            eprintln!("{} {e}", style("apps:").color256(crate::ui::theme::WARN));
+            tui::note_line(&format!(
+                "{} {e}",
+                style("apps:").color256(crate::ui::theme::WARN)
+            ));
         }
     }
 
@@ -5321,7 +5427,10 @@ fn run_id_migration_once() {
             eprintln!("{}", style(n).dim());
         }
         for w in rep.warnings.iter().take(3) {
-            eprintln!("{} {w}", style("⚠ memory id migration:").color256(theme::WARN));
+            eprintln!(
+                "{} {w}",
+                style("⚠ memory id migration:").color256(theme::WARN)
+            );
         }
     }
     // Persona self-memory filenames had the same defect, worse in proportion (45 of 89 files on the
@@ -5332,7 +5441,10 @@ fn run_id_migration_once() {
             eprintln!("{}", style(n).dim());
         }
         for w in rep.warnings.iter().take(3) {
-            eprintln!("{} {w}", style("⚠ persona stem migration:").color256(theme::WARN));
+            eprintln!(
+                "{} {w}",
+                style("⚠ persona stem migration:").color256(theme::WARN)
+            );
         }
     }
 }
@@ -5390,6 +5502,12 @@ async fn run_menu_sticky() -> Result<()> {
         startup_update_probe();
     }
     crate::core::recovery::begin(repo_scope.clone(), current_session_slug());
+    // Housekeeping for everything the previous runs could not clean up after themselves: lease
+    // directories from abrupt shutdowns (the clean-exit path never ran) and staging files from a
+    // write that was killed mid-rename. Both are pure accumulation — neither affects correctness,
+    // and neither had any collector before.
+    crate::core::recovery::sweep_expired();
+    sweep_orphan_temps();
     // Publish this window to the repository's session registry so the OTHER aizen windows (and the
     // one that eventually reviews and commits) can see it exists, what it is doing, and which files
     // it has changed. Best-effort: a registry failure never blocks the REPL.
@@ -6172,7 +6290,7 @@ async fn run_menu_plain() -> Result<()> {
         ) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("{} {e}", style("error:").red());
+                tui::note_line(&format!("{} {e}", style("error:").red()));
                 history.pop();
                 continue;
             }
@@ -6308,7 +6426,7 @@ async fn run_menu_plain() -> Result<()> {
                 autosave_session(&history, &http, &base_url, &api_key, &model).await;
             }
             Err(e) => {
-                eprintln!("{} {e}", style("error:").red());
+                tui::note_line(&format!("{} {e}", style("error:").red()));
                 if history.last().map(|m| m.role == "user").unwrap_or(false) {
                     history.pop(); // drop the failed user turn so history stays consistent
                 }
@@ -6548,26 +6666,52 @@ async fn maybe_run_secretary(
     }
 
     // Skill — save fresh, or fold into the existing one when the model asked to refine.
+    // DEDUP (fix C, 2026-08-06): before auto-creating a NEW skill, compare the proposed `when` +
+    // `steps` against every existing skill with `match_similarity`. Three identical "verify GitHub
+    // Actions YAML" skills were observed on the same day because the only collision key was the slug,
+    // and minor wording changes in the name produced different slugs. Now a new skill whose trigger
+    // resembles an existing one gets routed to `refine` instead of spawning a duplicate.
     if let Some(sk) = out.skill.as_ref() {
         if auto_skill_learn_enabled() {
+            use crate::memory::learning::match_text;
             let slug = skill::sanitize_name(&sk.name);
-            let exists = skill::list()
+            let all_skills = skill::list();
+            let exact_exists = all_skills
                 .iter()
                 .any(|s| skill::sanitize_name(&s.name) == slug);
-            let done = if exists {
+            // Check if any existing skill has a semantically similar trigger.
+            let similar_skill = if !exact_exists {
+                all_skills.iter().find(|s| {
+                    let trigger_sim = match_text::match_similarity(&sk.when, &s.when);
+                    let body_sim = match_text::match_similarity(&sk.steps, &s.body);
+                    // Both trigger AND body must resemble — trigger alone would merge skills that
+                    // fire in the same situation but do different things.
+                    trigger_sim >= 0.45 && body_sim >= 0.35
+                })
+            } else {
+                None
+            };
+            let done = if exact_exists {
                 // Only fold when the model MEANT to; otherwise a same-named skill is a collision to
                 // leave alone, not a licence to overwrite the user's procedure.
                 sk.refine && skill::refine(&sk.name, &sk.steps, None, Some(&sk.when)).is_ok()
+            } else if let Some(existing) = similar_skill {
+                // Similar enough to refine rather than duplicate. Route to the existing skill.
+                skill::refine(&existing.name, &sk.steps, None, Some(&sk.when)).is_ok()
             } else {
                 skill::save_scoped(&sk.name, "", &sk.when, &sk.steps, true).is_ok()
             };
             if done {
+                let label = if exact_exists || similar_skill.is_some() {
+                    "refined"
+                } else {
+                    "learned"
+                };
+                let display_name = similar_skill.map(|s| s.name.as_str()).unwrap_or(&sk.name);
                 tui::emit_line(
                     &style(format!(
-                        "{}{} skill '{}' — /skills to view",
+                        "{}{label} skill '{display_name}' — /skills to view",
                         icons::g(icons::learned()),
-                        if exists { "refined" } else { "learned" },
-                        sk.name
                     ))
                     .color256(splash::ACCENT)
                     .to_string(),
@@ -9160,12 +9304,12 @@ async fn handle_slash(
         }
         "sessions" => {
             if let Err(e) = sessions_menu(history, model_label).await {
-                eprintln!("{} {e}", style("sessions:").red());
+                tui::note_line(&format!("{} {e}", style("sessions:").red()));
             }
         }
         "import" => {
             if let Err(e) = import_menu(history, model_label).await {
-                eprintln!("{} {e}", style("import:").red());
+                tui::note_line(&format!("{} {e}", style("import:").red()));
             }
         }
         // One keystroke back into the last conversation. `/sessions` could already restore, but it
@@ -9536,7 +9680,7 @@ async fn handle_slash(
                 if tui::active() {
                     tui::emit_line(&format!("{} {e}", style("model:").red()));
                 } else {
-                    eprintln!("{} {e}", style("model:").red());
+                    tui::note_line(&format!("{} {e}", style("model:").red()));
                 }
             } else {
                 // Also in place: the help text promises `/model` "switches models mid-session", and a
@@ -9547,7 +9691,7 @@ async fn handle_slash(
         }
         "config" | "setup" => {
             if let Err(e) = config_wizard().await {
-                eprintln!("{} {e}", style("config:").red());
+                tui::note_line(&format!("{} {e}", style("config:").red()));
             }
             *model_label = cli_config::load().model.unwrap_or_else(|| model_label.clone());
             // Refresh IN PLACE — retuning settings mid-chat must not end the conversation.
@@ -9555,22 +9699,22 @@ async fn handle_slash(
         }
         "memory" | "mem" => {
             if let Err(e) = slash_memory(arg) {
-                eprintln!("{} {e}", style("memory:").red());
+                tui::note_line(&format!("{} {e}", style("memory:").red()));
             }
         }
         "persona" | "personas" | "character" => {
             if let Err(e) = personas_menu(history, model_label).await {
-                eprintln!("{} {e}", style("persona:").red());
+                tui::note_line(&format!("{} {e}", style("persona:").red()));
             }
         }
         "skills" | "skill" => {
             if let Err(e) = skills_menu().await {
-                eprintln!("{} {e}", style("skills:").red());
+                tui::note_line(&format!("{} {e}", style("skills:").red()));
             }
         }
         "apps" | "integrations" => {
             if let Err(e) = apps_menu().await {
-                eprintln!("{} {e}", style("apps:").red());
+                tui::note_line(&format!("{} {e}", style("apps:").red()));
             }
         }
         "mcp" => tui::emit_line(&crate::agent::mcp::summary()),
@@ -9596,13 +9740,13 @@ async fn handle_slash(
         },
         "telegram" | "tg" => {
             if let Err(e) = telegram_menu().await {
-                eprintln!("{} {e}", style("telegram:").red());
+                tui::note_line(&format!("{} {e}", style("telegram:").red()));
             }
         }
         // `/serve` kept as a direct shortcut to the daemon (also reachable via the Telegram menu).
         "serve" => {
             if let Err(e) = hostbot::run_serve(Vec::new()).await {
-                eprintln!("{} {e}", style("serve:").red());
+                tui::note_line(&format!("{} {e}", style("serve:").red()));
             }
         }
         // ── time machine (git snapshots) ──
@@ -9612,7 +9756,7 @@ async fn handle_slash(
         // leaves without touching anything).
         "timemachine" | "timeline" | "tm" => {
             if let Err(e) = timemachine_menu(history, model_label).await {
-                eprintln!("{} {e}", style("time:").red());
+                tui::note_line(&format!("{} {e}", style("time:").red()));
             }
         }
         // Capture the conversation alongside the tree so a pick in `/timemachine` can rewind chat as
@@ -9828,15 +9972,30 @@ struct SessionFileRef<'a> {
     messages: &'a [Message],
 }
 
-/// Parse either session format. `None` = unreadable/corrupt (callers surface that explicitly —
-/// a corrupt file must never masquerade as an empty conversation).
-fn parse_session_bytes(bytes: &[u8]) -> Option<(Vec<Message>, Option<SessionMeta>)> {
-    if let Ok(f) = serde_json::from_slice::<SessionFile>(bytes) {
-        return Some((f.messages, Some(f.meta)));
+/// Parse either session format, reporting WHY a file failed. `Err` = unreadable/corrupt (callers
+/// surface that explicitly — a corrupt file must never masquerade as an empty conversation).
+///
+/// The reason is not decoration. A silently-swallowed `serde` error is exactly how a real bug hid
+/// for months: our own `Serialize` wrote `content` as a multimodal parts array for any turn with a
+/// pasted image, `Option<String>` refused to read it back, and every such conversation simply became
+/// "(unreadable)" with nothing anywhere saying "invalid type: sequence". Naming the error makes the
+/// next asymmetry visible the first time it happens instead of after 29 files.
+fn parse_session_reason(bytes: &[u8]) -> Result<(Vec<Message>, Option<SessionMeta>), String> {
+    let envelope = match serde_json::from_slice::<SessionFile>(bytes) {
+        Ok(f) => return Ok((f.messages, Some(f.meta))),
+        Err(e) => e,
+    };
+    // Legacy bare-array format. Report the ENVELOPE's error when both fail: every file written since
+    // the v2 format landed is an envelope, so that is the diagnosis that actually helps.
+    match serde_json::from_slice::<Vec<Message>>(bytes) {
+        Ok(m) => Ok((m, None)),
+        Err(_) => Err(envelope.to_string()),
     }
-    serde_json::from_slice::<Vec<Message>>(bytes)
-        .ok()
-        .map(|m| (m, None))
+}
+
+/// [`parse_session_reason`] for the callers that only branch on success.
+fn parse_session_bytes(bytes: &[u8]) -> Option<(Vec<Message>, Option<SessionMeta>)> {
+    parse_session_reason(bytes).ok()
 }
 
 fn save_session(history: &[Message], name: &str, model: Option<&str>) -> Result<String> {
@@ -9974,7 +10133,8 @@ fn write_session(history: &[Message], name: &str, mut meta: SessionMeta) -> Resu
 fn load_session(history: &mut Vec<Message>, name: &str, model: &str) -> Result<usize> {
     let path = sessions_dir().join(format!("{}.json", sanitize_name(name)));
     let bytes = std::fs::read(&path).with_context(|| format!("no saved session '{name}'"))?;
-    let (loaded, meta) = parse_session_bytes(&bytes).context("parsing session file")?;
+    let (loaded, meta) = parse_session_reason(&bytes)
+        .map_err(|why| anyhow::anyhow!("session '{name}' is unreadable: {why}"))?;
     *history = loaded;
     // Rebuild BOTH prompt lanes for the CURRENT project + model. The stable lane saved in the file
     // reflects wherever the session was recorded — replaying it verbatim in another checkout
@@ -10065,6 +10225,39 @@ fn current_session_slug() -> Option<String> {
 }
 fn pretty_session_name(name: &str) -> String {
     name.replace('-', " ")
+}
+
+/// Remove `atomic_write` staging files abandoned by a killed process.
+///
+/// `persist::atomic_write` deletes its temp only when the write fails IN-PROCESS; a process killed
+/// between the staged write and the rename leaves `.{name}.aizen-tmp-{pid}-{seq}` behind with nothing
+/// to ever collect it. Harmless to readers (`stat_sessions` filters on the `.json` extension) but it
+/// accumulates silently for the life of the install.
+///
+/// Age-gated because the name is not enough: another aizen window may be mid-write RIGHT NOW, and its
+/// staging file is invisible to us. A minute is far longer than any staged write and far shorter than
+/// the interval at which anyone would notice clutter. Best-effort — never blocks startup.
+fn sweep_orphan_temps() {
+    let Ok(rd) = std::fs::read_dir(sessions_dir()) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with('.') || !name.contains(".aizen-tmp-") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|md| md.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age.as_secs() > 60);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// One row of the session pool, as scanned from disk.
@@ -10611,7 +10804,7 @@ async fn sessions_menu(history: &mut Vec<Message>, model_label: &str) -> Result<
                     agent::replay_transcript(history);
                     return Ok(());
                 }
-                Err(e) => eprintln!("{} {e}", style("restore:").red()),
+                Err(e) => tui::note_line(&format!("{} {e}", style("restore:").red())),
             }
         } else if items[pick].starts_with("+ Save") {
             let suggested = suggest_session_name(history);
@@ -10653,7 +10846,7 @@ async fn sessions_menu(history: &mut Vec<Message>, model_label: &str) -> Result<
                             style(format!("saved '{}'", name.trim())).color256(splash::ACCENT)
                         );
                     }
-                    Err(e) => eprintln!("{} {e}", style("save:").red()),
+                    Err(e) => tui::note_line(&format!("{} {e}", style("save:").red())),
                 }
             }
         } else if items[pick] == "Delete a session" {
@@ -10683,7 +10876,7 @@ async fn sessions_menu(history: &mut Vec<Message>, model_label: &str) -> Result<
                             style(format!("deleted '{pretty}'")).color256(splash::ACCENT)
                         );
                     }
-                    Err(e) => eprintln!("{} {e}", style("delete:").red()),
+                    Err(e) => tui::note_line(&format!("{} {e}", style("delete:").red())),
                 }
             }
         } else {
@@ -11113,10 +11306,31 @@ fn spawn_reconcile_pass() {
             .iter()
             .filter(|a| !matches!(a.action, memory::learning::reconcile::Action::Review { .. }))
             .count();
+        // Retirements are counted separately: "reconciled 3 facts" reads like bookkeeping, but a row
+        // leaving the active view is the change a user would want to know about, and it is the half
+        // that needs the undo hint. Only removals that reported no failure are counted.
+        let dropped = report
+            .applied
+            .iter()
+            .filter(|a| {
+                matches!(
+                    &a.action,
+                    memory::learning::reconcile::Action::Confirm {
+                        redundant: Some(_),
+                        ..
+                    }
+                ) && !a.note.contains("kept")
+            })
+            .count();
         if acted > 0 {
+            let what = if dropped > 0 {
+                format!("reconciled {acted} memory fact(s), retiring {dropped} duplicate(s)")
+            } else {
+                format!("reconciled {acted} memory fact(s)")
+            };
             tui::emit_line(
                 &style(format!(
-                    "⚖ reconciled {acted} memory fact(s) — `aizen memory list --superseded` to review, `revive <id>` to undo"
+                    "⚖ {what} — `aizen memory list --superseded` to review, `revive <id>` to undo"
                 ))
                 .dim()
                 .to_string(),
@@ -11564,9 +11778,15 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
 /// Render the saved config as a grouped, aligned "Studio" panel: a gold title rule with the file
 /// path, then sections (Endpoint / Session / Cost / Display) of `key   value` rows where the value's
 /// colour carries meaning (gold = a chosen value, green = on/ok, faint = off/unset). Shown at the end
-/// of the wizard, after `config set`, and on `aizen config show`. Plain `println!` (not the sticky
-/// emit): it always runs outside the pinned footer (suspended menu / one-shot CLI), and `console`
-/// auto-strips the colour under `NO_COLOR`/pipes.
+/// of the wizard, after `config set`, and on `aizen config show`.
+///
+/// Goes through `tui::emit_line`, NOT `println!`. The old claim that a plain print was safe here
+/// ("it always runs outside the pinned footer") held only while every caller suspended the renderer
+/// first — and suspending is not enough: the render thread keeps folding emissions into its block
+/// buffer while suspended and repaints from that buffer on resume, so a raw print is either wiped by
+/// the repaint or survives as foreign cells inside later frames. That is the `/config`-mid-chat
+/// layout corruption. `emit_line` degrades to plain stdout for the one-shot CLI, where `console`
+/// still auto-strips colour under `NO_COLOR`/pipes.
 fn print_config(cfg: &cli_config::CliConfig) {
     let width = tui::width().clamp(46, 72);
     let path = cli_config::config_path().display().to_string();
@@ -11575,18 +11795,25 @@ fn print_config(cfg: &cli_config::CliConfig) {
     let title = "config";
     let used = console::measure_text_width(title) + console::measure_text_width(&path);
     let gap = width.saturating_sub(used + 2).max(1);
-    println!(
+    tui::emit_line(&format!(
         "\n  {}{}{}",
         theme::accent(title).bold(),
         " ".repeat(gap),
         theme::faint(&path)
-    );
-    println!("  {}", theme::accent_dim("─".repeat(width)));
+    ));
+    tui::emit_line(&format!("  {}", theme::accent_dim("─".repeat(width))));
 
     // row/section helpers — keys aligned in a fixed column, values free-form (already styled).
-    let section =
-        |name: &str| println!("\n  {} {}", theme::accent("◆"), theme::accent(name).bold());
-    let row = |key: &str, val: String| println!("    {}  {val}", theme::muted(format!("{key:<8}")));
+    let section = |name: &str| {
+        tui::emit_line(&format!(
+            "\n  {} {}",
+            theme::accent("◆"),
+            theme::accent(name).bold()
+        ))
+    };
+    let row = |key: &str, val: String| {
+        tui::emit_line(&format!("    {}  {val}", theme::muted(format!("{key:<8}"))))
+    };
     let on = |b: bool| {
         if b {
             theme::ok("● on").to_string()
@@ -12047,23 +12274,32 @@ async fn spin_while<T>(label: &str, fut: impl std::future::Future<Output = T>) -
     out
 }
 
+// The three status lines below go through `tui::emit_line` for the reason spelled out on
+// `print_config`: a raw print during a suspended menu is either wiped by resume's repaint or
+// survives as foreign cells in later frames. Outside the REPL `emit_line` is a plain stdout write,
+// so the one-shot `aizen config` path is unchanged.
+
 /// `  ✓ <msg>` in the ok colour.
 fn line_ok(msg: &str) {
-    println!("  {} {}", crate::ui::theme::ok("✓"), style(msg).dim());
+    tui::emit_line(&format!(
+        "  {} {}",
+        crate::ui::theme::ok("✓"),
+        style(msg).dim()
+    ));
 }
 
 /// `  ✗ <msg>` in red — a failure the user has to act on.
 fn line_bad(msg: &str) {
-    println!("  {} {}", style("✗").red(), style(msg).red());
+    tui::emit_line(&format!("  {} {}", style("✗").red(), style(msg).red()));
 }
 
 /// `  ! <msg>` in the warn colour — something to know, but not a stop.
 fn line_warn(msg: &str) {
-    println!(
+    tui::emit_line(&format!(
         "  {} {}",
         style("!").color256(crate::ui::theme::WARN),
         style(msg).color256(crate::ui::theme::WARN)
-    );
+    ));
 }
 
 /// Ask for a base URL until one actually answers as a models endpoint, then return it with the model
@@ -12128,7 +12364,7 @@ async fn prompt_validated_base_url(
             client::EndpointCheck::NotFound(detail) => {
                 line_bad(&format!("no model list at {base}/models"));
                 if !detail.is_empty() {
-                    println!("    {}", style(&detail).dim());
+                    tui::emit_line(&format!("    {}", style(&detail).dim()));
                 }
                 match missing_version_suffix(&base) {
                     Some(fixed) => {
@@ -12145,7 +12381,7 @@ async fn prompt_validated_base_url(
             client::EndpointCheck::Http(code, detail) => {
                 line_bad(&format!("HTTP {code}"));
                 if !detail.is_empty() {
-                    println!("    {}", style(&detail).dim());
+                    tui::emit_line(&format!("    {}", style(&detail).dim()));
                 }
                 suggestion = Some(base);
             }
@@ -12205,7 +12441,7 @@ async fn prompt_validated_api_key(
     keys_url: Option<&str>,
 ) -> Result<Option<(String, Vec<client::ModelInfo>)>> {
     if let Some(url) = keys_url {
-        println!("  {}", style(format!("get a key: {url}")).dim());
+        tui::emit_line(&format!("  {}", style(format!("get a key: {url}")).dim()));
     }
     loop {
         let prompt = match current {
@@ -12242,7 +12478,7 @@ async fn prompt_validated_api_key(
             client::EndpointCheck::Auth(detail) => {
                 line_bad("the endpoint rejected that key");
                 if !detail.is_empty() {
-                    println!("    {}", style(&detail).dim());
+                    tui::emit_line(&format!("    {}", style(&detail).dim()));
                 }
             }
             // Not the key's fault — don't make them re-paste a key that may be fine.
@@ -12394,14 +12630,14 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
         };
         match edited {
             Ok(()) => match cli_config::save(&cfg) {
-                Ok(_) => println!(
+                Ok(_) => tui::emit_line(&format!(
                     "  {} {}",
                     crate::ui::theme::ok("✓"),
                     style("saved").color256(splash::ACCENT)
-                ),
-                Err(e) => eprintln!("  {} {e}", style("save:").red()),
+                )),
+                Err(e) => tui::note_line(&format!("  {} {e}", style("save:").red())),
             },
-            Err(e) => eprintln!("  {} {e}", style("config:").red()),
+            Err(e) => tui::note_line(&format!("  {} {e}", style("config:").red())),
         }
     }
     Ok(())
@@ -12664,7 +12900,7 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
         match pick {
             i if i < ROLE_ROWS.len() => {
                 let (key, label, what) = ROLE_ROWS[i];
-                println!("  {}", style(what).dim());
+                tui::emit_line(&format!("  {}", style(what).dim()));
                 config_edit_one_role(cfg, key, label).await?;
             }
             i if i == ROLE_ROWS.len() => config_edit_model_registry(cfg).await?,
@@ -12847,7 +13083,7 @@ async fn config_edit_one_role(
     let http = http_client()?;
     let cur = role_get(cfg, role).cloned().unwrap_or_default();
 
-    println!("  {}", style(format!("— {label} —")).dim());
+    tui::emit_line(&format!("  {}", style(format!("— {label} —")).dim()));
     let probed = prompt_probed_base_url(
         &theme,
         &http,
@@ -13090,19 +13326,29 @@ async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let (base, key) = match (cfg.base_url.clone(), cfg.api_key.clone()) {
         (Some(b), Some(k)) => (b, k),
         _ => {
-            println!(
+            tui::emit_line(&format!(
                 "  {}",
                 style("set the Connection (base URL + key) first").color256(crate::ui::theme::WARN)
-            );
+            ));
             return Ok(());
         }
     };
     let http = http_client()?;
-    print!("{} {base} … ", style("Fetching models from").dim());
-    std::io::Write::flush(&mut std::io::stdout()).ok();
+    // One complete line per outcome rather than a bare `print!` prefix completed later: a partial
+    // line cannot be a transcript block, so under the retained renderer it was a raw write into cells
+    // the render thread believes it owns (the same corruption `print_config` was fixed for).
+    tui::emit_line(
+        &style(format!("Fetching models from {base} …"))
+            .dim()
+            .to_string(),
+    );
     match client::fetch_models_info(&http, &base, &key).await {
         Ok(infos) if !infos.is_empty() => {
-            println!("{}", style(format!("ok ({} found)", infos.len())).dim());
+            tui::emit_line(
+                &style(format!("ok ({} found)", infos.len()))
+                    .dim()
+                    .to_string(),
+            );
             let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
             let mut items: Vec<String> = ids.clone();
             items.push(CUSTOM_MODEL_ITEM.to_string());
@@ -13130,8 +13376,8 @@ async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
         }
         other => {
             match other {
-                Ok(_) => println!("{}", style("no models returned.").dim()),
-                Err(e) => println!("{}", style(format!("failed: {e}")).red()),
+                Ok(_) => tui::emit_line(&style("no models returned.").dim().to_string()),
+                Err(e) => tui::note_line(&style(format!("failed: {e}")).red().to_string()),
             }
             let mut mi =
                 Input::<String>::with_theme(&theme).with_prompt("Enter a model id manually");
@@ -13157,13 +13403,13 @@ async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
         } else {
             "estimated from the model name"
         };
-        println!(
+        tui::emit_line(&format!(
             "{}",
             style(format!(
                 "Context window — currently {shown} tokens ({note})."
             ))
             .dim()
-        );
+        ));
         let ctx_in = Input::<String>::with_theme(&theme)
             .with_prompt("Context window (tokens, e.g. 200000 / 128k, or `auto`)")
             .default(ctx_default)
@@ -13213,7 +13459,10 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = crate::agent::reach::search::KeyCheck>,
 {
-    println!("  {}", style(format!("get a key: {keys_url}")).dim());
+    tui::emit_line(&format!(
+        "  {}",
+        style(format!("get a key: {keys_url}")).dim()
+    ));
     loop {
         let prompt = match current {
             Some(k) => format!(
@@ -13270,11 +13519,11 @@ where
 /// user discover it from a failed search.
 async fn config_edit_websearch(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let theme = ui_theme();
-    println!(
+    tui::emit_line(&format!(
         "{}",
         style("web_search is keyed-only: without a key it returns an error rather than guessing.")
             .dim()
-    );
+    ));
     // Say when the environment is in charge — otherwise editing this and seeing no change is baffling.
     for (var, what) in [
         ("AIZEN_TAVILY_API_KEY", "Tavily"),
@@ -13381,10 +13630,10 @@ fn config_edit_memory(cfg: &mut cli_config::CliConfig) -> Result<()> {
 
     if !dense_built {
         line_warn("this build has no semantic backend — recall is lexical only");
-        println!(
+        tui::emit_line(&format!(
             "  {}",
             style("(a `--features dense` build adds embedding-based recall for paraphrases)").dim()
-        );
+        ));
         return Ok(());
     }
     if let Ok(v) = std::env::var("AIZEN_MEM_DENSE") {
@@ -13394,10 +13643,10 @@ fn config_edit_memory(cfg: &mut cli_config::CliConfig) -> Result<()> {
     }
     if models.is_empty() {
         line_warn("no embedding model installed — dense recall is off");
-        println!(
+        tui::emit_line(&format!(
             "  {}",
             style("get one with: aizen memory model-download").dim()
-        );
+        ));
         return Ok(());
     }
     if active {
@@ -13636,28 +13885,31 @@ fn config_edit_display(cfg: &mut cli_config::CliConfig) -> Result<()> {
 async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let theme = ui_theme();
     let width = tui::width().clamp(46, 72);
-    println!();
-    println!("{}", style("Aizen · setup").bold().color256(splash::ACCENT));
-    println!(
+    tui::emit_line("");
+    tui::emit_line(&format!(
+        "{}",
+        style("Aizen · setup").bold().color256(splash::ACCENT)
+    ));
+    tui::emit_line(&format!(
         "{}",
         style(cli_config::config_path().display()).color256(crate::ui::theme::FAINT)
-    );
-    println!(
+    ));
+    tui::emit_line(&format!(
         "{}",
         style("Enter keeps the shown default at each step · Ctrl-C cancels")
             .color256(crate::ui::theme::FAINT)
-    );
-    println!(
+    ));
+    tui::emit_line(&format!(
         "{}",
         style("─".repeat(width)).color256(crate::ui::theme::ACCENT_DIM)
-    );
+    ));
     // Group the steps under gold section headers so the flow reads as Connection → Model → Behavior.
     let step = |label: &str| {
-        println!(
+        tui::emit_line(&format!(
             "\n{} {}",
             style("◆").color256(splash::ACCENT),
             style(label).color256(splash::ACCENT).bold()
-        );
+        ));
     };
 
     step("Connection");
@@ -13763,13 +14015,13 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
     } else {
         "estimated from the model name"
     };
-    println!(
+    tui::emit_line(&format!(
         "{}",
         style(format!(
             "Context window — currently {shown} tokens ({note})."
         ))
         .dim()
-    );
+    ));
     let ctx_in = Input::<String>::with_theme(&theme)
         .with_prompt("Context window (tokens, e.g. 200000 / 128k, or `auto`)")
         .default(ctx_default)
@@ -13791,11 +14043,11 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
     // signed up for anything. When a key IS given it gets verified with a real search, same as the
     // section editor.
     step("Web search");
-    println!(
+    tui::emit_line(&format!(
         "{}",
         style("Optional. web_search is keyed-only — skip now and add one later with `/config`.")
             .dim()
-    );
+    ));
     let cur_tavily = cfg.reach.as_ref().and_then(|r| r.tavily_api_key.clone());
     let edit = prompt_validated_reach_key(
         &theme,
@@ -13914,17 +14166,17 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
     icons::set_tier(cfg.icons.as_deref()); // apply immediately for the "Saved" preview below
 
     cli_config::save(cfg)?;
-    println!(
+    tui::emit_line(&format!(
         "\n{} {}",
         crate::ui::theme::ok("✓"),
         style("Saved.").color256(splash::ACCENT).bold()
-    );
+    ));
     print_config(cfg);
-    println!(
+    tui::emit_line(&format!(
         "{}",
         style("Ready — type a message, or run:  aizen chat -p \"hello\"")
             .color256(crate::ui::theme::FAINT)
-    );
+    ));
     Ok(())
 }
 
@@ -15997,6 +16249,57 @@ mod tests {
         );
     }
 
+    /// A conversation containing a pasted image must survive save → load.
+    ///
+    /// This is the session-level half of the `Message` round-trip bug: the writer emitted `content`
+    /// as a multimodal parts array, `parse_session_bytes` could not read it back, and the file was
+    /// reported as "(unreadable)" for the rest of its life with the serde error discarded. Two real
+    /// transcripts were lost this way before it was noticed, so the reason string is asserted too —
+    /// a silent `None` is what let this hide.
+    #[test]
+    fn a_session_with_images_survives_save_and_load() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-img-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        set_session_slug(None);
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+
+        let history = vec![
+            Message::system("lane"),
+            Message::user_with_images(
+                "read this screenshot",
+                vec!["data:image/png;base64,iVBORw0KGgo=".to_string()],
+            ),
+            Message::assistant("it says hello"),
+        ];
+        save_session(&history, "with-image", Some("m")).unwrap();
+
+        let bytes = std::fs::read(sessions_dir().join("with-image.json")).unwrap();
+        let (msgs, _) =
+            parse_session_reason(&bytes).expect("a transcript we wrote ourselves must be readable");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1].content.as_deref(), Some("read this screenshot"));
+        assert_eq!(
+            msgs[1].images,
+            vec!["data:image/png;base64,iVBORw0KGgo=".to_string()],
+            "image attachments must come back out of the parts array"
+        );
+
+        // The picker must count it as a real conversation, not report it unreadable.
+        let (count, _) = read_session_row(&sessions_dir().join("with-image.json"));
+        assert_eq!(count, Some(2), "2 conversation turns after the system lane");
+
+        // And a genuinely corrupt file still fails — with a reason attached.
+        let why = parse_session_reason(b"{not json").expect_err("corrupt must not parse");
+        assert!(!why.is_empty(), "the failure must explain itself");
+
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// `/resume` and the startup hint must offer THIS project's newest session, not whichever
     /// project's conversation happened to write last — the shared flat pool is exactly how a
     /// foreign transcript used to be offered unlabeled and restored into the wrong repo.
@@ -16985,8 +17288,14 @@ mod tests {
     /// orphan every file saved before the fold.
     #[test]
     fn sanitize_name_keeps_accented_files_addressable() {
-        assert_eq!(sanitize_name("tại-sao-ổ-của-anh-0803"), "tại-sao-ổ-của-anh-0803");
-        assert_eq!(sanitize_name("anh-cần-em-viết-tài-0804"), "anh-cần-em-viết-tài-0804");
+        assert_eq!(
+            sanitize_name("tại-sao-ổ-của-anh-0803"),
+            "tại-sao-ổ-của-anh-0803"
+        );
+        assert_eq!(
+            sanitize_name("anh-cần-em-viết-tài-0804"),
+            "anh-cần-em-viết-tài-0804"
+        );
     }
 
     /// A pasted credential must never become a filename. The derived stem is written to disk AND

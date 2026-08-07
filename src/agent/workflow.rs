@@ -33,8 +33,15 @@ const CHILD_MAX_ITERS: usize = 15;
 /// Hard ceiling on auto-extend for a workflow child (`2 × CHILD_MAX_ITERS`, same shape as task).
 const CHILD_AUTO_EXTEND: usize = 30;
 /// Transient model-call failures a workflow child absorbs per turn before giving up (see
-/// `AgentConfig::max_transient_retries`). Matches the `task` tool's sub-agent policy.
-const CHILD_TRANSIENT_RETRIES: usize = 4;
+/// `AgentConfig::max_transient_retries`). Matches the `task` tool's sub-agent policy
+/// (`SUBAGENT_TRANSIENT_RETRIES`) — kept EQUAL on purpose: both are unwatched loops on the same
+/// gateway, so a value that is right for one is right for the other, and a divergence here would
+/// mean the same provider blip loses a workflow child while a `task` dispatch rides it out.
+///
+/// Raised 4 → 6 with the empty-200 fix in [`crate::agent::run_agent_loop`]: exhausting the budget is
+/// now an `Err` rather than a fall-through reported as a finished run, which makes the number
+/// load-bearing instead of merely deciding how long a doomed turn took to give up.
+const CHILD_TRANSIENT_RETRIES: usize = 6;
 /// Fresh step budgets a STILL-PROGRESSING workflow child may be granted after its auto-extend is
 /// spent, instead of returning partial work as `status: "max-iters"` (see
 /// `AgentConfig::max_continuations`). Smaller than the top level's: children are meant to be narrow,

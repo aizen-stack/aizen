@@ -61,7 +61,15 @@ const CONTINUE_NUDGE: &str = "[continue] You reached your step budget and the di
 
 /// Transient model-call failures a sub-agent absorbs per turn before giving up (see
 /// `AgentConfig::max_transient_retries`). Unlike the top level, there is no user watching to re-ask.
-const SUBAGENT_TRANSIENT_RETRIES: usize = 4;
+///
+/// Raised 4 → 6 alongside the empty-200 fix in [`crate::agent::run_agent_loop`]. The two changes are
+/// a pair: exhausting this budget used to fall through and be reported as a finished run with an
+/// empty answer, so the budget's size only decided how long a doomed turn took to give up. It is now
+/// an `Err` that fails the whole dispatch, which makes the budget load-bearing — it is the only thing
+/// standing between a gateway shedding load for half a minute and a lost sub-agent run. Six attempts
+/// on the patient (`quiet`) backoff spans roughly 30s of waiting, comfortably past a rolling deploy
+/// or a 429 burst, and costs nothing when the provider is healthy (the first attempt returns).
+const SUBAGENT_TRANSIENT_RETRIES: usize = 6;
 
 /// WALL-CLOCK deadline for ONE sub-agent model call. Override with `AIZEN_SUBAGENT_CALL_SECS`.
 ///

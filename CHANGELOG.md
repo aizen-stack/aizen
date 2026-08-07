@@ -7,6 +7,108 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+## [0.5.9] — 2026-08-07
+
+One theme: **six places reported failure as success.** A sub-agent that never answered was labelled
+`done`. A saved conversation the program itself had written was listed as `(unreadable)`. A duplicate
+gate that had never once fired looked like a store with no duplicates in it. An abandoned lease
+directory was never swept because the only sweeper refused to look at other projects' leases. In every
+case the code path completed without error, so nothing upstream had any way to tell that nothing had
+happened — which is why several of these survived for months under a green test suite.
+
+### Fixed
+- **Sub-agents returned empty "successfully", many times in a row.** Three independent bugs, each
+  sufficient on its own, which is why fixing any one of them earlier never made the symptom go away.
+  (1) When the transient-retry budget ran out on an empty HTTP 200, the ordinary turn loop `break`ed
+  with an empty turn and fell through the done cascade into `StopReason::Done` — the caller received
+  `"(sub-agent produced no final answer)"` *under a `done` header*, indistinguishable from a genuine
+  silent success. A test named `..._falls_through_once_budget_is_spent` had pinned exactly this as
+  correct behaviour ("the pre-fix behavior, so a persistently-broken provider still terminates"), so
+  the suite was green the whole time. A spent budget is now an `Err`, which every caller already
+  handled correctly. (2) Each retry re-sent a **byte-identical** request. A provider that just answered
+  a request with silence usually answers it with silence again — this is the direct cause of "many
+  times". From the second attempt a short `[recover]` re-prompt is appended, and rolled back LIFO on
+  every early return so a retried turn can't leave a stray `user` message in history. (3) `RespMessage`
+  (non-streaming) never read `reasoning_content`, though the streaming `Delta` has always had it via
+  `#[serde(alias = "reasoning")]`. A provider that puts the whole answer in `reasoning_content` with
+  `content: null` therefore deserialized to exactly the shape of an empty 200. **Only sub-agents were
+  affected**, because they are the one caller running entirely on the non-streaming path — the same
+  model answering the same way through the streaming path was fine. Retry budgets 4 → 6 in both the
+  `task` tool and workflow children, and the backoff curve now selects the patient one (cap 30s) when
+  `cfg.quiet` marks a lane nobody is watching, rather than the interactive 4s cap.
+- **The first tool call of a stream could still dispatch with no arguments.** `snapshot` guarded
+  partial arguments with `args_complete`, but `finish_indexed` — the flush path for the LAST call in a
+  stream — only filtered on a non-empty *name*. A stream cut mid-arguments therefore dispatched with
+  `args = ""`, which reads as `{}` and surfaces as "missing required argument". Same filter now applies
+  on both paths.
+- **`/sessions` listed conversations as `(unreadable)` — and the files were fine.** Not abrupt
+  shutdown: all 29 session files on the reporting machine parsed as valid JSON, and the write path
+  (`atomic_write` → temp + `sync_all` + `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)`) is genuinely
+  crash-safe. The bug was an asymmetry inside `Message`: the hand-written `Serialize` emits `content`
+  as an OpenAI **parts array** for a user turn carrying images, while `Deserialize` accepted only
+  `Option<String>`. Any conversation that ever had an image pasted into it was written in a shape the
+  program could not read back. `content` now round-trips through a `ContentField` enum accepting all
+  three legitimate wire shapes (absent, string, parts array) and recovers `images` back out of the
+  parts, so **the two affected files on disk load again with no migration** — the data was never lost,
+  only unparseable. Unknown future part kinds (audio, video, file) degrade to "dropped" rather than
+  failing the whole message, so this exact class of bug cannot recur through a provider addition.
+  Images still live outside `content` in memory, keeping the `chars/4` token HUD and auto-compact from
+  counting multi-MB base64.
+- **The serde error that hid it for months is no longer swallowed.** `parse_session_bytes` returned a
+  bare `None` for every failure. It now has a `parse_session_reason` sibling returning the reason, and
+  `/sessions` prints `(unreadable: <why>)` — the corrupt-vs-empty distinction is unchanged.
+- **98 dead recovery leases, oldest two weeks old, that nothing could ever delete.** `clear()` only
+  runs on a clean exit, and `scan_stale()` filters by `repo_scope`, so a lease from any other project
+  was invisible to the only code that could remove it; every abrupt shutdown added one, and no
+  `consumed-*` or `quarantine-*` had ever been cleaned. `sweep_expired()` is deliberately scope-blind
+  (that *is* the leak) with safety from the lock plus a 7-day age check rather than from scope. The
+  lock guard is dropped before `remove_dir_all` — it holds an open handle to `lease.lock` inside the
+  directory, and Windows refuses to delete a directory containing an open file, so keeping it would
+  have made the sweep a silent no-op on the platform where the leak was measured. Orphaned
+  `.aizen-tmp-*` files in the sessions directory are swept at startup too.
+- **The duplicate-memory gate had never fired once.** Measured over the real 360-fact store, every
+  same-tier pair scored under both thresholds: 0 pairs ≥ 0.80, 0 pairs ≥ 0.55, median nearest-neighbour
+  0.199 — while the store held five separate facts all saying the user writes Vietnamese. The gate was
+  not too loose, it was **blind**: `best_match` was purely lexical, and the shared vocabulary is
+  exactly the layer Vietnamese paraphrase varies (`người dùng` / `user` / `anh`, `giao tiếp` /
+  `trao đổi`). Peak similarity between two facts stating the same thing was 0.44, under the 0.55 floor.
+  Similarity is now the max of three measures, the third being a new `match_text` layer that folds
+  accents and strips the pronoun-and-particle layer for comparison only. This is *not* the retrieval
+  tokenizer — that one deliberately preserves diacritics so searching `cà phê` works, and a test pins
+  it. `persona::self_mem` had already hit and fixed this same blindness one layer down; the fix is now
+  factored out so the two cannot drift apart again.
+- **`reconcile` reported 227 successful `confirm`s while retiring nothing.** `Action::Confirm` carried
+  only a target, so the redundant half of a `same` pair was never touched — the log was counting
+  *gestures*, not *effects*. The duplicate is now actually removed (`drop_redundant`), gated on the
+  candidate's own confirmations, with cycle protection so a supersede chain inside one batch can't
+  delete its own survivor. A failed removal is reported ("duplicate kept — <why>"), never swallowed.
+- **`/config` mid-chat corrupted the frame.** The suspend mechanism was correct; the raw prints were
+  not. Roughly 20 `eprintln!` calls on the `/config`, `/skills`, `/persona` and `/sessions` paths wrote
+  behind the render thread's back — ratatui diffs against its own cell buffer, never sees foreign text,
+  and so leaves it alive across later frames. All now route through `tui::note_line`. `Spinner::start`
+  gated only on `is_terminal()`, so a spinner on a background thread outliving the suspend window
+  scribbled `\r` + `clear_line` over a live frame; it is now inert while the retained renderer owns the
+  screen (the narrated operation still runs and still prints its verdict). `Command::Resume` now sets
+  `force_clear` like `Redraw` already did, and re-probes the terminal size on resume — while suspended
+  no paint happens, so `COLS`/`ROWS` were stale and a window resize with `/config` open drew at the old
+  width.
+
+### Changed
+- **The mouse wheel no longer scrolls the transcript.** A wheel tick moved the viewport out from under
+  a drag-selection's anchor line, silently changing what releasing the button would copy — which is why
+  selecting an earlier prompt to copy it kept producing the wrong text. Scrolling back is keyboard-only
+  now: PageUp/PageDown, End to return to the live tail. Mouse capture stays enabled regardless; it is
+  what stops the terminal's `alternateScroll` from leaking wheel ticks through as ↑/↓ and walking input
+  history behind the user's back.
+- **Drag-release copy now confirms.** It had always copied silently, so there was no way to tell it had
+  worked; it now prints the same `· copied N chars` note the right-click Copy path does, and says so
+  honestly when the platform has no clipboard (`arboard` is desktop-only, so Linux is a no-op).
+
+### Added
+- `aizen prompt-size` — byte breakdown of the fixed per-turn overhead (system prompt + tool schemas),
+  with `--tools` for per-tool sizes and `--json` for machine output. Tool schemas and loop count were
+  the two remaining token levers after an audit found prompt caching already correct.
+
 ## [0.5.8] — 2026-08-05
 
 One theme: **a name is a handle, and four of the five places that build one were cutting words in

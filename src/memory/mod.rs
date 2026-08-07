@@ -1775,7 +1775,14 @@ pub fn print_reconcile_report(r: &learning::reconcile::BatchReport) {
     ));
     for a in &r.applied {
         let verb = match &a.action {
-            Action::Confirm { target } => format!("confirm '{target}'"),
+            Action::Confirm {
+                target,
+                redundant: Some(x),
+            } => format!("confirm '{target}' and drop duplicate '{}'", x.id),
+            Action::Confirm {
+                target,
+                redundant: None,
+            } => format!("confirm '{target}'"),
             Action::Refine { target, .. } => format!("rewrite '{target}' in place"),
             Action::Supersede { target, .. } => format!("retire '{target}' behind a new fact"),
             Action::Review { target, why } => format!("leave '{target}' alone — {why}"),

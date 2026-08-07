@@ -1299,18 +1299,58 @@ where
             // EMPTY-200 (a 200 with neither content nor a tool call) is retried on the SAME budget:
             // it is the same silent-provider-failure goal mode already guards against, and outside
             // goal mode it used to feed an empty turn straight into the done cascade — the model
-            // going quiet mid-task and the loop reporting an empty "Done". Bounded (not indefinite
-            // like goal mode) because someone is watching; if it survives the budget it falls
-            // through, unchanged.
+            // going quiet mid-task and the loop reporting an empty "Done".
+            //
+            // Three properties this branch must hold, each learned from a real failure:
+            //
+            // 1. A SPENT BUDGET IS AN ERROR, NOT A `Done`. Falling through with the empty turn let it
+            //    reach the done cascade, so a provider that never spoke was reported as a finished
+            //    run: `StopReason::Done`, empty `final_text`, and — for a delegated dispatch —
+            //    "(sub-agent produced no final answer)" under a `done` header. The caller could not
+            //    tell success from silence. `Err` is what every caller already handles correctly.
+            // 2. RETRIES MUST NOT BE IDENTICAL. The first retry re-sent the byte-identical request, so
+            //    a provider that answered it with silence usually answered again with silence — the
+            //    observed "many empty responses in a row". After the first retry also comes back
+            //    empty, a `user` re-prompt is appended so each further attempt asks something new.
+            //    It stays in history when a retry finally lands (it is a legitimate turn the answer
+            //    responds to) and is rolled back, LIFO, on every early return.
+            // 3. AN UNWATCHED LOOP WAITS PATIENTLY. `interactive_backoff_ms` (cap 4s) is sized so a
+            //    person does not read the pause as a hang. A delegated sub-agent (`quiet`) has nobody
+            //    watching and a gateway that is shedding load needs longer than 4s, so it uses the
+            //    patient `goal_backoff_ms` (cap 30s) instead.
+            const EMPTY_RETRY_NUDGE: &str = "[recover] Your previous response arrived EMPTY — no \
+                text and no tool call. That is a transport-level failure, not an instruction to stop. \
+                Do not apologize, re-plan, or restart: continue from exactly where the task stood. If \
+                the next step is a tool call, make it; otherwise write the result.";
+
+            /// Undo everything this turn appended, innermost first: the empty-200 re-prompts sit ON
+            /// TOP of the pre-loop nudge, so they must come off before it.
+            fn rollback(messages: &mut Vec<Message>, empty_nudges: usize, nudge_pushed: bool) {
+                for _ in 0..empty_nudges {
+                    messages.pop();
+                }
+                if nudge_pushed {
+                    messages.pop();
+                }
+            }
+
+            // Property 3: patient when unwatched, snappy when watched.
+            let backoff = |a: u32| {
+                if cfg.quiet {
+                    crate::llm::client::goal_backoff_ms(a)
+                } else {
+                    crate::llm::client::interactive_backoff_ms(a)
+                }
+            };
+
             let mut attempt: u32 = 0;
+            let mut empty_nudges: usize = 0;
             loop {
                 match crate::core::cancel::race(&cfg.cancel, chat(messages.clone(), defs.clone()))
                     .await
                 {
                     None => {
-                        if nudge_pushed {
-                            messages.pop();
-                        }
+                        rollback(messages, empty_nudges, nudge_pushed);
                         return Ok(AgentOutcome {
                             final_text: None,
                             iters: iter,
@@ -1323,36 +1363,48 @@ where
                                 .as_deref()
                                 .map(|s| s.trim().is_empty())
                                 .unwrap_or(true);
-                        if empty_200 && (attempt as usize) < cfg.max_transient_retries {
-                            // INTERACTIVE backoff (fast, cap 4s), not `goal_backoff_ms` (cap 30s):
-                            // someone is watching this turn, so a whole ~10-retry chain must stay
-                            // inside ~30–40s total rather than let one late attempt stall 30s. Goal
-                            // mode's branch above keeps the slow-but-patient backoff on purpose.
-                            let delay = crate::llm::client::interactive_backoff_ms(attempt);
-                            attempt += 1;
-                            if !cfg.quiet {
-                                retry_line(
-                                    "empty",
-                                    &format!(
-                                        "empty response; retry {attempt}/{}",
-                                        cfg.max_transient_retries
-                                    ),
-                                    delay,
-                                );
-                            }
-                            if goal_sleep_or_cancel(&cfg.cancel, delay).await {
-                                if nudge_pushed {
-                                    messages.pop();
-                                }
-                                return Ok(AgentOutcome {
-                                    final_text: None,
-                                    iters: iter,
-                                    stop: StopReason::Cancelled,
-                                });
-                            }
-                            continue;
+                        if !empty_200 {
+                            break t;
                         }
-                        break t;
+                        // Property 1: the budget is spent and the provider still has not spoken.
+                        // Report that as the failure it is — never as a finished run.
+                        if attempt as usize >= cfg.max_transient_retries {
+                            rollback(messages, empty_nudges, nudge_pushed);
+                            return Err(anyhow::anyhow!(
+                                "provider returned {} empty response(s) in a row (HTTP 200 with no \
+                                 text and no tool call) — the model never answered this turn",
+                                attempt + 1
+                            ));
+                        }
+                        let delay = backoff(attempt);
+                        attempt += 1;
+                        if !cfg.quiet {
+                            retry_line(
+                                "empty",
+                                &format!(
+                                    "empty response; retry {attempt}/{}",
+                                    cfg.max_transient_retries
+                                ),
+                                delay,
+                            );
+                        }
+                        if goal_sleep_or_cancel(&cfg.cancel, delay).await {
+                            rollback(messages, empty_nudges, nudge_pushed);
+                            return Ok(AgentOutcome {
+                                final_text: None,
+                                iters: iter,
+                                stop: StopReason::Cancelled,
+                            });
+                        }
+                        // Property 2: stop re-sending the byte-identical request. The FIRST retry
+                        // repeats it unchanged (a one-off blip is the common case and the prompt
+                        // cache stays warm); from the second on, each attempt carries a re-prompt so
+                        // the provider is being asked something new.
+                        if attempt >= 2 && empty_nudges == 0 {
+                            messages.push(Message::user(EMPTY_RETRY_NUDGE));
+                            empty_nudges += 1;
+                        }
+                        continue;
                     }
                     Some(Err(e)) => {
                         let transient = matches!(
@@ -1360,14 +1412,10 @@ where
                             crate::llm::client::ApiErrorKind::Transient
                         );
                         if !transient || attempt as usize >= cfg.max_transient_retries {
-                            if nudge_pushed {
-                                messages.pop();
-                            }
+                            rollback(messages, empty_nudges, nudge_pushed);
                             return Err(e);
                         }
-                        // INTERACTIVE backoff here too (see the empty-200 branch above): the ordinary
-                        // path reports to a waiting user, so it retries fast and then fails cleanly.
-                        let delay = crate::llm::client::interactive_backoff_ms(attempt);
+                        let delay = backoff(attempt);
                         attempt += 1;
                         if !cfg.quiet {
                             retry_line(
@@ -1380,9 +1428,7 @@ where
                             );
                         }
                         if goal_sleep_or_cancel(&cfg.cancel, delay).await {
-                            if nudge_pushed {
-                                messages.pop();
-                            }
+                            rollback(messages, empty_nudges, nudge_pushed);
                             return Ok(AgentOutcome {
                                 final_text: None,
                                 iters: iter,
@@ -7715,24 +7761,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_mode_empty_200_falls_through_once_budget_is_spent() {
-        // If empty-200s outlast the retry budget, the loop must not spin forever — it falls through
-        // with the empty turn (Done, empty final_text), the pre-fix behavior, so a persistently-broken
-        // provider still terminates rather than hanging.
+    async fn ordinary_mode_empty_200_errors_rather_than_reporting_a_silent_done() {
+        // THE BUG this pins: a spent budget used to FALL THROUGH with the empty turn, which reached
+        // the done cascade and returned `Done` with empty `final_text`. A provider that never spoke
+        // was therefore indistinguishable from a finished run — and for a delegated dispatch it
+        // surfaced as "(sub-agent produced no final answer)" under a `done` header, which is a
+        // failure reporting itself as a success. It must be an `Err`: every caller already handles
+        // that path (the sub-agent one even names the completed tool turns so partial edits are
+        // findable), and the loop still TERMINATES rather than spinning.
         let r = registry();
         let c = AgentConfig {
             quiet: true,
-            max_transient_retries: 1, // one retry, then fall through
+            max_transient_retries: 1, // one retry, then give up
             ..cfg()
         };
         let mut messages = vec![Message::system("sys"), Message::user("task")];
-        // Three empties: initial + 1 retry both empty, budget spent → the 2nd is accepted as-is.
+        // Three empties: initial + 1 retry both empty ⇒ budget spent on the 2nd.
         let chat = scripted(vec![empty_turn(), empty_turn(), empty_turn()]);
-        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        let err = run_agent_loop(chat, &c, &r, &mut messages)
+            .await
+            .expect_err("a persistently silent provider must be an error, never a Done");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("empty"),
+            "the error must name provider silence as the cause, got: {msg}"
+        );
+        // History must be left exactly as it was found: the re-prompt this branch appends is rolled
+        // back on the error path, so a caller that retries the turn does not inherit a stray nudge.
         assert_eq!(
-            out.stop,
-            StopReason::Done,
-            "a persistently empty provider terminates rather than spinning"
+            messages.len(),
+            2,
+            "the empty-200 re-prompt must be rolled back on the error path, got: {messages:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_200_retry_reprompts_instead_of_resending_the_same_request() {
+        // Re-sending the byte-identical request is what produced the observed run of many empty
+        // responses: a provider that answered a request with silence usually answers the same
+        // request with silence again. From the SECOND attempt on, a `user` re-prompt must be
+        // appended so each further attempt asks something the provider has not already refused.
+        // It stays in history when a retry finally lands — it is a legitimate turn the answer
+        // responds to.
+        let r = registry();
+        let c = AgentConfig {
+            quiet: true,
+            max_transient_retries: 4,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        // empty, empty (→ re-prompt appended), then the real answer.
+        let chat = scripted(vec![
+            empty_turn(),
+            empty_turn(),
+            final_turn("recovered answer"),
+        ]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.final_text.as_deref(), Some("recovered answer"));
+        let nudges = messages
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with("[recover]"))
+            })
+            .count();
+        assert_eq!(
+            nudges, 1,
+            "exactly one re-prompt: none on the first retry, one on the second, kept on success"
         );
     }
 

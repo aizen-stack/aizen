@@ -150,7 +150,10 @@ fn at_matches(draft: &[char]) -> Vec<String> {
         None => return Vec::new(),
     };
     // The prefix is everything after the `@` up to the end of draft (cursor always at end for this).
-    let prefix: String = s[at_pos + 1..].chars().take_while(|c| !c.is_whitespace()).collect();
+    let prefix: String = s[at_pos + 1..]
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect();
     // Avoid triggering on obvious non-path patterns like `@everyone`.
     // We return results even for an empty prefix (show recent/top files) but cap at 12.
     const LIMIT: usize = 12;
@@ -162,16 +165,30 @@ fn at_matches(draft: &[char]) -> Vec<String> {
     let mut matches: Vec<String> = Vec::new();
     let lower_prefix = prefix.to_lowercase();
     // Use WalkDir-equivalent via std::fs recursive helper — no new dep.
-    fn collect_files(dir: &std::path::Path, root: &std::path::Path, depth: u8, out: &mut Vec<String>) {
-        if depth == 0 { return; }
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+    fn collect_files(
+        dir: &std::path::Path,
+        root: &std::path::Path,
+        depth: u8,
+        out: &mut Vec<String>,
+    ) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in rd.flatten() {
             let path = entry.path();
-            let ft = match entry.file_type() { Ok(t) => t, Err(_) => continue };
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
             // Skip hidden dirs and known noise dirs.
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') || matches!(name_str.as_ref(), "target" | "node_modules" | "__pycache__") {
+            if name_str.starts_with('.')
+                || matches!(name_str.as_ref(), "target" | "node_modules" | "__pycache__")
+            {
                 continue;
             }
             if ft.is_file() {
@@ -181,7 +198,9 @@ fn at_matches(draft: &[char]) -> Vec<String> {
             } else if ft.is_dir() {
                 collect_files(&path, root, depth - 1, out);
             }
-            if out.len() >= 2000 { return; }
+            if out.len() >= 2000 {
+                return;
+            }
         }
     }
     let mut all_files: Vec<String> = Vec::new();
@@ -203,12 +222,20 @@ fn at_matches(draft: &[char]) -> Vec<String> {
             .iter()
             .map(|p| {
                 let fname = p.rsplit('/').next().unwrap_or(p);
-                let score = if fname.to_lowercase().starts_with(&lower_prefix) { 0 } else { 1 };
+                let score = if fname.to_lowercase().starts_with(&lower_prefix) {
+                    0
+                } else {
+                    1
+                };
                 (score, p)
             })
             .collect();
         scored.sort_by_key(|(s, _)| *s);
-        matches = scored.into_iter().map(|(_, p)| p.clone()).take(LIMIT).collect();
+        matches = scored
+            .into_iter()
+            .map(|(_, p)| p.clone())
+            .take(LIMIT)
+            .collect();
     }
     matches
 }
@@ -358,6 +385,8 @@ const TIPS: &[&str] = &[
     "set a Tavily key (`/config`) to unlock `web_search`",
     "`/apps` connects GitHub, Notion, Slack & more via MCP",
     "`/approval smart` auto-runs read-only tools; `yolo` pre-authorizes the rest",
+    "PgUp/PgDn scrolls back through the transcript, End returns to the live tail",
+    "drag over transcript text to copy it; right-click a highlight for an explicit Copy",
 ];
 /// Per-session tip cursor — advanced once per submitted turn so tips rotate rather than repeat.
 static TIP_SEED: AtomicUsize = AtomicUsize::new(0);
@@ -718,8 +747,13 @@ pub fn ask_approval(prompt_line: &str) -> bool {
 /// The render thread is the single source of truth here: it calls `autoresize` and stores the result,
 /// so this can never disagree with what was actually painted (the old second copy in `Render.cols`
 /// needed its own 250 ms poller to stay in step, and drifted between polls).
+///
+/// EXCEPT while suspended for a dialoguer menu: there is no frame then, so the stored size is frozen
+/// at whatever was last painted and a window resized during the menu would lay out at the old width
+/// (the config panel's rule and right-aligned path). While the renderer holds no screen, nothing has
+/// been "actually painted" to disagree with, so a live probe is strictly better.
 pub fn width() -> usize {
-    if retained::is_running() {
+    if retained::is_running() && retained::is_active() {
         retained::size().1 as usize
     } else {
         term_size().1 as usize
@@ -1401,10 +1435,13 @@ fn hit(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
         && row < rect.y.saturating_add(rect.height)
 }
 
-/// Phase 3 mouse handler for the retained backend: wheel scroll, text selection (drag + copy-on-
-/// release), right-click Copy menu, and scrollbar thumb drag. Mutates `selecting` /
-/// `dragging_scrollbar` so state survives across successive mouse events. No-ops harmlessly when
-/// geometry is empty (first frame).
+/// Phase 3 mouse handler for the retained backend: text selection (drag + copy-on-release),
+/// right-click Copy menu, and scrollbar thumb drag. Mutates `selecting` / `dragging_scrollbar` so
+/// state survives across successive mouse events. No-ops harmlessly when geometry is empty (first
+/// frame).
+///
+/// The wheel is NOT handled: transcript scrolling is keyboard-only (PageUp/PageDown, End). See the
+/// `match` below for why.
 fn handle_retained_mouse(
     kind: crossterm::event::MouseEventKind,
     col: u16,
@@ -1415,12 +1452,8 @@ fn handle_retained_mouse(
     use crossterm::event::{MouseButton, MouseEventKind};
     let (start, visible, total, area) = retained::last_transcript_geom();
     if area.width == 0 || area.height == 0 {
-        // Still allow wheel even before first paint — scroll is idempotent.
-        match kind {
-            MouseEventKind::ScrollUp => retained::scroll(-3),
-            MouseEventKind::ScrollDown => retained::scroll(3),
-            _ => {}
-        }
+        // Nothing painted yet: there is no line/column mapping to hit-test against, and the wheel is
+        // deliberately not a scroll input (see the match below), so every event is a no-op here.
         return;
     }
     // Scrollbar gutter = rightmost cell of the transcript area.
@@ -1433,8 +1466,13 @@ fn handle_retained_mouse(
         && row < area.y.saturating_add(area.height);
 
     match kind {
-        MouseEventKind::ScrollUp => retained::scroll(-3),
-        MouseEventKind::ScrollDown => retained::scroll(3),
+        // The wheel is deliberately NOT a scroll input. Scrolling back through the transcript is
+        // keyboard-only (PageUp/PageDown, End) so the wheel never competes with a drag-selection in
+        // progress — a wheel tick used to move the viewport out from under the anchor line, which
+        // silently changed what a release would copy. Mouse capture stays on regardless: it is what
+        // stops the terminal's "alternateScroll" from leaking wheel ticks through as ↑/↓ and walking
+        // input history behind the user's back.
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {}
         MouseEventKind::Down(MouseButton::Left) => {
             // The right-click Copy menu floats above everything, so it is hit-tested FIRST — a click
             // on it must copy rather than start a new selection underneath it. `live_selection` is
@@ -1581,17 +1619,18 @@ fn handle_retained_mouse(
             if *dragging_scrollbar {
                 *dragging_scrollbar = false;
             } else if let Some(sel) = selecting.take() {
-                // Keep highlight until next click; copy text to the OS clipboard on release.
+                // Keep highlight until next click; copy text to the OS clipboard on release and
+                // confirm with a one-line note so the user knows the copy landed.
                 retained::set_selection(sel);
                 let text = retained::extract_selection_text(sel);
                 if !text.is_empty() {
-                    copy_to_os_clipboard(&text);
+                    let ok = copy_to_os_clipboard(&text);
+                    note_copied(&text, ok);
                 }
             }
         }
-        // Right-click over a highlight offers an explicit "Copy" button. The drag-release above
-        // already copies silently, but that is invisible — there is no way to tell it happened, and
-        // no way to ask for it again without re-dragging. This is the discoverable path.
+        // Right-click over a highlight offers an explicit "Copy" button as a secondary path.
+        // The drag-release above now also shows a confirmation note, so both flows confirm.
         //
         // Gated on there BEING a selection: a menu whose only item is Copy has nothing to offer
         // otherwise, and popping an inert box on every right-click in the transcript would be noise.
@@ -1936,7 +1975,12 @@ fn input_loop(
                     let at = {
                         let r = render().lock().unwrap();
                         let m = at_matches(&r.draft);
-                        (!m.is_empty()).then(|| (m[r.at_sel.min(m.len() - 1)].clone(), draft_at_prefix_start(&r.draft)))
+                        (!m.is_empty()).then(|| {
+                            (
+                                m[r.at_sel.min(m.len() - 1)].clone(),
+                                draft_at_prefix_start(&r.draft),
+                            )
+                        })
                     };
                     if let Some((path, at_start)) = at {
                         let mut r = render().lock().unwrap();
@@ -2019,9 +2063,7 @@ fn input_loop(
                 // marker stripped. A refused aside (no worker / blank / oversized) also falls through,
                 // so the text is delivered either way and the model never sees the `?`. Not offered
                 // for a vision message (an image belongs to the main turn).
-                else if let Some(rest) =
-                    trimmed.strip_prefix('?').filter(|_| images == 0)
-                {
+                else if let Some(rest) = trimmed.strip_prefix('?').filter(|_| images == 0) {
                     if turn_in_flight() && crate::core::aside::ask(rest) {
                         continue;
                     }
@@ -2108,7 +2150,12 @@ fn input_loop(
                 let at = {
                     let r = render().lock().unwrap();
                     let m = at_matches(&r.draft);
-                    (!m.is_empty()).then(|| (m[r.at_sel.min(m.len() - 1)].clone(), draft_at_prefix_start(&r.draft)))
+                    (!m.is_empty()).then(|| {
+                        (
+                            m[r.at_sel.min(m.len() - 1)].clone(),
+                            draft_at_prefix_start(&r.draft),
+                        )
+                    })
                 };
                 if let Some((path, at_start)) = at {
                     let mut r = render().lock().unwrap();
@@ -2278,7 +2325,9 @@ fn input_loop(
                 if at_len > 0 {
                     let mut r = render().lock().unwrap();
                     if retained::is_active() {
-                        if r.at_sel + 1 < at_len { r.at_sel += 1; }
+                        if r.at_sel + 1 < at_len {
+                            r.at_sel += 1;
+                        }
                     } else {
                         r.at_sel = r.at_sel.saturating_sub(1);
                     }

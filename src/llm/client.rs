@@ -958,12 +958,42 @@ pub async fn chat_with_tools_effort(
         .next()
         .ok_or_else(|| anyhow!("response had no choices"))?;
     Ok(ChatTurn {
-        content: choice.message.content,
+        content: resolve_content(&choice.message),
         tool_calls: choice.message.tool_calls,
         finish_reason: choice.finish_reason,
         usage,
         eager: Vec::new(),
     })
+}
+
+/// The message's text, falling back to its REASONING channel when `content` is empty.
+///
+/// Some providers put the whole reply in `reasoning_content` (DeepSeek) / `reasoning` (OpenRouter)
+/// and leave `content` null. With no tool calls that deserializes to "no text, no calls" — which
+/// every caller classifies as an empty-200 provider failure — so the loop retried an identical
+/// request, got the identical "empty" answer, and burned its whole budget before reporting silence.
+/// The model DID speak.
+///
+/// The asymmetry only bit SUB-AGENTS: [`Delta`] (streaming) has always read this field, and a
+/// sub-agent is the one caller that runs exclusively on the non-streaming [`chat_with_tools`]. The
+/// same model answering the same way over the streaming path was fine, which is why this looked like
+/// "sub-agents get empty responses" rather than a provider-shape gap.
+///
+/// Narrow on purpose. The fallback applies ONLY when there are no tool calls AND `content` is
+/// absent/blank, so a normal turn is untouched and reasoning is never APPENDED to real content —
+/// appending would leak the chain-of-thought the CLI deliberately suppresses on the streaming path.
+/// A blank `content` alongside tool calls stays blank: that is the canonical tool-call turn shape.
+fn resolve_content(m: &crate::core::types::RespMessage) -> Option<String> {
+    let has_text = m.content.as_deref().is_some_and(|s| !s.trim().is_empty());
+    if has_text || !m.tool_calls.is_empty() {
+        return m.content.clone();
+    }
+    m.reasoning_content
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| m.content.clone())
 }
 
 /// Reassembles streamed `delta.tool_calls[]` fragments into whole `ToolCall`s, keyed by index.
@@ -1106,10 +1136,17 @@ impl ToolCallAccumulator {
 
     /// Finalize, keeping each call's SLOT KEY alongside — the eager path maps slot → final
     /// position through this (positions are what the executor stitches by).
+    ///
+    /// Like [`snapshot`], we reject calls whose arguments are not a complete JSON object.  A stream
+    /// that was cut in the middle of `arguments` leaves `args` as `""` or a partial fragment; both
+    /// fail `args_complete`.  Dispatching them would produce a spurious `missing required arg` error
+    /// (and a wasted round-trip) even though the model would have sent correct arguments had the
+    /// stream finished.  We drop the truncated call instead — the executor will see it is missing
+    /// from the results and the model retries with full context.
     pub fn finish_indexed(self) -> Vec<(usize, ToolCall)> {
         self.calls
             .into_iter()
-            .filter(|(_, c)| !c.name.is_empty())
+            .filter(|(_, c)| !c.name.is_empty() && args_complete(&c.args))
             .enumerate()
             .map(|(i, (k, c))| {
                 (
@@ -2055,6 +2092,66 @@ mod tests {
         // Plain content chunk leaves the reasoning channel empty.
         let c: crate::core::types::Delta = serde_json::from_str(r#"{"content":"hi"}"#).unwrap();
         assert!(c.reasoning_content.is_none());
+    }
+
+    /// Deserialize a non-streaming `message` object the way `chat_with_tools` does.
+    fn resp_msg(json: &str) -> crate::core::types::RespMessage {
+        serde_json::from_str(json).expect("valid message json")
+    }
+
+    #[test]
+    fn reasoning_only_reply_is_not_mistaken_for_provider_silence() {
+        // THE BUG: the streaming `Delta` has always read `reasoning_content`/`reasoning`, but the
+        // non-streaming `RespMessage` did not — and SUB-AGENTS are the one caller that runs
+        // exclusively on the non-streaming path. A provider that puts the whole reply in the
+        // reasoning channel therefore deserialized to `content: None, tool_calls: []`, which every
+        // caller classifies as an empty-200 provider failure. The model spoke; we could not hear it.
+        assert_eq!(
+            resolve_content(&resp_msg(
+                r#"{"content":null,"reasoning_content":"the answer"}"#
+            ))
+            .as_deref(),
+            Some("the answer"),
+        );
+        // OpenRouter spells the same channel `reasoning` (serde alias).
+        assert_eq!(
+            resolve_content(&resp_msg(r#"{"reasoning":"the answer"}"#)).as_deref(),
+            Some("the answer"),
+        );
+        // Whitespace-only `content` is as silent as null.
+        assert_eq!(
+            resolve_content(&resp_msg(
+                r#"{"content":"   ","reasoning_content":"the answer"}"#
+            ))
+            .as_deref(),
+            Some("the answer"),
+        );
+    }
+
+    #[test]
+    fn reasoning_never_displaces_or_appends_to_a_real_reply() {
+        // The fallback is exactly that — a fallback. Real content wins untouched: appending reasoning
+        // to it would leak the chain-of-thought the CLI deliberately suppresses on the streaming path.
+        assert_eq!(
+            resolve_content(&resp_msg(
+                r#"{"content":"real answer","reasoning_content":"private thinking"}"#
+            ))
+            .as_deref(),
+            Some("real answer"),
+        );
+        // A TOOL-CALL turn legitimately has no content. Substituting reasoning there would turn a
+        // tool call into a text turn and lose the step.
+        let with_call = resp_msg(
+            r#"{"content":null,"reasoning_content":"private thinking",
+                "tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]}"#,
+        );
+        assert!(
+            resolve_content(&with_call).is_none(),
+            "a tool-call turn must stay a tool-call turn"
+        );
+        // Genuine silence stays silence — the empty-200 path must still fire.
+        assert!(resolve_content(&resp_msg(r#"{"content":null}"#)).is_none());
+        assert!(resolve_content(&resp_msg(r#"{"reasoning_content":"  "}"#)).is_none());
     }
 
     #[test]
