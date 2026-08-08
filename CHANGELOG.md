@@ -57,6 +57,10 @@ turns Time Machine's noisy per-edit snapshots into meaningful phase restore poin
 - **Atomic writes use one implementation.** The duplicate edit-tool writer was removed in favor of the
   shared persistence implementation, keeping crash-safe replacement and compare-before-write behavior
   consistent across the binary.
+- **Markdown tables render even when the separator's column count differs from the header.** A wider
+  header over a shorter delimiter row (`|---:|---|` beneath three columns) used to fail detection and
+  dump raw pipes into the transcript; the delimiter row is now accepted on shape alone and the columns
+  are reconciled, so the table draws as a box.
 
 ## [0.5.9] — 2026-08-07
 
