@@ -160,6 +160,10 @@ pub fn apply_toolset_filter(registry: &mut ToolRegistry) {
 }
 
 /// Human summary for `/tools` and `config show`.
+///
+/// Both surfaces now render the registry themselves (they need per-toolset controls, not a flat
+/// string). Kept as the one-call textual summary.
+#[allow(dead_code)]
 pub fn format_status(registry: &ToolRegistry) -> String {
     let cfg = cli_config::load();
     let names = registry.names();

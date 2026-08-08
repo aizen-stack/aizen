@@ -529,26 +529,26 @@ pub fn seal_turn() -> Vec<String> {
     )
     .ok();
 
-    let changed = match timemachine::diff(&DiffSide::Checkpoint(base), &DiffSide::Working, &[], None)
-    {
-        Ok(report) => report
-            .files
-            .iter()
-            .flat_map(|f| {
-                // A rename touches both names: the new path is this session's, and the old path
-                // must be staged too or the commit would leave the original file behind.
-                let mut v = vec![(f.status, f.path.clone())];
-                if let Some(old) = &f.old_path {
-                    v.push(('D', old.clone()));
-                }
-                v
-            })
-            .collect::<Vec<_>>(),
-        Err(e) => {
-            note_checkpoint_unavailable(&format!("diff from checkpoint #{base} failed: {e}"));
-            return Vec::new();
-        }
-    };
+    let changed =
+        match timemachine::diff(&DiffSide::Checkpoint(base), &DiffSide::Working, &[], None) {
+            Ok(report) => report
+                .files
+                .iter()
+                .flat_map(|f| {
+                    // A rename touches both names: the new path is this session's, and the old path
+                    // must be staged too or the commit would leave the original file behind.
+                    let mut v = vec![(f.status, f.path.clone())];
+                    if let Some(old) = &f.old_path {
+                        v.push(('D', old.clone()));
+                    }
+                    v
+                })
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                note_checkpoint_unavailable(&format!("diff from checkpoint #{base} failed: {e}"));
+                return Vec::new();
+            }
+        };
     if changed.is_empty() {
         return Vec::new();
     }
@@ -1105,7 +1105,9 @@ fn merge_three_way(
         Some(c) if (0..128).contains(&c) => Ok((merged, c as u32)),
         other => bail!(
             "git merge-file could not reconstruct this file (exit {})",
-            other.map(|c| c.to_string()).unwrap_or_else(|| "killed".into())
+            other
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "killed".into())
         ),
     }
 }
@@ -1137,12 +1139,7 @@ pub fn split_shared(view: &SessionView, path: &str) -> Result<SplitFile> {
         .files
         .iter()
         .find(|f| f.path == path)
-        .with_context(|| {
-            format!(
-                "session {} did not change {path}",
-                view.manifest.session_id
-            )
-        })?;
+        .with_context(|| format!("session {} did not change {path}", view.manifest.session_id))?;
     let mut out = SplitFile {
         path: path.to_string(),
         content: None,
@@ -1164,7 +1161,11 @@ pub fn split_shared(view: &SessionView, path: &str) -> Result<SplitFile> {
         .context("listing checkpoints")?
         .into_iter()
         .collect();
-    let pruned: Vec<u32> = mine.iter().copied().filter(|i| !existing.contains(i)).collect();
+    let pruned: Vec<u32> = mine
+        .iter()
+        .copied()
+        .filter(|i| !existing.contains(i))
+        .collect();
     if !pruned.is_empty() {
         // Without the pre-image of a turn there is no way to know what that turn changed, and
         // guessing would hand the user a file that silently drops work.
@@ -1181,8 +1182,13 @@ pub fn split_shared(view: &SessionView, path: &str) -> Result<SplitFile> {
     }
 
     let root = PathBuf::from(&view.manifest.root);
-    let bounds = turn_boundaries(&view.manifest.repo_id, &view.manifest.worktree_id, &existing);
-    let working = timemachine::resolve_tree(&DiffSide::Working).context("hashing the working tree")?;
+    let bounds = turn_boundaries(
+        &view.manifest.repo_id,
+        &view.manifest.worktree_id,
+        &existing,
+    );
+    let working =
+        timemachine::resolve_tree(&DiffSide::Working).context("hashing the working tree")?;
 
     let base_blob = match head_tree(&root) {
         Some(tree) => timemachine::blob_in_tree(&tree, path)
@@ -1404,7 +1410,10 @@ pub struct Staged {
 /// Deliberately NOT held across the approval prompt: blocking every other window for as long as a
 /// human takes to decide is worse than the race it would close, and the tree digest below closes that
 /// race without holding anything.
-fn coordinator_lease(root: &Path, what: &str) -> Option<crate::core::workspace_txn::WorkspaceWriterLease> {
+fn coordinator_lease(
+    root: &Path,
+    what: &str,
+) -> Option<crate::core::workspace_txn::WorkspaceWriterLease> {
     crate::core::workspace_txn::WorkspaceWriterLease::acquire(
         root,
         Duration::from_secs(15),
@@ -1661,7 +1670,11 @@ pub fn work_list() -> Result<Vec<WorkTree>> {
             let base = current_branch(&id.canonical_root)?;
             git_ok(
                 &path,
-                &["rev-list".into(), "--count".into(), format!("{base}..{branch}")],
+                &[
+                    "rev-list".into(),
+                    "--count".into(),
+                    format!("{base}..{branch}"),
+                ],
             )
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
@@ -1702,7 +1715,10 @@ pub fn work_remove_blockers(wt: &WorkTree) -> Vec<String> {
         ));
     }
     if wt.sessions > 0 {
-        blockers.push(format!("{} aizen session(s) still running in it", wt.sessions));
+        blockers.push(format!(
+            "{} aizen session(s) still running in it",
+            wt.sessions
+        ));
     }
     blockers
 }
@@ -1780,10 +1796,7 @@ impl crate::agent::tools::Tool for TeamStatus {
     }
 
     fn execute(&self, args: &serde_json::Value) -> Result<String> {
-        let want_files = args
-            .get("files")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let want_files = args.get("files").and_then(|v| v.as_bool()).unwrap_or(false);
         let sessions = list();
         if sessions.is_empty() {
             return Ok("no aizen sessions are registered in this repository".to_string());
@@ -1803,7 +1816,11 @@ impl crate::agent::tools::Tool for TeamStatus {
                 } else {
                     format!(" · shares {} file(s)", v.overlapping.len())
                 },
-                if m.task.is_empty() { "(unstated)" } else { &m.task },
+                if m.task.is_empty() {
+                    "(unstated)"
+                } else {
+                    &m.task
+                },
             ));
             if let Some(reason) = &m.degraded {
                 out.push_str(&format!("  no per-session diff: {reason}\n"));
@@ -1822,7 +1839,9 @@ impl crate::agent::tools::Tool for TeamStatus {
         }
         let overlaps = overlaps();
         if !overlaps.is_empty() {
-            out.push_str("\nfiles changed by more than one session (git cannot split these by line):\n");
+            out.push_str(
+                "\nfiles changed by more than one session (git cannot split these by line):\n",
+            );
             for o in overlaps.iter().take(20) {
                 out.push_str(&format!("  {} — {} then {}\n", o.path, o.first, o.second));
             }
@@ -1844,7 +1863,10 @@ fn git_ok(root: &Path, args: &[String]) -> Result<String> {
     let out = crate::core::proctree::output_bounded(&mut cmd, GIT_TIMEOUT, GIT_DRAIN_GRACE)
         .context("running git")?;
     if out.timed_out {
-        bail!("git {} timed out", args.first().cloned().unwrap_or_default());
+        bail!(
+            "git {} timed out",
+            args.first().cloned().unwrap_or_default()
+        );
     }
     if out.code != Some(0) {
         let stderr = out.stderr.trim();
@@ -1866,8 +1888,7 @@ fn git_code(root: &Path, args: &[String]) -> Option<i32> {
     let mut cmd = crate::core::gitx::command().ok()?;
     cmd.current_dir(root);
     cmd.args(args);
-    let out =
-        crate::core::proctree::output_bounded(&mut cmd, GIT_TIMEOUT, GIT_DRAIN_GRACE).ok()?;
+    let out = crate::core::proctree::output_bounded(&mut cmd, GIT_TIMEOUT, GIT_DRAIN_GRACE).ok()?;
     if out.timed_out {
         return None;
     }
@@ -2020,7 +2041,11 @@ mod tests {
         write_manifest(&old).unwrap();
 
         let views = list_in(repo);
-        assert_eq!(views.len(), 1, "the stale manifest is swept, the fresh one kept");
+        assert_eq!(
+            views.len(),
+            1,
+            "the stale manifest is swept, the fresh one kept"
+        );
         assert_eq!(views[0].manifest.session_id, "s-recent");
         assert!(
             !manifest_path(repo, "s-old").exists(),
@@ -2042,10 +2067,16 @@ mod tests {
         );
         assert_eq!(files.len(), 2);
         let a = files.iter().find(|f| f.path == "src/a.rs").unwrap();
-        assert_eq!(a.base, 5, "pre-image stays the FIRST checkpoint this session saw");
+        assert_eq!(
+            a.base, 5,
+            "pre-image stays the FIRST checkpoint this session saw"
+        );
         assert_eq!(a.last_turn, 3);
         let b = files.iter().find(|f| f.path == "src/b.rs").unwrap();
-        assert_eq!(b.base, 9, "a newly touched file bases on the turn that touched it");
+        assert_eq!(
+            b.base, 9,
+            "a newly touched file bases on the turn that touched it"
+        );
         assert_eq!(
             files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
             vec!["src/a.rs", "src/b.rs"],
@@ -2070,7 +2101,10 @@ mod tests {
         // An already-tracked path still updates once the ceiling is hit.
         let dropped = merge_touched(&mut files, &[('M', "f0.rs".into())], 2, 3);
         assert_eq!(dropped, 0);
-        assert_eq!(files.iter().find(|f| f.path == "f0.rs").unwrap().last_turn, 3);
+        assert_eq!(
+            files.iter().find(|f| f.path == "f0.rs").unwrap().last_turn,
+            3
+        );
     }
 
     #[test]
@@ -2084,10 +2118,16 @@ mod tests {
         let second = claim_paths(repo, "s-b", &["src/login.ts".to_string()]).unwrap();
         assert_eq!(second.len(), 1, "exactly one warning for the shared file");
         assert!(second[0].contains("src/login.ts"), "{:?}", second);
-        assert!(second[0].contains("s-a"), "the warning names the other session");
+        assert!(
+            second[0].contains("s-a"),
+            "the warning names the other session"
+        );
 
         let again = claim_paths(repo, "s-b", &["src/login.ts".to_string()]).unwrap();
-        assert!(again.is_empty(), "the same overlap is not re-reported every turn");
+        assert!(
+            again.is_empty(),
+            "the same overlap is not re-reported every turn"
+        );
 
         let shared = load_shared(repo);
         assert_eq!(shared.overlaps.len(), 1);
@@ -2214,7 +2254,10 @@ mod tests {
             .into_iter()
             .find(|v| v.manifest.session_id == "s-live")
             .unwrap();
-        assert!(view.ready_to_commit(), "a closed session is ready to commit");
+        assert!(
+            view.ready_to_commit(),
+            "a closed session is ready to commit"
+        );
     }
 
     #[test]
@@ -2233,7 +2276,11 @@ mod tests {
             .copied()
             .filter(|s| s.starts_with("1000"))
             .collect();
-        assert_eq!(ambiguous.len(), 2, "a shared prefix must not silently pick one");
+        assert_eq!(
+            ambiguous.len(),
+            2,
+            "a shared prefix must not silently pick one"
+        );
     }
 
     /// A throwaway git repository with one commit. `None` when git is unavailable, so the suite still
@@ -2248,7 +2295,11 @@ mod tests {
         fs::create_dir_all(&root).ok()?;
         let root = root.canonicalize().ok()?;
         let run = |args: &[&str]| {
-            git_ok(&root, &args.iter().map(|s| s.to_string()).collect::<Vec<_>>()).ok()
+            git_ok(
+                &root,
+                &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+            .ok()
         };
         run(&["init", "--initial-branch=main"])?;
         run(&["config", "user.email", "t@example.invalid"])?;
@@ -2396,7 +2447,10 @@ mod tests {
             ("s-a", "before", "after"),
         )
         .expect("replaying a clean turn");
-        assert_eq!(conflicts, 0, "the two sessions edited well-separated regions");
+        assert_eq!(
+            conflicts, 0,
+            "the two sessions edited well-separated regions"
+        );
         assert_eq!(
             String::from_utf8_lossy(&merged),
             "1\nA-EDITED\n3\n4\n5\n6\n7\n8\nB-target\n10\n",
@@ -2446,7 +2500,10 @@ mod tests {
         .expect("merge-file reports conflicts through its exit status");
         assert!(conflicts > 0, "an overlapping edit must not report success");
         let text = String::from_utf8_lossy(&merged);
-        assert!(text.contains("<<<<<<<"), "conflict markers are present: {text}");
+        assert!(
+            text.contains("<<<<<<<"),
+            "conflict markers are present: {text}"
+        );
         // A SplitFile in this shape is refused by `usable()`, so markers can never be staged.
         let split = SplitFile {
             path: "x.rs".into(),
@@ -2456,7 +2513,10 @@ mod tests {
             replayed: 1,
             unavailable: None,
         };
-        assert!(!split.usable(), "a conflicted reconstruction is never stageable");
+        assert!(
+            !split.usable(),
+            "a conflicted reconstruction is never stageable"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2480,11 +2540,8 @@ mod tests {
         };
         stage_split(&root, &split).expect("staging a reconstructed blob");
 
-        let staged = git_ok(&root, &[
-            "show".into(),
-            ":a.txt".into(),
-        ])
-        .expect("reading the staged version");
+        let staged =
+            git_ok(&root, &["show".into(), ":a.txt".into()]).expect("reading the staged version");
         assert_eq!(
             staged.trim_end(),
             "shared: only A's line",
@@ -2516,8 +2573,11 @@ mod tests {
             unavailable: None,
         };
         stage_split(&root, &split).expect("staging a removal");
-        let staged = git_ok(&root, &["diff".into(), "--cached".into(), "--name-status".into()])
-            .unwrap();
+        let staged = git_ok(
+            &root,
+            &["diff".into(), "--cached".into(), "--name-status".into()],
+        )
+        .unwrap();
         assert!(staged.starts_with('D'), "the deletion is staged: {staged}");
         assert!(
             root.join("a.txt").exists(),

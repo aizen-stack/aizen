@@ -46,6 +46,10 @@ impl Tier {
     }
 
     /// Lenient parse: unknown → `Place` (the default for legacy files).
+    ///
+    /// Entries reach memory through serde, which has its own tier deserializer; this is the
+    /// hand-parse path for a tier read from anywhere else.
+    #[allow(dead_code)]
     pub fn parse(s: &str) -> Tier {
         match s.trim().to_lowercase().as_str() {
             "user" => Tier::User,
@@ -77,6 +81,11 @@ pub struct Lineage {
     pub cwd: String,
     /// Ancestor places that may be relevant (project root, git roots, home).
     /// Ordered from narrowest (closest to cwd) to broadest.
+    ///
+    /// Scope decisions read `cwd` and compare against each entry's own anchor, so the precomputed
+    /// ancestor chain is never consulted. Tests assert on it — it is the visible record of what the
+    /// lineage walk found.
+    #[allow(dead_code)]
     pub places: Vec<String>,
     /// The stable device id (from `crate::core::device::id()`).
     pub device: String,
@@ -254,6 +263,10 @@ pub fn depth(path: &str) -> usize {
 /// would silently change the fact's SCOPE as a side effect of resolving its CONTENT — a fact that
 /// was true for the whole repo would come back true only under `src/agent`, and nothing in the
 /// output would say so.
+///
+/// Only [`super::learning::reconcile::resolve_chain`] needs this, and that rule is not wired into the
+/// reconcile pass yet — so this goes dead with it, and comes back with it.
+#[allow(dead_code)]
 pub fn common_ancestor(a: &str, b: &str) -> Option<String> {
     let a = a.trim_end_matches('/');
     let b = b.trim_end_matches('/');

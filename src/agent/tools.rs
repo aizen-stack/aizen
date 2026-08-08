@@ -251,7 +251,14 @@ fn declared_keys(schema: &Value) -> Vec<String> {
 }
 
 /// The single-key wrapper names models most often wrap a whole argument object in.
-const WRAPPER_KEYS: &[&str] = &["input", "args", "arguments", "parameters", "params", "kwargs"];
+const WRAPPER_KEYS: &[&str] = &[
+    "input",
+    "args",
+    "arguments",
+    "parameters",
+    "params",
+    "kwargs",
+];
 
 /// Repair argument-shape slips that can be inferred WITH CERTAINTY. Returns the corrected arguments
 /// plus a short human description of what changed (for the trace line), or `None` when there is
@@ -306,8 +313,7 @@ pub fn repair_args(schema: &Value, args: &Value) -> Option<(Value, String)> {
         let strays: Vec<String> = obj
             .iter()
             .filter(|(k, v)| {
-                !declared.contains(*k)
-                    && v.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)
+                !declared.contains(*k) && v.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)
             })
             .map(|(k, _)| k.clone())
             .collect();
@@ -407,7 +413,14 @@ mod tests {
 
     #[test]
     fn repair_unwraps_a_wrapped_args_object() {
-        for wrapper in ["input", "args", "arguments", "parameters", "params", "kwargs"] {
+        for wrapper in [
+            "input",
+            "args",
+            "arguments",
+            "parameters",
+            "params",
+            "kwargs",
+        ] {
             let args = json!({wrapper: {"path": "a.rs"}});
             let (fixed, what) = repair_args(&path_schema(), &args)
                 .unwrap_or_else(|| panic!("wrapper '{wrapper}' must unwrap"));
@@ -519,7 +532,10 @@ mod tests {
         assert!(msg.starts_with("error: "), "{msg}");
         assert!(msg.contains("file_glob"), "names the tool: {msg}");
         assert!(msg.contains("pattern (string)"), "states the schema: {msg}");
-        assert!(msg.contains(r#"{"glb":"**/*.rs"}"#), "echoes the args: {msg}");
+        assert!(
+            msg.contains(r#"{"glb":"**/*.rs"}"#),
+            "echoes the args: {msg}"
+        );
     }
 
     /// PINS the tokio behavior `block_for_tool` depends on: `block_in_place` + `Handle::block_on`

@@ -61,6 +61,14 @@ pub struct CliConfig {
     /// one) or set manually. Drives the `% context` HUD. `None` ⇒ HUD uses a name heuristic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_context_window: Option<usize>,
+    /// Named main-endpoint profiles for manual provider failover. The active profile is copied into
+    /// the root `base_url`/`api_key`/`model` fields, so legacy callers keep one resolution path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub providers: Option<Vec<ProviderProfile>>,
+    /// Name of the profile whose values currently occupy the root endpoint fields. `None` means the
+    /// root endpoint was configured directly rather than selected from the registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_provider: Option<String>,
     /// Auto-compact threshold as a percent of the context window (the REPL summarizes older turns
     /// when usage crosses it). `None` ⇒ default 80%. `Some(0)` ⇒ auto-compact disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,11 +237,19 @@ pub struct CliConfig {
     /// Keyed by exact model id. See [`endpoint_for_model`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_endpoints: Option<Vec<ModelEndpoint>>,
+    /// Provider/model assignments for installed specialist cards. This is the normal UI path; card
+    /// endpoint frontmatter remains an advanced legacy fallback for compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_routes: Option<Vec<AgentRoute>>,
 }
 
 /// One role's endpoint override. Any subset of fields; the rest inherit the main endpoint.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RoleModelConfig {
+    /// Saved provider profile to use. Its endpoint and default model are inherited before the legacy
+    /// per-field overrides below are applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -268,6 +284,18 @@ impl RolesConfig {
     }
 }
 
+/// One named main endpoint. Profiles are a manual failover surface: activating one copies this full
+/// tuple into the root config fields used by every existing caller.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderProfile {
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_window: Option<usize>,
+}
+
 /// A fully-resolved (base_url, api_key, model) triple for one call.
 #[derive(Debug, Clone)]
 pub struct ResolvedEndpoint {
@@ -289,6 +317,11 @@ pub fn resolve_role(role: &str, main: &ResolvedEndpoint) -> ResolvedEndpoint {
         "apply" => r.apply.clone(),
         _ => None,
     });
+    let profile = rc
+        .as_ref()
+        .and_then(|r| r.provider.as_deref())
+        .and_then(|name| cfg.provider(name))
+        .cloned();
     let key_from_ref = |r: &RoleModelConfig| {
         r.api_key_ref
             .as_ref()
@@ -300,14 +333,28 @@ pub fn resolve_role(role: &str, main: &ResolvedEndpoint) -> ResolvedEndpoint {
     ResolvedEndpoint {
         model: env_nonempty(&format!("AIZEN_{up}_MODEL"))
             .or_else(|| rc.as_ref().and_then(|r| r.model.clone()))
+            .or_else(|| profile.as_ref().map(|p| p.model.clone()))
             .unwrap_or_else(|| main.model.clone()),
         base_url: env_nonempty(&format!("AIZEN_{up}_BASE_URL"))
             .or_else(|| rc.as_ref().and_then(|r| r.base_url.clone()))
+            .or_else(|| profile.as_ref().map(|p| p.base_url.clone()))
             .unwrap_or_else(|| main.base_url.clone()),
         api_key: env_nonempty(&format!("AIZEN_{up}_API_KEY"))
             .or_else(|| rc.as_ref().and_then(key_from_ref))
+            .or_else(|| profile.as_ref().map(|p| p.api_key.clone()))
             .unwrap_or_else(|| main.api_key.clone()),
     }
+}
+
+/// A specialist's normal provider assignment. `model=None` means use the selected provider's default
+/// model; `provider=None` means inherit the sub-agent default role.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRoute {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// One entry in the model → endpoint registry. `model` is the exact model id a sub-agent/role can
@@ -380,6 +427,25 @@ pub fn subagent_endpoint(main: &ResolvedEndpoint) -> ResolvedEndpoint {
     endpoint_for_model(&role.model, &role)
 }
 
+/// Resolve the local provider/model assignment for one specialist from one config snapshot.
+pub fn resolve_agent_route(cfg: &CliConfig, agent: &str) -> Option<(AgentRoute, ResolvedEndpoint)> {
+    let route = cfg.agent_route(agent)?.clone();
+    let provider = route.provider.as_deref()?;
+    let profile = cfg.provider(provider)?;
+    let endpoint = ResolvedEndpoint {
+        base_url: profile.base_url.clone(),
+        api_key: profile.api_key.clone(),
+        model: route.model.clone().unwrap_or_else(|| profile.model.clone()),
+    };
+    Some((route, endpoint))
+}
+
+/// Resolve the local provider/model assignment for one specialist from persisted config.
+pub fn agent_route(agent: &str) -> Option<(AgentRoute, ResolvedEndpoint)> {
+    let cfg = load();
+    resolve_agent_route(&cfg, agent)
+}
+
 /// Resolve whether editing runs should spend the one-shot self-review turn.
 /// An explicit value always wins; otherwise a configured oracle role opts in because it supplies the
 /// reviewer endpoint. No oracle role keeps the feature off by default.
@@ -420,7 +486,12 @@ pub fn role_configured(role: &str) -> bool {
             "apply" => r.apply.as_ref(),
             _ => None,
         })
-        .is_some_and(|r| r.model.is_some() || r.base_url.is_some() || r.api_key_ref.is_some())
+        .is_some_and(|r| {
+            r.provider.is_some()
+                || r.model.is_some()
+                || r.base_url.is_some()
+                || r.api_key_ref.is_some()
+        })
 }
 
 /// Optional credentials for the reach layer. All channels have a keyless path; a key only upgrades:
@@ -475,7 +546,331 @@ pub fn branded_flag(suffix: &str) -> bool {
     std::env::var_os(format!("AIZEN_{suffix}")).is_some()
 }
 
+impl ProviderProfile {
+    pub fn normalized(name: &str, base_url: &str, api_key: &str, model: &str) -> Result<Self> {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("provider name must not be empty");
+        }
+        if name.chars().any(char::is_whitespace) {
+            anyhow::bail!("provider name must not contain whitespace");
+        }
+        let base_url = base_url.trim().trim_end_matches('/');
+        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+            anyhow::bail!("provider base URL must start with http:// or https://");
+        }
+        let api_key = api_key.trim();
+        if api_key.is_empty() {
+            anyhow::bail!("provider API key must not be empty");
+        }
+        let model = model.trim();
+        if model.is_empty() {
+            anyhow::bail!("provider model must not be empty");
+        }
+        Ok(Self {
+            name: name.to_string(),
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+            model: model.to_string(),
+            model_context_window: None,
+        })
+    }
+
+    pub fn matches_name(&self, name: &str) -> bool {
+        self.name.eq_ignore_ascii_case(name.trim())
+    }
+}
+
 impl CliConfig {
+    /// Find a named main-endpoint profile case-insensitively.
+    pub fn provider(&self, name: &str) -> Option<&ProviderProfile> {
+        self.providers
+            .as_ref()
+            .and_then(|list| list.iter().find(|p| p.matches_name(name)))
+    }
+
+    /// Add or replace a named main-endpoint profile. Names are case-insensitively unique.
+    pub fn upsert_provider(&mut self, profile: ProviderProfile) -> Result<()> {
+        let list = self.providers.get_or_insert_with(Vec::new);
+        if let Some(existing) = list.iter_mut().find(|p| p.matches_name(&profile.name)) {
+            if !existing.name.eq(&profile.name) {
+                anyhow::bail!("provider name already exists: {}", existing.name);
+            }
+            *existing = profile;
+        } else {
+            list.push(profile);
+        }
+        Ok(())
+    }
+
+    /// Activate a profile by copying its complete endpoint tuple into the legacy root fields.
+    pub fn activate_provider(&mut self, name: &str) -> Result<()> {
+        let profile = self
+            .provider(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown provider profile: {name}"))?;
+        self.base_url = Some(profile.base_url);
+        self.api_key = Some(profile.api_key);
+        self.model = Some(profile.model);
+        self.model_context_window = profile.model_context_window;
+        self.active_provider = Some(profile.name);
+        Ok(())
+    }
+
+    /// Remove a profile. The currently active root endpoint remains live when its profile is removed.
+    pub fn remove_provider(&mut self, name: &str) -> Result<ProviderProfile> {
+        let list = self
+            .providers
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("unknown provider profile: {name}"))?;
+        let index = list
+            .iter()
+            .position(|p| p.matches_name(name))
+            .ok_or_else(|| anyhow::anyhow!("unknown provider profile: {name}"))?;
+        let removed = list.remove(index);
+        if self
+            .active_provider
+            .as_deref()
+            .is_some_and(|active| active.eq_ignore_ascii_case(&removed.name))
+        {
+            self.active_provider = None;
+        }
+        if list.is_empty() {
+            self.providers = None;
+        }
+        Ok(removed)
+    }
+
+    /// Keep the active profile's stored values aligned after direct config edits.
+    pub fn sync_active_provider(&mut self) {
+        let Some(active) = self.active_provider.clone() else {
+            return;
+        };
+        let Some(profile) = self
+            .providers
+            .as_mut()
+            .and_then(|list| list.iter_mut().find(|p| p.matches_name(&active)))
+        else {
+            self.active_provider = None;
+            return;
+        };
+        profile.base_url = self.base_url.clone().unwrap_or_default();
+        profile.api_key = self.api_key.clone().unwrap_or_default();
+        profile.model = self.model.clone().unwrap_or_default();
+        profile.model_context_window = self.model_context_window;
+    }
+
+    /// A direct endpoint edit no longer belongs to the selected profile once its URL changes.
+    pub fn detach_provider_if_url_changed(&mut self, previous_url: Option<&str>) {
+        let current = self
+            .base_url
+            .as_deref()
+            .map(|url| url.trim_end_matches('/'));
+        let previous = previous_url.map(|url| url.trim_end_matches('/'));
+        if current != previous {
+            self.active_provider = None;
+        }
+    }
+
+    /// Return the named route for a specialist, case-insensitively by slug.
+    pub fn agent_route(&self, agent: &str) -> Option<&AgentRoute> {
+        self.agent_routes
+            .as_ref()?
+            .iter()
+            .find(|r| r.agent.eq_ignore_ascii_case(agent))
+    }
+
+    /// Upsert a specialist route. The empty route removes the entry.
+    pub fn set_agent_route(
+        &mut self,
+        agent: &str,
+        provider: Option<String>,
+        model: Option<String>,
+    ) -> Result<()> {
+        let agent = agent.trim();
+        if agent.is_empty() {
+            anyhow::bail!("agent route name must not be empty");
+        }
+        if let Some(ref name) = provider {
+            if self.provider(name).is_none() {
+                anyhow::bail!("unknown provider profile: {name}");
+            }
+        }
+        let list = self.agent_routes.get_or_insert_with(Vec::new);
+        list.retain(|r| !r.agent.eq_ignore_ascii_case(agent));
+        if provider.is_some() || model.is_some() {
+            list.push(AgentRoute {
+                agent: agent.to_string(),
+                provider,
+                model,
+            });
+        }
+        if list.is_empty() {
+            self.agent_routes = None;
+        }
+        Ok(())
+    }
+
+    /// Rename a provider and all role/specialist references in one transaction.
+    pub fn rename_provider(&mut self, old: &str, new: &str) -> Result<()> {
+        let new = new.trim();
+        if new.is_empty() || new.chars().any(char::is_whitespace) {
+            anyhow::bail!("provider name must not be empty or contain whitespace");
+        }
+        let old_profile = self
+            .provider(old)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown provider profile: {old}"))?;
+        if !old_profile.matches_name(new) && self.provider(new).is_some() {
+            anyhow::bail!("provider name already exists: {new}");
+        }
+        if let Some(list) = self.providers.as_mut() {
+            if let Some(p) = list.iter_mut().find(|p| p.matches_name(old)) {
+                p.name = new.to_string();
+            }
+        }
+        if self
+            .active_provider
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(old))
+        {
+            self.active_provider = Some(new.to_string());
+        }
+        if let Some(roles) = self.roles.as_mut() {
+            for slot in [
+                &mut roles.summarizer,
+                &mut roles.subagent_default,
+                &mut roles.oracle,
+                &mut roles.apply,
+            ] {
+                if slot
+                    .as_ref()
+                    .and_then(|r| r.provider.as_deref())
+                    .is_some_and(|n| n.eq_ignore_ascii_case(old))
+                {
+                    if let Some(r) = slot.as_mut() {
+                        r.provider = Some(new.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(routes) = self.agent_routes.as_mut() {
+            for route in routes {
+                if route
+                    .provider
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(old))
+                {
+                    route.provider = Some(new.to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Profiles referenced by roles or specialist routes, used to explain safe deletion.
+    pub fn provider_references(&self, name: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(roles) = &self.roles {
+            for (label, slot) in [
+                ("subagent_default", &roles.subagent_default),
+                ("summarizer", &roles.summarizer),
+                ("oracle", &roles.oracle),
+                ("apply", &roles.apply),
+            ] {
+                if slot
+                    .as_ref()
+                    .and_then(|r| r.provider.as_deref())
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                {
+                    out.push(format!("role:{label}"));
+                }
+            }
+        }
+        if let Some(routes) = &self.agent_routes {
+            for route in routes {
+                if route
+                    .provider
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                {
+                    out.push(format!("agent:{}", route.agent));
+                }
+            }
+        }
+        out
+    }
+
+    /// Replace every role/specialist reference to one provider with another saved provider.
+    pub fn replace_provider_references(&mut self, old: &str, new: &str) -> Result<()> {
+        if self.provider(new).is_none() {
+            anyhow::bail!("unknown replacement provider profile: {new}");
+        }
+        if let Some(roles) = self.roles.as_mut() {
+            for slot in [
+                &mut roles.summarizer,
+                &mut roles.subagent_default,
+                &mut roles.oracle,
+                &mut roles.apply,
+            ] {
+                if slot
+                    .as_ref()
+                    .and_then(|r| r.provider.as_deref())
+                    .is_some_and(|n| n.eq_ignore_ascii_case(old))
+                {
+                    if let Some(r) = slot.as_mut() {
+                        r.provider = Some(new.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(routes) = self.agent_routes.as_mut() {
+            for route in routes {
+                if route
+                    .provider
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(old))
+                {
+                    route.provider = Some(new.to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear references to a profile; the active root endpoint remains unchanged.
+    pub fn clear_provider_references(&mut self, name: &str) {
+        if let Some(roles) = self.roles.as_mut() {
+            for slot in [
+                &mut roles.summarizer,
+                &mut roles.subagent_default,
+                &mut roles.oracle,
+                &mut roles.apply,
+            ] {
+                if slot
+                    .as_ref()
+                    .and_then(|r| r.provider.as_deref())
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                {
+                    if let Some(r) = slot.as_mut() {
+                        r.provider = None;
+                    }
+                }
+            }
+        }
+        if let Some(routes) = self.agent_routes.as_mut() {
+            for route in routes {
+                if route
+                    .provider
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                {
+                    route.provider = None;
+                }
+            }
+        }
+    }
+
     /// Resolve the persisted approval level, accepting the pre-unification boolean fields as a
     /// migration fallback. The new enum always wins; if both legacy toggles are true, yolo keeps the
     /// old runtime precedence over smart.
@@ -798,7 +1193,58 @@ mod tests {
     }
 
     #[test]
-    fn role_routing_resolves_with_fallback() {
+    fn provider_references_rename_and_specialist_routes_are_atomic() {
+        let mut cfg = CliConfig::default();
+        cfg.upsert_provider(
+            ProviderProfile::normalized("fast", "https://fast/v1", "fast-key", "fast-model")
+                .unwrap(),
+        )
+        .unwrap();
+        cfg.roles = Some(RolesConfig {
+            subagent_default: Some(RoleModelConfig {
+                provider: Some("fast".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        cfg.set_agent_route("reviewer", Some("fast".into()), Some("review-model".into()))
+            .unwrap();
+        assert_eq!(
+            cfg.provider_references("FAST"),
+            vec!["role:subagent_default", "agent:reviewer"]
+        );
+        let resolved = resolve_agent_route(&cfg, "reviewer").unwrap().1;
+        assert_eq!(
+            (
+                resolved.base_url.as_str(),
+                resolved.api_key.as_str(),
+                resolved.model.as_str()
+            ),
+            ("https://fast/v1", "fast-key", "review-model")
+        );
+        cfg.rename_provider("fast", "backup").unwrap();
+        assert!(cfg.provider("backup").is_some());
+        assert_eq!(
+            cfg.roles
+                .as_ref()
+                .unwrap()
+                .subagent_default
+                .as_ref()
+                .unwrap()
+                .provider
+                .as_deref(),
+            Some("backup")
+        );
+        assert_eq!(
+            cfg.agent_route("reviewer").unwrap().provider.as_deref(),
+            Some("backup")
+        );
+        cfg.clear_provider_references("backup");
+        assert!(cfg.provider_references("backup").is_empty());
+    }
+
+    #[test]
+    fn role_provider_uses_profile_and_model_override() {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -817,10 +1263,18 @@ mod tests {
             ("main-model", "https://main/v1", "mk")
         );
         assert!(!role_configured("oracle"));
-        // Config: model-only summarizer (endpoint inherits) + env-indirected oracle key.
+        // Provider selection supplies the endpoint/default model; a role model overrides only model.
         save(&CliConfig {
+            providers: Some(vec![ProviderProfile::normalized(
+                "cheap-provider",
+                "https://cheap/v1",
+                "cheap-key",
+                "provider-model",
+            )
+            .unwrap()]),
             roles: Some(RolesConfig {
                 summarizer: Some(RoleModelConfig {
+                    provider: Some("cheap-provider".into()),
                     model: Some("cheap".into()),
                     ..Default::default()
                 }),
@@ -835,10 +1289,8 @@ mod tests {
         .unwrap();
         let r = resolve_role("summarizer", &main);
         assert_eq!(r.model, "cheap");
-        assert_eq!(
-            r.base_url, "https://main/v1",
-            "unset fields inherit the main endpoint"
-        );
+        assert_eq!(r.base_url, "https://cheap/v1");
+        assert_eq!(r.api_key, "cheap-key");
         assert!(role_configured("summarizer"));
         assert!(
             role_configured("oracle"),
@@ -971,6 +1423,71 @@ mod tests {
             ..Default::default()
         }
         .has_any());
+    }
+
+    #[test]
+    fn provider_profiles_activate_sync_remove_and_load_legacy_json() {
+        let mut cfg: CliConfig = serde_json::from_str(
+            r#"{"base_url":"https://legacy/v1","api_key":"legacy-key","model":"legacy-model"}"#,
+        )
+        .unwrap();
+        assert!(cfg.providers.is_none());
+        assert!(cfg.active_provider.is_none());
+
+        let mut primary = ProviderProfile::normalized(
+            "primary",
+            "https://primary/v1/",
+            "primary-secret",
+            "model-a",
+        )
+        .unwrap();
+        primary.model_context_window = Some(200_000);
+        cfg.upsert_provider(primary.clone()).unwrap();
+        cfg.upsert_provider(
+            ProviderProfile::normalized("backup", "https://backup/v1", "backup-secret", "model-b")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(cfg.provider("PRIMARY").is_some());
+        assert!(ProviderProfile::normalized("bad name", "https://x/v1", "k", "m").is_err());
+
+        cfg.activate_provider("PRIMARY").unwrap();
+        assert_eq!(cfg.active_provider.as_deref(), Some("primary"));
+        assert_eq!(cfg.base_url.as_deref(), Some("https://primary/v1"));
+        assert_eq!(cfg.api_key.as_deref(), Some("primary-secret"));
+        assert_eq!(cfg.model.as_deref(), Some("model-a"));
+        assert_eq!(cfg.model_context_window, Some(200_000));
+
+        cfg.api_key = Some("rotated-secret".into());
+        cfg.model = Some("model-a2".into());
+        cfg.sync_active_provider();
+        let primary = cfg.provider("primary").unwrap();
+        assert_eq!(primary.api_key, "rotated-secret");
+        assert_eq!(primary.model, "model-a2");
+
+        cfg.remove_provider("primary").unwrap();
+        assert_eq!(cfg.active_provider, None);
+        assert_eq!(cfg.base_url.as_deref(), Some("https://primary/v1"));
+        assert_eq!(cfg.api_key.as_deref(), Some("rotated-secret"));
+    }
+
+    #[test]
+    fn provider_profile_serialization_keeps_key_but_mask_never_reveals_it() {
+        let profile = ProviderProfile::normalized(
+            "backup",
+            "https://backup/v1",
+            "sk-backup-super-secret",
+            "model-b",
+        )
+        .unwrap();
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(
+            json.contains("sk-backup-super-secret"),
+            "profiles persist credentials"
+        );
+        let shown = mask(&profile.api_key);
+        assert!(!shown.contains("super-secret"));
+        assert!(shown.contains("chars"));
     }
 
     #[test]

@@ -314,8 +314,20 @@ enum AgentsCmd {
         #[arg(long)]
         all: bool,
     },
-    /// Pin (or clear) the `model:` a specialist runs on. The model routes through the model→endpoint
-    /// registry at dispatch, so it carries its own base_url/api_key (cross-provider sub-agents).
+    /// Set (or clear) the provider/model assignment for a specialist.
+    #[command(name = "set-provider")]
+    SetProvider {
+        /// Agent name or slug.
+        name: String,
+        /// Saved provider profile name.
+        provider: Option<String>,
+        /// Optional model override; omitted uses the provider default.
+        model: Option<String>,
+        /// Clear the assignment and inherit the sub-agent default.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Pin (or clear) the legacy `model:` field on a specialist card. Prefer set-provider for normal use.
     #[command(name = "set-model")]
     SetModel {
         /// Agent name or slug.
@@ -810,10 +822,60 @@ enum ConfigCmd {
         #[arg(long = "model-endpoint")]
         model_endpoint: Vec<String>,
     },
+    /// Manage named main-endpoint profiles for quick manual failover.
+    Provider {
+        #[command(subcommand)]
+        cmd: ProviderConfigCmd,
+    },
     /// Show the saved config (API key masked).
     Show,
     /// Print the config file path.
     Path,
+}
+
+#[derive(Subcommand, Debug)]
+enum ProviderConfigCmd {
+    /// Add a named endpoint profile. Existing names are rejected.
+    Add {
+        name: String,
+        #[arg(long)]
+        base_url: String,
+        #[arg(long)]
+        api_key: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        context_window: Option<usize>,
+        /// Activate this profile immediately after saving it.
+        #[arg(long = "use")]
+        activate: bool,
+    },
+    /// Edit every field of an existing profile.
+    Edit {
+        name: String,
+        #[arg(long)]
+        base_url: String,
+        #[arg(long)]
+        api_key: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        context_window: Option<usize>,
+    },
+    /// Rename a profile and update role/specialist references.
+    Rename { name: String, new_name: String },
+    /// Activate a saved profile.
+    Use { name: String },
+    /// List saved profiles (keys masked).
+    List,
+    /// Remove a saved profile. Referenced profiles require --replace-with or --force.
+    Remove {
+        name: String,
+        #[arg(long)]
+        replace_with: Option<String>,
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -1880,66 +1942,6 @@ async fn run_reach(cmd: ReachCmd) -> Result<()> {
     Ok(())
 }
 
-// ───────────────────────────── telegram daemon + setup ─────────────────────────────
-
-const SERVE_HELP: &str = "Aizen is listening. Send a message to chat with the agent \
-(read-only tools; destructive ops will ask you to approve here). Follow-ups keep context, so \
-\"now fix it\" works. Prefix with `/agent ` to run fully autonomously (file edits / shell without \
-asking). /new (or /reset) starts a fresh conversation · /resume shows how much context is kept · \
-/help shows this.";
-
-/// Discord has no inline approval routing yet (unlike Telegram's ✓/✗ buttons), so destructive ops
-/// are auto-DENIED on a plain message — the agent simply skips them. This help text says so honestly
-/// instead of promising an approval prompt that never arrives. Use `/agent ` to run autonomously.
-const DISCORD_HELP: &str = "Aizen is listening. Send a message to chat with the agent \
-(read-only tools work as-is). Discord can't show approval prompts yet, so file edits / shell are \
-SKIPPED unless you prefix with `/agent ` to run fully autonomously (no approval needed). \
-Follow-ups keep context, so \"now fix it\" works. /new (or /reset) starts a fresh conversation · \
-/help shows this.";
-
-/// Split text under a platform's UTF-16 limit, preferring newline boundaries so table records and
-/// text-diagram rows stay intact. A single over-limit line falls back to scalar-safe hard splitting.
-fn chunk_text(s: &str, max: usize) -> Vec<String> {
-    if s.encode_utf16().count() <= max {
-        return vec![s.to_string()];
-    }
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut cur_units = 0usize;
-    for segment in s.split_inclusive('\n') {
-        let units = segment.encode_utf16().count();
-        if units <= max {
-            if cur_units + units > max && !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-                cur_units = 0;
-            }
-            cur.push_str(segment);
-            cur_units += units;
-            continue;
-        }
-        if !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
-        }
-        let mut piece = String::new();
-        let mut piece_units = 0usize;
-        for ch in segment.chars() {
-            let u = ch.len_utf16();
-            if piece_units + u > max && !piece.is_empty() {
-                out.push(std::mem::take(&mut piece));
-                piece_units = 0;
-            }
-            piece.push(ch);
-            piece_units += u;
-        }
-        cur = piece;
-        cur_units = piece_units;
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
 /// Run the agent loop once (non-streaming, quiet) and return its final text — used by `aizen serve`
 /// to answer a Telegram message.
 async fn run_agent_capture(
@@ -1996,243 +1998,6 @@ async fn run_agent_capture(
         .final_text
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "(the agent produced no answer)".to_string()))
-}
-
-/// Hard cap on messages retained in one serve (Telegram) session, so a long conversation can't grow
-/// without bound. Generous — the mid-loop context guard handles within-turn pressure.
-const SERVE_SESSION_MAX_MSGS: usize = 40;
-
-/// Bound a serve session's history: drop the OLDEST whole turns (keeping the system prompt at [0])
-/// until under `max`, always cutting at a `user` boundary so an assistant tool-call turn is never
-/// split from its tool results (a dangling tool_call ⇒ a 400 on strict gateways).
-fn cap_session(history: &mut Vec<Message>, max: usize) {
-    let lead = agent::compact::leading_system_count(history).max(1);
-    while history.len() > max {
-        // index of the SECOND user message (the start of the 2nd turn); drop after the system prefix.
-        let second_user = history
-            .iter()
-            .enumerate()
-            .filter(|(i, m)| *i >= lead && m.role == "user")
-            .nth(1)
-            .map(|(i, _)| i);
-        match second_user {
-            Some(i) if i > lead => {
-                history.drain(lead..i);
-            }
-            _ => break, // only one turn present → nothing safe to drop; the loop guard handles it
-        }
-    }
-}
-
-/// Run one `aizen serve` turn over a PERSISTENT per-chat history, so follow-ups like "now fix it" keep
-/// context. Seeds the system prompt (with memory + SOUL + persona) once per session, appends the
-/// user task, drives the loop, learns passively, and bounds the history. A `clarify` yield leaves a
-/// resumable history (the owner's next message is the answer).
-async fn run_serve_turn(
-    http: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-    history: &mut Vec<Message>,
-    task: &str,
-    approval_mode: ApprovalMode,
-) -> Result<String> {
-    if history.is_empty() {
-        // Built once per session → the stable lane stays byte-stable across the conversation.
-        let bundle = refreshed_system_prompt_bundle(model);
-        history.push(Message::system(bundle.stable));
-        if !bundle.dynamic.trim().is_empty() {
-            history.push(Message::system(bundle.dynamic));
-        }
-    }
-    history.push(Message::user(task.to_string()));
-
-    arm_lsp_session();
-    let registry = agent::builtin::default_registry_with_task(
-        http.clone(),
-        base_url.to_string(),
-        api_key.to_string(),
-        model.to_string(),
-        approval_mode,
-        resolve_ctx_window(model).0,
-        None, // cwd IS the project on the CLI path
-    )?;
-    let cfg = AgentConfig {
-        approval_mode,
-        quiet: true,
-        enable_verify_gate: false,
-        context_window: resolve_ctx_window(model).0,
-        enable_lsp: crate::agent::lsp::LSP.is_enabled(),
-        ..Default::default()
-    };
-    let http_ref = http;
-    let base = base_url;
-    let key = api_key;
-    let model_ref = model;
-    let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
-        client::chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
-    };
-    // Mid-loop auto-compaction for long serve sessions: a NON-streaming summarize closure over the
-    // same endpoint. `cap_session` below stays only as a hard backstop (compaction usually keeps the
-    // history well under its cap).
-    let sum_ep = summarizer_endpoint(base, key, model_ref);
-    let summarize = move |msgs: Vec<Message>| {
-        let ep = sum_ep.clone();
-        async move {
-            chore_chat(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
-                .await
-                .map(|t| t.content.unwrap_or_default())
-        }
-    };
-    let outcome =
-        agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, history).await?;
-
-    // The bot path keeps the FREE regex learning and does NOT run the end-of-turn secretary. Two
-    // reasons, both worth stating rather than leaving as an accident of the refactor:
-    //   - a bot has no cwd, so `place` anchoring is meaningless here; it reads `user`/`device` facts
-    //     through the frozen core, which is machine-stable after phase 1.
-    //   - the secretary is a model call per gated turn. On a chat bot that is a standing cost the
-    //     operator should opt into, not inherit.
-    // Because no REPL loop calls this any more, the two write paths can no longer both fire on one
-    // turn — which was the reason to worry about having both.
-    maybe_learn_memory(history);
-    cap_session(history, SERVE_SESSION_MAX_MSGS);
-
-    if let StopReason::AwaitingInput(q) = &outcome.stop {
-        return Ok(format!("❓ {q}"));
-    }
-    Ok(outcome
-        .final_text
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "(the agent produced no answer)".to_string()))
-}
-
-/// `aizen serve` — the long-lived daemon: one poll loop owns getUpdates, an agent runner handles one
-/// message at a time, and destructive-op approvals route to the phone (via the approval gate).
-async fn run_serve() -> Result<()> {
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
-
-    let (client, cfg) = telegram::configured()
-        .context("telegram not configured — run `aizen telegram setup` first")?;
-    let (base_url, api_key, model) = resolve_endpoint(None, None, None)
-        .context("configure the model endpoint first (run `aizen config`)")?;
-    let http = http_client()?;
-
-    telegram::set_daemon_active(true);
-    let client = Arc::new(client);
-    eprintln!(
-        "{}",
-        style(format!(
-            "aizen serve — listening on Telegram (Ctrl-C to stop). chats: {:?}",
-            cfg.allowed_chat_ids
-        ))
-        .dim()
-    );
-
-    let (tx, mut rx) = mpsc::channel::<(i64, String)>(64);
-
-    let poll_client = client.clone();
-    let poll_cfg = cfg.clone();
-    let poll = tokio::spawn(async move {
-        let mut offset = 0i64;
-        loop {
-            let updates = match poll_client
-                .get_updates(offset, telegram::POLL_TIMEOUT_SECS)
-                .await
-            {
-                Ok(u) => u,
-                Err(e) => {
-                    eprintln!("[poll] {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    continue;
-                }
-            };
-            for u in updates {
-                offset = offset.max(u.update_id + 1);
-                if let Some(cb) = u.callback_query {
-                    let chat = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(cb.from.id);
-                    if telegram::is_allowed(&poll_cfg, chat) {
-                        if let Some((id, ok)) =
-                            cb.data.as_deref().and_then(telegram::parse_callback)
-                        {
-                            telegram::resolve_approval(&id, ok);
-                        }
-                    }
-                    let _ = poll_client.answer_callback(&cb.id, "").await;
-                    continue;
-                }
-                if let Some(msg) = u.message {
-                    if telegram::is_allowed(&poll_cfg, msg.chat.id) {
-                        if let Some(text) = msg.text {
-                            let _ = tx.send((msg.chat.id, text)).await;
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    // Per-chat conversation history → follow-ups ("now fix it") keep context. In-memory only
-    // (a daemon restart starts fresh); `/new`/`/reset` clear a chat, `/resume` reports its size.
-    let mut sessions: std::collections::HashMap<i64, Vec<Message>> =
-        std::collections::HashMap::new();
-
-    loop {
-        let (chat, text) = tokio::select! {
-            biased;
-            _ = tokio::signal::ctrl_c() => { eprintln!("\nshutting down…"); crate::agent::process::kill_all(); break; }
-            m = rx.recv() => match m { Some(m) => m, None => break },
-        };
-        let trimmed = text.trim();
-        if trimmed == "/help" || trimmed == "/start" {
-            let _ = client.send_message(chat, SERVE_HELP).await;
-            continue;
-        }
-        if trimmed == "/new" || trimmed == "/reset" {
-            sessions.remove(&chat);
-            let _ = client
-                .send_message(
-                    chat,
-                    "🆕 started a fresh conversation — earlier context dropped.",
-                )
-                .await;
-            continue;
-        }
-        if trimmed == "/resume" {
-            let turns = sessions
-                .get(&chat)
-                .map(|h| h.iter().filter(|m| m.role == "user").count())
-                .unwrap_or(0);
-            let msg = if turns == 0 {
-                "🧵 no active conversation — just send a message to start one.".to_string()
-            } else {
-                format!("🧵 continuing — {turns} message(s) of context kept. /new to start over.")
-            };
-            let _ = client.send_message(chat, &msg).await;
-            continue;
-        }
-        let (task, approval) = match trimmed.strip_prefix("/agent ") {
-            Some(rest) => (rest.trim().to_string(), ApprovalMode::Yolo),
-            None => (trimmed.to_string(), approval_mode()),
-        };
-        if task.is_empty() {
-            continue;
-        }
-        let _ = client.send_message(chat, "⏳ working…").await;
-        let history = sessions.entry(chat).or_default();
-        let reply = run_serve_turn(&http, &base_url, &api_key, &model, history, &task, approval)
-            .await
-            .unwrap_or_else(|e| format!("error: {e}"));
-        let shown = crate::ui::markdown::render_plain_blocks(&reply);
-        for piece in chunk_text(&shown, 3500) {
-            let _ = client.send_message(chat, &piece).await;
-        }
-    }
-
-    telegram::set_daemon_active(false);
-    poll.abort();
-    Ok(())
 }
 
 // ───────────────────────── project identity (where + zones) ─────────────────────────
@@ -3354,79 +3119,6 @@ async fn discord_setup() -> Result<()> {
         "\n{}",
         style("Saved. Start the bot with:  aizen discord serve").color256(splash::ACCENT)
     );
-    Ok(())
-}
-
-/// `aizen discord serve` — the Discord bot daemon. A gateway task receives messages (heartbeating
-/// independently); this loop runs the agent one message at a time (per-channel history) and replies
-/// over REST. Mirrors `run_serve` (Telegram). NOTE: destructive-op approvals are not yet routed to
-/// Discord, so edits need `/yolo`/smart approval; read/research work as-is.
-async fn run_discord_serve() -> Result<()> {
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
-
-    let (client, cfg) =
-        discord::configured().context("Discord bot not configured — run `aizen discord setup`")?;
-    let (base_url, api_key, model) = resolve_endpoint(None, None, None)
-        .context("configure the model endpoint first (run `aizen config`)")?;
-    let http = http_client()?;
-    let token = cfg.resolved_token().context("no bot token")?;
-    let client = Arc::new(client);
-    eprintln!(
-        "{}",
-        style(format!(
-            "aizen serve — listening on Discord (Ctrl-C to stop). channels: {:?}",
-            cfg.allowed_channel_ids
-        ))
-        .dim()
-    );
-
-    let (tx, mut rx) = mpsc::channel::<discord::Incoming>(64);
-    let gw_cfg = cfg.clone();
-    let gw = tokio::spawn(async move { discord::run_gateway(token, gw_cfg, tx).await });
-
-    // Per-channel conversation history → follow-ups keep context (in-memory; /new resets).
-    let mut sessions: std::collections::HashMap<u64, Vec<Message>> =
-        std::collections::HashMap::new();
-    loop {
-        let inc = tokio::select! {
-            biased;
-            _ = tokio::signal::ctrl_c() => { eprintln!("\nshutting down…"); crate::agent::process::kill_all(); break; }
-            m = rx.recv() => match m { Some(m) => m, None => break },
-        };
-        let trimmed = inc.content.trim();
-        if trimmed == "/help" || trimmed == "/start" {
-            let _ = client.send_message(inc.channel_id, DISCORD_HELP).await;
-            continue;
-        }
-        if trimmed == "/new" || trimmed == "/reset" {
-            sessions.remove(&inc.channel_id);
-            let _ = client
-                .send_message(
-                    inc.channel_id,
-                    "🆕 started a fresh conversation — earlier context dropped.",
-                )
-                .await;
-            continue;
-        }
-        let (task, approval) = match trimmed.strip_prefix("/agent ") {
-            Some(rest) => (rest.trim().to_string(), ApprovalMode::Yolo),
-            None => (trimmed.to_string(), approval_mode()),
-        };
-        if task.is_empty() {
-            continue;
-        }
-        let _ = client.send_message(inc.channel_id, "⏳ working…").await;
-        let history = sessions.entry(inc.channel_id).or_default();
-        let reply = run_serve_turn(&http, &base_url, &api_key, &model, history, &task, approval)
-            .await
-            .unwrap_or_else(|e| format!("error: {e}"));
-        let shown = crate::ui::markdown::render_plain_blocks(&reply);
-        for piece in chunk_text(&shown, discord::MESSAGE_MAX) {
-            let _ = client.send_message(inc.channel_id, &piece).await;
-        }
-    }
-    gw.abort();
     Ok(())
 }
 
@@ -7137,11 +6829,6 @@ fn hostbot_prompt_bundle(
     })
 }
 
-/// Flattened active prompt for callers that still expect a single string.
-fn current_system_prompt(model: &str) -> String {
-    active_system_prompt_bundle(model).flatten()
-}
-
 /// Seed both system lanes for a brand-new conversation.
 fn seed_prompt_lanes(history: &mut Vec<Message>, model: &str) {
     history.clear();
@@ -8394,7 +8081,8 @@ Commands:
   /init [--force|--status]  index the codebase into a semantic chunk index (SHA-256 incremental, secrets redacted); powers codebase_search + auto per-turn retrieval. --force rebuilds, --status shows state, Esc cancels
   /where             show THIS project's identity: root · zone slug · git executable · where memory/skills/sessions live (also `aizen where`, `aizen zone migrate`)
   /model             list the provider's models (with context windows) + pick one
-  /config            set endpoint + key + model (wizard)
+  /provider [name]   one-pick switch; `add` creates and `manage` edits/renames/deletes providers
+  /config            set endpoint + key + model and manage provider profiles
   /memory [query]    show your profile, or search memory; /memory remember <fact> to save
   /persona           pick the character the agent role-plays (list · select · new · clear · delete)
   /skills            saved procedures the agent can load (list · view · new · delete)
@@ -8408,7 +8096,7 @@ Commands:
   /import            resume a conversation started in another CLI (Claude Code or Codex) — pick from transcripts whose cwd matches this project
   /where             which project/zone you're in, and which file this conversation is saved to
   /workflows         multi-agent status — live task/workflow children, sub-agent slots (also /wf)
-  /agents            specialist sub-agents you can delegate to — list · set-model <name> <model> (routes model→endpoint)
+  /agents            specialist sub-agents — list · set-provider <agent> <provider> [model]
   /recover           a session interrupted by a crash/kill — restore its transcript + unsent draft, or /recover discard
   /timemachine       browse every checkpoint (▸ = current) and pick one to jump back to that code + chat; also /timeline · /tm · /undo · /redo
   /diff              what changed in the working tree since a checkpoint (read before you /undo)
@@ -8642,14 +8330,37 @@ fn fmt_time_ago(built_unix: u64) -> String {
     }
 }
 
-/// `/agents` — list installed specialists with their model pin; `/agents set-model <name> <model>`
-/// pins (or, with no model / `clear`, clears) the model a specialist runs on. The pin routes through
-/// the model→endpoint registry at dispatch, so it carries its own gateway (cross-provider).
+/// `/agents` — list installed specialists with their effective provider/model assignment. The normal
+/// write path is `/agents set-provider`; legacy card `set-model` remains available for compatibility.
 fn slash_agents(arg: &str) {
     let mut parts = arg.splitn(2, char::is_whitespace);
     let sub = parts.next().unwrap_or("").trim();
     let rest = parts.next().unwrap_or("").trim();
     match sub {
+        "set-provider" | "provider" => {
+            let mut rp = rest.split_whitespace();
+            let name = rp.next().unwrap_or("");
+            let provider = rp.next().unwrap_or("");
+            let model = rp.next();
+            if name.is_empty() || provider.is_empty() {
+                tui::emit_line(&style("usage: /agents set-provider <agent> <provider> [model]   ·   clear: /agents set-provider <agent> clear").dim().to_string());
+                return;
+            }
+            let mut cfg = cli_config::load();
+            let result = if provider.eq_ignore_ascii_case("clear") || provider == "-" {
+                cfg.set_agent_route(name, None, None)
+            } else {
+                cfg.set_agent_route(name, Some(provider.to_string()), model.map(str::to_string))
+            };
+            match result.and_then(|_| cli_config::save(&cfg)) {
+                Ok(()) => tui::emit_line(
+                    &style(format!("updated provider assignment for '{name}'"))
+                        .color256(theme::OK)
+                        .to_string(),
+                ),
+                Err(e) => tui::emit_line(&format!("{} {e:#}", style("agents:").red())),
+            }
+        }
         "set-model" | "model" => {
             let mut rp = rest.splitn(2, char::is_whitespace);
             let name = rp.next().unwrap_or("").trim();
@@ -8679,18 +8390,29 @@ fn slash_agents(arg: &str) {
             }
             let enabled = agents::enabled_set();
             let mut out = String::from("specialist agents (● pinned to <agents> index / ○ not):\n");
+            let cfg = cli_config::load();
             for def in &all {
                 let slug = def.slug();
                 let pin = enabled.as_ref().map(|s| s.contains(&slug)).unwrap_or(true);
                 let mark = if pin { "●" } else { "○" };
-                let model = def.model.as_deref().unwrap_or("(parent model)");
-                out.push_str(&format!("  {mark} {:<24} model: {model}\n", slug));
+                let route = cfg.agent_route(&slug);
+                let provider = route
+                    .and_then(|r| r.provider.as_deref())
+                    .unwrap_or("inherit");
+                let model = route
+                    .and_then(|r| r.model.as_deref())
+                    .or(def.model.as_deref())
+                    .unwrap_or("default");
+                out.push_str(&format!(
+                    "  {mark} {:<24} provider: {provider} · model: {model}\n",
+                    slug
+                ));
             }
-            out.push_str("\nset a model:  /agents set-model <name> <model>   ·   clear:  /agents set-model <name> clear");
+            out.push_str("\nset a provider: /agents set-provider <agent> <provider> [model]   ·   clear: ... <agent> clear");
             tui::emit_line(&out.trim_end().to_string());
         }
         other => {
-            tui::emit_line(&style(format!("unknown /agents subcommand '{other}' — try /agents or /agents set-model <name> <model>")).dim().to_string());
+            tui::emit_line(&style(format!("unknown /agents subcommand '{other}' — try /agents or /agents set-provider <agent> <provider> [model]")).dim().to_string());
         }
     }
 }
@@ -9673,6 +9395,51 @@ async fn handle_slash(
                 other => tui::emit_line(
                     &style(format!("usage: /effort [auto|off|low|medium|high|xhigh|max|none]  (unknown '{other}')")).dim().to_string(),
                 ),
+            }
+        }
+        "provider" | "providers" => {
+            let selected = if arg.eq_ignore_ascii_case("add") || arg.eq_ignore_ascii_case("manage") {
+                let mut cfg = cli_config::load();
+                config_edit_providers(&mut cfg).await.and_then(|_| {
+                    cli_config::save(&cfg)?;
+                    Ok(None)
+                })
+            } else if arg.is_empty() {
+                provider_menu().await
+            } else {
+                activate_provider_profile(arg).map(Some)
+            };
+            match selected {
+                Ok(Some(profile)) => {
+                    *model_label = profile.model.clone();
+                    refresh_prompt_lanes_in_place(history, model_label);
+                    tui::emit_line(
+                        &style(format!(
+                            "provider → {} · {} · {}",
+                            profile.name,
+                            profile.model,
+                            redact_url_userinfo(&profile.base_url)
+                        ))
+                        .color256(splash::ACCENT)
+                        .to_string(),
+                    );
+                    let overridden: Vec<&str> = ["BASE_URL", "API_KEY", "MODEL"]
+                        .into_iter()
+                        .filter(|name| cli_config::branded_env(name).is_some())
+                        .collect();
+                    if !overridden.is_empty() {
+                        tui::emit_line(
+                            &style(format!(
+                                "note: AIZEN_{} override the selected profile at runtime",
+                                overridden.join(" / AIZEN_")
+                            ))
+                            .color256(theme::WARN)
+                            .to_string(),
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tui::note_line(&format!("{} {e}", style("provider:").red())),
             }
         }
         "model" | "models" => {
@@ -11085,6 +10852,49 @@ fn sniff_cli(bytes: &[u8]) -> features::foreign_session::Cli {
     features::foreign_session::Cli::Claude
 }
 
+/// Switch to one saved provider profile. Root endpoint fields are updated atomically, so the next
+/// turn, aside question, and health probe all see the same provider without restarting the REPL.
+fn activate_provider_profile(name: &str) -> Result<cli_config::ProviderProfile> {
+    let mut cfg = cli_config::load();
+    cfg.activate_provider(name)?;
+    let profile = cfg
+        .provider(name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("unknown provider profile: {name}"))?;
+    cli_config::save(&cfg)?;
+    tui::set_health(tui::HealthKind::Unknown);
+    spawn_health_probe_once();
+    Ok(profile)
+}
+
+async fn provider_menu() -> Result<Option<cli_config::ProviderProfile>> {
+    let mut cfg = cli_config::load();
+    let list = cfg.providers.clone().unwrap_or_default();
+    let mut items: Vec<String> = list.iter().map(|p| provider_row(&cfg, p)).collect();
+    items.push("＋ Add provider".to_string());
+    items.push("✎ Manage providers".to_string());
+    let default = cfg
+        .active_provider
+        .as_deref()
+        .and_then(|name| list.iter().position(|p| p.matches_name(name)))
+        .unwrap_or(0)
+        .min(items.len().saturating_sub(1));
+    let pick = Select::with_theme(&ui_theme())
+        .with_prompt("Provider — choose to switch (Esc keeps current)")
+        .items(&items)
+        .default(default)
+        .interact_opt()?;
+    match pick {
+        Some(i) if i < list.len() => activate_provider_profile(&list[i].name).map(Some),
+        Some(_) => {
+            config_edit_providers(&mut cfg).await?;
+            cli_config::save(&cfg)?;
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
 /// `/model` — fetch the provider's models, pick one (arrow-key), persist it. Also captures the
 /// context window when the provider reports it (→ a real `% context` HUD; else a name heuristic).
 async fn slash_model(model_label: &mut String) -> Result<()> {
@@ -11336,6 +11146,24 @@ fn spawn_reconcile_pass() {
                 .to_string(),
             );
         }
+    });
+}
+
+/// Probe the newly selected provider immediately instead of waiting for the next 60-second poll tick.
+fn spawn_health_probe_once() {
+    tokio::spawn(async move {
+        let kind = match (health_http_client(), resolve_base_key(None, None)) {
+            (Ok(http), Ok((base, key))) => {
+                let t0 = std::time::Instant::now();
+                classify_health_probe(
+                    client::probe_models(&http, &base, &key)
+                        .await
+                        .map(|_| t0.elapsed()),
+                )
+            }
+            _ => tui::HealthKind::Down,
+        };
+        tui::set_health(kind);
     });
 }
 
@@ -11647,6 +11475,8 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                 anyhow::bail!("nothing to set — pass at least one supported --flag (including --timemachine-keep / --timemachine-max-files / --timemachine-max-bytes / --timemachine-max-file-bytes)");
             }
             let mut cfg = cli_config::load();
+            let previous_url = cfg.base_url.clone();
+            let base_url_was_set = base_url.is_some();
             if let Some(v) = base_url {
                 cfg.base_url = Some(v.trim().trim_end_matches('/').to_string());
             }
@@ -11755,6 +11585,10 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             for spec in model_endpoint {
                 apply_model_endpoint(&mut cfg, &spec)?;
             }
+            if base_url_was_set {
+                cfg.detach_provider_if_url_changed(previous_url.as_deref());
+            }
+            cfg.sync_active_provider();
             cli_config::save(&cfg)?;
             println!(
                 "{} {}",
@@ -11764,6 +11598,7 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             print_config(&cfg);
             Ok(())
         }
+        ConfigCmd::Provider { cmd } => run_provider_config(cmd),
         ConfigCmd::Show => {
             print_config(&cli_config::load());
             Ok(())
@@ -11772,6 +11607,172 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             println!("{}", cli_config::config_path().display());
             Ok(())
         }
+    }
+}
+
+fn provider_row(cfg: &cli_config::CliConfig, p: &cli_config::ProviderProfile) -> String {
+    let active = cfg
+        .active_provider
+        .as_deref()
+        .is_some_and(|name| name.eq_ignore_ascii_case(&p.name));
+    format!(
+        "{} {:<16} · {} · {} · key {}",
+        if active { "●" } else { "○" },
+        p.name,
+        p.model,
+        redact_url_userinfo(&p.base_url),
+        cli_config::mask(&p.api_key)
+    )
+}
+
+/// Manage named main endpoint profiles from the CLI.
+fn run_provider_config(cmd: ProviderConfigCmd) -> Result<()> {
+    let mut cfg = cli_config::load();
+    match cmd {
+        ProviderConfigCmd::Add {
+            name,
+            base_url,
+            api_key,
+            model,
+            context_window,
+            activate,
+        } => {
+            if cfg.provider(&name).is_some() {
+                anyhow::bail!("provider profile already exists: {name}");
+            }
+            let mut profile =
+                cli_config::ProviderProfile::normalized(&name, &base_url, &api_key, &model)?;
+            profile.model_context_window = context_window.filter(|n| *n > 0);
+            cfg.upsert_provider(profile.clone())?;
+            if activate {
+                cfg.activate_provider(&profile.name)?;
+            }
+            cli_config::save(&cfg)?;
+            println!(
+                "{} provider '{}' saved{}",
+                crate::ui::theme::ok("✓"),
+                profile.name,
+                if activate { " and active" } else { "" }
+            );
+        }
+        ProviderConfigCmd::Edit {
+            name,
+            base_url,
+            api_key,
+            model,
+            context_window,
+        } => {
+            let canonical = cfg
+                .provider(&name)
+                .map(|p| p.name.clone())
+                .ok_or_else(|| anyhow::anyhow!("unknown provider profile: {name}"))?;
+            let active = cfg
+                .active_provider
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(&canonical));
+            let mut profile =
+                cli_config::ProviderProfile::normalized(&canonical, &base_url, &api_key, &model)?;
+            profile.model_context_window = context_window.filter(|n| *n > 0);
+            cfg.upsert_provider(profile.clone())?;
+            if active {
+                cfg.activate_provider(&canonical)?;
+            }
+            cli_config::save(&cfg)?;
+            println!(
+                "{} provider '{}' updated",
+                crate::ui::theme::ok("✓"),
+                canonical
+            );
+        }
+        ProviderConfigCmd::Rename { name, new_name } => {
+            cfg.rename_provider(&name, &new_name)?;
+            cli_config::save(&cfg)?;
+            println!(
+                "{} provider '{}' renamed to '{}'",
+                crate::ui::theme::ok("✓"),
+                name,
+                new_name
+            );
+        }
+        ProviderConfigCmd::Use { name } => {
+            cfg.activate_provider(&name)?;
+            let active = cfg.active_provider.clone().unwrap_or(name);
+            cli_config::save(&cfg)?;
+            println!("{} provider '{}' active", crate::ui::theme::ok("✓"), active);
+            print_provider_env_override_note();
+        }
+        ProviderConfigCmd::List => {
+            let Some(list) = cfg.providers.as_ref() else {
+                println!("no provider profiles — add one with `aizen config provider add`");
+                return Ok(());
+            };
+            for p in list {
+                println!("{}", provider_row(&cfg, p));
+            }
+        }
+        ProviderConfigCmd::Remove {
+            name,
+            replace_with,
+            force,
+        } => {
+            let refs = cfg.provider_references(&name);
+            if !refs.is_empty() {
+                if let Some(replacement) = replace_with.as_deref() {
+                    if cfg.provider(replacement).is_none() {
+                        anyhow::bail!("unknown replacement provider profile: {replacement}");
+                    }
+                    cfg.replace_provider_references(&name, replacement)?;
+                } else if force {
+                    cfg.clear_provider_references(&name);
+                } else {
+                    anyhow::bail!(
+                        "provider '{}' is used by {} — pass --replace-with <provider> or --force to clear those assignments",
+                        name,
+                        refs.join(", ")
+                    );
+                }
+            }
+            let was_active = cfg
+                .active_provider
+                .as_deref()
+                .is_some_and(|active| active.eq_ignore_ascii_case(&name));
+            let removed = cfg.remove_provider(&name)?;
+            cli_config::save(&cfg)?;
+            println!(
+                "{} provider '{}' removed{}",
+                crate::ui::theme::ok("✓"),
+                removed.name,
+                if was_active {
+                    " (current endpoint kept)"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_provider_env_override_note() {
+    let vars = [
+        ("AIZEN_BASE_URL", "endpoint"),
+        ("AIZEN_API_KEY", "API key"),
+        ("AIZEN_MODEL", "model"),
+    ];
+    let overridden: Vec<&str> = vars
+        .iter()
+        .filter_map(|(var, label)| {
+            std::env::var(var)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(|_| *label)
+        })
+        .collect();
+    if !overridden.is_empty() {
+        println!(
+            "  note: environment variables override the saved provider's {}",
+            overridden.join(", ")
+        );
     }
 }
 
@@ -11848,6 +11849,27 @@ fn print_config(cfg: &cli_config::CliConfig) {
             Some(k) => format!("{}  {}", cli_config::mask(k), theme::ok("✓")),
             None => format!("{}  {}", unset(), theme::warn("required")),
         },
+    );
+    row(
+        "provider",
+        cfg.active_provider
+            .as_deref()
+            .map(|name| theme::accent(name).to_string())
+            .unwrap_or_else(|| theme::faint("direct endpoint").to_string()),
+    );
+    row(
+        "profiles",
+        cfg.providers
+            .as_ref()
+            .map(|list| {
+                let names = list
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{} · {}", list.len(), theme::faint(names))
+            })
+            .unwrap_or_else(|| "0 · save the current connection as a provider".to_string()),
     );
     match cfg.model.as_deref() {
         Some(m) => {
@@ -12073,6 +12095,9 @@ fn role_row_value(rc: Option<&cli_config::RoleModelConfig>) -> String {
         );
     };
     let mut parts: Vec<String> = Vec::new();
+    if let Some(provider) = rc.provider.as_deref().filter(|s| !s.trim().is_empty()) {
+        parts.push(theme::accent(format!("provider:{provider}")).to_string());
+    }
     if let Some(m) = rc.model.as_deref().filter(|s| !s.trim().is_empty()) {
         parts.push(theme::accent(m).to_string());
     }
@@ -12131,24 +12156,38 @@ fn print_roles_section(cfg: &cli_config::CliConfig) {
         "apply",
         role_row_value(roles.and_then(|r| r.apply.as_ref())),
     );
+    match cfg.agent_routes.as_deref().filter(|l| !l.is_empty()) {
+        Some(routes) => row(
+            "specialists",
+            theme::accent(format!("{} provider assignment(s)", routes.len())).to_string(),
+        ),
+        None => row(
+            "specialists",
+            format!(
+                "{}  {}",
+                theme::faint("— inherit").italic(),
+                theme::faint("· use subagent default")
+            ),
+        ),
+    }
     match cfg.model_endpoints.as_deref().filter(|l| !l.is_empty()) {
         Some(list) => {
             let names: Vec<&str> = list.iter().map(|e| e.model.as_str()).collect();
             row(
-                "registry",
+                "advanced",
                 format!(
                     "{}  {}",
-                    theme::accent(format!("{} model(s) mapped", list.len())),
+                    theme::warn(format!("{} model endpoint override(s)", list.len())),
                     theme::faint(format!("· {}", names.join(", ")))
                 ),
             );
         }
         None => row(
-            "registry",
+            "advanced",
             format!(
                 "{}  {}",
-                theme::faint("— empty").italic(),
-                theme::faint("· pinned models use the caller's gateway")
+                theme::faint("— none").italic(),
+                theme::faint("· provider routing is unmasked")
             ),
         ),
     }
@@ -12556,11 +12595,6 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
     let theme = ui_theme();
     loop {
         // Glanceable current-value hints, one per row.
-        let key_h = if cfg.api_key.is_some() {
-            "set"
-        } else {
-            "missing"
-        };
         let model_h = cfg.model.clone().unwrap_or_else(|| "not set".into());
         let tavily_h = if cfg
             .reach
@@ -12590,8 +12624,17 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
         let visuals_h = cfg.response_visuals().to_string();
 
         let items = vec![
-            format!("Connection      · api key {key_h}"),
-            format!("Model & context · {model_h}"),
+            format!(
+                "Providers & connection · {} · {}",
+                cfg.active_provider
+                    .as_deref()
+                    .unwrap_or("unsaved connection"),
+                model_h
+            ),
+            format!(
+                "Main model & context · {}",
+                cfg.model.as_deref().unwrap_or("not set")
+            ),
             format!("Sub-agents      · {}", subagent_hint(&cfg)),
             format!("Web search      · tavily {tavily_h}"),
             format!("Memory          · {}", memory_hint(&cfg)),
@@ -12613,7 +12656,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
         };
         // Sections 0..=8 edit + save; 9 shows the panel; 10 (or Esc) exits.
         let edited = match pick {
-            0 => config_edit_connection(&mut cfg).await,
+            0 => config_edit_providers(&mut cfg).await,
             1 => config_edit_model(&mut cfg).await,
             2 => config_edit_subagents(&mut cfg).await,
             3 => config_edit_websearch(&mut cfg).await,
@@ -12646,9 +12689,11 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
 /// Section editor: provider → base URL → API key, each step verified against the live endpoint
 /// before it is accepted. Nothing is written to `cfg` until a step actually passes, so a failed
 /// attempt leaves the previous working connection intact.
+#[allow(dead_code)]
 async fn config_edit_connection(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let theme = ui_theme();
     let http = http_client()?;
+    let previous_base = cfg.base_url.clone();
 
     let preset = prompt_provider(&theme, cfg.base_url.as_deref())?;
     // A preset's URL is already correct, so it only needs the reachability check — not the
@@ -12699,25 +12744,184 @@ async fn config_edit_connection(cfg: &mut cli_config::CliConfig) -> Result<()> {
             }
         }
     };
-    cfg.base_url = Some(base.clone());
+    let same_endpoint = previous_base
+        .as_deref()
+        .map(|url| url.trim().trim_end_matches('/'))
+        == Some(base.as_str());
 
     let keys_url = preset.map(|p| p.keys_url);
-    match prompt_validated_api_key(&theme, &http, &base, cfg.api_key.as_deref(), keys_url).await? {
-        Some((key, fetched)) => {
-            cfg.api_key = Some(key);
-            if !fetched.is_empty() {
-                infos = fetched;
-            }
-        }
-        None => return Ok(()),
+    let current_key = same_endpoint.then_some(cfg.api_key.as_deref()).flatten();
+    let (key, fetched) =
+        match prompt_validated_api_key(&theme, &http, &base, current_key, keys_url).await? {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+    if !fetched.is_empty() {
+        infos = fetched;
+    }
+
+    let mut draft = cfg.clone();
+    draft.base_url = Some(base);
+    draft.api_key = Some(key);
+    if !same_endpoint {
+        draft.model = None;
+        draft.model_context_window = None;
+        draft.active_provider = None;
     }
 
     // The key check already fetched the list — offering it here saves a redundant round-trip and
     // means a fresh connection lands on a working model instead of whatever was configured before.
     if !infos.is_empty() && yn(&theme, "Pick a model now?", true)? {
-        pick_model_from(&theme, cfg, &infos, preset.map(|p| p.sample_model))?;
+        pick_model_from(&theme, &mut draft, &infos, preset.map(|p| p.sample_model))?;
+    } else if draft.model.is_none() {
+        let mut input = Input::<String>::with_theme(&theme)
+            .with_prompt("Model id")
+            .allow_empty(true);
+        if let Some(sample) = preset.map(|p| p.sample_model.to_string()) {
+            input = input.default(sample);
+        }
+        let model = input.interact_text()?;
+        if model.trim().is_empty() {
+            line_warn("connection unchanged — a model is required for the new URL");
+            return Ok(());
+        }
+        draft.model = Some(model.trim().to_string());
     }
+    draft.sync_active_provider();
+    *cfg = draft;
     Ok(())
+}
+
+/// Manage provider profiles from the config hub. Adding/editing reuses the validated Connection flow;
+/// the complete resulting tuple is then stored under the chosen name.
+async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    let http = http_client()?;
+    loop {
+        let list = cfg.providers.clone().unwrap_or_default();
+        let mut items: Vec<String> = list.iter().map(|p| provider_row(cfg, p)).collect();
+        items.push("＋ Add provider".to_string());
+        items.push("Back".to_string());
+        let pick = match Select::with_theme(&theme)
+            .with_prompt("Providers (Esc when done)")
+            .items(&items)
+            .default(items.len().saturating_sub(2))
+            .interact_opt()?
+        {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        if pick == items.len() - 1 {
+            return Ok(());
+        }
+        if pick == list.len() {
+            let name: String = Input::with_theme(&theme)
+                .with_prompt("Provider name (no spaces)")
+                .allow_empty(true)
+                .interact_text()?;
+            if name.trim().is_empty() || cfg.provider(&name).is_some() {
+                line_bad("provider name is empty or already exists");
+                continue;
+            }
+            let base = match prompt_validated_base_url(&theme, &http, None, true).await? {
+                Some((url, _)) => url,
+                None => continue,
+            };
+            let (key, mut infos) =
+                match prompt_validated_api_key(&theme, &http, &base, None, None).await? {
+                    Some(v) => v,
+                    None => continue,
+                };
+            if infos.is_empty() {
+                if let Ok(fetched) = client::fetch_models_info(&http, &base, &key).await {
+                    infos = fetched;
+                }
+            }
+            let Some(model) = prompt_required_provider_model(&theme, &infos, None)? else {
+                continue;
+            };
+            let mut draft = cli_config::ProviderProfile::normalized(&name, &base, &key, &model)?;
+            draft.model_context_window = None;
+            cfg.upsert_provider(draft.clone())?;
+            if yn(&theme, "Use this provider now?", true)? {
+                cfg.activate_provider(&draft.name)?;
+            }
+            continue;
+        }
+
+        let existing = &list[pick];
+        let action = Select::with_theme(&theme)
+            .with_prompt(format!("{} (Esc cancels)", existing.name))
+            .items(&["use now", "edit endpoint + key + model", "rename", "remove"])
+            .default(0)
+            .interact_opt()?;
+        match action {
+            Some(0) => cfg.activate_provider(&existing.name)?,
+            Some(1) => {
+                let old = existing.clone();
+                let base = match prompt_validated_base_url(&theme, &http, Some(&old.base_url), true)
+                    .await?
+                {
+                    Some((url, _)) => url,
+                    None => continue,
+                };
+                let same = base.trim_end_matches('/') == old.base_url.trim_end_matches('/');
+                let current = same.then_some(old.api_key.as_str());
+                let (key, mut infos) =
+                    match prompt_validated_api_key(&theme, &http, &base, current, None).await? {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                if infos.is_empty() {
+                    if let Ok(fetched) = client::fetch_models_info(&http, &base, &key).await {
+                        infos = fetched;
+                    }
+                }
+                let Some(model) = prompt_required_provider_model(&theme, &infos, Some(&old.model))?
+                else {
+                    continue;
+                };
+                let mut replacement =
+                    cli_config::ProviderProfile::normalized(&old.name, &base, &key, &model)?;
+                replacement.model_context_window = old.model_context_window;
+                let active = cfg
+                    .active_provider
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&old.name));
+                cfg.upsert_provider(replacement)?;
+                if active {
+                    cfg.activate_provider(&old.name)?;
+                }
+            }
+            Some(2) => {
+                let new_name: String = Input::with_theme(&theme)
+                    .with_prompt("New provider name")
+                    .default(existing.name.clone())
+                    .interact_text()?;
+                cfg.rename_provider(&existing.name, &new_name)?;
+            }
+            Some(3) => {
+                let refs = cfg.provider_references(&existing.name);
+                if !refs.is_empty() {
+                    line_warn(&format!("used by {}", refs.join(", ")));
+                    let choices = ["clear assignments and remove", "cancel"];
+                    if Select::with_theme(&theme)
+                        .with_prompt("This provider is in use")
+                        .items(&choices)
+                        .default(1)
+                        .interact()?
+                        == 0
+                    {
+                        cfg.clear_provider_references(&existing.name);
+                    } else {
+                        continue;
+                    }
+                }
+                cfg.remove_provider(&existing.name)?;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Present `infos` as a picker and store the choice (plus its reported context window). Esc keeps the
@@ -12857,6 +13061,9 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
                 let cur = role_get(cfg, key)
                     .map(|rc| {
                         let mut bits: Vec<String> = Vec::new();
+                        if let Some(p) = rc.provider.as_deref() {
+                            bits.push(format!("provider {p}"));
+                        }
                         if let Some(m) = rc.model.as_deref() {
                             bits.push(m.to_string());
                         }
@@ -12877,8 +13084,8 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
             })
             .collect();
         items.push(format!(
-            "{:<22}· {} entr(ies)",
-            "Model → endpoint map",
+            "{:<22}· {} advanced entr(ies)",
+            "Advanced overrides",
             cfg.model_endpoints.as_deref().map_or(0, <[_]>::len)
         ));
         let installed = crate::agents::list().len();
@@ -12903,8 +13110,11 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
                 tui::emit_line(&format!("  {}", style(what).dim()));
                 config_edit_one_role(cfg, key, label).await?;
             }
-            i if i == ROLE_ROWS.len() => config_edit_model_registry(cfg).await?,
-            i if i == ROLE_ROWS.len() + 1 => config_edit_agent_pins().await?,
+            i if i == ROLE_ROWS.len() => {
+                line_warn("advanced model→endpoint overrides can supersede provider-based routing");
+                config_edit_model_registry(cfg).await?
+            }
+            i if i == ROLE_ROWS.len() + 1 => config_edit_agent_pins(cfg).await?,
             _ => return Ok(()),
         }
     }
@@ -13034,104 +13244,108 @@ fn prompt_api_key_ref(theme: &ColorfulTheme, current: Option<&str>) -> Result<Op
     }
 }
 
-/// Pick a model from a probed list, or type one. Unlike [`pick_model_from`] this returns the choice
-/// instead of writing `cfg.model`, because a role's model must not touch the main model.
-fn prompt_role_model(
+fn prompt_required_provider_model(
     theme: &ColorfulTheme,
     infos: &[client::ModelInfo],
     current: Option<&str>,
 ) -> Result<Option<String>> {
     if !infos.is_empty() {
         let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
-        let mut items: Vec<String> = ids.clone();
+        let mut items = ids.clone();
         items.push(CUSTOM_MODEL_ITEM.to_string());
-        items.push("‹ inherit the main model ›".to_string());
-        let pick = match Select::with_theme(theme)
-            .with_prompt("Model (Esc keeps current)")
+        let Some(pick) = Select::with_theme(theme)
+            .with_prompt("Provider default model (Esc cancels)")
             .items(&items)
             .default(model_default_index(&ids, current))
             .interact_opt()?
-        {
-            Some(i) => i,
-            None => return Ok(current.map(str::to_string)),
+        else {
+            return Ok(None);
         };
         if pick < ids.len() {
             return Ok(Some(ids[pick].clone()));
         }
-        if pick == ids.len() + 1 {
-            return Ok(None);
-        }
     }
     let mut input = Input::<String>::with_theme(theme)
-        .with_prompt("Model id (empty = inherit the main model)")
+        .with_prompt("Provider default model id (empty cancels)")
         .allow_empty(true);
-    if let Some(c) = current {
-        input = input.default(c.to_string());
+    if let Some(model) = current {
+        input = input.default(model.to_string());
     }
-    let m = input.interact_text()?;
-    let m = m.trim();
-    Ok((!m.is_empty() && m != "-").then(|| m.to_string()))
+    let value = input.interact_text()?;
+    Ok((!value.trim().is_empty()).then(|| value.trim().to_string()))
 }
 
-/// Edit one role end-to-end: URL (probed) → key → model (picked from the probe when possible).
+/// Edit one role by choosing a saved provider and an optional model override. Direct URL/key fields
+/// are preserved only as advanced legacy overrides elsewhere.
 async fn config_edit_one_role(
     cfg: &mut cli_config::CliConfig,
     role: &str,
     label: &str,
 ) -> Result<()> {
     let theme = ui_theme();
-    let http = http_client()?;
-    let cur = role_get(cfg, role).cloned().unwrap_or_default();
-
-    tui::emit_line(&format!("  {}", style(format!("— {label} —")).dim()));
-    let probed = prompt_probed_base_url(
-        &theme,
-        &http,
-        cur.base_url.as_deref(),
-        "inherit the main endpoint",
-    )
-    .await?;
-    let (base_url, mut infos) = match probed {
-        Some((u, i)) => (Some(u), i),
-        None => (None, Vec::new()),
-    };
-    let api_key_ref = prompt_api_key_ref(&theme, cur.api_key_ref.as_deref())?;
-
-    // With a URL and a key in hand, re-fetch so the model picker lists what THIS endpoint serves
-    // rather than the main one's catalogue.
-    if infos.is_empty() {
-        if let Some(url) = base_url.as_deref() {
-            let key = api_key_ref
-                .as_deref()
-                .and_then(|k| match k.strip_prefix("env:") {
-                    Some(var) => std::env::var(var.trim()).ok(),
-                    None => Some(k.to_string()),
-                })
-                .or_else(|| cfg.api_key.clone())
-                .unwrap_or_default();
-            if !key.is_empty() {
-                if let Ok(fetched) = spin_while(
-                    "fetching models",
-                    client::fetch_models_info(&http, url, &key),
-                )
-                .await
-                {
-                    infos = fetched;
-                }
-            }
+    if cfg.providers.as_ref().is_none_or(Vec::is_empty) {
+        line_warn("no saved providers — add one first");
+        config_edit_providers(cfg).await?;
+        if cfg.providers.as_ref().is_none_or(Vec::is_empty) {
+            return Ok(());
         }
     }
-    let model = prompt_role_model(&theme, &infos, cur.model.as_deref())?;
-
+    let cur = role_get(cfg, role).cloned().unwrap_or_default();
+    let list = cfg.providers.clone().unwrap_or_default();
+    let mut items = vec!["‹ inherit the main provider ›".to_string()];
+    items.extend(list.iter().map(|p| provider_row(cfg, p)));
+    let default = cur
+        .provider
+        .as_deref()
+        .and_then(|name| list.iter().position(|p| p.matches_name(name)))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let Some(pick) = Select::with_theme(&theme)
+        .with_prompt(format!("{label} — provider (Esc keeps current)"))
+        .items(&items)
+        .default(default)
+        .interact_opt()?
+    else {
+        return Ok(());
+    };
+    let provider = (pick > 0).then(|| list[pick - 1].name.clone());
+    let selected = provider
+        .as_deref()
+        .and_then(|name| cfg.provider(name))
+        .cloned();
+    let model = if let Some(profile) = selected.as_ref() {
+        let options = [
+            format!("Use provider default · {}", profile.model),
+            "Enter another model id".to_string(),
+        ];
+        match Select::with_theme(&theme)
+            .with_prompt("Model")
+            .items(&options)
+            .default(if cur.model.is_some() { 1 } else { 0 })
+            .interact_opt()?
+        {
+            Some(0) => None,
+            Some(1) => {
+                let mut input = Input::<String>::with_theme(&theme).with_prompt("Model id");
+                if let Some(m) = cur.model.clone() {
+                    input = input.default(m);
+                }
+                let value = input.allow_empty(true).interact_text()?;
+                (!value.trim().is_empty()).then(|| value.trim().to_string())
+            }
+            None => return Ok(()),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let mut roles = cfg.roles.take().unwrap_or_default();
     let slot = role_slot(&mut roles, role);
-    *slot = (model.is_some() || base_url.is_some() || api_key_ref.is_some()).then_some(
-        cli_config::RoleModelConfig {
-            model,
-            base_url,
-            api_key_ref,
-        },
-    );
+    *slot = (provider.is_some() || model.is_some()).then_some(cli_config::RoleModelConfig {
+        provider,
+        model,
+        ..Default::default()
+    });
     cfg.roles = roles.has_any().then_some(roles);
     Ok(())
 }
@@ -13232,92 +13446,94 @@ async fn config_edit_model_registry(cfg: &mut cli_config::CliConfig) -> Result<(
     }
 }
 
-/// Pin a model (and optionally a gateway) onto ONE installed specialist card.
-///
-/// Writes frontmatter, not `cli-config.json`, so it lives with the agent and travels with the repo
-/// when the card is project-local. That is also why the key option here is `env:VAR` only — those
-/// directories get committed.
-async fn config_edit_agent_pins() -> Result<()> {
+/// Assign one installed specialist to a saved provider and optional model override.
+async fn config_edit_agent_pins(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let theme = ui_theme();
     let all = crate::agents::list();
     if all.is_empty() {
         line_warn("no specialists installed — `aizen agents install msitarzewski/agency-agents`");
         return Ok(());
     }
-    let items: Vec<String> = all
-        .iter()
-        .map(|d| {
-            format!(
-                "{:<24}· {}{}",
-                d.slug(),
-                d.model.as_deref().unwrap_or("(sub-agent default)"),
-                d.base_url
-                    .as_deref()
-                    .map(|u| format!(" · {u}"))
-                    .unwrap_or_default()
-            )
-        })
-        .collect();
-    let pick = match Select::with_theme(&theme)
-        .with_prompt("Pin a specialist (Esc when done)")
-        .items(&items)
-        .default(0)
-        .interact_opt()?
-    {
-        Some(i) => i,
-        None => return Ok(()),
-    };
-    let def = &all[pick];
-
-    let mut mi = Input::<String>::with_theme(&theme)
-        .with_prompt("Model id (empty = use the sub-agent default, `-` clears)")
-        .allow_empty(true);
-    if let Some(m) = def.model.as_deref() {
-        mi = mi.default(m.to_string());
-    }
-    let model = mi.interact_text()?;
-    let model = model.trim();
-
-    let mut ui = Input::<String>::with_theme(&theme)
-        .with_prompt("Base URL (empty = use the model→endpoint map, `-` clears)")
-        .allow_empty(true);
-    if let Some(u) = def.base_url.as_deref() {
-        ui = ui.default(u.to_string());
-    }
-    let base = ui.interact_text()?;
-    let base = base.trim().trim_end_matches('/');
-
-    let mut ki = Input::<String>::with_theme(&theme)
-        .with_prompt(
-            "API key env var (empty = inherit, `-` clears) — env only, cards get committed",
-        )
-        .allow_empty(true);
-    if let Some(v) = def
-        .api_key_ref
-        .as_deref()
-        .and_then(|k| k.strip_prefix("env:"))
-    {
-        ki = ki.default(v.to_string());
-    }
-    let var = ki.interact_text()?;
-    let var = var.trim().trim_start_matches("env:").trim();
-
-    // `-` means clear, empty means leave alone — matching the prompt text above.
-    let edit = |s: &str| -> Option<Option<String>> {
-        match s {
-            "" => None,
-            "-" => Some(None),
-            v => Some(Some(v.to_string())),
+    if cfg.providers.as_ref().is_none_or(Vec::is_empty) {
+        line_warn("no saved providers — add one first");
+        config_edit_providers(cfg).await?;
+        if cfg.providers.as_ref().is_none_or(Vec::is_empty) {
+            return Ok(());
         }
-    };
-    let path = crate::agents::set_endpoint(
-        &def.slug(),
-        edit(model),
-        edit(base),
-        edit(var).map(|v| v.map(|s| format!("env:{s}"))),
-    )?;
-    line_ok(&format!("wrote {}", path.display()));
-    Ok(())
+    }
+    loop {
+        let items: Vec<String> = all
+            .iter()
+            .map(|d| {
+                let route = cfg.agent_route(&d.slug());
+                format!(
+                    "{:<24}· {} · {}",
+                    d.slug(),
+                    route
+                        .and_then(|r| r.provider.as_deref())
+                        .unwrap_or("inherit sub-agent default"),
+                    route
+                        .and_then(|r| r.model.as_deref())
+                        .unwrap_or("default model")
+                )
+            })
+            .collect();
+        let Some(pick) = Select::with_theme(&theme)
+            .with_prompt("Specialist agent (Esc when done)")
+            .items(&items)
+            .default(0)
+            .interact_opt()?
+        else {
+            return Ok(());
+        };
+        let slug = all[pick].slug();
+        let current = cfg.agent_route(&slug).cloned().unwrap_or_default();
+        let providers = cfg.providers.clone().unwrap_or_default();
+        let mut choices = vec!["‹ inherit sub-agent default ›".to_string()];
+        choices.extend(providers.iter().map(|p| provider_row(cfg, p)));
+        let default = current
+            .provider
+            .as_deref()
+            .and_then(|name| providers.iter().position(|p| p.matches_name(name)))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let Some(pp) = Select::with_theme(&theme)
+            .with_prompt(format!("{slug} — provider"))
+            .items(&choices)
+            .default(default)
+            .interact_opt()?
+        else {
+            continue;
+        };
+        if pp == 0 {
+            cfg.set_agent_route(&slug, None, None)?;
+            continue;
+        }
+        let provider = &providers[pp - 1];
+        let model_choices = [
+            format!("Use provider default · {}", provider.model),
+            "Enter another model id".to_string(),
+        ];
+        let Some(mp) = Select::with_theme(&theme)
+            .with_prompt("Model")
+            .items(&model_choices)
+            .default(if current.model.is_some() { 1 } else { 0 })
+            .interact_opt()?
+        else {
+            continue;
+        };
+        let model = if mp == 0 {
+            None
+        } else {
+            let mut input = Input::<String>::with_theme(&theme).with_prompt("Model id");
+            if let Some(m) = current.model {
+                input = input.default(m);
+            }
+            let value = input.allow_empty(true).interact_text()?;
+            (!value.trim().is_empty()).then(|| value.trim().to_string())
+        };
+        cfg.set_agent_route(&slug, Some(provider.name.clone()), model)?;
+    }
 }
 
 /// Section editor: fetch the model list, pick one (Esc keeps current), then the context window.
@@ -13426,6 +13642,7 @@ async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
             _ => None, // "auto"/blank/garbage → detect-or-heuristic
         };
     }
+    cfg.sync_active_provider();
     Ok(())
 }
 
@@ -15182,6 +15399,43 @@ async fn run_agents(cmd: Option<AgentsCmd>) -> Result<()> {
         }
         Some(AgentsCmd::Enable { name, all }) => agents_set_enabled(name.as_deref(), all, true),
         Some(AgentsCmd::Disable { name, all }) => agents_set_enabled(name.as_deref(), all, false),
+        Some(AgentsCmd::SetProvider {
+            name,
+            provider,
+            model,
+            clear,
+        }) => {
+            let mut cfg = cli_config::load();
+            if agents::load(&name).is_none() {
+                anyhow::bail!("no agent named '{name}' (try `aizen agents list`)");
+            }
+            if clear {
+                cfg.set_agent_route(&name, None, None)?;
+                cli_config::save(&cfg)?;
+                println!(
+                    "{} cleared provider assignment on '{}'",
+                    crate::ui::theme::ok("✓"),
+                    name
+                );
+            } else {
+                let provider = provider
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .context("pass a saved provider name (or --clear)")?;
+                cfg.set_agent_route(&name, Some(provider.to_string()), model)?;
+                cli_config::save(&cfg)?;
+                let route = cfg.agent_route(&name).expect("route just saved");
+                println!(
+                    "{} assigned '{}' to provider {} · model {}",
+                    crate::ui::theme::ok("✓"),
+                    name,
+                    route.provider.as_deref().unwrap_or("inherit"),
+                    route.model.as_deref().unwrap_or("provider default")
+                );
+            }
+            Ok(())
+        }
         Some(AgentsCmd::SetModel { name, model, clear }) => {
             let new_model = if clear {
                 None
@@ -15250,6 +15504,7 @@ fn agents_list(
         all.retain(|a| is_enabled(&a.slug()));
     }
 
+    let cfg = cli_config::load();
     if json {
         let arr: Vec<serde_json::Value> = all
             .iter()
@@ -15261,6 +15516,8 @@ fn agents_list(
                     "division": a.division,
                     "source": a.source.label(),
                     "model": a.model,
+                    "provider": cfg.agent_route(&a.slug()).and_then(|r| r.provider.clone()),
+                    "route_model": cfg.agent_route(&a.slug()).and_then(|r| r.model.clone()),
                     "tools": a.tools,
                     "enabled": is_enabled(&a.slug()),
                     "path": a.source_path.display().to_string(),
@@ -15303,7 +15560,23 @@ fn agents_list(
                 style("○").dim().to_string()
             };
             let desc: String = a.description.chars().take(80).collect();
-            println!("  {} {}  —  {}", mark, a.slug(), desc.replace('\n', " "));
+            let route = cfg.agent_route(&a.slug());
+            let route_hint = route
+                .map(|r| {
+                    format!(
+                        " · provider {} · {}",
+                        r.provider.as_deref().unwrap_or("inherit"),
+                        r.model.as_deref().unwrap_or("default model")
+                    )
+                })
+                .unwrap_or_default();
+            println!(
+                "  {} {}  —  {}{}",
+                mark,
+                a.slug(),
+                desc.replace('\n', " "),
+                route_hint
+            );
         }
     }
     let hint = if enabled.is_some() {
@@ -15679,6 +15952,82 @@ fn finish_install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_provider_subcommands_parse() {
+        for argv in [
+            vec![
+                "aizen",
+                "config",
+                "provider",
+                "add",
+                "backup",
+                "--base-url",
+                "https://backup/v1",
+                "--api-key",
+                "key",
+                "--model",
+                "model-b",
+                "--use",
+            ],
+            vec![
+                "aizen",
+                "config",
+                "provider",
+                "edit",
+                "backup",
+                "--base-url",
+                "https://backup-2/v1",
+                "--api-key",
+                "key-2",
+                "--model",
+                "model-c",
+            ],
+            vec![
+                "aizen",
+                "config",
+                "provider",
+                "rename",
+                "backup",
+                "secondary",
+            ],
+            vec!["aizen", "config", "provider", "use", "backup"],
+            vec!["aizen", "config", "provider", "list"],
+            vec!["aizen", "config", "provider", "remove", "backup", "--force"],
+        ] {
+            assert!(
+                matches!(
+                    Cli::try_parse_from(argv).expect("parse").command,
+                    Some(Commands::Config {
+                        cmd: Some(ConfigCmd::Provider { .. })
+                    })
+                ),
+                "provider command should parse"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["aizen", "config", "provider", "add", "missing-flags"]).is_err()
+        );
+    }
+
+    #[test]
+    fn agents_set_provider_parses() {
+        assert!(matches!(
+            Cli::try_parse_from([
+                "aizen",
+                "agents",
+                "set-provider",
+                "reviewer",
+                "backup",
+                "model-x"
+            ])
+            .expect("parse")
+            .command,
+            Some(Commands::Agents {
+                cmd: Some(AgentsCmd::SetProvider { .. })
+            })
+        ));
+    }
 
     /// `memory list current` and `memory list --scope current` must mean the same thing.
     ///
@@ -16974,40 +17323,6 @@ mod tests {
     }
 
     #[test]
-    fn chunk_text_splits_on_utf16_units_not_scalars() {
-        // 2100 emoji = 2100 scalars but 4200 UTF-16 units. Under a 3500-unit cap it MUST split —
-        // Telegram/Discord count length in UTF-16; naive char-splitting would wrongly keep it whole
-        // and the platform would 400 → the reply is silently dropped.
-        let s = "🚀".repeat(2100);
-        let chunks = chunk_text(&s, 3500);
-        assert!(
-            chunks.len() >= 2,
-            "over-the-UTF16-cap reply must split, got {}",
-            chunks.len()
-        );
-        for c in &chunks {
-            assert!(
-                c.encode_utf16().count() <= 3500,
-                "each chunk within the UTF-16 budget"
-            );
-        }
-        assert_eq!(chunks.concat(), s, "reassembles losslessly");
-        assert_eq!(
-            chunk_text("hello", 3500),
-            vec!["hello".to_string()],
-            "ASCII under cap stays whole"
-        );
-
-        let rows = "alpha row\nbeta row\ngamma row\n";
-        let chunks = chunk_text(rows, 20);
-        assert_eq!(chunks.concat(), rows, "line-aware splitting stays lossless");
-        assert!(
-            chunks[..chunks.len() - 1].iter().all(|c| c.ends_with('\n')),
-            "{chunks:?}"
-        );
-    }
-
-    #[test]
     fn default_index_points_at_the_saved_model() {
         assert_eq!(model_default_index(&models(), Some("sonnet-4-6")), 1);
         assert_eq!(model_default_index(&models(), Some("minimax-m3")), 2);
@@ -17144,42 +17459,6 @@ mod tests {
         assert_eq!(blocks(50.0), 5);
         assert_eq!(blocks(100.0), 10);
         assert_eq!(blocks(150.0), 10); // clamped, never overflows the 10-cell bar
-    }
-
-    #[test]
-    fn cap_session_drops_oldest_whole_turns_at_user_boundary() {
-        // sys + 3 turns (each user + assistant). Cap to 5 → must drop the oldest whole turn(s),
-        // keep system[0], and always START the tail at a `user` message.
-        let mut h = vec![
-            Message::system("sys"),
-            Message::user("u1"),
-            Message::assistant("a1"),
-            Message::user("u2"),
-            Message::assistant("a2"),
-            Message::user("u3"),
-            Message::assistant("a3"),
-        ];
-        cap_session(&mut h, 5);
-        assert!(h.len() <= 5, "trimmed under the cap");
-        assert_eq!(h[0].role, "system", "system prompt is preserved");
-        assert_eq!(
-            h[1].role, "user",
-            "tail begins at a user boundary (no orphaned turn)"
-        );
-        // the most recent turn must survive
-        assert!(h.iter().any(|m| m.content.as_deref() == Some("u3")));
-    }
-
-    #[test]
-    fn cap_session_keeps_single_turn_even_if_over_cap() {
-        // One huge turn can't be split at a 2nd user boundary → left intact (loop guard handles size).
-        let mut h = vec![
-            Message::system("sys"),
-            Message::user("u1"),
-            Message::assistant("a1"),
-        ];
-        cap_session(&mut h, 2);
-        assert_eq!(h.len(), 3, "no safe cut point → keep the turn whole");
     }
 
     #[test]

@@ -2378,53 +2378,11 @@ impl Tool for FileMove {
     }
 }
 
-/// Write `content` to `target` ATOMICALLY: stream into a sibling temp file, fsync it, then
-/// `fs::rename` it over the target. A same-directory rename is atomic on every OS we support (POSIX
-/// `rename(2)`; Windows `MoveFileExW` with REPLACE_EXISTING), so a concurrent reader — and, more
-/// importantly, the on-disk state after a crash/kill/disk-full mid-write — is either the intact old
-/// file or the fully-written new one, never a truncated/partial file. Plain `fs::write` truncates
-/// the target in place before streaming, so an interrupted write destroys the original. Preserves
-/// the target's existing permission bits (temp files are created with default perms, so an in-place
-/// rewrite would otherwise silently reset mode). The temp file is cleaned up on any failure before
-/// the rename lands. The temp lives in the target's own directory, so the rename never crosses a
-/// filesystem boundary (which would make it non-atomic).
-pub(crate) fn atomic_write(target: &Path, content: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let parent = target
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let fname = target.file_name().and_then(|n| n.to_str()).unwrap_or("out");
-    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(".{fname}.aizen-tmp.{}.{n}", std::process::id()));
-
-    // Write + fsync, then CLOSE the temp handle before renaming (Windows won't replace the
-    // destination while a handle to the source is open). Any error aborts before the rename, so the
-    // original target is untouched; clean up the temp.
-    let write_res = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(content)?;
-        f.sync_all()?;
-        Ok(())
-    })();
-    if let Err(e) = write_res {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-
-    // Carry over the target's mode so an atomic rewrite preserves permissions. Best-effort: a
-    // metadata/permission hiccup must never turn into data loss.
-    if let Ok(meta) = std::fs::metadata(target) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
-    }
-
-    if let Err(e) = std::fs::rename(&tmp, target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
-}
+// A local `atomic_write` used to live here. It is gone: [`crate::core::persist::atomic_write`] does
+// the same job and is strictly stronger — it stages with `create_new` (concurrent writers can never
+// share a staging path) and replaces via `MoveFileExW(WRITE_THROUGH)` on Windows instead of a plain
+// `fs::rename`. Every write path in this file already called the `persist` one; only this copy's own
+// tests still referenced it, and they now exercise `persist` directly.
 
 /// A sibling temp path for staging an existing file/dir out of the way during an overwrite. Lives in
 /// the same directory as `p`, so the stash rename stays on one filesystem (and is thus atomic).
@@ -4953,6 +4911,7 @@ mod tests {
 
     #[test]
     fn atomic_write_replaces_content_and_leaves_no_temp() {
+        use crate::core::persist::atomic_write;
         let root = temp_root("atomic-write");
         let target = root.join("f.txt");
         // Fresh create.
@@ -4965,7 +4924,7 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains(".aizen-tmp."))
+            .filter(|e| e.file_name().to_string_lossy().contains(".aizen-tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp file leaked: {leftovers:?}");
     }
@@ -4973,6 +4932,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn atomic_write_preserves_permissions() {
+        use crate::core::persist::atomic_write;
         use std::os::unix::fs::PermissionsExt;
         let root = temp_root("atomic-perms");
         let target = root.join("script.sh");

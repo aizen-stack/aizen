@@ -754,6 +754,11 @@ pub type EagerStartFn<'a> =
 /// Stream a chat completion. Prints content deltas to stdout as they arrive and
 /// returns the full concatenated assistant text. Returns a typed error on a non-2xx
 /// response (so the caller can decide retry/stop) instead of panicking.
+///
+/// Superseded by the tool-aware streaming path: every live caller needs tool calls out of the same
+/// stream, and printing straight to stdout would corrupt the retained frame anyway. Kept as the
+/// plain-text reference shape of an SSE read.
+#[allow(dead_code)]
 pub async fn stream_chat(
     client: &reqwest::Client,
     base_url: &str,

@@ -1294,7 +1294,10 @@ mod tests {
         // Exact, including the drive-letter casing Claude and Codex disagree about.
         assert!(cwd_matches(r"C:\Users\me\proj\aizen", root));
         assert!(cwd_matches(r"c:\users\me\proj\aizen", root));
-        assert!(cwd_matches(r"C:\Users\me\proj\aizen\", root), "trailing sep");
+        assert!(
+            cwd_matches(r"C:\Users\me\proj\aizen\", root),
+            "trailing sep"
+        );
         // Launched from a subdir of the checkout — still this project.
         assert!(cwd_matches(r"C:\Users\me\proj\aizen\crates\core", root));
         // A PARENT of the checkout is not this project. `project_root` already resolved to the

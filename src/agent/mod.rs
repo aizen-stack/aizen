@@ -147,6 +147,9 @@ impl PromptBundle {
         }
     }
 
+    /// Whether both prompt lanes are blank. Part of the bundle's read API; callers currently check the
+    /// lanes they care about directly.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.stable.trim().is_empty() && self.dynamic.trim().is_empty()
     }
@@ -422,11 +425,14 @@ pub struct AgentConfig {
     /// the whole session's edits are rewindable (W15). Best-effort (no-op outside a git repo).
     /// Default `true`; tests set it `false` (their cwd is a real repo — no checkpoint pollution).
     pub auto_checkpoint: bool,
-    /// Stamp a time-machine checkpoint AFTER every turn that successfully edited files (Cline-style
-    /// per-step snapshots), so each editing step is an independent restore point — not just the one
-    /// pre-run snapshot from `auto_checkpoint`. Best-effort + dedup'd (a zero-diff tree reuses the
-    /// last snapshot), so quiet turns cost nothing. Requires `auto_checkpoint`; default `true`,
-    /// forced `false` in tests (their cwd is a real repo).
+    /// Stamp a time-machine checkpoint at each PHASE boundary (a todo reaching `done` / focus moving
+    /// to a new `in_progress` item, or a clean verify gate after edits) rather than after every edit
+    /// turn — so a run of N edits inside one phase yields ONE meaningful restore point, not N noise
+    /// snapshots. `note_last_good` is set at that mark, so `checkpoint_rewind target=last_good` lands
+    /// at the last CLEAN phase. Best-effort + dedup'd (a zero-diff tree reuses the last snapshot), so
+    /// a phase that only ran a build costs nothing. Requires `auto_checkpoint`; default `true`,
+    /// forced `false` in tests (their cwd is a real repo). Field name kept for wire/back-compat; only
+    /// the firing CONDITION changed.
     pub checkpoint_each_edit: bool,
     /// The model's context window in tokens, for the mid-loop context guard. A single run-away
     /// loop (reading many large files) can blow past the window BEFORE control returns to the
@@ -477,6 +483,13 @@ pub struct AgentConfig {
     /// server). Default ON: tools register and servers spawn lazily on first symbol query (no
     /// process until needed). Set false / `/lsp off` to reclaim RAM and hide the tools. Sub-agents
     /// and workflows keep a separate slim registry (no LSP tools).
+    ///
+    /// Never read: the real gate is the process-wide `lsp::LSP.is_enabled()`, which tool registration
+    /// and every LSP call site consult directly. Each site that sets this field copies it *from* that
+    /// same flag, so it is a mirror rather than a forgotten switch — a reader here would be a second
+    /// source of truth, which is what the global exists to avoid. Kept so `AgentConfig` still
+    /// documents the subsystem's on/off state for anything that inspects a config.
+    #[allow(dead_code)]
     pub enable_lsp: bool,
     /// Per-request wall-clock cap (seconds) for an LSP query, so a hung server can never block the
     /// agent turn. Mirrors Helix's 20s default.
@@ -833,6 +846,18 @@ where
     // pre-edit checkpoint already discovers via `target_dir`; the gate must not lag behind it. `None`
     // (no path named, or the edit was `shell_run`) keeps the cwd-relative fallback.
     let mut last_edit_dir: Option<std::path::PathBuf> = None;
+    // PHASE CHECKPOINT STATE (replaces the old per-edit-turn checkpoint). A "phase" is a unit of work
+    // the model marks in its todo list; the timeline stamps ONE checkpoint when a phase closes, not
+    // one per edit. `phase_todos_before` is the todo snapshot at the TOP of the current turn — compared
+    // against the post-turn snapshot to detect a boundary (see `todo::phase_boundary_crossed`).
+    // `made_edits_in_phase` gates the checkpoint so an all-talk phase (todo flipped with no file
+    // change) does not stamp one; it resets to false the moment a phase is stamped, so the next
+    // stamp trigger cannot double-fire on the same work. `phase_counter` supplies a fallback label
+    // for the no-todo path: a model that never calls `todo_write` closes no todo phases, so its only
+    // boundary is the verify gate coming back clean — that stamp needs a name too.
+    let mut phase_todos_before: Vec<crate::agent::todo::Todo> = crate::agent::todo::snapshot();
+    let mut made_edits_in_phase = false;
+    let mut phase_counter = 0usize;
     // Operation-scoped checkpoint latch: set only after a pre-edit checkpoint succeeds. Approval is
     // evaluated first; a declined call must never run Git hooks/filters or mutate recovery metadata.
     let mut auto_checkpointed = false;
@@ -1553,13 +1578,41 @@ where
                             images: Vec::new(),
                             cache_control: None,
                         });
-                        messages.push(Message::user(verify_gate::format_gate_failure(&result)));
+                        // Once a phase has spent past half its repair budget, offer the rewind as an
+                        // explicit escape hatch: patching further is often more costly than dropping
+                        // back to the last clean phase mark and re-approaching. Reuses the existing
+                        // `recovery_hint` (respects the rewind budget; empty when none is left) — no
+                        // new state, just surfacing an option the model already has.
+                        let mut failure_msg = verify_gate::format_gate_failure(&result);
+                        if verify_attempts * 2 >= cfg.max_verify_attempts {
+                            if let Some(hint) = crate::features::timemachine::recovery_hint() {
+                                failure_msg.push_str("\n\n");
+                                failure_msg.push_str(&hint);
+                            }
+                        }
+                        messages.push(Message::user(failure_msg));
                         iter += 1;
                         continue;
                     }
                     // PASSED: latch it so a subsequent no-edit "done" doesn't needlessly re-run the
                     // gate (a fresh successful edit clears the latch → new work is re-verified).
                     verify_passed = true;
+                    // A clean verify is the OTHER phase boundary (decision: todo-close AND
+                    // verify-pass both mark phases). This catches the no-todo run — the model edited
+                    // and finished without ever flipping a todo, so `phase_boundary_crossed` never
+                    // fired. Stamp the still-uncheckpointed edits ONCE here as a verified phase.
+                    // Gated on `made_edits_in_phase` so a no-edit "done" (latch already clean) stamps
+                    // nothing; `save` dedups a zero-diff tree so it's free when the last todo boundary
+                    // already captured this exact tree.
+                    if cfg.checkpoint_each_edit && made_edits_in_phase {
+                        phase_counter += 1;
+                        stamp_phase_checkpoint(
+                            cfg.quiet,
+                            &format!("phase {phase_counter} verified"),
+                        );
+                        made_edits_in_phase = false;
+                        phase_todos_before = crate::agent::todo::snapshot();
+                    }
                 }
             }
             if cfg.enable_verify_gate
@@ -1905,44 +1958,37 @@ where
                     last_edit_dir = Some(dir);
                 }
             }
-            // PER-STEP CHECKPOINT (Cline-style): after each turn whose edits SUCCEEDED, stamp a
-            // restore point so every editing step is independently rewindable — not just the whole
-            // run from the single pre-edit snapshot. Best-effort; `save` dedups a zero-diff tree, so
-            // a turn that only ran (say) a shell build with no file change costs nothing. Runs AFTER
-            // the pre-fill/execute so the snapshot captures the POST-edit tree.
-            if cfg.checkpoint_each_edit {
-                match crate::features::timemachine::save("after agent edit", true) {
-                    Ok(snap) => {
-                        crate::features::timemachine::note_last_good(snap.id);
-                        if !cfg.quiet {
-                            emit_trace(&format!(
-                                "  └ checkpoint #{} (agent: `checkpoint_rewind` target=last_good; human: `aizen time restore {}`)",
-                                snap.id, snap.id
-                            ));
-                        }
-                    }
-                    // No work tree at all is not a failure — it mirrors the pre-edit path, which
-                    // reports "checkpoint unavailable: not a git repository" and moves on. Only a
-                    // REAL failure (dubious ownership, a corrupt store, a locked ref) is worth a
-                    // cry-wolf warning, and it must carry git's own cause (`{e:#}` = full chain),
-                    // not the swallowed top-level context.
-                    Err(e) if e.to_string().contains("not a git repository") => {
-                        if !cfg.quiet {
-                            emit_trace("  └ checkpoint unavailable: not a git repository");
-                        }
-                    }
-                    Err(e) if crate::core::gitx::is_git_missing(&e) => {
-                        if !cfg.quiet {
-                            emit_trace("  └ checkpoint unavailable: git executable not found (edits proceed without checkpoints)");
-                        }
-                    }
-                    Err(e) => {
-                        emit_trace(&format!(
-                            "  └ warning: post-edit checkpoint failed; the latest change may not be independently rewindable: {e:#}"
-                        ));
-                    }
+            // A successful edit belongs to the CURRENT phase. The checkpoint is no longer stamped
+            // here (one-per-edit made the timeline unreadable) — it is deferred to the phase boundary
+            // just below, so a run of N edits inside one phase yields ONE restore point, not N. This
+            // flag gates that stamp: a phase that only talked (todo flipped, no file change) captures
+            // nothing.
+            made_edits_in_phase = true;
+        }
+
+        // PHASE CHECKPOINT (replaces the old per-edit-turn snapshot). A "phase" is a unit of work the
+        // model marks in its todo list; the timeline stamps ONE checkpoint when a phase CLOSES —
+        // an item reaching Done, or focus moving to a new in_progress item (see
+        // `todo::phase_boundary_crossed`) — instead of one per edit. Gated on `made_edits_in_phase`
+        // so an all-talk phase stamps nothing, and `save` dedups a zero-diff tree so a phase that only
+        // ran a build costs nothing either. Behind the same `checkpoint_each_edit` latch as before
+        // (ON in production, OFF in tests / workflow children), and checked OUTSIDE the
+        // `edited_this_turn` block because the closing `todo_write` can land on a turn that itself made
+        // no file edit. `note_last_good` moves to the phase mark here, so `checkpoint_rewind
+        // target=last_good` lands at the last CLEAN phase, not mid-phase.
+        if cfg.checkpoint_each_edit {
+            let phase_todos_after = crate::agent::todo::snapshot();
+            if made_edits_in_phase {
+                if let Some(label) = crate::agent::todo::phase_boundary_crossed(
+                    &phase_todos_before,
+                    &phase_todos_after,
+                ) {
+                    stamp_phase_checkpoint(cfg.quiet, &format!("phase: {label}"));
+                    made_edits_in_phase = false;
                 }
             }
+            // Track the latest list so the next boundary is measured against it, moved or not.
+            phase_todos_before = phase_todos_after;
         }
 
         // EVIDENCE / STALL GUARD: a turn is informative when it adds facts, changes the workspace, or
@@ -2888,6 +2934,43 @@ fn emit_trace(line: &str) {
 /// `println!` into a raw-mode TUI and be wiped by the next repaint.
 pub(crate) fn emit_trace_public(line: &str) {
     emit_trace(line);
+}
+
+/// Stamp ONE time-machine checkpoint at a phase boundary and record it as this run's `last_good`
+/// rewind anchor. Best-effort: the three error shapes match the pre-edit path exactly — no work tree
+/// and a missing git executable are benign (checkpoints are simply off, the run continues), and only
+/// a real store/lock/ownership failure earns a cry-wolf warning carrying git's own cause (`{e:#}`).
+///
+/// Factored out of the loop because the phase mark can fire on a turn that made no edit (the closing
+/// `todo_write` lands alone), so the call site is outside the `edited_this_turn` block. `label` is the
+/// full checkpoint label (e.g. `"phase: wire up auth"`), already prefixed by the caller.
+fn stamp_phase_checkpoint(quiet: bool, label: &str) {
+    match crate::features::timemachine::save(label, true) {
+        Ok(snap) => {
+            crate::features::timemachine::note_last_good(snap.id);
+            if !quiet {
+                emit_trace(&format!(
+                    "  └ checkpoint #{} — {label} (agent: `checkpoint_rewind` target=last_good; human: `aizen time restore {}`)",
+                    snap.id, snap.id
+                ));
+            }
+        }
+        Err(e) if e.to_string().contains("not a git repository") => {
+            if !quiet {
+                emit_trace("  └ checkpoint unavailable: not a git repository");
+            }
+        }
+        Err(e) if crate::core::gitx::is_git_missing(&e) => {
+            if !quiet {
+                emit_trace("  └ checkpoint unavailable: git executable not found (edits proceed without checkpoints)");
+            }
+        }
+        Err(e) => {
+            emit_trace(&format!(
+                "  └ warning: phase checkpoint failed; this phase's work may not be independently rewindable: {e:#}"
+            ));
+        }
+    }
 }
 
 /// The tool-call anchor icon — the moonlight cog `⚙` (matching the mockup), or empty when icons are
@@ -6072,16 +6155,17 @@ mod tests {
             !cfg().auto_checkpoint,
             "test cfg must force it OFF to avoid repo pollution"
         );
-        // The per-edit-turn checkpoint (Cline-style: a restore point after EACH editing turn, not
-        // just once before the first) is gated behind the SAME latch, so it also defaults ON in
-        // production and OFF in tests — a per-edit checkpoint would pollute the real test repo.
+        // The phase checkpoint (a restore point when a phase closes — todo done or verify pass —
+        // rather than after each edit) is gated behind the SAME latch, so it also defaults ON in
+        // production and OFF in tests, where a checkpoint would pollute the real test repo. Field
+        // name kept for back-compat; only the firing condition changed.
         assert!(
             AgentConfig::default().checkpoint_each_edit,
-            "per-edit checkpoint default must be ON"
+            "phase checkpoint default must be ON"
         );
         assert!(
             !cfg().checkpoint_each_edit,
-            "test cfg must force per-edit checkpoint OFF"
+            "test cfg must force phase checkpoint OFF"
         );
     }
 

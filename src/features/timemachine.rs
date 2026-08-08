@@ -1578,11 +1578,7 @@ fn index_blob_bytes(ctx: &RepoContext, index: &Path) -> Result<u64> {
         batch_input.push_str(oid);
         batch_input.push('\n');
     }
-    let out = run_git_piped_bounded(
-        &mut child,
-        batch_input.as_bytes(),
-        "cat-file --batch-check",
-    )?;
+    let out = run_git_piped_bounded(&mut child, batch_input.as_bytes(), "cat-file --batch-check")?;
     if !out.status.success() {
         bail!(
             "internal git operation failed: {}",
@@ -1727,9 +1723,10 @@ fn benign_no_checkpoint(e: &anyhow::Error) -> bool {
 /// The holder was this same process — a thread stranded inside an unbounded `git` child from an
 /// earlier turn (now bounded; see [`GIT_OP_TIMEOUT`]). Naming that turns an impasse into one step.
 pub fn checkpoint_failure_hint(e: &anyhow::Error) -> String {
-    let busy = e
-        .chain()
-        .any(|c| c.downcast_ref::<crate::core::repo_lock::LockBusy>().is_some());
+    let busy = e.chain().any(|c| {
+        c.downcast_ref::<crate::core::repo_lock::LockBusy>()
+            .is_some()
+    });
     if !busy {
         return String::new();
     }
@@ -1760,6 +1757,10 @@ pub fn preflight_protected_change() -> Result<bool> {
 /// Capture the preimage for an already-leased workspace mutation. The caller must hold the
 /// `WorkspaceWriterLease` across this call and the subsequent tool body, closing the old
 /// preflight→save→mutation gap without acquiring a second workspace lock.
+///
+/// Callers all reach the `_in` form directly because they already know the repo root they resolved;
+/// this is the cwd-discovering convenience wrapper.
+#[allow(dead_code)]
 pub fn save_protected_change(label: &str) -> Result<Option<Snapshot>> {
     save_protected_change_in(label, None)
 }
@@ -3289,7 +3290,9 @@ mod tests {
 
         // An unrelated failure must stay clean — a hint about locks on a filter-driver refusal
         // would send the reader chasing the wrong cause.
-        let other = anyhow::anyhow!("checkpoint refused: repository config defines external Git filter `filter.foo.clean`");
+        let other = anyhow::anyhow!(
+            "checkpoint refused: repository config defines external Git filter `filter.foo.clean`"
+        );
         assert!(
             checkpoint_failure_hint(&other).is_empty(),
             "only lock contention earns the lock hint"

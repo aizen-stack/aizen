@@ -106,7 +106,60 @@ pub fn status_summary() -> Option<String> {
     Some(format!("☑ {done}/{}", items.len()))
 }
 
+/// Which phase (if any) just CLOSED between two todo snapshots — its label, for a phase checkpoint.
+///
+/// The todo list is the only "phase" signal aizen has, so a boundary is read from it:
+///   1. an item that moved INTO `Done` this turn — its `content` names the phase that finished;
+///   2. failing that, a NEW `in_progress` item appearing while a DIFFERENT item was `in_progress`
+///      before — the previously-active item implicitly closed, so its content is the label.
+///
+/// Returns `None` when the list did not cross a boundary.
+///
+/// Matched by `content`, never by index: the model resends the whole list each call and may reorder
+/// or edit rows, so position is not stable. When several items reach `Done` in one turn (a model that
+/// batch-marks at the end), the LAST newly-done item's content is returned — ONE checkpoint for the
+/// group, never one per item.
+pub fn phase_boundary_crossed(before: &[Todo], after: &[Todo]) -> Option<String> {
+    use std::collections::HashMap;
+    let before_status: HashMap<&str, Status> = before
+        .iter()
+        .map(|t| (t.content.as_str(), t.status))
+        .collect();
+
+    // 1. Any item that moved into Done this turn closes a phase. Scan from the end so a batch
+    //    "mark everything done" yields the last item's label once, not one label per item.
+    if let Some(t) = after.iter().rev().find(|t| {
+        t.status == Status::Done
+            && before_status.get(t.content.as_str()).copied() != Some(Status::Done)
+    }) {
+        return Some(t.content.clone());
+    }
+
+    // 2. No new Done, but the focus moved: an item that WAS in_progress no longer is, while some
+    //    OTHER item is now in_progress. The previous active item implicitly closed — name it.
+    let was_active: Option<&str> = before
+        .iter()
+        .find(|t| t.status == Status::InProgress)
+        .map(|t| t.content.as_str());
+    if let Some(prev) = was_active {
+        let prev_still_active = after
+            .iter()
+            .any(|t| t.content == prev && t.status == Status::InProgress);
+        let other_now_active = after
+            .iter()
+            .any(|t| t.status == Status::InProgress && t.content != prev);
+        if !prev_still_active && other_now_active {
+            return Some(prev.to_string());
+        }
+    }
+    None
+}
+
 /// A glyph for a status: done ✓, in-progress ▸, pending ○.
+///
+/// Used only by [`render_block`], which is itself unused — the retained TUI paints todos as ratatui
+/// rows rather than a pre-rendered string.
+#[allow(dead_code)]
 fn glyph(s: Status) -> &'static str {
     match s {
         Status::Done => "✓",
@@ -116,6 +169,7 @@ fn glyph(s: Status) -> &'static str {
 }
 
 /// Render the list as a colored checklist block (one line per item). Empty list → empty string.
+#[allow(dead_code)]
 pub fn render_block(items: &[Todo]) -> String {
     if items.is_empty() {
         return String::new();
@@ -492,5 +546,90 @@ mod tests {
         // it unchanged.
         assert_eq!(TodoWrite.parameters(), ScopedTodo::new().parameters());
         assert_eq!(TodoWrite.name(), ScopedTodo::new().name());
+    }
+
+    // ── phase_boundary_crossed: pure, needs no repo/global state ──
+    #[test]
+    fn phase_boundary_item_reaches_done() {
+        let before = vec![Todo::new("A", Status::InProgress)];
+        let after = vec![Todo::new("A", Status::Done)];
+        assert_eq!(
+            phase_boundary_crossed(&before, &after).as_deref(),
+            Some("A")
+        );
+    }
+
+    #[test]
+    fn phase_boundary_focus_moves_to_next() {
+        // A done, focus shifts B→? No: A stays, B goes in_progress. The done case (rule 1) wins.
+        let before = vec![
+            Todo::new("A", Status::InProgress),
+            Todo::new("B", Status::Pending),
+        ];
+        let after = vec![
+            Todo::new("A", Status::Done),
+            Todo::new("B", Status::InProgress),
+        ];
+        assert_eq!(
+            phase_boundary_crossed(&before, &after).as_deref(),
+            Some("A")
+        );
+    }
+
+    #[test]
+    fn phase_boundary_focus_shift_without_done() {
+        // No item reaches Done, but the active row changed A→B. A implicitly closed (rule 2).
+        let before = vec![
+            Todo::new("A", Status::InProgress),
+            Todo::new("B", Status::Pending),
+        ];
+        let after = vec![
+            Todo::new("A", Status::Pending),
+            Todo::new("B", Status::InProgress),
+        ];
+        assert_eq!(
+            phase_boundary_crossed(&before, &after).as_deref(),
+            Some("A")
+        );
+    }
+
+    #[test]
+    fn phase_boundary_none_when_unchanged() {
+        let list = vec![
+            Todo::new("A", Status::InProgress),
+            Todo::new("B", Status::Pending),
+        ];
+        assert_eq!(phase_boundary_crossed(&list, &list), None);
+    }
+
+    #[test]
+    fn phase_boundary_none_when_only_pending_added() {
+        // Adding a future task without moving focus is not a boundary.
+        let before = vec![Todo::new("A", Status::InProgress)];
+        let after = vec![
+            Todo::new("A", Status::InProgress),
+            Todo::new("B", Status::Pending),
+        ];
+        assert_eq!(phase_boundary_crossed(&before, &after), None);
+    }
+
+    #[test]
+    fn phase_boundary_batch_done_yields_one_label() {
+        // Model batch-marks several done at the end of a run: ONE label (the last), not three.
+        let before = vec![
+            Todo::new("A", Status::Done),
+            Todo::new("B", Status::InProgress),
+            Todo::new("C", Status::Pending),
+        ];
+        let after = vec![
+            Todo::new("A", Status::Done),
+            Todo::new("B", Status::Done),
+            Todo::new("C", Status::Done),
+        ];
+        // B and C are newly done; the last one scanned wins.
+        assert_eq!(
+            phase_boundary_crossed(&before, &after).as_deref(),
+            Some("C")
+        );
     }
 }

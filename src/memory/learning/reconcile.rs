@@ -335,8 +335,13 @@ fn guard_against_cycles(action: Action, removed: &std::collections::HashSet<Stri
 }
 
 // ── The same-chain tie-break ─────────────────────────────────────────────
+//
+// Complete and unit-tested, but not yet called from the reconcile pass: nothing feeds it candidate
+// pairs. Kept whole because the rule it encodes (freshness first, then specificity, re-anchor to the
+// common ancestor) is the decision, not the plumbing around it.
 
 /// Which of two place facts on the same inheritance chain survives, and where it re-anchors.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChainWinner {
     pub winner_id: String,
@@ -348,6 +353,7 @@ pub struct ChainWinner {
 
 /// The freshness key for the chain rule: the later of `lastUsed` and `updated`. Dates are
 /// `YYYY-MM-DD`, which sorts chronologically as a plain string.
+#[allow(dead_code)]
 fn freshness(e: &MemoryEntry) -> String {
     let a = e.last_used.as_deref().unwrap_or("");
     let b = e.updated.as_deref().unwrap_or("");
@@ -368,6 +374,7 @@ fn freshness(e: &MemoryEntry) -> String {
 /// facts disagreed about CONTENT, and silently narrowing the winner's scope as a side effect would
 /// change where it applies without saying so. Returns `None` when the pair is not on one chain (or
 /// is not a place pair at all), which is the caller's signal to leave the anchors alone.
+#[allow(dead_code)]
 pub fn resolve_chain(a: &MemoryEntry, b: &MemoryEntry) -> Option<ChainWinner> {
     if a.tier != Tier::Place || b.tier != Tier::Place {
         return None;

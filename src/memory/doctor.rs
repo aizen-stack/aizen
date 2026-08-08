@@ -38,6 +38,9 @@ pub enum Finding {
 
 impl Finding {
     /// The fact this finding is about (for grouping/sorting).
+    ///
+    /// The report currently prints findings in discovery order, so nothing groups by subject yet.
+    #[allow(dead_code)]
     pub fn subject(&self) -> &str {
         match self {
             Finding::OrphanPlace { id }

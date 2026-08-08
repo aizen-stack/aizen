@@ -51,7 +51,8 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | --- | --- |
 | `/help` | list commands |
 | `/model` | list the provider's models (with context windows) + arrow-key pick one |
-| `/config` | settings wizard: endpoint + key + model + context window + auto-compact |
+| `/provider [name|add|manage]` | one-pick switch among saved providers; add/edit/rename/delete in the same manager |
+| `/config` | provider-first settings: add/edit/switch connections, then assign providers/models to roles and specialists |
 | `/memory [query]` | show your profile, or search memory |
 | `/persona` | character the agent plays + its evolving self-memory: select · new · paste-to-create · view/reset self-memory |
 | `/skills` | saved procedures the agent can load: list · view · new · delete |
@@ -229,11 +230,12 @@ export AIZEN_API_KEY=sk-...
 export AIZEN_MODEL=gpt-4o-mini
 ```
 
-### `aizen config` — interactive setup (recommended)
-Run it with no subcommand for a guided setup: it asks for the base URL + API key, **fetches the
-model list from the provider, and lets you pick one**, then saves to `~/.aizen/cli-config.json`.
+### `aizen config` — provider-first setup (recommended)
+Run it with no subcommand for the config dashboard. **Providers & connection** is the first row: add a
+name, endpoint, API key, and default model once, then switch by choosing that named row. The same
+manager supports Use, Edit, Rename, and Delete; API keys are masked in every list/display.
 ```bash
-aizen config            # interactive: base URL → key → pick a model → saved
+aizen config            # Providers & connection → Add provider
 ```
 After this, `aizen chat`/`agent`/`workflow` work with **zero env vars**. Non-interactive equivalents:
 ```bash
@@ -241,6 +243,40 @@ aizen config set --base-url https://api.openai.com/v1 --api-key sk-... --model g
 aizen config show       # API key masked
 aizen config path
 ```
+
+Save complete URL + key + model profiles when you have more than one compatible gateway, then switch
+manually without restarting the REPL:
+
+```bash
+aizen config provider add primary --base-url https://api.openai.com/v1 --api-key sk-... --model gpt-4o-mini --use
+aizen config provider add backup --base-url https://backup.example/v1 --api-key bk-... --model model-x
+aizen config provider list
+aizen config provider use backup
+aizen config provider edit backup --base-url https://backup-2.example/v1 --api-key bk-2... --model model-y
+aizen config provider rename backup secondary
+```
+
+Inside the REPL, `/provider` is the fast one-pick switcher. `/provider add` opens the add wizard,
+`/provider manage` opens Use/Edit/Rename/Delete, and `/provider backup` switches directly. The next turn and health probe use the selected URL, key, and model. This is manual failover, not an
+automatic retry/failover chain. `AIZEN_BASE_URL`, `AIZEN_API_KEY`, and `AIZEN_MODEL` still override the
+saved selection; Aizen prints a note when those environment variables mask a switch.
+
+Changing an existing provider's endpoint asks for a new key instead of offering the previous
+endpoint's credential. Cancelling any wizard step leaves the complete saved profile unchanged.
+
+Sub-agent configuration uses the same provider list. In `/config` → **Sub-agents**, choose a saved
+provider and either its default model or a model override for Sub-agent default, Summarizer, Oracle,
+Apply, or an installed specialist. No endpoint/key is retyped. Scriptable specialist equivalent:
+
+```bash
+aizen agents set-provider code-reviewer backup              # provider default model
+aizen agents set-provider code-reviewer backup model-y      # model override
+aizen agents set-provider code-reviewer --clear             # inherit sub-agent default
+```
+
+Direct role URLs/keys, model→endpoint mappings, and endpoint fields in specialist cards remain
+supported as advanced compatibility overrides. Environment variables remain highest precedence;
+advanced overrides can therefore mask a provider selection and are labelled as such in `/config`.
 
 ### `aizen models` — list the provider's models
 ```bash

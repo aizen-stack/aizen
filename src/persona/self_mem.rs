@@ -201,9 +201,43 @@ fn stem_source(body: &str) -> &str {
 /// unrelated memories, so it would re-create the collision `stem_source` just removed.
 fn is_filler(word: &str) -> bool {
     const FILLER: &[&str] = &[
-        "todo", "poke", "session", "todos", "are", "still", "incomplete", "you", "may", "not",
-        "finish", "yet", "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "is", "it",
-        "this", "that", "with", "i", "me", "my", "user", "va", "la", "cua", "co", "khong", "cac",
+        "todo",
+        "poke",
+        "session",
+        "todos",
+        "are",
+        "still",
+        "incomplete",
+        "you",
+        "may",
+        "not",
+        "finish",
+        "yet",
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "to",
+        "of",
+        "in",
+        "on",
+        "for",
+        "is",
+        "it",
+        "this",
+        "that",
+        "with",
+        "i",
+        "me",
+        "my",
+        "user",
+        "va",
+        "la",
+        "cua",
+        "co",
+        "khong",
+        "cac",
     ];
     FILLER.contains(&word)
 }
@@ -635,6 +669,9 @@ pub fn classify_turn(user_text: &str, tool_calls: usize) -> Option<TurnSalience>
 }
 
 /// Backward-compatible importance helper (CLI `persona remember` + tests). Prefer [`classify_turn`].
+///
+/// The callers named above have all moved to `classify_turn`; kept for the scoring it documents.
+#[allow(dead_code)]
 pub fn episode_importance(user_text: &str, tool_calls: usize, corrected: bool) -> u8 {
     if corrected {
         return if user_text.chars().count() > 160 {

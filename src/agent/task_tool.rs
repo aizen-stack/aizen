@@ -492,9 +492,33 @@ impl TaskTool {
                 .filter(|s| !s.is_empty())
             {
                 if let Some(def) = crate::agents::load(slug) {
-                    let mut ep =
-                        self.resolve_endpoint(arg_model.clone().or_else(|| def.model.clone()));
-                    Self::apply_card_endpoint(&mut ep, &def);
+                    let local_route = crate::core::cli_config::agent_route(&def.slug());
+                    let has_local_route = local_route.is_some();
+                    let route_model = local_route
+                        .as_ref()
+                        .and_then(|(route, _)| route.model.clone());
+                    let mut ep = match (arg_model.clone(), local_route) {
+                        // An explicit task model changes only the model when the specialist has a
+                        // selected provider, so it never falls back to the parent's credentials.
+                        (Some(model), Some((_, mut route_ep))) => {
+                            route_ep.model = model;
+                            route_ep
+                        }
+                        (None, Some((_, route_ep))) => route_ep,
+                        (override_model, None) => {
+                            self.resolve_endpoint(override_model.or_else(|| def.model.clone()))
+                        }
+                    };
+                    // A local route is the user-facing source of truth. Legacy card endpoint fields
+                    // remain a fallback only when no local route was selected.
+                    if !has_local_route {
+                        Self::apply_card_endpoint(&mut ep, &def);
+                    }
+                    if arg_model.is_none() {
+                        if let Some(model) = route_model {
+                            ep.model = model;
+                        }
+                    }
                     let registry = crate::agent::builtin::agent_registry(&def, &self.root);
                     let system = build_agent_subagent_prompt(
                         &def,
@@ -2064,6 +2088,58 @@ mod tests {
         let d3 = t.resolve_dispatch(&serde_json::json!({"prompt": "x", "role": "planner"}));
         assert_eq!(d3.base_url, "http://localhost");
 
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
+    #[test]
+    fn specialist_provider_route_keeps_provider_when_model_is_overridden() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sandbox =
+            std::env::temp_dir().join(format!("aizen-agent-provider-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let _env = crate::core::config::EnvGuard::set([
+            ("USERPROFILE", sandbox.clone()),
+            ("HOME", sandbox.clone()),
+            ("AIZEN_HOME", sandbox.join(".aizen")),
+            ("AIZEN_PROJECT_ROOT", sandbox.join("proj")),
+        ]);
+        let dir = sandbox.join(".aizen/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("reviewer.md"),
+            "---\nname: Reviewer\nmodel: card-model\nbase_url: https://card/v1\n---\nbody",
+        )
+        .unwrap();
+        let mut cfg = crate::core::cli_config::CliConfig::default();
+        cfg.upsert_provider(
+            crate::core::cli_config::ProviderProfile::normalized(
+                "backup",
+                "https://backup/v1",
+                "backup-key",
+                "provider-model",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        cfg.set_agent_route("reviewer", Some("backup".into()), None)
+            .unwrap();
+        crate::core::cli_config::save(&cfg).unwrap();
+        let t = tool(0);
+        let d = t.resolve_dispatch(&serde_json::json!({"prompt":"x", "agent":"reviewer"}));
+        assert_eq!(
+            (d.model.as_str(), d.base_url.as_str(), d.api_key.as_str()),
+            ("provider-model", "https://backup/v1", "backup-key")
+        );
+        let d = t.resolve_dispatch(
+            &serde_json::json!({"prompt":"x", "agent":"reviewer", "model":"override-model"}),
+        );
+        assert_eq!(
+            (d.model.as_str(), d.base_url.as_str(), d.api_key.as_str()),
+            ("override-model", "https://backup/v1", "backup-key")
+        );
         drop(_env);
         let _ = std::fs::remove_dir_all(&sandbox);
     }

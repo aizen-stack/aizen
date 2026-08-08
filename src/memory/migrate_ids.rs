@@ -81,7 +81,10 @@ impl Report {
             self.renamed
         );
         if self.edges_rewritten > 0 {
-            s.push_str(&format!("; {} graph edge(s) re-pointed", self.edges_rewritten));
+            s.push_str(&format!(
+                "; {} graph edge(s) re-pointed",
+                self.edges_rewritten
+            ));
         }
         if let Some(p) = &self.mapping_path {
             s.push_str(&format!(" — old→new map: {}", p.display()));
@@ -191,8 +194,9 @@ pub fn apply(plan: &[Rename]) -> Report {
         Ok(p) => rep.mapping_path = Some(p),
         Err(e) => {
             // No record means no way back, so this is the one failure that stops the pass.
-            rep.warnings
-                .push(format!("could not write the old→new map ({e:#}) — nothing was renamed"));
+            rep.warnings.push(format!(
+                "could not write the old→new map ({e:#}) — nothing was renamed"
+            ));
             return rep;
         }
     }
@@ -245,7 +249,10 @@ pub fn apply(plan: &[Rename]) -> Report {
 fn write_mapping(plan: &[Rename]) -> anyhow::Result<PathBuf> {
     let dir = config::cli_memory_dir();
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!(".id-migration-{}.tsv", crate::memory::bloat::decay::today()));
+    let path = dir.join(format!(
+        ".id-migration-{}.tsv",
+        crate::memory::bloat::decay::today()
+    ));
     let mut s = String::with_capacity(plan.len() * 64);
     s.push_str("# old_id\tnew_id — written before any rename; `memory show <old>` will not work\n");
     for r in plan {
@@ -390,7 +397,11 @@ mod tests {
         );
         write(&config::entries_dir(), "auth-strategy", "Auth Strategy");
         write(&config::review_dir(), "m-y-windows", "Máy Windows");
-        write(&config::archive_dir(), &format!("{shredded}-r1"), "Người dùng giao tiếp bằng tiếng Việt");
+        write(
+            &config::archive_dir(),
+            &format!("{shredded}-r1"),
+            "Người dùng giao tiếp bằng tiếng Việt",
+        );
         std::fs::write(
             config::graph_path(),
             format!(
@@ -418,7 +429,9 @@ mod tests {
         assert!(config::entries_dir().join("auth-strategy.md").is_file());
         assert!(config::review_dir().join("may-windows.md").is_file());
         // The `-r1` revision suffix survives, or two archived copies would collide.
-        assert!(config::archive_dir().join(format!("{want}-r1.md")).is_file());
+        assert!(config::archive_dir()
+            .join(format!("{want}-r1.md"))
+            .is_file());
 
         let graph = std::fs::read_to_string(config::graph_path()).unwrap();
         assert!(graph.contains(want), "edge not re-pointed: {graph}");
@@ -433,7 +446,10 @@ mod tests {
         // The map exists and describes what moved.
         let map = std::fs::read_to_string(rep.mapping_path.as_ref().unwrap()).unwrap();
         assert!(map.contains(&format!("{shredded}\t{want}")), "map: {map}");
-        assert!(!map.contains("auth-strategy\t"), "unchanged id in map: {map}");
+        assert!(
+            !map.contains("auth-strategy\t"),
+            "unchanged id in map: {map}"
+        );
 
         // Second pass is a no-op: nothing left to rename.
         assert!(plan().is_empty(), "plan not empty on a migrated store");

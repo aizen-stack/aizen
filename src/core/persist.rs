@@ -44,6 +44,9 @@ impl FileFingerprint {
         }
     }
 
+    /// Six hex chars of the digest — a fingerprint short enough to put in a message. Conflict
+    /// reporting currently names the path instead, which is what a reader can act on.
+    #[allow(dead_code)]
     pub fn short_id(&self) -> String {
         self.sha256[..6]
             .iter()
@@ -60,6 +63,9 @@ pub struct WriteConflict {
 }
 
 impl WriteConflict {
+    /// The path that drifted. Read via the `Display` impl in practice, which formats the whole
+    /// conflict; this is the accessor for a caller that wants to branch on the path itself.
+    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -144,6 +150,10 @@ pub fn create_if_absent(path: &Path, bytes: &[u8]) -> Result<FileFingerprint> {
     compare_and_atomic_write(path, &FileFingerprint::missing(), bytes)
 }
 
+/// Delete `path` only if it still matches `expected` — the compare-and-swap of removal, so a
+/// concurrent writer's version is never destroyed. No deletion path needs the guard yet (retire and
+/// purge rewrite the store rather than unlinking files), so it goes unused.
+#[allow(dead_code)]
 pub fn remove_if_unchanged(path: &Path, expected: &FileFingerprint) -> Result<bool> {
     let actual = fingerprint(path)?;
     if &actual != expected {

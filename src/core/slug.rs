@@ -102,10 +102,44 @@ pub fn slug_first_words(text: &str, max_words: usize, max_chars: usize) -> Strin
 /// Vendor key prefixes, checked on the RAW token — stripping `-`/`_` first would erase the very
 /// evidence, turning `sk-…` into an innocent-looking `sk…`.
 const VENDOR_PREFIXES: &[&str] = &[
-    "sk-", "sk_", "pk-", "pk_", "rk_", "sk-ant-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_",
-    "github_pat_", "glpat-", "xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "aiza", "ya29.", "hf_",
-    "npm_", "sg.", "akia", "asia", "tvly-", "tvly_", "eyj", "dop_v1_", "shpat_", "sq0atp-",
-    "sq0csp-", "lin_api_", "figd_", "pplx-", "gsk_", "xai-", "or-v1-",
+    "sk-",
+    "sk_",
+    "pk-",
+    "pk_",
+    "rk_",
+    "sk-ant-",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "xoxb-",
+    "xoxa-",
+    "xoxp-",
+    "xoxr-",
+    "xoxs-",
+    "aiza",
+    "ya29.",
+    "hf_",
+    "npm_",
+    "sg.",
+    "akia",
+    "asia",
+    "tvly-",
+    "tvly_",
+    "eyj",
+    "dop_v1_",
+    "shpat_",
+    "sq0atp-",
+    "sq0csp-",
+    "lin_api_",
+    "figd_",
+    "pplx-",
+    "gsk_",
+    "xai-",
+    "or-v1-",
 ];
 
 /// A token that carries a known vendor key prefix. Narrow by design — no shape heuristic, so it can
@@ -181,7 +215,10 @@ mod tests {
             slug_words("Người dùng giao tiếp bằng tiếng Việt", MAX_ID_CHARS),
             "nguoi-dung-giao-tiep-bang-tieng-viet"
         );
-        assert_eq!(slug_words("Đường dẫn tới thư mục", MAX_ID_CHARS), "duong-dan-toi-thu-muc");
+        assert_eq!(
+            slug_words("Đường dẫn tới thư mục", MAX_ID_CHARS),
+            "duong-dan-toi-thu-muc"
+        );
     }
 
     /// Every Vietnamese vowel+tone combination folds to its bare ASCII letter, and `đ` is the one
@@ -202,7 +239,11 @@ mod tests {
         for (base, accented) in groups {
             for c in accented.chars() {
                 let got = fold_to_ascii(&c.to_string());
-                assert_eq!(got, base.to_string(), "{c:?} folded to {got:?}, want {base:?}");
+                assert_eq!(
+                    got,
+                    base.to_string(),
+                    "{c:?} folded to {got:?}, want {base:?}"
+                );
             }
             // Uppercase folds to the same lowercase base.
             let upper: String = accented.chars().flat_map(|c| c.to_uppercase()).collect();
@@ -217,21 +258,30 @@ mod tests {
     /// A cut must not leave a fragment that reads as a different word.
     #[test]
     fn cuts_at_a_word_boundary() {
-        let s = slug_words("nguoi dung giao tiep bang tieng viet va mong muon tra loi", 30);
+        let s = slug_words(
+            "nguoi dung giao tiep bang tieng viet va mong muon tra loi",
+            30,
+        );
         assert!(s.chars().count() <= 30, "{} chars", s.chars().count());
         assert!(!s.ends_with('-'));
         let src: Vec<&str> = "nguoi dung giao tiep bang tieng viet va mong muon tra loi"
             .split(' ')
             .collect();
         for w in s.split('-') {
-            assert!(src.contains(&w), "{w:?} is a fragment, not a whole word (from {s})");
+            assert!(
+                src.contains(&w),
+                "{w:?} is a fragment, not a whole word (from {s})"
+            );
         }
     }
 
     /// A single word past the cap has no boundary to back up to; it must still be bounded.
     #[test]
     fn caps_a_single_overlong_word() {
-        assert_eq!(slug_words(&"a".repeat(200), MAX_ID_CHARS).chars().count(), MAX_ID_CHARS);
+        assert_eq!(
+            slug_words(&"a".repeat(200), MAX_ID_CHARS).chars().count(),
+            MAX_ID_CHARS
+        );
     }
 
     /// Composed vs decomposed spellings of one name must produce one id, or a store written on
@@ -246,9 +296,18 @@ mod tests {
     /// or ids would keep changing on every startup.
     #[test]
     fn idempotent() {
-        for src in ["Người dùng giao tiếp", "Prefer pnpm over npm", "!!!", "a b  c"] {
+        for src in [
+            "Người dùng giao tiếp",
+            "Prefer pnpm over npm",
+            "!!!",
+            "a b  c",
+        ] {
             let once = slug_words(src, MAX_ID_CHARS);
-            assert_eq!(slug_words(&once, MAX_ID_CHARS), once, "not idempotent for {src:?}");
+            assert_eq!(
+                slug_words(&once, MAX_ID_CHARS),
+                once,
+                "not idempotent for {src:?}"
+            );
         }
     }
 
@@ -372,7 +431,10 @@ mod tests {
             "ghp_abcdefghijklmnopqrstuvwxyz0123",
             "AKIAIOSFODNN7EXAMPLE",
         ] {
-            assert!(has_vendor_key_prefix(keyish), "haystack scan missed: {keyish}");
+            assert!(
+                has_vendor_key_prefix(keyish),
+                "haystack scan missed: {keyish}"
+            );
         }
         // A bare `sk-` in prose is not a key — the length floor rejects it.
         assert!(!has_vendor_key_prefix("sk-test"));

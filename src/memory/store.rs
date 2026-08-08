@@ -1337,7 +1337,8 @@ mod tests {
     /// cut backs up to the last whole word.
     #[test]
     fn slugify_cuts_at_a_word_boundary_not_mid_word() {
-        let id = slugify("Người dùng giao tiếp bằng tiếng Việt và mong muốn trả lời bằng tiếng Việt");
+        let id =
+            slugify("Người dùng giao tiếp bằng tiếng Việt và mong muốn trả lời bằng tiếng Việt");
         assert!(
             id.chars().count() <= slug::MAX_ID_CHARS,
             "{} chars",

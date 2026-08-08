@@ -448,6 +448,10 @@ pub fn git_remote_origin(root: &Path) -> Option<String> {
 
 /// Where inside the project the user is working right now: cwd relative to the project root,
 /// `/`-normalized. `None` at the root (or outside it) — only a real subdir is a "region".
+///
+/// The memory tiers compute their own region from a `Lineage`, which they need anyway; this is the
+/// standalone answer for anything that just wants the current subpath.
+#[allow(dead_code)]
 pub fn current_subpath() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
     let rel = cwd.strip_prefix(project_root()).ok()?;
@@ -498,6 +502,11 @@ pub fn current_anchor() -> String {
 
 /// A human-friendly label for the current project (the git remote origin when available,
 /// else the directory name). Used in prompts and `/where`.
+///
+/// Both of those now print the resolved project ROOT rather than a derived label — after the slug
+/// rework, showing the path the identity actually keys on beats showing a prettier name that could
+/// disagree with it.
+#[allow(dead_code)]
 pub fn project_label() -> Option<String> {
     // Prefer the git remote origin
     let root = project_root();

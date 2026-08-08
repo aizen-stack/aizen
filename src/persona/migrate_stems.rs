@@ -181,8 +181,10 @@ pub fn apply_for(persona_slug: &str, plan: &[Rename]) -> Report {
             continue;
         }
         if to.exists() {
-            rep.warnings
-                .push(format!("'{}' already exists — left '{}' alone", r.new, r.old));
+            rep.warnings.push(format!(
+                "'{}' already exists — left '{}' alone",
+                r.new, r.old
+            ));
             continue;
         }
         match std::fs::rename(&from, &to) {
@@ -347,7 +349,12 @@ mod tests {
 
         let dir = home.join("personas").join("kira.self");
         let shredded = "in-ng-i-d-ng-giao-2";
-        write_mem(&dir, shredded, "insight", "Người dùng giao tiếp bằng tiếng Việt");
+        write_mem(
+            &dir,
+            shredded,
+            "insight",
+            "Người dùng giao tiếp bằng tiếng Việt",
+        );
         write_mem(
             &dir.join(".archive"),
             "ep-work-handled-b-y-gi",

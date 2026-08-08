@@ -7,6 +7,57 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-08-08
+
+Aizen now treats a provider as one reusable configuration object instead of making users coordinate
+an endpoint, key, model, role override, and specialist card separately. This release also restores
+mouse-wheel transcript scrolling, makes Ctrl-C useful for copying inside the retained terminal, and
+turns Time Machine's noisy per-edit snapshots into meaningful phase restore points.
+
+### Added
+- **Named provider profiles with one-pick manual failover.** A profile stores its name, endpoint,
+  API key, default model, and optional context window. `/provider` switches directly from a masked,
+  secret-safe list; `/provider add` and `/provider manage` expose Add, Use, Edit, Rename, and Delete
+  in the same surface. Scriptable equivalents live under `aizen config provider
+  add|edit|rename|use|list|remove`.
+- **Provider-aware sub-agent routing.** Sub-agent default, Summarizer, Oracle, Apply, and individual
+  specialist agents choose from the same saved provider list and may inherit the provider's default
+  model or set a model override. `aizen agents set-provider <agent> <provider> [model]` provides the
+  automation path; `--clear` returns to inheritance.
+- **Safe provider dependency management.** Renaming a profile atomically updates the active provider,
+  role assignments, and specialist routes. Removing a referenced provider is refused unless the CLI
+  is given `--replace-with` or an explicit `--force` clear, so config cannot acquire dangling refs.
+- **Immediate health feedback after a switch.** Activating a provider resets the health chip and runs
+  a one-shot probe immediately instead of waiting for the periodic poll.
+
+### Changed
+- **`/config` is provider-first.** The old parallel Connection/Providers paths are replaced by one
+  **Providers & connection** row. Editing the main model synchronizes it back into the active profile;
+  legacy direct role endpoints, model-to-endpoint mappings, and card endpoint fields remain available
+  as labelled advanced overrides.
+- **Time Machine checkpoints follow work phases, not individual edits.** A checkpoint is stamped when
+  a todo phase closes or an edited run passes verification. `last_good` therefore lands on a clean,
+  understandable boundary instead of one of many nearly-identical intermediate snapshots; repeated
+  verification failure also surfaces the existing rewind option once repair budget is running low.
+- **Mouse and clipboard behavior match terminal expectations.** The wheel scrolls the transcript or
+  active overlay again, except during a scrollbar-thumb drag. Drag-release still copies a selection;
+  Ctrl-C copies the highlighted transcript text (or the current draft), and a second Ctrl-C within two
+  seconds quits. The old floating right-click Copy menu is removed, leaving right-click available to
+  the terminal on Windows.
+
+### Fixed
+- **Changing an endpoint no longer offers or retains the previous endpoint's API key.** Provider edits
+  may keep the current key only when the normalized URL is unchanged; a different URL requires a new
+  key, and cancelling any wizard step leaves the saved tuple untouched.
+- **Specialist model overrides no longer lose the selected provider endpoint.** An explicit task model
+  changes only the model while retaining the locally assigned provider URL/key, and legacy card
+  endpoint metadata cannot overwrite a normal local provider route.
+- **Provider displays cannot leak credentials.** API keys are always masked and URL userinfo is
+  redacted across `/provider`, `/config`, `config show`, provider CLI output, and agent listings.
+- **Atomic writes use one implementation.** The duplicate edit-tool writer was removed in favor of the
+  shared persistence implementation, keeping crash-safe replacement and compare-before-write behavior
+  consistent across the binary.
+
 ## [0.5.9] — 2026-08-07
 
 One theme: **six places reported failure as success.** A sub-agent that never answered was labelled

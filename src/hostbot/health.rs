@@ -38,6 +38,11 @@ const DEFAULT_MAX_BUSY_SECS: u64 = 1800;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     /// Booting: listeners not up yet. Judged with the idle deadline.
+    ///
+    /// The daemon publishes its first beat once listeners are up, so it never reports this. It is
+    /// still parsed: a beat written by a future binary that does report it must be readable here, and
+    /// the string encoding exists precisely so that stays true.
+    #[allow(dead_code)]
     Starting,
     /// Waiting on the inbound channel — the beat must keep advancing.
     Idle,

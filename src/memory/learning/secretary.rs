@@ -410,6 +410,8 @@ pub struct ApplyReport {
 }
 
 impl ApplyReport {
+    /// Whether the pass changed nothing. Callers currently test the specific list they report on.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.confirmed.is_empty() && self.queued_review.is_empty()
     }

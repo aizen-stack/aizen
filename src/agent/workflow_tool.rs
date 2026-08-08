@@ -80,7 +80,10 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                 .filter(|a| !a.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("fanout mode requires a non-empty 'tasks' array"))?;
             if tasks_in.len() > 32 {
-                bail!("workflow caps at 32 tasks per call (got {})", tasks_in.len());
+                bail!(
+                    "workflow caps at 32 tasks per call (got {})",
+                    tasks_in.len()
+                );
             }
             let mut tasks = Vec::new();
             for (i, t) in tasks_in.iter().enumerate() {

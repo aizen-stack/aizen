@@ -47,6 +47,10 @@ pub fn arm(tx: UnboundedSender<String>) {
 }
 
 /// Is an aside worker running (i.e. are we in the interactive sticky REPL)?
+///
+/// `offer` already returns `false` when no worker is armed, so callers branch on that instead of
+/// asking first — one check rather than two, with no window between them.
+#[allow(dead_code)]
 pub fn is_available() -> bool {
     SENDER.get().is_some()
 }
@@ -88,8 +92,7 @@ pub fn build_messages(snapshot: &[Message], question: &str) -> Vec<Message> {
         .filter(|m| {
             (m.role == "user" || m.role == "assistant")
                 && m.tool_calls.is_empty()
-                && m
-                    .content
+                && m.content
                     .as_deref()
                     .map(|c| !c.trim().is_empty())
                     .unwrap_or(false)
@@ -100,7 +103,11 @@ pub fn build_messages(snapshot: &[Message], question: &str) -> Vec<Message> {
         let recap = tail[start..]
             .iter()
             .map(|m| {
-                let who = if m.role == "user" { "User" } else { "Assistant" };
+                let who = if m.role == "user" {
+                    "User"
+                } else {
+                    "Assistant"
+                };
                 let body = truncate_chars(m.content.as_deref().unwrap_or("").trim(), PER_MSG_CHARS);
                 format!("{who}: {body}")
             })
@@ -153,7 +160,13 @@ mod tests {
     fn build_messages_has_system_then_question_last() {
         let msgs = build_messages(&[], "what is a borrow checker?");
         assert_eq!(msgs.first().unwrap().role, "system");
-        assert!(msgs.first().unwrap().content.as_deref().unwrap().contains("SIDE QUESTION"));
+        assert!(msgs
+            .first()
+            .unwrap()
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("SIDE QUESTION"));
         let last = msgs.last().unwrap();
         assert_eq!(last.role, "user");
         assert_eq!(last.content.as_deref(), Some("what is a borrow checker?"));
@@ -181,7 +194,10 @@ mod tests {
             !recap.contains("file contents here"),
             "tool-result turns are dropped from the recap"
         );
-        assert_eq!(msgs[2].role, "assistant", "recap is folded as an acknowledged exchange");
+        assert_eq!(
+            msgs[2].role, "assistant",
+            "recap is folded as an acknowledged exchange"
+        );
         assert_eq!(
             msgs.last().unwrap().content.as_deref(),
             Some("wait, what language is this project in?")
@@ -197,7 +213,10 @@ mod tests {
         }
         let msgs = build_messages(&snapshot, "quick q");
         let recap = msgs[1].content.as_deref().unwrap();
-        assert!(recap.contains("message number 19"), "newest turn is present");
+        assert!(
+            recap.contains("message number 19"),
+            "newest turn is present"
+        );
         assert!(
             recap.contains(&format!("message number {}", 20 - CONTEXT_TAIL)),
             "the tail window starts CONTEXT_TAIL back"
@@ -213,7 +232,13 @@ mod tests {
         let big = "word ".repeat(1000); // ~5000 chars, well over PER_MSG_CHARS
         let msgs = build_messages(&[Message::assistant(big)], "q");
         let recap = msgs[1].content.as_deref().unwrap();
-        assert!(recap.ends_with('…'), "an oversized context turn is truncated with an ellipsis");
-        assert!(recap.chars().count() < 700, "clamped near PER_MSG_CHARS, not the full 5000");
+        assert!(
+            recap.ends_with('…'),
+            "an oversized context turn is truncated with an ellipsis"
+        );
+        assert!(
+            recap.chars().count() < 700,
+            "clamped near PER_MSG_CHARS, not the full 5000"
+        );
     }
 }
