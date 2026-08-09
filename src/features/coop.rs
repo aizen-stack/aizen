@@ -27,7 +27,7 @@
 //! instant, and the logical operation still torn. Three defenses, each at the layer that can see the
 //! problem:
 //!
-//! 1. **`file_edit` / `multi_edit`** match `old_string` against a FRESH read, so a rewritten region
+//! 1. **`file_edit`** (single or batch) matches `old_string` against a FRESH read, so a rewritten region
 //!    fails to match on its own. Nothing to add.
 //! 2. **`file_write` / `file_move --overwrite`** have no anchor — a whole-file overwrite whose CAS
 //!    passes against whatever is on disk right now. [`crate::core::read_ledger`] is the anchor: what

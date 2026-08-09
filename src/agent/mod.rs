@@ -230,18 +230,77 @@ pub fn build_system_prompt_bundle(
     PromptBundle { stable, dynamic }
 }
 
-/// The SLIM sub-agent base: static base (tiered) + `<environment>` + `<skills>` — deliberately NO
-/// soul / persona / self / user_memory (a focused sub-agent pays no identity-costume tax: up to
-/// ~1.1K tokens saved per spawn, and personal facts never leak into task context) and NO
-/// `<agents>` / auto `<project_context>` (top-level-only concerns). `include_project_context`
-/// opts a role in explicitly — build/test conventions are exactly what coder/tester need.
+/// The generic (role-less) sub-agent base, kept for tests and any caller with no role to scope by.
+/// Production dispatches go through [`build_role_scoped_subagent_base_prompt`] with the resolved
+/// role, which is the documented shape.
+#[cfg(test)]
+pub fn build_subagent_base_prompt(
+    cwd: &str,
+    os: &str,
+    date: &str,
+    model: &str,
+    include_project_context: bool,
+    task: Option<&str>,
+) -> String {
+    build_role_scoped_subagent_base_prompt(
+        "assistant",
+        cwd,
+        os,
+        date,
+        model,
+        include_project_context,
+        task,
+    )
+}
+
+/// Swap the top-level tool CATALOG for the capability family this role actually holds.
+///
+/// The catalog earns its ~7.3 KB at the top level: it is written once into a prefix the provider
+/// cache amortizes across a whole session, and the interactive model really can reach every tool in
+/// it. Neither is true of a child. Every dispatch is a fresh uncached request, so the catalog is
+/// re-billed per spawn — and a `reviewer` holds a read-only registry, so most of what the catalog
+/// describes (edit/write/shell/checkpoint/delegation/browser) is advice it cannot act on. Describing
+/// tools a child does not have is worse than silent: it invites a call that can only come back as
+/// "unknown tool".
+///
+/// The per-tool `ToolDef` descriptions still ride on the request, so selection guidance is not lost —
+/// only the duplicate prose. The `# Memory (your edge)` heading is the stable end marker; if either
+/// marker ever moves, the strip silently no-ops and the child simply keeps the old (larger) prompt,
+/// which is the safe direction to fail.
+fn append_role_tool_guidance(s: &mut String, role: &str) {
+    // The full top-level catalog is valuable once, in the interactive loop, but every child is a
+    // fresh uncached request. Remove it for the child path and replace it with the capability family
+    // the role can use; the ToolDef descriptions remain on the request itself.
+    if let (Some(start), Some(end)) = (s.find("# Tool catalog"), s.find("# Memory (your edge)")) {
+        if start < end {
+            s.replace_range(start..end, "");
+        }
+    }
+    s.push_str("\n\n# Available tools in this role\n");
+    match role {
+        "coder" => s.push_str("read/glob/search, LSP navigation and symbolic edits, file edits/writes/moves, shell, memory, web, skills\n"),
+        "tester" => s.push_str("read/glob/search, LSP navigation, shell, memory, web\n"),
+        "planner" | "reviewer" => s.push_str("read/glob/search, LSP navigation, memory, web\n"),
+        _ => s.push_str("read/glob/search, memory, web\n"),
+    }
+    s.push_str("Use only tools actually advertised in this request.\n");
+}
+
+/// The SLIM sub-agent base: static base (tiered, with the top-level catalog swapped for this role's
+/// capability family) + `<environment>` + `<skills>` — deliberately NO soul / persona / self /
+/// user_memory (a focused sub-agent pays no identity-costume tax: up to ~1.1K tokens saved per spawn,
+/// and personal facts never leak into task context) and NO `<agents>` / auto `<project_context>`
+/// (top-level-only concerns). `include_project_context` opts a role in explicitly — build/test
+/// conventions are exactly what coder/tester need.
 ///
 /// `task` is the sub-agent's assignment, when the caller has it. A sub-agent is spawned for ONE
 /// stated job, and unlike the REPL it gets no cached prefix to amortize a broad index across turns —
 /// every spawn re-bills the whole prompt. So when the task is known, the index is narrowed to the
 /// procedures that actually cover it ([`crate::skills::gated_index`]); `None` keeps the full
-/// applicable list, which is the right default when there is nothing to narrow against.
-pub fn build_subagent_base_prompt(
+/// applicable list, which is the right default when there is nothing to narrow against. The same
+/// no-cache-to-amortize logic is why [`append_role_tool_guidance`] trims the catalog here.
+pub(crate) fn build_role_scoped_subagent_base_prompt(
+    role: &str,
     cwd: &str,
     os: &str,
     date: &str,
@@ -257,7 +316,8 @@ pub fn build_subagent_base_prompt(
         PromptTier::Full => system_base(),
     };
     let mut s = String::from(base.trim_end());
-    s.push_str("\n\n<environment>\n");
+    append_role_tool_guidance(&mut s, role);
+    s.push_str("\n<environment>\n");
     s.push_str(&format!(
         "cwd: {cwd}\nos: {os}\ndate: {date}\nmodel: {model}\n"
     ));
@@ -428,7 +488,7 @@ pub struct AgentConfig {
     /// Stamp a time-machine checkpoint at each PHASE boundary (a todo reaching `done` / focus moving
     /// to a new `in_progress` item, or a clean verify gate after edits) rather than after every edit
     /// turn — so a run of N edits inside one phase yields ONE meaningful restore point, not N noise
-    /// snapshots. `note_last_good` is set at that mark, so `checkpoint_rewind target=last_good` lands
+    /// snapshots. `note_last_good` is set at that mark, so `checkpoint action=rewind target=last_good` lands
     /// at the last CLEAN phase. Best-effort + dedup'd (a zero-diff tree reuses the last snapshot), so
     /// a phase that only ran a build costs nothing. Requires `auto_checkpoint`; default `true`,
     /// forced `false` in tests (their cwd is a real repo). Field name kept for wire/back-compat; only
@@ -2279,22 +2339,18 @@ async fn execute_calls(
     // every tool in the registry is covered by the same repair. Fixes are traced, not silent.
     let parsed: Vec<Result<serde_json::Value, String>> = calls
         .iter()
-        .map(|tc| match parse_call_args(&tc.function.arguments) {
-            Ok(args) => {
-                let Some(tool) = registry.get(&tc.function.name) else {
-                    return Ok(args);
-                };
-                match tools::repair_args(&tool.parameters(), &args) {
-                    Some((fixed, what)) => {
-                        if !cfg.quiet {
+        .map(|tc| match prepare_call_args(registry, tc) {
+            Ok((args, repair)) => {
+                if let Some(what) = repair {
+                    if !cfg.quiet {
+                        if let Some(tool) = registry.get(&tc.function.name) {
                             emit_trace(&format!("→ {}: {what}", tool.name()));
                         }
-                        Ok(fixed)
                     }
-                    None => Ok(args),
                 }
+                Ok(args)
             }
-            other => other,
+            Err(e) => Err(e),
         })
         .collect();
     let safe: Vec<bool> = calls
@@ -2427,8 +2483,10 @@ async fn execute_calls(
                                     effect,
                                     crate::agent::tools::WorkspaceEffect::Paths
                                         | crate::agent::tools::WorkspaceEffect::OpaqueWorkspace
-                                ) || tool.name() == "checkpoint_rewind")
-                            {
+                                ) || crate::features::timemachine::is_rewind_call(
+                                    tool.name(),
+                                    args,
+                                )) {
                                 // The lane's own root, not the process cwd: `serve` runs lanes
                                 // concurrently, so a cwd read here would take the lease on whichever
                                 // directory another lane happened to be working in.
@@ -2454,9 +2512,10 @@ async fn execute_calls(
                             } else {
                                 None
                             };
-                            // `checkpoint_rewind` IS the recovery path — never nest a pre-edit
+                            // `checkpoint` action=rewind IS the recovery path — never nest a pre-edit
                             // snapshot of the broken tree before undoing it.
-                            let skip_pre_checkpoint = tool.name() == "checkpoint_rewind";
+                            let skip_pre_checkpoint =
+                                crate::features::timemachine::is_rewind_call(tool.name(), args);
                             let checkpoint_error = if let Some(error) = lease_error {
                                 Some(error)
                             } else if skip_pre_checkpoint {
@@ -2515,7 +2574,7 @@ async fn execute_calls(
                                         crate::features::coop::note_turn_base(snap.id);
                                         if !cfg.quiet {
                                             emit_trace(&format!(
-                                                "→ checkpoint #{} saved (agent: `checkpoint_rewind` target=pre_edit; human: `aizen time restore {}`)",
+                                                "→ checkpoint #{} saved (agent: `checkpoint` action=rewind target=pre_edit; human: `aizen time restore {}`)",
                                                 snap.id, snap.id
                                             ));
                                         }
@@ -2595,7 +2654,7 @@ fn turn_made_edits(
         // `shell_run` returns Ok("exit N\n…") even when the command FAILED (non-zero exit), so a
         // failed destructive shell op would otherwise arm the gate and let pre-existing breakage be
         // blamed on this turn. Only a clean `exit 0` counts as a real edit. (file_edit/file_write/
-        // multi_edit return Err → "error:" on failure, already excluded above.)
+        // file_edit returns Err → "error:" on failure, already excluded above.)
         if tc.function.name == "shell_run" {
             return result.starts_with("exit 0");
         }
@@ -2633,18 +2692,27 @@ pub fn eager_starter<'a>(
         if tc.function.arguments.trim().is_empty() {
             return None;
         }
-        let ok = parse_call_args(&tc.function.arguments)
-            .ok()
-            .and_then(|args| {
-                let tool = registry.get_arc(&tc.function.name)?;
-                (!tool.is_destructive() && tool.is_concurrency_safe_for(&args))
-                    .then_some((tool, args))
-            });
+        // REPAIR FIRST, then classify. `execute_calls` corrects argument-shape slips before it reads
+        // the arguments at all, so doing it here too is what keeps one call from taking two different
+        // behaviors depending on whether its arguments finished streaming early enough to be eligible
+        // for a head start (`{"message": …}` for a tool that wants `text` used to run repaired on the
+        // normal path and unrepaired here).
+        let ok = prepare_call_args(registry, tc).ok().and_then(|(args, _)| {
+            let tool = registry.get_arc(&tc.function.name)?;
+            (!tool.is_destructive() && tool.is_concurrency_safe_for(&args)).then_some((tool, args))
+        });
         let Some((tool, args)) = ok else {
             // First unsafe/unknown/unparseable call = the barrier: nothing after it starts early.
             barrier_hit.store(true, Relaxed);
             return None;
         };
+        // Still missing a required argument AFTER repair ⇒ the call cannot succeed, and its only
+        // possible output is the instructional schema error. Leave that to `execute_calls`, which
+        // emits it with the normal tool trace, instead of racing to produce the same error quietly.
+        // Not a barrier (the call is malformed, not unsafe), so later calls keep their head start.
+        if !tools::missing_required_strings(&tool.parameters(), &args).is_empty() {
+            return None;
+        }
         if started.fetch_add(1, Relaxed) >= MAX_PARALLEL {
             return None; // over the cap: run normally at execution time
         }
@@ -2664,6 +2732,24 @@ fn parse_call_args(raw: &str) -> Result<serde_json::Value, String> {
         return Ok(serde_json::json!({}));
     }
     serde_json::from_str(raw).map_err(|e| format!("error: invalid JSON arguments: {e}"))
+}
+
+/// Parse and repair one model tool call before any safety classification or execution. The repaired
+/// value is shared by the eager streaming path and the normal executor so a malformed-but-unambiguous
+/// call cannot take two different behaviors depending on whether its arguments finished streaming
+/// early.
+fn prepare_call_args(
+    registry: &ToolRegistry,
+    tc: &ToolCall,
+) -> Result<(serde_json::Value, Option<String>), String> {
+    let args = parse_call_args(&tc.function.arguments)?;
+    let Some(tool) = registry.get(&tc.function.name) else {
+        return Ok((args, None));
+    };
+    match tools::repair_args(&tool.parameters(), &args) {
+        Some((fixed, what)) => Ok((fixed, Some(what))),
+        None => Ok((args, None)),
+    }
 }
 
 /// The safety gate for a BARRIER call: the hard cmd_guard floor, then interactive approval.
@@ -2950,7 +3036,7 @@ fn stamp_phase_checkpoint(quiet: bool, label: &str) {
             crate::features::timemachine::note_last_good(snap.id);
             if !quiet {
                 emit_trace(&format!(
-                    "  └ checkpoint #{} — {label} (agent: `checkpoint_rewind` target=last_good; human: `aizen time restore {}`)",
+                    "  └ checkpoint #{} — {label} (agent: `checkpoint` action=rewind target=last_good; human: `aizen time restore {}`)",
                     snap.id, snap.id
                 ));
             }
@@ -2993,7 +3079,7 @@ fn tool_target(name: &str, args: &serde_json::Value) -> String {
         "shell_run" | "bash" | "powershell" | "shell" => {
             shell_target(field("command").or_else(|| field("cmd")).unwrap_or(""))
         }
-        "file_write" | "write_file" | "file_edit" | "edit_file" | "apply_patch" | "multi_edit"
+        "file_write" | "write_file" | "file_edit" | "edit_file" | "apply_patch"
         | "symbol_replace" | "symbol_insert" => base(
             field("path")
                 .or_else(|| field("file"))
@@ -3173,7 +3259,6 @@ fn is_edit_tool(name: &str) -> bool {
     matches!(
         name,
         "file_edit"
-            | "multi_edit"
             | "edit_file"
             | "apply_patch"
             | "file_write"
@@ -3281,10 +3366,6 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
                 let (a, d) = count_diff(out);
                 (true, format!("{} · +{a} −{d}", edit_target(first)))
             }
-        }
-        "multi_edit" => {
-            let (a, d) = count_diff(out);
-            (true, format!("{} · +{a} −{d}", edit_target(first)))
         }
         "file_write" | "write_file" => {
             // out first line = "created <path> (N line(s))" | "overwrote <path> (N line(s))"
@@ -4498,8 +4579,7 @@ fn tool_action(name: &str, args: &serde_json::Value) -> Option<String> {
             "Write {}",
             base(field("path").or_else(|| field("file")).unwrap_or(""))
         ),
-        "file_edit" | "edit_file" | "apply_patch" | "multi_edit" | "symbol_replace"
-        | "symbol_insert" => {
+        "file_edit" | "edit_file" | "apply_patch" | "symbol_replace" | "symbol_insert" => {
             format!(
                 "Edit {}",
                 base(
@@ -4615,7 +4695,7 @@ fn tool_trace(name: &str, args: &serde_json::Value) -> String {
     let field = |k: &str| args.get(k).and_then(|v| v.as_str());
     let salient = match name {
         "shell_run" | "bash" | "powershell" | "shell" => field("command").or_else(|| field("cmd")),
-        "file_edit" | "multi_edit" | "edit_file" | "file_write" | "write_file" | "apply_patch"
+        "file_edit" | "edit_file" | "file_write" | "write_file" | "apply_patch"
         | "symbol_replace" | "symbol_insert" => field("path")
             .or_else(|| field("file"))
             .or_else(|| field("symbol")),
@@ -7394,6 +7474,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eager_starter_repairs_unambiguous_args_before_execution() {
+        let r = registry();
+        let c = cfg();
+        let starter = eager_starter(&r, &c);
+        // The eager path must use the same schema repair as the normal executor. `echo` requires
+        // `text`; a single undeclared string key makes `message` an unambiguous alias.
+        let h = starter(0, &call("1", "echo", r#"{"message":"hello"}"#))
+            .expect("repairable read-only call should start eagerly");
+        assert_eq!(h.await.unwrap(), "hello");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execute_calls_adopts_eager_repaired_result() {
+        let r = registry();
+        let c = cfg();
+        let tc = call("1", "echo", r#"{"message":"hello"}"#);
+        let starter = eager_starter(&r, &c);
+        let h = starter(0, &tc).expect("repairable read-only call should start eagerly");
+        let mut sink = vec![Message::tool_result(
+            tc.id.clone(),
+            INTERRUPTED_TOOL_PLACEHOLDER.to_string(),
+        )];
+        let mut checkpointed = false;
+        let mut writer_lease = None;
+        let results = execute_calls(
+            &r,
+            &[tc],
+            &c,
+            &mut sink,
+            vec![(0, h)],
+            &mut checkpointed,
+            &mut writer_lease,
+        )
+        .await;
+        assert_eq!(results[0].1, "hello");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eager_starter_skips_ambiguous_repair() {
+        let r = registry();
+        let c = cfg();
+        let starter = eager_starter(&r, &c);
+        assert!(
+            starter(0, &call("1", "echo", r#"{"a":"x","b":"y"}"#)).is_none(),
+            "ambiguous args must wait for the normal executor to return an instructional error"
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unrepairable_missing_args_get_a_schema_bearing_error() {
         // Ambiguous (two strays) ⇒ no repair. The error must then TEACH: name the tool, state what it
         // requires, and echo what was sent, so the retry is informed rather than another guess.
@@ -9530,6 +9658,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn role_scoped_subagent_prompt_drops_top_level_catalog_tax() {
+        // The full-tier base carries the top-level `# Tool catalog`; a sub-agent prompt strips it and
+        // substitutes the role's own capability line. Measure against the RAW base (which still holds
+        // the catalog) — the generic `build_subagent_base_prompt` strips it too, so comparing the two
+        // stripped prompts would only show the role-line delta, not the reclaimed catalog.
+        let raw_base = system_base().trim_end().len();
+        let reviewer = build_role_scoped_subagent_base_prompt(
+            "reviewer",
+            "/w",
+            "linux",
+            "2026-06-20",
+            "m", // Full tier: `m` is not in any strict family / size list
+            false,
+            None,
+        );
+        assert!(
+            system_base().contains("# Tool catalog"),
+            "full base carries the catalog"
+        );
+        assert!(
+            !reviewer.contains("# Tool catalog"),
+            "sub-agent prompt drops it"
+        );
+        assert!(reviewer.contains("# Available tools in this role"));
+        assert!(reviewer.contains("LSP navigation"));
+        assert!(
+            reviewer.len() + 5_000 < raw_base,
+            "role-scoped prompt should reclaim the large catalog: raw_base={raw_base} scoped={}",
+            reviewer.len()
+        );
+    }
     #[test]
     fn top_level_prompt_adds_agents_block_and_keeps_base_prefix() {
         with_agent_sandbox("some", |root| {

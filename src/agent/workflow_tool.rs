@@ -26,6 +26,7 @@ use crate::agent::workflow::{
 };
 use anyhow::{bail, Result};
 use serde_json::Value;
+use std::path::PathBuf;
 
 pub struct WorkflowTool {
     client: reqwest::Client,
@@ -34,6 +35,8 @@ pub struct WorkflowTool {
     model: String,
     approval_mode: crate::core::approval::ApprovalMode,
     depth: usize,
+    root: PathBuf,
+    context_window: usize,
 }
 
 impl WorkflowTool {
@@ -44,6 +47,8 @@ impl WorkflowTool {
         model: String,
         approval_mode: crate::core::approval::ApprovalMode,
         depth: usize,
+        root: PathBuf,
+        context_window: usize,
     ) -> Self {
         Self {
             client,
@@ -52,6 +57,8 @@ impl WorkflowTool {
             model,
             approval_mode,
             depth,
+            root,
+            context_window,
         }
     }
 }
@@ -239,7 +246,15 @@ impl Tool for WorkflowTool {
                     // Restored on drop before control returns to the parent turn.
                     let _effort = crate::core::cli_config::suppress_effort_override();
                     tokio::runtime::Handle::current().block_on(run_workflow_collect(
-                        &client, &base, &key, &model, approval, &spec, synthesize,
+                        &client,
+                        &base,
+                        &key,
+                        &model,
+                        approval,
+                        &spec,
+                        synthesize,
+                        &self.root,
+                        self.context_window,
                     ))
                 })
             })
@@ -369,6 +384,8 @@ mod tests {
             "m".into(),
             crate::core::approval::ApprovalMode::Ask,
             1,
+            std::path::PathBuf::from("."),
+            0,
         );
         let err = t
             .execute(&serde_json::json!({"mode": "verify", "findings": ["x"]}))

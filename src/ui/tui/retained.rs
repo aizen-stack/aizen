@@ -1206,12 +1206,18 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 }
             }
         }
-        // Turn just ended (working true→false): a tool may have spawned a child that reset our
-        // console input mode, dropping mouse capture. Re-assert it (and raw mode + cursor hide) so the
-        // wheel keeps arriving as mouse events and the transcript stays scrollable. Idempotent — a
-        // terminal already in these modes ignores the repeat. Only on the edge, so it costs nothing
-        // during a turn or while idle.
-        if was_working && !state.working && session.is_some() {
+        // Keep mouse capture pinned for the WHOLE working window, not just its trailing edge. A tool
+        // can spawn a child process that resets our console input mode on Windows, silently dropping
+        // mouse capture mid-turn; from then on the terminal's "alternateScroll" leaks the wheel through
+        // as ↑/↓ keys, so scrolling walks input history instead of the transcript — the "sometimes the
+        // wheel scrolls inside the chat box" bug. The reset happens at an arbitrary point during the
+        // turn (whenever the child spawns), so an edge-only re-assert left the rest of the turn leaking.
+        // Children only ever run while WORKING, so re-assert raw mode + mouse capture + cursor-hide on
+        // every working tick (~110ms) and once more on the working→idle edge to catch the last child.
+        // All three are idempotent — a terminal already in these modes ignores the repeat, and the
+        // escapes are invisible mode-sets (no flicker, ~270 B/s while working). Idle ticks skip it
+        // entirely: nothing resets the mode while the user is just reading, so there's no cost there.
+        if session.is_some() && (state.working || was_working) {
             let _ = crossterm::terminal::enable_raw_mode();
             let _ = execute!(io::stdout(), EnableMouseCapture, Hide);
         }

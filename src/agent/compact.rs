@@ -144,7 +144,7 @@ pub fn context_touchpoints(history: &[Message]) -> Touchpoints {
             let args: serde_json::Value =
                 serde_json::from_str(&call.function.arguments).unwrap_or(serde_json::Value::Null);
             match call.function.name.as_str() {
-                "file_read" | "file_edit" | "file_write" | "multi_edit" => {
+                "file_read" | "file_edit" | "file_write" => {
                     if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
                         push(&mut tp.files, p);
                     }
@@ -563,7 +563,8 @@ mod tests {
                 r#"{"path":"src/main.rs","old_string":"a","new_string":"b"}"#,
             ),
             tool_call("file_write", r#"{"path":"src/new.rs","content":"x"}"#),
-            tool_call("multi_edit", r#"{"path":"src/ui/tui.rs","edits":[]}"#),
+            // The batch (`edits`) form of file_edit — same tool, same `path` argument.
+            tool_call("file_edit", r#"{"path":"src/ui/tui.rs","edits":[]}"#),
             tool_call("skill_load", r#"{"name":"deep-research"}"#),
             tool_call("shell_run", r#"{"command":"ls"}"#),
         ];

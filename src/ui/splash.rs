@@ -27,7 +27,7 @@ const TOOL_GROUPS: &[(&str, &str)] = &[
     ),
     (
         "files",
-        "file_read, file_glob, file_edit, multi_edit, search_files",
+        "file_read, file_glob, file_edit, file_write, search_files",
     ),
     ("shell", "shell_run, process"),
     ("web", "web_search, web_fetch, web_crawl"),

@@ -21,25 +21,38 @@ use crate::llm::client::ChatTurn;
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 // ── scripted model + fixture tools (production scope, not #[cfg(test)]) ─────────
 
-/// A scripted fake model: pops the next turn each call; empties → a final "stop". Ignores the
-/// messages it's handed (a fixture emits a fixed sequence), which is the whole point — the SCENARIO
-/// is the script, and the loop's own nudges can't derail a deterministic replay.
+#[derive(Debug, Default)]
+struct ScriptedStats {
+    model_calls: AtomicUsize,
+}
+
+/// A scripted fake model: pops the next turn each call; empties → a final "stop". It ignores the
+/// messages it receives by design, so the existing fixtures remain deterministic. The call counter
+/// is real instrumentation: the old report claimed loop metrics but never counted model calls.
 fn scripted(
     turns: Vec<ChatTurn>,
-) -> impl Fn(Vec<Message>, Vec<ToolDef>) -> std::future::Ready<Result<ChatTurn>> {
+) -> (
+    impl Fn(Vec<Message>, Vec<ToolDef>) -> std::future::Ready<Result<ChatTurn>>,
+    Arc<ScriptedStats>,
+) {
     let q = Mutex::new(VecDeque::from(turns));
-    move |_m, _d| {
+    let stats = Arc::new(ScriptedStats::default());
+    let seen = Arc::clone(&stats);
+    let f = move |_m: Vec<Message>, _d: Vec<ToolDef>| {
+        seen.model_calls.fetch_add(1, Ordering::Relaxed);
         let next = q
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pop_front()
             .unwrap_or_else(|| final_turn("stop"));
         std::future::ready(Ok(next))
-    }
+    };
+    (f, stats)
 }
 
 fn tool_turn(name: &str, args: &str) -> ChatTurn {
@@ -521,6 +534,15 @@ fn scenarios() -> Vec<Scenario> {
 
 // ── metrics ──────────────────────────────────────────────────────────────────
 
+/// Per-scenario measurements returned alongside the health verdict.
+#[derive(Debug, Default)]
+struct ScenarioStats {
+    model_calls: usize,
+    tool_calls: usize,
+    repeated_tool_turns: usize,
+    nudges: usize,
+}
+
 /// The Section-10 loop metrics, aggregated across the scenario set.
 #[derive(Default)]
 struct LoopMetrics {
@@ -536,6 +558,11 @@ struct LoopMetrics {
     unexpected_abnormal: usize,
     /// Sum of iterations over healthy-Done scenarios (for mean steps/task).
     done_iters: usize,
+    /// Per-scenario model calls, tool calls, repeated tool turns, and injected nudges.
+    model_calls: usize,
+    tool_calls: usize,
+    repeated_tool_turns: usize,
+    nudges: usize,
     /// Per-shape pass/total.
     by_shape: HashMap<&'static str, (usize, usize)>,
 }
@@ -563,8 +590,8 @@ fn eval_cfg() -> AgentConfig {
     }
 }
 
-/// Run one scenario against the REAL loop, return `(passed, iters, stop)`.
-async fn run_scenario(s: &Scenario) -> (bool, usize, StopReason) {
+/// Run one scenario against the REAL loop, return its health verdict, outcome, and measurements.
+async fn run_scenario(s: &Scenario) -> (bool, usize, StopReason, ScenarioStats) {
     // Serialize process-global todo mutations across scenarios.
     let _g = crate::agent::todo::TEST_LOCK
         .lock()
@@ -586,14 +613,10 @@ async fn run_scenario(s: &Scenario) -> (bool, usize, StopReason) {
 
     // Capture messages for expect_msg_contains via run_agent_loop on a local buffer.
     let mut messages = vec![Message::system("sys"), Message::user(s.user_task)];
-    let outcome = crate::agent::run_agent_loop(
-        scripted(clone_turns(&s.turns)),
-        &cfg,
-        &registry,
-        &mut messages,
-    )
-    .await
-    .expect("eval scenarios never error the loop itself");
+    let (chat, call_stats) = scripted(clone_turns(&s.turns));
+    let outcome = crate::agent::run_agent_loop(chat, &cfg, &registry, &mut messages)
+        .await
+        .expect("eval scenarios never error the loop itself");
 
     let stop_ok = outcome.stop == s.expect_stop;
     let iters_ok = s.max_iters.is_none_or(|m| outcome.iters <= m);
@@ -615,10 +638,44 @@ async fn run_scenario(s: &Scenario) -> (bool, usize, StopReason) {
     };
 
     crate::agent::todo::clear();
+    let mut stats = ScenarioStats {
+        model_calls: call_stats.model_calls.load(Ordering::Relaxed),
+        ..Default::default()
+    };
+    let mut previous_signature: Option<String> = None;
+    for m in &messages {
+        if m.role == "assistant" {
+            stats.tool_calls += m.tool_calls.len();
+            if !m.tool_calls.is_empty() {
+                let signature = m
+                    .tool_calls
+                    .iter()
+                    .map(|c| format!("{}:{}", c.function.name, c.function.arguments))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                if previous_signature.as_deref() == Some(signature.as_str()) {
+                    stats.repeated_tool_turns += 1;
+                }
+                previous_signature = Some(signature);
+            }
+        }
+        if m.role == "system"
+            && m.content.as_deref().is_some_and(|c| {
+                c.starts_with("[todo-poke]")
+                    || c.starts_with("[hill-climb]")
+                    || c.starts_with("You repeated the same tool")
+                    || c.starts_with("Recent turns added no new evidence")
+                    || c.starts_with("Context is nearly full")
+            })
+        {
+            stats.nudges += 1;
+        }
+    }
     (
         stop_ok && iters_ok && msg_ok && no_spurious_poke,
         outcome.iters,
         outcome.stop,
+        stats,
     )
 }
 
@@ -638,6 +695,54 @@ fn clone_turns(turns: &[ChatTurn]) -> Vec<ChatTurn> {
         .collect()
 }
 
+/// A small message-aware smoke fixture. The scripted suite proves state-machine invariants, but a
+/// harness can also regress by appending a nudge that the model ignores forever. This responder repeats
+/// one useless read until it sees the divergence nudge, then changes approach and finishes.
+async fn run_reactive_nudge_smoke() -> Result<(usize, usize)> {
+    let registry = eval_registry();
+    let cfg = eval_cfg();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let chat = move |messages: Vec<Message>, _defs: Vec<ToolDef>| {
+        let n = seen.fetch_add(1, Ordering::Relaxed);
+        let nudged = messages.iter().any(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|c| c.contains("You repeated the same tool call(s)"))
+        });
+        let turn = if !nudged && n < 2 {
+            tool_turn("const_read", r#"{"i":"same"}"#)
+        } else if nudged && n == 2 {
+            tool_turn("echo", r#"{"text":"changed approach"}"#)
+        } else {
+            final_turn("finished after changing approach")
+        };
+        std::future::ready(Ok(turn))
+    };
+    let mut messages = vec![
+        Message::system("sys"),
+        Message::user("reactive harness task"),
+    ];
+    let outcome = crate::agent::run_agent_loop(chat, &cfg, &registry, &mut messages).await?;
+    let nudges = messages
+        .iter()
+        .filter(|m| {
+            m.role == "system"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains("You repeated the same tool call(s)"))
+        })
+        .count();
+    if outcome.stop != StopReason::Done || nudges != 1 {
+        anyhow::bail!(
+            "reactive nudge smoke regressed: stop={:?}, nudges={nudges}, calls={}",
+            outcome.stop,
+            calls.load(Ordering::Relaxed)
+        );
+    }
+    Ok((calls.load(Ordering::Relaxed), nudges))
+}
+
 /// `aizen bench loop` entry point: run every scenario, print a report, exit non-zero if any regressed.
 /// Async because `main` already drives a Tokio runtime — we run on it rather than nesting one.
 pub async fn run() -> Result<()> {
@@ -649,7 +754,11 @@ pub async fn run() -> Result<()> {
     let mut failures: Vec<String> = Vec::new();
 
     for s in &scens {
-        let (passed, iters, stop) = run_scenario(s).await;
+        let (passed, iters, stop, stats) = run_scenario(s).await;
+        m.model_calls += stats.model_calls;
+        m.tool_calls += stats.tool_calls;
+        m.repeated_tool_turns += stats.repeated_tool_turns;
+        m.nudges += stats.nudges;
         let shape_entry = m.by_shape.entry(s.shape).or_insert((0, 0));
         shape_entry.1 += 1;
         if passed {
@@ -710,6 +819,15 @@ pub async fn run() -> Result<()> {
         },
         m.unexpected_abnormal,
         m.expected_done
+    );
+    println!(
+        "harness activity: {} model calls · {} tool calls · {} repeated tool turns · {} nudges",
+        m.model_calls, m.tool_calls, m.repeated_tool_turns, m.nudges
+    );
+    let (reactive_calls, reactive_nudges) = run_reactive_nudge_smoke().await?;
+    println!(
+        "reactive smoke: PASS ({} model calls · {} divergence nudge)",
+        reactive_calls, reactive_nudges
     );
 
     if !failures.is_empty() {

@@ -278,6 +278,12 @@ Direct role URLs/keys, model→endpoint mappings, and endpoint fields in special
 supported as advanced compatibility overrides. Environment variables remain highest precedence;
 advanced overrides can therefore mask a provider selection and are labelled as such in `/config`.
 
+Gateways differ in how they shape their streaming frames, and Aizen absorbs the differences quietly:
+a frame it cannot read strictly is retried leniently, and whatever is still unreadable is keepalive
+noise it drops without a word. If a new gateway ever *does* go quiet or lose tool calls on you, set
+`AIZEN_DEBUG_STREAM=1` to print the offending frames (capped at 3 per response plus a total) — that
+output is the useful thing to attach to a bug report.
+
 ### `aizen models` — list the provider's models
 ```bash
 aizen models                       # GET {base}/models, marks your default

@@ -7,6 +7,67 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-08-09
+
+A maintenance release about the parts of the agent that were quietly doing the wrong thing: a stream
+frame that could take a tool call down with it, a delegated workflow that resolved paths against the
+wrong directory, and a mouse wheel that scrolled the input box instead of the transcript. It also
+folds the tool surface down — one `file_edit` covering both the single and batch form, and two
+checkpoint tools instead of four — which is fewer schemas on every request.
+
+### Fixed
+- **A duplicate key in one streamed frame no longer drops the tool call riding with it.** Gateways
+  that mirror the reasoning channel into both `reasoning_content` and `reasoning` produced a serde
+  `duplicate field` error, and the rejected frame took whatever `content` or `tool_calls` arrived in
+  the same delta with it. The two spellings are now separate fields, read through one accessor, and
+  any frame that still fails a strict parse is retried leniently through `serde_json::Value`
+  (last-wins on duplicates) before being given up on.
+- **Unparseable-frame warnings no longer bury the session.** A mis-modelled delta shape breaks every
+  frame, so the old warn printed one line per streamed token over the live UI. Frames that survive
+  neither parse attempt are keepalive/ping noise and are dropped silently; set `AIZEN_DEBUG_STREAM=1`
+  to see them, capped at 3 per response and truncated to the informative head of the payload.
+- **The mouse wheel keeps scrolling the transcript for the whole turn.** A tool that spawns a child
+  process can reset the console input mode on Windows, dropping mouse capture mid-turn; from there
+  the terminal's `alternateScroll` leaks wheel ticks through as `↑`/`↓` keys, so scrolling walked
+  input history instead of the transcript. Capture was only re-asserted on the turn's trailing edge,
+  which left the rest of the turn leaking — it is now pinned across the entire working window.
+- **A delegated workflow resolves paths against its own lane root.** The model-callable `workflow`
+  tool read the process working directory, so concurrent lanes could read, edit, and checkpoint the
+  wrong project. The root and context window now arrive from the registry that built the tool.
+- **Workflow synthesis cannot park a fan-out forever.** The final non-streaming synthesis call had no
+  deadline — a socket that stays byte-alive but never completes has neither `read_timeout` nor an
+  inter-event watchdog to catch it. It now runs under the same call deadline as every other
+  background call, and reports a timeout as a failure rather than a cancel.
+- **Eagerly-started tool calls get the same argument repair as the normal path.** The streaming
+  fast-start path skipped schema repair, so a call the deferred executor would have fixed could fail
+  with a missing-argument error purely because it started early. Both paths now share one prepare
+  step, and a call whose repair is ambiguous or that changes safety classification falls back to the
+  normal executor.
+
+### Changed
+- **`multi_edit` is gone; `file_edit` does both.** Pass `edits[]` instead of `old_string`/`new_string`
+  to apply an ordered list of edits to one file in a single atomic write. One fewer schema on every
+  request, and one fewer decision for the model to get wrong.
+- **Four checkpoint tools collapse into two.** `checkpoint` takes an `action` of `save`, `rewind`, or
+  `restore` (all approval-gated); the read-only `checkpoint_view` takes `diff` or `list` and stays out
+  of the approval path. `aizen time …` and free-form `restore <id>` are unchanged for humans.
+- **Sub-agent prompts carry role-scoped tool guidance** instead of the full top-level catalog, so a
+  planner or reviewer child no longer pays for tools it was never granted.
+- **Workflow children inherit the parent's context window** and the tool-result clearing that goes
+  with it, rather than a default.
+
+### Internal
+- Tool registration and `classify_tool` are now checked against each other, so a tool cannot be
+  registered while being invisible to toolset filtering — the gap that let `codebase_search`,
+  `skill_forget`, `team_status`, `goal_complete`, and `bot_admin` bypass it.
+- `aizen bench loop` counts what it claimed to measure: model calls, tool calls, repeated call
+  signatures, nudges by kind, and context-management events. A reactive fake-model harness checks
+  that a nudge changes the model's approach instead of merely being appended.
+- The schema budget test measures the real top-level registry after delegation, persona, LSP, goal,
+  and config filtering, with separate ceilings for the minimal and maximal surfaces.
+- Workflow synthesis prompts have a total cap derived from the resolved context window, truncating
+  deterministically and naming what it dropped.
+
 ## [0.6.0] — 2026-08-08
 
 Aizen now treats a provider as one reusable configuration object instead of making users coordinate

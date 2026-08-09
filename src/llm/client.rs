@@ -522,6 +522,73 @@ fn stream_stall_timeout() -> std::time::Duration {
 /// on the blank case — see `stream_chat_with_tools_eager`.
 const STREAM_BLANK_RETRIES: u32 = 2;
 
+/// How many unparseable-frame warnings one stream may print before they collapse into a single
+/// count — and only ever under [`FRAME_DEBUG_ENV`], since the normal path prints none at all.
+///
+/// The failure this bounds is per-TOKEN, not occasional: when our model of a provider's delta shape
+/// is wrong, EVERY frame fails to parse, so an uncapped warn prints one line per streamed token and
+/// buries the session under hundreds of near-identical lines. A handful names the problem; the rest
+/// only repeat it.
+const MAX_FRAME_WARNS: usize = 3;
+
+/// Longest frame payload echoed in a warn line. A full SSE frame is one long JSON line that wraps
+/// across the whole terminal; the head is where the offending key is, and the tail teaches nothing.
+const FRAME_WARN_MAX: usize = 160;
+
+/// Opt-in switch for stream-frame diagnostics. Unset (the default) means a frame we cannot read is
+/// handled silently: see [`parse_chunk`] for why the remaining cases carry nothing worth a line.
+const FRAME_DEBUG_ENV: &str = "AIZEN_DEBUG_STREAM";
+
+/// Whether to narrate frames that survived neither parse attempt.
+fn frame_debug() -> bool {
+    std::env::var(FRAME_DEBUG_ENV)
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off" && v != "no"
+        })
+        .unwrap_or(false)
+}
+
+/// Shorten a frame payload for a warn line, cutting on a char boundary (frames carry UTF-8 text).
+fn truncate_frame(data: &str) -> String {
+    let data = data.trim();
+    if data.chars().count() <= FRAME_WARN_MAX {
+        return data.to_string();
+    }
+    let head: String = data.chars().take(FRAME_WARN_MAX).collect();
+    format!("{head}… ({} bytes total)", data.len())
+}
+
+/// Deserialize one SSE data frame into a [`ChatChunk`], strictly first and then LENIENTLY.
+///
+/// The lenient retry is the whole point. Deriving `Deserialize` on a struct makes serde reject an
+/// object outright on things that are not actually ambiguous on the wire — most importantly a
+/// DUPLICATE KEY, which OpenRouter-shaped gateways produce every time they mirror one value into two
+/// spellings of the same channel. A rejected frame is not just a warning: whatever `content` or
+/// `tool_calls` rode in that delta is dropped with it, and a lost tool-call fragment is a step the
+/// agent never takes.
+///
+/// Routing through [`serde_json::Value`] fixes that class generically, because its object map takes
+/// duplicate keys last-wins instead of erroring — so the retry succeeds without us having to predict
+/// which field a given gateway will double up next. It costs one extra allocation on a path that,
+/// when everything is well-shaped, is never taken.
+///
+/// What survives BOTH attempts is therefore not a chunk at all: keepalive/comment/`{"type":"ping"}`
+/// noise and other non-completion frames gateways interleave. Those carry nothing this loop wants,
+/// which is why the caller drops them silently unless [`FRAME_DEBUG_ENV`] is set.
+fn parse_chunk(data: &str) -> Result<ChatChunk, serde_json::Error> {
+    match serde_json::from_str::<ChatChunk>(data) {
+        Ok(chunk) => Ok(chunk),
+        Err(strict) => match serde_json::from_str::<serde_json::Value>(data) {
+            // Report the STRICT error on failure, not the lenient one: it names the offending key,
+            // while the second pass only says the value had the wrong shape.
+            Ok(value) => serde_json::from_value::<ChatChunk>(value).map_err(|_| strict),
+            Err(_) => Err(strict),
+        },
+    }
+}
+
 /// Tell the user the stream stalled and is being replayed. Routed through the TUI funnel: a raw
 /// `eprintln!` here would be painted over by the retained render thread.
 fn stream_retry_note(reason: &str, attempt: u32, max: u32, delay_ms: u64) {
@@ -825,6 +892,9 @@ pub async fn stream_chat_with_visual_contract(
     // BYTES, which keepalive frames defeat entirely. No replay here: this one-shot surface has no
     // eager handles to detach and its caller already prints the error.
     let stall = stream_stall_timeout();
+    // Rate-limit counter, same reason as the tool-calling path: a delta shape we mis-model breaks
+    // EVERY frame, and one warn per token buries the reply.
+    let mut bad_frames: usize = 0;
     loop {
         let event = match tokio::time::timeout(stall, stream.next()).await {
             Ok(Some(Ok(e))) => e,
@@ -850,7 +920,7 @@ pub async fn stream_chat_with_visual_contract(
             continue;
         }
 
-        match serde_json::from_str::<ChatChunk>(&event.data) {
+        match parse_chunk(&event.data) {
             Ok(chunk) => {
                 if let Some(choice) = chunk.choices.first() {
                     if let Some(content) = &choice.delta.content {
@@ -864,15 +934,29 @@ pub async fn stream_chat_with_visual_contract(
                     }
                 }
             }
-            // Tolerate keepalive / non-JSON frames rather than aborting the whole turn.
+            // Keepalive / ping / non-completion frames gateways interleave. Dropped SILENTLY: after
+            // `parse_chunk`'s lenient retry, what lands here carries nothing this loop consumes, and a
+            // line per frame is one line per token on a stream we merely fail to recognise.
             Err(e) => {
-                spin.take();
-                eprintln!("\n[warn] unparseable stream frame ({e}): {}", event.data);
+                bad_frames += 1;
+                if frame_debug() && bad_frames <= MAX_FRAME_WARNS {
+                    spin.take();
+                    eprintln!(
+                        "\n[warn] unparseable stream frame ({e}): {}",
+                        truncate_frame(&event.data)
+                    );
+                }
             }
         }
     }
 
     spin.take();
+    if frame_debug() && bad_frames > MAX_FRAME_WARNS {
+        eprintln!(
+            "[warn] {} more unparseable stream frames suppressed ({bad_frames} total this response)",
+            bad_frames - MAX_FRAME_WARNS
+        );
+    }
     let closing = md.finish();
     if !closing.is_empty() {
         print!("{closing}");
@@ -993,10 +1077,7 @@ fn resolve_content(m: &crate::core::types::RespMessage) -> Option<String> {
     if has_text || !m.tool_calls.is_empty() {
         return m.content.clone();
     }
-    m.reasoning_content
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+    m.reasoning_text()
         .map(str::to_string)
         .or_else(|| m.content.clone())
 }
@@ -1297,6 +1378,9 @@ pub async fn stream_chat_with_tools_eager(
         // Has this stream produced anything a retry would duplicate? Text, a tool-call fragment, or a
         // usage report all count. Governs both the watchdog's error wording and blank-stream replay.
         let mut produced = false;
+        // Unparseable frames seen this stream. Counted so the warn can be rate-limited: the shape that
+        // breaks parsing usually breaks EVERY frame, which is one line per token over the live UI.
+        let mut bad_frames: usize = 0;
         loop {
             let event = match tokio::time::timeout(idle_cap, stream.next()).await {
                 Ok(Some(Ok(e))) => e,
@@ -1326,7 +1410,7 @@ pub async fn stream_chat_with_tools_eager(
             if event.data.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<ChatChunk>(&event.data) {
+            match parse_chunk(&event.data) {
                 Ok(chunk) => {
                     // Record usage ONLY on the final chunk (choices empty). Spec-compliant OpenAI sends
                     // usage=null until then, but some gateways (vLLM/LiteLLM/OpenRouter) attach a
@@ -1343,7 +1427,7 @@ pub async fn stream_chat_with_tools_eager(
                         // A dedicated reasoning channel (`reasoning_content`/`reasoning`) is the model
                         // thinking out loud — suppress it entirely so output is uniform across models.
                         // (Clear the spinner: the model IS producing, just not user-facing text yet.)
-                        if choice.delta.reasoning_content.is_some() {
+                        if choice.delta.reasoning_text().is_some() {
                             spin.take();
                         }
                         if let Some(content) = &choice.delta.content {
@@ -1380,22 +1464,48 @@ pub async fn stream_chat_with_tools_eager(
                         }
                     }
                 }
+                // SILENT BY DEFAULT. What reaches here survived neither parse attempt, so it is not a
+                // completion chunk at all — it is the keepalive / comment / `{"type":"ping"}` noise
+                // gateways interleave, which this loop has nothing to do with. Narrating it taught the
+                // user nothing and, because the shape repeats per frame, printed one line per token
+                // over the live UI. The chunk-shaped failures that WERE worth knowing about (a
+                // duplicate key dropping a `content` or `tool_calls` delta) no longer land here at all:
+                // `parse_chunk` recovers them. Keep the diagnostic behind an env switch for the next
+                // time a gateway invents a shape.
                 Err(e) => {
-                    spin.take();
-                    // Gateways (vLLM/LiteLLM/OpenRouter) interleave keepalive / non-JSON frames mid-stream.
-                    // A raw `eprintln!` here writes straight to the terminal, bypassing the retained render
-                    // thread → corrupts the pinned frame ("breaks during work"). Route through the TUI funnel
-                    // when it owns the screen; only fall back to stderr when it doesn't.
-                    let warn = format!("[warn] unparseable stream frame ({e}): {}", event.data);
-                    if crate::ui::tui::active() {
-                        crate::ui::tui::emit_line(&crate::ui::theme::faint(warn).to_string());
-                    } else {
-                        eprintln!("\n{warn}");
+                    bad_frames += 1;
+                    if frame_debug() && bad_frames <= MAX_FRAME_WARNS {
+                        // A raw `eprintln!` would bypass the retained render thread and corrupt the
+                        // pinned frame, so route through the TUI funnel when it owns the screen.
+                        let warn = format!(
+                            "[warn] unparseable stream frame ({e}): {}",
+                            truncate_frame(&event.data)
+                        );
+                        if crate::ui::tui::active() {
+                            crate::ui::tui::emit_line(&crate::ui::theme::faint(warn).to_string());
+                        } else {
+                            eprintln!("\n{warn}");
+                        }
                     }
                 }
             }
         }
         spin.take(); // stream ended (e.g. empty turn) — ensure the spinner is gone
+                     // Debug-only tally, for the same reason the per-frame lines are: these frames are
+                     // gateway noise, so a count of them on a healthy turn is a number the user cannot act
+                     // on. Under the env switch it tells whoever is diagnosing a new gateway how wide the
+                     // mismatch is.
+        if frame_debug() && bad_frames > MAX_FRAME_WARNS {
+            let line = format!(
+                "[warn] {} more unparseable stream frames suppressed ({bad_frames} total this response)",
+                bad_frames - MAX_FRAME_WARNS
+            );
+            if crate::ui::tui::active() {
+                crate::ui::tui::emit_line(&crate::ui::theme::faint(line).to_string());
+            } else {
+                eprintln!("\n{line}");
+            }
+        }
         let tail = think.finish();
         if !tail.is_empty() {
             full.push_str(&tail);
@@ -2087,16 +2197,127 @@ mod tests {
 
     #[test]
     fn delta_captures_both_reasoning_field_names() {
-        // DeepSeek-style `reasoning_content` and OpenRouter-style `reasoning` both land in the field.
+        // DeepSeek-style `reasoning_content` and OpenRouter-style `reasoning` both resolve to the
+        // same channel, whichever spelling the provider used.
         let a: crate::core::types::Delta =
             serde_json::from_str(r#"{"reasoning_content":"thinking…"}"#).unwrap();
-        assert_eq!(a.reasoning_content.as_deref(), Some("thinking…"));
+        assert_eq!(a.reasoning_text(), Some("thinking…"));
         let b: crate::core::types::Delta =
             serde_json::from_str(r#"{"reasoning":"thinking…"}"#).unwrap();
-        assert_eq!(b.reasoning_content.as_deref(), Some("thinking…"));
+        assert_eq!(b.reasoning_text(), Some("thinking…"));
         // Plain content chunk leaves the reasoning channel empty.
         let c: crate::core::types::Delta = serde_json::from_str(r#"{"content":"hi"}"#).unwrap();
-        assert!(c.reasoning_content.is_none());
+        assert!(c.reasoning_text().is_none());
+    }
+
+    #[test]
+    fn delta_with_both_reasoning_spellings_still_parses() {
+        // THE BUG. The two spellings used to be ONE field plus `#[serde(alias = "reasoning")]`, so a
+        // provider that mirrors its reasoning text into BOTH keys of a single delta — which
+        // OpenRouter-shaped gateways do — was a serde `duplicate field` error. serde rejects the
+        // whole object, so the frame was DISCARDED, and the loop printed
+        // `[warn] unparseable stream frame (duplicate field ...)` once per streamed reasoning token
+        // over the live UI. Two separate fields cannot collide.
+        let d: crate::core::types::Delta = serde_json::from_str(
+            r#"{"content":null,"reasoning":" ch","reasoning_content":" ch",
+                "reasoning_details":[{"format":"unknown"}]}"#,
+        )
+        .expect("both spellings in one delta must parse");
+        assert_eq!(d.reasoning_text(), Some("ch"));
+
+        // The real cost was never the noise: anything riding in the SAME delta died with the frame.
+        // A tool call lost this way is a step the agent never takes.
+        let d: crate::core::types::Delta = serde_json::from_str(
+            r#"{"reasoning":"x","reasoning_content":"x",
+                "tool_calls":[{"index":0,"id":"c1","function":{"name":"file_read","arguments":"{}"}}]}"#,
+        )
+        .expect("a tool-call fragment must survive a mirrored reasoning delta");
+        assert_eq!(d.tool_calls.len(), 1);
+        assert_eq!(
+            d.tool_calls[0].function.as_ref().unwrap().name.as_deref(),
+            Some("file_read")
+        );
+
+        // Same shape on the non-streaming path, where a dropped message is a whole dead turn.
+        let m = resp_msg(
+            r#"{"content":null,"reasoning":"the answer","reasoning_content":"the answer"}"#,
+        );
+        assert_eq!(resolve_content(&m).as_deref(), Some("the answer"));
+    }
+
+    #[test]
+    fn parse_chunk_recovers_a_duplicate_key_frame() {
+        // A gateway that mirrors one value into two spellings of the same channel emits a literal
+        // duplicate key once the two spellings map to one field. Deriving `Deserialize` rejects the
+        // whole object there — dropping whatever `content`/`tool_calls` shared that delta — so the
+        // lenient pass routes through `Value`, whose object map takes duplicate keys last-wins.
+        let dup = r#"{"choices":[{"delta":{"content":"hi","content":"hi"}}]}"#;
+        assert!(
+            serde_json::from_str::<ChatChunk>(dup).is_err(),
+            "precondition: the strict derive must reject a duplicate key",
+        );
+        let chunk = parse_chunk(dup).expect("lenient pass recovers the frame");
+        assert_eq!(
+            chunk.choices[0].delta.content.as_deref(),
+            Some("hi"),
+            "the payload riding in that delta must survive",
+        );
+
+        // The shape from the report: both reasoning spellings plus a tool-call fragment in one delta.
+        // The fragment is the part that matters — a lost one is a step the agent never takes.
+        let real = r#"{"choices":[{"delta":{"reasoning":" ch","reasoning_content":" ch",
+            "tool_calls":[{"index":0,"id":"c1","function":{"name":"file_read","arguments":"{}"}}]}}]}"#;
+        let chunk = parse_chunk(real).expect("mirrored reasoning + tool call must parse");
+        assert_eq!(chunk.choices[0].delta.reasoning_text(), Some("ch"));
+        assert_eq!(chunk.choices[0].delta.tool_calls.len(), 1);
+
+        // Well-shaped frames still take the strict path unchanged.
+        let ok = r#"{"choices":[{"delta":{"content":"x"}}]}"#;
+        assert_eq!(
+            parse_chunk(ok).unwrap().choices[0].delta.content.as_deref(),
+            Some("x"),
+        );
+
+        // Genuine non-chunks stay errors — the caller drops them, it must not treat them as content.
+        assert!(parse_chunk(": keepalive").is_err());
+        assert!(parse_chunk(r#"{"choices":"not-an-array"}"#).is_err());
+        // The reported error names the offending key (the strict one), not the vaguer second pass.
+        let e = parse_chunk(r#"{"choices":[{"delta":{"content":"a","content":1}}]}"#).unwrap_err();
+        assert!(e.to_string().contains("duplicate field"), "err: {e}");
+    }
+
+    #[test]
+    fn frame_diagnostics_are_off_unless_the_env_switch_is_truthy() {
+        // The default must be silent: these frames are gateway noise, and one line per frame is one
+        // line per token painted over a live turn. Serial-safe — no other test reads this var.
+        let prev = std::env::var(FRAME_DEBUG_ENV).ok();
+        std::env::remove_var(FRAME_DEBUG_ENV);
+        assert!(!frame_debug(), "unset must mean silent");
+        for off in ["", "0", "false", "off", "no", " OFF "] {
+            std::env::set_var(FRAME_DEBUG_ENV, off);
+            assert!(!frame_debug(), "{off:?} must read as off");
+        }
+        for on in ["1", "true", "yes", "please"] {
+            std::env::set_var(FRAME_DEBUG_ENV, on);
+            assert!(frame_debug(), "{on:?} must read as on");
+        }
+        match prev {
+            Some(v) => std::env::set_var(FRAME_DEBUG_ENV, v),
+            None => std::env::remove_var(FRAME_DEBUG_ENV),
+        }
+    }
+
+    #[test]
+    fn frame_warn_payload_is_truncated_on_a_char_boundary() {
+        // Frames carry UTF-8 (the user's own prose comes back as reasoning), so a byte-index cut
+        // would panic mid-codepoint on exactly the streams this warn exists to describe.
+        let short = r#"{"choices":[]}"#;
+        assert_eq!(truncate_frame(short), short);
+
+        let long = format!(r#"{{"reasoning":"{}"}}"#, "ườ".repeat(200));
+        let cut = truncate_frame(&long);
+        assert!(cut.chars().count() <= FRAME_WARN_MAX + 32, "cut: {cut}");
+        assert!(cut.contains("bytes total"), "cut: {cut}");
     }
 
     /// Deserialize a non-streaming `message` object the way `chat_with_tools` does.
@@ -2118,7 +2339,7 @@ mod tests {
             .as_deref(),
             Some("the answer"),
         );
-        // OpenRouter spells the same channel `reasoning` (serde alias).
+        // OpenRouter spells the same channel `reasoning` — a separate field, resolved together.
         assert_eq!(
             resolve_content(&resp_msg(r#"{"reasoning":"the answer"}"#)).as_deref(),
             Some("the answer"),

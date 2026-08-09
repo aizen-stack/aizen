@@ -158,7 +158,7 @@ pub fn rewind_run(target: RewindTarget) -> Result<Snapshot> {
         (id, g.rewinds_used)
     };
     // Lease-free restore: the agent loop already holds the workspace writer lease for
-    // `checkpoint_rewind` (see execute_calls), and re-acquiring it via the public `restore()` would
+    // a `checkpoint` action=rewind call (see execute_calls), and re-acquiring it via the public `restore()` would
     // self-deadlock — `LockFileEx`/`flock` are per-handle, non-reentrant, so a second acquire of the
     // same `workspace.lock` blocks until timeout → spurious `Busy`. `restore_in` takes only the
     // store/metadata locks, which are a different namespace, so it is safe under the held lease.
@@ -182,22 +182,22 @@ pub fn recovery_hint() -> Option<String> {
     match (s.pre_edit, s.last_good) {
         (None, None) => None,
         (Some(p), Some(l)) if p == l => Some(format!(
-            "If this approach is wrong, call `checkpoint_rewind` with target=\"pre_edit\" to restore checkpoint #{p} \
+            "If this approach is wrong, call `checkpoint` action=\"rewind\" target=\"pre_edit\" to restore checkpoint #{p} \
              (working tree before this run's edits; {left} rewind left).",
             left = s.rewinds_left
         )),
         (Some(p), Some(l)) => Some(format!(
-            "If this approach is wrong, call `checkpoint_rewind`: target=\"last_good\" → #{l} (last good step) or \
+            "If this approach is wrong, call `checkpoint` action=\"rewind\": target=\"last_good\" → #{l} (last good step) or \
              target=\"pre_edit\" → #{p} (before this run's edits). {left} rewind(s) left this run.",
             left = s.rewinds_left
         )),
         (Some(p), None) => Some(format!(
-            "If this approach is wrong, call `checkpoint_rewind` with target=\"pre_edit\" to restore checkpoint #{p} \
+            "If this approach is wrong, call `checkpoint` action=\"rewind\" target=\"pre_edit\" to restore checkpoint #{p} \
              ({left} rewind left).",
             left = s.rewinds_left
         )),
         (None, Some(l)) => Some(format!(
-            "If this approach is wrong, call `checkpoint_rewind` with target=\"last_good\" to restore checkpoint #{l} \
+            "If this approach is wrong, call `checkpoint` action=\"rewind\" target=\"last_good\" to restore checkpoint #{l} \
              ({left} rewind left).",
             left = s.rewinds_left
         )),
@@ -1704,7 +1704,7 @@ fn no_repo_here(consequence: &str) -> String {
 /// "Checkpoints are simply off here" — either the directory isn't a repo, or there is no git
 /// executable at all. Both must degrade to no-checkpoint instead of failing the caller: the
 /// git-missing case used to propagate as a hard error, and because the protected-edit gate runs
-/// before every mutation, that refused EVERY `file_write`/`multi_edit` on a gitless machine
+/// before every mutation, that refused EVERY `file_write`/`file_edit` on a gitless machine
 /// while blaming "the pre-edit checkpoint".
 fn benign_no_checkpoint(e: &anyhow::Error) -> bool {
     e.to_string().contains("not a git repository") || crate::core::gitx::is_git_missing(e)
@@ -2767,21 +2767,84 @@ pub fn doctor_gc() -> Result<DoctorReport> {
     doctor()
 }
 
+/// Which mutating Time Machine operation a `checkpoint` call selects. All three share
+/// `is_destructive` (approval-gated) and the serial path, which is exactly why they can live in ONE
+/// tool: the trait's `is_destructive` is a constant, so mixing in the read-only `list`/`diff` would
+/// have forced those behind an approval prompt. They stay in `checkpoint_view`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointAction {
+    Save,
+    Rewind,
+    Restore,
+}
+
+impl CheckpointAction {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "save" | "create" | "pin" | "snapshot" => Some(Self::Save),
+            "rewind" | "undo" => Some(Self::Rewind),
+            "restore" => Some(Self::Restore),
+            _ => None,
+        }
+    }
+}
+
+/// Read the `action` of a `checkpoint` call. Kept module-level (not a method) so the agent loop can
+/// ask "is this call a rewind?" without duplicating the alias table — see [`is_rewind_call`].
+fn checkpoint_action(args: &serde_json::Value) -> Option<CheckpointAction> {
+    args.get("action")
+        .and_then(|v| v.as_str())
+        .and_then(CheckpointAction::parse)
+}
+
+/// Is this tool call the run-scoped rewind — the RECOVERY path? The agent loop needs to know two
+/// things about it that no other call shares: it must take the workspace writer lease even though
+/// it is not a plain path write, and it must NOT be preceded by a pre-edit checkpoint (snapshotting
+/// the broken tree before undoing it is exactly what the rewind is escaping). Before the merge those
+/// were `tool.name() == "checkpoint_rewind"` string checks; now the action decides.
+pub fn is_rewind_call(tool_name: &str, args: &serde_json::Value) -> bool {
+    tool_name == "checkpoint" && checkpoint_action(args) == Some(CheckpointAction::Rewind)
+}
+
+/// The mutating half of the Time Machine surface: `save` (pin a restore point), `rewind` (undo this
+/// run's own edits from a recovery anchor), `restore` (go back to any checkpoint by id). One tool
+/// rather than three — the model picks an `action` instead of picking between three sibling names,
+/// and the schema is advertised once per turn instead of three times.
 pub struct Checkpoint;
 impl crate::agent::tools::Tool for Checkpoint {
     fn name(&self) -> &str {
         "checkpoint"
     }
     fn description(&self) -> &str {
-        "Create an explicit Time Machine checkpoint (private store). Use before high-risk work the \
-         runtime won't auto-catch. The runtime already auto-checkpoints before the first edit and \
-         after each successful edit — don't duplicate those. To undo a bad approach THIS run, use \
-         `checkpoint_rewind` (not free-form restore)."
+        "Time Machine writes, by `action`. `save`: pin a restore point before high-risk work (the \
+         runtime already auto-checkpoints around edits — don't duplicate). `rewind`: undo THIS \
+         run's edits to an anchor (`target`, max 2/run) when the approach broke the tree. \
+         `restore`: go back to a checkpoint `id`, including from an earlier turn, which rewind \
+         cannot reach. Files change on disk, chat does not — re-read afterwards. To look first, \
+         use `checkpoint_view`."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
-            "properties": {"label": {"type": "string", "description": "short note, e.g. 'before refactor auth'"}},
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["save", "rewind", "restore"],
+                    "description": "save = pin a restore point; rewind = undo this run's edits from an anchor; restore = go back to a checkpoint id"
+                },
+                "label": {"type": "string", "description": "save only: short note, e.g. 'before refactor auth'"},
+                "target": {
+                    "type": "string",
+                    "enum": ["last_good", "pre_edit"],
+                    "description": "rewind only: last_good = last successful step this run; pre_edit = tree before the first edit this run"
+                },
+                "id": {"type": "integer", "minimum": 1, "description": "restore only: checkpoint id from `checkpoint_view`"},
+                "reason": {
+                    "type": "string",
+                    "description": "rewind/restore: one short line on why (shown in the tool result)"
+                }
+            },
+            "required": ["action"],
             "additionalProperties": false
         })
     }
@@ -2791,10 +2854,33 @@ impl crate::agent::tools::Tool for Checkpoint {
     fn is_concurrency_safe(&self) -> bool {
         false
     }
-    fn workspace_effect(&self, _args: &serde_json::Value) -> crate::agent::tools::WorkspaceEffect {
-        crate::agent::tools::WorkspaceEffect::RepoMetadata
+    fn workspace_effect(&self, args: &serde_json::Value) -> crate::agent::tools::WorkspaceEffect {
+        // Args-aware, unlike `is_destructive`: a save only writes the private store (RepoMetadata),
+        // while rewind/restore rewrite the working tree (Paths) and must take the writer lease. An
+        // unparseable action falls back to Paths — the stricter of the two.
+        match checkpoint_action(args) {
+            Some(CheckpointAction::Save) => crate::agent::tools::WorkspaceEffect::RepoMetadata,
+            _ => crate::agent::tools::WorkspaceEffect::Paths,
+        }
     }
     fn execute(&self, args: &serde_json::Value) -> Result<String> {
+        let Some(action) = checkpoint_action(args) else {
+            let raw = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            return Ok(format!(
+                "error: `action` must be \"save\", \"rewind\", or \"restore\" (got {raw:?}). \
+                 To list or diff checkpoints use `checkpoint_view`."
+            ));
+        };
+        match action {
+            CheckpointAction::Save => self.save_point(args),
+            CheckpointAction::Rewind => self.rewind(args),
+            CheckpointAction::Restore => self.restore(args),
+        }
+    }
+}
+
+impl Checkpoint {
+    fn save_point(&self, args: &serde_json::Value) -> Result<String> {
         if !is_repo() {
             return Ok(no_repo_here(
                 "checkpoints need one. If the files you mean are in a project elsewhere, work from \
@@ -2810,66 +2896,25 @@ impl crate::agent::tools::Tool for Checkpoint {
         // Explicit saves also count as last_good within the run (model just pinned a known-good tree).
         note_last_good(snap.id);
         Ok(format!(
-            "checkpoint #{} saved ({}). Run-scoped rewind: `checkpoint_rewind` target=last_good|pre_edit. \
+            "checkpoint #{} saved ({}). Run-scoped rewind: action=rewind target=last_good|pre_edit. \
              Human free-form: `aizen time restore {}`.",
             snap.id,
             if snap.label.is_empty() { "no label" } else { &snap.label },
             snap.id
         ))
     }
-}
 
-/// Agent-only, run-scoped rewind. Restores ONLY the pre-edit or last-good anchor of the current
-/// agent run — never arbitrary snapshot ids (those stay human/CLI). Cap: [`MAX_RUN_REWINDS`].
-pub struct CheckpointRewind;
-impl crate::agent::tools::Tool for CheckpointRewind {
-    fn name(&self) -> &str {
-        "checkpoint_rewind"
-    }
-    fn description(&self) -> &str {
-        "Rewind the working tree to a recovery anchor from THIS agent run only. Use when your last \
-         approach broke the tree and a clean base is cheaper than patching further. \
-         target=`last_good` = after the last successful edit step; target=`pre_edit` = before any \
-         edit this run. Budget: 2 rewinds per run. Does NOT restore chat history. To reach a \
-         checkpoint from an EARLIER turn (not this run's own edits), use `checkpoint_restore` by id."
-    }
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "target": {
-                    "type": "string",
-                    "enum": ["last_good", "pre_edit"],
-                    "description": "last_good = last successful step this run; pre_edit = tree before first edit this run"
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "one short line: why this approach is abandoned (shown in the tool result)"
-                }
-            },
-            "required": ["target"],
-            "additionalProperties": false
-        })
-    }
-    fn is_destructive(&self) -> bool {
-        true
-    }
-    fn is_concurrency_safe(&self) -> bool {
-        false
-    }
-    fn workspace_effect(&self, _args: &serde_json::Value) -> crate::agent::tools::WorkspaceEffect {
-        // Mutates the working tree. The agent loop skips the pre-edit checkpoint for this tool
-        // (restoring is the recovery path; snapshotting the broken tree first is restore's job).
-        crate::agent::tools::WorkspaceEffect::Paths
-    }
-    fn execute(&self, args: &serde_json::Value) -> Result<String> {
+    /// Agent-only, run-scoped rewind. Restores ONLY the pre-edit or last-good anchor of the current
+    /// agent run — never arbitrary snapshot ids (those go through `action=restore`, or the human
+    /// CLI). Cap: [`MAX_RUN_REWINDS`].
+    fn rewind(&self, args: &serde_json::Value) -> Result<String> {
         if !is_repo() {
             return Ok(no_repo_here("there is nothing to rewind"));
         }
         let raw = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
         let Some(target) = RewindTarget::parse(raw) else {
             return Ok(
-                "error: target must be \"last_good\" or \"pre_edit\" (run-scoped only; free-form ids are human-driven)"
+                "error: target must be \"last_good\" or \"pre_edit\" (run-scoped only; for a specific id use action=restore)"
                     .to_string(),
             );
         };
@@ -2899,6 +2944,51 @@ impl crate::agent::tools::Tool for CheckpointRewind {
             Err(e) => Ok(format!("error: {e}")),
         }
     }
+
+    /// Restore-by-id. Unlike `rewind` (run-scoped anchors only), this reaches ANY checkpoint in the
+    /// ledger — what's needed when the user says "go back to how it was before" across turns. The
+    /// loop takes the workspace writer lease for `Paths`, so the body uses the lease-free
+    /// `restore_under_lease` (re-acquiring `workspace.lock` here would self-deadlock — see
+    /// `rewind_run`).
+    fn restore(&self, args: &serde_json::Value) -> Result<String> {
+        if !is_repo() {
+            return Ok(no_repo_here("there is nothing to restore here"));
+        }
+        let Some(id) = args.get("id").and_then(|v| v.as_u64()) else {
+            return Ok(
+                "error: `id` is required for action=restore (an integer checkpoint id — see `checkpoint_view`)"
+                    .to_string(),
+            );
+        };
+        let id = id as u32;
+        let reason = args
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        match restore_under_lease(id) {
+            Ok(snap) => {
+                // Restoring an arbitrary id makes that tree the new run floor: a subsequent
+                // action=rewind target=last_good should land here, not on a stale post-edit id.
+                note_last_good(snap.id);
+                let why = if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(" reason: {reason}.")
+                };
+                Ok(format!(
+                    "restored working tree to checkpoint #{} ({}).{why} Files only — chat history was NOT \
+                     changed, and this is reversible (the pre-restore tree was auto-snapshotted; a human can \
+                     `aizen time redo`). Re-read files you care about — contents changed on disk.",
+                    snap.id,
+                    if snap.label.is_empty() { "no label" } else { &snap.label },
+                ))
+            }
+            Err(e) => Ok(format!(
+                "error: {e:#}. Nothing was restored. Check the id with `checkpoint_view`."
+            )),
+        }
+    }
 }
 
 /// One timeline row shaped for the model: id, whether it is the current cursor, label, whether a
@@ -2914,24 +3004,91 @@ fn format_timeline_row(snap: &Snapshot, is_cursor: bool) -> String {
     format!("{marker} #{} — {label} [{kind}, {}]", snap.id, snap.created)
 }
 
-/// Agent-facing timeline read. Read-only, so it fans out safely and needs no approval. Gives the
-/// model the checkpoint ids it needs to call `checkpoint_restore` when the user asks to go back to a
-/// specific earlier state (across turns, where run-scoped `checkpoint_rewind` has no anchor).
-pub struct CheckpointList;
-impl crate::agent::tools::Tool for CheckpointList {
+/// The READ half of the Time Machine surface: `list` (the timeline) and `diff` (what changed
+/// between two points). Split from [`Checkpoint`] on the one line that matters to the agent loop —
+/// `is_destructive` is a per-TYPE constant, not per-args, so folding these read-only actions into
+/// the mutating tool would make listing a timeline prompt the user for approval. Read-only ⇒ fans
+/// out in a parallel batch and needs no approval.
+pub struct CheckpointView;
+
+impl CheckpointView {
+    /// Which read action was requested. Defaults to `diff`: "what have my edits done so far" is the
+    /// overwhelmingly common question, and it is the one the model should ask BEFORE a rewind.
+    fn action_of(args: &serde_json::Value) -> Option<&'static str> {
+        match args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("") | Some("diff") => Some("diff"),
+            Some("list") | Some("timeline") => Some("list"),
+            _ => None,
+        }
+    }
+}
+
+impl crate::agent::tools::Tool for CheckpointView {
     fn name(&self) -> &str {
-        "checkpoint_list"
+        "checkpoint_view"
     }
     fn description(&self) -> &str {
-        "List Time Machine checkpoints (newest last), with the ▸ marking the current tree. Use to \
-         find the id to pass to `checkpoint_restore` when the user asks to go back to an earlier \
-         state from a PREVIOUS turn (run-scoped `checkpoint_rewind` only reaches this run's own \
-         edits). Read-only."
+        "Read the Time Machine timeline; changes nothing. action=`diff` (default): what changed \
+         between two points, defaulting to \"what have my edits done so far\" — call it BEFORE \
+         `checkpoint` action=rewind, which discards every change since the anchor. `patch=true` for \
+         line-level, `paths` to narrow. action=`list`: the timeline, to find an `id` for \
+         `checkpoint` action=restore. Read-only."
     }
     fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["diff", "list"],
+                    "description": "diff = what changed between two points (default); list = the checkpoint timeline"
+                },
+                "from": {
+                    "type": "string",
+                    "description": "diff only: checkpoint id (e.g. \"5\"), or \"working\" for the live tree. Default: this run's pre_edit anchor, else the newest checkpoint."
+                },
+                "to": {
+                    "type": "string",
+                    "description": "diff only: checkpoint id, or \"working\" for the live tree (default)."
+                },
+                "patch": {
+                    "type": "boolean",
+                    "description": "diff only: include the unified line-level diff, not just the per-file stat. Default false."
+                },
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "diff only: limit to these paths (repo-relative). Strongly recommended together with patch=true."
+                }
+            },
+            "additionalProperties": false
+        })
     }
-    fn execute(&self, _args: &serde_json::Value) -> Result<String> {
+    fn execute(&self, args: &serde_json::Value) -> Result<String> {
+        match Self::action_of(args) {
+            Some("list") => self.list(),
+            Some("diff") => self.diff_report(args),
+            _ => {
+                let raw = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                Ok(format!(
+                    "error: `action` must be \"diff\" or \"list\" (got {raw:?}). To save, rewind, \
+                     or restore, use the `checkpoint` tool."
+                ))
+            }
+        }
+    }
+}
+
+impl CheckpointView {
+    /// The checkpoint timeline. Gives the model the ids `checkpoint` action=restore needs when the
+    /// user asks for a state from an earlier turn (run-scoped rewind has no anchor there).
+    fn list(&self) -> Result<String> {
         if !is_repo() {
             return Ok(no_repo_here(
                 "there are no checkpoints here. If the project you mean is elsewhere, work from \
@@ -2956,185 +3113,16 @@ impl crate::agent::tools::Tool for CheckpointList {
             out.push('\n');
         }
         out.push_str(
-            "\nRestore a specific id with `checkpoint_restore id=<n>` (files only — chat is untouched, and reversible).",
+            "\nGo back to one with `checkpoint action=restore id=<n>` (files only — chat is untouched, and reversible).",
         );
         Ok(out)
     }
-}
 
-/// Agent-facing restore-by-id. Unlike `checkpoint_rewind` (run-scoped anchors only), this reaches
-/// ANY checkpoint in the ledger — the tool the model needs when the user says "go back to how it was
-/// before" across turns. Destructive → approval-gated. Declares `Paths` so the agent loop takes the
-/// workspace writer lease around it; the body therefore uses the lease-free `restore_under_lease`
-/// (re-acquiring the same `workspace.lock` would self-deadlock — see `rewind_run`).
-pub struct CheckpointRestore;
-impl crate::agent::tools::Tool for CheckpointRestore {
-    fn name(&self) -> &str {
-        "checkpoint_restore"
-    }
-    fn description(&self) -> &str {
-        "Restore the working tree to a specific Time Machine checkpoint by id (see `checkpoint_list`). \
-         Use when the user asks to go back to an earlier state — including from a PREVIOUS turn, which \
-         `checkpoint_rewind` cannot reach (it only rewinds this run's own edits). Files only: your \
-         chat/history is untouched, and the pre-restore tree is auto-snapshotted so it is reversible. \
-         After restoring, re-read any files you care about — their contents changed on disk."
-    }
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "integer", "minimum": 1, "description": "checkpoint id from `checkpoint_list`"},
-                "reason": {"type": "string", "description": "one short line: why you are restoring (shown in the result)"}
-            },
-            "required": ["id"],
-            "additionalProperties": false
-        })
-    }
-    fn is_destructive(&self) -> bool {
-        true
-    }
-    fn is_concurrency_safe(&self) -> bool {
-        false
-    }
-    fn workspace_effect(&self, _args: &serde_json::Value) -> crate::agent::tools::WorkspaceEffect {
-        // Mutates the working tree. The loop takes the workspace writer lease for `Paths`; restore
-        // itself takes only store/metadata locks (a different namespace), so no self-deadlock.
-        crate::agent::tools::WorkspaceEffect::Paths
-    }
-    fn execute(&self, args: &serde_json::Value) -> Result<String> {
-        if !is_repo() {
-            return Ok(no_repo_here("there is nothing to restore here"));
-        }
-        let Some(id) = args.get("id").and_then(|v| v.as_u64()) else {
-            return Ok(
-                "error: `id` is required (an integer checkpoint id — see `checkpoint_list`)"
-                    .to_string(),
-            );
-        };
-        let id = id as u32;
-        let reason = args
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        match restore_under_lease(id) {
-            Ok(snap) => {
-                // Restoring an arbitrary id makes that tree the new run floor: a subsequent
-                // `checkpoint_rewind target=last_good` should land here, not on a stale post-edit id.
-                note_last_good(snap.id);
-                let why = if reason.is_empty() {
-                    String::new()
-                } else {
-                    format!(" reason: {reason}.")
-                };
-                Ok(format!(
-                    "restored working tree to checkpoint #{} ({}).{why} Files only — chat history was NOT \
-                     changed, and this is reversible (the pre-restore tree was auto-snapshotted; a human can \
-                     `aizen time redo`). Re-read files you care about — contents changed on disk.",
-                    snap.id,
-                    if snap.label.is_empty() { "no label" } else { &snap.label },
-                ))
-            }
-            Err(e) => Ok(format!(
-                "error: {e:#}. Nothing was restored. Check the id with `checkpoint_list`."
-            )),
-        }
-    }
-}
-
-/// Render a diff report as compact text for a tool result / CLI. Kept pure (no git, no I/O) so the
-/// shaping is unit-testable and identical for the agent and the human CLI.
-fn format_diff(report: &DiffReport, max_rows: usize) -> String {
-    if report.is_empty() {
-        return format!(
-            "no changes between {} and {} — the trees are identical.",
-            report.from, report.to
-        );
-    }
-    let mut out = format!(
-        "{} → {}: {} file(s) changed, +{} -{}\n",
-        report.from,
-        report.to,
-        report.files.len(),
-        report.total_added(),
-        report.total_deleted()
-    );
-    let shown = report.files.len().min(max_rows);
-    for f in &report.files[..shown] {
-        let counts = match (f.added, f.deleted) {
-            (Some(a), Some(d)) => format!("+{a} -{d}"),
-            // Git reports `-` for both columns on a binary file; say so rather than printing "+0 -0",
-            // which would read as "nothing changed".
-            _ => "binary".to_string(),
-        };
-        match &f.old_path {
-            Some(old) => out.push_str(&format!("  {} {old} → {}  ({counts})\n", f.status, f.path)),
-            None => out.push_str(&format!("  {} {}  ({counts})\n", f.status, f.path)),
-        }
-    }
-    if report.files.len() > shown {
-        out.push_str(&format!(
-            "  … {} more file(s)\n",
-            report.files.len() - shown
-        ));
-    }
-    if let Some(patch) = &report.patch {
-        out.push_str("\n");
-        out.push_str(patch);
-        if report.patch_truncated {
-            out.push_str(
-                "\n… patch truncated. Narrow it with `paths` to see the rest of a specific file.\n",
-            );
-        }
-    }
-    out
-}
-
-/// Agent-facing diff between two points in the timeline. Read-only, so it needs no approval and can
-/// run concurrently — which matters, because the model should reach for this BEFORE a rewind.
-///
-/// Without it, reacting to a bad edit meant discarding the whole tree: the model could not see which
-/// file went wrong, so one bad line cost every good change made beside it. With it, the normal move
-/// is read the diff → fix the one file, and `checkpoint_rewind` becomes the fallback it should be.
-pub struct CheckpointDiff;
-impl crate::agent::tools::Tool for CheckpointDiff {
-    fn name(&self) -> &str {
-        "checkpoint_diff"
-    }
-    fn description(&self) -> &str {
-        "Show what changed between two Time Machine points: checkpoint↔checkpoint, or a checkpoint↔the \
-         live working tree (`to`/`from` = \"working\"). Defaults to `from`=the last run anchor, \
-         `to`=\"working\" — i.e. \"what have my edits done so far\". Use this BEFORE `checkpoint_rewind`: \
-         a rewind throws away every change since the anchor, so read the diff first and fix the one \
-         file that is wrong when you can. Also the way to inspect a suspicious edit you did not make \
-         this turn. Set `patch=true` for the unified diff (line-level), `paths` to narrow it. Read-only."
-    }
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "from": {
-                    "type": "string",
-                    "description": "checkpoint id (e.g. \"5\"), or \"working\" for the live tree. Default: this run's pre_edit anchor, else the newest checkpoint."
-                },
-                "to": {
-                    "type": "string",
-                    "description": "checkpoint id, or \"working\" for the live tree (default)."
-                },
-                "patch": {
-                    "type": "boolean",
-                    "description": "include the unified line-level diff, not just the per-file stat. Default false."
-                },
-                "paths": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "limit to these paths (repo-relative). Strongly recommended together with patch=true."
-                }
-            },
-            "additionalProperties": false
-        })
-    }
-    fn execute(&self, args: &serde_json::Value) -> Result<String> {
+    /// Diff between two points in the timeline. Without it, reacting to a bad edit meant discarding
+    /// the whole tree: the model could not see which file went wrong, so one bad line cost every good
+    /// change made beside it. With it, the normal move is read the diff → fix the one file, and a
+    /// rewind becomes the fallback it should be.
+    fn diff_report(&self, args: &serde_json::Value) -> Result<String> {
         if !is_repo() {
             return Ok(no_repo_here(
                 "there is no timeline to diff. If the project you mean lives elsewhere, run this \
@@ -3191,6 +3179,54 @@ impl crate::agent::tools::Tool for CheckpointDiff {
             Err(e) => Ok(format!("error: {e:#}")),
         }
     }
+}
+
+/// Render a diff report as compact text for a tool result / CLI. Kept pure (no git, no I/O) so the
+/// shaping is unit-testable and identical for the agent and the human CLI.
+fn format_diff(report: &DiffReport, max_rows: usize) -> String {
+    if report.is_empty() {
+        return format!(
+            "no changes between {} and {} — the trees are identical.",
+            report.from, report.to
+        );
+    }
+    let mut out = format!(
+        "{} → {}: {} file(s) changed, +{} -{}\n",
+        report.from,
+        report.to,
+        report.files.len(),
+        report.total_added(),
+        report.total_deleted()
+    );
+    let shown = report.files.len().min(max_rows);
+    for f in &report.files[..shown] {
+        let counts = match (f.added, f.deleted) {
+            (Some(a), Some(d)) => format!("+{a} -{d}"),
+            // Git reports `-` for both columns on a binary file; say so rather than printing "+0 -0",
+            // which would read as "nothing changed".
+            _ => "binary".to_string(),
+        };
+        match &f.old_path {
+            Some(old) => out.push_str(&format!("  {} {old} → {}  ({counts})\n", f.status, f.path)),
+            None => out.push_str(&format!("  {} {}  ({counts})\n", f.status, f.path)),
+        }
+    }
+    if report.files.len() > shown {
+        out.push_str(&format!(
+            "  … {} more file(s)\n",
+            report.files.len() - shown
+        ));
+    }
+    if let Some(patch) = &report.patch {
+        out.push_str("\n");
+        out.push_str(patch);
+        if report.patch_truncated {
+            out.push_str(
+                "\n… patch truncated. Narrow it with `paths` to see the rest of a specific file.\n",
+            );
+        }
+    }
+    out
 }
 
 #[cfg(test)]

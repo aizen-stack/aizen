@@ -420,9 +420,8 @@ pub struct RespMessage {
     /// gateways emit `stop`/`end_turn` alongside tool calls).
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
-    /// Dedicated reasoning channel some providers return INSTEAD of `content` (DeepSeek
-    /// `reasoning_content`, OpenRouter `reasoning`) — the same field the streaming [`Delta`] has
-    /// always read.
+    /// Dedicated reasoning channel some providers return INSTEAD of `content` (DeepSeek spells it
+    /// `reasoning_content`) — the same channel the streaming [`Delta`] has always read.
     ///
     /// This struct did NOT read it, so a reasoning-only reply deserialized to
     /// `content: None, tool_calls: []` — which every caller classifies as an empty-200 provider
@@ -430,8 +429,31 @@ pub struct RespMessage {
     /// one caller that runs exclusively on the non-streaming path (`chat_with_tools`): the same
     /// model answering the same way over the streaming path was fine. Read here so
     /// [`crate::llm::client::chat_with_tools`] can fall back to it rather than report silence.
-    #[serde(default, alias = "reasoning")]
+    ///
+    /// Read it through [`RespMessage::reasoning_text`], never directly — the same channel arrives
+    /// under two spellings and either one may be the populated one.
+    #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// The OpenRouter spelling of [`Self::reasoning_content`]. A SEPARATE field on purpose: as a
+    /// `#[serde(alias)]` on the one above, a provider that sends BOTH keys in a single object
+    /// (OpenRouter-shaped gateways mirror the text into both) is a serde `duplicate field` error
+    /// that rejects the whole message. Two fields cannot collide.
+    #[serde(default)]
+    pub reasoning: Option<String>,
+}
+
+impl RespMessage {
+    /// The reasoning channel under whichever spelling the provider used, blank treated as absent.
+    ///
+    /// When both keys are present they carry the SAME text (mirrored, not two halves), so this picks
+    /// one rather than concatenating.
+    pub fn reasoning_text(&self) -> Option<&str> {
+        [self.reasoning_content.as_deref(), self.reasoning.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+    }
 }
 
 // ── streaming response (plain chat; tool-call delta reassembly is H5/v2) ──────
@@ -464,15 +486,35 @@ pub struct Delta {
     pub role: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
-    /// Dedicated chain-of-thought channel some providers stream alongside `content` (DeepSeek uses
-    /// `reasoning_content`; OpenRouter uses `reasoning`). Captured so the CLI can SUPPRESS it from
-    /// the display — the user sees only the answer, uniform across models. (Tag-based `<think>…`
-    /// reasoning that arrives inside `content` is stripped separately by the `ThinkFilter`.)
-    #[serde(default, alias = "reasoning")]
+    /// Dedicated chain-of-thought channel some providers stream alongside `content` (the DeepSeek
+    /// spelling). Captured so the CLI can SUPPRESS it from the display — the user sees only the
+    /// answer, uniform across models. (Tag-based `<think>…` reasoning that arrives inside `content`
+    /// is stripped separately by the `ThinkFilter`.)
+    ///
+    /// Read it through [`Delta::reasoning_text`], never directly — see [`Self::reasoning`].
+    #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// The OpenRouter spelling of [`Self::reasoning_content`], a SEPARATE field for the same reason
+    /// as on [`RespMessage`]: OpenRouter-shaped gateways mirror the text into BOTH keys of one
+    /// delta, and as an alias that is a `duplicate field` error. The frame then failed to parse, so
+    /// every reasoning token printed a `[warn] unparseable stream frame` line over the live UI —
+    /// and any `content`/`tool_calls` riding in the same delta was dropped with it.
+    #[serde(default)]
+    pub reasoning: Option<String>,
     /// Tool-call fragments (streaming). Reassembled by `(index)` across chunks.
     #[serde(default)]
     pub tool_calls: Vec<ToolCallDelta>,
+}
+
+impl Delta {
+    /// The reasoning channel under whichever spelling the provider used, blank treated as absent.
+    pub fn reasoning_text(&self) -> Option<&str> {
+        [self.reasoning_content.as_deref(), self.reasoning.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+    }
 }
 
 /// One streamed tool-call fragment. `id`+`function.name` arrive on the first fragment for an

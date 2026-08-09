@@ -266,7 +266,8 @@ pub(crate) fn build_subagent_prompt(
 ) -> String {
     let cwd = root.display().to_string();
     let include_ctx = matches!(role, "coder" | "tester");
-    let mut s = crate::agent::build_subagent_base_prompt(
+    let mut s = crate::agent::build_role_scoped_subagent_base_prompt(
+        role,
         &cwd,
         std::env::consts::OS,
         date,
@@ -1039,14 +1040,12 @@ pub(crate) fn dispatch_is_read_only(r: &crate::agent::tools::ToolRegistry) -> bo
     // two symbol_replace dispatches race in parallel.
     const WRITERS: &[&str] = &[
         "file_edit",
-        "multi_edit",
         "file_write",
         "file_move",
         "shell_run",
         "skill_save",
+        // One name now covers save/rewind/restore (the read-only `checkpoint_view` is not a writer).
         "checkpoint",
-        "checkpoint_rewind",
-        "checkpoint_restore",
         "symbol_replace",
         "symbol_insert",
     ];
@@ -1871,7 +1870,6 @@ mod tests {
             r.get("file_edit").is_some(),
             "empty tools → coder scope (edit)"
         );
-        assert!(r.get("multi_edit").is_some());
         assert!(r.get("shell_run").is_some(), "coder scope (shell)");
         assert!(r.get("skill_save").is_some());
         assert!(r.get("file_read").is_some(), "read-only base present");
@@ -1889,8 +1887,8 @@ mod tests {
         assert!(r.get("file_edit").is_some(), "Edit alias → file_edit");
         assert!(r.get("shell_run").is_some(), "Bash alias → shell_run");
         assert!(
-            r.get("multi_edit").is_none(),
-            "multi_edit not listed → not granted"
+            r.get("file_write").is_none(),
+            "file_write not listed → not granted"
         );
         assert!(
             r.get("skill_save").is_none(),
