@@ -583,9 +583,9 @@ pub fn set_enabled(slug: &str, on: bool) -> Result<()> {
 }
 
 /// Is at least one INSTALLED agent pinned to the allowlist? This is "the delegating population"
-/// signal (used to gate the `workflow` tool's ~350-token schema): merely having agent files on
-/// disk — e.g. a cloned repo shipping `.claude/agents/`, or a bulk install never enabled — must
-/// NOT silently tax every turn. Stale allowlist slugs (agent since removed) don't count.
+/// signal (preserved for callers that gate secondary behavior on specialist presence; no longer
+/// drives `workflow` registration, which is now on by default).
+#[allow(dead_code)]
 pub fn any_enabled() -> bool {
     match enabled_set() {
         Some(set) if !set.is_empty() => list().iter().any(|d| set.contains(&d.slug())),

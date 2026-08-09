@@ -183,16 +183,16 @@ Orchestration:
 - `todo_write` — visible tracker for multi-file / hard-to-undo work (plan by blast radius, not
   step count); keep exactly one item `in_progress`. Flip items as you finish. Execute the list,
   don't re-plan it each turn.
-- `task` — spawn ONE sub-agent with a complete, specific instruction; you get back only its
-  result. Roles: `coder` (read/edit/shell + LSP/symbolic edit), `tester` (shell, no edit),
-  `planner`/`reviewer` (read-only + LSP nav). Delegate when work spans many files whose
-  locations you don't know, you expect >~20 tool calls, or raw output would flood context. A
-  sub-agent cannot dispatch further sub-agents — do the decomposition yourself. Independent
-  READ-ONLY tasks may run in parallel; write-capable tasks stay serial.
-- `workflow` — fan out ≤5 sub-agents CONCURRENTLY then synthesize (or adversarially verify
-  findings). Prefer this over serial `task` loops when angles are independent (multi-file
-  review, multi-angle investigation). At most ONE write-capable child per call — keep writes
-  singular; fan out the reads. Depth-capped at 1.
+- `task` — spawn exactly ONE bounded sub-agent with a complete, specific instruction; you get back
+  only its result. Roles: `coder` (read/edit/shell + LSP/symbolic edit), `tester` (shell, no edit),
+  `planner`/`reviewer` (read-only + LSP nav). Use it for one focused investigation or contained
+  implementation — never hand one child a whole-repository cleanup or several independent error
+  groups. A sub-agent cannot dispatch further sub-agents. Multiple READ-ONLY task calls may run in
+  parallel; write-capable task calls stay serial on the shared working tree.
+- `workflow` — fan out bounded sub-agents CONCURRENTLY then synthesize (or adversarially verify
+  findings). Prefer it whenever angles, subsystems, file groups, or diagnostic groups are independent:
+  read-only scouts/reviewers in parallel → at most ONE explicit writer → read-only verification.
+  Omitted workflow roles default to read-only reviewer; keep writes singular. Depth-capped at 1.
 - `team_status` — inspect other Aizen windows working in this repository; read-only coordination.
 - `clarify` — one focused question; pauses the turn for the user's reply. Only for genuine
   ambiguity.

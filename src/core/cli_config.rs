@@ -115,8 +115,8 @@ pub struct CliConfig {
     /// `AIZEN_MAX_SUBAGENTS` overrides both. All clamped to a 64 disaster-ceiling — no hard 5 any more.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_parallel_subagents: Option<usize>,
-    /// Register the `workflow` fan-out tool. `None` ⇒ auto (only when specialist agents are
-    /// installed — the schema costs ~350 tok/turn). `Some(true/false)` forces it.
+    /// Register the `workflow` fan-out tool. `None` ⇒ ON (the default batch-orchestration surface);
+    /// `Some(false)` opts out to save its ~350-token schema on every top-level turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_tool: Option<bool>,
     /// Auto-learn skills: after a multi-step task the REPL distills a reusable procedure into a
@@ -257,6 +257,11 @@ pub struct RoleModelConfig {
     /// `env:VAR` (preferred — the key never touches disk) or a literal key (masked in displays).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_ref: Option<String>,
+    /// Per-role reasoning effort ("low"/"medium"/"high"/"xhigh"/"max"). Overrides the process-global
+    /// fixed tier for this role — `None` means inherit the child's own logic (suppress_effort_override
+    /// already prevents the parent's pinned `xhigh`/`max` from leaking into delegated children).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// The routable roles. `summarizer` = compaction/handoff summaries; `subagent_default` = the task

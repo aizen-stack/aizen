@@ -37,27 +37,13 @@ const SUBAGENT_PREAMBLE: &str = "\
 <subagent>
 You are a focused sub-agent dispatched to do ONE task and report back.
 - output_discipline: your FINAL message is the RETURN VALUE to the orchestrating agent — it is not shown to a human. Return the result/finding directly: no greeting, no \"I'll help\", no sign-off.
-- completeness: finish the WHOLE dispatched task, not the easy part of it. Multi-step work is still ONE task — keep going until every part is done. Never hand back a plan, an outline, or a partial result as if it were the answer, and never stop merely because the task is large.
+- completeness: finish the bounded dispatched task, not just its easiest part. If the request actually contains independent subsystems, error groups, or review angles, that decomposition belongs in the parent's `workflow` call — do not widen this child into a whole-repository cleanup.
 - plan: for anything past a few steps, write the steps with todo_write first, then work them off one at a time and flip each to done as you finish it. Consult it as you go so you don't stop halfway.
 - verify: before returning, check your own work with the tools you have — read the edited region back, run the build/tests when shell is in scope. Say what you verified and what you could not.
 - scope: do only the dispatched task; do not widen it. If you are genuinely blocked, state exactly what is done, what remains, and what blocks you.
 - workspace: file/shell ops resolve relative paths against the working directory but may reach elsewhere on disk; you cannot dispatch further sub-agents.
 - contract: if a <contract> block follows, its boundaries, expected output, and step budget are BINDING.
 </subagent>";
-
-/// Bounded CONTINUATION: how many extra step budgets a sub-agent may earn after exhausting one
-/// without finishing. The step budget exists to bound a *runaway* loop, but it also silently
-/// truncated genuinely large tasks — the sub-agent returned a partial result and the parent reported
-/// it as an answer. A continuation re-enters the SAME conversation (full context, its own todo list
-/// and tool results intact), so the work resumes instead of restarting.
-const MAX_CONTINUATIONS: u32 = 2;
-
-/// The continuation nudge, injected as a `user` turn (the role a model can't talk past) when a
-/// sub-agent burns its budget with work still open.
-const CONTINUE_NUDGE: &str = "[continue] You reached your step budget and the dispatched task is \
-    NOT finished. Do not restart, re-plan from scratch, or re-summarize what you already did: pick up \
-    exactly where you left off and work through what remains. You have a fresh budget of steps. Return \
-    your final result only once the whole task is genuinely done and verified.";
 
 /// Transient model-call failures a sub-agent absorbs per turn before giving up (see
 /// `AgentConfig::max_transient_retries`). Unlike the top level, there is no user watching to re-ask.
@@ -101,24 +87,17 @@ pub(crate) fn subagent_call_timeout() -> Duration {
         .unwrap_or(SUBAGENT_CALL_TIMEOUT)
 }
 
-/// WALL-CLOCK ceiling for a WHOLE dispatch — every continuation included. Override with
+/// WALL-CLOCK ceiling for a WHOLE dispatch. Override with
 /// `AIZEN_SUBAGENT_WALL_SECS` (`0` disables it entirely).
 ///
-/// [`SUBAGENT_CALL_TIMEOUT`] bounds ONE call; this bounds the run. The two are not substitutes: with
-/// per-call deadlines in place a dispatch can no longer strand, but it is still bounded only in STEPS
-/// — default 25, auto-extended to 50, plus [`MAX_CONTINUATIONS`] fresh budgets, so ~150 steps (up to
-/// 480 at `max_steps: 80`). Every step returns, so the run always ends; nothing answers *by when*. At
-/// a legitimate ~20s per step that is roughly an hour, and a dispatch that quietly runs for hours is
-/// indistinguishable from the hang this file's other deadline was written to kill.
-///
-/// Deliberately generous rather than tight, because the failure modes are not symmetric: firing late
-/// costs some wasted minutes, while firing early destroys real work and mislabels a healthy run as
-/// pathological. Sized so only a genuinely runaway dispatch reaches it.
+/// [`SUBAGENT_CALL_TIMEOUT`] bounds ONE call; this bounds the unattended run. `max_steps` is now a
+/// total iteration ceiling, but one step may still spend minutes in a model call or shell command, so
+/// time remains an independent bound. Twenty minutes is enough for a focused child while preventing
+/// one bad delegation from silently occupying a slot for an hour.
 ///
 /// Delegated runs only — a top-level turn leaves `AgentConfig::deadline` at `None`. The user is
-/// watching there and owns Esc; a sub-agent runs `quiet` with nobody watching, which is exactly why
-/// it needs a ceiling it cannot talk its way past.
-const SUBAGENT_WALL_TIMEOUT: Duration = Duration::from_secs(3600);
+/// watching there and owns Esc; a sub-agent runs `quiet` with nobody watching.
+const SUBAGENT_WALL_TIMEOUT: Duration = Duration::from_secs(1200);
 
 /// Floor for the [`SUBAGENT_WALL_TIMEOUT`] env override. A misconfigured `AIZEN_SUBAGENT_WALL_SECS=5`
 /// would make every dispatch fail before its first model call could return, which reads as a broken
@@ -127,9 +106,8 @@ const SUBAGENT_WALL_FLOOR: Duration = Duration::from_secs(60);
 
 /// The absolute instant a dispatch starting NOW must stop by, or `None` when no ceiling applies.
 ///
-/// Called once per dispatch and threaded through every continuation, so the ceiling covers the whole
-/// run rather than restarting with each fresh budget (see `is_resumable`, which must never resume a
-/// `Deadline`).
+/// Called once per dispatch and threaded into the one agent loop, so the ceiling covers the whole
+/// run and can never be refreshed by a step extension.
 pub(crate) fn subagent_wall_deadline() -> Option<std::time::Instant> {
     let budget = match std::env::var("AIZEN_SUBAGENT_WALL_SECS")
         .ok()
@@ -143,13 +121,11 @@ pub(crate) fn subagent_wall_deadline() -> Option<std::time::Instant> {
     Some(std::time::Instant::now() + budget)
 }
 
-/// Default step budget for a dispatch when the parent doesn't set `max_steps`. Matches the top-level
-/// default (25) rather than undercutting it: a sub-task is narrower in SCOPE, but the old 15 meant a
-/// multi-file investigation ran out of steps mid-way and reported a partial answer as done.
+/// Default total step budget for a dispatch when the parent doesn't set `max_steps`. Matches the
+/// top-level default (25), while the explicit argument remains capped at [`MAX_STEP_BUDGET`].
 const DEFAULT_STEP_BUDGET: usize = 25;
 
-/// Ceiling on an explicit `max_steps`, so a parent can size a genuinely large dispatch without the
-/// harness capping it back down. The continuation mechanism above stacks on top of this.
+/// Ceiling on an explicit total `max_steps`.
 const MAX_STEP_BUDGET: usize = 80;
 
 /// The dispatch CONTRACT the parent attaches to a spawn (the Anthropic multi-agent lesson:
@@ -380,9 +356,8 @@ pub(crate) struct Dispatch {
     /// Defaults to the parent endpoint when the model has no registry entry (same-gateway case).
     pub base_url: String,
     pub api_key: String,
-    /// The dispatch step budget (`max_steps` arg, clamped `1..=MAX_STEP_BUDGET`; default
-    /// [`DEFAULT_STEP_BUDGET`]). Exhausting it without finishing earns a bounded CONTINUATION rather
-    /// than truncating the task — see [`MAX_CONTINUATIONS`].
+    /// The TOTAL dispatch step budget (`max_steps` arg, clamped `1..=MAX_STEP_BUDGET`; default
+    /// [`DEFAULT_STEP_BUDGET`]). No outer continuation can multiply it.
     pub max_steps: usize,
     /// Optional JSON Schema the sub-agent's FINAL answer must satisfy (`expects` arg).
     pub expects: Option<Value>,
@@ -579,14 +554,13 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Dispatch a focused sub-agent (fresh context) to do ONE self-contained sub-task and return \
-         its result. Use for isolatable work that would clutter your own context (a deep \
-         investigation, a contained implementation). The sub-task may be LARGE — the sub-agent plans, \
-         works through every part, verifies, and earns extra step budget automatically if it needs it; \
-         do not pre-split a coherent task into fragments to keep it small. The sub-agent CANNOT \
-         dispatch further sub-agents. Prefer a named specialist via `agent` (a slug from <agents>, \
-         e.g. \"code-reviewer\") when one fits; otherwise pick a generic `role`: coder \
-         (read/edit/shell), tester (shell, no edit), planner/reviewer (read-only)."
+        "Dispatch exactly ONE bounded sub-agent (fresh context) and return its result. Use for a \
+         focused investigation or contained implementation with one clear scope. For independent \
+         angles, file groups, or error groups use `workflow` instead: read-only children fan out, while \
+         coder/tester children stay serial on the shared working tree. Do not hand one child a \
+         whole-repository cleanup. The child cannot dispatch further sub-agents. Prefer a named \
+         specialist via `agent` when one fits; otherwise choose coder (read/edit/shell), tester \
+         (shell, no edit), or planner/reviewer (read-only)."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -599,7 +573,7 @@ impl Tool for TaskTool {
                 "label": {"type": "string", "description": "short tag echoed in the result header — attribution when dispatching several tasks"},
                 "boundaries": {"type": "string", "description": "what the sub-agent must NOT do or touch"},
                 "expected_output": {"type": "string", "description": "the shape/content of the answer you want back"},
-                "max_steps": {"type": "integer", "description": "step budget per continuation (default 25, cap 80). Raise it for a large task; the sub-agent also earns up to 2 fresh budgets automatically if unfinished, so a big dispatch is never truncated"},
+                "max_steps": {"type": "integer", "description": "TOTAL model-step budget for this child (default 25, cap 80); use workflow instead of raising this for independent work"},
                 "expects": {"type": "object", "description": "JSON Schema the final answer must satisfy — the sub-agent replies with ONLY a JSON object and the harness validates it (result header shows json:ok|invalid)"}
             },
             "required": ["prompt"],
@@ -715,21 +689,29 @@ impl Tool for TaskTool {
         // dispatch while the orchestrating turn and any sibling dispatches carry on. Esc still reaches
         // it, because cancellation flows down from the turn token (see `TurnCancel::child`).
         let own_cancel = crate::core::cancel::current().unwrap_or_default().child();
-        // Inherit the parent's conversation identity so a delegated sub-agent shares the same
-        // per-conversation resource scope (e.g. the browser session), exactly as it inherits `cancel`.
+        // Inherit the parent's conversation identity, but isolate stateful child resources and hide
+        // tool-body progress from the parent transcript. The orchestration row remains the visible
+        // progress surface.
         let parent_ctx = crate::core::exec_ctx::current().unwrap_or_default();
+        let child_scope = format!(
+            "{}/task/{}",
+            parent_ctx.resource_scope(),
+            NEXT_TASK_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let child_ctx = parent_ctx
+            .with_resource_scope(child_scope)
+            .with_trace_visible(false);
         let cfg = AgentConfig {
             approval_mode: self.approval_mode, // inherit parent approval tier transitively
             cancel: own_cancel.clone(),
-            exec_ctx: parent_ctx,
+            exec_ctx: child_ctx,
             quiet: true,                         // suppress nested progress trace
             enable_verify_gate: sub_verify_gate, // ON for write-capable roles; OFF for read-only (W14)
-            // The dispatch step budget, with a bounded auto-extend. Exhausting BOTH is not the end of
-            // the road any more: the continuation loop below re-enters the same conversation with a
-            // fresh budget (up to MAX_CONTINUATIONS) so a genuinely large task finishes instead of
-            // returning the partial work it happened to reach.
-            max_iters: max_steps,
-            auto_extend_to: max_steps * 2,
+            // `max_steps` is the TOTAL child budget. Start with a smaller soft cap so the core loop can
+            // issue its one near-limit nudge, then extend only up to the exact requested total. There is
+            // no outer continuation loop to reset this budget.
+            max_iters: max_steps.div_ceil(2).max(1),
+            auto_extend_to: max_steps,
             // Inherit the parent's window so TOOL-RESULT CLEARING is ON for deep investigations
             // (mid-loop compaction stays off by construction: one user turn can't be cut).
             context_window: self.context_window,
@@ -747,16 +729,11 @@ impl Tool for TaskTool {
             // used to discard every step it had already completed and surface to the parent as a bare
             // "sub-agent (coder) failed" — the work was gone, and the parent could only guess why.
             max_transient_retries: SUBAGENT_TRANSIENT_RETRIES,
-            // The dispatch loop below owns continuation for a sub-agent (`MAX_CONTINUATIONS` on a
-            // persistent `msgs`), so the in-loop grant must stay off here — otherwise a large task
-            // would multiply the two budgets together. Stall recovery likewise reads the
-            // process-global todo list, which is the PARENT's plan, not this child's ScopedTodo.
+            // This delegated run owns one total budget; the core loop's own extension is the only
+            // budget grant. Keep its continuation controls off so no second layer can multiply it.
             max_continuations: 0,
             max_stall_recoveries: 0,
-            // WALL-CLOCK ceiling for the WHOLE dispatch. An absolute `Instant` computed ONCE here, so
-            // the continuation loop below re-enters with the SAME deadline rather than a fresh one —
-            // a per-continuation budget would let three budgets multiply into three times the ceiling,
-            // which is the bound this is meant to be. Steps say how MUCH work; this says by WHEN.
+            // The deadline is absolute for this one run; it cannot be refreshed by a continuation.
             deadline: subagent_wall_deadline(),
             ..AgentConfig::default()
         };
@@ -810,56 +787,28 @@ impl Tool for TaskTool {
         // MaxIters, its own synthesized summary) to `msgs`, so re-entering with a `[continue]` user
         // turn keeps the sub-agent's whole context: its plan, its tool results, its edits.
         let outcome = tokio::task::block_in_place(|| {
-            // EFFORT ISOLATION: the parent turn may have armed a process-global effort override
-            // (e.g. ultimate mode pins `max`). A sub-agent is a NARROWER task and must pick its own
-            // tier from `cfg.reasoning_effort`, not inherit the parent's — otherwise the whole
-            // fan-out runs at `max` for no measured quality gain (see the effort-leak finding). The
-            // guard disarms the override for exactly this synchronous dispatch and restores it on
-            // drop, before control returns to the parent turn.
             let _effort = crate::core::cli_config::suppress_effort_override();
             tokio::runtime::Handle::current().block_on(async {
                 let mut msgs = vec![Message::system(system.as_str()), Message::user(prompt)];
-                let mut total_iters = 0usize;
-                let mut continuations = 0u32;
-                loop {
-                    // NOT `?`: a bare propagate discards the live transcript, so a run that worked
-                    // for many tool turns — possibly writing files — surfaced to the parent as nothing
-                    // but "sub-agent failed". The parent then has no idea the tree was touched. Count
-                    // completed assistant tool-call turns from `msgs` (which survives the failed final
-                    // call) and carry that into the error text so the failure names what may already be
-                    // on disk.
-                    let o = match crate::agent::run_agent_loop(&chat, &cfg, &registry, &mut msgs)
-                        .await
-                    {
-                        Ok(o) => o,
-                        Err(e) => {
-                            let completed_tool_turns = msgs
-                                .iter()
-                                .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty())
-                                .count();
-                            return Err(e.context(format!(
-                                "after {completed_tool_turns} completed tool turn(s) — the workspace \
-                                 may already contain partial edits from this sub-agent; inspect before \
-                                 retrying"
-                            )));
-                        }
-                    };
-                    total_iters += o.iters;
-                    let resumable = is_resumable(&o.stop, continuations)
-                        && !cfg.cancel.is_cancelled();
-                    if !resumable {
-                        return Ok::<_, anyhow::Error>(crate::agent::AgentOutcome {
-                            iters: total_iters,
-                            ..o
-                        });
+                let o = match crate::agent::run_agent_loop(&chat, &cfg, &registry, &mut msgs).await
+                {
+                    Ok(o) => o,
+                    Err(e) => {
+                        let completed_tool_turns = msgs
+                            .iter()
+                            .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty())
+                            .count();
+                        return Err(e.context(format!(
+                            "after {completed_tool_turns} completed tool turn(s) — the workspace \
+                             may already contain partial edits from this sub-agent; inspect before \
+                             retrying"
+                        )));
                     }
-                    continuations += 1;
-                    continue_note(&header_label, continuations, MAX_CONTINUATIONS);
-                    msgs.push(Message::user(CONTINUE_NUDGE));
-                }
+                };
+                Ok::<_, anyhow::Error>((o, msgs))
             })
         });
-        let outcome = match outcome {
+        let (outcome, msgs) = match outcome {
             Ok(o) => o,
             Err(e) => {
                 track.finish_err(format!("error: {e}"));
@@ -884,7 +833,11 @@ impl Tool for TaskTool {
         let body = outcome
             .final_text
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "(sub-agent produced no final answer)".to_string());
+            .unwrap_or_else(|| {
+                // No model-authored final text: build a deterministic partial report from the
+                // conversation history so the parent always receives actionable partial information.
+                partial_report_from_messages(&msgs)
+            });
 
         // OUTPUT CONTRACT: validate (and once repair) the final text against `expects`. The header
         // carries the verdict so the parent can trust-or-inspect without re-parsing prose. Without
@@ -934,6 +887,87 @@ impl Tool for TaskTool {
     }
 }
 
+/// Deterministic fallback when a child stops without a final answer. Uses only bounded, redacted
+/// facts already present in the transcript — no extra model call after the deadline.
+fn partial_report_from_messages(msgs: &[Message]) -> String {
+    const MAX_ITEMS: usize = 12;
+    const MAX_TEXT: usize = 800;
+    let mut targets = Vec::new();
+    let mut commands = Vec::new();
+    let mut last_assistant: Option<String> = None;
+
+    for m in msgs {
+        if m.role == "assistant" {
+            if let Some(text) = m.content.as_deref().filter(|s| !s.trim().is_empty()) {
+                last_assistant = Some(text.trim().to_string());
+            }
+            for tc in &m.tool_calls {
+                let args: Value = serde_json::from_str(&tc.function.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                match tc.function.name.as_str() {
+                    "file_edit" | "file_write" => {
+                        if let Some(p) = args.get("path").and_then(Value::as_str) {
+                            if !targets.iter().any(|x| x == p) && targets.len() < MAX_ITEMS {
+                                targets.push(p.to_string());
+                            }
+                        }
+                    }
+                    "file_move" => {
+                        for key in ["from", "to"] {
+                            if let Some(p) = args.get(key).and_then(Value::as_str) {
+                                if !targets.iter().any(|x| x == p) && targets.len() < MAX_ITEMS {
+                                    targets.push(p.to_string());
+                                }
+                            }
+                        }
+                    }
+                    "shell_run" => {
+                        if let Some(c) = args.get("command").and_then(Value::as_str) {
+                            if commands.len() < MAX_ITEMS {
+                                commands.push(c.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let redact = |s: &str| crate::agent::codebase::redact_for_review(s);
+    let mut out =
+        String::from("Partial report (deterministic; the child returned no final answer):\n");
+    if targets.is_empty() {
+        out.push_str("- Files/targets named by completed tool calls: none recorded\n");
+    } else {
+        out.push_str("- Files/targets named by tool calls:\n");
+        for p in targets {
+            out.push_str(&format!("  - {}\n", redact(&p)));
+        }
+    }
+    if commands.is_empty() {
+        out.push_str("- Shell commands attempted: none recorded\n");
+    } else {
+        out.push_str("- Shell commands attempted (status may be unknown):\n");
+        for c in commands {
+            let safe = redact(&c);
+            let clipped: String = safe.chars().take(240).collect();
+            out.push_str(&format!("  - {clipped}\n"));
+        }
+    }
+    if let Some(text) = last_assistant {
+        let safe = redact(&text);
+        let clipped: String = safe.chars().take(MAX_TEXT).collect();
+        out.push_str(&format!("- Last stated progress:\n{clipped}\n"));
+    } else {
+        out.push_str("- Last stated progress: none\n");
+    }
+    out.push_str(
+        "- Verification: incomplete or unknown; inspect the working tree before retrying.",
+    );
+    out
+}
+
 /// The in-BODY caveat for a sub-agent run that did not finish cleanly. `None` for `Done`.
 ///
 /// The result header already names the stop reason, but a header is one line that the parent's own
@@ -952,7 +986,7 @@ fn stop_body_warning(stop: &crate::agent::StopReason) -> Option<&'static str> {
             "[INCOMPLETE — the sub-agent stopped because its recent attempts added no new evidence. The work below may be partial.]",
         ),
         crate::agent::StopReason::MaxIters => Some(
-            "[INCOMPLETE — the sub-agent spent every continuation budget and still hit the step limit. The work below may be partial.]",
+            "[INCOMPLETE — the sub-agent spent its total step budget. The work below may be partial.]",
         ),
         crate::agent::StopReason::Cancelled => Some(
             "[CANCELLED — the user stopped this sub-agent. Do not treat the work below as complete.]",
@@ -967,32 +1001,6 @@ fn stop_body_warning(stop: &crate::agent::StopReason) -> Option<&'static str> {
             "[INCOMPLETE — the sub-agent ran out of TIME (its wall-clock limit), not steps, and nobody cancelled it. The work below is whatever it had reached; it was cut off mid-task.]",
         ),
     }
-}
-
-/// Should a finished sub-agent run be RESUMED with a fresh step budget? Only a budget exhaustion
-/// qualifies, and only while continuations remain:
-/// - `MaxIters` — ran out of steps with work still open. This is the resumable one.
-/// - `Done` — it finished; nothing to resume.
-/// - `Divergence` — it is repeating itself; more steps buy more of the same, not progress.
-/// - `VerificationFailed` — its own verify/repair loop already spent its attempts.
-/// - `Cancelled` — the user said stop. Never override that.
-/// - `AwaitingInput` — unreachable for a sub-agent (no `clarify` in any sub-registry: nobody to
-///   answer), and resuming would loop on a question that can never be answered.
-/// - `Deadline` — MUST NOT resume, and this is the load-bearing case: the wall-clock limit exists to
-///   bound total time, so handing the run a fresh budget would restart the clock and make the limit
-///   unenforceable. A continuation here would silently undo the ceiling it just hit.
-fn is_resumable(stop: &crate::agent::StopReason, continuations_used: u32) -> bool {
-    matches!(stop, crate::agent::StopReason::MaxIters) && continuations_used < MAX_CONTINUATIONS
-}
-
-/// Surface a continuation to the user: a sub-agent silently earning more budget would otherwise look
-/// like a hang (it runs `quiet`, so nothing else it does reaches the screen). Routed through
-/// `tui::note_line` — a raw `eprintln!` mid-turn corrupts the retained frame, and `note_line` also
-/// covers the SUSPENDED case (a dialoguer menu open mid-turn) that a bare `active()` check misses.
-fn continue_note(label: &str, n: u32, max: u32) {
-    let note =
-        format!("→ task({label}): step budget spent, work still open — continuing ({n}/{max})");
-    crate::ui::tui::note_line(&crate::ui::theme::faint(note).to_string());
 }
 
 impl TaskTool {
@@ -1055,6 +1063,7 @@ pub(crate) fn dispatch_is_read_only(r: &crate::agent::tools::ToolRegistry) -> bo
 /// Live count of in-flight sub-agents (process-global; both `task` and the workflow tool draw
 /// from real OS/model resources, so the cap is global too).
 static ACTIVE_SUBAGENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static NEXT_TASK_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Absolute disaster-stop on concurrent sub-agents. NOT the old hard `5`: this only exists so a
 /// nonsense config/env value (or a machine reporting a huge core count) can't fan hundreds of model
@@ -1543,35 +1552,12 @@ mod tests {
     }
 
     #[test]
-    fn only_budget_exhaustion_earns_a_continuation() {
-        use crate::agent::StopReason::*;
-        // A large task that ran out of steps resumes — the whole point: the old behavior returned
-        // whatever partial work it had reached and the parent reported it as the answer.
-        assert!(is_resumable(&MaxIters, 0));
-        assert!(
-            is_resumable(&MaxIters, MAX_CONTINUATIONS - 1),
-            "budget still available"
-        );
-        // Bounded: never an unlimited loop.
-        assert!(!is_resumable(&MaxIters, MAX_CONTINUATIONS));
-        assert!(!is_resumable(&MaxIters, MAX_CONTINUATIONS + 1));
-        // Every other stop reason returns as-is (see the doc comment for why each one).
-        for stop in [
-            Done,
-            Divergence,
-            VerificationFailed,
-            Cancelled,
-            AwaitingInput("q?".into()),
-            Deadline,
-        ] {
-            assert!(!is_resumable(&stop, 0), "{stop:?} must not be resumed");
-        }
-        // Deadline is the load-bearing one: a continuation would restart the wall clock, so granting
-        // it here would make the time limit unenforceable no matter how much budget remains.
-        assert!(
-            !is_resumable(&Deadline, 0),
-            "a time-limited run must never earn a fresh budget — that restarts the clock"
-        );
+    fn task_budget_is_one_total_ceiling() {
+        let c = TaskContract::from_args(&serde_json::json!({"max_steps": 80}));
+        let soft = c.max_steps.div_ceil(2).max(1);
+        assert_eq!(soft, 40);
+        assert_eq!(c.max_steps, 80);
+        assert!(soft <= c.max_steps, "soft cap cannot exceed total budget");
     }
 
     #[test]
@@ -1623,19 +1609,12 @@ mod tests {
         const K: &str = "AIZEN_SUBAGENT_WALL_SECS";
         let prior = std::env::var(K).ok();
 
-        // Default: ON, and bounding the WHOLE dispatch — so it must exceed a single call's ceiling,
-        // otherwise the run would die before one legitimate slow call could even finish.
+        // Default wall clock: bounded and larger than one model-call ceiling, but no longer an hour.
         std::env::remove_var(K);
         let d = subagent_wall_deadline().expect("a dispatch must be time-bounded by default");
         let budget = d.saturating_duration_since(std::time::Instant::now());
-        assert!(
-            budget > subagent_call_timeout(),
-            "the run ceiling must be larger than one call's: {budget:?}"
-        );
-        assert!(
-            budget <= SUBAGENT_WALL_TIMEOUT,
-            "never longer than the constant: {budget:?}"
-        );
+        assert!(budget > subagent_call_timeout());
+        assert!(budget <= SUBAGENT_WALL_TIMEOUT);
 
         // Explicit opt-out for anyone who wants the old unbounded-in-time behavior.
         std::env::set_var(K, "0");
@@ -1670,15 +1649,12 @@ mod tests {
     }
 
     #[test]
-    fn subagent_preamble_demands_completion_not_a_partial_answer() {
-        // The behavioral half of the same fix: a sub-agent that stops early because the task felt
-        // large is the failure the continuation loop can't detect (it looks like a clean `Done`), so
-        // the preamble has to forbid it explicitly.
+    fn subagent_preamble_demands_bounded_completion() {
         let root = std::env::temp_dir();
         let p = build_subagent_prompt("coder", &root, "m", "2026-06-20", None, None);
         assert!(p.contains("completeness:"), "completeness clause present");
-        assert!(p.contains("finish the WHOLE dispatched task"));
-        assert!(p.contains("never stop merely because the task is large"));
+        assert!(p.contains("finish the bounded dispatched task"));
+        assert!(p.contains("do not widen this child into a whole-repository cleanup"));
         assert!(
             p.contains("plan:"),
             "told to plan multi-step work with todo_write"

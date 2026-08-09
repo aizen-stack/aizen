@@ -729,8 +729,7 @@ pub enum StopReason {
     Cancelled,
     /// [`AgentConfig::deadline`] elapsed. Distinct from `Cancelled` (nobody pressed anything — saying
     /// "cancelled by user" would send the user looking for a keypress that never happened) and from
-    /// `MaxIters` (which `task_tool::is_resumable` grants a fresh budget for; a deadline that earned
-    /// continuations would not be a deadline). Never resumable.
+    /// `MaxIters` (a step-budget stop). Never automatically resumed.
     Deadline,
 }
 
@@ -906,6 +905,10 @@ where
     // pre-edit checkpoint already discovers via `target_dir`; the gate must not lag behind it. `None`
     // (no path named, or the edit was `shell_run`) keeps the cwd-relative fallback.
     let mut last_edit_dir: Option<std::path::PathBuf> = None;
+    // PRE-EDIT VERIFY BASELINE: captured on demand just before the first workspace mutation so the
+    // gate can distinguish pre-existing compiler errors from regressions introduced by this run.
+    // `None` = not yet captured; `Some` = immutable for the lifetime of the run.
+    let mut verify_baseline: Option<verify_gate::VerifyBaseline> = None;
     // PHASE CHECKPOINT STATE (replaces the old per-edit-turn checkpoint). A "phase" is a unit of work
     // the model marks in its todo list; the timeline stamps ONE checkpoint when a phase closes, not
     // one per edit. `phase_todos_before` is the todo snapshot at the TOP of the current turn — compared
@@ -1600,7 +1603,6 @@ where
                 {
                     if !cfg.quiet {
                         if result.passed {
-                            // The mockup's green success line — `✓ <cmd> — verify gate passed`.
                             crate::ui::tui::verify_line(&result.command, "verify gate passed");
                         } else {
                             let line = format!(
@@ -1616,7 +1618,25 @@ where
                             }
                         }
                     }
-                    if !result.passed {
+                    // Compare against pre-edit baseline if available; otherwise use raw pass/fail.
+                    let (gate_passed, failure_msg_body) = if let Some(baseline) = &verify_baseline {
+                        let delta = verify_gate::compare_to_baseline(baseline, &result);
+                        if delta.passed {
+                            if let Some(note) = &delta.note {
+                                if !cfg.quiet {
+                                    crate::ui::tui::verify_line(&result.command, note.as_str());
+                                }
+                            }
+                            (true, String::new())
+                        } else if delta.new_diagnostics.is_empty() {
+                            (false, verify_gate::format_gate_failure(&result))
+                        } else {
+                            (false, verify_gate::format_delta_failure(&result, &delta))
+                        }
+                    } else {
+                        (result.passed, verify_gate::format_gate_failure(&result))
+                    };
+                    if !gate_passed {
                         verify_attempts += 1;
                         // GOAL MODE: a failed verify invalidates any completion claim the model made
                         // this turn — clear it so the stale claim can't leak through the goal gate to
@@ -1643,7 +1663,7 @@ where
                         // back to the last clean phase mark and re-approaching. Reuses the existing
                         // `recovery_hint` (respects the rewind budget; empty when none is left) — no
                         // new state, just surfacing an option the model already has.
-                        let mut failure_msg = verify_gate::format_gate_failure(&result);
+                        let mut failure_msg = failure_msg_body;
                         if verify_attempts * 2 >= cfg.max_verify_attempts {
                             if let Some(hint) = crate::features::timemachine::recovery_hint() {
                                 failure_msg.push_str("\n\n");
@@ -1970,6 +1990,32 @@ where
                 tc.id.clone(),
                 INTERRUPTED_TOOL_PLACEHOLDER.to_string(),
             ));
+        }
+
+        // BASELINE CAPTURE: just before the first workspace mutation of this run, capture the
+        // current compiler state. The baseline is immutable; later turns only compare against it.
+        // Run only when the verify gate is armed, a baseline has not yet been taken, and the turn
+        // actually contains a write-capable call (skip for read-only turns to avoid paying the
+        // compiler invocation cost on every model turn).
+        if cfg.enable_verify_gate
+            && verify_baseline.is_none()
+            && calls.iter().any(|tc| {
+                if let Some(t) = registry.get(&tc.function.name) {
+                    let args = parse_call_args(&tc.function.arguments)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    t.workspace_effect(&args).needs_checkpoint() || t.recovery_effect(&args)
+                } else {
+                    false
+                }
+            })
+        {
+            let cwd = cfg.effective_root();
+            let gate_dir = verify_gate::verify_root(&cwd).unwrap_or(cwd);
+            if let Some(result) =
+                verify_gate::run_verify_gate(&gate_dir, cfg.verify_gate_timeout_secs).await
+            {
+                verify_baseline = Some(verify_gate::baseline_from_result(&result));
+            }
         }
 
         // EXECUTE the call(s): barrier-partitioned — consecutive read-only calls run concurrently

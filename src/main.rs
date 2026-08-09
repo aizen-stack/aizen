@@ -1169,12 +1169,44 @@ enum MemoryCmd {
     ModelList,
 }
 
+/// Suppress Windows "hard error" dialogs process-wide (and for every child we spawn, which inherits
+/// our error mode). `SEM_FAILCRITICALERRORS` is the one that matters here: it turns the modal
+/// "The application was unable to start correctly (0xc0000142)" box — raised by the loader when a
+/// child's DLL init fails — into a plain non-zero exit we can read, instead of a dialog that blocks
+/// a headless/TUI agent forever. `SEM_NOGPFAULTERRORBOX` and `SEM_NOOPENFILEERRORBOX` close the
+/// sibling crash/open-file dialogs. No-op off Windows. Declared via a raw `extern` so no new
+/// windows-sys feature is pulled (kernel32 is always linked).
+#[cfg(windows)]
+fn suppress_hard_error_dialogs() {
+    const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+    const SEM_NOGPFAULTERRORBOX: u32 = 0x0002;
+    const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
+    #[allow(non_snake_case)]
+    extern "system" {
+        fn SetErrorMode(uMode: u32) -> u32;
+    }
+    // SAFETY: `SetErrorMode` is a thread-safe kernel32 call taking a plain flag word; it has no
+    // failure mode we need to observe (it returns the prior mode, which we don't need at startup).
+    unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    }
+}
+
+/// No-op on non-Windows platforms — the hard-error dialog is a Windows concept.
+#[cfg(not(windows))]
+fn suppress_hard_error_dialogs() {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Restore the terminal (leave alt screen, show cursor, reset scroll region + cooked stdin) BEFORE
     // the default panic printer runs, so a panic inside retained/sticky mode never dumps its backtrace
     // into the alternate screen or onto a frame with a restricted scroll region. Idempotent.
     crate::ui::tui::install_panic_hook();
+    // Windows: stop a failing CHILD process from popping a modal "unable to start correctly" box.
+    // A child inherits our error mode, so this one call covers every spawn (git, cmd, sh, mcp, lsp).
+    // Without it, a git.exe that fails loader-init (0xc0000142) blocks behind a dialog the agent
+    // can neither see nor dismiss; with it the child just returns a status we handle. Idempotent.
+    suppress_hard_error_dialogs();
     let cli = Cli::parse();
     // Before ANY command touches the store: ids the old slugifier cut mid-word are re-slugged whole.
     // Ahead of the `match` so the CLI paths (`memory list`, `memory show`) and the REPL see the same

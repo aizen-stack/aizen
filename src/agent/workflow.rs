@@ -27,10 +27,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
-/// Per-child step budget (mirrors `task` default `max_steps=15`). Workflow children are narrower
-/// than a top-level agent — keep them from burning the full 25/50 default.
+/// Per-child total hard cap after the one soft extension.
 const CHILD_MAX_ITERS: usize = 15;
-/// Hard ceiling on auto-extend for a workflow child (`2 × CHILD_MAX_ITERS`, same shape as task).
+/// Total ceiling for a workflow child (2 × the narrow initial budget).
 const CHILD_AUTO_EXTEND: usize = 30;
 /// Transient model-call failures a workflow child absorbs per turn before giving up (see
 /// `AgentConfig::max_transient_retries`). Matches the `task` tool's sub-agent policy
@@ -42,13 +41,8 @@ const CHILD_AUTO_EXTEND: usize = 30;
 /// now an `Err` rather than a fall-through reported as a finished run, which makes the number
 /// load-bearing instead of merely deciding how long a doomed turn took to give up.
 const CHILD_TRANSIENT_RETRIES: usize = 6;
-/// Fresh step budgets a STILL-PROGRESSING workflow child may be granted after its auto-extend is
-/// spent, instead of returning partial work as `status: "max-iters"` (see
-/// `AgentConfig::max_continuations`). Smaller than the top level's: children are meant to be narrow,
-/// and up to the process-global cap of them run at once, so the worst case is bounded by
-/// `cap × (CHILD_AUTO_EXTEND + CHILD_CONTINUATIONS × CHILD_MAX_ITERS)`.
-const CHILD_CONTINUATIONS: usize = 2;
-
+/// Fresh step budgets are no longer granted after the child's hard total cap; a workflow child is
+/// intentionally narrow and should be split into another workflow call instead of silently growing.
 /// Cap each child's summary before stuffing it into the synthesis prompt (chars). Prevents 5 verbose
 /// children from blowing the synth context / $$.
 const SUMMARY_CHAR_CAP: usize = 4_000;
@@ -79,7 +73,7 @@ pub struct WorkflowTask {
 }
 
 fn default_role() -> String {
-    "coder".to_string()
+    "reviewer".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,7 +142,8 @@ async fn run_workflow_with_cancel(
 ) -> Result<()> {
     validate_spec_ids(spec)?;
     // Same singular-writer gate as `workflow_tool::build_spec` — CLI specs used to skip it and could
-    // launch two default-role `coder`s in parallel (file/build races).
+    // launch two omitted-role children as writers (file/build races). Omitted roles are read-only
+    // reviewers; a writer must be explicit and still stays singular.
     enforce_singular_writer(spec)?;
 
     let root = std::env::current_dir()
@@ -748,12 +743,15 @@ async fn run_one_task(
     let cfg = AgentConfig {
         approval_mode,
         cancel: own_cancel.clone(),
-        // Inherit the parent turn's conversation identity so a workflow child's tool bodies (e.g.
-        // browser) scope to the SAME conversation as the orchestrating turn. `default` on the CLI
-        // `run_workflow` path, which has no conversation thread — matching the pre-context behavior.
-        exec_ctx: crate::core::exec_ctx::current().unwrap_or_default(),
+        // Inherit the parent conversation identity but isolate each child's stateful resources and
+        // keep tool-body heartbeats off the parent transcript. The workflow board owns progress.
+        exec_ctx: crate::core::exec_ctx::current()
+            .unwrap_or_default()
+            .with_resource_scope(format!("workflow/{}/{}", parent.unwrap_or(0), task.id))
+            .with_trace_visible(false),
         quiet: true,
         enable_verify_gate: false,
+        // One soft extension reaches the child's total cap; no second continuation layer.
         max_iters: CHILD_MAX_ITERS,
         auto_extend_to: CHILD_AUTO_EXTEND,
         auto_checkpoint: is_writer,
@@ -766,22 +764,16 @@ async fn run_one_task(
         // Same reason as the `task` tool: a workflow child runs unwatched, and a transient gateway
         // error used to reduce a whole child's work to `status: "error"` in the synthesis input.
         max_transient_retries: CHILD_TRANSIENT_RETRIES,
-        // Unlike the `task` tool, nothing resumes a workflow child — a budget exhaustion here becomes
-        // `status: "max-iters"` in the synthesis input, i.e. partial work presented as a result. Grant
-        // the same in-loop continuation the top level gets, but smaller: children are meant to be
-        // narrow, and N of them run concurrently. Stall recovery stays off — it reads the
-        // process-global todo list, which belongs to the orchestrating turn, not this child.
-        max_continuations: CHILD_CONTINUATIONS,
+        // A workflow child has one total budget; do not present partial work from a multiplied budget.
+        // Stall recovery stays off because it reads the process-global todo list, not ScopedTodo.
+        max_continuations: 0,
         max_stall_recoveries: 0,
         // The PARENT's resolved window, so tool-result clearing and the wrap-up guard are ON for a
         // child (the clearing/guard knobs themselves come from `AgentConfig::default()` below, which
         // already carries the production percentages — they are inert while this is 0).
         //
-        // A child is not short: `CHILD_AUTO_EXTEND` plus `CHILD_CONTINUATIONS` fresh budgets is up to
-        // 60 steps of tool results, and unlike a `task` dispatch nothing above it compacts. Leaving
-        // this 0 meant a read-heavy fan-out child could overflow its provider context mid-run — the
-        // one failure the cheap deterministic clearing exists to prevent. `0` (the CLI `run_workflow`
-        // path, which has no resolved window) keeps the previous behavior exactly.
+        // A child is intentionally narrow: the one soft extension reaches 30 total steps. Split a
+        // broader request into another workflow call instead of silently multiplying child budgets.
         context_window,
         // WALL-CLOCK ceiling per child, same knob as a `task` dispatch. It matters MORE here than
         // there: `join_all` below has no per-task timeout, so one child still grinding holds up the
@@ -1053,8 +1045,8 @@ mod tests {
         assert_eq!(spec.tasks.len(), 2);
         assert_eq!(spec.tasks[0].role, "reviewer");
         assert_eq!(
-            spec.tasks[1].role, "coder",
-            "missing role defaults to coder"
+            spec.tasks[1].role, "reviewer",
+            "missing role defaults to read-only reviewer"
         );
         assert!(spec.synthesis.is_none(), "synthesis is optional");
     }
@@ -1088,8 +1080,8 @@ mod tests {
             "agent is optional; defaults to None"
         );
         assert_eq!(
-            spec.tasks[1].role, "coder",
-            "no agent ⇒ role still defaults to coder"
+            spec.tasks[1].role, "reviewer",
+            "no agent + no role defaults to read-only reviewer"
         );
     }
 

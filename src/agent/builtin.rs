@@ -53,11 +53,16 @@ fn shell_timeout_secs() -> u64 {
 /// how close the ceiling is — and without that a slow build and a wedged process look identical.
 const SLOW_NOTE_EVERY_SECS: u64 = 30;
 
-/// Note a still-running command into the transcript (once per [`SLOW_NOTE_EVERY_SECS`]).
-///
-/// Routed through the same trace surface the tool lines use, so it lands in the retained TUI's buffer
-/// rather than being printed over the frame.
+/// Note a still-running command into the transcript — but ONLY for interactive top-level turns
+/// where the progress is visible. A delegated child (quiet, trace_visible=false) must not write
+/// into the parent transcript; its live status is visible through the orchestration board instead.
 fn note_slow_command(command: &str, waited: u64, cap: u64) {
+    // Suppress for delegated quiet children.
+    if let Some(ctx) = crate::core::exec_ctx::current() {
+        if !ctx.trace_visible() {
+            return;
+        }
+    }
     // One line, command clipped: a 300-char pipeline would wrap and push the transcript around.
     let mut label: String = command.trim().chars().take(60).collect();
     if command.trim().chars().count() > 60 {
@@ -195,9 +200,11 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     r.register(Box::new(SkillSave));
     register_skill_refine(&mut r);
     register_skill_forget(&mut r);
-    // Top-level only (NOT in role sub-agents) — the in-session list + process pool are shared, so a
-    // sub-agent must not clobber them. `role_registry` builds its own list and never gets these.
+    // Top-level only (NOT in role sub-agents) — the in-session todo list is shared with the user's
+    // scroll region, so a sub-agent must not clobber it. `role_registry` builds its own scratch list.
     r.register(Box::new(crate::agent::todo::TodoWrite));
+    // `process` IS granted to the shell-capable sub-agent roles (see `role_registry`): its pool is
+    // keyed by execution scope, so a child sees only the handles it started.
     r.register(Box::new(crate::agent::process::Process::new(
         root.to_path_buf(),
     )));
@@ -357,9 +364,10 @@ pub fn default_registry_with_task(
         0,
         context_window,
     )));
-    // The `workflow` fan-out tool is GATED: its schema costs ~350 tokens on every turn, so it
-    // registers only for the delegating population — ≥1 specialist ENABLED on the allowlist, or
-    // an explicit `workflow_tool: true` in config.
+    // The model-callable fan-out primitive is available by default: hiding it left a normal install
+    // with only the single-child `task` tool, so broad work collapsed into one oversized coder. An
+    // explicit `workflow_tool: false` remains the opt-out for users who prefer the smaller schema;
+    // the delegation toolset filter below can also remove the whole orchestration surface.
     if should_register_workflow() {
         r.register(Box::new(crate::agent::workflow_tool::WorkflowTool::new(
             client,
@@ -378,18 +386,13 @@ pub fn default_registry_with_task(
     Ok(r)
 }
 
-/// Register the `workflow` tool? Config wins either way; default: only when ≥1 specialist agent is
-/// ENABLED on the allowlist (the population that actually fans out — the `<agents>` index already
-/// advertises exactly them). Deliberately NOT "any agent file exists": that over-triggered — a
-/// bulk `agents install` never enabled, or a cloned repo shipping `.claude/agents/`, would silently
-/// tax every turn with the ~350-token schema.
+/// Register the `workflow` tool unless the user explicitly opts out. The ~350-token schema is a
+/// deliberate default cost: without it a fresh install has no batch fan-out primitive, so the model
+/// can only serialize `task` calls or overload one coder with a whole broad job.
 fn should_register_workflow() -> bool {
-    match crate::core::cli_config::load().workflow_tool {
-        Some(v) => v,
-        // Ultimate mode orchestrates by default, so the fan-out tool must be present even when no
-        // specialist agent is enabled (the model is told to prefer it in the system prompt).
-        None => crate::agents::any_enabled() || crate::core::cli_config::ultimate_enabled(),
-    }
+    crate::core::cli_config::load()
+        .workflow_tool
+        .unwrap_or(true)
 }
 
 /// The read-only tool base shared by EVERY sub-agent registry (role- or specialist-scoped): memory +
@@ -481,9 +484,15 @@ fn register_subagent_lsp_write(r: &mut ToolRegistry, root: &Path) {
 /// `task` tool → a sub-agent physically cannot dispatch further sub-agents (recursion guard).
 /// Scoping is deterministic (documented in `system_prompt.md`):
 /// Every role also gets the read-only web research tools (`web_search`/`web_fetch`).
-/// - `coder` → all builtins (read/glob/edit/shell + memory + web)
-/// - `tester` → read/glob + shell + memory + web (no `file_edit`)
+/// - `coder` → all builtins (read/glob/edit/shell/process + memory + web)
+/// - `tester` → read/glob + shell/process + memory + web (no `file_edit`)
 /// - `planner` / `reviewer` / unknown → read-only (read/glob + memory + web)
+///
+/// The shell-capable roles get `process` too, and that pairing is deliberate: `shell_run`'s timeout
+/// message tells the caller to re-run a long command through `process`, which used to be advice a
+/// sub-agent could not act on — it had no such tool, so its only recourse was re-running the command
+/// that had just timed out. The pool is keyed by execution scope (see [`crate::agent::process`]), so a
+/// child can only see the handles it started; one dispatch cannot log or kill a sibling's build.
 pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
     let mut r = subagent_read_only_base(root);
     match role {
@@ -492,12 +501,18 @@ pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
             r.register(Box::new(FileWrite::new(root.to_path_buf())));
             r.register(Box::new(FileMove::new(root.to_path_buf())));
             r.register(Box::new(ShellRun::new(root.to_path_buf())));
+            r.register(Box::new(crate::agent::process::Process::new(
+                root.to_path_buf(),
+            )));
             r.register(Box::new(SkillSave));
             register_skill_refine(&mut r);
             register_subagent_lsp_write(&mut r, root);
         }
         "tester" => {
             r.register(Box::new(ShellRun::new(root.to_path_buf())));
+            r.register(Box::new(crate::agent::process::Process::new(
+                root.to_path_buf(),
+            )));
         }
         // planner / reviewer / unknown → read-only (already has LSP nav when enabled).
         _ => {}
@@ -5283,5 +5298,26 @@ mod tests {
             crate::agent::task_tool::dispatch_is_read_only(&role_registry("planner", &root)),
             "todo_write does not make a read-only role a writer (it's not workspace mutation)"
         );
+    }
+
+    #[test]
+    fn shell_capable_roles_get_the_scoped_process_pool() {
+        // `shell_run`'s timeout message tells a child to re-run a long command with `process`. That
+        // advice was unreachable while the tool was top-level only, so the child could only re-run
+        // the command that had just timed out. The pool is execution-scope keyed, so granting it here
+        // does not let one child observe or kill a sibling's handles.
+        let root = std::env::temp_dir();
+        for role in ["coder", "tester"] {
+            assert!(
+                role_registry(role, &root).get("process").is_some(),
+                "{role} can start and monitor a long-running command"
+            );
+        }
+        for role in ["planner", "reviewer", "unknown-role"] {
+            assert!(
+                role_registry(role, &root).get("process").is_none(),
+                "{role} is read-only — no background command pool"
+            );
+        }
     }
 }

@@ -13,10 +13,9 @@
 //!   prompted to REFUTE it (industrially measured at ~0.93 accuracy filtering false positives).
 //!   No synthesis: the per-finding verdicts return raw.
 //!
-//! Registration is GATED (config `workflow_tool: true`, or auto when ≥1 specialist agent is
-//! ENABLED on the allowlist): the schema costs ~350 tokens on every turn, so only the delegating
-//! population pays — agent files merely existing on disk (bulk installs, repo-shipped dirs) don't.
-//! Depth 0 only, like `task`. The tool itself is not concurrency-safe — it IS the parallelism.
+//! Registered by default at depth 0 so a fresh install always has a real fan-out primitive. Users
+//! who prefer the smaller top-level schema can opt out with `workflow_tool: false`. Depth 0 only,
+//! like `task`; the tool itself is not concurrency-safe — it IS the parallelism.
 
 use crate::agent::tools::Tool;
 #[cfg(test)]
@@ -97,7 +96,7 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                 let role = t
                     .get("role")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("coder")
+                    .unwrap_or("reviewer")
                     .to_string();
                 tasks.push(WorkflowTask {
                     id: t
@@ -197,7 +196,7 @@ impl Tool for WorkflowTool {
                 "tasks": {"type": "array", "maxItems": 32, "description": "fanout mode: the tasks to run concurrently (request what the work needs; the harness bounds concurrent width by machine)", "items": {"type": "object", "properties": {
                     "id": {"type": "string"},
                     "prompt": {"type": "string", "description": "complete, self-contained task"},
-                    "role": {"type": "string", "enum": ["coder", "planner", "reviewer", "tester"]},
+                    "role": {"type": "string", "enum": ["coder", "planner", "reviewer", "tester"], "description": "default reviewer (read-only); set coder/tester explicitly, at most one writer per workflow"},
                     "agent": {"type": "string", "description": "optional specialist slug from <agents>"},
                     "model": {"type": "string"}
                 }, "required": ["prompt"], "additionalProperties": false}},
