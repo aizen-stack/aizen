@@ -5197,6 +5197,10 @@ async fn run_menu_sticky() -> Result<()> {
     let mut model_label = cli_config::load()
         .model
         .unwrap_or_else(|| "(no model)".to_string());
+    // Pin this window to the model it launched with, so another window's `/model` (which rewrites the
+    // shared cli-config.json) can't retarget this one on its next turn. Skipped when no model is set
+    // yet — a first-run window must still adopt whatever `/config`/`/model` configures here.
+    cli_config::pin_session_model(&model_label);
     let mut history: Vec<Message> = Vec::new();
     rebuild_system(&mut history, &model_label);
     let repo_scope = crate::core::recovery::current_repo_scope();
@@ -5414,6 +5418,15 @@ async fn run_menu_sticky() -> Result<()> {
                     );
                 }
                 model_label = model.clone();
+                // Seed the query-expansion endpoint from THIS turn's resolution so a non-English
+                // `codebase_search` can translate itself to English identifiers via the chore model.
+                // Re-seeded every turn so it follows a mid-session `/model` switch. Routes through the
+                // summarizer role internally; the LLM tier still stays behind `AIZEN_QUERY_EXPAND`.
+                agent::query_lang::set_expansion_endpoint(&cli_config::ResolvedEndpoint {
+                    base_url: base_url.clone(),
+                    api_key: api_key.clone(),
+                    model: model.clone(),
+                });
                 migrate_legacy_prompt_lanes(&mut history, &model);
                 // The rotating discoverability tip is emitted AFTER the turn finishes (see the
                 // success branch below) so it lands UNDER the model's final answer, not stranded
@@ -5855,6 +5868,7 @@ async fn run_menu_plain() -> Result<()> {
     let mut model_label = cli_config::load()
         .model
         .unwrap_or_else(|| "(no model)".to_string());
+    cli_config::pin_session_model(&model_label); // see the sticky REPL: per-window model, not per-disk
     let mut history: Vec<Message> = Vec::new();
     let mut input_history: Vec<String> = Vec::new(); // recallable past prompts (↑/↓ in the box)
     rebuild_system(&mut history, &model_label);
@@ -5962,6 +5976,12 @@ async fn run_menu_plain() -> Result<()> {
             }
         };
         model_label = model.clone();
+        // See the sticky REPL: seed the query-expansion endpoint per turn so it follows `/model`.
+        agent::query_lang::set_expansion_endpoint(&cli_config::ResolvedEndpoint {
+            base_url: base_url.clone(),
+            api_key: api_key.clone(),
+            model: model.clone(),
+        });
         migrate_legacy_prompt_lanes(&mut history, &model);
         // Per-turn reasoning-effort auto-detect (mirrors the sticky REPL): classify what the user
         // TYPED, not the expanded payload — see the sticky path for why. Falls back to the finalized
@@ -9444,6 +9464,7 @@ async fn handle_slash(
             match selected {
                 Ok(Some(profile)) => {
                     *model_label = profile.model.clone();
+                    cli_config::pin_session_model(&profile.model); // switching provider is a deliberate model change for THIS window
                     refresh_prompt_lanes_in_place(history, model_label);
                     tui::emit_line(
                         &style(format!(
@@ -9493,6 +9514,9 @@ async fn handle_slash(
                 tui::note_line(&format!("{} {e}", style("config:").red()));
             }
             *model_label = cli_config::load().model.unwrap_or_else(|| model_label.clone());
+            // The wizard just wrote config for THIS window on purpose, so adopt its model as the new
+            // session pin rather than letting the startup pin override what the user just chose.
+            cli_config::pin_session_model(model_label);
             // Refresh IN PLACE — retuning settings mid-chat must not end the conversation.
             refresh_prompt_lanes_in_place(history, model_label);
         }
@@ -10973,6 +10997,9 @@ async fn slash_model(model_label: &mut String) -> Result<()> {
     cfg.model_context_window = chosen.context_length; // Some ⇒ auto; None ⇒ HUD falls back to heuristic
     cli_config::save(&cfg)?;
     *model_label = chosen.id.clone();
+    // Re-pin: the save above sets the default for the NEXT window, the pin makes the switch stick in
+    // THIS one. Without it the startup pin would win and the user's pick would be ignored.
+    cli_config::pin_session_model(&chosen.id);
     let (window, auto) = resolve_ctx_window(&chosen.id);
     let winlabel = if window >= 1000 {
         format!("{}K", window / 1000)
@@ -11005,8 +11032,12 @@ fn resolve_endpoint(
         .or_else(|| cli_config::branded_env("API_KEY"))
         .or(cfg.api_key)
         .context("no API key — run `aizen config` (interactive setup), or pass --api-key / set AIZEN_API_KEY")?;
+    // Session pin sits between env and disk: a REPL window stays on the model IT resolved, so a
+    // sibling window running `/model` (which rewrites the shared cli-config.json) can't switch this
+    // one out from under it on the next turn. Non-REPL callers never pin ⇒ they read `cfg.model`.
     let model = model
         .or_else(|| cli_config::branded_env("MODEL"))
+        .or_else(cli_config::session_model)
         .or(cfg.model)
         .context("no model — run `aizen config` (interactive setup) or `aizen models` to list, or pass --model / set AIZEN_MODEL")?;
     Ok((base_url, api_key, model))

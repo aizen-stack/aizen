@@ -124,7 +124,7 @@ Memory — recall before you rediscover:
 
 Discovery & code intelligence — locate and understand:
 - `repo_map` — high-level structure; first move in an unfamiliar repo.
-- `codebase_search` — search the `/init` semantic codebase index; run `/init` first when unavailable.
+- `codebase_search` — search the `/init` semantic codebase index; run `/init` first when unavailable. Code identifiers are English, so when the user asks about the codebase in another language, search with the English terms the code would use (e.g. "đăng nhập" → `login auth session`), not their literal words.
 - `file_glob` — find files by name or pattern.
 - `search_files` — content/regex search across the tree.
 - `lsp_workspace_symbol` — find a symbol by name project-wide.

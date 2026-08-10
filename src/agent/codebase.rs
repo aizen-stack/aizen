@@ -1859,7 +1859,13 @@ pub fn search(query: &str, limit: usize) -> Result<String> {
     if tokenize(query).is_empty() {
         return Ok(format!("`{query}` has no searchable terms."));
     }
-    let hits = rank_chunks(&idx, &bm, query, limit);
+    // Same language-neutral normalization as the auto path, but with the LLM fallback ENABLED: this
+    // is a deliberate tool call (the model asked to search), so a cached, opt-in chore-model call to
+    // translate an arbitrary-language query is worth it here in a way it is not on every auto turn.
+    // No-op for an English query, or when the fallback is disabled/unseeded. Ranking uses the
+    // expansion; the messages below quote the user's `query` so the model never sees our scaffolding.
+    let expanded = crate::agent::query_lang::expand_query_with_fallback(query);
+    let hits = rank_chunks(&idx, &bm, &expanded, limit);
     if hits.is_empty() {
         return Ok(format!("no indexed chunks match `{query}`."));
     }
@@ -1921,7 +1927,14 @@ pub fn retrieval_block(query: &str, budget_tokens: usize) -> Option<String> {
     if idx.chunks.is_empty() {
         return None;
     }
-    let hits = rank_chunks(&idx, &bm, query, 20);
+    // Language-neutral normalization FIRST: code identifiers are English, the question may not be.
+    // An un-expanded non-English query tokenizes to terms no chunk contains, so `rank_chunks` scores
+    // everything 0.0 and the gate below sees zero coverage — the index goes unused on every turn the
+    // user does not happen to type English. `expand_query` APPENDS English terms (no-op for an
+    // English query), and BOTH the ranker and the gate must see the same expanded text: they call
+    // `tokenize` separately, so expanding for only one of them would still leave the gate shut.
+    let expanded = crate::agent::query_lang::expand_query(query);
+    let hits = rank_chunks(&idx, &bm, &expanded, 20);
     if hits.is_empty() {
         return None;
     }
@@ -1931,7 +1944,7 @@ pub fn retrieval_block(query: &str, budget_tokens: usize) -> Option<String> {
     // CONFIDENT match: it covers >=2 distinct query tokens in its body, OR it is a high-signal
     // exact match (the query names the symbol, or a query token is a substring of the file path).
     // Mirrors the memory subsystem's lexical-coverage gate (memory/mod.rs `lexical_coverage`).
-    if !gate_passes(query, hits[0].chunk) {
+    if !gate_passes(&expanded, hits[0].chunk) {
         return None;
     }
     let budget_chars = budget_tokens.saturating_mul(4).max(800);

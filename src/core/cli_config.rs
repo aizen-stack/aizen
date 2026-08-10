@@ -918,6 +918,48 @@ pub fn approval_mode() -> ApprovalMode {
     }
 }
 
+/// The model THIS process is pinned to, once its REPL has resolved one.
+///
+/// Why this exists: `cli-config.json` is a single file shared by every aizen window on the machine,
+/// and the REPL re-reads it on EVERY turn (`resolve_endpoint`). So a second window running `/model`
+/// wrote the new id to that shared file and the first window silently adopted it on its next turn —
+/// the user picked a model in window B and watched window A switch too. `model_label` was already
+/// per-process, but disk won each turn, so the in-memory value was pointless.
+///
+/// The pin makes the model a SESSION decision: window A keeps what it started with (or last chose
+/// itself), regardless of what other windows persist. `/model` still saves to disk — that is what
+/// makes the choice the default for the NEXT window — it just no longer reaches back into running
+/// ones.
+///
+/// `None` ⇒ unpinned: fall through to `cfg.model`. That is deliberately the state for every
+/// non-REPL caller (one-shot `aizen -p`, cron jobs, the hostbot daemon, sub-agents), which have no
+/// session to pin and must keep reading the saved config.
+static SESSION_MODEL: Lazy<RwLock<Option<String>>> = Lazy::new(|| RwLock::new(None));
+
+/// Pin this process to `model` (called by the REPL at startup and after any in-session switch).
+pub fn pin_session_model(model: &str) {
+    let model = model.trim();
+    if model.is_empty() {
+        return;
+    }
+    *SESSION_MODEL.write().unwrap_or_else(|e| e.into_inner()) = Some(model.to_string());
+}
+
+/// The pinned session model, if this process is a REPL that has resolved one.
+pub fn session_model() -> Option<String> {
+    SESSION_MODEL
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Drop the pin. Test-only: at runtime a session never un-pins — it either keeps its model or
+/// re-pins to a new one — so exposing this outside tests would only invite an accidental un-pin.
+#[cfg(test)]
+pub fn clear_session_model() {
+    *SESSION_MODEL.write().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Per-turn reasoning-effort override, set by the REPL for one user turn and read by the LLM client
 /// when it builds a request. Kept OUT of `CliConfig` on purpose — effort is a per-turn decision, not
 /// a persisted setting. The nesting distinguishes three states:
@@ -1589,6 +1631,48 @@ mod tests {
 
         std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_model_pin_survives_a_sibling_window_rewriting_the_config() {
+        // Serialize against other tests touching process-global state / $AIZEN_HOME.
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_session_model();
+        assert_eq!(
+            session_model(),
+            None,
+            "unpinned by default (non-REPL callers)"
+        );
+
+        // This window launched on model A and pinned it.
+        pin_session_model("model-a");
+        assert_eq!(session_model(), Some("model-a".into()));
+
+        // A second window runs `/model` and picks B — that only rewrites the SHARED config file.
+        // The pin is what keeps this window on A, which is the whole bug.
+        assert_eq!(
+            session_model(),
+            Some("model-a".into()),
+            "a sibling window's save must not retarget this session"
+        );
+
+        // An in-session switch here (this window's own `/model`) re-pins.
+        pin_session_model("model-c");
+        assert_eq!(session_model(), Some("model-c".into()));
+
+        // Blank ids are ignored — a window with no model configured must stay unpinned so it can
+        // still adopt whatever `/config` sets up.
+        pin_session_model("   ");
+        assert_eq!(
+            session_model(),
+            Some("model-c".into()),
+            "blank pin is a no-op"
+        );
+
+        clear_session_model();
+        assert_eq!(session_model(), None);
     }
 
     #[test]
