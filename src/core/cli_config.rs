@@ -199,6 +199,12 @@ pub struct CliConfig {
     /// active one). `None` ⇒ default 50. `Some(0)` ⇒ unlimited (keep everything).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timemachine_keep: Option<usize>,
+    /// How many low-value SAFETY-NET checkpoints (`before agent edits`, one per agent run) to retain,
+    /// independent of `timemachine_keep`. Retention drops the oldest safety-nets past this floor before
+    /// it ever touches a descriptive `phase: …` milestone, so `aizen time list` stays readable.
+    /// `None` ⇒ default 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timemachine_keep_safety: Option<usize>,
     /// Maximum files in one Time Machine snapshot. `None` ⇒ 100,000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timemachine_max_files: Option<u64>,

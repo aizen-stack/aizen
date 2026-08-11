@@ -598,7 +598,18 @@ enum TimeCmd {
         repair: bool,
     },
     /// Remove orphan Time Machine refs/sidecars after validating the authoritative ledger.
-    Gc,
+    ///
+    /// With `--all`, instead sweeps EVERY private store under `~/.aizen/timemachine/` and reports
+    /// orphan stores whose source repository no longer exists (deleted or moved). Dry-run unless
+    /// `--apply` is given, which moves orphans to `~/.aizen/timemachine/.trash/<timestamp>/`.
+    Gc {
+        /// Sweep every repo's store at the home level (orphan-store cleanup), not just this repo.
+        #[arg(long)]
+        all: bool,
+        /// With `--all`: actually move orphan stores to `.trash/` (default is a dry-run report).
+        #[arg(long)]
+        apply: bool,
+    },
     /// Delete ALL checkpoints (Git objects are reclaimed later by normal Git maintenance).
     Clear,
 }
@@ -2590,16 +2601,57 @@ fn run_time(cmd: TimeCmd) -> Result<()> {
             }
             Ok(())
         }
-        TimeCmd::Gc => {
-            let report = timemachine::doctor_gc()?;
-            println!(
-                "{} repo {} · worktree {} · {} checkpoint(s)",
-                style("🧹 time metadata cleaned:").color256(splash::ACCENT),
-                report.repo_id,
-                report.worktree_id,
-                report.checkpoints
-            );
-            Ok(())
+        TimeCmd::Gc { all, apply } => {
+            if all {
+                let report = timemachine::gc_all(apply)?;
+                let fmt_mb = |b: u64| format!("{:.1} MB", b as f64 / 1_048_576.0);
+                if report.orphans.is_empty() {
+                    println!(
+                        "{} {} store(s) scanned · no orphans (every source repo still exists)",
+                        style("🧹 time gc --all:").color256(splash::ACCENT),
+                        report.stores.len()
+                    );
+                } else {
+                    let total: u64 = report.orphans.iter().map(|o| o.bytes).sum();
+                    println!(
+                        "{} {} orphan store(s), {} reclaimable:",
+                        style("🧹 time gc --all:").color256(splash::ACCENT),
+                        report.orphans.len(),
+                        fmt_mb(total)
+                    );
+                    for o in &report.orphans {
+                        println!(
+                            "  {} · {} · {} checkpoint(s) · source gone: {}",
+                            o.repo_id,
+                            fmt_mb(o.bytes),
+                            o.checkpoints,
+                            o.source.as_deref().unwrap_or("(unknown)")
+                        );
+                    }
+                    if report.applied {
+                        println!(
+                            "  → moved to {}",
+                            report.trash_dir.as_deref().unwrap_or("(trash)")
+                        );
+                    } else {
+                        println!(
+                            "  (dry-run — re-run with {} to move these to .trash/)",
+                            style("--apply").bold()
+                        );
+                    }
+                }
+                Ok(())
+            } else {
+                let report = timemachine::doctor_gc()?;
+                println!(
+                    "{} repo {} · worktree {} · {} checkpoint(s)",
+                    style("🧹 time metadata cleaned:").color256(splash::ACCENT),
+                    report.repo_id,
+                    report.worktree_id,
+                    report.checkpoints
+                );
+                Ok(())
+            }
         }
         TimeCmd::Clear => {
             let n = timemachine::clear()?;

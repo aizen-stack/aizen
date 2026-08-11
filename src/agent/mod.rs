@@ -2584,7 +2584,7 @@ async fn execute_calls(
                                 // instead, that same write is an ordinary in-repo edit with full
                                 // rewind coverage. `None` (no path named, e.g. `shell_run`) keeps
                                 // the cwd-relative behavior.
-                                match crate::features::timemachine::save_protected_change_in("before agent edits", target_dir.as_deref()) {
+                                match crate::features::timemachine::save_protected_change_in(crate::features::timemachine::PRE_EDIT_LABEL, target_dir.as_deref()) {
                                     Ok(None) => {
                                         // Two benign shapes, two honest messages: "not a repo" and
                                         // "no git executable" behave the same (checkpoints off, the

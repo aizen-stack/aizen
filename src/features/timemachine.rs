@@ -2,11 +2,23 @@
 //!
 //! Checkpoints live in a private store under `~/.aizen/timemachine/<repo-id>/`, fully outside the
 //! source repository's `.git`. Each linked worktree owns its own ledger/journal/chat namespace while
-//! sharing a bare object store. Source Git objects remain readable only through a sealed alternates
-//! pointer for migration/seed; new checkpoint objects and all Time Machine refs are written into the
-//! private store. Metadata is fail-closed, writes are atomic, and every mutating operation is
-//! serialized by an OS lock. Git is invoked with hooks/fsmonitor/filters disabled so checkpointing
-//! cannot execute repository-controlled code before an approval gate.
+//! sharing a bare object store. Metadata is fail-closed, writes are atomic, and every mutating
+//! operation is serialized by an OS lock. Git is invoked with hooks/fsmonitor/filters disabled so
+//! checkpointing cannot execute repository-controlled code before an approval gate.
+//!
+//! # Relationship to the source repo — restore-tree always works; full independence is best-effort
+//!
+//! New checkpoint objects (the checkpoint commit, its tree, and every blob that CHANGED) and all Time
+//! Machine refs are written into the private store, so restoring a checkpoint's working tree does not
+//! depend on the source repo staying alive. It is NOT a fully self-contained clone, though: the store
+//! keeps a sealed `objects/info/alternates` pointer back to the source `.git/objects`, and Git's
+//! alternates mechanism means an UNCHANGED blob (one already present in a source commit) may never be
+//! copied into the private store — the checkpoint tree references it only through the source. The
+//! first checkpoint of a timeline also parents on the source `HEAD` commit, which is not materialized.
+//! Consequences if the source `.git` is later deleted: `read-tree`/restore still succeeds for the
+//! materialized trees, but history walks (`git log`) and `git fsck` over the store can report missing
+//! objects, and any blob that lived only in the source is gone. A future `aizen time seal` (copy the
+//! full object closure, drop alternates) would make a store archival-independent; today it is not.
 
 use crate::core::types::Message;
 use anyhow::{bail, Context, Result};
@@ -22,6 +34,17 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 const DEFAULT_KEEP: usize = 50;
+/// How many low-value SAFETY-NET checkpoints (`before agent edits`) to retain, independent of the
+/// `DEFAULT_KEEP` total budget. These are per-run recovery nets: one is stamped before the first
+/// destructive edit of every agent run, so they pile up fast (81 on this machine's aizen store) and
+/// bury the descriptive `phase: …` / `phase N verified` MILESTONES the user actually browses to.
+/// Retention drops the oldest safety-nets past this floor FIRST, so the timeline stays readable
+/// without ever touching a milestone until the total budget itself is exceeded. Override with
+/// `timemachine_keep_safety` in config.
+const DEFAULT_KEEP_SAFETY: usize = 5;
+/// Label of the once-per-run pre-edit auto-checkpoint. Shared with the agent loop's call site so the
+/// SafetyNet classification keys off a single source of truth, not a copy-pasted string literal.
+pub(crate) const PRE_EDIT_LABEL: &str = "before agent edits";
 const LEDGER_SCHEMA: u32 = 2;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 /// Wall-clock ceiling on ONE internal git invocation.
@@ -214,6 +237,24 @@ pub struct Coverage {
     pub notes: Vec<String>,
 }
 
+/// Retention value tier of a checkpoint. The timeline treats these very differently: a MILESTONE is
+/// a place the user deliberately browses back to, a SAFETY-NET is a transient per-run recovery net,
+/// and a RECOVERY preimage is created implicitly by restore. Retention keeps many milestones but only
+/// a few recent safety-nets, so the list does not fill with `before agent edits` noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotKind {
+    /// Worth keeping: a manual `/checkpoint`, a closed todo phase (`phase: …`), or a clean verify
+    /// gate (`phase N verified`). These are the "chỗ cần check" the user navigates to.
+    Milestone,
+    /// The once-per-run pre-edit net (`before agent edits`). Useful during and just after its own run
+    /// (via process-local run anchors); afterward it is mostly timeline clutter, so it is pruned first.
+    SafetyNet,
+    /// A preimage created by restore/time-travel (`recovery == true`). Restorable but excluded from
+    /// redo branch selection.
+    Recovery,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub id: u32,
@@ -234,6 +275,30 @@ pub struct Snapshot {
     /// normal redo branch selection so safety snapshots do not hijack timeline navigation.
     #[serde(default)]
     pub recovery: bool,
+    /// Retention tier. `None` on checkpoints written before this field existed (older ledgers); read
+    /// through [`Snapshot::kind`], which INFERS the tier from `recovery`/`auto`/`label` so legacy rows
+    /// classify correctly without a migration pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SnapshotKind>,
+}
+
+impl Snapshot {
+    /// Effective retention tier. Uses the stored `kind` when present; otherwise infers it from the
+    /// legacy signals so pre-`kind` ledgers (and the dead `after agent edit` label from the old
+    /// per-edit binary) still sort into the right bucket. `recovery` wins first (it is authoritative),
+    /// then the auto pre-edit / dead-per-edit labels are SafetyNet, and everything else is a Milestone.
+    pub fn kind(&self) -> SnapshotKind {
+        if let Some(k) = self.kind {
+            return k;
+        }
+        if self.recovery {
+            SnapshotKind::Recovery
+        } else if self.auto && (self.label == PRE_EDIT_LABEL || self.label == "after agent edit") {
+            SnapshotKind::SafetyNet
+        } else {
+            SnapshotKind::Milestone
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -453,10 +518,11 @@ impl RepoContext {
         let common_canon =
             fs::canonicalize(&common_git_dir).unwrap_or_else(|_| common_git_dir.clone());
         let wt_canon = fs::canonicalize(&git_dir).unwrap_or_else(|_| git_dir.clone());
-        let repo_id = format!("repo-{:016x}", fnv1a64(&common_canon.to_string_lossy()));
-        let worktree_id = format!("wt-{:016x}", fnv1a64(&wt_canon.to_string_lossy()));
 
         let home = crate::core::config::aizen_home();
+        // Stable identity via the home-level registry (survives repo moves; distinguishes clones).
+        // Fails open to the legacy `repo-<fnv(path)>` ids if the registry is unavailable.
+        let (repo_id, worktree_id) = resolve_identity(&home, &common_canon, &wt_canon, &root);
         let repo_store_root = home.join("timemachine").join(&repo_id);
         let store_git_dir = repo_store_root.join("store.git");
         let namespace_dir = repo_store_root.join("worktrees").join(&worktree_id);
@@ -1391,6 +1457,257 @@ fn fnv1a64(s: &str) -> u64 {
     h
 }
 
+/// Stable repo/worktree identity, decoupled from the filesystem path.
+///
+/// The store id used to be `repo-<fnv(path-of-.git)>`. That made identity a function of LOCATION, so
+/// renaming or moving a repo minted a brand-new (empty) store and the whole timeline appeared to
+/// vanish — the old store became an unreachable orphan (`repo-d137…` on this machine). This module
+/// keeps the store OUTSIDE `.git` (all the isolation reasons stand) but remembers each repo's id in a
+/// home-level registry keyed for reconnection by its ROOT COMMIT, so a move keeps the timeline while a
+/// `cp -r`/clone (same root commit, but the ORIGINAL path still exists) correctly gets a fresh id.
+///
+/// The [`resolve`] core is a pure function over an in-memory [`Registry`] so every branch — exact hit,
+/// moved-repo reconnect, legacy grandfather, brand-new — is unit-tested without touching git or disk.
+mod identity {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct WorktreeEntry {
+        pub worktree_id: String,
+        /// Absolute canonical worktree git dir (`.git` or `.git/worktrees/<name>`) last seen.
+        pub git_dir: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct RepoEntry {
+        /// Immutable once assigned. Never recomputed from a path.
+        pub repo_id: String,
+        /// Reconnection key across moves. `None` only for a repo with no commits yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub root_commit: Option<String>,
+        /// Absolute canonical common git dir last seen; updated (not re-keyed) when the repo moves.
+        pub common_git_dir: String,
+        #[serde(default)]
+        pub worktrees: Vec<WorktreeEntry>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct Registry {
+        #[serde(default)]
+        pub schema_version: u32,
+        #[serde(default)]
+        pub repos: Vec<RepoEntry>,
+    }
+
+    /// Everything [`resolve`] needs, with side effects injected as closures so it stays pure/testable.
+    pub struct ResolveInput<'a> {
+        pub common_git_dir: String,
+        pub git_dir: String,
+        pub root_commit: Option<String>,
+        /// `repo-<fnv(common)>` — the pre-registry id; used to grandfather an existing on-disk store.
+        pub legacy_repo_id: String,
+        /// `wt-<fnv(wt)>` — the pre-registry worktree id, grandfathered alongside a legacy store.
+        pub legacy_wt_id: String,
+        /// Does `~/.aizen/timemachine/<legacy_repo_id>/store.git` already exist on disk?
+        pub legacy_store_exists: bool,
+        /// Does this recorded path still exist? (Used to tell a MOVE from a live clone.)
+        pub path_exists: &'a dyn Fn(&str) -> bool,
+        /// Mint a fresh random id for the given prefix (`"repo"` / `"wt"`).
+        pub new_id: &'a dyn Fn(&str) -> String,
+    }
+
+    pub struct Resolved {
+        pub repo_id: String,
+        pub worktree_id: String,
+        /// True when the registry was mutated and must be persisted.
+        pub changed: bool,
+    }
+
+    /// Assign (or look up) the worktree id within an already-selected repo entry.
+    fn resolve_worktree(entry: &mut RepoEntry, input: &ResolveInput) -> (String, bool) {
+        // Exact git-dir hit — the common case.
+        if let Some(w) = entry.worktrees.iter().find(|w| w.git_dir == input.git_dir) {
+            return (w.worktree_id.clone(), false);
+        }
+        // Reclaim a stale worktree whose recorded git-dir is gone (the moved-checkout case), but only
+        // when EXACTLY one is stale, so we never guess among several dead worktrees.
+        let stale: Vec<usize> = entry
+            .worktrees
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| !(input.path_exists)(&w.git_dir))
+            .map(|(i, _)| i)
+            .collect();
+        if stale.len() == 1 {
+            let i = stale[0];
+            entry.worktrees[i].git_dir = input.git_dir.clone();
+            return (entry.worktrees[i].worktree_id.clone(), true);
+        }
+        // Otherwise a genuinely new (linked) worktree.
+        let wt_id = (input.new_id)("wt");
+        entry.worktrees.push(WorktreeEntry {
+            worktree_id: wt_id.clone(),
+            git_dir: input.git_dir.clone(),
+        });
+        (wt_id, true)
+    }
+
+    /// Resolve identity against the registry, mutating it as needed. Pure: all I/O is in the caller.
+    pub fn resolve(reg: &mut Registry, input: &ResolveInput) -> Resolved {
+        // 1. Exact path hit — return the stored id; backfill root_commit if we only now learned it.
+        if let Some(idx) = reg
+            .repos
+            .iter()
+            .position(|r| r.common_git_dir == input.common_git_dir)
+        {
+            let (worktree_id, mut changed) = resolve_worktree(&mut reg.repos[idx], input);
+            if reg.repos[idx].root_commit.is_none() && input.root_commit.is_some() {
+                reg.repos[idx].root_commit = input.root_commit.clone();
+                changed = true;
+            }
+            let repo_id = reg.repos[idx].repo_id.clone();
+            return Resolved {
+                repo_id,
+                worktree_id,
+                changed,
+            };
+        }
+
+        // 2. Moved repo: a UNIQUE entry with the same root commit whose recorded path is now gone.
+        //    Uniqueness + "old path gone" is what separates a move from a live clone/`cp -r`.
+        if let Some(rc) = input.root_commit.as_deref() {
+            let matches: Vec<usize> = reg
+                .repos
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| {
+                    r.root_commit.as_deref() == Some(rc) && !(input.path_exists)(&r.common_git_dir)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if matches.len() == 1 {
+                let idx = matches[0];
+                reg.repos[idx].common_git_dir = input.common_git_dir.clone();
+                let (worktree_id, _) = resolve_worktree(&mut reg.repos[idx], input);
+                let repo_id = reg.repos[idx].repo_id.clone();
+                return Resolved {
+                    repo_id,
+                    worktree_id,
+                    changed: true,
+                };
+            }
+        }
+
+        // 3. New to the registry. Grandfather a legacy hash-path store if one is already on disk (so
+        //    existing timelines keep their id + namespace with ZERO data migration); else mint random.
+        let (repo_id, worktree_id) = if input.legacy_store_exists {
+            (input.legacy_repo_id.clone(), input.legacy_wt_id.clone())
+        } else {
+            ((input.new_id)("repo"), (input.new_id)("wt"))
+        };
+        reg.repos.push(RepoEntry {
+            repo_id: repo_id.clone(),
+            root_commit: input.root_commit.clone(),
+            common_git_dir: input.common_git_dir.clone(),
+            worktrees: vec![WorktreeEntry {
+                worktree_id: worktree_id.clone(),
+                git_dir: input.git_dir.clone(),
+            }],
+        });
+        Resolved {
+            repo_id,
+            worktree_id,
+            changed: true,
+        }
+    }
+}
+
+/// Mint a random `<prefix>-<16 hex>` id. Random (not path-derived) so it is stable for a repo's life
+/// and can never collide with a `cp -r` sibling. Falls back to a time-seeded value if the system RNG
+/// is somehow unavailable — uniqueness still holds well enough for a per-repo store name.
+fn random_id(prefix: &str) -> String {
+    let mut bytes = [0u8; 8];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        let n = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64
+            ^ OP_SEQ.fetch_add(1, Ordering::Relaxed);
+        bytes = n.to_le_bytes();
+    }
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{prefix}-{hex}")
+}
+
+/// The single root-commit OID of a repo's current HEAD history, used as the move-reconnection key.
+/// `--max-parents=0` lists root commits; a repo with several roots (merged histories) or none (no
+/// commits yet) yields `None`, which simply disables reconnect for that repo — never an error.
+fn root_commit_of(root: &Path) -> Option<String> {
+    let out = raw_git(root, ["rev-list", "--max-parents=0", "HEAD"]).ok()?;
+    let mut roots = out.split_whitespace();
+    let first = roots.next()?;
+    // Exactly one root — ambiguous multi-root histories are not a stable key.
+    if roots.next().is_some() {
+        return None;
+    }
+    Some(first.to_string())
+}
+
+/// Resolve `(repo_id, worktree_id)` for a repo, keeping identity stable across moves via the home-level
+/// registry. FAIL-OPEN: any registry error (unreadable, lock busy, write failure) falls back to the
+/// legacy `repo-<fnv(path)>` / `wt-<fnv(path)>` ids — exactly today's behavior — so a broken registry
+/// can never block checkpointing. The registry is a stable-identity optimization, not the source of
+/// truth for the tree itself.
+fn resolve_identity(
+    home: &Path,
+    common_canon: &Path,
+    wt_canon: &Path,
+    root: &Path,
+) -> (String, String) {
+    let common_key = common_canon.to_string_lossy().replace('\\', "/");
+    let git_key = wt_canon.to_string_lossy().replace('\\', "/");
+    let legacy_repo_id = format!("repo-{:016x}", fnv1a64(&common_key));
+    let legacy_wt_id = format!("wt-{:016x}", fnv1a64(&git_key));
+
+    let attempt = || -> Result<(String, String)> {
+        let tm_root = home.join("timemachine");
+        fs::create_dir_all(&tm_root)?;
+        // Serialize registry read-modify-write across processes. Short-lived, taken BEFORE any store
+        // lock (different namespace), released when this function returns → no lock nesting.
+        let reg_lock_path = tm_root.join("registry.lock");
+        let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+            &reg_lock_path,
+            Duration::from_secs(5),
+        )?;
+        let reg_path = tm_root.join("registry.json");
+        let mut reg: identity::Registry = match crate::core::persist::read_optional(&reg_path)? {
+            Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            None => identity::Registry::default(),
+        };
+        if reg.schema_version == 0 {
+            reg.schema_version = 1;
+        }
+        let legacy_store_exists = tm_root.join(&legacy_repo_id).join("store.git").is_dir();
+        let path_exists = |p: &str| Path::new(p).exists();
+        let new_id = |prefix: &str| random_id(prefix);
+        let input = identity::ResolveInput {
+            common_git_dir: common_key.clone(),
+            git_dir: git_key.clone(),
+            root_commit: root_commit_of(root),
+            legacy_repo_id: legacy_repo_id.clone(),
+            legacy_wt_id: legacy_wt_id.clone(),
+            legacy_store_exists,
+            path_exists: &path_exists,
+            new_id: &new_id,
+        };
+        let resolved = identity::resolve(&mut reg, &input);
+        if resolved.changed {
+            let bytes = serde_json::to_vec_pretty(&reg)?;
+            crate::core::persist::atomic_write(&reg_path, &bytes)?;
+        }
+        Ok((resolved.repo_id, resolved.worktree_id))
+    };
+
+    attempt().unwrap_or((legacy_repo_id, legacy_wt_id))
+}
+
 fn raw_git<I, S>(root: &Path, args: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,
@@ -1789,24 +2106,29 @@ pub fn save_protected_change_in(label: &str, start: Option<&Path>) -> Result<Opt
 pub fn save(label: &str, auto: bool) -> Result<Snapshot> {
     let ctx = RepoContext::current()?;
     let snap = save_in(&ctx, label, auto, None)?;
-    let keep = crate::core::cli_config::load()
-        .timemachine_keep
-        .unwrap_or(DEFAULT_KEEP);
-    prune_after_save(&ctx, keep, &[snap.id])?;
+    let cfg = crate::core::cli_config::load();
+    let keep = cfg.timemachine_keep.unwrap_or(DEFAULT_KEEP);
+    let keep_safety = cfg.timemachine_keep_safety.unwrap_or(DEFAULT_KEEP_SAFETY);
+    prune_after_save(&ctx, keep, keep_safety, &[snap.id])?;
     Ok(snap)
 }
 
 pub fn save_with_chat(label: &str, auto: bool, chat: &[Message]) -> Result<Snapshot> {
     let ctx = RepoContext::current()?;
     let snap = save_in(&ctx, label, auto, Some(chat))?;
-    let keep = crate::core::cli_config::load()
-        .timemachine_keep
-        .unwrap_or(DEFAULT_KEEP);
-    prune_after_save(&ctx, keep, &[snap.id])?;
+    let cfg = crate::core::cli_config::load();
+    let keep = cfg.timemachine_keep.unwrap_or(DEFAULT_KEEP);
+    let keep_safety = cfg.timemachine_keep_safety.unwrap_or(DEFAULT_KEEP_SAFETY);
+    prune_after_save(&ctx, keep, keep_safety, &[snap.id])?;
     Ok(snap)
 }
 
-fn prune_after_save(ctx: &RepoContext, keep: usize, protected: &[u32]) -> Result<()> {
+fn prune_after_save(
+    ctx: &RepoContext,
+    keep: usize,
+    keep_safety: usize,
+    protected: &[u32],
+) -> Result<()> {
     if keep == 0 {
         return Ok(());
     }
@@ -1817,9 +2139,15 @@ fn prune_after_save(ctx: &RepoContext, keep: usize, protected: &[u32]) -> Result
     if ledger.snapshots.len() <= keep {
         return Ok(());
     }
+    // Never prune the CURRENT run's recovery anchors: its pre-edit net and last-good must survive
+    // even when older safety-nets are being thinned, or an in-run rewind could lose its target.
+    let status = recovery_status();
+    let mut protected: Vec<u32> = protected.to_vec();
+    protected.extend(status.pre_edit);
+    protected.extend(status.last_good);
     let mut journal = Journal::new(JournalKind::Prune, ledger.generation);
     ctx.save_journal(&journal)?;
-    let dropped = enforce_retention_plan(&mut ledger, keep, protected);
+    let dropped = enforce_retention_plan(&mut ledger, keep, keep_safety, &protected);
     // Commit the new authoritative ledger first. Old refs remain recovery pins if cleanup is
     // interrupted; doctor can safely report/reap those orphans later.
     ctx.save_ledger(&mut ledger)?;
@@ -1861,22 +2189,88 @@ pub fn load_chat_checked(id: u32) -> Result<Vec<Message>> {
     read_chat_in(&ctx, id)?.with_context(|| format!("checkpoint #{id} has no saved conversation"))
 }
 
-fn enforce_retention_plan(ledger: &mut Ledger, keep: usize, protected: &[u32]) -> Vec<Snapshot> {
-    if keep == 0 || ledger.snapshots.len() <= keep {
+/// Value-aware retention. Two knobs: `keep` caps the TOTAL snapshots, `keep_safety` caps how many
+/// low-value SafetyNet checkpoints (`before agent edits`) may occupy that budget. The point is that
+/// not all checkpoints are worth the same — a descriptive `phase: …` milestone the user browses to
+/// must not be evicted by a pile of per-run pre-edit nets.
+///
+/// Order of eviction (oldest-first within each pass; `protected` and the cursor are never dropped):
+///   Pass 1 — drop SafetyNet snapshots beyond the newest `keep_safety`.
+///   Pass 2 — if still over `keep`, drop the remaining droppable snapshots oldest-first, SafetyNet
+///            before Milestone/Recovery, so the surviving set skews toward milestones.
+///
+/// `keep == 0` means unlimited (matches the old contract).
+fn enforce_retention_plan(
+    ledger: &mut Ledger,
+    keep: usize,
+    keep_safety: usize,
+    protected: &[u32],
+) -> Vec<Snapshot> {
+    if keep == 0 {
         return Vec::new();
     }
     let mut protected: HashSet<u32> = protected.iter().copied().collect();
     if let Some(id) = ledger.cursor_id {
         protected.insert(id);
     }
-    let mut dropped = Vec::new();
-    let mut i = 0;
-    while ledger.snapshots.len() > keep && i < ledger.snapshots.len() {
-        if protected.contains(&ledger.snapshots[i].id) {
-            i += 1;
+
+    let mut drop_ids: HashSet<u32> = HashSet::new();
+
+    // Pass 1 — thin SafetyNet nets to the newest `keep_safety`. Snapshots are stored oldest→newest,
+    // so iterating in reverse keeps the most recent nets and marks the older overflow for eviction.
+    let mut safety_kept = 0usize;
+    for snap in ledger.snapshots.iter().rev() {
+        if protected.contains(&snap.id) || snap.kind() != SnapshotKind::SafetyNet {
             continue;
         }
-        dropped.push(ledger.snapshots.remove(i));
+        if safety_kept < keep_safety {
+            safety_kept += 1;
+        } else {
+            drop_ids.insert(snap.id);
+        }
+    }
+
+    // Pass 2 — if the total (after Pass 1 removals) still exceeds `keep`, evict the oldest droppable
+    // snapshots until it fits. SafetyNet outranks Milestone/Recovery for eviction so milestones die last.
+    let surviving = ledger.snapshots.len() - drop_ids.len();
+    if surviving > keep {
+        let mut need = surviving - keep;
+        let mut candidates: Vec<(usize, u32)> = ledger
+            .snapshots
+            .iter()
+            .filter(|s| !protected.contains(&s.id) && !drop_ids.contains(&s.id))
+            .map(|s| {
+                // Lower rank = evicted sooner. SafetyNet (0) before Milestone/Recovery (1).
+                let rank = if s.kind() == SnapshotKind::SafetyNet {
+                    0
+                } else {
+                    1
+                };
+                (rank, s.id)
+            })
+            .collect();
+        // Sort by (rank asc, id asc) → oldest of the cheapest tier first.
+        candidates.sort_unstable();
+        for (_, id) in candidates {
+            if need == 0 {
+                break;
+            }
+            drop_ids.insert(id);
+            need -= 1;
+        }
+    }
+
+    if drop_ids.is_empty() {
+        return Vec::new();
+    }
+    let mut dropped = Vec::new();
+    let mut i = 0;
+    while i < ledger.snapshots.len() {
+        if drop_ids.contains(&ledger.snapshots[i].id) {
+            dropped.push(ledger.snapshots.remove(i));
+        } else {
+            i += 1;
+        }
     }
     ledger.set_cursor(ledger.cursor_id);
     dropped
@@ -1908,7 +2302,10 @@ pub fn prune(keep: usize) -> Result<usize> {
     ctx.migrate_legacy_refs(&mut ledger)?;
     let mut journal = Journal::new(JournalKind::Prune, ledger.generation);
     ctx.save_journal(&journal)?;
-    let dropped = enforce_retention_plan(&mut ledger, keep, &[]);
+    // Manual prune honours the same value-aware order: drop safety-nets before milestones. The safety
+    // floor cannot exceed the total budget the user asked for.
+    let keep_safety = DEFAULT_KEEP_SAFETY.min(keep);
+    let dropped = enforce_retention_plan(&mut ledger, keep, keep_safety, &[]);
     // Ledger-first deletion: an interrupted cleanup leaves harmless orphan refs, never ledger entries
     // pointing at objects we already made unreachable.
     ctx.save_ledger(&mut ledger)?;
@@ -2008,6 +2405,15 @@ fn capture_checkpoint_locked(
         }
         None => false,
     };
+    // Classify for retention at write time. `recovery` is authoritative; the once-per-run pre-edit
+    // net is a SafetyNet; a manual save or a closed/verified phase is a Milestone.
+    let kind = if recovery {
+        SnapshotKind::Recovery
+    } else if auto && label == PRE_EDIT_LABEL {
+        SnapshotKind::SafetyNet
+    } else {
+        SnapshotKind::Milestone
+    };
     let snap = Snapshot {
         id,
         commit,
@@ -2020,6 +2426,7 @@ fn capture_checkpoint_locked(
         worktree_id: ctx.worktree_id.clone(),
         coverage,
         recovery,
+        kind: Some(kind),
     };
     ledger.next_id = id.checked_add(1).context("checkpoint id space exhausted")?;
     ledger.snapshots.push(snap.clone());
@@ -2767,6 +3174,158 @@ pub fn doctor_gc() -> Result<DoctorReport> {
     doctor()
 }
 
+/// One private store found while sweeping `~/.aizen/timemachine/`. `source_exists == false` marks an
+/// ORPHAN: the source repo it alternates onto is gone (deleted, or moved before the identity fix
+/// landed), so the store can never be reached by discovery again — pure dead weight.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreEntry {
+    pub repo_id: String,
+    /// Absolute source `.git/objects` path recorded in the store's sealed alternates pointer.
+    pub source: Option<String>,
+    pub source_exists: bool,
+    pub bytes: u64,
+    pub checkpoints: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GcAllReport {
+    /// Every store under the home root, newest-scan order.
+    pub stores: Vec<StoreEntry>,
+    /// Orphan stores (subset of `stores` with `source_exists == false`).
+    pub orphans: Vec<StoreEntry>,
+    /// True when `--apply` actually moved orphans to `.trash/`; false for a dry run.
+    pub applied: bool,
+    /// Where orphans were moved to on `--apply` (the `.trash/<timestamp>` dir), if any.
+    pub trash_dir: Option<String>,
+}
+
+/// Sum every regular file under `dir` (recursive). Best-effort: unreadable entries are skipped rather
+/// than failing the whole sweep, because a GC report must never be blocked by one bad directory.
+fn dir_size_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for entry in rd.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if let Ok(md) = entry.metadata() {
+                total = total.saturating_add(md.len());
+            }
+        }
+    }
+    total
+}
+
+/// Count checkpoints across every worktree ledger in a store (sum of `snapshots`). Reads the ledger
+/// JSON directly rather than through `Ledger` so a schema the current binary cannot fully parse still
+/// yields a usable count. Best-effort: a missing/garbage ledger contributes 0.
+fn store_checkpoint_count(store_root: &Path) -> usize {
+    let worktrees = store_root.join("worktrees");
+    let Ok(rd) = fs::read_dir(&worktrees) else {
+        return 0;
+    };
+    let mut n = 0usize;
+    for entry in rd.flatten() {
+        let ledger = entry.path().join("ledger.json");
+        if let Ok(Some(bytes)) = crate::core::persist::read_optional(&ledger) {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(arr) = v.get("snapshots").and_then(|s| s.as_array()) {
+                    n += arr.len();
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Home-level store sweep. Unlike [`doctor_gc`] (which cleans refs/sidecars WITHIN the current repo's
+/// store), this walks EVERY `~/.aizen/timemachine/repo-*` and finds ORPHAN stores whose source repo
+/// no longer exists on disk. Dry-run by default (`apply == false`) — it only reports. With
+/// `apply == true` it moves each orphan into `~/.aizen/timemachine/.trash/<timestamp>/` (reversible,
+/// not an irrecoverable delete). A store whose source still exists is never touched.
+pub fn gc_all(apply: bool) -> Result<GcAllReport> {
+    let root = crate::core::config::aizen_home().join("timemachine");
+    let mut stores = Vec::new();
+    let mut orphans = Vec::new();
+
+    let rd = match fs::read_dir(&root) {
+        Ok(rd) => rd,
+        // No store root yet ⇒ nothing to sweep, not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(GcAllReport {
+                stores,
+                orphans,
+                applied: false,
+                trash_dir: None,
+            });
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", root.display())),
+    };
+
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Only sweep repo stores. Skip our own `.trash/` and any unrelated dirs.
+        if !name.starts_with("repo-") {
+            continue;
+        }
+        let store_root = entry.path();
+        let alternates = store_root
+            .join("store.git")
+            .join("objects")
+            .join("info")
+            .join("alternates");
+        // The recorded source object dir, and whether it still exists. A MISSING alternates file is
+        // treated as unknown (not an orphan): a store mid-creation must not be reaped.
+        let (source, source_exists, known) = match crate::core::persist::read_optional(&alternates)
+        {
+            Ok(Some(bytes)) => {
+                let line = String::from_utf8_lossy(&bytes).trim().to_string();
+                let exists = !line.is_empty() && Path::new(&line).exists();
+                (Some(line), exists, true)
+            }
+            _ => (None, false, false),
+        };
+        let se = StoreEntry {
+            repo_id: name,
+            source,
+            source_exists,
+            bytes: dir_size_bytes(&store_root),
+            checkpoints: store_checkpoint_count(&store_root),
+        };
+        // Orphan = alternates was readable AND its source path is gone. `known == false` (no
+        // alternates) is left alone.
+        if known && !source_exists {
+            orphans.push(se.clone());
+        }
+        stores.push(se);
+    }
+
+    let mut trash_dir = None;
+    if apply && !orphans.is_empty() {
+        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+        let trash = root.join(".trash").join(&stamp);
+        fs::create_dir_all(&trash)
+            .with_context(|| format!("creating trash dir {}", trash.display()))?;
+        for o in &orphans {
+            let from = root.join(&o.repo_id);
+            let to = trash.join(&o.repo_id);
+            fs::rename(&from, &to).with_context(|| {
+                format!("moving orphan store {} to {}", from.display(), to.display())
+            })?;
+        }
+        trash_dir = Some(trash.to_string_lossy().replace('\\', "/"));
+    }
+
+    Ok(GcAllReport {
+        stores,
+        orphans,
+        applied: apply && trash_dir.is_some(),
+        trash_dir,
+    })
+}
+
 /// Which mutating Time Machine operation a `checkpoint` call selects. All three share
 /// `is_destructive` (approval-gated) and the serial path, which is exactly why they can live in ONE
 /// tool: the trait's `is_destructive` is a constant, so mixing in the read-only `list`/`diff` would
@@ -3299,6 +3858,17 @@ mod tests {
             worktree_id: "wt-test".into(),
             coverage: Coverage::default(),
             recovery: false,
+            kind: Some(SnapshotKind::Milestone),
+        }
+    }
+
+    /// Build a SafetyNet snapshot (the once-per-run `before agent edits` net) for retention tests.
+    fn mk_safety(id: u32, parent: Option<u32>) -> Snapshot {
+        Snapshot {
+            auto: true,
+            label: PRE_EDIT_LABEL.into(),
+            kind: Some(SnapshotKind::SafetyNet),
+            ..mk(id, parent)
         }
     }
 
@@ -3359,13 +3929,146 @@ mod tests {
             ..Default::default()
         };
         l.set_cursor(Some(1));
-        let dropped = enforce_retention_plan(&mut l, 2, &[4]);
+        let dropped = enforce_retention_plan(&mut l, 2, DEFAULT_KEEP_SAFETY, &[4]);
         assert_eq!(
             l.snapshots.iter().map(|s| s.id).collect::<Vec<_>>(),
             vec![1, 4]
         );
         assert_eq!(dropped.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2, 3]);
         assert_eq!(l.cursor_id, Some(1));
+    }
+
+    #[test]
+    fn kind_inferred_for_legacy_rows_without_field() {
+        // A pre-`kind` ledger row: field absent, inferred from auto+label.
+        let pre_edit = Snapshot {
+            auto: true,
+            label: PRE_EDIT_LABEL.into(),
+            kind: None,
+            ..mk(1, None)
+        };
+        assert_eq!(pre_edit.kind(), SnapshotKind::SafetyNet);
+        // The dead per-edit label from the old binary is also low value.
+        let dead = Snapshot {
+            auto: true,
+            label: "after agent edit".into(),
+            kind: None,
+            ..mk(2, None)
+        };
+        assert_eq!(dead.kind(), SnapshotKind::SafetyNet);
+        // A descriptive phase checkpoint is a milestone even when auto.
+        let phase = Snapshot {
+            auto: true,
+            label: "phase: wire up auth".into(),
+            kind: None,
+            ..mk(3, None)
+        };
+        assert_eq!(phase.kind(), SnapshotKind::Milestone);
+        // recovery wins regardless of label/auto.
+        let rec = Snapshot {
+            recovery: true,
+            kind: None,
+            ..mk(4, None)
+        };
+        assert_eq!(rec.kind(), SnapshotKind::Recovery);
+    }
+
+    #[test]
+    fn retention_thins_safetynets_before_milestones() {
+        // 8 safety-nets + 2 milestones. keep is generous (100) but keep_safety = 2 ⇒ only the newest
+        // two safety-nets survive; BOTH milestones are untouched even though they are older.
+        let mut snaps = Vec::new();
+        for id in 1..=8 {
+            snaps.push(mk_safety(id, if id == 1 { None } else { Some(id - 1) }));
+        }
+        snaps.push(Snapshot {
+            label: "phase: important A".into(),
+            ..mk(9, Some(8))
+        });
+        snaps.push(Snapshot {
+            label: "phase: important B".into(),
+            ..mk(10, Some(9))
+        });
+        let mut l = Ledger {
+            snapshots: snaps,
+            next_id: 11,
+            ..Default::default()
+        };
+        l.set_cursor(Some(10));
+        let dropped = enforce_retention_plan(&mut l, 100, 2, &[]);
+        // Dropped: safety-nets 1..=6 (oldest six). Kept: newest two nets (7,8) + both milestones.
+        assert_eq!(
+            dropped.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            l.snapshots.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![7, 8, 9, 10]
+        );
+    }
+
+    #[test]
+    fn retention_pass2_evicts_safetynet_before_milestone_when_over_total() {
+        // 3 milestones + 3 safety-nets, all within safety floor (keep_safety=3) so Pass 1 drops none.
+        // Total budget keep=4 forces Pass 2 to shed 2 — and it must take the oldest SAFETY-NETS, not
+        // the milestones, so the readable timeline is preserved.
+        let mut snaps = vec![
+            Snapshot {
+                label: "phase: m1".into(),
+                ..mk(1, None)
+            },
+            mk_safety(2, Some(1)),
+            Snapshot {
+                label: "phase: m2".into(),
+                ..mk(3, Some(2))
+            },
+            mk_safety(4, Some(3)),
+            Snapshot {
+                label: "phase: m3".into(),
+                ..mk(5, Some(4))
+            },
+            mk_safety(6, Some(5)),
+        ];
+        // Cursor on the newest so it is protected; does not affect the point being tested.
+        let _ = &mut snaps;
+        let mut l = Ledger {
+            snapshots: snaps,
+            next_id: 7,
+            ..Default::default()
+        };
+        l.set_cursor(Some(5));
+        let dropped = enforce_retention_plan(&mut l, 4, 3, &[]);
+        // Two oldest safety-nets (2,4) evicted; all three milestones + newest net (6) survive.
+        assert_eq!(dropped.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2, 4]);
+        assert_eq!(
+            l.snapshots.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 3, 5, 6]
+        );
+    }
+
+    #[test]
+    fn retention_protects_run_anchors_passed_in() {
+        // Even an OLD safety-net survives if it is the current run's protected pre-edit anchor.
+        let mut l = Ledger {
+            snapshots: vec![
+                mk_safety(1, None),
+                mk_safety(2, Some(1)),
+                mk_safety(3, Some(2)),
+                mk_safety(4, Some(3)),
+            ],
+            next_id: 5,
+            ..Default::default()
+        };
+        l.set_cursor(Some(4));
+        // keep_safety=0 keeps ZERO historical safety-nets, so only PROTECTED ones survive: the cursor
+        // (#4) and the explicitly-protected run anchor (#1). This is the property that matters — an old
+        // safety-net that is the current run's anchor is never pruned out from under an in-run rewind.
+        let dropped = enforce_retention_plan(&mut l, 100, 0, &[1]);
+        assert_eq!(dropped.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(
+            l.snapshots.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 4]
+        );
     }
 
     #[test]
@@ -3557,5 +4260,223 @@ mod tests {
         let back: Journal = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.operation_id, j.operation_id);
         assert!(matches!(back.kind, JournalKind::Save));
+    }
+
+    // ── identity::resolve — pure, no git/disk. Each move/clone/legacy branch is exercised here. ──
+    mod identity_resolve {
+        use super::super::identity::*;
+
+        /// Deterministic id minter: `repo`/`wt` prefix + a monotonic counter, so assertions on the
+        /// exact minted ids are stable across runs.
+        fn minter(counter: &std::cell::Cell<u32>) -> impl Fn(&str) -> String + '_ {
+            move |prefix: &str| {
+                counter.set(counter.get() + 1);
+                format!("{prefix}-{}", counter.get())
+            }
+        }
+
+        /// A path_exists probe backed by a fixed set of "present" paths.
+        fn presence(set: &std::collections::HashSet<String>) -> impl Fn(&str) -> bool + '_ {
+            move |p: &str| set.contains(p)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn input<'a>(
+            common: &str,
+            git: &str,
+            root: Option<&str>,
+            legacy_store_exists: bool,
+            path_exists: &'a dyn Fn(&str) -> bool,
+            new_id: &'a dyn Fn(&str) -> String,
+        ) -> ResolveInput<'a> {
+            ResolveInput {
+                common_git_dir: common.to_string(),
+                git_dir: git.to_string(),
+                root_commit: root.map(|s| s.to_string()),
+                legacy_repo_id: "repo-legacyaaaaaaaa".to_string(),
+                legacy_wt_id: "wt-legacybbbbbbbb".to_string(),
+                legacy_store_exists,
+                path_exists,
+                new_id,
+            }
+        }
+
+        #[test]
+        fn brand_new_repo_gets_random_ids_and_records_entry() {
+            let mut reg = Registry::default();
+            let empty = std::collections::HashSet::new();
+            let present = presence(&empty);
+            let counter = std::cell::Cell::new(0u32);
+            let mint = minter(&counter);
+            let r = resolve(
+                &mut reg,
+                &input("/a/.git", "/a/.git", Some("root1"), false, &present, &mint),
+            );
+            assert!(r.changed);
+            assert_eq!(r.repo_id, "repo-1");
+            assert_eq!(r.worktree_id, "wt-2");
+            assert_eq!(reg.repos.len(), 1);
+            assert_eq!(reg.repos[0].root_commit.as_deref(), Some("root1"));
+        }
+
+        #[test]
+        fn exact_path_hit_is_stable_and_unchanged() {
+            let mut reg = Registry::default();
+            let empty = std::collections::HashSet::new();
+            let present = presence(&empty);
+            let counter = std::cell::Cell::new(0u32);
+            let mint = minter(&counter);
+            let first = resolve(
+                &mut reg,
+                &input("/a/.git", "/a/.git", Some("root1"), false, &present, &mint),
+            );
+            // Second discovery at the SAME path returns the SAME ids and reports no change.
+            let again = resolve(
+                &mut reg,
+                &input("/a/.git", "/a/.git", Some("root1"), false, &present, &mint),
+            );
+            assert_eq!(first.repo_id, again.repo_id);
+            assert_eq!(first.worktree_id, again.worktree_id);
+            assert!(!again.changed);
+            assert_eq!(reg.repos.len(), 1);
+        }
+
+        #[test]
+        fn moved_repo_reconnects_by_root_commit() {
+            let mut reg = Registry::default();
+            let empty = std::collections::HashSet::new();
+            let present = presence(&empty);
+            let counter = std::cell::Cell::new(0u32);
+            let mint = minter(&counter);
+            let orig = resolve(
+                &mut reg,
+                &input(
+                    "/old/.git",
+                    "/old/.git",
+                    Some("root1"),
+                    false,
+                    &present,
+                    &mint,
+                ),
+            );
+            // Repo moved to /new; /old no longer exists (empty presence), same root commit.
+            let moved = resolve(
+                &mut reg,
+                &input(
+                    "/new/.git",
+                    "/new/.git",
+                    Some("root1"),
+                    false,
+                    &present,
+                    &mint,
+                ),
+            );
+            // Same repo id — timeline preserved — and the path was rewritten, not re-keyed.
+            assert_eq!(orig.repo_id, moved.repo_id);
+            assert_eq!(reg.repos.len(), 1);
+            assert_eq!(reg.repos[0].common_git_dir, "/new/.git");
+        }
+
+        #[test]
+        fn cp_r_copy_gets_new_id_because_original_path_still_exists() {
+            let mut reg = Registry::default();
+            // The ORIGINAL path exists on disk → the copy is NOT a move.
+            let mut set = std::collections::HashSet::new();
+            set.insert("/orig/.git".to_string());
+            let present = presence(&set);
+            let counter = std::cell::Cell::new(0u32);
+            let mint = minter(&counter);
+            let orig = resolve(
+                &mut reg,
+                &input(
+                    "/orig/.git",
+                    "/orig/.git",
+                    Some("root1"),
+                    false,
+                    &present,
+                    &mint,
+                ),
+            );
+            // `cp -r` to /copy: same root commit, but /orig is still present → distinct id.
+            let copy = resolve(
+                &mut reg,
+                &input(
+                    "/copy/.git",
+                    "/copy/.git",
+                    Some("root1"),
+                    false,
+                    &present,
+                    &mint,
+                ),
+            );
+            assert_ne!(orig.repo_id, copy.repo_id);
+            assert_eq!(reg.repos.len(), 2);
+        }
+
+        #[test]
+        fn legacy_store_on_disk_is_grandfathered_not_re_minted() {
+            let mut reg = Registry::default();
+            let empty = std::collections::HashSet::new();
+            let present = presence(&empty);
+            let counter = std::cell::Cell::new(0u32);
+            let mint = minter(&counter);
+            let r = resolve(
+                &mut reg,
+                &input("/a/.git", "/a/.git", Some("root1"), true, &present, &mint),
+            );
+            // Adopts the existing hash-path store id/namespace with no data migration.
+            assert_eq!(r.repo_id, "repo-legacyaaaaaaaa");
+            assert_eq!(r.worktree_id, "wt-legacybbbbbbbb");
+        }
+
+        #[test]
+        fn no_root_commit_cannot_reconnect_and_stays_separate() {
+            let mut reg = Registry::default();
+            let empty = std::collections::HashSet::new();
+            let present = presence(&empty);
+            let counter = std::cell::Cell::new(0u32);
+            let mint = minter(&counter);
+            let a = resolve(
+                &mut reg,
+                &input("/old/.git", "/old/.git", None, false, &present, &mint),
+            );
+            // A repo with no commits (root_commit None) that "moves" cannot be recognized → new id.
+            let b = resolve(
+                &mut reg,
+                &input("/new/.git", "/new/.git", None, false, &present, &mint),
+            );
+            assert_ne!(a.repo_id, b.repo_id);
+            assert_eq!(reg.repos.len(), 2);
+        }
+
+        #[test]
+        fn linked_worktree_shares_repo_id_new_worktree_id() {
+            let mut reg = Registry::default();
+            // Main worktree exists; a linked worktree has a different git_dir under the same common dir.
+            let mut set = std::collections::HashSet::new();
+            set.insert("/a/.git".to_string());
+            let present = presence(&set);
+            let counter = std::cell::Cell::new(0u32);
+            let mint = minter(&counter);
+            let main = resolve(
+                &mut reg,
+                &input("/a/.git", "/a/.git", Some("root1"), false, &present, &mint),
+            );
+            let linked = resolve(
+                &mut reg,
+                &input(
+                    "/a/.git",
+                    "/a/.git/worktrees/feature",
+                    Some("root1"),
+                    false,
+                    &present,
+                    &mint,
+                ),
+            );
+            assert_eq!(main.repo_id, linked.repo_id);
+            assert_ne!(main.worktree_id, linked.worktree_id);
+            assert_eq!(reg.repos.len(), 1);
+            assert_eq!(reg.repos[0].worktrees.len(), 2);
+        }
     }
 }
