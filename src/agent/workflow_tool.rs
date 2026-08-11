@@ -13,10 +13,9 @@
 //!   prompted to REFUTE it (industrially measured at ~0.93 accuracy filtering false positives).
 //!   No synthesis: the per-finding verdicts return raw.
 //!
-//! Registration is GATED (config `workflow_tool: true`, or auto when ≥1 specialist agent is
-//! ENABLED on the allowlist): the schema costs ~350 tokens on every turn, so only the delegating
-//! population pays — agent files merely existing on disk (bulk installs, repo-shipped dirs) don't.
-//! Depth 0 only, like `task`. The tool itself is not concurrency-safe — it IS the parallelism.
+//! Registered by default at depth 0 so a fresh install always has a real fan-out primitive. Users
+//! who prefer the smaller top-level schema can opt out with `workflow_tool: false`. Depth 0 only,
+//! like `task`; the tool itself is not concurrency-safe — it IS the parallelism.
 
 use crate::agent::tools::Tool;
 #[cfg(test)]
@@ -26,6 +25,7 @@ use crate::agent::workflow::{
 };
 use anyhow::{bail, Result};
 use serde_json::Value;
+use std::path::PathBuf;
 
 pub struct WorkflowTool {
     client: reqwest::Client,
@@ -34,6 +34,8 @@ pub struct WorkflowTool {
     model: String,
     approval_mode: crate::core::approval::ApprovalMode,
     depth: usize,
+    root: PathBuf,
+    context_window: usize,
 }
 
 impl WorkflowTool {
@@ -44,6 +46,8 @@ impl WorkflowTool {
         model: String,
         approval_mode: crate::core::approval::ApprovalMode,
         depth: usize,
+        root: PathBuf,
+        context_window: usize,
     ) -> Self {
         Self {
             client,
@@ -52,6 +56,8 @@ impl WorkflowTool {
             model,
             approval_mode,
             depth,
+            root,
+            context_window,
         }
     }
 }
@@ -80,14 +86,17 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                 .filter(|a| !a.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("fanout mode requires a non-empty 'tasks' array"))?;
             if tasks_in.len() > 32 {
-                bail!("workflow caps at 32 tasks per call (got {})", tasks_in.len());
+                bail!(
+                    "workflow caps at 32 tasks per call (got {})",
+                    tasks_in.len()
+                );
             }
             let mut tasks = Vec::new();
             for (i, t) in tasks_in.iter().enumerate() {
                 let role = t
                     .get("role")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("coder")
+                    .unwrap_or("reviewer")
                     .to_string();
                 tasks.push(WorkflowTask {
                     id: t
@@ -187,7 +196,7 @@ impl Tool for WorkflowTool {
                 "tasks": {"type": "array", "maxItems": 32, "description": "fanout mode: the tasks to run concurrently (request what the work needs; the harness bounds concurrent width by machine)", "items": {"type": "object", "properties": {
                     "id": {"type": "string"},
                     "prompt": {"type": "string", "description": "complete, self-contained task"},
-                    "role": {"type": "string", "enum": ["coder", "planner", "reviewer", "tester"]},
+                    "role": {"type": "string", "enum": ["coder", "planner", "reviewer", "tester"], "description": "default reviewer (read-only); set coder/tester explicitly, at most one writer per workflow"},
                     "agent": {"type": "string", "description": "optional specialist slug from <agents>"},
                     "model": {"type": "string"}
                 }, "required": ["prompt"], "additionalProperties": false}},
@@ -236,7 +245,15 @@ impl Tool for WorkflowTool {
                     // Restored on drop before control returns to the parent turn.
                     let _effort = crate::core::cli_config::suppress_effort_override();
                     tokio::runtime::Handle::current().block_on(run_workflow_collect(
-                        &client, &base, &key, &model, approval, &spec, synthesize,
+                        &client,
+                        &base,
+                        &key,
+                        &model,
+                        approval,
+                        &spec,
+                        synthesize,
+                        &self.root,
+                        self.context_window,
                     ))
                 })
             })
@@ -366,6 +383,8 @@ mod tests {
             "m".into(),
             crate::core::approval::ApprovalMode::Ask,
             1,
+            std::path::PathBuf::from("."),
+            0,
         );
         let err = t
             .execute(&serde_json::json!({"mode": "verify", "findings": ["x"]}))

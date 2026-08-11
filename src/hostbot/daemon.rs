@@ -91,7 +91,11 @@ const SERVE_COMMANDS: &[(&str, &str, &str)] = &[
         "<level>",
         "this bot's reasoning effort: auto | low | medium | high | xhigh | max | off",
     ),
-    ("model", "[name]", "show or switch THIS bot's model"),
+    (
+        "model",
+        "[name|clear]",
+        "show or switch THIS bot's model (clear = inherit the machine default)",
+    ),
     (
         "memory",
         "[query]",
@@ -161,11 +165,60 @@ fn lane_cwd(route: &str) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
+/// Where a lane's effective model came from. `/model` reports this so the owner can tell a pin on
+/// THIS bot from a value merely inherited off the machine config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSource {
+    /// This bot's own `/model` pin, from `hostbot/lanes.json`.
+    Lane,
+    /// No pin on this lane — the machine's `cli-config.json` model.
+    Machine,
+}
+
+impl ModelSource {
+    fn label(self) -> &'static str {
+        match self {
+            ModelSource::Lane => "this bot",
+            ModelSource::Machine => "machine default",
+        }
+    }
+}
+
+/// The model a turn on `route` will ACTUALLY send, plus where it came from.
+///
+/// The single seam both the runtime path and `/model` read, so "what the command reports" and "what
+/// the request carries" cannot drift apart. Re-read from disk on every call (never cached): a pin
+/// written by `/model` must take effect on the very next turn, and must survive a daemon restart
+/// because `lanes.json` — not process memory — is the source of truth.
+///
+/// An empty/whitespace pin is treated as absent rather than sent as a blank model id.
+pub fn resolve_effective_model(route: &str, machine_fallback: &str) -> (String, ModelSource) {
+    match store::load_lane(route).model {
+        Some(m) if !m.trim().is_empty() => (m, ModelSource::Lane),
+        _ => (machine_fallback.to_string(), ModelSource::Machine),
+    }
+}
+
 /// This lane's model: its own `/model`, else the machine default.
 fn lane_model(route: &str, fallback: &str) -> String {
-    store::load_lane(route)
-        .model
-        .unwrap_or_else(|| fallback.to_string())
+    resolve_effective_model(route, fallback).0
+}
+
+/// Split a `/name arg` line into `(name, arg)`, or `None` when it isn't a command line at all.
+///
+/// Telegram addresses a command to ONE bot by suffixing its username — `/model@mybot claude-x` —
+/// always in groups, and whenever the "/" menu has to disambiguate between several bots. That
+/// suffix made the name fail `looks_like_name` (no `@` in its alphabet), so the whole line fell
+/// through to the AGENT as ordinary prose: the model switch was answered conversationally and then
+/// never took effect, which is exactly the "it says it switched but keeps using the old model"
+/// report. Stripping the suffix here keeps the dispatcher's own vocabulary intact.
+fn parse_slash(trimmed: &str) -> Option<(String, String)> {
+    let rest = trimmed.strip_prefix('/')?;
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let raw = parts.next().unwrap_or("").trim();
+    let arg = parts.next().unwrap_or("").trim().to_string();
+    let name = raw.split('@').next().unwrap_or("").to_string();
+    Some((name, arg))
 }
 
 /// This lane's approval tier: its own `/approval`, else the machine setting.
@@ -451,15 +504,11 @@ async fn lane_worker<P: Platform>(
         // gate from `slash::classify`, not the whole verdict — this surface has its own vocabulary
         // (`/sh`, `/cd`, `/pwd`, `/bots`, …) that isn't in the REPL catalog, and `handle_command`'s
         // catch-all deliberately runs an unrecognized name as a SHELL command.
-        let slash_name = trimmed.strip_prefix('/').map(|rest| {
-            let mut parts = rest.splitn(2, char::is_whitespace);
-            (
-                parts.next().unwrap_or("").trim().to_string(),
-                parts.next().unwrap_or("").trim().to_string(),
-            )
-        });
+        //
+        // `parse_slash` strips Telegram's `@botname` suffix first — see its docs for why a
+        // `/model@bot` that reached the agent instead of the dispatcher looked like a broken switch.
         if let Some((name, arg)) =
-            slash_name.filter(|(n, _)| crate::features::slash::looks_like_name(n))
+            parse_slash(&trimmed).filter(|(n, _)| crate::features::slash::looks_like_name(n))
         {
             if let Some(reply) = handle_command(
                 &*platform,
@@ -911,7 +960,35 @@ async fn handle_command<P: Platform>(
         "model" => {
             let want = arg.trim();
             if want.is_empty() {
-                return Some(format!("model: {}", lane_model(route, model)));
+                // Report the model the NEXT turn will actually send, resolved through the same seam
+                // the runtime uses, and say where it came from — an inherited value and a pin on
+                // this bot are otherwise indistinguishable.
+                let (effective, source) = resolve_effective_model(route, model);
+                return Some(format!("model: {effective} ({})", source.label()));
+            }
+            // Reuse the CLI's existing reset vocabulary (`/agents set-model … clear|-`) rather than
+            // inventing a new one: clearing the pin drops this lane back to the machine default.
+            if matches!(want, "clear" | "-" | "default" | "auto" | "reset") {
+                return Some(
+                    match store::update_lane(route, |l| {
+                        l.model = None;
+                        Ok(())
+                    }) {
+                        Ok(()) => {
+                            let (effective, _) = resolve_effective_model(route, model);
+                            format!("model cleared for this bot — back to the machine default ({effective}).")
+                        }
+                        Err(e) => format!("model: {e}"),
+                    },
+                );
+            }
+            // Validate by SHAPE only. A gateway's catalog is remote and this path must stay offline
+            // (the daemon answers chats, it does not block a command on a `/models` round-trip), so
+            // we reject only what can never be a model id: whitespace inside, or a stray leading `-`.
+            if want.split_whitespace().count() > 1 || want.starts_with('-') {
+                return Some(format!(
+                    "usage: /model <name>  ·  /model clear to inherit the machine default (rejected '{want}')"
+                ));
             }
             // Per lane: switching the model in one bot must not switch it in every other bot, nor
             // in the owner's REPL — which is what writing `cli-config.json` from here used to do.
@@ -919,12 +996,26 @@ async fn handle_command<P: Platform>(
                 l.model = Some(want.to_string());
                 Ok(())
             });
-            history.clear(); // next turn rebuilds the system prompt with the new model/ctx-window
-            store::drop_session(platform.name(), route, &chat.to_string());
             match saved {
-                Ok(()) => Some(format!(
-                    "🔄 model → {want} for this bot (context reset for this chat)"
-                )),
+                Ok(()) => {
+                    // Reset the context ONLY after the write succeeded. The old code cleared it
+                    // unconditionally, so a failed write threw the conversation away AND left the
+                    // model unchanged — the worst of both.
+                    //
+                    // The reset itself is required, not cosmetic: the stable system lane is built by
+                    // `hostbot_prompt_bundle(model, …)` and literally carries `model: <id>`, and the
+                    // turn's context guard is sized by `resolve_ctx_window(model)`. Keeping a prefix
+                    // that names the OLD model would both mislead the new one and size its window
+                    // wrong. `run_serve_turn` rebuilds both lanes from the cleared history.
+                    history.clear();
+                    store::drop_session(platform.name(), route, &chat.to_string());
+                    // Read back through the seam so the confirmation states what the next turn will
+                    // really send, rather than echoing the input.
+                    let (effective, _) = resolve_effective_model(route, model);
+                    Some(format!(
+                        "🔄 model → {effective} for this bot (context reset for this chat)"
+                    ))
+                }
                 Err(e) => Some(format!("model: {e}")),
             }
         }
@@ -984,7 +1075,8 @@ async fn handle_command<P: Platform>(
             } else {
                 "off"
             };
-            let model = lane_model(route, model);
+            let (model, model_source) = resolve_effective_model(route, model);
+            let model = format!("{model} ({})", model_source.label());
             let turns = history.iter().filter(|m| m.role == "user").count();
             let lanes = registry
                 .upgrade()
@@ -1220,6 +1312,250 @@ mod tests {
             .unwrap();
             assert_eq!(lane_effort("max-bot"), Some(Some("max".to_string())));
         });
+    }
+
+    // ── P0 regression: a Telegram `/model` must reach the WIRE, not just lanes.json ──────────
+    //
+    // The completion bar for this bug is deliberately higher than "the file was written": every
+    // test below asserts on what the NEXT TURN WOULD SEND, resolved through the same seam the
+    // runtime calls (`resolve_effective_model`), and the last one captures the model id off a real
+    // HTTP request body.
+
+    #[test]
+    fn model_pinned_on_one_route_is_what_that_route_sends_next_turn() {
+        with_temp_home("eff-a", || {
+            store::update_lane("bot-a", |l| {
+                l.model = Some("model-x".into());
+                Ok(())
+            })
+            .unwrap();
+
+            // (1) the pin is stored, (4) it is what the next turn resolves.
+            assert_eq!(store::load_lane("bot-a").model.as_deref(), Some("model-x"));
+            let (eff, src) = resolve_effective_model("bot-a", "machine-default");
+            assert_eq!(eff, "model-x");
+            assert_eq!(src, ModelSource::Lane);
+
+            // (2) a sibling route is untouched, (6) and still inherits the machine fallback.
+            assert_eq!(store::load_lane("bot-b").model, None);
+            assert_eq!(
+                resolve_effective_model("bot-b", "machine-default"),
+                ("machine-default".to_string(), ModelSource::Machine),
+                "a pin on bot-a must not move bot-b off the machine default"
+            );
+        });
+    }
+
+    #[test]
+    fn switching_a_bots_model_never_touches_the_machine_config() {
+        // (3) The original sin this whole lane file exists to prevent: `/model` in a chat rewriting
+        // `cli-config.json`, which is the REPL's own model too.
+        with_temp_home("eff-cli", || {
+            let cfg_before = crate::core::cli_config::load().model;
+            store::update_lane("bot-a", |l| {
+                l.model = Some("model-x".into());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                crate::core::cli_config::load().model,
+                cfg_before,
+                "a bot's /model must never write the machine config (the CLI/REPL reads it)"
+            );
+        });
+    }
+
+    #[test]
+    fn a_lane_pin_survives_a_daemon_restart() {
+        // (5) `resolve_effective_model` re-reads lanes.json rather than a cached map, so a fresh
+        // process — which is all a restart is — resolves the same value. Simulated by resolving
+        // through a path that holds no state between calls.
+        with_temp_home("eff-restart", || {
+            store::update_lane("bot-a", |l| {
+                l.model = Some("model-x".into());
+                Ok(())
+            })
+            .unwrap();
+            // Nothing in-process caches this; a second call is exactly what a restarted daemon does.
+            assert_eq!(resolve_effective_model("bot-a", "other").0, "model-x");
+            assert_eq!(
+                store::load_lanes()
+                    .iter()
+                    .find(|l| l.route == "bot-a")
+                    .and_then(|l| l.model.clone())
+                    .as_deref(),
+                Some("model-x"),
+                "the pin is on disk, so a cold start resolves it too"
+            );
+        });
+    }
+
+    #[test]
+    fn two_routes_run_two_different_models_and_chats_share_their_routes() {
+        // (7) + (8). The lane key is the ROUTE, so two chats on one bot share its model while two
+        // bots stay independent — the property that makes one daemon able to host many bots.
+        with_temp_home("eff-two", || {
+            store::update_lane("bot-a", |l| {
+                l.model = Some("model-x".into());
+                Ok(())
+            })
+            .unwrap();
+            store::update_lane("bot-b", |l| {
+                l.model = Some("model-y".into());
+                Ok(())
+            })
+            .unwrap();
+            let a = resolve_effective_model("bot-a", "machine").0;
+            let b = resolve_effective_model("bot-b", "machine").0;
+            assert_eq!(a, "model-x");
+            assert_eq!(b, "model-y");
+            assert_ne!(a, b, "two routes must be able to run two different models");
+            // Two chats on bot-a: the model is a property of the route, not of the conversation.
+            assert_eq!(resolve_effective_model("bot-a", "machine").0, a);
+        });
+    }
+
+    #[test]
+    fn clearing_a_pin_returns_the_lane_to_the_machine_default() {
+        with_temp_home("eff-clear", || {
+            store::update_lane("bot-a", |l| {
+                l.model = Some("model-x".into());
+                Ok(())
+            })
+            .unwrap();
+            store::update_lane("bot-a", |l| {
+                l.model = None;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                resolve_effective_model("bot-a", "machine-default"),
+                ("machine-default".to_string(), ModelSource::Machine)
+            );
+        });
+    }
+
+    #[test]
+    fn a_blank_pin_is_treated_as_no_pin_rather_than_sent_as_an_empty_model() {
+        // A hand-edited lanes.json (or any future writer) can leave `""`. Sending that as the model
+        // id is a guaranteed 400 on every turn; inheriting is the only sane reading.
+        with_temp_home("eff-blank", || {
+            store::update_lane("bot-a", |l| {
+                l.model = Some("   ".into());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                resolve_effective_model("bot-a", "machine-default"),
+                ("machine-default".to_string(), ModelSource::Machine)
+            );
+        });
+    }
+
+    #[test]
+    fn telegram_addresses_commands_to_a_bot_by_username_suffix() {
+        // THE root cause. In any group chat — and whenever the "/" menu disambiguates between the
+        // bots this daemon hosts — Telegram sends `/model@mybot <name>`. `@` is not in
+        // `looks_like_name`'s alphabet, so the line missed the dispatcher entirely and was answered
+        // by the AGENT as prose: it "replied about" the model change and never performed it.
+        assert_eq!(
+            parse_slash("/model@aizen_bot claude-opus-4-1"),
+            Some(("model".to_string(), "claude-opus-4-1".to_string()))
+        );
+        assert_eq!(
+            parse_slash("/model@aizen_bot"),
+            Some(("model".to_string(), String::new())),
+            "the bare addressed form must still reach the dispatcher"
+        );
+        assert_eq!(
+            parse_slash("/model claude-opus-4-1"),
+            Some(("model".to_string(), "claude-opus-4-1".to_string())),
+            "the unaddressed form keeps working"
+        );
+        assert!(
+            crate::features::slash::looks_like_name(&parse_slash("/model@bot").unwrap().0),
+            "the stripped name must pass the shape gate that previously rejected it"
+        );
+        assert_eq!(parse_slash("not a command"), None);
+        // A path or prose must still NOT be eaten as a command (the gate this surface relies on).
+        assert!(!crate::features::slash::looks_like_name(
+            &parse_slash("/usr/local/bin").unwrap().0
+        ));
+    }
+
+    /// The completion bar: the lane's model must appear in the JSON body of the actual
+    /// `/chat/completions` request. Everything above proves resolution; this proves DELIVERY.
+    ///
+    /// A stub gateway stands in for the provider (same pattern as `llm::client`'s tests) — no real
+    /// LLM, no Telegram. It captures the request body and hands back a minimal valid completion.
+    #[tokio::test]
+    async fn the_lane_model_is_what_lands_in_the_chat_completions_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<String>();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 65536];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let _ = seen_tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+                let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        // Resolve exactly as `lane_worker` does for a route carrying a pin, then make the call the
+        // turn makes. `with_temp_home` is sync-only, so pin AIZEN_HOME around the resolve alone.
+        let model = {
+            let _g = crate::core::config::TEST_HOME_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let dir = std::env::temp_dir().join(format!("aizen-wire-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::env::set_var("AIZEN_HOME", &dir);
+            store::update_lane("bot-a", |l| {
+                l.model = Some("lane-pinned-model".into());
+                Ok(())
+            })
+            .unwrap();
+            let m = lane_model("bot-a", "machine-default-model");
+            std::env::remove_var("AIZEN_HOME");
+            let _ = std::fs::remove_dir_all(&dir);
+            m
+        };
+        assert_eq!(model, "lane-pinned-model");
+
+        let http = reqwest::Client::new();
+        let _ = crate::llm::client::chat_with_tools_effort(
+            &http,
+            &base,
+            "test-key",
+            &model,
+            &[Message::user("hi".to_string())],
+            &[],
+            None,
+        )
+        .await;
+        server.abort();
+
+        let req = seen_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the stub gateway should have received a request");
+        assert!(
+            req.contains("\"model\":\"lane-pinned-model\""),
+            "the lane's model must be the one on the wire; body was:\n{req}"
+        );
+        assert!(
+            !req.contains("machine-default-model"),
+            "the machine default must NOT reach the wire when the lane is pinned"
+        );
     }
 
     #[test]

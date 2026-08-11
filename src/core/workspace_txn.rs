@@ -130,6 +130,10 @@ impl WorkspaceIdentity {
             .join("workspace.lock")
     }
 
+    /// Path of the per-worktree Time Machine lock. Reached only through
+    /// `WorkspaceWriterLease::time_machine_lock`, which is itself unused — Time Machine still takes
+    /// its lock via the older `RepoTxnLock::acquire` path.
+    #[allow(dead_code)]
     pub fn timemachine_lock(&self) -> PathBuf {
         self.lock_root()
             .join("worktrees")
@@ -226,14 +230,24 @@ impl WorkspaceWriterLease {
     }
 
     /// Does this process already hold the workspace lease for `identity`'s worktree?
+    ///
+    /// Reentrancy is handled inside acquisition (it bumps a refcount rather than deadlocking), so no
+    /// caller has to ask first. Kept as the queryable form of that state.
+    #[allow(dead_code)]
     pub fn held_by_this_process(identity: &WorkspaceIdentity) -> bool {
         held_map(|m| m.contains_key(&identity.worktree_id))
     }
 
+    /// Take the Time Machine lock under this lease, so snapshot work orders after the workspace lock
+    /// (class 3 before class 4) and cannot invert with another session. Unused: Time Machine still
+    /// acquires directly, outside the lease.
+    #[allow(dead_code)]
     pub fn time_machine_lock(&self) -> Result<RepoTxnLock> {
         RepoTxnLock::acquire_exclusive(&self.identity.timemachine_lock(), Duration::from_secs(5))
     }
 
+    /// The workspace this lease was taken for.
+    #[allow(dead_code)]
     pub fn identity(&self) -> &WorkspaceIdentity {
         &self.identity
     }
@@ -259,6 +273,11 @@ impl Drop for WorkspaceWriterLease {
     }
 }
 
+/// Lock ordering classes. The numbers ARE the contract: a holder may only acquire a strictly higher
+/// class, which is what makes deadlock impossible between sessions. Three variants have no acquirer
+/// yet; they are declared anyway because removing them would renumber the rest and silently change
+/// the ordering every existing lock was reasoned about under.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LockClass {
     Capacity = 1,
@@ -326,10 +345,14 @@ impl LockSet {
         Ok(Self { held })
     }
 
+    /// How many locks this set holds. The set is acquired all-or-nothing and released by `Drop`, so
+    /// callers never need to count it; these are its inspection surface.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.held.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.held.is_empty()
     }

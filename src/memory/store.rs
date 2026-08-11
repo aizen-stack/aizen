@@ -5,6 +5,7 @@
 //! caps/eviction land in P4; this keeps the write path simple and correct first.
 
 use crate::core::config;
+use crate::core::slug;
 use crate::memory::dimension::Dimension;
 use crate::memory::frontmatter::{self, Frontmatter};
 use crate::memory::path_scope::Tier;
@@ -405,20 +406,19 @@ pub fn load_from(dir: &Path) -> Result<Vec<MemoryEntry>> {
     Ok(out)
 }
 
-/// Slugify a name into a safe filename stem.
+/// Slugify a name into a safe filename stem — the entry's id, and the only thing a human has to
+/// type at `memory show|edit|forget`.
+///
+/// The id stays ASCII, but `-` marks a WORD boundary and nothing else. The
+/// `is_ascii_alphanumeric` version tested one codepoint at a time, so every accented letter failed
+/// the test and became a separator — it cut INSIDE words. "Người dùng giao tiếp bằng tiếng Việt"
+/// came out `ng-i-d-ng-giao-ti-p-b-ng-ti-ng-vi-t`: 76% of a real 243-entry store was unreadable
+/// and unguessable, which makes every id-addressed command unusable without first listing.
+///
+/// The order that fixes it — fold the accent off the letter, THEN find word boundaries — lives in
+/// [`crate::core::slug`], shared with the four other surfaces that name files from free text.
 pub fn slugify(name: &str) -> String {
-    let mut s = String::new();
-    let mut prev_dash = false;
-    for c in name.trim().to_lowercase().chars() {
-        if c.is_ascii_alphanumeric() {
-            s.push(c);
-            prev_dash = false;
-        } else if !prev_dash && !s.is_empty() {
-            s.push('-');
-            prev_dash = true;
-        }
-    }
-    let s = s.trim_matches('-').to_string();
+    let s = slug::slug_words(name, slug::MAX_ID_CHARS);
     if s.is_empty() {
         "memory".to_string()
     } else {
@@ -1260,6 +1260,114 @@ mod tests {
         assert_eq!(slugify("Auth Strategy!"), "auth-strategy");
         assert_eq!(slugify("  pnpm   over npm  "), "pnpm-over-npm");
         assert_eq!(slugify("***"), "memory");
+    }
+
+    /// The id is the ONLY handle `memory show|edit|forget` accepts, so `-` has to mean "word ended"
+    /// and nothing else. The ASCII-only predicate cut INSIDE words — this exact real name became
+    /// `ng-i-d-ng-giao-ti-p-b-ng-ti-ng-vi-t`, and 76% of a measured 243-entry store looked like it.
+    #[test]
+    fn slugify_keeps_vietnamese_words_whole() {
+        let id = slugify("Người dùng giao tiếp bằng tiếng Việt");
+        assert_eq!(id, "nguoi-dung-giao-tiep-bang-tieng-viet", "got {id}");
+        // The property behind the string above: every segment is a whole word, so none is the
+        // single stranded letter that shredding produces.
+        let singles = id.split('-').filter(|s| s.chars().count() == 1).count();
+        assert!(singles < 3, "id still looks shredded: {id}");
+    }
+
+    /// `đ` is a letter of the Vietnamese alphabet, not `d` plus a mark, so NFD leaves it whole and
+    /// a marks-only filter would drop it — turning `đường` into `uong`, a different word.
+    #[test]
+    fn slugify_folds_every_vietnamese_letter_including_d_stroke() {
+        assert_eq!(slugify("Đường dẫn tới thư mục"), "duong-dan-toi-thu-muc");
+        assert_eq!(slugify("cà phê đen"), "ca-phe-den");
+        // Every accented vowel form, one word per row, must fold to its bare vowel.
+        assert_eq!(
+            slugify("ăn ân ê ôi ơ ư ỳ"),
+            "an-an-e-oi-o-u-y",
+            "a vowel form did not fold"
+        );
+    }
+
+    /// Non-Latin scripts have no ASCII fold. They must collapse to a boundary rather than vanish
+    /// mid-word or transliterate into something wrong.
+    #[test]
+    fn slugify_collapses_unfoldable_scripts_without_joining_words() {
+        assert_eq!(slugify("deploy 部署 script"), "deploy-script");
+        assert_eq!(slugify("日本語"), "memory"); // nothing foldable at all → the fallback
+    }
+
+    /// `graph.rs` namespaces cross-kind endpoints as `skill:<name>` / `persona:<slug>/<id>` and its
+    /// own test asserts a memory id can never collide with one. An id must never carry a `:` or a
+    /// path separator, which would escape the entries dir.
+    #[test]
+    fn slugify_never_emits_separator_characters() {
+        for raw in [
+            "skill: do a thing",
+            "a/b\\c",
+            "C:\\Users\\admin",
+            "persona:kira/insight",
+            "tab\there",
+        ] {
+            let id = slugify(raw);
+            for bad in [':', '/', '\\', '\t', '.'] {
+                assert!(!id.contains(bad), "{id} contains {bad:?} (from {raw:?})");
+            }
+        }
+    }
+
+    /// The migration re-slugs every stored `name`, so a second pass must be a no-op — otherwise ids
+    /// would keep churning on every launch and the mapping file would never describe the store.
+    #[test]
+    fn slugify_is_idempotent() {
+        for raw in [
+            "Người dùng giao tiếp bằng tiếng Việt",
+            "Auth Strategy!",
+            "***",
+            "Máy này chạy Windows; lệnh shell dùng cú pháp cmd",
+            "ĐÃ ĐƯỢC VIẾT HOA",
+            "Đường dẫn tới thư mục",
+        ] {
+            let once = slugify(raw);
+            assert_eq!(slugify(&once), once, "not idempotent for {raw:?}");
+        }
+    }
+
+    /// A blind char cut leaves a fragment that reads as a DIFFERENT word (`tieng` → `tien`), so the
+    /// cut backs up to the last whole word.
+    #[test]
+    fn slugify_cuts_at_a_word_boundary_not_mid_word() {
+        let id =
+            slugify("Người dùng giao tiếp bằng tiếng Việt và mong muốn trả lời bằng tiếng Việt");
+        assert!(
+            id.chars().count() <= slug::MAX_ID_CHARS,
+            "{} chars",
+            id.chars().count()
+        );
+        assert!(!id.ends_with('-'), "trailing dash survived the cut: {id}");
+        // Whatever the cap lands on, the final segment is a whole word of the source — not a prefix
+        // of one. `tien` would pass a naive length check and still be wrong.
+        let words: Vec<&str> = "nguoi dung giao tiep bang tieng viet va mong muon tra loi"
+            .split(' ')
+            .collect();
+        let last = id.rsplit('-').next().unwrap();
+        assert!(words.contains(&last), "id ends mid-word ({last}) in {id}");
+    }
+
+    /// A single word longer than the cap has no boundary to back up to; it must still be cut rather
+    /// than blow past the limit.
+    #[test]
+    fn slugify_caps_a_single_overlong_word() {
+        let id = slugify(&"a".repeat(200));
+        assert_eq!(id.chars().count(), slug::MAX_ID_CHARS);
+    }
+
+    /// Composed vs decomposed spellings of the same name must land on the same file, or a store
+    /// written on one platform would grow duplicates when read on another.
+    #[test]
+    fn slugify_is_normalization_insensitive() {
+        assert_eq!(slugify("ph\u{00EA}"), slugify("phe\u{0302}"));
+        assert_eq!(slugify("ph\u{00EA}"), "phe");
     }
 
     #[test]

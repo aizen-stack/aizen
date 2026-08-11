@@ -14,6 +14,7 @@ pub mod frozen_core;
 pub mod fuse;
 pub mod graph;
 pub mod learning;
+pub mod migrate_ids;
 pub mod model_dl;
 pub mod path_scope;
 pub mod pending;
@@ -695,27 +696,19 @@ fn strip_global_prefix(text: &str) -> Option<&str> {
 }
 
 /// A short kebab id from the first few words of a `#remember` capture (the store also disambiguates
-/// on collision). Letters/digits kept; runs of anything else collapse to a single `-`.
+/// on collision). ASCII, with `-` marking a word boundary and nothing else.
+///
+/// Shares [`crate::core::slug`] with [`store::slugify`] so the two id-producing paths cannot
+/// disagree about what a name's id is. `is_ascii_alphanumeric` on its own treated every accented
+/// character as a separator and cut inside words, so a Vietnamese `#remember` produced an id of
+/// one-letter fragments.
 fn remember_slug(text: &str) -> String {
-    let mut slug = String::new();
-    let mut last_dash = true; // suppress a leading dash
-    for c in text.chars() {
-        if c.is_ascii_alphanumeric() {
-            slug.push(c.to_ascii_lowercase());
-            last_dash = false;
-        } else if !last_dash {
-            slug.push('-');
-            last_dash = true;
-        }
-        if slug.split('-').filter(|s| !s.is_empty()).count() >= 6 && c.is_whitespace() {
-            break; // ~6 words is enough for a readable id
-        }
-    }
-    let slug = slug.trim_matches('-');
+    // ~6 words is enough for a readable id; the char cap still applies for long words.
+    let slug = crate::core::slug::slug_first_words(text, 6, crate::core::slug::MAX_ID_CHARS);
     if slug.is_empty() {
         "note".to_string()
     } else {
-        slug.chars().take(60).collect()
+        slug
     }
 }
 
@@ -1011,7 +1004,8 @@ pub fn inventory(
         }
         out.push_str(
             "\nused = the model cited it · cold = never recalled · low? = extractor unsure\
-             \n`memory show <id>` reads one · `memory edit <id> <text>` fixes · `memory forget <id>` retires (restorable)",
+             \n`memory show <id>` reads one · `memory edit <id> <text>` fixes · `memory forget <id>` retires (restorable)\
+             \n`memory where` prints the folders — for editing or clearing out many at once",
         );
     }
     Ok(out.trim_start().to_string())
@@ -1781,7 +1775,14 @@ pub fn print_reconcile_report(r: &learning::reconcile::BatchReport) {
     ));
     for a in &r.applied {
         let verb = match &a.action {
-            Action::Confirm { target } => format!("confirm '{target}'"),
+            Action::Confirm {
+                target,
+                redundant: Some(x),
+            } => format!("confirm '{target}' and drop duplicate '{}'", x.id),
+            Action::Confirm {
+                target,
+                redundant: None,
+            } => format!("confirm '{target}'"),
             Action::Refine { target, .. } => format!("rewrite '{target}' in place"),
             Action::Supersede { target, .. } => format!("retire '{target}' behind a new fact"),
             Action::Review { target, why } => format!("leave '{target}' alone — {why}"),
@@ -2691,6 +2692,24 @@ mod tests {
         );
         assert_eq!(remember_slug("!!!"), "note"); // no alphanumerics → fallback
         assert!(remember_slug(&"word ".repeat(50)).chars().count() <= 60);
+    }
+
+    /// `#remember` in Vietnamese has to produce the same shape of id as `store::slugify` — whole
+    /// words, `-` only between them. Before the shared fold this path cut inside every accented word.
+    #[test]
+    fn remember_slug_folds_vietnamese_into_whole_words() {
+        // Six words, and the last is reached before any further whitespace, so all six are kept.
+        assert_eq!(
+            remember_slug("Đường dẫn tới thư mục home"),
+            "duong-dan-toi-thu-muc-home"
+        );
+        // Seven words: the whitespace after the sixth ends the id there.
+        let id = remember_slug("Người dùng giao tiếp bằng tiếng Việt");
+        assert_eq!(id, "nguoi-dung-giao-tiep-bang-tieng");
+        assert!(
+            id.split('-').filter(|s| s.chars().count() == 1).count() < 3,
+            "still shredded: {id}"
+        );
     }
 
     fn entry(id: &str, text: &str) -> MemoryEntry {

@@ -61,11 +61,27 @@ pub fn git_exe() -> Option<PathBuf> {
 /// A ready `Command` for the resolved git, or `Err(GitMissing)` — best-effort call sites keep
 /// their old "git broken → skip" behavior with a plain `.ok()?`, while strict sites propagate a
 /// typed, self-explanatory error instead of a raw spawn ENOENT.
+///
+/// On Windows the command carries `CREATE_NO_WINDOW`: some callers (`workspace_txn`, `repo_map`,
+/// `config::project_root`) run git via a bare `.output()` that never touches `proctree::prepare`,
+/// so the flag has to live here too — otherwise those spawns keep allocating a console and can trip
+/// the `0xc0000142` loader-init failure the flag exists to avoid.
 pub fn command() -> anyhow::Result<std::process::Command> {
     match git_exe() {
-        Some(p) => Ok(std::process::Command::new(p)),
+        Some(p) => Ok(no_window(std::process::Command::new(p))),
         None => Err(anyhow::Error::new(GitMissing)),
     }
+}
+
+/// Apply `CREATE_NO_WINDOW` on Windows; a pass-through elsewhere. Centralizes the flag so every
+/// git spawn in this module (including the `--version` probe) gets it.
+fn no_window(mut cmd: std::process::Command) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(crate::core::proctree::CREATE_NO_WINDOW);
+    }
+    cmd
 }
 
 /// One-line status for the identity surfaces (startup banner, `/where`). `None` when git was
@@ -146,7 +162,7 @@ fn resolve_from(override_var: &str, path_var: &str) -> Resolution {
 /// One real `git --version` run — used only for well-known fallback candidates (a PATH hit and
 /// an explicit override are taken at face value, matching the old behavior).
 fn probe_works(p: &Path) -> bool {
-    std::process::Command::new(p)
+    no_window(std::process::Command::new(p))
         .arg("--version")
         .output()
         .map(|o| o.status.success())

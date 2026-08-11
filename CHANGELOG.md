@@ -5,6 +5,349 @@ All notable changes to **Aizen** (`aizen`) — the pure-Rust agentic coding CLI.
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
+## [Unreleased]
+
+## [0.6.1] — 2026-08-09
+
+A maintenance release about the parts of the agent that were quietly doing the wrong thing: a stream
+frame that could take a tool call down with it, a delegated workflow that resolved paths against the
+wrong directory, and a mouse wheel that scrolled the input box instead of the transcript. It also
+folds the tool surface down — one `file_edit` covering both the single and batch form, and two
+checkpoint tools instead of four — which is fewer schemas on every request.
+
+### Fixed
+- **A duplicate key in one streamed frame no longer drops the tool call riding with it.** Gateways
+  that mirror the reasoning channel into both `reasoning_content` and `reasoning` produced a serde
+  `duplicate field` error, and the rejected frame took whatever `content` or `tool_calls` arrived in
+  the same delta with it. The two spellings are now separate fields, read through one accessor, and
+  any frame that still fails a strict parse is retried leniently through `serde_json::Value`
+  (last-wins on duplicates) before being given up on.
+- **Unparseable-frame warnings no longer bury the session.** A mis-modelled delta shape breaks every
+  frame, so the old warn printed one line per streamed token over the live UI. Frames that survive
+  neither parse attempt are keepalive/ping noise and are dropped silently; set `AIZEN_DEBUG_STREAM=1`
+  to see them, capped at 3 per response and truncated to the informative head of the payload.
+- **The mouse wheel keeps scrolling the transcript for the whole turn.** A tool that spawns a child
+  process can reset the console input mode on Windows, dropping mouse capture mid-turn; from there
+  the terminal's `alternateScroll` leaks wheel ticks through as `↑`/`↓` keys, so scrolling walked
+  input history instead of the transcript. Capture was only re-asserted on the turn's trailing edge,
+  which left the rest of the turn leaking — it is now pinned across the entire working window.
+- **A delegated workflow resolves paths against its own lane root.** The model-callable `workflow`
+  tool read the process working directory, so concurrent lanes could read, edit, and checkpoint the
+  wrong project. The root and context window now arrive from the registry that built the tool.
+- **Workflow synthesis cannot park a fan-out forever.** The final non-streaming synthesis call had no
+  deadline — a socket that stays byte-alive but never completes has neither `read_timeout` nor an
+  inter-event watchdog to catch it. It now runs under the same call deadline as every other
+  background call, and reports a timeout as a failure rather than a cancel.
+- **Eagerly-started tool calls get the same argument repair as the normal path.** The streaming
+  fast-start path skipped schema repair, so a call the deferred executor would have fixed could fail
+  with a missing-argument error purely because it started early. Both paths now share one prepare
+  step, and a call whose repair is ambiguous or that changes safety classification falls back to the
+  normal executor.
+
+### Changed
+- **`multi_edit` is gone; `file_edit` does both.** Pass `edits[]` instead of `old_string`/`new_string`
+  to apply an ordered list of edits to one file in a single atomic write. One fewer schema on every
+  request, and one fewer decision for the model to get wrong.
+- **Four checkpoint tools collapse into two.** `checkpoint` takes an `action` of `save`, `rewind`, or
+  `restore` (all approval-gated); the read-only `checkpoint_view` takes `diff` or `list` and stays out
+  of the approval path. `aizen time …` and free-form `restore <id>` are unchanged for humans.
+- **Sub-agent prompts carry role-scoped tool guidance** instead of the full top-level catalog, so a
+  planner or reviewer child no longer pays for tools it was never granted.
+- **Workflow children inherit the parent's context window** and the tool-result clearing that goes
+  with it, rather than a default.
+
+### Internal
+- Tool registration and `classify_tool` are now checked against each other, so a tool cannot be
+  registered while being invisible to toolset filtering — the gap that let `codebase_search`,
+  `skill_forget`, `team_status`, `goal_complete`, and `bot_admin` bypass it.
+- `aizen bench loop` counts what it claimed to measure: model calls, tool calls, repeated call
+  signatures, nudges by kind, and context-management events. A reactive fake-model harness checks
+  that a nudge changes the model's approach instead of merely being appended.
+- The schema budget test measures the real top-level registry after delegation, persona, LSP, goal,
+  and config filtering, with separate ceilings for the minimal and maximal surfaces.
+- Workflow synthesis prompts have a total cap derived from the resolved context window, truncating
+  deterministically and naming what it dropped.
+
+## [0.6.0] — 2026-08-08
+
+Aizen now treats a provider as one reusable configuration object instead of making users coordinate
+an endpoint, key, model, role override, and specialist card separately. This release also restores
+mouse-wheel transcript scrolling, makes Ctrl-C useful for copying inside the retained terminal, and
+turns Time Machine's noisy per-edit snapshots into meaningful phase restore points.
+
+### Added
+- **Named provider profiles with one-pick manual failover.** A profile stores its name, endpoint,
+  API key, default model, and optional context window. `/provider` switches directly from a masked,
+  secret-safe list; `/provider add` and `/provider manage` expose Add, Use, Edit, Rename, and Delete
+  in the same surface. Scriptable equivalents live under `aizen config provider
+  add|edit|rename|use|list|remove`.
+- **Provider-aware sub-agent routing.** Sub-agent default, Summarizer, Oracle, Apply, and individual
+  specialist agents choose from the same saved provider list and may inherit the provider's default
+  model or set a model override. `aizen agents set-provider <agent> <provider> [model]` provides the
+  automation path; `--clear` returns to inheritance.
+- **Safe provider dependency management.** Renaming a profile atomically updates the active provider,
+  role assignments, and specialist routes. Removing a referenced provider is refused unless the CLI
+  is given `--replace-with` or an explicit `--force` clear, so config cannot acquire dangling refs.
+- **Immediate health feedback after a switch.** Activating a provider resets the health chip and runs
+  a one-shot probe immediately instead of waiting for the periodic poll.
+
+### Changed
+- **`/config` is provider-first.** The old parallel Connection/Providers paths are replaced by one
+  **Providers & connection** row. Editing the main model synchronizes it back into the active profile;
+  legacy direct role endpoints, model-to-endpoint mappings, and card endpoint fields remain available
+  as labelled advanced overrides.
+- **Time Machine checkpoints follow work phases, not individual edits.** A checkpoint is stamped when
+  a todo phase closes or an edited run passes verification. `last_good` therefore lands on a clean,
+  understandable boundary instead of one of many nearly-identical intermediate snapshots; repeated
+  verification failure also surfaces the existing rewind option once repair budget is running low.
+- **Mouse and clipboard behavior match terminal expectations.** The wheel scrolls the transcript or
+  active overlay again, except during a scrollbar-thumb drag. Drag-release still copies a selection;
+  Ctrl-C copies the highlighted transcript text (or the current draft), and a second Ctrl-C within two
+  seconds quits. The old floating right-click Copy menu is removed, leaving right-click available to
+  the terminal on Windows.
+
+### Fixed
+- **Changing an endpoint no longer offers or retains the previous endpoint's API key.** Provider edits
+  may keep the current key only when the normalized URL is unchanged; a different URL requires a new
+  key, and cancelling any wizard step leaves the saved tuple untouched.
+- **Specialist model overrides no longer lose the selected provider endpoint.** An explicit task model
+  changes only the model while retaining the locally assigned provider URL/key, and legacy card
+  endpoint metadata cannot overwrite a normal local provider route.
+- **Provider displays cannot leak credentials.** API keys are always masked and URL userinfo is
+  redacted across `/provider`, `/config`, `config show`, provider CLI output, and agent listings.
+- **Atomic writes use one implementation.** The duplicate edit-tool writer was removed in favor of the
+  shared persistence implementation, keeping crash-safe replacement and compare-before-write behavior
+  consistent across the binary.
+- **Markdown tables render even when the separator's column count differs from the header.** A wider
+  header over a shorter delimiter row (`|---:|---|` beneath three columns) used to fail detection and
+  dump raw pipes into the transcript; the delimiter row is now accepted on shape alone and the columns
+  are reconciled, so the table draws as a box.
+
+## [0.5.9] — 2026-08-07
+
+One theme: **six places reported failure as success.** A sub-agent that never answered was labelled
+`done`. A saved conversation the program itself had written was listed as `(unreadable)`. A duplicate
+gate that had never once fired looked like a store with no duplicates in it. An abandoned lease
+directory was never swept because the only sweeper refused to look at other projects' leases. In every
+case the code path completed without error, so nothing upstream had any way to tell that nothing had
+happened — which is why several of these survived for months under a green test suite.
+
+### Fixed
+- **Sub-agents returned empty "successfully", many times in a row.** Three independent bugs, each
+  sufficient on its own, which is why fixing any one of them earlier never made the symptom go away.
+  (1) When the transient-retry budget ran out on an empty HTTP 200, the ordinary turn loop `break`ed
+  with an empty turn and fell through the done cascade into `StopReason::Done` — the caller received
+  `"(sub-agent produced no final answer)"` *under a `done` header*, indistinguishable from a genuine
+  silent success. A test named `..._falls_through_once_budget_is_spent` had pinned exactly this as
+  correct behaviour ("the pre-fix behavior, so a persistently-broken provider still terminates"), so
+  the suite was green the whole time. A spent budget is now an `Err`, which every caller already
+  handled correctly. (2) Each retry re-sent a **byte-identical** request. A provider that just answered
+  a request with silence usually answers it with silence again — this is the direct cause of "many
+  times". From the second attempt a short `[recover]` re-prompt is appended, and rolled back LIFO on
+  every early return so a retried turn can't leave a stray `user` message in history. (3) `RespMessage`
+  (non-streaming) never read `reasoning_content`, though the streaming `Delta` has always had it via
+  `#[serde(alias = "reasoning")]`. A provider that puts the whole answer in `reasoning_content` with
+  `content: null` therefore deserialized to exactly the shape of an empty 200. **Only sub-agents were
+  affected**, because they are the one caller running entirely on the non-streaming path — the same
+  model answering the same way through the streaming path was fine. Retry budgets 4 → 6 in both the
+  `task` tool and workflow children, and the backoff curve now selects the patient one (cap 30s) when
+  `cfg.quiet` marks a lane nobody is watching, rather than the interactive 4s cap.
+- **The first tool call of a stream could still dispatch with no arguments.** `snapshot` guarded
+  partial arguments with `args_complete`, but `finish_indexed` — the flush path for the LAST call in a
+  stream — only filtered on a non-empty *name*. A stream cut mid-arguments therefore dispatched with
+  `args = ""`, which reads as `{}` and surfaces as "missing required argument". Same filter now applies
+  on both paths.
+- **`/sessions` listed conversations as `(unreadable)` — and the files were fine.** Not abrupt
+  shutdown: all 29 session files on the reporting machine parsed as valid JSON, and the write path
+  (`atomic_write` → temp + `sync_all` + `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)`) is genuinely
+  crash-safe. The bug was an asymmetry inside `Message`: the hand-written `Serialize` emits `content`
+  as an OpenAI **parts array** for a user turn carrying images, while `Deserialize` accepted only
+  `Option<String>`. Any conversation that ever had an image pasted into it was written in a shape the
+  program could not read back. `content` now round-trips through a `ContentField` enum accepting all
+  three legitimate wire shapes (absent, string, parts array) and recovers `images` back out of the
+  parts, so **the two affected files on disk load again with no migration** — the data was never lost,
+  only unparseable. Unknown future part kinds (audio, video, file) degrade to "dropped" rather than
+  failing the whole message, so this exact class of bug cannot recur through a provider addition.
+  Images still live outside `content` in memory, keeping the `chars/4` token HUD and auto-compact from
+  counting multi-MB base64.
+- **The serde error that hid it for months is no longer swallowed.** `parse_session_bytes` returned a
+  bare `None` for every failure. It now has a `parse_session_reason` sibling returning the reason, and
+  `/sessions` prints `(unreadable: <why>)` — the corrupt-vs-empty distinction is unchanged.
+- **98 dead recovery leases, oldest two weeks old, that nothing could ever delete.** `clear()` only
+  runs on a clean exit, and `scan_stale()` filters by `repo_scope`, so a lease from any other project
+  was invisible to the only code that could remove it; every abrupt shutdown added one, and no
+  `consumed-*` or `quarantine-*` had ever been cleaned. `sweep_expired()` is deliberately scope-blind
+  (that *is* the leak) with safety from the lock plus a 7-day age check rather than from scope. The
+  lock guard is dropped before `remove_dir_all` — it holds an open handle to `lease.lock` inside the
+  directory, and Windows refuses to delete a directory containing an open file, so keeping it would
+  have made the sweep a silent no-op on the platform where the leak was measured. Orphaned
+  `.aizen-tmp-*` files in the sessions directory are swept at startup too.
+- **The duplicate-memory gate had never fired once.** Measured over the real 360-fact store, every
+  same-tier pair scored under both thresholds: 0 pairs ≥ 0.80, 0 pairs ≥ 0.55, median nearest-neighbour
+  0.199 — while the store held five separate facts all saying the user writes Vietnamese. The gate was
+  not too loose, it was **blind**: `best_match` was purely lexical, and the shared vocabulary is
+  exactly the layer Vietnamese paraphrase varies (`người dùng` / `user` / `anh`, `giao tiếp` /
+  `trao đổi`). Peak similarity between two facts stating the same thing was 0.44, under the 0.55 floor.
+  Similarity is now the max of three measures, the third being a new `match_text` layer that folds
+  accents and strips the pronoun-and-particle layer for comparison only. This is *not* the retrieval
+  tokenizer — that one deliberately preserves diacritics so searching `cà phê` works, and a test pins
+  it. `persona::self_mem` had already hit and fixed this same blindness one layer down; the fix is now
+  factored out so the two cannot drift apart again.
+- **`reconcile` reported 227 successful `confirm`s while retiring nothing.** `Action::Confirm` carried
+  only a target, so the redundant half of a `same` pair was never touched — the log was counting
+  *gestures*, not *effects*. The duplicate is now actually removed (`drop_redundant`), gated on the
+  candidate's own confirmations, with cycle protection so a supersede chain inside one batch can't
+  delete its own survivor. A failed removal is reported ("duplicate kept — <why>"), never swallowed.
+- **`/config` mid-chat corrupted the frame.** The suspend mechanism was correct; the raw prints were
+  not. Roughly 20 `eprintln!` calls on the `/config`, `/skills`, `/persona` and `/sessions` paths wrote
+  behind the render thread's back — ratatui diffs against its own cell buffer, never sees foreign text,
+  and so leaves it alive across later frames. All now route through `tui::note_line`. `Spinner::start`
+  gated only on `is_terminal()`, so a spinner on a background thread outliving the suspend window
+  scribbled `\r` + `clear_line` over a live frame; it is now inert while the retained renderer owns the
+  screen (the narrated operation still runs and still prints its verdict). `Command::Resume` now sets
+  `force_clear` like `Redraw` already did, and re-probes the terminal size on resume — while suspended
+  no paint happens, so `COLS`/`ROWS` were stale and a window resize with `/config` open drew at the old
+  width.
+
+### Changed
+- **The mouse wheel no longer scrolls the transcript.** A wheel tick moved the viewport out from under
+  a drag-selection's anchor line, silently changing what releasing the button would copy — which is why
+  selecting an earlier prompt to copy it kept producing the wrong text. Scrolling back is keyboard-only
+  now: PageUp/PageDown, End to return to the live tail. Mouse capture stays enabled regardless; it is
+  what stops the terminal's `alternateScroll` from leaking wheel ticks through as ↑/↓ and walking input
+  history behind the user's back.
+- **Drag-release copy now confirms.** It had always copied silently, so there was no way to tell it had
+  worked; it now prints the same `· copied N chars` note the right-click Copy path does, and says so
+  honestly when the platform has no clipboard (`arboard` is desktop-only, so Linux is a no-op).
+
+### Added
+- `aizen prompt-size` — byte breakdown of the fixed per-turn overhead (system prompt + tool schemas),
+  with `--tools` for per-tool sizes and `--json` for machine output. Tool schemas and loop count were
+  the two remaining token levers after an audit found prompt caching already correct.
+
+## [0.5.8] — 2026-08-05
+
+One theme: **a name is a handle, and four of the five places that build one were cutting words in
+half.** Testing a name one codepoint at a time against `is_ascii_alphanumeric` makes every accented
+letter fail, so it becomes a separator and splits the word it belonged to. Three quarters of a real
+memory store had ids nobody could read, and the id is the only thing `memory show|edit|forget`
+accepts. The accent is now folded off the letter *before* anything decides where a word ends, in one
+shared helper, and names already on disk are recomputed once. Two things fell out of the same work: a
+pasted API key can no longer become a filename, and `aizen where` says when a saved transcript still
+contains one.
+
+### Fixed
+- **Memory ids were cut inside words, so 76% of a real store was unusable.** `slugify` tested one
+  codepoint at a time against `is_ascii_alphanumeric`, and every accented letter failed the test and
+  became a `-`. On a measured 243-entry store that left **185 (76%)** of ids looking like
+  `ng-i-d-ng-giao-ti-p-b-ng-ti-ng-vi-t`; the worst were readable as no word at all
+  (`ngd-ng-mucugihd-liv-ngukic`). That is not a cosmetic problem: the id is the only handle
+  `memory show|edit|forget` accepts, so an id nobody can read is a record nobody can address without
+  listing the whole store first. The bug was the ORDER, not the character set — the accent is now
+  folded off the letter *before* anything decides where a word ends, so the same name files as
+  `nguoi-dung-giao-tiep-bang-tieng-viet` and `-` means "word ended here" and nothing else. Ids stay
+  ASCII. `đ`/`Đ` are handled explicitly, since they are letters of the Vietnamese alphabet rather
+  than `d` plus a mark and no normalization form decomposes them — without that, `đường` would have
+  folded to `uong`. Truncation now backs up to the last whole word: a blind cut turned `tieng` into
+  `tien`, a different word, so a shortened id read as a fact about something else.
+  `memory` and `#remember` share one folding helper, so the two id-producing paths cannot drift.
+- **A learned fact's display name also ended mid-word — and the id is derived from it.** Found by
+  reading the migrated store rather than the code, which is why it is worth stating separately:
+  `fact_name` cut the head of a fact at 60 characters on a *char* boundary, so it never panicked, but
+  it cut straight through words. **73 of the same 243 names** end in a one- or two-character fragment,
+  and `slugify` faithfully carried that fragment into the filename —
+  `agents-md-…-la-khe-uoc-lam-viec-l`, where the `l` is the first letter of `lâu`. Folding accents
+  could not have caught this: by then the accent was gone and the orphan was legitimately ASCII. The
+  cut now backs up to the last whitespace and drops the punctuation left at the seam, so `…giữ a,`
+  no longer leaves a dangling comma in a listing either; a fact shorter than the cap keeps its final
+  word. **The 73 names already on disk are not rewritten** — their bodies still hold the full text so
+  recovering them is mechanical, but a second automatic pass over a user's data in one release should
+  be seen before it runs.
+- **The same defect was live in three more places; all four now share one implementation.** Five
+  surfaces independently turn free text into a filename, and four of them had written the same broken
+  loop. `core::slug` is now the single definition of "a name a human can read and retype", so they
+  cannot drift apart again:
+  - **Persona self-memory** (`personas/<slug>.self/`) was the worst hit in proportion — **45 of 89
+    files (51%)** on a measured store, named `in-t-i-n-n-l-9` or `ep-work-handled-b-y-gi-3`. It stayed
+    invisible longer than the memory store because `/persona self` renders bodies, not filenames.
+  - **Session working memory** (`session_mem::slug_id`) — the ids never reach disk, but they are
+    rendered into the prompt block the model reads.
+  - **The project zone key** (`config::slug_fragment`, half of `dirname-hex8`) — latent rather than
+    observed: a checkout under an accented path keyed a zone like `d-n-aizen-…`. An ASCII dirname
+    produces the byte-identical fragment it always did, so no existing zone is re-keyed; for the
+    accented minority `aizen zone migrate` now also probes the pre-fold spelling so the old directory
+    is still found and merged.
+- **Persona self-memory filenames are re-slugged once, automatically** — the same mechanical pass as
+  the memory ids, recomputed from each file's own body (self-memories have no frontmatter `name`),
+  with the old→new map written to `personas/.stem-migration-<persona>-<date>.tsv` before the first
+  rename. `persona:<slug>/<id>` graph edges are re-pointed in the same pass; the measured store has
+  none, but `note_insight_cofire` can write them at any time, so the pass re-points rather than
+  assuming. Per-persona flag file, so a character created later still gets migrated on its own first
+  launch. Shares the `AIZEN_NO_ID_MIGRATE=1` opt-out.
+- **Twelve persona self-memories were indistinguishable from each other.** Every episode body opens
+  with its own type label (`correction: user redirected me — "…"`) plus, for todo nags, identical
+  `[todo-poke]` scaffolding — so a stem taken from the first five words described the FORMAT, not the
+  memory. Twelve files on a real store read `ep-correction-user-redirected-me-todo`, separated only by
+  a `-2`…`-12` counter. Widening the word count would not have helped (the shared prefix just gets
+  longer); the stem now skips the label and filler words and carries a short content hash, so it is
+  unique by construction and the `-N` counter is back to being a last resort.
+- **A pasted API key could become a session filename, and filenames are printed.**
+  `suggest_session_name` derives a name from the first line of the first user message and kept any
+  token of 2+ characters, so a key pasted as the opening line became the name of the file — which
+  `/sessions` renders on screen, `ls` shows, and every backup copies. A real machine had one: 40
+  characters, vendor prefix, no separators left after sanitizing. Credential-shaped tokens are now
+  dropped while the name is being derived, by vendor prefix (checked on the raw token, since stripping
+  separators first would erase the evidence) and by shape (length plus the character-class mixing that
+  random material shows and words do not). A key on its own falls back to the generic `chat-<date>`
+  stem; with prose around it the topic survives and only the key is dropped. This guards name
+  derivation only — it does not redact transcript bodies, and **4 of 27 transcripts on the measured
+  machine still contain key-shaped strings in their message text.**
+- **`aizen where` now says when saved transcripts contain keys.** The name guard above stops a key
+  becoming a *filename*, but a saved session is a verbatim transcript and nothing redacts what is
+  inside it. `/where` reports the file count and names the folder; it never prints a value, and it
+  does not touch the files — editing a user's own conversation history is their call. The scan uses
+  vendor key prefixes rather than the shape test that guards name derivation, and that distinction is
+  load-bearing: measured over the same 27 files, the shape test matched 5170 tokens of which **4026
+  were ISO timestamps** (long, mixed-case, letters and digits — indistinguishable from key material by
+  shape alone), which would have flagged 23 of 27 files and taught the user to ignore the warning.
+  Prefix matching flags 12 strings, all real keys, in 4 files.
+- **`persona self` asked you to choose from a set it would not show you.** At the 40-insight cap the
+  view said "retire one" and then printed 10 of the 40 — and it is the only place a self-memory id
+  appears, so `persona forget <id>` had nothing to name. The hidden count is now always stated and
+  `--all` prints every id. Bodies render through `elide` rather than a truncator that appends
+  `[+73 chars]`: that suffix exists so a *model* reading a clipped tool result knows content was
+  withheld, but in a listing it is noise the reader cannot act on and it costs the width the text
+  needed.
+
+### Changed
+- **Session names are ASCII whole words, like every other id.** `suggest_session_name` used unicode
+  `is_alphanumeric`, so it was never shredded — but it kept diacritics, which meant a filename that
+  differs by normalization form between platforms. It now folds through the same helper, per word, so
+  no word is cut apart. `sanitize_name` is deliberately unchanged: it also has to map an *existing*
+  on-disk name to itself, and folding there would orphan the accented session files already saved.
+- **Ids already on disk are re-slugged once, automatically.** The new rule only helps facts written
+  from here on, so a store written by an older build is migrated on the first run of a build that has
+  this. It needs no model and makes no guesses: the display `name` in each file's frontmatter was
+  never mangled, only the filename, so the correct id is `slugify(name)` recomputed. The old→new
+  table is written to `cli-memory/.id-migration-<date>.tsv` **before the first rename**, since it is
+  the only route back to the previous names. `graph.tsv` endpoints are re-pointed in the same pass —
+  renaming the files alone would leave every edge aimed at an id that no longer exists and the
+  association layer would silently go dark. Cross-kind endpoints (`skill:`, `persona:`) pass through
+  untouched, `archive/` revision suffixes (`-r1`) survive, and collisions get a numeric suffix rather
+  than clobbering. Verified on a copy of a real store: 258 ids renamed, 187 edges re-pointed, **0
+  dangling endpoints**, no files lost. `AIZEN_NO_ID_MIGRATE=1` skips it; a flag file stops a second
+  pass. It renames files without asking — but not silently: the count and the map's path go to
+  stderr, so a piped `memory list` stays machine-readable.
+
+### Added
+- **`aizen memory where` and `aizen skill where`** — print the folders, with a file count each.
+  Nothing pointed a user at a directory before: the `memory list` footer named only the three
+  per-id verbs (`show`/`edit`/`forget`), and a path appeared just once, in `memory show <id>`, one
+  entry at a time. Opening the folder is the faster route when the job is editing or deleting many
+  records at once, and skills made this worse by living in **three** roots that the `[project]` and
+  `[repo]` tags only hinted at. A directory that does not exist yet says so, so absence never reads
+  as emptiness. `persona list` gained the same pointer inline, since personas have only one folder.
+
 ## [0.5.7] — 2026-08-05
 
 Two things this release is about. **A hosted daemon now answers several conversations at once**

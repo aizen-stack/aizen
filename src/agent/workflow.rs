@@ -23,25 +23,26 @@ use crate::agent::task_tool::{build_agent_subagent_prompt, build_subagent_prompt
 use crate::agent::{run_agent, AgentConfig, StopReason};
 use crate::core::types::{Message, ToolDef};
 use crate::llm::client::{chat_with_tools, stream_chat_with_visual_contract};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
-/// Per-child step budget (mirrors `task` default `max_steps=15`). Workflow children are narrower
-/// than a top-level agent — keep them from burning the full 25/50 default.
+/// Per-child total hard cap after the one soft extension.
 const CHILD_MAX_ITERS: usize = 15;
-/// Hard ceiling on auto-extend for a workflow child (`2 × CHILD_MAX_ITERS`, same shape as task).
+/// Total ceiling for a workflow child (2 × the narrow initial budget).
 const CHILD_AUTO_EXTEND: usize = 30;
 /// Transient model-call failures a workflow child absorbs per turn before giving up (see
-/// `AgentConfig::max_transient_retries`). Matches the `task` tool's sub-agent policy.
-const CHILD_TRANSIENT_RETRIES: usize = 4;
-/// Fresh step budgets a STILL-PROGRESSING workflow child may be granted after its auto-extend is
-/// spent, instead of returning partial work as `status: "max-iters"` (see
-/// `AgentConfig::max_continuations`). Smaller than the top level's: children are meant to be narrow,
-/// and up to the process-global cap of them run at once, so the worst case is bounded by
-/// `cap × (CHILD_AUTO_EXTEND + CHILD_CONTINUATIONS × CHILD_MAX_ITERS)`.
-const CHILD_CONTINUATIONS: usize = 2;
-
+/// `AgentConfig::max_transient_retries`). Matches the `task` tool's sub-agent policy
+/// (`SUBAGENT_TRANSIENT_RETRIES`) — kept EQUAL on purpose: both are unwatched loops on the same
+/// gateway, so a value that is right for one is right for the other, and a divergence here would
+/// mean the same provider blip loses a workflow child while a `task` dispatch rides it out.
+///
+/// Raised 4 → 6 with the empty-200 fix in [`crate::agent::run_agent_loop`]: exhausting the budget is
+/// now an `Err` rather than a fall-through reported as a finished run, which makes the number
+/// load-bearing instead of merely deciding how long a doomed turn took to give up.
+const CHILD_TRANSIENT_RETRIES: usize = 6;
+/// Fresh step budgets are no longer granted after the child's hard total cap; a workflow child is
+/// intentionally narrow and should be split into another workflow call instead of silently growing.
 /// Cap each child's summary before stuffing it into the synthesis prompt (chars). Prevents 5 verbose
 /// children from blowing the synth context / $$.
 const SUMMARY_CHAR_CAP: usize = 4_000;
@@ -72,7 +73,7 @@ pub struct WorkflowTask {
 }
 
 fn default_role() -> String {
-    "coder".to_string()
+    "reviewer".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,7 +142,8 @@ async fn run_workflow_with_cancel(
 ) -> Result<()> {
     validate_spec_ids(spec)?;
     // Same singular-writer gate as `workflow_tool::build_spec` — CLI specs used to skip it and could
-    // launch two default-role `coder`s in parallel (file/build races).
+    // launch two omitted-role children as writers (file/build races). Omitted roles are read-only
+    // reviewers; a writer must be explicit and still stays singular.
     enforce_singular_writer(spec)?;
 
     let root = std::env::current_dir()
@@ -178,6 +180,7 @@ async fn run_workflow_with_cancel(
         width,
         Some(parent_id),
         cancel.clone(),
+        0,
     )
     .await;
     drop(slots);
@@ -219,7 +222,7 @@ async fn run_workflow_with_cancel(
         .as_ref()
         .and_then(|s| s.prompt.as_deref())
         .unwrap_or(default_instruction);
-    let synth_prompt = build_synthesis_prompt(&spec.name, instruction, &results);
+    let synth_prompt = build_synthesis_prompt_capped(&spec.name, instruction, &results, None);
 
     // Optional audit trace of the fan-out (per-task model + outcome + the synthesis model). Written
     // BEFORE synthesis so a synthesis failure still leaves the fan-out record. Best-effort.
@@ -349,6 +352,7 @@ pub(crate) async fn fan_out(
         max_parallel,
         None,
         crate::core::cancel::TurnCancel::new(),
+        0,
     )
     .await
 }
@@ -367,6 +371,7 @@ async fn fan_out_tracked(
     max_parallel: usize,
     parent: Option<u64>,
     cancel: crate::core::cancel::TurnCancel,
+    context_window: usize,
 ) -> Vec<TaskOutcome> {
     let width = max_parallel.clamp(1, crate::agent::task_tool::max_parallel_subagents_pub());
     let mut results: Vec<TaskOutcome> = Vec::with_capacity(tasks.len());
@@ -409,6 +414,7 @@ async fn fan_out_tracked(
                 t,
                 parent,
                 cancel.clone(),
+                context_window,
             )
         });
         results.extend(futures_util::future::join_all(futs).await);
@@ -428,6 +434,8 @@ pub(crate) async fn run_workflow_collect(
     approval_mode: crate::core::approval::ApprovalMode,
     spec: &WorkflowSpec,
     synthesize: bool,
+    root: &Path,
+    context_window: usize,
 ) -> Result<String> {
     let cancel = crate::core::cancel::current().unwrap_or_default();
     validate_spec_ids(spec)?;
@@ -435,10 +443,7 @@ pub(crate) async fn run_workflow_collect(
     // future direct caller can't bypass it.
     enforce_singular_writer(spec)?;
 
-    let root = std::env::current_dir()
-        .context("resolving cwd")?
-        .canonicalize()
-        .context("canonicalizing cwd")?;
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     // Reserve ONE global sub-agent slot per concurrent child (bounded by both the process-global
     // sub-agent cap and the number of tasks), so a fan-out is accounted against the global cap at
@@ -473,6 +478,7 @@ pub(crate) async fn run_workflow_collect(
         width,
         Some(parent_id),
         cancel.clone(),
+        context_window,
     )
     .await;
     drop(slots); // explicit: hold the reservation across the whole fan-out, free it here
@@ -527,14 +533,23 @@ pub(crate) async fn run_workflow_collect(
         .as_ref()
         .and_then(|s| s.prompt.as_deref())
         .unwrap_or(default_instruction);
-    let synth_prompt = build_synthesis_prompt(&spec.name, instruction, &results);
+    let synth_prompt = build_synthesis_prompt_capped(
+        &spec.name,
+        instruction,
+        &results,
+        context_window
+            .checked_mul(2)
+            .filter(|&chars| chars >= SUMMARY_CHAR_CAP),
+    );
     wf_track.set_phase(
         crate::agent::orchestration::Phase::Synthesizing,
         format!("via {synth_model}"),
     );
     wf_trace(&format!("⋯ synthesizing ({synth_model})…"));
-    let merged = match crate::core::cancel::race(
+    let synth_deadline = crate::agent::task_tool::subagent_call_timeout();
+    let merged = match await_synthesis(
         &cancel,
+        synth_deadline,
         crate::llm::client::chat_with_tools(
             http,
             base_url,
@@ -546,12 +561,12 @@ pub(crate) async fn run_workflow_collect(
     )
     .await
     {
-        None => {
+        SynthOutcome::Cancelled => {
             wf_track.finish_err("cancelled during synthesis");
             bail!("workflow '{}': cancelled by user", spec.name);
         }
-        Some(Ok(t)) => t.content.unwrap_or_default(),
-        Some(Err(e)) => {
+        SynthOutcome::Merged(text) => text,
+        SynthOutcome::Failed(e) => {
             wf_track.finish_err(format!("synthesis failed: {e}"));
             return Err(e).context("workflow synthesis failed");
         }
@@ -560,6 +575,50 @@ pub(crate) async fn run_workflow_collect(
     out.push_str(merged.trim());
     wf_track.finish_ok("synthesized");
     Ok(out)
+}
+
+/// What the bounded synthesis await produced.
+enum SynthOutcome {
+    /// Esc (or `/workflows stop`) landed while the synthesis call was in flight.
+    Cancelled,
+    /// The merged answer (possibly empty text, which the caller reports as-is).
+    Merged(String),
+    /// The call failed, or its deadline elapsed.
+    Failed(anyhow::Error),
+}
+
+/// Await the synthesis call under BOTH cooperative cancel and a wall-clock deadline.
+///
+/// Every child of a fan-out is time-bounded (see [`crate::agent::task_tool::subagent_call_timeout`]
+/// and `subagent_wall_deadline`), but the synthesis pass that merges their work was bounded only by
+/// cancel — and cancel needs somebody watching. This is the one call in a fan-out with no step budget
+/// and no stall watchdog behind it: it runs on the NON-streaming path, so the streaming inter-event
+/// watchdog never applies, and reqwest's `read_timeout` only fires when the socket goes BYTE-silent,
+/// which a keepalive-warm gateway never does. So a gateway that answers 200 and then drips could park
+/// a fan-out AFTER every child had already finished: all the work done, the slots freed, and no result
+/// — the failure shape that reads as "the workflow just never came back".
+///
+/// A deadline turns that into an ordinary `Err`, which the caller already reports as a failed
+/// synthesis while keeping the per-task status lines it had assembled. Generic over the future so the
+/// deadline is testable without a network call.
+async fn await_synthesis<F>(
+    cancel: &crate::core::cancel::TurnCancel,
+    deadline: std::time::Duration,
+    call: F,
+) -> SynthOutcome
+where
+    F: std::future::Future<Output = Result<crate::llm::client::ChatTurn>>,
+{
+    match crate::core::cancel::race(cancel, tokio::time::timeout(deadline, call)).await {
+        None => SynthOutcome::Cancelled,
+        Some(Ok(Ok(turn))) => SynthOutcome::Merged(turn.content.unwrap_or_default()),
+        Some(Ok(Err(e))) => SynthOutcome::Failed(e),
+        Some(Err(_)) => SynthOutcome::Failed(anyhow!(
+            "synthesis call exceeded {}s with no response (set AIZEN_SUBAGENT_CALL_SECS to raise \
+             the limit)",
+            deadline.as_secs()
+        )),
+    }
 }
 
 /// Run one task as a role-scoped sub-agent (silent; non-streaming). Errors are captured into the
@@ -576,6 +635,7 @@ async fn run_one_task(
     task: &WorkflowTask,
     parent: Option<u64>,
     cancel: crate::core::cancel::TurnCancel,
+    context_window: usize,
 ) -> TaskOutcome {
     // Bail early if cancel already landed before this child was scheduled.
     if cancel.is_cancelled() {
@@ -663,7 +723,7 @@ async fn run_one_task(
             .await
             {
                 Ok(result) => result,
-                Err(_) => Err(anyhow::anyhow!(
+                Err(_) => Err(anyhow!(
                     "model call exceeded {}s with no response (set AIZEN_SUBAGENT_CALL_SECS to \
                      raise the limit)",
                     deadline.as_secs()
@@ -683,12 +743,15 @@ async fn run_one_task(
     let cfg = AgentConfig {
         approval_mode,
         cancel: own_cancel.clone(),
-        // Inherit the parent turn's conversation identity so a workflow child's tool bodies (e.g.
-        // browser) scope to the SAME conversation as the orchestrating turn. `default` on the CLI
-        // `run_workflow` path, which has no conversation thread — matching the pre-context behavior.
-        exec_ctx: crate::core::exec_ctx::current().unwrap_or_default(),
+        // Inherit the parent conversation identity but isolate each child's stateful resources and
+        // keep tool-body heartbeats off the parent transcript. The workflow board owns progress.
+        exec_ctx: crate::core::exec_ctx::current()
+            .unwrap_or_default()
+            .with_resource_scope(format!("workflow/{}/{}", parent.unwrap_or(0), task.id))
+            .with_trace_visible(false),
         quiet: true,
         enable_verify_gate: false,
+        // One soft extension reaches the child's total cap; no second continuation layer.
         max_iters: CHILD_MAX_ITERS,
         auto_extend_to: CHILD_AUTO_EXTEND,
         auto_checkpoint: is_writer,
@@ -701,21 +764,26 @@ async fn run_one_task(
         // Same reason as the `task` tool: a workflow child runs unwatched, and a transient gateway
         // error used to reduce a whole child's work to `status: "error"` in the synthesis input.
         max_transient_retries: CHILD_TRANSIENT_RETRIES,
-        // Unlike the `task` tool, nothing resumes a workflow child — a budget exhaustion here becomes
-        // `status: "max-iters"` in the synthesis input, i.e. partial work presented as a result. Grant
-        // the same in-loop continuation the top level gets, but smaller: children are meant to be
-        // narrow, and N of them run concurrently. Stall recovery stays off — it reads the
-        // process-global todo list, which belongs to the orchestrating turn, not this child.
-        max_continuations: CHILD_CONTINUATIONS,
+        // A workflow child has one total budget; do not present partial work from a multiplied budget.
+        // Stall recovery stays off because it reads the process-global todo list, not ScopedTodo.
+        max_continuations: 0,
         max_stall_recoveries: 0,
+        // The PARENT's resolved window, so tool-result clearing and the wrap-up guard are ON for a
+        // child (the clearing/guard knobs themselves come from `AgentConfig::default()` below, which
+        // already carries the production percentages — they are inert while this is 0).
+        //
+        // A child is intentionally narrow: the one soft extension reaches 30 total steps. Split a
+        // broader request into another workflow call instead of silently multiplying child budgets.
+        context_window,
         // WALL-CLOCK ceiling per child, same knob as a `task` dispatch. It matters MORE here than
         // there: `join_all` below has no per-task timeout, so one child still grinding holds up the
         // whole chunk's synthesis — every sibling can be done and the fan-out still produces nothing.
         // A child that hits the ceiling becomes `status: "deadline"` in the synthesis input, so the
         // rest of the work is reported instead of waiting on the slowest one indefinitely.
         deadline: crate::agent::task_tool::subagent_wall_deadline(),
-        // Sub-agents leave context_window 0 (no tool-result clearing) — workflow children are short.
         // enable_lsp default true is fine; tools only appear if registered in the sub-agent registry.
+        // The clearing knobs themselves come from the defaults below — they are inert while
+        // `context_window` is 0 and become live the moment a real window is threaded in.
         ..AgentConfig::default()
     };
 
@@ -870,22 +938,58 @@ fn write_trace(path: &Path, name: &str, results: &[TaskOutcome], synth_model: &s
 }
 
 /// Build the synthesis prompt from the per-task outcomes (each clearly delimited + labeled).
-/// Long child summaries are hard-capped at [`SUMMARY_CHAR_CAP`] so 5 verbose agents cannot blow
-/// the synth context / $$.
-fn build_synthesis_prompt(name: &str, instruction: &str, results: &[TaskOutcome]) -> String {
+///
+/// [`SUMMARY_CHAR_CAP`] bounds ONE child; `max_chars` bounds the WHOLE request. The two are not
+/// substitutes: the per-summary cap was written for a ≤5-child fan-out, but the tool accepts 32
+/// tasks per call, so 32 verbose children could assemble a ~128k-char synthesis request — larger
+/// than many context windows — while every individual summary sat comfortably under its own cap.
+///
+/// The cap drops WHOLE blocks rather than clipping the last one mid-sentence: a half-summary reads
+/// like a complete finding that happens to end abruptly, which is exactly the shape a synthesis pass
+/// would then state as fact. Dropping the block and SAYING SO keeps the omission visible to the
+/// model. `None` ⇒ no total cap (the CLI runner, which has no resolved window).
+fn build_synthesis_prompt_capped(
+    name: &str,
+    instruction: &str,
+    results: &[TaskOutcome],
+    max_chars: Option<usize>,
+) -> String {
     let mut s =
         format!("You are synthesizing the results of workflow '{name}'.\n\n{instruction}\n\n");
+    let mut omitted: Vec<&str> = Vec::new();
     for r in results {
-        s.push_str(&format!(
+        let block = format!(
             "=== task: {} (role={}, {}) ===\n{}\n\n",
             r.id,
             r.role,
             r.status,
             truncate_summary(r.summary.trim())
+        );
+        // Whole-block admission: a block that doesn't fit is named, not clipped.
+        if let Some(cap) = max_chars {
+            if s.chars().count() + block.chars().count() > cap {
+                omitted.push(r.id.as_str());
+                continue;
+            }
+        }
+        s.push_str(&block);
+    }
+    if !omitted.is_empty() {
+        s.push_str(&format!(
+            "=== omitted for context budget ===\n{} task summar{} left out of this request entirely \
+             (ids: {}). Do NOT infer their content — say the synthesis does not cover them.\n\n",
+            omitted.len(),
+            if omitted.len() == 1 { "y was" } else { "ies were" },
+            omitted.join(", ")
         ));
     }
     s.push_str("=== end of results ===\nProduce the final synthesis now.");
     s
+}
+
+#[cfg(test)]
+fn build_synthesis_prompt(name: &str, instruction: &str, results: &[TaskOutcome]) -> String {
+    build_synthesis_prompt_capped(name, instruction, results, None)
 }
 
 /// Cap a child summary for the synth prompt (char-based; UTF-8 safe via char boundary walk).
@@ -941,8 +1045,8 @@ mod tests {
         assert_eq!(spec.tasks.len(), 2);
         assert_eq!(spec.tasks[0].role, "reviewer");
         assert_eq!(
-            spec.tasks[1].role, "coder",
-            "missing role defaults to coder"
+            spec.tasks[1].role, "reviewer",
+            "missing role defaults to read-only reviewer"
         );
         assert!(spec.synthesis.is_none(), "synthesis is optional");
     }
@@ -976,8 +1080,8 @@ mod tests {
             "agent is optional; defaults to None"
         );
         assert_eq!(
-            spec.tasks[1].role, "coder",
-            "no agent ⇒ role still defaults to coder"
+            spec.tasks[1].role, "reviewer",
+            "no agent + no role defaults to read-only reviewer"
         );
     }
 
@@ -1191,5 +1295,130 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("duplicate task id"));
+    }
+
+    fn outcome(id: &str, summary: &str) -> TaskOutcome {
+        TaskOutcome {
+            id: id.into(),
+            role: "reviewer".into(),
+            model: "m".into(),
+            status: "done".into(),
+            summary: summary.into(),
+            iters: 1,
+        }
+    }
+
+    #[test]
+    fn synthesis_total_cap_drops_whole_blocks_and_names_them() {
+        // The per-summary cap bounds ONE child; this bounds the WHOLE request. A 32-task fan-out of
+        // individually-legal summaries must not assemble a prompt larger than the window.
+        let results: Vec<TaskOutcome> = (1..=10)
+            .map(|i| outcome(&format!("t{i}"), &"x".repeat(1_000)))
+            .collect();
+        let capped = build_synthesis_prompt_capped("big", "merge", &results, Some(3_000));
+        assert!(
+            capped.chars().count() < 4_000,
+            "total cap must bound the request: {} chars",
+            capped.chars().count()
+        );
+        // Whatever DID fit stays intact — the cap never clips a summary mid-sentence, because a
+        // half-finding reads like a complete one and the synthesis would state it as fact.
+        assert!(capped.contains("=== task: t1 (role=reviewer, done) ==="));
+        assert!(
+            capped.contains("omitted for context budget"),
+            "the omission must be visible to the model: {capped}"
+        );
+        assert!(
+            capped.contains("t10"),
+            "omitted ids must be named so the synthesis can disclaim them: {capped}"
+        );
+        // Uncapped (the CLI runner, no resolved window) keeps every block.
+        let full = build_synthesis_prompt_capped("big", "merge", &results, None);
+        assert!(!full.contains("omitted for context budget"));
+        for i in 1..=10 {
+            assert!(full.contains(&format!("=== task: t{i} ")), "block {i} kept");
+        }
+    }
+
+    #[tokio::test]
+    async fn synthesis_deadline_fails_instead_of_parking_the_fan_out() {
+        // A gateway that answers 200 then keepalive-drips has no byte-silence for reqwest's
+        // read_timeout to catch, and the non-streaming path has no inter-event watchdog. Without a
+        // deadline the fan-out would hang AFTER every child finished — all work done, no result.
+        let cancel = crate::core::cancel::TurnCancel::new();
+        let never = std::future::pending::<Result<crate::llm::client::ChatTurn>>();
+        let out = await_synthesis(&cancel, std::time::Duration::from_secs(1), never).await;
+        match out {
+            SynthOutcome::Failed(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("1s"), "names the elapsed budget: {msg}");
+                assert!(
+                    msg.contains("AIZEN_SUBAGENT_CALL_SECS"),
+                    "names the knob that raises it: {msg}"
+                );
+            }
+            SynthOutcome::Cancelled => panic!("a timeout is not a cancel"),
+            SynthOutcome::Merged(_) => panic!("a pending call cannot produce a merge"),
+        }
+    }
+
+    #[tokio::test]
+    async fn synthesis_cancel_is_reported_as_cancel_not_failure() {
+        // Esc during synthesis must stay distinguishable from a deadline/provider error: the caller
+        // bails with "cancelled by user" rather than reporting a failed synthesis.
+        let cancel = crate::core::cancel::TurnCancel::new();
+        cancel.cancel();
+        let never = std::future::pending::<Result<crate::llm::client::ChatTurn>>();
+        assert!(matches!(
+            await_synthesis(&cancel, std::time::Duration::from_secs(30), never).await,
+            SynthOutcome::Cancelled
+        ));
+    }
+
+    #[tokio::test]
+    async fn synthesis_passes_through_a_provider_error() {
+        let cancel = crate::core::cancel::TurnCancel::new();
+        let failing = async { Err::<crate::llm::client::ChatTurn, _>(anyhow!("upstream 500")) };
+        match await_synthesis(&cancel, std::time::Duration::from_secs(30), failing).await {
+            SynthOutcome::Failed(e) => assert!(e.to_string().contains("upstream 500")),
+            _ => panic!("a provider error must surface as a failure"),
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_resolves_paths_against_the_supplied_root_not_the_process_cwd() {
+        // The model-callable `workflow` used to read `current_dir()`, so under `aizen serve` — where
+        // several lanes run concurrently with their OWN roots — a fan-out could read, edit, and
+        // checkpoint the wrong project. The root now arrives from the registry that built the tool.
+        // Proven WITHOUT a network call: an empty-tasks spec bails after the root is resolved, and a
+        // non-existent root would surface here if the path were still taken from the process cwd.
+        let lane_root = std::env::temp_dir().join("aizen-wf-root-probe");
+        std::fs::create_dir_all(&lane_root).expect("probe root");
+        let cwd_before = std::env::current_dir().expect("cwd");
+        let spec = WorkflowSpec {
+            name: "empty".into(),
+            tasks: vec![],
+            synthesis: None,
+        };
+        let http = reqwest::Client::new();
+        let err = run_workflow_collect(
+            &http,
+            "http://localhost",
+            "k",
+            "m",
+            crate::core::approval::ApprovalMode::Ask,
+            &spec,
+            true,
+            &lane_root,
+            200_000,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no tasks"), "{err}");
+        assert_eq!(
+            std::env::current_dir().expect("cwd"),
+            cwd_before,
+            "resolving a lane root must never move the process"
+        );
     }
 }

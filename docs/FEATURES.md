@@ -82,8 +82,7 @@ Every tool is one clear capability. Tools are either **read-only** (run freely, 
 - `file_read` — read a file or a 1-based line range (whole-file budget ~2000 lines / 200 KB, else head+tail preview). *Read-only.*
 - `file_glob` — list files by glob (`src/**/*.rs`); skips `target`/`node_modules`/hidden; capped at 200. *Read-only.*
 - `search_files` — regex content search honoring `.gitignore` (ripgrep's own walker, built in); `path:line: text` output. *Read-only.*
-- `file_edit` — exact-string replace or create; whitespace-tolerant single fallback; shows a before→after diff. *Destructive.*
-- `multi_edit` — an ordered list of edits applied atomically to one file. *Destructive.*
+- `file_edit` — exact-string replace or create; whitespace-tolerant single fallback; shows a before→after diff. Pass `edits[]` instead of `old_string`/`new_string` to apply an ordered list of edits to one file in a single atomic write (all succeed or the file is untouched). *Destructive.*
 
 **Shell & processes:**
 - `shell_run` — run a command, return stdout/stderr + exit code (120s timeout, UTF-8, cwd-confined). *Destructive (gated).*
@@ -104,8 +103,8 @@ Every tool is one clear capability. Tools are either **read-only** (run freely, 
 - `skill_load` / `skill_save` — load/save reusable procedures (only advertised when skills exist).
 - `persona_create` — mint/switch a persona.
 - `notify` — broadcast a status line to configured channels (only when channels exist).
-- `checkpoint` — save a time-machine restore point before a risky change.
-- `checkpoint_rewind` — run-scoped recovery only (`last_good` / `pre_edit`, max 2 per agent run). Free-form `time restore <id>` stays human/CLI.
+- `checkpoint` — the mutating time-machine surface, by `action`: `save` (pin a restore point before a risky change), `rewind` (run-scoped recovery only — `target=last_good|pre_edit`, max 2 per agent run), `restore` (any checkpoint `id`, including one from an earlier turn). Free-form `time restore <id>` also stays available to humans/CLI.
+- `checkpoint_view` — read the timeline without changing anything, by `action`: `diff` (default — what changed between two points, `patch=true` for line level) or `list` (the checkpoint timeline). *Read-only.*
 - **MCP tools** — every connected MCP server's tools appear as `mcp_<server>_<tool>`, destructive-by-default unless the server marks them read-only.
 
 ---
@@ -232,7 +231,7 @@ transport ambiguity.
 
 **Web crawler — `aizen crawl <url…>`** — katana-style BFS: extracts links from HTML and endpoints from JS. Flags: `--depth`, `--max-pages`, `--scope strict|subs`, `--concurrency`, `--timeout`, `--json`, `--show-source`. SSRF floor applies.
 
-**Time machine — `aizen time …`** — crash-recoverable Git snapshots of the current repository's Git-visible tree. Snapshots and metadata live in a **private store under `~/.aizen/timemachine/<repo-id>/`** (bare object store with a sealed alternates pointer into the source repo + per-worktree ledger/journal/chat); the source `.git` is never written by Time Machine. Metadata is fail-closed and atomically persisted behind an OS cross-process lock; internal Git runs disable hooks/fsmonitor/external filters; restore saves a preimage, verifies the resulting tree, and preserves a recovery journal on interruption. Ignored paths, paths outside the repository, nested repositories and unsafe reparse/junction targets are **not silently promised as covered**. Commands: `save [label]`, `list`, `restore <id>`, branch-aware `undo`/`redo`, `prune [--keep N]`, `doctor [--json] [--repair]`, `gc`, `clear`. The agent creates an operation-scoped checkpoint only after approval and blocks a protected edit if that checkpoint fails; after each successful edit it stamps `last_good`. When an approach is cascading-broken, the agent may call **`checkpoint_rewind`** (`target=last_good|pre_edit`, max 2 rewinds per run) — free-form `restore <id>` stays human/CLI. Retention cap `timemachine_keep` (default 50).
+**Time machine — `aizen time …`** — crash-recoverable Git snapshots of the current repository's Git-visible tree. Snapshots and metadata live in a **private store under `~/.aizen/timemachine/<repo-id>/`** (bare object store with a sealed alternates pointer into the source repo + per-worktree ledger/journal/chat); the source `.git` is never written by Time Machine. Metadata is fail-closed and atomically persisted behind an OS cross-process lock; internal Git runs disable hooks/fsmonitor/external filters; restore saves a preimage, verifies the resulting tree, and preserves a recovery journal on interruption. Ignored paths, paths outside the repository, nested repositories and unsafe reparse/junction targets are **not silently promised as covered**. Commands: `save [label]`, `list`, `restore <id>`, branch-aware `undo`/`redo`, `prune [--keep N]`, `doctor [--json] [--repair]`, `gc`, `clear`. The agent creates an operation-scoped checkpoint only after approval and blocks a protected edit if that checkpoint fails; after each successful edit it stamps `last_good`. When an approach is cascading-broken, the agent may call **`checkpoint` with `action=rewind`** (`target=last_good|pre_edit`, max 2 rewinds per run); `action=restore` reaches any id, and free-form `restore <id>` also stays available to the human/CLI. Retention cap `timemachine_keep` (default 50).
 
 **Scheduled jobs — `aizen cron …`** — register agent tasks with the **OS scheduler** (Windows Task Scheduler / Unix crontab) — no daemon. `add <name> --schedule <daily@HH:MM|hourly|Nm|Nh> --task "…"`, `list`, `remove`. Runs unattended (`auto_approve`, hard floor still applies), pins the model at creation, logs each run to `~/.aizen/cron/<name>.log`.
 

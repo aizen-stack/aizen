@@ -99,22 +99,22 @@ pub fn classify_tool(name: &str) -> Option<&'static str> {
     match name {
         "memory_search" | "memory_list" | "memory_profile" | "memory_ask" | "memory_save"
         | "memory_update" | "memory_forget" => Some("memory"),
-        "file_read" | "file_glob" | "search_files" | "file_edit" | "multi_edit" | "file_write"
-        | "file_move" => Some("file"),
+        "file_read" | "file_glob" | "search_files" | "file_edit" | "file_write" | "file_move" => {
+            Some("file")
+        }
         "shell_run" | "process" => Some("terminal"),
         "web_search" | "web_fetch" | "web_crawl" => Some("web"),
-        "skill_load" | "skill_save" | "skill_refine" | "skill_search" | "skill_install" => {
-            Some("skills")
-        }
-        "task" | "workflow" => Some("delegation"),
-        "todo_write" => Some("todo"),
+        "skill_load" | "skill_save" | "skill_refine" | "skill_forget" | "skill_search"
+        | "skill_install" => Some("skills"),
+        "task" | "workflow" | "team_status" => Some("delegation"),
+        "todo_write" | "goal_complete" => Some("todo"),
         "clarify" => Some("clarify"),
-        "checkpoint" | "checkpoint_rewind" | "checkpoint_list" | "checkpoint_restore"
-        | "checkpoint_diff" => Some("checkpoint"),
-        "telegram_send" | "telegram_ask" | "notify" => Some("messaging"),
+        "checkpoint" | "checkpoint_view" => Some("checkpoint"),
+        "telegram_send" | "telegram_ask" | "bot_admin" | "notify" => Some("messaging"),
         "persona_create" => Some("persona"),
         "lsp_references"
         | "lsp_definition"
+        | "codebase_search"
         | "read_symbol"
         | "lsp_hover"
         | "lsp_document_symbols"
@@ -160,6 +160,10 @@ pub fn apply_toolset_filter(registry: &mut ToolRegistry) {
 }
 
 /// Human summary for `/tools` and `config show`.
+///
+/// Both surfaces now render the registry themselves (they need per-toolset controls, not a flat
+/// string). Kept as the one-call textual summary.
+#[allow(dead_code)]
 pub fn format_status(registry: &ToolRegistry) -> String {
     let cfg = cli_config::load();
     let names = registry.names();
@@ -269,6 +273,11 @@ mod tests {
         assert_eq!(classify_tool("symbol_replace"), Some("lsp"));
         assert_eq!(classify_tool("symbol_insert"), Some("lsp"));
         assert_eq!(classify_tool("repo_map"), Some("lsp"));
+        assert_eq!(classify_tool("codebase_search"), Some("lsp"));
+        assert_eq!(classify_tool("skill_forget"), Some("skills"));
+        assert_eq!(classify_tool("team_status"), Some("delegation"));
+        assert_eq!(classify_tool("goal_complete"), Some("todo"));
+        assert_eq!(classify_tool("bot_admin"), Some("messaging"));
     }
 
     #[test]

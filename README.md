@@ -72,7 +72,7 @@ That's the whole setup. No env vars, no config file to hand-edit.
 
   ⚙ search_files  "fn parse_config"        3 hits
   ⚙ file_read     src/config.rs            142 lines
-  ⚙ multi_edit    src/config.rs            3 edits
+  ⚙ file_edit     src/config.rs            3 edits
   ⚙ shell_run     cargo test               ✓ 0 failed · 1.18s
                                            verify gate passed
 ```

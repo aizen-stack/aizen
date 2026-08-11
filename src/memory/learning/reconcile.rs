@@ -22,11 +22,35 @@
 //! | 0.55 – 0.80 | [`Verdict::NeedsJudgement`] — review queue, BOTH texts | 0 (queue is a live view) |
 //! | < 0.55 | [`Verdict::New`] — write it | 1 |
 //!
+//! The similarity feeding those bands is the max of three measures — see [`best_match`]. The bands
+//! themselves are unchanged; what changed (2026-08-06) is that a Vietnamese restatement now REACHES
+//! them. Measured beforehand on 360 live facts, zero pairs cleared either threshold while the store
+//! plainly held duplicates, so the bands were tuned against a signal that could not fire.
+//!
 //! A contradiction phrased in different words ("we use npm" vs "switched to pnpm") scores LOW and so
 //! lands in `New`. That is correct here and is why phase 4 exists: resolving it needs enough context
 //! to judge intent, which belongs in a batched off-turn pass, not on this hot path.
+//!
+//! ## The batch pass removes duplicates; before 2026-08-06 it only counted them
+//!
+//! M2a (above) stops a duplicate from being WRITTEN. Nothing removed one already in the store, and
+//! that gap was invisible because the pass reported success either way: measured on the live store,
+//! **246 reconcile passes had produced 227 `confirm` actions and retired exactly 0 rows**, while six
+//! copies of one fact sat in the store having survived every pass. [`Action::Confirm`] named only the
+//! surviving target, so `apply_action` credited it and returned — the redundant half was never
+//! addressed even though [`BatchVerdict::Same`]'s own doc called it redundant.
+//!
+//! `Confirm` now carries the duplicate too, and removing it answers to its own gates
+//! ([`decide_action`]). Two properties make that safe to do automatically:
+//!
+//! - **Nothing is destroyed.** A live duplicate is retired with `supersededBy` (revivable, still in
+//!   `memory as-of`); a queued one moves to `review/.discarded/`. See [`drop_redundant`].
+//! - **A cluster never empties.** Similarity is symmetric, so {a,b,c} yields pairs a→b, b→c, c→a and
+//!   three individually-correct decisions would delete all three. [`guard_against_cycles`] downgrades
+//!   any pair whose target an earlier pair already retired, leaving exactly one survivor.
 
 use crate::memory::bloat::dedup;
+use crate::memory::learning::match_text;
 use crate::memory::path_scope::{self, Tier};
 use crate::memory::score::lexical_score_tokens;
 use crate::memory::store::MemoryEntry;
@@ -69,12 +93,18 @@ pub enum Verdict {
 
 /// The best match for `text` within `pool`, as `(id, similarity)`.
 ///
-/// Similarity is the MAX of two cheap measures rather than either alone, because they fail on
-/// opposite inputs: MinHash-over-shingles catches rewording and word order but is blind to a short
-/// fact (too few shingles to sample), while token overlap handles short facts but is fooled by two
-/// sentences that share vocabulary and mean different things. Taking the max means a hit from either
-/// is enough to stop a duplicate, which is the asymmetry we want — a missed duplicate is a second
-/// row saying the same thing, a false duplicate is a lost fact.
+/// Similarity is the MAX of three cheap measures rather than any alone, because they fail on
+/// different inputs: MinHash-over-shingles catches rewording and word order but is blind to a short
+/// fact (too few shingles to sample); token overlap handles short facts but is fooled by two
+/// sentences that share vocabulary and mean different things; and BOTH are defeated by a restatement
+/// that swaps the words themselves, which is the normal case in Vietnamese
+/// (`người dùng`/`user`/`anh`, `giao tiếp`/`trao đổi`). Taking the max means a hit from any is enough
+/// to stop a duplicate, which is the asymmetry we want — a missed duplicate is a second row saying
+/// the same thing, a false duplicate is a lost fact.
+///
+/// The third measure ([`match_text::match_similarity`]) was added after measuring the live store:
+/// over 360 real facts, the first two produced ZERO pairs above either band while the store visibly
+/// held five copies of one fact. See that module's header for the numbers.
 pub fn best_match(text: &str, pool: &[MemoryEntry]) -> Option<(String, f64)> {
     if pool.is_empty() {
         return None;
@@ -85,7 +115,8 @@ pub fn best_match(text: &str, pool: &[MemoryEntry]) -> Option<(String, f64)> {
     for e in pool {
         let minhash = dedup::similarity(&sig, &dedup::signature(&e.body));
         let lexical = lexical_score_tokens(&toks, &e.tokens);
-        let s = minhash.max(lexical);
+        let normalized = match_text::match_similarity(text, &e.body);
+        let s = minhash.max(lexical).max(normalized);
         if best.as_ref().is_none_or(|(_, bs)| s > *bs) {
             best = Some((e.id.clone(), s));
         }
@@ -118,6 +149,14 @@ pub struct Pair {
     pub similarity: f64,
     /// The target's confirmation count, which decides whether it is protected.
     pub target_confirmations: u32,
+    /// Is the candidate a LIVE fact (as opposed to a review-queue item)? The two are retired by
+    /// different mechanisms — a live row gets `supersededBy`, a queued row moves to `.discarded/` —
+    /// and only the live case can leave the store one row shorter.
+    pub candidate_is_live: bool,
+    /// The candidate's own confirmation count. The redundant side of a `same` pair is *deleted*, so
+    /// it needs the same protection [`PROTECTED_CONFIRMATIONS`] gives the target: a duplicate the
+    /// user has leaned on twice is not something an automatic pass gets to remove unasked.
+    pub candidate_confirmations: u32,
 }
 
 /// What the model said about one pair.
@@ -166,13 +205,30 @@ pub struct Judgement {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// Credit the target and drop the redundant candidate.
-    Confirm { target: String },
+    ///
+    /// `redundant` is the candidate to remove, or `None` when the duplicate has to stay: an
+    /// unprotected duplicate is deleted, a protected or already-claimed one is only counted.
+    /// Splitting it this way keeps the CONFIRM half unconditional (crediting a fact is always safe)
+    /// while the DELETE half answers to its own gate.
+    Confirm {
+        target: String,
+        redundant: Option<Redundant>,
+    },
     /// Rewrite the target's body in place, keeping its id.
     Refine { target: String, body: String },
     /// Write a new fact that retires the target in the same write.
     Supersede { target: String, body: String },
     /// Touch nothing; the pair stays in review. `why` is shown in the dry-run listing.
     Review { target: String, why: &'static str },
+}
+
+/// The duplicate half of a `same` pair, and how to get rid of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Redundant {
+    pub id: String,
+    /// A live row is retired with `supersededBy` (reversible via `memory revive`); a review-queue
+    /// row is moved to `.discarded/` (the queue is that text's only copy, so it is never unlinked).
+    pub live: bool,
 }
 
 impl Action {
@@ -199,11 +255,28 @@ impl Action {
 ///    actually helped someone; a batch pass overruling that on its own authority inverts who is in
 ///    charge. The barrier scales with what is being broken.
 ///
-/// `Same` is exempt from both: confirming a fact adds evidence and destroys nothing.
+/// `Same` is exempt from BOTH, but only for the half that adds evidence. Crediting the target
+/// destroys nothing, so it happens at any confidence. **Removing the duplicate is a delete**, and
+/// answers to the same two gates the destructive verdicts do — which is the whole reason `Confirm`
+/// carries `redundant: Option<_>` instead of a bare id. Measured 2026-08-06 on the live store: 246
+/// reconcile passes had produced 227 `confirm` actions and removed exactly zero rows, because this
+/// branch used to return only the target. Six copies of one fact survived every one of those passes.
+///
+/// The delete is gated on the CANDIDATE's confirmations, not the target's: the candidate is what
+/// disappears. A duplicate the user has confirmed twice is evidence in its own right — probably that
+/// the two texts are not actually the same fact — so it stays and a human decides.
 pub fn decide_action(pair: &Pair, j: &Judgement) -> Action {
     match &j.verdict {
         BatchVerdict::Same => Action::Confirm {
             target: pair.target_id.clone(),
+            // A duplicate is removed only when the pass is sure AND the duplicate carries no
+            // standing of its own. Otherwise the target is still credited and the row survives.
+            redundant: (j.confidence >= APPLY_MIN
+                && pair.candidate_confirmations < PROTECTED_CONFIRMATIONS)
+                .then(|| Redundant {
+                    id: pair.candidate_id.clone(),
+                    live: pair.candidate_is_live,
+                }),
         },
         BatchVerdict::Unsure => Action::Review {
             target: pair.target_id.clone(),
@@ -232,9 +305,43 @@ pub fn decide_action(pair: &Pair, j: &Judgement) -> Action {
     }
 }
 
+/// Second-pass rail: re-decide one action in light of what earlier pairs in the SAME batch already
+/// removed. Pure, so the "a cluster never empties" invariant is testable without a filesystem.
+///
+/// [`decide_action`] judges each pair in isolation, which is right — it has no business knowing the
+/// batch. But duplicate detection is symmetric, so a cluster of three near-identical facts produces
+/// pairs A→B, B→C, C→A, and three isolated-but-correct decisions delete all three. This function is
+/// where the batch gets a say:
+///
+/// - **The candidate is already gone.** Nothing to do; the pair is history.
+/// - **The target is already gone.** The candidate was judged redundant *relative to that target*.
+///   With the target retired, keeping the candidate is no longer redundancy — it may now be the
+///   cluster's only survivor. Downgrade to review and let a human look.
+///
+/// Non-`Confirm` actions pass through: [`Action::Supersede`] writes a replacement in the same
+/// operation, so it cannot empty anything, and `Refine`/`Review` remove nothing.
+fn guard_against_cycles(action: Action, removed: &std::collections::HashSet<String>) -> Action {
+    let Action::Confirm { target, redundant } = action else {
+        return action;
+    };
+    if removed.contains(&target) {
+        return Action::Review {
+            target,
+            why: "its target was just retired — a human decides which survives",
+        };
+    }
+    let redundant = redundant.filter(|r| !removed.contains(&r.id));
+    Action::Confirm { target, redundant }
+}
+
 // ── The same-chain tie-break ─────────────────────────────────────────────
+//
+// Complete and unit-tested, but not yet called from the reconcile pass: nothing feeds it candidate
+// pairs. Kept whole because the rule it encodes (freshness first, then specificity, re-anchor to the
+// common ancestor) is the decision, not the plumbing around it.
 
 /// Which of two place facts on the same inheritance chain survives, and where it re-anchors.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChainWinner {
     pub winner_id: String,
@@ -246,6 +353,7 @@ pub struct ChainWinner {
 
 /// The freshness key for the chain rule: the later of `lastUsed` and `updated`. Dates are
 /// `YYYY-MM-DD`, which sorts chronologically as a plain string.
+#[allow(dead_code)]
 fn freshness(e: &MemoryEntry) -> String {
     let a = e.last_used.as_deref().unwrap_or("");
     let b = e.updated.as_deref().unwrap_or("");
@@ -266,6 +374,7 @@ fn freshness(e: &MemoryEntry) -> String {
 /// facts disagreed about CONTENT, and silently narrowing the winner's scope as a side effect would
 /// change where it applies without saying so. Returns `None` when the pair is not on one chain (or
 /// is not a place pair at all), which is the caller's signal to leave the anchors alone.
+#[allow(dead_code)]
 pub fn resolve_chain(a: &MemoryEntry, b: &MemoryEntry) -> Option<ChainWinner> {
     if a.tier != Tier::Place || b.tier != Tier::Place {
         return None;
@@ -369,6 +478,10 @@ pub fn collect_pairs(candidates: &[MemoryEntry], live: &[MemoryEntry]) -> Vec<Pa
             target_text: t.body.clone(),
             similarity,
             target_confirmations: t.confirmations,
+            // Identity by id, not by path: `live` is the caller's active view, and a candidate that
+            // appears in it IS that row rather than a queued copy of it.
+            candidate_is_live: live.iter().any(|e| e.id == c.id),
+            candidate_confirmations: c.confirmations,
         });
     }
     pairs.sort_by(|a, b| {
@@ -535,12 +648,37 @@ where
         None => return report, // the call failed: nothing judged, nothing written
     };
     let today = crate::memory::bloat::decay::today();
+    // Ids this pass has already removed. Duplicate detection is SYMMETRIC — if A is a restatement
+    // of B, then B is a restatement of A — so one cluster of near-identical facts yields pairs
+    // pointing both ways, and acting on each independently would delete every member and leave the
+    // store with none. Two rules keep at least one survivor per cluster:
+    //
+    //   1. A row already removed is not removed twice.
+    //   2. A pair whose TARGET is gone cannot act. The target is the survivor the candidate was
+    //      judged redundant *against*; once it is retired, "keep the target, drop the candidate" no
+    //      longer describes anything true, so the pair goes to review instead of guessing.
+    //
+    // Rule 2 is what breaks the A→B / B→A cycle: the second pair sees its target already retired.
+    let mut removed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for j in parse_judgements(&raw, capped.len()) {
         let pair = &capped[j.pair];
-        let action = decide_action(pair, &j);
+        let mut action = decide_action(pair, &j);
+        if !dry_run {
+            action = guard_against_cycles(action, &removed);
+        }
         let mut note = String::new();
         if !dry_run {
             note = apply_action(pair, &action, live, session_id, &today);
+            // Only a removal that actually happened counts — a failed rename must not make the next
+            // pair believe the row is gone.
+            if let Action::Confirm {
+                redundant: Some(r), ..
+            } = &action
+            {
+                if !note.contains("failed") {
+                    removed.insert(r.id.clone());
+                }
+            }
         }
         crate::memory::learning::audit::reconcile(
             session_id,
@@ -581,11 +719,24 @@ fn apply_action(
     };
     match action {
         Action::Review { .. } => String::new(),
-        Action::Confirm { .. } => match store::confirm_use(target, today) {
-            Ok(true) => "confirmed".to_string(),
-            Ok(false) => "already confirmed today".to_string(),
-            Err(e) => format!("failed: {e}"),
-        },
+        Action::Confirm { redundant, .. } => {
+            let credited = match store::confirm_use(target, today) {
+                Ok(true) => "confirmed".to_string(),
+                Ok(false) => "already confirmed today".to_string(),
+                Err(e) => return format!("failed: {e}"),
+            };
+            // Credit first, remove second. If the removal fails the store is left with a duplicate
+            // and an accurate confirmation count — the harmless direction. The reverse order could
+            // drop the duplicate and then fail to credit the survivor, losing the only record that
+            // two sessions agreed on the fact.
+            let Some(r) = redundant else {
+                return credited;
+            };
+            match drop_redundant(r, session_id, &target.id) {
+                Ok(where_to) => format!("{credited}; dropped duplicate {} → {where_to}", r.id),
+                Err(e) => format!("{credited}; duplicate {} kept — {e}", r.id),
+            }
+        }
         Action::Refine { body, .. } => match store::refine_in_place(target, body, today) {
             Ok(rev) => format!("previous wording kept as {rev}"),
             Err(e) => format!("failed: {e}"),
@@ -631,6 +782,63 @@ fn apply_action(
             }
         }
     }
+}
+
+/// Remove the redundant half of a `same` pair. Returns where it went, for the report.
+///
+/// Neither branch unlinks anything. The two cases differ because the two stores differ:
+///
+/// - A **live** row is retired with `supersededBy: <survivor>`, exactly as a `contradict` retires a
+///   fact — so `aizen memory revive <id>` undoes it, `memory as-of` still shows it, and the row that
+///   replaced it is named on disk rather than merely implied.
+/// - A **review-queue** row moves to `review/.discarded/`, which is where the queue's own reject path
+///   puts it. The queue is a mid-confidence fact's only copy; `supersededBy` is not available there
+///   because nothing reads frontmatter in `.discarded/`.
+///
+/// Failure is returned, never swallowed: the caller reports "duplicate kept — <why>", because a
+/// silent no-op here is what let 227 confirms remove zero rows.
+fn drop_redundant(r: &Redundant, session_id: &str, survivor: &str) -> anyhow::Result<String> {
+    use crate::memory::store;
+
+    if r.live {
+        let all = store::load_all()?;
+        let entry = all
+            .iter()
+            .find(|e| e.id == r.id)
+            .ok_or_else(|| anyhow::anyhow!("'{}' is no longer in the store", r.id))?;
+        store::mark_superseded(entry, survivor)?;
+        crate::memory::learning::audit::append(crate::memory::learning::audit::AuditEvent {
+            ts: crate::memory::learning::audit::ts_now(),
+            session_id,
+            op: "supersede",
+            old_id: Some(&r.id),
+            new_id: Some(survivor),
+            verdict: Some("same"),
+            ..Default::default()
+        });
+        return Ok(format!("retired behind {survivor} (revive to undo)"));
+    }
+
+    let rdir = crate::core::config::review_dir();
+    let queued = store::load_from(&rdir)?;
+    let item = queued
+        .iter()
+        .find(|e| e.id == r.id)
+        .ok_or_else(|| anyhow::anyhow!("'{}' is no longer in the review queue", r.id))?;
+    let ddir = rdir.join(".discarded");
+    std::fs::create_dir_all(&ddir)?;
+    let dest = crate::memory::bloat::caps::unique_in(&ddir, &item.id);
+    std::fs::rename(&item.path, &dest)?;
+    crate::memory::learning::audit::append(crate::memory::learning::audit::AuditEvent {
+        ts: crate::memory::learning::audit::ts_now(),
+        session_id,
+        op: "review-discard",
+        old_id: Some(&r.id),
+        new_id: Some(survivor),
+        verdict: Some("same"),
+        ..Default::default()
+    });
+    Ok("review/.discarded/".to_string())
 }
 
 #[cfg(test)]
@@ -764,6 +972,8 @@ mod tests {
             target_text: "the project uses npm".into(),
             similarity: 0.6,
             target_confirmations,
+            candidate_is_live: true,
+            candidate_confirmations: 0,
         }
     }
 
@@ -941,6 +1151,337 @@ mod tests {
             .find(|x| x.id == rev)
             .expect("previous wording parked in the archive");
         assert!(old.body.contains("deploys to fly"));
+
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── the duplicate half of a `same` pair actually goes away ───────────
+
+    /// The bug this whole branch exists for. Measured on the live store 2026-08-06: 246 reconcile
+    /// passes, 227 `confirm` actions, **0 rows removed** — because `Confirm` named only the target.
+    /// Six copies of one fact had survived every pass. A confident `same` must now name the
+    /// duplicate, or the pass is decorative.
+    #[test]
+    fn a_confident_same_names_the_duplicate_for_removal() {
+        let p = pair(0);
+        let a = decide_action(&p, &judge(BatchVerdict::Same, 0.9));
+        let Action::Confirm { target, redundant } = a else {
+            panic!("expected Confirm, got {a:?}");
+        };
+        assert_eq!(target, "target", "the survivor is still credited");
+        let r = redundant.expect("the redundant candidate must be named");
+        assert_eq!(r.id, "cand");
+        assert!(r.live, "this fixture's candidate is a live row");
+    }
+
+    /// Removing a row is a delete, so it answers to the same two gates the destructive verdicts do —
+    /// unlike the CONFIRM half, which only ever adds evidence. Both halves are checked here because
+    /// the point is that they diverge: the target keeps getting credited either way.
+    #[test]
+    fn an_unsure_or_confirmed_duplicate_is_kept_but_the_target_is_still_credited() {
+        // Gate 1: below the apply bar. Confirming is safe at any confidence; deleting is not.
+        let low = decide_action(&pair(0), &judge(BatchVerdict::Same, 0.5));
+        match low {
+            Action::Confirm { redundant, .. } => assert!(
+                redundant.is_none(),
+                "a 0.5 guess must not delete a row: {redundant:?}"
+            ),
+            other => panic!("credit must still happen, got {other:?}"),
+        }
+
+        // Gate 2: the CANDIDATE's own confirmations. The candidate is what disappears, so its
+        // standing is what protects it — a duplicate the user leaned on twice is evidence that the
+        // two texts may not be the same fact after all.
+        let mut p = pair(0);
+        p.candidate_confirmations = PROTECTED_CONFIRMATIONS;
+        match decide_action(&p, &judge(BatchVerdict::Same, 0.95)) {
+            Action::Confirm { redundant, .. } => assert!(
+                redundant.is_none(),
+                "a confirmed duplicate is a human's call: {redundant:?}"
+            ),
+            other => panic!("credit must still happen, got {other:?}"),
+        }
+    }
+
+    /// The invariant that makes automatic removal safe at all: **a cluster never empties.**
+    ///
+    /// Duplicate detection is symmetric, so three near-identical facts produce pairs A→B, B→C, C→A.
+    /// Each decision is correct in isolation and deleting all three is catastrophic. The batch-level
+    /// rail downgrades any pair whose target has already been retired.
+    #[test]
+    fn a_symmetric_cluster_never_deletes_its_last_survivor() {
+        let mut removed = std::collections::HashSet::new();
+        let mut survivors: Vec<&str> = vec!["a", "b", "c"];
+
+        // The three pairs a cluster of {a,b,c} yields, in the order the batch would see them.
+        for (cand, targ) in [("a", "b"), ("b", "c"), ("c", "a")] {
+            let p = Pair {
+                candidate_id: cand.into(),
+                target_id: targ.into(),
+                ..pair(0)
+            };
+            let action =
+                guard_against_cycles(decide_action(&p, &judge(BatchVerdict::Same, 0.9)), &removed);
+            if let Action::Confirm {
+                redundant: Some(r), ..
+            } = &action
+            {
+                removed.insert(r.id.clone());
+                survivors.retain(|s| *s != r.id);
+            }
+        }
+
+        assert!(
+            !survivors.is_empty(),
+            "every member of the cluster was deleted — the fact is gone"
+        );
+        assert_eq!(
+            survivors.len(),
+            1,
+            "a duplicate cluster should converge to exactly one row, kept {survivors:?}"
+        );
+    }
+
+    /// The rail's second rule, stated on its own: once the survivor a candidate was judged against
+    /// is gone, "drop the candidate as redundant" no longer describes anything true. It may now be
+    /// the last copy, so a human decides rather than the pass guessing.
+    #[test]
+    fn a_pair_whose_target_was_retired_goes_to_review() {
+        let removed: std::collections::HashSet<String> =
+            ["target".to_string()].into_iter().collect();
+        let action = guard_against_cycles(
+            decide_action(&pair(0), &judge(BatchVerdict::Same, 0.9)),
+            &removed,
+        );
+        match action {
+            Action::Review { why, .. } => assert!(
+                why.contains("retired"),
+                "the reason must say what happened, got {why:?}"
+            ),
+            other => panic!("expected Review once the target is gone, got {other:?}"),
+        }
+    }
+
+    /// A live duplicate is retired the same way a `contradict` retires a fact: `supersededBy` set,
+    /// file kept, `memory revive` able to undo it. **Nothing is unlinked** — the store's whole
+    /// promise is that a model deciding something is obsolete cannot destroy it.
+    #[test]
+    fn dropping_a_live_duplicate_hides_it_reversibly_without_deleting_the_file() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("aizen-dupe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("AIZEN_HOME", &dir);
+
+        let keep =
+            crate::memory::store::add("keep", "", MemoryType::Project, "deploys to fly").unwrap();
+        let dupe =
+            crate::memory::store::add("dupe", "", MemoryType::Project, "the deploy goes to fly")
+                .unwrap();
+
+        let r = Redundant {
+            id: dupe.clone(),
+            live: true,
+        };
+        let note = drop_redundant(&r, "s", &keep).expect("the drop must succeed");
+        assert!(
+            note.contains("revive"),
+            "the note must say it is undoable: {note}"
+        );
+
+        let all = crate::memory::store::load_all().unwrap();
+        let d = all
+            .iter()
+            .find(|e| e.id == dupe)
+            .expect("the FILE must still exist — retiring is not deleting");
+        assert_eq!(
+            d.superseded_by.as_deref(),
+            Some(keep.as_str()),
+            "the survivor must be named on disk, not merely implied"
+        );
+        // The point of the exercise: the active view is one row shorter.
+        let live = crate::memory::bloat::supersede::active(&all);
+        assert!(
+            live.iter().all(|e| e.id != dupe),
+            "the duplicate is still live — 227 confirms removed 0 rows exactly like this"
+        );
+        assert!(
+            live.iter().any(|e| e.id == keep),
+            "the survivor must remain"
+        );
+
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A review-queue duplicate moves to `.discarded/` instead of being retired: the queue is that
+    /// text's only copy, and nothing reads frontmatter in `.discarded/`, so `supersededBy` would be
+    /// a pointer no code follows. Same rule as the queue's own reject path.
+    #[test]
+    fn dropping_a_queued_duplicate_moves_it_aside_rather_than_retiring_it() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("aizen-dupeq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("AIZEN_HOME", &dir);
+
+        let rdir = crate::core::config::review_dir();
+        std::fs::create_dir_all(&rdir).unwrap();
+        let qid = crate::memory::store::add_learned_in(
+            &rdir,
+            &crate::memory::store::LearnedWrite {
+                name: "queued dupe",
+                description: "",
+                mtype: MemoryType::Project,
+                body: "the deploy goes to fly",
+                source: crate::memory::provenance::ProvenanceKind::Inferred,
+                confidence: 0.7,
+                session_id: "s",
+                no_core: false,
+                scope: None,
+                subpath: None,
+                tier: crate::memory::path_scope::Tier::User,
+                anchor: None,
+                device: None,
+                supersedes: None,
+            },
+        )
+        .unwrap();
+
+        let r = Redundant {
+            id: qid.clone(),
+            live: false,
+        };
+        let note = drop_redundant(&r, "s", "keep").expect("the drop must succeed");
+        assert!(note.contains("discarded"), "got {note}");
+
+        assert!(
+            crate::memory::store::load_from(&rdir)
+                .unwrap()
+                .iter()
+                .all(|e| e.id != qid),
+            "the item must leave the live queue"
+        );
+        assert!(
+            rdir.join(".discarded").join(format!("{qid}.md")).is_file(),
+            "the text must survive in .discarded/ — rejecting is not destroying"
+        );
+
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dry run must be exactly that. The CLI's default surface prints what it WOULD do, and a
+    /// preview that quietly retires rows is worse than no preview.
+    #[test]
+    fn a_dry_run_removes_nothing() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("aizen-dry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("AIZEN_HOME", &dir);
+
+        let keep =
+            crate::memory::store::add("keep", "", MemoryType::Project, "deploys to fly").unwrap();
+        let dupe =
+            crate::memory::store::add("dupe", "", MemoryType::Project, "the deploy goes to fly")
+                .unwrap();
+        let all = crate::memory::store::load_all().unwrap();
+
+        let p = Pair {
+            candidate_id: dupe.clone(),
+            target_id: keep.clone(),
+            ..pair(0)
+        };
+        let report = batch_pass(
+            std::slice::from_ref(&p),
+            // The wire shape `parse_judgements` accepts: a `pairs` array, `n` 1-based.
+            |_, _| Some(r#"{"pairs":[{"n":1,"verdict":"same","confidence":0.95}]}"#.to_string()),
+            true, // dry run
+            "s",
+            &all,
+        );
+        assert_eq!(
+            report.applied.len(),
+            1,
+            "the preview must still list the pair"
+        );
+        let after = crate::memory::store::load_all().unwrap();
+        assert!(
+            crate::memory::bloat::supersede::active(&after)
+                .iter()
+                .any(|e| e.id == dupe),
+            "a dry run retired a row"
+        );
+
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end on the APPLY path, which is the only one where the batch-level rail runs: three
+    /// mutually-similar facts, all three symmetric pairs judged `same` in one response. The store
+    /// must end up with exactly one live row — not zero, and not three.
+    ///
+    /// A unit test of `guard_against_cycles` cannot catch a wiring mistake here (forgetting to
+    /// record a removal, or gating the rail on the wrong flag), and a wiring mistake is what would
+    /// silently empty a cluster.
+    #[test]
+    fn applying_a_whole_cluster_leaves_exactly_one_live_row() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("aizen-cluster-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("AIZEN_HOME", &dir);
+
+        let ids: Vec<String> = [
+            "the deploy goes to fly",
+            "deploys to fly",
+            "deployment targets fly",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            crate::memory::store::add(&format!("dep{i}"), "", MemoryType::Project, b).unwrap()
+        })
+        .collect();
+        let all = crate::memory::store::load_all().unwrap();
+
+        // The three pairs a symmetric cluster of {0,1,2} produces.
+        let pairs: Vec<Pair> = [(0, 1), (1, 2), (2, 0)]
+            .iter()
+            .map(|(c, t)| Pair {
+                candidate_id: ids[*c].clone(),
+                target_id: ids[*t].clone(),
+                ..pair(0)
+            })
+            .collect();
+        let response = r#"{"pairs":[
+            {"n":1,"verdict":"same","confidence":0.95},
+            {"n":2,"verdict":"same","confidence":0.95},
+            {"n":3,"verdict":"same","confidence":0.95}]}"#;
+
+        let report = batch_pass(&pairs, |_, _| Some(response.to_string()), false, "s", &all);
+        assert_eq!(report.pairs_judged, 3);
+
+        let after = crate::memory::store::load_all().unwrap();
+        let live = crate::memory::bloat::supersede::active(&after);
+        assert_eq!(
+            live.len(),
+            1,
+            "a duplicate cluster must converge to one row, got {:?}",
+            live.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+        // Nothing was destroyed: all three files are still on disk, two of them retired.
+        assert_eq!(after.len(), 3, "retiring is not deleting");
 
         std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);

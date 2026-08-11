@@ -49,15 +49,34 @@ pub struct ApprovalRoute {
 
 /// Immutable per-turn identity. Cheap to clone (one `Arc` bump); shared by a top-level turn and every
 /// delegated sub-agent that inherits it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Inner {
     /// The conversation this turn serves — a REPL session slug, or a `serve`
     /// `platform:route:chat` triple. Scopes per-conversation resources (the browser session).
     conversation: Option<ConversationId>,
+    /// One concrete agent/tool-execution scope within a conversation. Top-level turns inherit the
+    /// conversation id; each delegated child derives its own id so stateful tools such as `process`
+    /// cannot list/read/kill a sibling's handles.
+    resource_scope: Option<String>,
+    /// Whether tool bodies may emit progress lines into the parent transcript. Delegated children run
+    /// quiet and publish progress through the orchestration board instead.
+    trace_visible: bool,
     /// Persona this turn speaks as, layered over the global `config.persona`. `None` ⇒ the global one.
     persona: Option<String>,
     /// Where an approval prompt goes this turn. `None` ⇒ the platform's process-global fallback.
     approval_route: Option<ApprovalRoute>,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            conversation: None,
+            resource_scope: None,
+            trace_visible: true,
+            persona: None,
+            approval_route: None,
+        }
+    }
 }
 
 /// Cloneable handle to one turn's execution context. Threaded through [`crate::agent::AgentConfig`]
@@ -69,14 +88,15 @@ impl ExecutionContext {
     /// Build a context for a turn serving `conversation`.
     pub fn new(conversation: ConversationId) -> Self {
         Self(Arc::new(Inner {
+            resource_scope: Some(conversation.to_string()),
             conversation: Some(conversation),
+            trace_visible: true,
             ..Inner::default()
         }))
     }
 
-    /// The conversation this turn serves. Read by `convo::active()`, which the browser session
-    /// registry consults — hence the same `cfg` gate that module carries.
-    #[cfg(any(feature = "browser", test))]
+    /// The conversation this turn serves. Read by `convo::active()` inside tool bodies.
+    #[cfg_attr(not(any(feature = "browser", test)), allow(dead_code))]
     pub fn conversation(&self) -> ConversationId {
         self.0
             .conversation
@@ -93,11 +113,36 @@ impl ExecutionContext {
     fn with(&self, f: impl FnOnce(&mut Inner)) -> Self {
         let mut next = Inner {
             conversation: self.0.conversation.clone(),
+            resource_scope: self.0.resource_scope.clone(),
+            trace_visible: self.0.trace_visible,
             persona: self.0.persona.clone(),
             approval_route: self.0.approval_route.clone(),
         };
         f(&mut next);
         Self(Arc::new(next))
+    }
+
+    /// Give a delegated child an isolated resource namespace. The caller supplies a stable label for
+    /// the dispatch lifetime; no process-global counter or provider-visible value is required.
+    pub fn with_resource_scope(&self, scope: impl Into<String>) -> Self {
+        let scope = scope.into();
+        self.with(|i| i.resource_scope = Some(scope))
+    }
+    /// Resource namespace visible to stateful tool bodies.
+    pub fn resource_scope(&self) -> String {
+        self.0
+            .resource_scope
+            .clone()
+            .or_else(|| self.0.conversation.as_ref().map(ToString::to_string))
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// Control whether a tool body may append progress to the parent transcript.
+    pub fn with_trace_visible(&self, visible: bool) -> Self {
+        self.with(|i| i.trace_visible = visible)
+    }
+    pub fn trace_visible(&self) -> bool {
+        self.0.trace_visible
     }
 
     /// Pin the persona this turn speaks as (`None` ⇒ fall back to the global `config.persona`).
@@ -207,6 +252,21 @@ mod tests {
         let ctx = ExecutionContext::new(ConversationId::new("repl:main"));
         assert_eq!(ctx.persona(), None);
         assert_eq!(ctx.approval_route(), None);
+        assert_eq!(ctx.resource_scope(), "repl:main");
+        assert!(ctx.trace_visible());
+    }
+
+    #[test]
+    fn delegated_scope_and_trace_visibility_are_isolated() {
+        let parent = ExecutionContext::new(ConversationId::new("repl:main"));
+        let child = parent
+            .with_resource_scope("repl:main/task/7")
+            .with_trace_visible(false);
+        assert_eq!(parent.resource_scope(), "repl:main");
+        assert!(parent.trace_visible());
+        assert_eq!(child.resource_scope(), "repl:main/task/7");
+        assert!(!child.trace_visible());
+        assert_eq!(child.conversation().as_str(), "repl:main");
     }
 
     #[test]

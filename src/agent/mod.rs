@@ -25,6 +25,7 @@ pub mod mcp_oauth;
 pub mod orchestration;
 pub mod process;
 pub mod project_context;
+pub mod query_lang;
 pub mod reach;
 pub mod repo_map;
 pub mod search;
@@ -147,6 +148,9 @@ impl PromptBundle {
         }
     }
 
+    /// Whether both prompt lanes are blank. Part of the bundle's read API; callers currently check the
+    /// lanes they care about directly.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.stable.trim().is_empty() && self.dynamic.trim().is_empty()
     }
@@ -227,18 +231,77 @@ pub fn build_system_prompt_bundle(
     PromptBundle { stable, dynamic }
 }
 
-/// The SLIM sub-agent base: static base (tiered) + `<environment>` + `<skills>` — deliberately NO
-/// soul / persona / self / user_memory (a focused sub-agent pays no identity-costume tax: up to
-/// ~1.1K tokens saved per spawn, and personal facts never leak into task context) and NO
-/// `<agents>` / auto `<project_context>` (top-level-only concerns). `include_project_context`
-/// opts a role in explicitly — build/test conventions are exactly what coder/tester need.
+/// The generic (role-less) sub-agent base, kept for tests and any caller with no role to scope by.
+/// Production dispatches go through [`build_role_scoped_subagent_base_prompt`] with the resolved
+/// role, which is the documented shape.
+#[cfg(test)]
+pub fn build_subagent_base_prompt(
+    cwd: &str,
+    os: &str,
+    date: &str,
+    model: &str,
+    include_project_context: bool,
+    task: Option<&str>,
+) -> String {
+    build_role_scoped_subagent_base_prompt(
+        "assistant",
+        cwd,
+        os,
+        date,
+        model,
+        include_project_context,
+        task,
+    )
+}
+
+/// Swap the top-level tool CATALOG for the capability family this role actually holds.
+///
+/// The catalog earns its ~7.3 KB at the top level: it is written once into a prefix the provider
+/// cache amortizes across a whole session, and the interactive model really can reach every tool in
+/// it. Neither is true of a child. Every dispatch is a fresh uncached request, so the catalog is
+/// re-billed per spawn — and a `reviewer` holds a read-only registry, so most of what the catalog
+/// describes (edit/write/shell/checkpoint/delegation/browser) is advice it cannot act on. Describing
+/// tools a child does not have is worse than silent: it invites a call that can only come back as
+/// "unknown tool".
+///
+/// The per-tool `ToolDef` descriptions still ride on the request, so selection guidance is not lost —
+/// only the duplicate prose. The `# Memory (your edge)` heading is the stable end marker; if either
+/// marker ever moves, the strip silently no-ops and the child simply keeps the old (larger) prompt,
+/// which is the safe direction to fail.
+fn append_role_tool_guidance(s: &mut String, role: &str) {
+    // The full top-level catalog is valuable once, in the interactive loop, but every child is a
+    // fresh uncached request. Remove it for the child path and replace it with the capability family
+    // the role can use; the ToolDef descriptions remain on the request itself.
+    if let (Some(start), Some(end)) = (s.find("# Tool catalog"), s.find("# Memory (your edge)")) {
+        if start < end {
+            s.replace_range(start..end, "");
+        }
+    }
+    s.push_str("\n\n# Available tools in this role\n");
+    match role {
+        "coder" => s.push_str("read/glob/search, LSP navigation and symbolic edits, file edits/writes/moves, shell, memory, web, skills\n"),
+        "tester" => s.push_str("read/glob/search, LSP navigation, shell, memory, web\n"),
+        "planner" | "reviewer" => s.push_str("read/glob/search, LSP navigation, memory, web\n"),
+        _ => s.push_str("read/glob/search, memory, web\n"),
+    }
+    s.push_str("Use only tools actually advertised in this request.\n");
+}
+
+/// The SLIM sub-agent base: static base (tiered, with the top-level catalog swapped for this role's
+/// capability family) + `<environment>` + `<skills>` — deliberately NO soul / persona / self /
+/// user_memory (a focused sub-agent pays no identity-costume tax: up to ~1.1K tokens saved per spawn,
+/// and personal facts never leak into task context) and NO `<agents>` / auto `<project_context>`
+/// (top-level-only concerns). `include_project_context` opts a role in explicitly — build/test
+/// conventions are exactly what coder/tester need.
 ///
 /// `task` is the sub-agent's assignment, when the caller has it. A sub-agent is spawned for ONE
 /// stated job, and unlike the REPL it gets no cached prefix to amortize a broad index across turns —
 /// every spawn re-bills the whole prompt. So when the task is known, the index is narrowed to the
 /// procedures that actually cover it ([`crate::skills::gated_index`]); `None` keeps the full
-/// applicable list, which is the right default when there is nothing to narrow against.
-pub fn build_subagent_base_prompt(
+/// applicable list, which is the right default when there is nothing to narrow against. The same
+/// no-cache-to-amortize logic is why [`append_role_tool_guidance`] trims the catalog here.
+pub(crate) fn build_role_scoped_subagent_base_prompt(
+    role: &str,
     cwd: &str,
     os: &str,
     date: &str,
@@ -254,7 +317,8 @@ pub fn build_subagent_base_prompt(
         PromptTier::Full => system_base(),
     };
     let mut s = String::from(base.trim_end());
-    s.push_str("\n\n<environment>\n");
+    append_role_tool_guidance(&mut s, role);
+    s.push_str("\n<environment>\n");
     s.push_str(&format!(
         "cwd: {cwd}\nos: {os}\ndate: {date}\nmodel: {model}\n"
     ));
@@ -422,11 +486,14 @@ pub struct AgentConfig {
     /// the whole session's edits are rewindable (W15). Best-effort (no-op outside a git repo).
     /// Default `true`; tests set it `false` (their cwd is a real repo — no checkpoint pollution).
     pub auto_checkpoint: bool,
-    /// Stamp a time-machine checkpoint AFTER every turn that successfully edited files (Cline-style
-    /// per-step snapshots), so each editing step is an independent restore point — not just the one
-    /// pre-run snapshot from `auto_checkpoint`. Best-effort + dedup'd (a zero-diff tree reuses the
-    /// last snapshot), so quiet turns cost nothing. Requires `auto_checkpoint`; default `true`,
-    /// forced `false` in tests (their cwd is a real repo).
+    /// Stamp a time-machine checkpoint at each PHASE boundary (a todo reaching `done` / focus moving
+    /// to a new `in_progress` item, or a clean verify gate after edits) rather than after every edit
+    /// turn — so a run of N edits inside one phase yields ONE meaningful restore point, not N noise
+    /// snapshots. `note_last_good` is set at that mark, so `checkpoint action=rewind target=last_good` lands
+    /// at the last CLEAN phase. Best-effort + dedup'd (a zero-diff tree reuses the last snapshot), so
+    /// a phase that only ran a build costs nothing. Requires `auto_checkpoint`; default `true`,
+    /// forced `false` in tests (their cwd is a real repo). Field name kept for wire/back-compat; only
+    /// the firing CONDITION changed.
     pub checkpoint_each_edit: bool,
     /// The model's context window in tokens, for the mid-loop context guard. A single run-away
     /// loop (reading many large files) can blow past the window BEFORE control returns to the
@@ -477,6 +544,13 @@ pub struct AgentConfig {
     /// server). Default ON: tools register and servers spawn lazily on first symbol query (no
     /// process until needed). Set false / `/lsp off` to reclaim RAM and hide the tools. Sub-agents
     /// and workflows keep a separate slim registry (no LSP tools).
+    ///
+    /// Never read: the real gate is the process-wide `lsp::LSP.is_enabled()`, which tool registration
+    /// and every LSP call site consult directly. Each site that sets this field copies it *from* that
+    /// same flag, so it is a mirror rather than a forgotten switch — a reader here would be a second
+    /// source of truth, which is what the global exists to avoid. Kept so `AgentConfig` still
+    /// documents the subsystem's on/off state for anything that inspects a config.
+    #[allow(dead_code)]
     pub enable_lsp: bool,
     /// Per-request wall-clock cap (seconds) for an LSP query, so a hung server can never block the
     /// agent turn. Mirrors Helix's 20s default.
@@ -656,8 +730,7 @@ pub enum StopReason {
     Cancelled,
     /// [`AgentConfig::deadline`] elapsed. Distinct from `Cancelled` (nobody pressed anything — saying
     /// "cancelled by user" would send the user looking for a keypress that never happened) and from
-    /// `MaxIters` (which `task_tool::is_resumable` grants a fresh budget for; a deadline that earned
-    /// continuations would not be a deadline). Never resumable.
+    /// `MaxIters` (a step-budget stop). Never automatically resumed.
     Deadline,
 }
 
@@ -833,6 +906,22 @@ where
     // pre-edit checkpoint already discovers via `target_dir`; the gate must not lag behind it. `None`
     // (no path named, or the edit was `shell_run`) keeps the cwd-relative fallback.
     let mut last_edit_dir: Option<std::path::PathBuf> = None;
+    // PRE-EDIT VERIFY BASELINE: captured on demand just before the first workspace mutation so the
+    // gate can distinguish pre-existing compiler errors from regressions introduced by this run.
+    // `None` = not yet captured; `Some` = immutable for the lifetime of the run.
+    let mut verify_baseline: Option<verify_gate::VerifyBaseline> = None;
+    // PHASE CHECKPOINT STATE (replaces the old per-edit-turn checkpoint). A "phase" is a unit of work
+    // the model marks in its todo list; the timeline stamps ONE checkpoint when a phase closes, not
+    // one per edit. `phase_todos_before` is the todo snapshot at the TOP of the current turn — compared
+    // against the post-turn snapshot to detect a boundary (see `todo::phase_boundary_crossed`).
+    // `made_edits_in_phase` gates the checkpoint so an all-talk phase (todo flipped with no file
+    // change) does not stamp one; it resets to false the moment a phase is stamped, so the next
+    // stamp trigger cannot double-fire on the same work. `phase_counter` supplies a fallback label
+    // for the no-todo path: a model that never calls `todo_write` closes no todo phases, so its only
+    // boundary is the verify gate coming back clean — that stamp needs a name too.
+    let mut phase_todos_before: Vec<crate::agent::todo::Todo> = crate::agent::todo::snapshot();
+    let mut made_edits_in_phase = false;
+    let mut phase_counter = 0usize;
     // Operation-scoped checkpoint latch: set only after a pre-edit checkpoint succeeds. Approval is
     // evaluated first; a declined call must never run Git hooks/filters or mutate recovery metadata.
     let mut auto_checkpointed = false;
@@ -1299,18 +1388,58 @@ where
             // EMPTY-200 (a 200 with neither content nor a tool call) is retried on the SAME budget:
             // it is the same silent-provider-failure goal mode already guards against, and outside
             // goal mode it used to feed an empty turn straight into the done cascade — the model
-            // going quiet mid-task and the loop reporting an empty "Done". Bounded (not indefinite
-            // like goal mode) because someone is watching; if it survives the budget it falls
-            // through, unchanged.
+            // going quiet mid-task and the loop reporting an empty "Done".
+            //
+            // Three properties this branch must hold, each learned from a real failure:
+            //
+            // 1. A SPENT BUDGET IS AN ERROR, NOT A `Done`. Falling through with the empty turn let it
+            //    reach the done cascade, so a provider that never spoke was reported as a finished
+            //    run: `StopReason::Done`, empty `final_text`, and — for a delegated dispatch —
+            //    "(sub-agent produced no final answer)" under a `done` header. The caller could not
+            //    tell success from silence. `Err` is what every caller already handles correctly.
+            // 2. RETRIES MUST NOT BE IDENTICAL. The first retry re-sent the byte-identical request, so
+            //    a provider that answered it with silence usually answered again with silence — the
+            //    observed "many empty responses in a row". After the first retry also comes back
+            //    empty, a `user` re-prompt is appended so each further attempt asks something new.
+            //    It stays in history when a retry finally lands (it is a legitimate turn the answer
+            //    responds to) and is rolled back, LIFO, on every early return.
+            // 3. AN UNWATCHED LOOP WAITS PATIENTLY. `interactive_backoff_ms` (cap 4s) is sized so a
+            //    person does not read the pause as a hang. A delegated sub-agent (`quiet`) has nobody
+            //    watching and a gateway that is shedding load needs longer than 4s, so it uses the
+            //    patient `goal_backoff_ms` (cap 30s) instead.
+            const EMPTY_RETRY_NUDGE: &str = "[recover] Your previous response arrived EMPTY — no \
+                text and no tool call. That is a transport-level failure, not an instruction to stop. \
+                Do not apologize, re-plan, or restart: continue from exactly where the task stood. If \
+                the next step is a tool call, make it; otherwise write the result.";
+
+            /// Undo everything this turn appended, innermost first: the empty-200 re-prompts sit ON
+            /// TOP of the pre-loop nudge, so they must come off before it.
+            fn rollback(messages: &mut Vec<Message>, empty_nudges: usize, nudge_pushed: bool) {
+                for _ in 0..empty_nudges {
+                    messages.pop();
+                }
+                if nudge_pushed {
+                    messages.pop();
+                }
+            }
+
+            // Property 3: patient when unwatched, snappy when watched.
+            let backoff = |a: u32| {
+                if cfg.quiet {
+                    crate::llm::client::goal_backoff_ms(a)
+                } else {
+                    crate::llm::client::interactive_backoff_ms(a)
+                }
+            };
+
             let mut attempt: u32 = 0;
+            let mut empty_nudges: usize = 0;
             loop {
                 match crate::core::cancel::race(&cfg.cancel, chat(messages.clone(), defs.clone()))
                     .await
                 {
                     None => {
-                        if nudge_pushed {
-                            messages.pop();
-                        }
+                        rollback(messages, empty_nudges, nudge_pushed);
                         return Ok(AgentOutcome {
                             final_text: None,
                             iters: iter,
@@ -1323,36 +1452,48 @@ where
                                 .as_deref()
                                 .map(|s| s.trim().is_empty())
                                 .unwrap_or(true);
-                        if empty_200 && (attempt as usize) < cfg.max_transient_retries {
-                            // INTERACTIVE backoff (fast, cap 4s), not `goal_backoff_ms` (cap 30s):
-                            // someone is watching this turn, so a whole ~10-retry chain must stay
-                            // inside ~30–40s total rather than let one late attempt stall 30s. Goal
-                            // mode's branch above keeps the slow-but-patient backoff on purpose.
-                            let delay = crate::llm::client::interactive_backoff_ms(attempt);
-                            attempt += 1;
-                            if !cfg.quiet {
-                                retry_line(
-                                    "empty",
-                                    &format!(
-                                        "empty response; retry {attempt}/{}",
-                                        cfg.max_transient_retries
-                                    ),
-                                    delay,
-                                );
-                            }
-                            if goal_sleep_or_cancel(&cfg.cancel, delay).await {
-                                if nudge_pushed {
-                                    messages.pop();
-                                }
-                                return Ok(AgentOutcome {
-                                    final_text: None,
-                                    iters: iter,
-                                    stop: StopReason::Cancelled,
-                                });
-                            }
-                            continue;
+                        if !empty_200 {
+                            break t;
                         }
-                        break t;
+                        // Property 1: the budget is spent and the provider still has not spoken.
+                        // Report that as the failure it is — never as a finished run.
+                        if attempt as usize >= cfg.max_transient_retries {
+                            rollback(messages, empty_nudges, nudge_pushed);
+                            return Err(anyhow::anyhow!(
+                                "provider returned {} empty response(s) in a row (HTTP 200 with no \
+                                 text and no tool call) — the model never answered this turn",
+                                attempt + 1
+                            ));
+                        }
+                        let delay = backoff(attempt);
+                        attempt += 1;
+                        if !cfg.quiet {
+                            retry_line(
+                                "empty",
+                                &format!(
+                                    "empty response; retry {attempt}/{}",
+                                    cfg.max_transient_retries
+                                ),
+                                delay,
+                            );
+                        }
+                        if goal_sleep_or_cancel(&cfg.cancel, delay).await {
+                            rollback(messages, empty_nudges, nudge_pushed);
+                            return Ok(AgentOutcome {
+                                final_text: None,
+                                iters: iter,
+                                stop: StopReason::Cancelled,
+                            });
+                        }
+                        // Property 2: stop re-sending the byte-identical request. The FIRST retry
+                        // repeats it unchanged (a one-off blip is the common case and the prompt
+                        // cache stays warm); from the second on, each attempt carries a re-prompt so
+                        // the provider is being asked something new.
+                        if attempt >= 2 && empty_nudges == 0 {
+                            messages.push(Message::user(EMPTY_RETRY_NUDGE));
+                            empty_nudges += 1;
+                        }
+                        continue;
                     }
                     Some(Err(e)) => {
                         let transient = matches!(
@@ -1360,14 +1501,10 @@ where
                             crate::llm::client::ApiErrorKind::Transient
                         );
                         if !transient || attempt as usize >= cfg.max_transient_retries {
-                            if nudge_pushed {
-                                messages.pop();
-                            }
+                            rollback(messages, empty_nudges, nudge_pushed);
                             return Err(e);
                         }
-                        // INTERACTIVE backoff here too (see the empty-200 branch above): the ordinary
-                        // path reports to a waiting user, so it retries fast and then fails cleanly.
-                        let delay = crate::llm::client::interactive_backoff_ms(attempt);
+                        let delay = backoff(attempt);
                         attempt += 1;
                         if !cfg.quiet {
                             retry_line(
@@ -1380,9 +1517,7 @@ where
                             );
                         }
                         if goal_sleep_or_cancel(&cfg.cancel, delay).await {
-                            if nudge_pushed {
-                                messages.pop();
-                            }
+                            rollback(messages, empty_nudges, nudge_pushed);
                             return Ok(AgentOutcome {
                                 final_text: None,
                                 iters: iter,
@@ -1469,7 +1604,6 @@ where
                 {
                     if !cfg.quiet {
                         if result.passed {
-                            // The mockup's green success line — `✓ <cmd> — verify gate passed`.
                             crate::ui::tui::verify_line(&result.command, "verify gate passed");
                         } else {
                             let line = format!(
@@ -1485,7 +1619,25 @@ where
                             }
                         }
                     }
-                    if !result.passed {
+                    // Compare against pre-edit baseline if available; otherwise use raw pass/fail.
+                    let (gate_passed, failure_msg_body) = if let Some(baseline) = &verify_baseline {
+                        let delta = verify_gate::compare_to_baseline(baseline, &result);
+                        if delta.passed {
+                            if let Some(note) = &delta.note {
+                                if !cfg.quiet {
+                                    crate::ui::tui::verify_line(&result.command, note.as_str());
+                                }
+                            }
+                            (true, String::new())
+                        } else if delta.new_diagnostics.is_empty() {
+                            (false, verify_gate::format_gate_failure(&result))
+                        } else {
+                            (false, verify_gate::format_delta_failure(&result, &delta))
+                        }
+                    } else {
+                        (result.passed, verify_gate::format_gate_failure(&result))
+                    };
+                    if !gate_passed {
                         verify_attempts += 1;
                         // GOAL MODE: a failed verify invalidates any completion claim the model made
                         // this turn — clear it so the stale claim can't leak through the goal gate to
@@ -1507,13 +1659,41 @@ where
                             images: Vec::new(),
                             cache_control: None,
                         });
-                        messages.push(Message::user(verify_gate::format_gate_failure(&result)));
+                        // Once a phase has spent past half its repair budget, offer the rewind as an
+                        // explicit escape hatch: patching further is often more costly than dropping
+                        // back to the last clean phase mark and re-approaching. Reuses the existing
+                        // `recovery_hint` (respects the rewind budget; empty when none is left) — no
+                        // new state, just surfacing an option the model already has.
+                        let mut failure_msg = failure_msg_body;
+                        if verify_attempts * 2 >= cfg.max_verify_attempts {
+                            if let Some(hint) = crate::features::timemachine::recovery_hint() {
+                                failure_msg.push_str("\n\n");
+                                failure_msg.push_str(&hint);
+                            }
+                        }
+                        messages.push(Message::user(failure_msg));
                         iter += 1;
                         continue;
                     }
                     // PASSED: latch it so a subsequent no-edit "done" doesn't needlessly re-run the
                     // gate (a fresh successful edit clears the latch → new work is re-verified).
                     verify_passed = true;
+                    // A clean verify is the OTHER phase boundary (decision: todo-close AND
+                    // verify-pass both mark phases). This catches the no-todo run — the model edited
+                    // and finished without ever flipping a todo, so `phase_boundary_crossed` never
+                    // fired. Stamp the still-uncheckpointed edits ONCE here as a verified phase.
+                    // Gated on `made_edits_in_phase` so a no-edit "done" (latch already clean) stamps
+                    // nothing; `save` dedups a zero-diff tree so it's free when the last todo boundary
+                    // already captured this exact tree.
+                    if cfg.checkpoint_each_edit && made_edits_in_phase {
+                        phase_counter += 1;
+                        stamp_phase_checkpoint(
+                            cfg.quiet,
+                            &format!("phase {phase_counter} verified"),
+                        );
+                        made_edits_in_phase = false;
+                        phase_todos_before = crate::agent::todo::snapshot();
+                    }
                 }
             }
             if cfg.enable_verify_gate
@@ -1813,6 +1993,32 @@ where
             ));
         }
 
+        // BASELINE CAPTURE: just before the first workspace mutation of this run, capture the
+        // current compiler state. The baseline is immutable; later turns only compare against it.
+        // Run only when the verify gate is armed, a baseline has not yet been taken, and the turn
+        // actually contains a write-capable call (skip for read-only turns to avoid paying the
+        // compiler invocation cost on every model turn).
+        if cfg.enable_verify_gate
+            && verify_baseline.is_none()
+            && calls.iter().any(|tc| {
+                if let Some(t) = registry.get(&tc.function.name) {
+                    let args = parse_call_args(&tc.function.arguments)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    t.workspace_effect(&args).needs_checkpoint() || t.recovery_effect(&args)
+                } else {
+                    false
+                }
+            })
+        {
+            let cwd = cfg.effective_root();
+            let gate_dir = verify_gate::verify_root(&cwd).unwrap_or(cwd);
+            if let Some(result) =
+                verify_gate::run_verify_gate(&gate_dir, cfg.verify_gate_timeout_secs).await
+            {
+                verify_baseline = Some(verify_gate::baseline_from_result(&result));
+            }
+        }
+
         // EXECUTE the call(s): barrier-partitioned — consecutive read-only calls run concurrently
         // (spawn_blocking, raced against Esc); each write/shell call is a barrier executed alone
         // with approval on THIS future. Eager starts from the streaming path are adopted by
@@ -1859,44 +2065,37 @@ where
                     last_edit_dir = Some(dir);
                 }
             }
-            // PER-STEP CHECKPOINT (Cline-style): after each turn whose edits SUCCEEDED, stamp a
-            // restore point so every editing step is independently rewindable — not just the whole
-            // run from the single pre-edit snapshot. Best-effort; `save` dedups a zero-diff tree, so
-            // a turn that only ran (say) a shell build with no file change costs nothing. Runs AFTER
-            // the pre-fill/execute so the snapshot captures the POST-edit tree.
-            if cfg.checkpoint_each_edit {
-                match crate::features::timemachine::save("after agent edit", true) {
-                    Ok(snap) => {
-                        crate::features::timemachine::note_last_good(snap.id);
-                        if !cfg.quiet {
-                            emit_trace(&format!(
-                                "  └ checkpoint #{} (agent: `checkpoint_rewind` target=last_good; human: `aizen time restore {}`)",
-                                snap.id, snap.id
-                            ));
-                        }
-                    }
-                    // No work tree at all is not a failure — it mirrors the pre-edit path, which
-                    // reports "checkpoint unavailable: not a git repository" and moves on. Only a
-                    // REAL failure (dubious ownership, a corrupt store, a locked ref) is worth a
-                    // cry-wolf warning, and it must carry git's own cause (`{e:#}` = full chain),
-                    // not the swallowed top-level context.
-                    Err(e) if e.to_string().contains("not a git repository") => {
-                        if !cfg.quiet {
-                            emit_trace("  └ checkpoint unavailable: not a git repository");
-                        }
-                    }
-                    Err(e) if crate::core::gitx::is_git_missing(&e) => {
-                        if !cfg.quiet {
-                            emit_trace("  └ checkpoint unavailable: git executable not found (edits proceed without checkpoints)");
-                        }
-                    }
-                    Err(e) => {
-                        emit_trace(&format!(
-                            "  └ warning: post-edit checkpoint failed; the latest change may not be independently rewindable: {e:#}"
-                        ));
-                    }
+            // A successful edit belongs to the CURRENT phase. The checkpoint is no longer stamped
+            // here (one-per-edit made the timeline unreadable) — it is deferred to the phase boundary
+            // just below, so a run of N edits inside one phase yields ONE restore point, not N. This
+            // flag gates that stamp: a phase that only talked (todo flipped, no file change) captures
+            // nothing.
+            made_edits_in_phase = true;
+        }
+
+        // PHASE CHECKPOINT (replaces the old per-edit-turn snapshot). A "phase" is a unit of work the
+        // model marks in its todo list; the timeline stamps ONE checkpoint when a phase CLOSES —
+        // an item reaching Done, or focus moving to a new in_progress item (see
+        // `todo::phase_boundary_crossed`) — instead of one per edit. Gated on `made_edits_in_phase`
+        // so an all-talk phase stamps nothing, and `save` dedups a zero-diff tree so a phase that only
+        // ran a build costs nothing either. Behind the same `checkpoint_each_edit` latch as before
+        // (ON in production, OFF in tests / workflow children), and checked OUTSIDE the
+        // `edited_this_turn` block because the closing `todo_write` can land on a turn that itself made
+        // no file edit. `note_last_good` moves to the phase mark here, so `checkpoint_rewind
+        // target=last_good` lands at the last CLEAN phase, not mid-phase.
+        if cfg.checkpoint_each_edit {
+            let phase_todos_after = crate::agent::todo::snapshot();
+            if made_edits_in_phase {
+                if let Some(label) = crate::agent::todo::phase_boundary_crossed(
+                    &phase_todos_before,
+                    &phase_todos_after,
+                ) {
+                    stamp_phase_checkpoint(cfg.quiet, &format!("phase: {label}"));
+                    made_edits_in_phase = false;
                 }
             }
+            // Track the latest list so the next boundary is measured against it, moved or not.
+            phase_todos_before = phase_todos_after;
         }
 
         // EVIDENCE / STALL GUARD: a turn is informative when it adds facts, changes the workspace, or
@@ -2187,22 +2386,18 @@ async fn execute_calls(
     // every tool in the registry is covered by the same repair. Fixes are traced, not silent.
     let parsed: Vec<Result<serde_json::Value, String>> = calls
         .iter()
-        .map(|tc| match parse_call_args(&tc.function.arguments) {
-            Ok(args) => {
-                let Some(tool) = registry.get(&tc.function.name) else {
-                    return Ok(args);
-                };
-                match tools::repair_args(&tool.parameters(), &args) {
-                    Some((fixed, what)) => {
-                        if !cfg.quiet {
+        .map(|tc| match prepare_call_args(registry, tc) {
+            Ok((args, repair)) => {
+                if let Some(what) = repair {
+                    if !cfg.quiet {
+                        if let Some(tool) = registry.get(&tc.function.name) {
                             emit_trace(&format!("→ {}: {what}", tool.name()));
                         }
-                        Ok(fixed)
                     }
-                    None => Ok(args),
                 }
+                Ok(args)
             }
-            other => other,
+            Err(e) => Err(e),
         })
         .collect();
     let safe: Vec<bool> = calls
@@ -2335,8 +2530,10 @@ async fn execute_calls(
                                     effect,
                                     crate::agent::tools::WorkspaceEffect::Paths
                                         | crate::agent::tools::WorkspaceEffect::OpaqueWorkspace
-                                ) || tool.name() == "checkpoint_rewind")
-                            {
+                                ) || crate::features::timemachine::is_rewind_call(
+                                    tool.name(),
+                                    args,
+                                )) {
                                 // The lane's own root, not the process cwd: `serve` runs lanes
                                 // concurrently, so a cwd read here would take the lease on whichever
                                 // directory another lane happened to be working in.
@@ -2362,9 +2559,10 @@ async fn execute_calls(
                             } else {
                                 None
                             };
-                            // `checkpoint_rewind` IS the recovery path — never nest a pre-edit
+                            // `checkpoint` action=rewind IS the recovery path — never nest a pre-edit
                             // snapshot of the broken tree before undoing it.
-                            let skip_pre_checkpoint = tool.name() == "checkpoint_rewind";
+                            let skip_pre_checkpoint =
+                                crate::features::timemachine::is_rewind_call(tool.name(), args);
                             let checkpoint_error = if let Some(error) = lease_error {
                                 Some(error)
                             } else if skip_pre_checkpoint {
@@ -2386,7 +2584,7 @@ async fn execute_calls(
                                 // instead, that same write is an ordinary in-repo edit with full
                                 // rewind coverage. `None` (no path named, e.g. `shell_run`) keeps
                                 // the cwd-relative behavior.
-                                match crate::features::timemachine::save_protected_change_in("before agent edits", target_dir.as_deref()) {
+                                match crate::features::timemachine::save_protected_change_in(crate::features::timemachine::PRE_EDIT_LABEL, target_dir.as_deref()) {
                                     Ok(None) => {
                                         // Two benign shapes, two honest messages: "not a repo" and
                                         // "no git executable" behave the same (checkpoints off, the
@@ -2423,7 +2621,7 @@ async fn execute_calls(
                                         crate::features::coop::note_turn_base(snap.id);
                                         if !cfg.quiet {
                                             emit_trace(&format!(
-                                                "→ checkpoint #{} saved (agent: `checkpoint_rewind` target=pre_edit; human: `aizen time restore {}`)",
+                                                "→ checkpoint #{} saved (agent: `checkpoint` action=rewind target=pre_edit; human: `aizen time restore {}`)",
                                                 snap.id, snap.id
                                             ));
                                         }
@@ -2503,7 +2701,7 @@ fn turn_made_edits(
         // `shell_run` returns Ok("exit N\n…") even when the command FAILED (non-zero exit), so a
         // failed destructive shell op would otherwise arm the gate and let pre-existing breakage be
         // blamed on this turn. Only a clean `exit 0` counts as a real edit. (file_edit/file_write/
-        // multi_edit return Err → "error:" on failure, already excluded above.)
+        // file_edit returns Err → "error:" on failure, already excluded above.)
         if tc.function.name == "shell_run" {
             return result.starts_with("exit 0");
         }
@@ -2541,18 +2739,27 @@ pub fn eager_starter<'a>(
         if tc.function.arguments.trim().is_empty() {
             return None;
         }
-        let ok = parse_call_args(&tc.function.arguments)
-            .ok()
-            .and_then(|args| {
-                let tool = registry.get_arc(&tc.function.name)?;
-                (!tool.is_destructive() && tool.is_concurrency_safe_for(&args))
-                    .then_some((tool, args))
-            });
+        // REPAIR FIRST, then classify. `execute_calls` corrects argument-shape slips before it reads
+        // the arguments at all, so doing it here too is what keeps one call from taking two different
+        // behaviors depending on whether its arguments finished streaming early enough to be eligible
+        // for a head start (`{"message": …}` for a tool that wants `text` used to run repaired on the
+        // normal path and unrepaired here).
+        let ok = prepare_call_args(registry, tc).ok().and_then(|(args, _)| {
+            let tool = registry.get_arc(&tc.function.name)?;
+            (!tool.is_destructive() && tool.is_concurrency_safe_for(&args)).then_some((tool, args))
+        });
         let Some((tool, args)) = ok else {
             // First unsafe/unknown/unparseable call = the barrier: nothing after it starts early.
             barrier_hit.store(true, Relaxed);
             return None;
         };
+        // Still missing a required argument AFTER repair ⇒ the call cannot succeed, and its only
+        // possible output is the instructional schema error. Leave that to `execute_calls`, which
+        // emits it with the normal tool trace, instead of racing to produce the same error quietly.
+        // Not a barrier (the call is malformed, not unsafe), so later calls keep their head start.
+        if !tools::missing_required_strings(&tool.parameters(), &args).is_empty() {
+            return None;
+        }
         if started.fetch_add(1, Relaxed) >= MAX_PARALLEL {
             return None; // over the cap: run normally at execution time
         }
@@ -2572,6 +2779,24 @@ fn parse_call_args(raw: &str) -> Result<serde_json::Value, String> {
         return Ok(serde_json::json!({}));
     }
     serde_json::from_str(raw).map_err(|e| format!("error: invalid JSON arguments: {e}"))
+}
+
+/// Parse and repair one model tool call before any safety classification or execution. The repaired
+/// value is shared by the eager streaming path and the normal executor so a malformed-but-unambiguous
+/// call cannot take two different behaviors depending on whether its arguments finished streaming
+/// early.
+fn prepare_call_args(
+    registry: &ToolRegistry,
+    tc: &ToolCall,
+) -> Result<(serde_json::Value, Option<String>), String> {
+    let args = parse_call_args(&tc.function.arguments)?;
+    let Some(tool) = registry.get(&tc.function.name) else {
+        return Ok((args, None));
+    };
+    match tools::repair_args(&tool.parameters(), &args) {
+        Some((fixed, what)) => Ok((fixed, Some(what))),
+        None => Ok((args, None)),
+    }
 }
 
 /// The safety gate for a BARRIER call: the hard cmd_guard floor, then interactive approval.
@@ -2844,6 +3069,43 @@ pub(crate) fn emit_trace_public(line: &str) {
     emit_trace(line);
 }
 
+/// Stamp ONE time-machine checkpoint at a phase boundary and record it as this run's `last_good`
+/// rewind anchor. Best-effort: the three error shapes match the pre-edit path exactly — no work tree
+/// and a missing git executable are benign (checkpoints are simply off, the run continues), and only
+/// a real store/lock/ownership failure earns a cry-wolf warning carrying git's own cause (`{e:#}`).
+///
+/// Factored out of the loop because the phase mark can fire on a turn that made no edit (the closing
+/// `todo_write` lands alone), so the call site is outside the `edited_this_turn` block. `label` is the
+/// full checkpoint label (e.g. `"phase: wire up auth"`), already prefixed by the caller.
+fn stamp_phase_checkpoint(quiet: bool, label: &str) {
+    match crate::features::timemachine::save(label, true) {
+        Ok(snap) => {
+            crate::features::timemachine::note_last_good(snap.id);
+            if !quiet {
+                emit_trace(&format!(
+                    "  └ checkpoint #{} — {label} (agent: `checkpoint` action=rewind target=last_good; human: `aizen time restore {}`)",
+                    snap.id, snap.id
+                ));
+            }
+        }
+        Err(e) if e.to_string().contains("not a git repository") => {
+            if !quiet {
+                emit_trace("  └ checkpoint unavailable: not a git repository");
+            }
+        }
+        Err(e) if crate::core::gitx::is_git_missing(&e) => {
+            if !quiet {
+                emit_trace("  └ checkpoint unavailable: git executable not found (edits proceed without checkpoints)");
+            }
+        }
+        Err(e) => {
+            emit_trace(&format!(
+                "  └ warning: phase checkpoint failed; this phase's work may not be independently rewindable: {e:#}"
+            ));
+        }
+    }
+}
+
 /// The tool-call anchor icon — the moonlight cog `⚙` (matching the mockup), or empty when icons are
 /// off. Kept plain (no SGR) so the retained/classic renderer tints it as part of the line.
 fn tool_icon() -> &'static str {
@@ -2864,7 +3126,7 @@ fn tool_target(name: &str, args: &serde_json::Value) -> String {
         "shell_run" | "bash" | "powershell" | "shell" => {
             shell_target(field("command").or_else(|| field("cmd")).unwrap_or(""))
         }
-        "file_write" | "write_file" | "file_edit" | "edit_file" | "apply_patch" | "multi_edit"
+        "file_write" | "write_file" | "file_edit" | "edit_file" | "apply_patch"
         | "symbol_replace" | "symbol_insert" => base(
             field("path")
                 .or_else(|| field("file"))
@@ -3044,7 +3306,6 @@ fn is_edit_tool(name: &str) -> bool {
     matches!(
         name,
         "file_edit"
-            | "multi_edit"
             | "edit_file"
             | "apply_patch"
             | "file_write"
@@ -3152,10 +3413,6 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
                 let (a, d) = count_diff(out);
                 (true, format!("{} · +{a} −{d}", edit_target(first)))
             }
-        }
-        "multi_edit" => {
-            let (a, d) = count_diff(out);
-            (true, format!("{} · +{a} −{d}", edit_target(first)))
         }
         "file_write" | "write_file" => {
             // out first line = "created <path> (N line(s))" | "overwrote <path> (N line(s))"
@@ -4369,8 +4626,7 @@ fn tool_action(name: &str, args: &serde_json::Value) -> Option<String> {
             "Write {}",
             base(field("path").or_else(|| field("file")).unwrap_or(""))
         ),
-        "file_edit" | "edit_file" | "apply_patch" | "multi_edit" | "symbol_replace"
-        | "symbol_insert" => {
+        "file_edit" | "edit_file" | "apply_patch" | "symbol_replace" | "symbol_insert" => {
             format!(
                 "Edit {}",
                 base(
@@ -4486,7 +4742,7 @@ fn tool_trace(name: &str, args: &serde_json::Value) -> String {
     let field = |k: &str| args.get(k).and_then(|v| v.as_str());
     let salient = match name {
         "shell_run" | "bash" | "powershell" | "shell" => field("command").or_else(|| field("cmd")),
-        "file_edit" | "multi_edit" | "edit_file" | "file_write" | "write_file" | "apply_patch"
+        "file_edit" | "edit_file" | "file_write" | "write_file" | "apply_patch"
         | "symbol_replace" | "symbol_insert" => field("path")
             .or_else(|| field("file"))
             .or_else(|| field("symbol")),
@@ -6026,16 +6282,17 @@ mod tests {
             !cfg().auto_checkpoint,
             "test cfg must force it OFF to avoid repo pollution"
         );
-        // The per-edit-turn checkpoint (Cline-style: a restore point after EACH editing turn, not
-        // just once before the first) is gated behind the SAME latch, so it also defaults ON in
-        // production and OFF in tests — a per-edit checkpoint would pollute the real test repo.
+        // The phase checkpoint (a restore point when a phase closes — todo done or verify pass —
+        // rather than after each edit) is gated behind the SAME latch, so it also defaults ON in
+        // production and OFF in tests, where a checkpoint would pollute the real test repo. Field
+        // name kept for back-compat; only the firing condition changed.
         assert!(
             AgentConfig::default().checkpoint_each_edit,
-            "per-edit checkpoint default must be ON"
+            "phase checkpoint default must be ON"
         );
         assert!(
             !cfg().checkpoint_each_edit,
-            "test cfg must force per-edit checkpoint OFF"
+            "test cfg must force phase checkpoint OFF"
         );
     }
 
@@ -7264,6 +7521,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eager_starter_repairs_unambiguous_args_before_execution() {
+        let r = registry();
+        let c = cfg();
+        let starter = eager_starter(&r, &c);
+        // The eager path must use the same schema repair as the normal executor. `echo` requires
+        // `text`; a single undeclared string key makes `message` an unambiguous alias.
+        let h = starter(0, &call("1", "echo", r#"{"message":"hello"}"#))
+            .expect("repairable read-only call should start eagerly");
+        assert_eq!(h.await.unwrap(), "hello");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execute_calls_adopts_eager_repaired_result() {
+        let r = registry();
+        let c = cfg();
+        let tc = call("1", "echo", r#"{"message":"hello"}"#);
+        let starter = eager_starter(&r, &c);
+        let h = starter(0, &tc).expect("repairable read-only call should start eagerly");
+        let mut sink = vec![Message::tool_result(
+            tc.id.clone(),
+            INTERRUPTED_TOOL_PLACEHOLDER.to_string(),
+        )];
+        let mut checkpointed = false;
+        let mut writer_lease = None;
+        let results = execute_calls(
+            &r,
+            &[tc],
+            &c,
+            &mut sink,
+            vec![(0, h)],
+            &mut checkpointed,
+            &mut writer_lease,
+        )
+        .await;
+        assert_eq!(results[0].1, "hello");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eager_starter_skips_ambiguous_repair() {
+        let r = registry();
+        let c = cfg();
+        let starter = eager_starter(&r, &c);
+        assert!(
+            starter(0, &call("1", "echo", r#"{"a":"x","b":"y"}"#)).is_none(),
+            "ambiguous args must wait for the normal executor to return an instructional error"
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unrepairable_missing_args_get_a_schema_bearing_error() {
         // Ambiguous (two strays) ⇒ no repair. The error must then TEACH: name the tool, state what it
         // requires, and echo what was sent, so the retry is informed rather than another guess.
@@ -7715,24 +8020,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_mode_empty_200_falls_through_once_budget_is_spent() {
-        // If empty-200s outlast the retry budget, the loop must not spin forever — it falls through
-        // with the empty turn (Done, empty final_text), the pre-fix behavior, so a persistently-broken
-        // provider still terminates rather than hanging.
+    async fn ordinary_mode_empty_200_errors_rather_than_reporting_a_silent_done() {
+        // THE BUG this pins: a spent budget used to FALL THROUGH with the empty turn, which reached
+        // the done cascade and returned `Done` with empty `final_text`. A provider that never spoke
+        // was therefore indistinguishable from a finished run — and for a delegated dispatch it
+        // surfaced as "(sub-agent produced no final answer)" under a `done` header, which is a
+        // failure reporting itself as a success. It must be an `Err`: every caller already handles
+        // that path (the sub-agent one even names the completed tool turns so partial edits are
+        // findable), and the loop still TERMINATES rather than spinning.
         let r = registry();
         let c = AgentConfig {
             quiet: true,
-            max_transient_retries: 1, // one retry, then fall through
+            max_transient_retries: 1, // one retry, then give up
             ..cfg()
         };
         let mut messages = vec![Message::system("sys"), Message::user("task")];
-        // Three empties: initial + 1 retry both empty, budget spent → the 2nd is accepted as-is.
+        // Three empties: initial + 1 retry both empty ⇒ budget spent on the 2nd.
         let chat = scripted(vec![empty_turn(), empty_turn(), empty_turn()]);
-        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        let err = run_agent_loop(chat, &c, &r, &mut messages)
+            .await
+            .expect_err("a persistently silent provider must be an error, never a Done");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("empty"),
+            "the error must name provider silence as the cause, got: {msg}"
+        );
+        // History must be left exactly as it was found: the re-prompt this branch appends is rolled
+        // back on the error path, so a caller that retries the turn does not inherit a stray nudge.
         assert_eq!(
-            out.stop,
-            StopReason::Done,
-            "a persistently empty provider terminates rather than spinning"
+            messages.len(),
+            2,
+            "the empty-200 re-prompt must be rolled back on the error path, got: {messages:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_200_retry_reprompts_instead_of_resending_the_same_request() {
+        // Re-sending the byte-identical request is what produced the observed run of many empty
+        // responses: a provider that answered a request with silence usually answers the same
+        // request with silence again. From the SECOND attempt on, a `user` re-prompt must be
+        // appended so each further attempt asks something the provider has not already refused.
+        // It stays in history when a retry finally lands — it is a legitimate turn the answer
+        // responds to.
+        let r = registry();
+        let c = AgentConfig {
+            quiet: true,
+            max_transient_retries: 4,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        // empty, empty (→ re-prompt appended), then the real answer.
+        let chat = scripted(vec![
+            empty_turn(),
+            empty_turn(),
+            final_turn("recovered answer"),
+        ]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.final_text.as_deref(), Some("recovered answer"));
+        let nudges = messages
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with("[recover]"))
+            })
+            .count();
+        assert_eq!(
+            nudges, 1,
+            "exactly one re-prompt: none on the first retry, one on the second, kept on success"
         );
     }
 
@@ -9348,6 +9705,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn role_scoped_subagent_prompt_drops_top_level_catalog_tax() {
+        // The full-tier base carries the top-level `# Tool catalog`; a sub-agent prompt strips it and
+        // substitutes the role's own capability line. Measure against the RAW base (which still holds
+        // the catalog) — the generic `build_subagent_base_prompt` strips it too, so comparing the two
+        // stripped prompts would only show the role-line delta, not the reclaimed catalog.
+        let raw_base = system_base().trim_end().len();
+        let reviewer = build_role_scoped_subagent_base_prompt(
+            "reviewer",
+            "/w",
+            "linux",
+            "2026-06-20",
+            "m", // Full tier: `m` is not in any strict family / size list
+            false,
+            None,
+        );
+        assert!(
+            system_base().contains("# Tool catalog"),
+            "full base carries the catalog"
+        );
+        assert!(
+            !reviewer.contains("# Tool catalog"),
+            "sub-agent prompt drops it"
+        );
+        assert!(reviewer.contains("# Available tools in this role"));
+        assert!(reviewer.contains("LSP navigation"));
+        assert!(
+            reviewer.len() + 5_000 < raw_base,
+            "role-scoped prompt should reclaim the large catalog: raw_base={raw_base} scoped={}",
+            reviewer.len()
+        );
+    }
     #[test]
     fn top_level_prompt_adds_agents_block_and_keeps_base_prefix() {
         with_agent_sandbox("some", |root| {

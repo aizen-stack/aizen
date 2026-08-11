@@ -61,8 +61,13 @@ const BUILTINS: &[Builtin] = &[
         argument_hint: "",
     },
     Builtin {
+        name: "provider",
+        description: "switch, add, or manage saved endpoint profiles",
+        argument_hint: "[name|add|manage]",
+    },
+    Builtin {
         name: "config",
-        description: "set endpoint, key, and model",
+        description: "set endpoint, key, model, and provider profiles",
         argument_hint: "",
     },
     Builtin {
@@ -132,7 +137,8 @@ const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "team",
-        description: "see other aizen windows in this repo, their files, diffs, and commit their work",
+        description:
+            "see other aizen windows in this repo, their files, diffs, and commit their work",
         argument_hint: "[status|diff <s>|claims|task <text>|done|commit <s>]",
     },
     Builtin {
@@ -507,9 +513,9 @@ pub fn looks_like_name(tok: &str) -> bool {
 fn takes_args(name: &str) -> bool {
     // Hidden aliases mirror the arg-taking behaviour of the command they alias.
     match name {
-        "changes" => return true,          // alias of /diff
+        "changes" => return true,                // alias of /diff
         "worktree" | "worktrees" => return true, // aliases of /work
-        "sessions-live" => return true,    // alias of /team
+        "sessions-live" => return true,          // alias of /team
         _ => {}
     }
     list()
@@ -672,7 +678,10 @@ mod tests {
         assert_eq!(cmd("/help"), ("help".into(), "".into()));
         assert_eq!(cmd("/model"), ("model".into(), "".into()));
         // Arg-taking commands keep their whole argument string.
-        assert_eq!(cmd("/goal ship the release"), ("goal".into(), "ship the release".into()));
+        assert_eq!(
+            cmd("/goal ship the release"),
+            ("goal".into(), "ship the release".into())
+        );
         assert_eq!(cmd("/init --force"), ("init".into(), "--force".into()));
         assert_eq!(cmd("/effort max"), ("effort".into(), "max".into()));
     }
@@ -701,11 +710,11 @@ mod tests {
     #[test]
     fn paths_and_xpaths_are_chat_not_commands() {
         for line in [
-            "/html/body/div[2]/span",          // XPath — the "copy full xpath" report
-            "/usr/bin/python có gì",           // POSIX absolute path
-            "/c/Users/admin/Desktop/foo.txt",  // git-bash style Windows path
+            "/html/body/div[2]/span",         // XPath — the "copy full xpath" report
+            "/usr/bin/python có gì",          // POSIX absolute path
+            "/c/Users/admin/Desktop/foo.txt", // git-bash style Windows path
             "/etc/hosts",
-            "//div[@id='root']",               // XPath double-slash
+            "//div[@id='root']", // XPath double-slash
         ] {
             assert_eq!(classify(line), Verdict::Chat, "{line} must reach the model");
         }
@@ -751,7 +760,11 @@ mod tests {
         // Jaro-Winkler's prefix bonus scores `ls`→`lsp` at 0.911 and `cd`→`cmds` at 0.850. Without
         // FUZZY_MIN_LEN those become bogus suggestions for obvious prose.
         for line in ["/ls", "/cd", "/c", "/x"] {
-            assert_eq!(classify(line), Verdict::Chat, "{line} is too short to guess");
+            assert_eq!(
+                classify(line),
+                Verdict::Chat,
+                "{line} is too short to guess"
+            );
         }
     }
 
@@ -778,8 +791,14 @@ mod tests {
             cmd("/goal làm cho xong bản release rồi báo tôi"),
             ("goal".into(), "làm cho xong bản release rồi báo tôi".into())
         );
-        assert!(matches!(classify("/handoff finish the retry work"), Verdict::Command { .. }));
-        assert!(matches!(classify("/memory what did I say about MCP"), Verdict::Command { .. }));
+        assert!(matches!(
+            classify("/handoff finish the retry work"),
+            Verdict::Command { .. }
+        ));
+        assert!(matches!(
+            classify("/memory what did I say about MCP"),
+            Verdict::Command { .. }
+        ));
     }
 
     #[test]

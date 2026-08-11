@@ -19,7 +19,6 @@
 //! The empty second parameter is "no params"; the terminator is ST (`\x1b\\`).
 
 use std::collections::HashMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -34,6 +33,11 @@ pub struct LinkSpan {
     /// The URL to open (already formatted as `https://…` or `file:///…`).
     pub url: String,
     /// The visible text (subset of the row).
+    ///
+    /// The injector re-slices the row from `col`/`width` to keep the SGR colours, so it never reads
+    /// this field; the tests assert on it, because "which text got linked" is the thing a reader
+    /// needs to see to trust the scan.
+    #[allow(dead_code)]
     pub text: String,
 }
 
@@ -126,7 +130,10 @@ fn starts_scheme(chars: &[char], i: usize) -> bool {
 }
 
 fn is_url_break(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\n' | '"' | '\'' | '>' | '<' | ')' | ']' | '}' | '`')
+    matches!(
+        c,
+        ' ' | '\t' | '\n' | '"' | '\'' | '>' | '<' | ')' | ']' | '}' | '`'
+    )
 }
 
 /// Trim trailing punctuation that is usually sentence punctuation, not part of the link.
@@ -221,9 +228,9 @@ fn is_path_char(c: char) -> bool {
 /// Known source/config file extensions that should be linkified.
 fn has_source_ext(path: &str) -> bool {
     const EXTS: &[&str] = &[
-        ".rs", ".toml", ".json", ".md", ".txt", ".py", ".ts", ".tsx", ".js", ".jsx",
-        ".go", ".c", ".cpp", ".h", ".hpp", ".java", ".kt", ".swift", ".rb", ".sh",
-        ".yaml", ".yml", ".env", ".lock", ".html", ".css", ".scss",
+        ".rs", ".toml", ".json", ".md", ".txt", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".c",
+        ".cpp", ".h", ".hpp", ".java", ".kt", ".swift", ".rb", ".sh", ".yaml", ".yml", ".env",
+        ".lock", ".html", ".css", ".scss",
     ];
     let lower = strip_line_suffix(path).to_lowercase();
     EXTS.iter().any(|ext| lower.ends_with(ext))
@@ -408,7 +415,9 @@ pub fn scan_window_with(
         let text = &plain_rows[row];
         let chars: Vec<char> = text.chars().collect();
         for cand in scan_row_shapes(text) {
-            let head: String = chars[cand.start..cand.end.min(chars.len())].iter().collect();
+            let head: String = chars[cand.start..cand.end.min(chars.len())]
+                .iter()
+                .collect();
             // Only a candidate that runs to the very end of a FULL row can have been wrapped.
             let touches_end = cand.end >= chars.len();
             let mut pieces: Vec<(usize, usize, usize, String)> =
@@ -743,7 +752,10 @@ mod tests {
     #[test]
     fn nonexistent_path_is_not_linked() {
         let got = urls("edited src/nope/imaginary.rs today", &never);
-        assert!(got.is_empty(), "must not link a file that isn't there: {got:?}");
+        assert!(
+            got.is_empty(),
+            "must not link a file that isn't there: {got:?}"
+        );
     }
 
     #[test]
@@ -757,7 +769,8 @@ mod tests {
     fn unc_path_is_refused_without_touching_the_network() {
         // Probing a UNC path opens an SMB connection to a host named by model output. The refusal
         // must happen BEFORE the resolver runs, so this one panics if it is ever consulted.
-        let tripwire = |_: &str| -> Option<PathBuf> { panic!("resolver must not be called for UNC") };
+        let tripwire =
+            |_: &str| -> Option<PathBuf> { panic!("resolver must not be called for UNC") };
         assert!(resolve_path(r"\\evil.example.com\share\x.rs").is_none());
         assert!(resolve_path("//evil.example.com/share/x.rs").is_none());
         // And the same through the scan path, where a UNC row must simply produce nothing.
@@ -780,10 +793,7 @@ mod tests {
         assert!(u.starts_with("file:///"), "needs three slashes: {u}");
         assert!(!u.contains(' '), "space must be encoded: {u}");
         assert!(u.contains("%20"), "space must be encoded: {u}");
-        assert!(
-            !u.contains("tài"),
-            "non-ascii must be percent-encoded: {u}"
-        );
+        assert!(!u.contains("tài"), "non-ascii must be percent-encoded: {u}");
     }
 
     #[test]
@@ -856,7 +866,17 @@ mod tests {
         assert!(rows.len() >= 2, "test needs a real wrap: {rows:?}");
         let area = Rect::new(0, 0, 32, 8);
         let mut out: Vec<u8> = Vec::new();
-        inject_hyperlinks(&mut out, &rows, &rows, &InjectCtx { start: 1, visible: 8, area, ..Default::default() });
+        inject_hyperlinks(
+            &mut out,
+            &rows,
+            &rows,
+            &InjectCtx {
+                start: 1,
+                visible: 8,
+                area,
+                ..Default::default()
+            },
+        );
         let s = String::from_utf8_lossy(&out);
         assert!(
             s.contains(url),
@@ -881,7 +901,17 @@ mod tests {
         let rows = vec!["see https://example.com/foo now".to_string()];
         let mut out: Vec<u8> = Vec::new();
         // Sanity: with no occluder it DOES write.
-        inject_hyperlinks(&mut out, &rows, &rows, &InjectCtx { start: 0, visible: 10, area, ..Default::default() });
+        inject_hyperlinks(
+            &mut out,
+            &rows,
+            &rows,
+            &InjectCtx {
+                start: 0,
+                visible: 10,
+                area,
+                ..Default::default()
+            },
+        );
         assert!(!out.is_empty(), "baseline must emit a link");
 
         // Now cover the whole transcript with an overlay.
@@ -911,7 +941,18 @@ mod tests {
         let area = Rect::new(0, 0, 80, 10);
         let rows = vec!["see https://example.com/foo now".to_string()];
         let mut out: Vec<u8> = Vec::new();
-        inject_hyperlinks(&mut out, &rows, &rows, &InjectCtx { start: 0, visible: 10, area, occluders: Vec::new(), caret: Some((7, 21)) });
+        inject_hyperlinks(
+            &mut out,
+            &rows,
+            &rows,
+            &InjectCtx {
+                start: 0,
+                visible: 10,
+                area,
+                occluders: Vec::new(),
+                caret: Some((7, 21)),
+            },
+        );
         let s = String::from_utf8_lossy(&out);
         // crossterm MoveTo is 1-based and row-first: `ESC[{y+1};{x+1}H`
         assert!(
@@ -926,7 +967,18 @@ mod tests {
         let area = Rect::new(0, 0, 80, 10);
         let rows = vec!["nothing to see here".to_string()];
         let mut out: Vec<u8> = Vec::new();
-        inject_hyperlinks(&mut out, &rows, &rows, &InjectCtx { start: 0, visible: 10, area, occluders: Vec::new(), caret: Some((7, 21)) });
+        inject_hyperlinks(
+            &mut out,
+            &rows,
+            &rows,
+            &InjectCtx {
+                start: 0,
+                visible: 10,
+                area,
+                occluders: Vec::new(),
+                caret: Some((7, 21)),
+            },
+        );
         assert!(out.is_empty(), "must not touch the cursor for nothing");
     }
 }

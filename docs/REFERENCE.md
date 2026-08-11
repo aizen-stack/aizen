@@ -51,7 +51,8 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | --- | --- |
 | `/help` | list commands |
 | `/model` | list the provider's models (with context windows) + arrow-key pick one |
-| `/config` | settings wizard: endpoint + key + model + context window + auto-compact |
+| `/provider [name|add|manage]` | one-pick switch among saved providers; add/edit/rename/delete in the same manager |
+| `/config` | provider-first settings: add/edit/switch connections, then assign providers/models to roles and specialists |
 | `/memory [query]` | show your profile, or search memory |
 | `/persona` | character the agent plays + its evolving self-memory: select · new · paste-to-create · view/reset self-memory |
 | `/skills` | saved procedures the agent can load: list · view · new · delete |
@@ -229,11 +230,12 @@ export AIZEN_API_KEY=sk-...
 export AIZEN_MODEL=gpt-4o-mini
 ```
 
-### `aizen config` — interactive setup (recommended)
-Run it with no subcommand for a guided setup: it asks for the base URL + API key, **fetches the
-model list from the provider, and lets you pick one**, then saves to `~/.aizen/cli-config.json`.
+### `aizen config` — provider-first setup (recommended)
+Run it with no subcommand for the config dashboard. **Providers & connection** is the first row: add a
+name, endpoint, API key, and default model once, then switch by choosing that named row. The same
+manager supports Use, Edit, Rename, and Delete; API keys are masked in every list/display.
 ```bash
-aizen config            # interactive: base URL → key → pick a model → saved
+aizen config            # Providers & connection → Add provider
 ```
 After this, `aizen chat`/`agent`/`workflow` work with **zero env vars**. Non-interactive equivalents:
 ```bash
@@ -241,6 +243,46 @@ aizen config set --base-url https://api.openai.com/v1 --api-key sk-... --model g
 aizen config show       # API key masked
 aizen config path
 ```
+
+Save complete URL + key + model profiles when you have more than one compatible gateway, then switch
+manually without restarting the REPL:
+
+```bash
+aizen config provider add primary --base-url https://api.openai.com/v1 --api-key sk-... --model gpt-4o-mini --use
+aizen config provider add backup --base-url https://backup.example/v1 --api-key bk-... --model model-x
+aizen config provider list
+aizen config provider use backup
+aizen config provider edit backup --base-url https://backup-2.example/v1 --api-key bk-2... --model model-y
+aizen config provider rename backup secondary
+```
+
+Inside the REPL, `/provider` is the fast one-pick switcher. `/provider add` opens the add wizard,
+`/provider manage` opens Use/Edit/Rename/Delete, and `/provider backup` switches directly. The next turn and health probe use the selected URL, key, and model. This is manual failover, not an
+automatic retry/failover chain. `AIZEN_BASE_URL`, `AIZEN_API_KEY`, and `AIZEN_MODEL` still override the
+saved selection; Aizen prints a note when those environment variables mask a switch.
+
+Changing an existing provider's endpoint asks for a new key instead of offering the previous
+endpoint's credential. Cancelling any wizard step leaves the complete saved profile unchanged.
+
+Sub-agent configuration uses the same provider list. In `/config` → **Sub-agents**, choose a saved
+provider and either its default model or a model override for Sub-agent default, Summarizer, Oracle,
+Apply, or an installed specialist. No endpoint/key is retyped. Scriptable specialist equivalent:
+
+```bash
+aizen agents set-provider code-reviewer backup              # provider default model
+aizen agents set-provider code-reviewer backup model-y      # model override
+aizen agents set-provider code-reviewer --clear             # inherit sub-agent default
+```
+
+Direct role URLs/keys, model→endpoint mappings, and endpoint fields in specialist cards remain
+supported as advanced compatibility overrides. Environment variables remain highest precedence;
+advanced overrides can therefore mask a provider selection and are labelled as such in `/config`.
+
+Gateways differ in how they shape their streaming frames, and Aizen absorbs the differences quietly:
+a frame it cannot read strictly is retried leniently, and whatever is still unreadable is keepalive
+noise it drops without a word. If a new gateway ever *does* go quiet or lose tool calls on you, set
+`AIZEN_DEBUG_STREAM=1` to print the offending frames (capped at 3 per response plus a total) — that
+output is the useful thing to attach to a bug report.
 
 ### `aizen models` — list the provider's models
 ```bash
@@ -412,6 +454,7 @@ pulls a skill's full steps on demand with the **`skill_load`** tool, and can per
 aizen skill add deploy-vps -d "ship over SSH" -w "asked to deploy"   # body from --body or stdin
 aizen skill fetch https://example.com/deploy-vps.md                  # pull a shared skill from a URL
 aizen skill list / show <name> / delete <name>
+aizen skill where                                                    # the three folders + counts
 ```
 
 Optional frontmatter narrows when a skill shows in the index: **`requires:`** (tool names — hidden
@@ -541,7 +584,47 @@ aizen memory ask "which package manager should I use?"   # abstains rather than 
 aizen memory learn "<a user turn>"  # free extraction → threat-scan → route → store
 aizen memory frozen                 # the always-on prompt-prefix core
 aizen memory style | review | as-of <date> | supersede <old> <new> | archive | restore <id> | compact
+aizen memory where                  # the folders + counts, for editing or clearing out many at once
 ```
+
+Ids are whole words. A fact named "Người dùng giao tiếp bằng tiếng Việt" files as
+`nguoi-dung-giao-tiep-bang-tieng-viet` — accents are folded off each letter, and `-` marks a word
+boundary and nothing else. An earlier slugifier tested one codepoint at a time, so every accented
+letter became a separator and cut inside words: the same name came out `ng-i-d-ng-giao-ti-p…`. Stores
+written by that version are re-slugged once, automatically, on the first run of a build that has this
+— the old→new table is left in `cli-memory/.id-migration-<date>.tsv`, and graph edges are re-pointed
+in the same pass. Set `AIZEN_NO_ID_MIGRATE=1` to skip it.
+
+A fact's id comes from its display `name`, which is the first 60 characters of the fact — so that cut
+has to land on a word too. It used to cut anywhere: 73 entries on one store had names ending in a
+one- or two-letter fragment, and the id inherited it (`…-la-khe-uoc-lam-viec-l`, where `l` began
+`lâu`). New facts back the cut up to the last word; the names already written are left alone, since
+their bodies still hold the full text and a second automatic rewrite of a store belongs behind a
+command you type, not a startup pass.
+
+The same rule now governs every name derived from free text — memory ids, `#remember` captures,
+persona self-memories, session saves, and the project zone key all share one implementation:
+
+| Surface | Where | Migrated? |
+|---|---|---|
+| memory entry id | `cli-memory/entries/` | yes — `.id-migration-<date>.tsv` |
+| `#remember` id | same | yes, same pass |
+| persona self-memory | `personas/<slug>.self/` | yes — `.stem-migration-<persona>-<date>.tsv` |
+| session save name | `sessions/` | no — existing files keep working, see below |
+| project zone key | `skills/p/<slug>`, index | only if the checkout path is non-ASCII |
+
+**Persona self-memories** get one extra thing: a short content hash on the end
+(`ep-hoan-thien-landing-install-tabs-os-85ed`). Every episode body opens with its own type label, so a
+stem taken from the first few words described the format rather than the memory — twelve files on one
+store all read `ep-correction-user-redirected-me-todo`, separated only by a counter. The stem now skips
+the label and carries a hash, so it identifies one memory.
+
+**Session names** are derived, not migrated. New saves fold to ASCII whole words; files already saved
+with accents keep their names and stay loadable, listable and deletable. Two guards on derivation:
+credential-shaped tokens are dropped before the name exists (a key pasted as the first line of a chat
+used to become the filename — and `/sessions` prints filenames), and a name is never cut mid-word.
+The credential guard covers name derivation only: it does not redact what is inside a saved transcript,
+so a key pasted into a chat is still in that file's message text.
 
 ### `aizen bench` — anti-oracle benches
 ```bash

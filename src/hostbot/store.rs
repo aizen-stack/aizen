@@ -205,6 +205,11 @@ pub fn update_bots<T>(mutate: impl FnOnce(&mut Vec<HostedBot>) -> Result<T>) -> 
 }
 
 /// Persist the hosted-bot list to `hostbot/bots.json`, hardened to owner-only.
+///
+/// Every mutation goes through the read-modify-write helpers in this module, which hold the store
+/// lock across the whole change; a bare save would let a concurrent edit be overwritten. Kept as the
+/// single place that knows the file's permissions and layout.
+#[allow(dead_code)]
 pub fn save_bots(bots: &[HostedBot]) -> Result<()> {
     let path = bots_path();
     let lock_path = crate::core::workspace_txn::store_lock("hostbot", "bots");

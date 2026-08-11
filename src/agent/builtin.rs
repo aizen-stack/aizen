@@ -53,11 +53,16 @@ fn shell_timeout_secs() -> u64 {
 /// how close the ceiling is — and without that a slow build and a wedged process look identical.
 const SLOW_NOTE_EVERY_SECS: u64 = 30;
 
-/// Note a still-running command into the transcript (once per [`SLOW_NOTE_EVERY_SECS`]).
-///
-/// Routed through the same trace surface the tool lines use, so it lands in the retained TUI's buffer
-/// rather than being printed over the frame.
+/// Note a still-running command into the transcript — but ONLY for interactive top-level turns
+/// where the progress is visible. A delegated child (quiet, trace_visible=false) must not write
+/// into the parent transcript; its live status is visible through the orchestration board instead.
 fn note_slow_command(command: &str, waited: u64, cap: u64) {
+    // Suppress for delegated quiet children.
+    if let Some(ctx) = crate::core::exec_ctx::current() {
+        if !ctx.trace_visible() {
+            return;
+        }
+    }
     // One line, command clipped: a 300-char pipeline would wrap and push the transcript around.
     let mut label: String = command.trim().chars().take(60).collect();
     if command.trim().chars().count() > 60 {
@@ -170,11 +175,12 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     // `subagent_read_only_base`, so a specialist sub-agent can't touch bot config.
     register_bot_admin(&mut r);
     register_notify(&mut r);
+    // Two tools, not five: `checkpoint` carries the mutating actions (save/rewind/restore) and
+    // `checkpoint_view` the read-only ones (diff/list). The split is on `is_destructive`, which the
+    // trait defines per TYPE rather than per args — folding the reads in would make listing a
+    // timeline ask the user for approval.
     r.register(Box::new(crate::features::timemachine::Checkpoint));
-    r.register(Box::new(crate::features::timemachine::CheckpointRewind));
-    r.register(Box::new(crate::features::timemachine::CheckpointList));
-    r.register(Box::new(crate::features::timemachine::CheckpointDiff));
-    r.register(Box::new(crate::features::timemachine::CheckpointRestore));
+    r.register(Box::new(crate::features::timemachine::CheckpointView));
     // Who else is editing this repository right now. Top-level only, and not because it is unsafe
     // (it is read-only): a sub-agent's writes are attributed to the SESSION that spawned it, so the
     // overlap warning it would need already surfaces on this window's turn. Registering it in
@@ -188,16 +194,17 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     r.register(Box::new(MemoryUpdate));
     r.register(Box::new(MemoryForget));
     r.register(Box::new(FileEdit::new(root.to_path_buf())));
-    r.register(Box::new(MultiEdit::new(root.to_path_buf())));
     r.register(Box::new(FileWrite::new(root.to_path_buf())));
     r.register(Box::new(FileMove::new(root.to_path_buf())));
     r.register(Box::new(ShellRun::new(root.to_path_buf())));
     r.register(Box::new(SkillSave));
     register_skill_refine(&mut r);
     register_skill_forget(&mut r);
-    // Top-level only (NOT in role sub-agents) — the in-session list + process pool are shared, so a
-    // sub-agent must not clobber them. `role_registry` builds its own list and never gets these.
+    // Top-level only (NOT in role sub-agents) — the in-session todo list is shared with the user's
+    // scroll region, so a sub-agent must not clobber it. `role_registry` builds its own scratch list.
     r.register(Box::new(crate::agent::todo::TodoWrite));
+    // `process` IS granted to the shell-capable sub-agent roles (see `role_registry`): its pool is
+    // keyed by execution scope, so a child sees only the handles it started.
     r.register(Box::new(crate::agent::process::Process::new(
         root.to_path_buf(),
     )));
@@ -353,13 +360,14 @@ pub fn default_registry_with_task(
         api_key.clone(),
         model.clone(),
         approval_mode,
-        root,
+        root.clone(),
         0,
         context_window,
     )));
-    // The `workflow` fan-out tool is GATED: its schema costs ~350 tokens on every turn, so it
-    // registers only for the delegating population — ≥1 specialist ENABLED on the allowlist, or
-    // an explicit `workflow_tool: true` in config.
+    // The model-callable fan-out primitive is available by default: hiding it left a normal install
+    // with only the single-child `task` tool, so broad work collapsed into one oversized coder. An
+    // explicit `workflow_tool: false` remains the opt-out for users who prefer the smaller schema;
+    // the delegation toolset filter below can also remove the whole orchestration surface.
     if should_register_workflow() {
         r.register(Box::new(crate::agent::workflow_tool::WorkflowTool::new(
             client,
@@ -368,6 +376,8 @@ pub fn default_registry_with_task(
             model,
             approval_mode,
             0,
+            root.clone(),
+            context_window,
         )));
     }
     crate::agent::toolsets::apply_toolset_filter(&mut r);
@@ -376,18 +386,13 @@ pub fn default_registry_with_task(
     Ok(r)
 }
 
-/// Register the `workflow` tool? Config wins either way; default: only when ≥1 specialist agent is
-/// ENABLED on the allowlist (the population that actually fans out — the `<agents>` index already
-/// advertises exactly them). Deliberately NOT "any agent file exists": that over-triggered — a
-/// bulk `agents install` never enabled, or a cloned repo shipping `.claude/agents/`, would silently
-/// tax every turn with the ~350-token schema.
+/// Register the `workflow` tool unless the user explicitly opts out. The ~350-token schema is a
+/// deliberate default cost: without it a fresh install has no batch fan-out primitive, so the model
+/// can only serialize `task` calls or overload one coder with a whole broad job.
 fn should_register_workflow() -> bool {
-    match crate::core::cli_config::load().workflow_tool {
-        Some(v) => v,
-        // Ultimate mode orchestrates by default, so the fan-out tool must be present even when no
-        // specialist agent is enabled (the model is told to prefer it in the system prompt).
-        None => crate::agents::any_enabled() || crate::core::cli_config::ultimate_enabled(),
-    }
+    crate::core::cli_config::load()
+        .workflow_tool
+        .unwrap_or(true)
 }
 
 /// The read-only tool base shared by EVERY sub-agent registry (role- or specialist-scoped): memory +
@@ -479,24 +484,35 @@ fn register_subagent_lsp_write(r: &mut ToolRegistry, root: &Path) {
 /// `task` tool → a sub-agent physically cannot dispatch further sub-agents (recursion guard).
 /// Scoping is deterministic (documented in `system_prompt.md`):
 /// Every role also gets the read-only web research tools (`web_search`/`web_fetch`).
-/// - `coder` → all builtins (read/glob/edit/shell + memory + web)
-/// - `tester` → read/glob + shell + memory + web (no `file_edit`)
+/// - `coder` → all builtins (read/glob/edit/shell/process + memory + web)
+/// - `tester` → read/glob + shell/process + memory + web (no `file_edit`)
 /// - `planner` / `reviewer` / unknown → read-only (read/glob + memory + web)
+///
+/// The shell-capable roles get `process` too, and that pairing is deliberate: `shell_run`'s timeout
+/// message tells the caller to re-run a long command through `process`, which used to be advice a
+/// sub-agent could not act on — it had no such tool, so its only recourse was re-running the command
+/// that had just timed out. The pool is keyed by execution scope (see [`crate::agent::process`]), so a
+/// child can only see the handles it started; one dispatch cannot log or kill a sibling's build.
 pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
     let mut r = subagent_read_only_base(root);
     match role {
         "coder" => {
             r.register(Box::new(FileEdit::new(root.to_path_buf())));
-            r.register(Box::new(MultiEdit::new(root.to_path_buf())));
             r.register(Box::new(FileWrite::new(root.to_path_buf())));
             r.register(Box::new(FileMove::new(root.to_path_buf())));
             r.register(Box::new(ShellRun::new(root.to_path_buf())));
+            r.register(Box::new(crate::agent::process::Process::new(
+                root.to_path_buf(),
+            )));
             r.register(Box::new(SkillSave));
             register_skill_refine(&mut r);
             register_subagent_lsp_write(&mut r, root);
         }
         "tester" => {
             r.register(Box::new(ShellRun::new(root.to_path_buf())));
+            r.register(Box::new(crate::agent::process::Process::new(
+                root.to_path_buf(),
+            )));
         }
         // planner / reviewer / unknown → read-only (already has LSP nav when enabled).
         _ => {}
@@ -506,7 +522,7 @@ pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
 
 /// Build a tool registry for a dispatched SPECIALIST agent (see [`crate::agents`]). Same read-only
 /// base as [`role_registry`], plus a destructive scope derived from the persona's `tools:` frontmatter:
-/// - EMPTY `tools:` → **coder scope** (file_edit + multi_edit + file_write + file_move + shell_run +
+/// - EMPTY `tools:` → **coder scope** (file_edit + file_write + file_move + shell_run +
 ///   skill_save) — the locked default; no wider than the trusted `coder` sub-agent (the `cmd_guard`
 ///   floor + per-op approval still apply underneath).
 /// - non-empty `tools:` → exactly those, mapped by name (Claude-Code casing accepted via the alias
@@ -521,7 +537,6 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
     if def.tools.is_empty() {
         // Locked default: coder scope.
         r.register(Box::new(FileEdit::new(root.to_path_buf())));
-        r.register(Box::new(MultiEdit::new(root.to_path_buf())));
         r.register(Box::new(FileWrite::new(root.to_path_buf())));
         r.register(Box::new(FileMove::new(root.to_path_buf())));
         r.register(Box::new(ShellRun::new(root.to_path_buf())));
@@ -544,7 +559,6 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
                 r.register(Box::new(FileEdit::new(root.to_path_buf())));
                 has_file_edit = true;
             }
-            "multi_edit" => r.register(Box::new(MultiEdit::new(root.to_path_buf()))),
             "file_write" => r.register(Box::new(FileWrite::new(root.to_path_buf()))),
             "file_move" => r.register(Box::new(FileMove::new(root.to_path_buf()))),
             "shell_run" => r.register(Box::new(ShellRun::new(root.to_path_buf()))),
@@ -558,7 +572,7 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
         }
     }
     // Symbolic edit rides with any file-edit capability (same intent as top-level coder scope).
-    if has_file_edit || granted.contains("multi_edit") || granted.contains("file_write") {
+    if has_file_edit || granted.contains("file_write") {
         register_subagent_lsp_write(&mut r, root);
     }
     r
@@ -569,15 +583,14 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
 /// "don't add it": read-only tools (already in the base — `Read`/`Grep`/`Glob`/…), forbidden tools
 /// (`task`/`todo`/`process`/`clarify`/`persona_create`/`mcp_*`), and unknown names. This is the single
 /// structural choke-point for the capability invariant: only the grantable destructive tool names
-/// (`file_edit`/`multi_edit`/`file_write`/`file_move`/`shell_run`/`skill_save`) can ever be returned,
+/// (`file_edit`/`file_write`/`file_move`/`shell_run`/`skill_save`) can ever be returned,
 /// so nothing else can be granted to a specialist.
 fn canonical_subagent_tool(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        // editing
-        "edit" | "file_edit" | "fileedit" | "str_replace" | "str_replace_editor" => {
-            Some("file_edit")
-        }
-        "multiedit" | "multi_edit" => Some("multi_edit"),
+        // editing — file_edit now covers both the single and batch (multi-edit) forms, so the old
+        // multi_edit aliases fold into it (a persona that still lists MultiEdit gets file_edit).
+        "edit" | "file_edit" | "fileedit" | "str_replace" | "str_replace_editor" | "multiedit"
+        | "multi_edit" => Some("file_edit"),
         // whole-file create/overwrite (Claude-Code's "Write" maps here now that file_write exists)
         "write" | "file_write" | "filewrite" | "write_file" | "writefile" | "create"
         | "create_file" => Some("file_write"),
@@ -2002,46 +2015,10 @@ impl FileEdit {
     fn new(root: PathBuf) -> Self {
         Self { root }
     }
-}
-impl Tool for FileEdit {
-    fn name(&self) -> &str {
-        "file_edit"
-    }
-    fn description(&self) -> &str {
-        "Edit a file by exact string replacement (or create one when old_string is empty and the \
-         file does not exist). old_string must be unique unless replace_all. If the exact text \
-         isn't found, a whitespace/indentation-tolerant retry is attempted for a single matching \
-         block. To create OR fully rewrite a whole file, use file_write instead. Returns a \
-         before→after preview. Read the file first. Relative paths resolve under the working \
-         directory; an absolute path or a leading `../` may write elsewhere on disk."
-    }
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "old_string": {"type": "string", "description": "exact text to replace; empty = create new file"},
-                "new_string": {"type": "string"},
-                "replace_all": {"type": "boolean"}
-            },
-            "required": ["path", "new_string"],
-            "additionalProperties": false
-        })
-    }
-    fn is_destructive(&self) -> bool {
-        true
-    }
-    fn is_concurrency_safe(&self) -> bool {
-        false
-    }
-    fn workspace_effect(&self, args: &Value) -> WorkspaceEffect {
-        write_effect(&self.root, args.get("path").and_then(|v| v.as_str()))
-    }
-    fn workspace_target(&self, args: &Value) -> Option<std::path::PathBuf> {
-        write_target_dir(&self.root, args.get("path").and_then(|v| v.as_str()))
-    }
-    fn execute(&self, args: &Value) -> Result<String> {
-        let path = str_arg(args, "path")?;
+
+    /// Single exact-string replacement (or create-new when `old_string` is empty). The classic
+    /// one-shot form; the batch form lives in [`FileEdit::apply_edits`].
+    fn apply_single(&self, path: &str, args: &Value) -> Result<String> {
         let new = str_arg(args, "new_string")?;
         let old = args
             .get("old_string")
@@ -2099,6 +2076,154 @@ impl Tool for FileEdit {
             out.push_str(&fb);
         }
         Ok(out)
+    }
+
+    /// Apply an ORDERED list of edits to ONE file in a single atomic write. Collapses what would be N
+    /// single `file_edit` round-trips (each invalidating the model's byte offsets) into one call /
+    /// one turn — this is the batch form the `edits` argument selects.
+    fn apply_edits(&self, path: &str, edits: &[Value]) -> Result<String> {
+        if edits.is_empty() {
+            bail!("file_edit `edits` must be a non-empty array (or omit it and pass new_string for a single edit)");
+        }
+        let target = confine(&self.root, path, true)?;
+        let (original_bytes, expected) = crate::core::persist::read_with_fingerprint(&target)?;
+        let original = String::from_utf8(original_bytes.context("file disappeared while reading")?)
+            .with_context(|| format!("{} is not valid UTF-8", target.display()))?;
+
+        // Compute the whole result in memory; write ONCE at the end. Any edit error returns before
+        // the write is reached → atomic ("nothing written"), no temp file / rollback needed. Each
+        // edit re-searches the EVOLVING buffer, so offsets can never go stale (string search, not
+        // byte offsets) and a later edit may target text an earlier one produced.
+        let mut buf = original.clone();
+        let mut summaries: Vec<String> = Vec::with_capacity(edits.len());
+        // Diff each edit's OWN before/after (the small changed region) rather than the whole file:
+        // precise per-hunk output, and it keeps `diff_preview`'s prefix/suffix trim on small inputs
+        // (a whole-file trim would merge far-apart edits into one giant spurious hunk).
+        let mut diffs: Vec<String> = Vec::with_capacity(edits.len());
+        for (i, e) in edits.iter().enumerate() {
+            let n = i + 1;
+            let old = e
+                .get("old_string")
+                .and_then(|v| v.as_str())
+                .with_context(|| format!("edit #{n}: missing old_string"))?;
+            let new = e
+                .get("new_string")
+                .and_then(|v| v.as_str())
+                .with_context(|| format!("edit #{n}: missing new_string"))?;
+            let replace_all = e
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let applied =
+                apply_one_edit(&buf, old, new, replace_all, &format!("edit #{n} ({path})"))?;
+            let detail = match applied.rung {
+                "indent" => "1 replacement, indentation-tolerant".to_string(),
+                "exact" if replace_all => format!("{} replacement(s), replace_all", applied.count),
+                "exact" => format!("{} replacement(s)", applied.count),
+                other => format!("1 replacement, {other} match"),
+            };
+            summaries.push(format!("  #{n}: {detail}"));
+            diffs.push(diff_preview(&applied.before, &applied.after));
+            buf = applied.content;
+        }
+
+        // No-op guard: every edit is individually valid (else apply_one_edit already bailed above),
+        // but a sequence that nets out to the original content (e.g. a change immediately undone by
+        // a later edit) must not touch disk or arm the verify gate (W16).
+        if buf == original {
+            return Ok(format!(
+                "{NOOP_WRITE_PREFIX}: {path} unchanged after {} edit(s) net to nothing",
+                edits.len()
+            ));
+        }
+        crate::core::persist::compare_and_atomic_write(&target, &expected, buf.as_bytes())
+            .with_context(|| format!("writing {}", target.display()))?;
+        // Same as the single form: record what this session now knows is on disk.
+        crate::core::read_ledger::note(
+            &target,
+            &crate::core::persist::FileFingerprint::for_bytes(buf.as_bytes()),
+        );
+        let mut out = format!(
+            "edited {path} ({} edits applied)\n{}\n{}",
+            edits.len(),
+            summaries.join("\n"),
+            diffs.join("\n")
+        );
+        // One fold after the single atomic write (same as the single form).
+        if let Some(fb) = crate::agent::lsp::LSP.edit_feedback(&target) {
+            out.push('\n');
+            out.push_str(&fb);
+        }
+        Ok(out)
+    }
+}
+impl Tool for FileEdit {
+    fn name(&self) -> &str {
+        "file_edit"
+    }
+    fn description(&self) -> &str {
+        "Edit a file by exact string replacement. ONE edit → old_string + new_string. SEVERAL edits \
+         to the SAME file → pass `edits` instead, in one atomic call (all succeed or nothing is \
+         written) — always prefer that over repeat calls. old_string must be unique unless \
+         replace_all; indentation-tolerant retry if the exact text misses. To create or fully \
+         rewrite a whole file, use file_write. Read the file first. An absolute or `../` path may \
+         write outside the working directory."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_string": {"type": "string", "description": "exact text to replace; empty = create new file"},
+                "new_string": {"type": "string"},
+                "replace_all": {"type": "boolean"},
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "several edits to this one file, applied in order; use instead of old_string/new_string",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                            "replace_all": {"type": "boolean"}
+                        },
+                        "required": ["old_string", "new_string"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        })
+    }
+    fn is_destructive(&self) -> bool {
+        true
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
+    fn workspace_effect(&self, args: &Value) -> WorkspaceEffect {
+        write_effect(&self.root, args.get("path").and_then(|v| v.as_str()))
+    }
+    fn workspace_target(&self, args: &Value) -> Option<std::path::PathBuf> {
+        write_target_dir(&self.root, args.get("path").and_then(|v| v.as_str()))
+    }
+    fn execute(&self, args: &Value) -> Result<String> {
+        let path = str_arg(args, "path")?;
+        // An `edits` array selects the batch form; otherwise it's a single old_string/new_string
+        // replacement. Batch wins if both are somehow present (a caller that filled `edits` meant it).
+        match args.get("edits").and_then(|v| v.as_array()) {
+            Some(edits) => self.apply_edits(&path, edits),
+            // Name BOTH forms when neither is present. `str_arg` alone would say only "missing
+            // new_string", which reads as "this tool cannot batch" — the one wrong lesson to teach a
+            // model that merely reached for the batch form and mis-spelled the key.
+            None if args.get("new_string").is_none() => bail!(
+                "file_edit needs either `new_string` (single edit, with `old_string`) or a non-empty \
+                 `edits` array (batch of {{old_string, new_string}} applied atomically to {path})"
+            ),
+            None => self.apply_single(&path, args),
+        }
     }
 }
 
@@ -2178,7 +2303,7 @@ impl Tool for FileWrite {
         }
         // CROSS-SESSION CLOBBER GUARD. The CAS below only compares against the fingerprint read two
         // lines up, so it passes happily when another aizen window rewrote this file three turns ago:
-        // that window's work would vanish with no error. `file_edit`/`multi_edit` are safe on their
+        // that window's work would vanish with no error. Both `file_edit` forms are safe on their
         // own (`old_string` is matched against a fresh read, so a rewritten region fails to match);
         // a whole-file write has no such anchor, which is why the check lives here.
         if let Some(stale) = crate::core::read_ledger::overwrite_conflict(&target, &expected) {
@@ -2378,53 +2503,11 @@ impl Tool for FileMove {
     }
 }
 
-/// Write `content` to `target` ATOMICALLY: stream into a sibling temp file, fsync it, then
-/// `fs::rename` it over the target. A same-directory rename is atomic on every OS we support (POSIX
-/// `rename(2)`; Windows `MoveFileExW` with REPLACE_EXISTING), so a concurrent reader — and, more
-/// importantly, the on-disk state after a crash/kill/disk-full mid-write — is either the intact old
-/// file or the fully-written new one, never a truncated/partial file. Plain `fs::write` truncates
-/// the target in place before streaming, so an interrupted write destroys the original. Preserves
-/// the target's existing permission bits (temp files are created with default perms, so an in-place
-/// rewrite would otherwise silently reset mode). The temp file is cleaned up on any failure before
-/// the rename lands. The temp lives in the target's own directory, so the rename never crosses a
-/// filesystem boundary (which would make it non-atomic).
-pub(crate) fn atomic_write(target: &Path, content: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let parent = target
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let fname = target.file_name().and_then(|n| n.to_str()).unwrap_or("out");
-    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(".{fname}.aizen-tmp.{}.{n}", std::process::id()));
-
-    // Write + fsync, then CLOSE the temp handle before renaming (Windows won't replace the
-    // destination while a handle to the source is open). Any error aborts before the rename, so the
-    // original target is untouched; clean up the temp.
-    let write_res = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(content)?;
-        f.sync_all()?;
-        Ok(())
-    })();
-    if let Err(e) = write_res {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-
-    // Carry over the target's mode so an atomic rewrite preserves permissions. Best-effort: a
-    // metadata/permission hiccup must never turn into data loss.
-    if let Ok(meta) = std::fs::metadata(target) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
-    }
-
-    if let Err(e) = std::fs::rename(&tmp, target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
-}
+// A local `atomic_write` used to live here. It is gone: [`crate::core::persist::atomic_write`] does
+// the same job and is strictly stronger — it stages with `create_new` (concurrent writers can never
+// share a staging path) and replaces via `MoveFileExW(WRITE_THROUGH)` on Windows instead of a plain
+// `fs::rename`. Every write path in this file already called the `persist` one; only this copy's own
+// tests still referenced it, and they now exercise `persist` directly.
 
 /// A sibling temp path for staging an existing file/dir out of the way during an overwrite. Lives in
 /// the same directory as `p`, so the stash rename stays on one filesystem (and is thus atomic).
@@ -2518,7 +2601,7 @@ const LADDER_MAX_BYTES: usize = 16 * 1024;
 const NEAREST_MISS_MAX_FILE_LINES: usize = 20_000;
 
 /// Apply ONE replacement to `content` — the shared matcher behind both `file_edit` and
-/// `multi_edit` (pure, no IO). A LADDER of progressively looser strategies (the Aider lesson:
+/// the batch `edits` form (pure, no IO). A LADDER of progressively looser strategies (the Aider lesson:
 /// every rescued edit is a saved round-trip — a ~9× edit-error reduction was measured for this
 /// class of matcher), with one invariant at every rung: EXACTLY one match applies; more than one
 /// is a hard "ambiguous" error that never falls through to a looser rung (a looser rung must not
@@ -2536,7 +2619,7 @@ const NEAREST_MISS_MAX_FILE_LINES: usize = 20_000;
 ///                        "copy EXACTLY from this"), so the retry lands in ONE turn
 ///
 /// `old` MUST be non-empty (create-new is the caller's concern). `label` names the target in
-/// errors (a path for file_edit; "edit #N (path)" for multi_edit).
+/// errors (a path for the single form; "edit #N (path)" for the batch form).
 fn apply_one_edit(
     content: &str,
     old: &str,
@@ -2938,7 +3021,7 @@ fn blank_insensitive_blocks(content: &str, old: &str) -> Vec<(usize, usize)> {
 /// are `^[-+]`-prefixed at column 0 so the display can pick them out unambiguously. Both sides are
 /// capped so a giant replacement can't flood the result.
 ///
-/// Callers pass the SMALL changed region (file_edit: `applied.before`/`after`; multi_edit: each
+/// Callers pass the SMALL changed region (single form: `applied.before`/`after`; batch form: each
 /// per-edit before/after), so the prefix/suffix trim is enough — no full LCS needed.
 fn diff_preview(before: &str, after: &str) -> String {
     const CTX: usize = 2; // context lines kept on each side of the change
@@ -2988,147 +3071,6 @@ fn diff_preview(before: &str, after: &str) -> String {
         out.push_str(&format!(" {line}\n"));
     }
     out.trim_end_matches('\n').to_string()
-}
-
-// ── multi_edit ───────────────────────────────────────────────────────────────
-
-/// Apply an ORDERED list of edits to ONE file in a single atomic write. Collapses what would be N
-/// `file_edit` round-trips (each invalidating the model's byte offsets) into one call / one turn.
-struct MultiEdit {
-    root: PathBuf,
-}
-impl MultiEdit {
-    fn new(root: PathBuf) -> Self {
-        Self { root }
-    }
-}
-impl Tool for MultiEdit {
-    fn name(&self) -> &str {
-        "multi_edit"
-    }
-    fn description(&self) -> &str {
-        "Apply an ORDERED list of exact-string edits to ONE file in a single atomic write — all \
-         succeed or the file is left untouched. Each edit is {old_string, new_string, replace_all?} \
-         and applies to the result of the previous one (same matching as file_edit, incl. the \
-         indentation-tolerant retry). For a SINGLE edit use file_edit. Read the file first. A relative \
-         path resolves under the working directory; an absolute path or a leading `../` may write \
-         elsewhere on disk."
-    }
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "edits": {
-                    "type": "array",
-                    "minItems": 1,
-                    "description": "ordered; each applies to the result of the previous edit",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "old_string": {"type": "string", "description": "exact text to replace (non-empty)"},
-                            "new_string": {"type": "string"},
-                            "replace_all": {"type": "boolean", "description": "replace every occurrence in the current buffer (default false)"}
-                        },
-                        "required": ["old_string", "new_string"],
-                        "additionalProperties": false
-                    }
-                }
-            },
-            "required": ["path", "edits"],
-            "additionalProperties": false
-        })
-    }
-    fn is_destructive(&self) -> bool {
-        true
-    }
-    fn is_concurrency_safe(&self) -> bool {
-        false
-    }
-    fn workspace_effect(&self, args: &Value) -> WorkspaceEffect {
-        write_effect(&self.root, args.get("path").and_then(|v| v.as_str()))
-    }
-    fn workspace_target(&self, args: &Value) -> Option<std::path::PathBuf> {
-        write_target_dir(&self.root, args.get("path").and_then(|v| v.as_str()))
-    }
-    fn execute(&self, args: &Value) -> Result<String> {
-        let path = str_arg(args, "path")?;
-        let edits = args
-            .get("edits")
-            .and_then(|v| v.as_array())
-            .filter(|a| !a.is_empty())
-            .context("multi_edit requires a non-empty 'edits' array")?;
-        let target = confine(&self.root, path, true)?;
-        let (original_bytes, expected) = crate::core::persist::read_with_fingerprint(&target)?;
-        let original = String::from_utf8(original_bytes.context("file disappeared while reading")?)
-            .with_context(|| format!("{} is not valid UTF-8", target.display()))?;
-
-        // Compute the whole result in memory; write ONCE at the end. Any edit error returns before
-        // the write is reached → atomic ("nothing written"), no temp file / rollback needed. Each
-        // edit re-searches the EVOLVING buffer, so offsets can never go stale (string search, not
-        // byte offsets) and a later edit may target text an earlier one produced.
-        let mut buf = original.clone();
-        let mut summaries: Vec<String> = Vec::with_capacity(edits.len());
-        // Diff each edit's OWN before/after (the small changed region) rather than the whole file:
-        // precise per-hunk output, and it keeps `diff_preview`'s prefix/suffix trim on small inputs
-        // (a whole-file trim would merge far-apart edits into one giant spurious hunk).
-        let mut diffs: Vec<String> = Vec::with_capacity(edits.len());
-        for (i, e) in edits.iter().enumerate() {
-            let n = i + 1;
-            let old = e
-                .get("old_string")
-                .and_then(|v| v.as_str())
-                .with_context(|| format!("edit #{n}: missing old_string"))?;
-            let new = e
-                .get("new_string")
-                .and_then(|v| v.as_str())
-                .with_context(|| format!("edit #{n}: missing new_string"))?;
-            let replace_all = e
-                .get("replace_all")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let applied =
-                apply_one_edit(&buf, old, new, replace_all, &format!("edit #{n} ({path})"))?;
-            let detail = match applied.rung {
-                "indent" => "1 replacement, indentation-tolerant".to_string(),
-                "exact" if replace_all => format!("{} replacement(s), replace_all", applied.count),
-                "exact" => format!("{} replacement(s)", applied.count),
-                other => format!("1 replacement, {other} match"),
-            };
-            summaries.push(format!("  #{n}: {detail}"));
-            diffs.push(diff_preview(&applied.before, &applied.after));
-            buf = applied.content;
-        }
-
-        // No-op guard: every edit is individually valid (else apply_one_edit already bailed above),
-        // but a sequence that nets out to the original content (e.g. a change immediately undone by
-        // a later edit) must not touch disk or arm the verify gate (W16).
-        if buf == original {
-            return Ok(format!(
-                "{NOOP_WRITE_PREFIX}: {path} unchanged after {} edit(s) net to nothing",
-                edits.len()
-            ));
-        }
-        crate::core::persist::compare_and_atomic_write(&target, &expected, buf.as_bytes())
-            .with_context(|| format!("writing {}", target.display()))?;
-        // Same as file_edit: record what this session now knows is on disk.
-        crate::core::read_ledger::note(
-            &target,
-            &crate::core::persist::FileFingerprint::for_bytes(buf.as_bytes()),
-        );
-        let mut out = format!(
-            "edited {path} ({} edits applied)\n{}\n{}",
-            edits.len(),
-            summaries.join("\n"),
-            diffs.join("\n")
-        );
-        // One fold after the single atomic write (same as file_edit).
-        if let Some(fb) = crate::agent::lsp::LSP.edit_feedback(&target) {
-            out.push('\n');
-            out.push_str(&fb);
-        }
-        Ok(out)
-    }
 }
 
 // ── shell_run ────────────────────────────────────────────────────────────────
@@ -3634,17 +3576,11 @@ mod tests {
 
     #[test]
     fn tool_schema_stays_within_budget() {
-        // The whole tool array sits at the FRONT of every request and is re-sent at full price
-        // each time the prompt cache lapses (Anthropic's ~5-min TTL — i.e. after any think-pause
-        // in an interactive session), so schema bloat is a RECURRING cost, not a one-time one.
-        // These ceilings are a ratchet: a new tool (or a description that grows a paragraph of
-        // internal-mechanics prose the model doesn't need to CHOOSE the tool) trips the test
-        // instead of silently re-inflating the surface. Raise a ceiling only with a measurement
-        // that shows the added bytes earn their keep (better tool selection), never to make a
-        // fat description compile. Bytes, not tokens, so the bound is deterministic across
-        // tokenizers; ≈ bytes/4 tokens.
-        const TOTAL_CEILING: usize = 31_000; // measured ~30.2 KB after trimming file_glob (2026-07-29)
-        const PER_TOOL_CEILING: usize = 1_400; // no single tool should dwarf the rest (todo_write ~1.3 KB)
+        // The default registry is the CORE top-level surface. Delegation and persona tools are
+        // appended by `default_registry_with_task`; keeping this test explicit prevents a new core
+        // tool from silently consuming the budget reserved for those conditional additions.
+        const TOTAL_CEILING: usize = 31_000; // measured core surface after trimming file_glob
+        const PER_TOOL_CEILING: usize = 1_400; // no single tool should dwarf the rest
 
         let root = temp_root("schema-budget");
         let defs = default_registry_in(&root).defs();
@@ -3683,6 +3619,87 @@ mod tests {
                 "tool `{name}` is {whole} B (per-tool ceiling {PER_TOOL_CEILING}) — its \
                  description likely explains HOW it works instead of WHEN to pick it.\n{}",
                 dump()
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_delegation_and_lsp_surface_stays_within_budget() {
+        // The previous ratchet stopped at `default_registry_in`, but the actual interactive registry
+        // appends delegation/persona and (by default) LSP schemas afterwards. Measure that real
+        // maximal shape too; otherwise adding a 2 KB task schema can pass the 31 KB core test forever.
+        const TOTAL_CEILING: usize = 45_000;
+        const PER_TOOL_CEILING: usize = 2_400;
+        let root = temp_root("schema-top-level");
+        let mut registry = default_registry_in(&root);
+        registry.register(Box::new(PersonaCreate));
+        registry.register(Box::new(crate::agent::task_tool::TaskTool::new(
+            reqwest::Client::new(),
+            "http://x".into(),
+            "k".into(),
+            "m".into(),
+            crate::core::approval::ApprovalMode::Ask,
+            root.clone(),
+            0,
+            200_000,
+        )));
+        registry.register(Box::new(crate::agent::workflow_tool::WorkflowTool::new(
+            reqwest::Client::new(),
+            "http://x".into(),
+            "k".into(),
+            "m".into(),
+            crate::core::approval::ApprovalMode::Ask,
+            0,
+            root.clone(),
+            200_000,
+        )));
+        registry.register(Box::new(crate::agent::goal::GoalComplete));
+        register_subagent_lsp_read(&mut registry, &root);
+        register_subagent_lsp_write(&mut registry, &root);
+
+        let mut rows: Vec<(String, usize)> = registry
+            .defs()
+            .iter()
+            .map(|d| {
+                (
+                    d.function.name.clone(),
+                    serde_json::to_string(d).unwrap().len(),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        let total: usize = rows.iter().map(|(_, n)| *n).sum();
+        let dump = || {
+            rows.iter()
+                .map(|(name, bytes)| format!("  {name:<26} {bytes:>7} B"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            total <= TOTAL_CEILING,
+            "top-level tool schema {total} B exceeds {TOTAL_CEILING} B:\n{}",
+            dump()
+        );
+        assert!(
+            rows.first()
+                .is_none_or(|(_, bytes)| *bytes <= PER_TOOL_CEILING),
+            "one top-level tool exceeds {PER_TOOL_CEILING} B:\n{}",
+            dump()
+        );
+    }
+
+    #[test]
+    fn registered_conditional_tools_are_classified_for_toolset_filtering() {
+        for name in [
+            "codebase_search",
+            "skill_forget",
+            "team_status",
+            "bot_admin",
+            "goal_complete",
+        ] {
+            assert!(
+                crate::agent::toolsets::classify_tool(name).is_some(),
+                "registered tool `{name}` must not become an unclassified escape hatch"
             );
         }
     }
@@ -4419,14 +4436,9 @@ mod tests {
             w.workspace_target(&serde_json::json!({"path": abs.to_string_lossy()})),
             Some(outside.clone())
         );
-        // file_edit and multi_edit share the contract.
+        // file_edit resolves the target dir the same whether single or batch (same `path` arg).
         assert_eq!(
             FileEdit::new(root.clone())
-                .workspace_target(&serde_json::json!({"path":"mini_project/web/src/app.js"})),
-            Some(proj.join("src"))
-        );
-        assert_eq!(
-            MultiEdit::new(root.clone())
                 .workspace_target(&serde_json::json!({"path":"mini_project/web/src/app.js"})),
             Some(proj.join("src"))
         );
@@ -4492,9 +4504,10 @@ mod tests {
 
     #[test]
     fn multi_edit_applies_ordered_edits() {
+        // The batch (`edits`) form of file_edit, formerly the separate multi_edit tool.
         let root = temp_root("medit-order");
         std::fs::write(root.join("f.txt"), "alpha beta gamma").unwrap();
-        let t = MultiEdit::new(root.clone());
+        let t = FileEdit::new(root.clone());
         let r = t
             .execute(&serde_json::json!({
                 "path": "f.txt",
@@ -4517,7 +4530,7 @@ mod tests {
         // Edit #2 targets text PRODUCED by edit #1 (evolving-buffer proof).
         let root = temp_root("medit-evolve");
         std::fs::write(root.join("f.txt"), "one").unwrap();
-        let t = MultiEdit::new(root.clone());
+        let t = FileEdit::new(root.clone());
         t.execute(&serde_json::json!({
             "path": "f.txt",
             "edits": [
@@ -4537,7 +4550,7 @@ mod tests {
         // Edit #1 valid, #2 absent → whole call fails and the file equals the ORIGINAL (atomicity).
         let root = temp_root("medit-atomic");
         std::fs::write(root.join("f.txt"), "keep me exactly").unwrap();
-        let t = MultiEdit::new(root.clone());
+        let t = FileEdit::new(root.clone());
         let r = t.execute(&serde_json::json!({
             "path": "f.txt",
             "edits": [
@@ -4557,7 +4570,7 @@ mod tests {
     fn multi_edit_reports_failing_index() {
         let root = temp_root("medit-idx");
         std::fs::write(root.join("f.txt"), "a b c").unwrap();
-        let t = MultiEdit::new(root);
+        let t = FileEdit::new(root);
         let err = t
             .execute(&serde_json::json!({
                 "path": "f.txt",
@@ -4578,7 +4591,7 @@ mod tests {
     fn multi_edit_replace_all_per_edit() {
         let root = temp_root("medit-all");
         std::fs::write(root.join("f.txt"), "x x x | y").unwrap();
-        let t = MultiEdit::new(root.clone());
+        let t = FileEdit::new(root.clone());
         t.execute(&serde_json::json!({
             "path": "f.txt",
             "edits": [
@@ -4604,14 +4617,14 @@ mod tests {
     #[test]
     fn multi_edit_indent_tolerant_per_edit() {
         // A 2-line block with wrong indentation on BOTH lines isn't an accidental exact substring,
-        // so it genuinely exercises the indentation-tolerant fallback (mirrors the file_edit test).
+        // so it genuinely exercises the indentation-tolerant fallback (mirrors the single-edit test).
         let root = temp_root("medit-indent");
         std::fs::write(
             root.join("f.rs"),
             "fn main() {\n    let x = 1;\n    foo();\n}\n",
         )
         .unwrap();
-        let t = MultiEdit::new(root.clone());
+        let t = FileEdit::new(root.clone());
         let r = t
             .execute(&serde_json::json!({
                 "path": "f.rs",
@@ -4626,10 +4639,28 @@ mod tests {
     }
 
     #[test]
+    fn file_edit_without_either_form_names_both() {
+        // A call with neither `new_string` nor `edits` must not be told only "missing new_string" —
+        // that hides the batch form from a model that was reaching for it.
+        let root = temp_root("fe-neither");
+        std::fs::write(root.join("f.txt"), "hi").unwrap();
+        let t = FileEdit::new(root);
+        let err = t
+            .execute(&serde_json::json!({"path": "f.txt"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("new_string"), "{err}");
+        assert!(
+            err.contains("edits"),
+            "must mention the batch form too: {err}"
+        );
+    }
+
+    #[test]
     fn multi_edit_empty_edits_array_errs() {
         let root = temp_root("medit-empty");
         std::fs::write(root.join("f.txt"), "hi").unwrap();
-        let t = MultiEdit::new(root);
+        let t = FileEdit::new(root);
         assert!(t
             .execute(&serde_json::json!({"path": "f.txt", "edits": []}))
             .is_err());
@@ -4638,7 +4669,7 @@ mod tests {
     #[test]
     fn multi_edit_rejects_escape() {
         let root = temp_root("medit-escape");
-        let t = MultiEdit::new(root);
+        let t = FileEdit::new(root);
         let r = t.execute(&serde_json::json!({
             "path": "../../secret",
             "edits": [{"old_string": "a", "new_string": "b"}]
@@ -4649,7 +4680,7 @@ mod tests {
     #[test]
     fn multi_edit_nonexistent_file_errs() {
         let root = temp_root("medit-nofile");
-        let t = MultiEdit::new(root);
+        let t = FileEdit::new(root);
         assert!(t
             .execute(&serde_json::json!({"path": "nope.txt", "edits": [{"old_string": "a", "new_string": "b"}]}))
             .is_err());
@@ -4657,8 +4688,8 @@ mod tests {
 
     #[test]
     fn multi_edit_is_destructive_not_concurrency_safe() {
-        let t = MultiEdit::new(PathBuf::from("."));
-        assert!(t.is_destructive(), "must be approval-gated like file_edit");
+        let t = FileEdit::new(PathBuf::from("."));
+        assert!(t.is_destructive(), "must be approval-gated");
         assert!(!t.is_concurrency_safe(), "must take the serial path");
     }
 
@@ -4667,7 +4698,7 @@ mod tests {
         // Mid-edit create-new is meaningless; apply_one_edit rejects an empty old_string.
         let root = temp_root("medit-emptyold");
         std::fs::write(root.join("f.txt"), "hi").unwrap();
-        let t = MultiEdit::new(root.clone());
+        let t = FileEdit::new(root.clone());
         let r = t.execute(&serde_json::json!({
             "path": "f.txt",
             "edits": [{"old_string": "", "new_string": "X"}]
@@ -4678,6 +4709,26 @@ mod tests {
             "hi",
             "nothing written"
         );
+    }
+
+    #[test]
+    fn file_edit_batch_and_single_dispatch_by_edits_presence() {
+        // The merged tool: `edits` present → batch; absent → single old_string/new_string.
+        let root = temp_root("fe-dispatch");
+        let p = root.join("f.txt");
+        std::fs::write(&p, "one two").unwrap();
+        let t = FileEdit::new(root.clone());
+        // single form
+        t.execute(&serde_json::json!({"path":"f.txt","old_string":"one","new_string":"1"}))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "1 two");
+        // batch form
+        t.execute(&serde_json::json!({
+            "path":"f.txt",
+            "edits":[{"old_string":"1","new_string":"ONE"},{"old_string":"two","new_string":"TWO"}]
+        }))
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "ONE TWO");
     }
 
     #[test]
@@ -4805,7 +4856,7 @@ mod tests {
         std::fs::write(&p, "one two three\n").unwrap();
         let mtime_before = std::fs::metadata(&p).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let t = MultiEdit::new(root.clone());
+        let t = FileEdit::new(root.clone());
         let r = t
             .execute(&serde_json::json!({
                 "path": "f.txt",
@@ -4953,6 +5004,7 @@ mod tests {
 
     #[test]
     fn atomic_write_replaces_content_and_leaves_no_temp() {
+        use crate::core::persist::atomic_write;
         let root = temp_root("atomic-write");
         let target = root.join("f.txt");
         // Fresh create.
@@ -4965,7 +5017,7 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains(".aizen-tmp."))
+            .filter(|e| e.file_name().to_string_lossy().contains(".aizen-tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp file leaked: {leftovers:?}");
     }
@@ -4973,6 +5025,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn atomic_write_preserves_permissions() {
+        use crate::core::persist::atomic_write;
         use std::os::unix::fs::PermissionsExt;
         let root = temp_root("atomic-perms");
         let target = root.join("script.sh");
@@ -5245,5 +5298,26 @@ mod tests {
             crate::agent::task_tool::dispatch_is_read_only(&role_registry("planner", &root)),
             "todo_write does not make a read-only role a writer (it's not workspace mutation)"
         );
+    }
+
+    #[test]
+    fn shell_capable_roles_get_the_scoped_process_pool() {
+        // `shell_run`'s timeout message tells a child to re-run a long command with `process`. That
+        // advice was unreachable while the tool was top-level only, so the child could only re-run
+        // the command that had just timed out. The pool is execution-scope keyed, so granting it here
+        // does not let one child observe or kill a sibling's handles.
+        let root = std::env::temp_dir();
+        for role in ["coder", "tester"] {
+            assert!(
+                role_registry(role, &root).get("process").is_some(),
+                "{role} can start and monitor a long-running command"
+            );
+        }
+        for role in ["planner", "reviewer", "unknown-role"] {
+            assert!(
+                role_registry(role, &root).get("process").is_none(),
+                "{role} is read-only — no background command pool"
+            );
+        }
     }
 }

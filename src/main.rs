@@ -203,6 +203,20 @@ enum Commands {
     /// (newer or older). The running terminal keeps the version it started with; the next terminal
     /// picks up the installed one.
     Update,
+    /// Show a byte breakdown of what every turn resends: the system prompt (static base +
+    /// environment + memory lanes) and the JSON tool schemas. Runs offline — no request is made.
+    #[command(name = "prompt-size")]
+    PromptSize {
+        /// Model id to size for (the prompt tier depends on it). Defaults to the configured model.
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Per-tool schema sizes, largest first.
+        #[arg(long)]
+        tools: bool,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
     /// Render the moonlit braille art scene (one frame) to the terminal.
     Art,
 }
@@ -300,8 +314,20 @@ enum AgentsCmd {
         #[arg(long)]
         all: bool,
     },
-    /// Pin (or clear) the `model:` a specialist runs on. The model routes through the model→endpoint
-    /// registry at dispatch, so it carries its own base_url/api_key (cross-provider sub-agents).
+    /// Set (or clear) the provider/model assignment for a specialist.
+    #[command(name = "set-provider")]
+    SetProvider {
+        /// Agent name or slug.
+        name: String,
+        /// Saved provider profile name.
+        provider: Option<String>,
+        /// Optional model override; omitted uses the provider default.
+        model: Option<String>,
+        /// Clear the assignment and inherit the sub-agent default.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Pin (or clear) the legacy `model:` field on a specialist card. Prefer set-provider for normal use.
     #[command(name = "set-model")]
     SetModel {
         /// Agent name or slug.
@@ -342,6 +368,9 @@ enum SkillCmd {
         /// Skill name.
         name: String,
     },
+    /// Print the three folders skills are read from, with file counts. The `[project]`/`[repo]` tags
+    /// in `skill list` say which folder a skill came from but not where that folder IS.
+    Where,
     /// Add or overwrite a skill. The body comes from `--body` or stdin.
     Add {
         /// Skill name.
@@ -569,7 +598,18 @@ enum TimeCmd {
         repair: bool,
     },
     /// Remove orphan Time Machine refs/sidecars after validating the authoritative ledger.
-    Gc,
+    ///
+    /// With `--all`, instead sweeps EVERY private store under `~/.aizen/timemachine/` and reports
+    /// orphan stores whose source repository no longer exists (deleted or moved). Dry-run unless
+    /// `--apply` is given, which moves orphans to `~/.aizen/timemachine/.trash/<timestamp>/`.
+    Gc {
+        /// Sweep every repo's store at the home level (orphan-store cleanup), not just this repo.
+        #[arg(long)]
+        all: bool,
+        /// With `--all`: actually move orphan stores to `.trash/` (default is a dry-run report).
+        #[arg(long)]
+        apply: bool,
+    },
     /// Delete ALL checkpoints (Git objects are reclaimed later by normal Git maintenance).
     Clear,
 }
@@ -793,10 +833,60 @@ enum ConfigCmd {
         #[arg(long = "model-endpoint")]
         model_endpoint: Vec<String>,
     },
+    /// Manage named main-endpoint profiles for quick manual failover.
+    Provider {
+        #[command(subcommand)]
+        cmd: ProviderConfigCmd,
+    },
     /// Show the saved config (API key masked).
     Show,
     /// Print the config file path.
     Path,
+}
+
+#[derive(Subcommand, Debug)]
+enum ProviderConfigCmd {
+    /// Add a named endpoint profile. Existing names are rejected.
+    Add {
+        name: String,
+        #[arg(long)]
+        base_url: String,
+        #[arg(long)]
+        api_key: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        context_window: Option<usize>,
+        /// Activate this profile immediately after saving it.
+        #[arg(long = "use")]
+        activate: bool,
+    },
+    /// Edit every field of an existing profile.
+    Edit {
+        name: String,
+        #[arg(long)]
+        base_url: String,
+        #[arg(long)]
+        api_key: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        context_window: Option<usize>,
+    },
+    /// Rename a profile and update role/specialist references.
+    Rename { name: String, new_name: String },
+    /// Activate a saved profile.
+    Use { name: String },
+    /// List saved profiles (keys masked).
+    List,
+    /// Remove a saved profile. Referenced profiles require --replace-with or --force.
+    Remove {
+        name: String,
+        #[arg(long)]
+        replace_with: Option<String>,
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -1059,6 +1149,9 @@ enum MemoryCmd {
     },
     /// Report what is structurally wrong (or merely invisible) in the store. Read-only.
     Doctor,
+    /// Print the folders the store lives in, with file counts — for editing or clearing out many
+    /// entries at once, which no per-id command can do.
+    Where,
     /// Show the three §8 health metrics per week of use (saturation, recall usefulness,
     /// contradictions found). Read-only; reads `stats.jsonl` + the learning audit.
     Health,
@@ -1087,13 +1180,49 @@ enum MemoryCmd {
     ModelList,
 }
 
+/// Suppress Windows "hard error" dialogs process-wide (and for every child we spawn, which inherits
+/// our error mode). `SEM_FAILCRITICALERRORS` is the one that matters here: it turns the modal
+/// "The application was unable to start correctly (0xc0000142)" box — raised by the loader when a
+/// child's DLL init fails — into a plain non-zero exit we can read, instead of a dialog that blocks
+/// a headless/TUI agent forever. `SEM_NOGPFAULTERRORBOX` and `SEM_NOOPENFILEERRORBOX` close the
+/// sibling crash/open-file dialogs. No-op off Windows. Declared via a raw `extern` so no new
+/// windows-sys feature is pulled (kernel32 is always linked).
+#[cfg(windows)]
+fn suppress_hard_error_dialogs() {
+    const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+    const SEM_NOGPFAULTERRORBOX: u32 = 0x0002;
+    const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
+    #[allow(non_snake_case)]
+    extern "system" {
+        fn SetErrorMode(uMode: u32) -> u32;
+    }
+    // SAFETY: `SetErrorMode` is a thread-safe kernel32 call taking a plain flag word; it has no
+    // failure mode we need to observe (it returns the prior mode, which we don't need at startup).
+    unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    }
+}
+
+/// No-op on non-Windows platforms — the hard-error dialog is a Windows concept.
+#[cfg(not(windows))]
+fn suppress_hard_error_dialogs() {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Restore the terminal (leave alt screen, show cursor, reset scroll region + cooked stdin) BEFORE
     // the default panic printer runs, so a panic inside retained/sticky mode never dumps its backtrace
     // into the alternate screen or onto a frame with a restricted scroll region. Idempotent.
     crate::ui::tui::install_panic_hook();
+    // Windows: stop a failing CHILD process from popping a modal "unable to start correctly" box.
+    // A child inherits our error mode, so this one call covers every spawn (git, cmd, sh, mcp, lsp).
+    // Without it, a git.exe that fails loader-init (0xc0000142) blocks behind a dialog the agent
+    // can neither see nor dismiss; with it the child just returns a status we handle. Idempotent.
+    suppress_hard_error_dialogs();
     let cli = Cli::parse();
+    // Before ANY command touches the store: ids the old slugifier cut mid-word are re-slugged whole.
+    // Ahead of the `match` so the CLI paths (`memory list`, `memory show`) and the REPL see the same
+    // ids — see `run_id_migration_once`.
+    run_id_migration_once();
     let command = match cli.command {
         Some(c) => c,
         // Bare `ng` → the interactive landing menu (hermes-style).
@@ -1211,11 +1340,102 @@ async fn main() -> Result<()> {
         Commands::Apps { cmd } => run_apps(cmd).await,
         Commands::Agents { cmd } => run_agents(cmd).await,
         Commands::Update => features::update::run().await,
+        Commands::PromptSize { model, tools, json } => run_prompt_size(model, tools, json),
         Commands::Art => {
             crate::ui::moonscape::run();
             Ok(())
         }
     }
+}
+
+/// `aizen prompt-size` — byte breakdown of the per-turn fixed overhead (system prompt + tool
+/// schemas). Offline: builds the same lanes and the same registry a real turn would, then measures
+/// them. No request is made, so it costs nothing and works without a configured key.
+fn run_prompt_size(model: Option<String>, show_tools: bool, as_json: bool) -> Result<()> {
+    let model = model
+        .or_else(|| cli_config::load().model)
+        .unwrap_or_else(|| "gpt-4o".to_string());
+
+    // Same lanes a turn would send: static base + <environment> (stable) and the memory/persona
+    // blocks (dynamic). LSP is armed first so the registry advertises the symbolic-edit tools.
+    let bundle = active_system_prompt_bundle(&model);
+    arm_lsp_session();
+    let registry = agent::builtin::default_registry_with_task(
+        reqwest::Client::new(),
+        String::new(),
+        String::new(),
+        model.clone(),
+        crate::core::approval::ApprovalMode::Ask,
+        resolve_ctx_window(&model).0,
+        None,
+    )?;
+    let defs = registry.defs();
+    let tools_json = serde_json::to_string(&defs)?;
+
+    let stable = bundle.stable.len();
+    let dynamic = bundle.dynamic.len();
+    let prompt = stable + dynamic;
+    let tools_bytes = tools_json.len();
+    let total = prompt + tools_bytes;
+    // Rough: 4 bytes/token. The real count is tokenizer-specific — this is a budget, not a bill.
+    let tok = |b: usize| b / 4;
+
+    let mut per_tool: Vec<(usize, String)> = defs
+        .iter()
+        .map(|d| {
+            let n = serde_json::to_string(d).map(|s| s.len()).unwrap_or(0);
+            (n, d.function.name.clone())
+        })
+        .collect();
+    per_tool.sort_by(|a, b| b.0.cmp(&a.0));
+
+    if as_json {
+        let out = serde_json::json!({
+            "model": model,
+            "system_prompt": { "bytes": prompt, "stable_bytes": stable, "dynamic_bytes": dynamic },
+            "tools": { "count": defs.len(), "json_bytes": tools_bytes },
+            "fixed_total": { "bytes": total, "approx_tokens": tok(total) },
+            "per_tool": per_tool
+                .iter()
+                .map(|(n, name)| serde_json::json!({ "name": name, "bytes": n }))
+                .collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    let kb = |b: usize| format!("{:.1} KB", b as f64 / 1024.0);
+    println!("Prompt-size breakdown (model={model})\n");
+    println!("  System prompt        : {prompt:>8} B  ({})", kb(prompt));
+    println!(
+        "    stable  (base+env) : {stable:>8} B  ({})  \u{2190} cache-stable prefix",
+        kb(stable)
+    );
+    println!("    dynamic (memory)   : {dynamic:>8} B  ({})", kb(dynamic));
+    println!(
+        "  Tool schemas         : {tools_bytes:>8} B  ({}, {} tools, avg {} B)",
+        kb(tools_bytes),
+        defs.len(),
+        if defs.is_empty() {
+            0
+        } else {
+            tools_bytes / defs.len()
+        }
+    );
+    println!(
+        "  Fixed per turn       : {total:>8} B  ({}, ~{}k tokens)",
+        kb(total),
+        tok(total) / 1000
+    );
+    if show_tools {
+        println!("\n  Per tool, largest first:");
+        for (n, name) in &per_tool {
+            println!("    {n:>6} B  {name}");
+        }
+    } else {
+        println!("\n  (--tools for per-tool sizes, --json for machine output)");
+    }
+    Ok(())
 }
 
 /// `aizen apps …` — connect apps via the MCP registry.
@@ -1765,66 +1985,6 @@ async fn run_reach(cmd: ReachCmd) -> Result<()> {
     Ok(())
 }
 
-// ───────────────────────────── telegram daemon + setup ─────────────────────────────
-
-const SERVE_HELP: &str = "Aizen is listening. Send a message to chat with the agent \
-(read-only tools; destructive ops will ask you to approve here). Follow-ups keep context, so \
-\"now fix it\" works. Prefix with `/agent ` to run fully autonomously (file edits / shell without \
-asking). /new (or /reset) starts a fresh conversation · /resume shows how much context is kept · \
-/help shows this.";
-
-/// Discord has no inline approval routing yet (unlike Telegram's ✓/✗ buttons), so destructive ops
-/// are auto-DENIED on a plain message — the agent simply skips them. This help text says so honestly
-/// instead of promising an approval prompt that never arrives. Use `/agent ` to run autonomously.
-const DISCORD_HELP: &str = "Aizen is listening. Send a message to chat with the agent \
-(read-only tools work as-is). Discord can't show approval prompts yet, so file edits / shell are \
-SKIPPED unless you prefix with `/agent ` to run fully autonomously (no approval needed). \
-Follow-ups keep context, so \"now fix it\" works. /new (or /reset) starts a fresh conversation · \
-/help shows this.";
-
-/// Split text under a platform's UTF-16 limit, preferring newline boundaries so table records and
-/// text-diagram rows stay intact. A single over-limit line falls back to scalar-safe hard splitting.
-fn chunk_text(s: &str, max: usize) -> Vec<String> {
-    if s.encode_utf16().count() <= max {
-        return vec![s.to_string()];
-    }
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut cur_units = 0usize;
-    for segment in s.split_inclusive('\n') {
-        let units = segment.encode_utf16().count();
-        if units <= max {
-            if cur_units + units > max && !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-                cur_units = 0;
-            }
-            cur.push_str(segment);
-            cur_units += units;
-            continue;
-        }
-        if !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
-        }
-        let mut piece = String::new();
-        let mut piece_units = 0usize;
-        for ch in segment.chars() {
-            let u = ch.len_utf16();
-            if piece_units + u > max && !piece.is_empty() {
-                out.push(std::mem::take(&mut piece));
-                piece_units = 0;
-            }
-            piece.push(ch);
-            piece_units += u;
-        }
-        cur = piece;
-        cur_units = piece_units;
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
 /// Run the agent loop once (non-streaming, quiet) and return its final text — used by `aizen serve`
 /// to answer a Telegram message.
 async fn run_agent_capture(
@@ -1883,243 +2043,6 @@ async fn run_agent_capture(
         .unwrap_or_else(|| "(the agent produced no answer)".to_string()))
 }
 
-/// Hard cap on messages retained in one serve (Telegram) session, so a long conversation can't grow
-/// without bound. Generous — the mid-loop context guard handles within-turn pressure.
-const SERVE_SESSION_MAX_MSGS: usize = 40;
-
-/// Bound a serve session's history: drop the OLDEST whole turns (keeping the system prompt at [0])
-/// until under `max`, always cutting at a `user` boundary so an assistant tool-call turn is never
-/// split from its tool results (a dangling tool_call ⇒ a 400 on strict gateways).
-fn cap_session(history: &mut Vec<Message>, max: usize) {
-    let lead = agent::compact::leading_system_count(history).max(1);
-    while history.len() > max {
-        // index of the SECOND user message (the start of the 2nd turn); drop after the system prefix.
-        let second_user = history
-            .iter()
-            .enumerate()
-            .filter(|(i, m)| *i >= lead && m.role == "user")
-            .nth(1)
-            .map(|(i, _)| i);
-        match second_user {
-            Some(i) if i > lead => {
-                history.drain(lead..i);
-            }
-            _ => break, // only one turn present → nothing safe to drop; the loop guard handles it
-        }
-    }
-}
-
-/// Run one `aizen serve` turn over a PERSISTENT per-chat history, so follow-ups like "now fix it" keep
-/// context. Seeds the system prompt (with memory + SOUL + persona) once per session, appends the
-/// user task, drives the loop, learns passively, and bounds the history. A `clarify` yield leaves a
-/// resumable history (the owner's next message is the answer).
-async fn run_serve_turn(
-    http: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-    history: &mut Vec<Message>,
-    task: &str,
-    approval_mode: ApprovalMode,
-) -> Result<String> {
-    if history.is_empty() {
-        // Built once per session → the stable lane stays byte-stable across the conversation.
-        let bundle = refreshed_system_prompt_bundle(model);
-        history.push(Message::system(bundle.stable));
-        if !bundle.dynamic.trim().is_empty() {
-            history.push(Message::system(bundle.dynamic));
-        }
-    }
-    history.push(Message::user(task.to_string()));
-
-    arm_lsp_session();
-    let registry = agent::builtin::default_registry_with_task(
-        http.clone(),
-        base_url.to_string(),
-        api_key.to_string(),
-        model.to_string(),
-        approval_mode,
-        resolve_ctx_window(model).0,
-        None, // cwd IS the project on the CLI path
-    )?;
-    let cfg = AgentConfig {
-        approval_mode,
-        quiet: true,
-        enable_verify_gate: false,
-        context_window: resolve_ctx_window(model).0,
-        enable_lsp: crate::agent::lsp::LSP.is_enabled(),
-        ..Default::default()
-    };
-    let http_ref = http;
-    let base = base_url;
-    let key = api_key;
-    let model_ref = model;
-    let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
-        client::chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
-    };
-    // Mid-loop auto-compaction for long serve sessions: a NON-streaming summarize closure over the
-    // same endpoint. `cap_session` below stays only as a hard backstop (compaction usually keeps the
-    // history well under its cap).
-    let sum_ep = summarizer_endpoint(base, key, model_ref);
-    let summarize = move |msgs: Vec<Message>| {
-        let ep = sum_ep.clone();
-        async move {
-            chore_chat(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
-                .await
-                .map(|t| t.content.unwrap_or_default())
-        }
-    };
-    let outcome =
-        agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, history).await?;
-
-    // The bot path keeps the FREE regex learning and does NOT run the end-of-turn secretary. Two
-    // reasons, both worth stating rather than leaving as an accident of the refactor:
-    //   - a bot has no cwd, so `place` anchoring is meaningless here; it reads `user`/`device` facts
-    //     through the frozen core, which is machine-stable after phase 1.
-    //   - the secretary is a model call per gated turn. On a chat bot that is a standing cost the
-    //     operator should opt into, not inherit.
-    // Because no REPL loop calls this any more, the two write paths can no longer both fire on one
-    // turn — which was the reason to worry about having both.
-    maybe_learn_memory(history);
-    cap_session(history, SERVE_SESSION_MAX_MSGS);
-
-    if let StopReason::AwaitingInput(q) = &outcome.stop {
-        return Ok(format!("❓ {q}"));
-    }
-    Ok(outcome
-        .final_text
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "(the agent produced no answer)".to_string()))
-}
-
-/// `aizen serve` — the long-lived daemon: one poll loop owns getUpdates, an agent runner handles one
-/// message at a time, and destructive-op approvals route to the phone (via the approval gate).
-async fn run_serve() -> Result<()> {
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
-
-    let (client, cfg) = telegram::configured()
-        .context("telegram not configured — run `aizen telegram setup` first")?;
-    let (base_url, api_key, model) = resolve_endpoint(None, None, None)
-        .context("configure the model endpoint first (run `aizen config`)")?;
-    let http = http_client()?;
-
-    telegram::set_daemon_active(true);
-    let client = Arc::new(client);
-    eprintln!(
-        "{}",
-        style(format!(
-            "aizen serve — listening on Telegram (Ctrl-C to stop). chats: {:?}",
-            cfg.allowed_chat_ids
-        ))
-        .dim()
-    );
-
-    let (tx, mut rx) = mpsc::channel::<(i64, String)>(64);
-
-    let poll_client = client.clone();
-    let poll_cfg = cfg.clone();
-    let poll = tokio::spawn(async move {
-        let mut offset = 0i64;
-        loop {
-            let updates = match poll_client
-                .get_updates(offset, telegram::POLL_TIMEOUT_SECS)
-                .await
-            {
-                Ok(u) => u,
-                Err(e) => {
-                    eprintln!("[poll] {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    continue;
-                }
-            };
-            for u in updates {
-                offset = offset.max(u.update_id + 1);
-                if let Some(cb) = u.callback_query {
-                    let chat = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(cb.from.id);
-                    if telegram::is_allowed(&poll_cfg, chat) {
-                        if let Some((id, ok)) =
-                            cb.data.as_deref().and_then(telegram::parse_callback)
-                        {
-                            telegram::resolve_approval(&id, ok);
-                        }
-                    }
-                    let _ = poll_client.answer_callback(&cb.id, "").await;
-                    continue;
-                }
-                if let Some(msg) = u.message {
-                    if telegram::is_allowed(&poll_cfg, msg.chat.id) {
-                        if let Some(text) = msg.text {
-                            let _ = tx.send((msg.chat.id, text)).await;
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    // Per-chat conversation history → follow-ups ("now fix it") keep context. In-memory only
-    // (a daemon restart starts fresh); `/new`/`/reset` clear a chat, `/resume` reports its size.
-    let mut sessions: std::collections::HashMap<i64, Vec<Message>> =
-        std::collections::HashMap::new();
-
-    loop {
-        let (chat, text) = tokio::select! {
-            biased;
-            _ = tokio::signal::ctrl_c() => { eprintln!("\nshutting down…"); crate::agent::process::kill_all(); break; }
-            m = rx.recv() => match m { Some(m) => m, None => break },
-        };
-        let trimmed = text.trim();
-        if trimmed == "/help" || trimmed == "/start" {
-            let _ = client.send_message(chat, SERVE_HELP).await;
-            continue;
-        }
-        if trimmed == "/new" || trimmed == "/reset" {
-            sessions.remove(&chat);
-            let _ = client
-                .send_message(
-                    chat,
-                    "🆕 started a fresh conversation — earlier context dropped.",
-                )
-                .await;
-            continue;
-        }
-        if trimmed == "/resume" {
-            let turns = sessions
-                .get(&chat)
-                .map(|h| h.iter().filter(|m| m.role == "user").count())
-                .unwrap_or(0);
-            let msg = if turns == 0 {
-                "🧵 no active conversation — just send a message to start one.".to_string()
-            } else {
-                format!("🧵 continuing — {turns} message(s) of context kept. /new to start over.")
-            };
-            let _ = client.send_message(chat, &msg).await;
-            continue;
-        }
-        let (task, approval) = match trimmed.strip_prefix("/agent ") {
-            Some(rest) => (rest.trim().to_string(), ApprovalMode::Yolo),
-            None => (trimmed.to_string(), approval_mode()),
-        };
-        if task.is_empty() {
-            continue;
-        }
-        let _ = client.send_message(chat, "⏳ working…").await;
-        let history = sessions.entry(chat).or_default();
-        let reply = run_serve_turn(&http, &base_url, &api_key, &model, history, &task, approval)
-            .await
-            .unwrap_or_else(|e| format!("error: {e}"));
-        let shown = crate::ui::markdown::render_plain_blocks(&reply);
-        for piece in chunk_text(&shown, 3500) {
-            let _ = client.send_message(chat, &piece).await;
-        }
-    }
-
-    telegram::set_daemon_active(false);
-    poll.abort();
-    Ok(())
-}
-
 // ───────────────────────── project identity (where + zones) ─────────────────────────
 
 #[derive(Subcommand, Debug)]
@@ -2150,6 +2073,103 @@ fn redact_remote_url(url: &str) -> String {
         Some(at) if rest[..at].contains(':') => format!("{scheme}***@{}", &rest[at + 1..]),
         _ => url.to_string(),
     }
+}
+
+/// How many `*.md` files a store directory holds, and a `(not created yet)` note when it doesn't
+/// exist. Shared by both `where` reports so an absent folder never reads as an empty one.
+fn dir_count_line(label: &str, p: &std::path::Path, unit: &str) -> String {
+    if !p.exists() {
+        return format!("  {label:<8}: {}   (not created yet)", p.display());
+    }
+    let n = std::fs::read_dir(p)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
+                .count()
+        })
+        .unwrap_or(0);
+    format!("  {label:<8}: {}   {n} {unit}", p.display())
+}
+
+/// Where the memory store physically lives, per directory, with counts.
+///
+/// `memory list` names three commands and every one of them edits a SINGLE entry by id. Bulk work —
+/// deleting forty near-duplicates, fixing a wrong word across many facts — is a file-manager job, and
+/// until now the only place any path appeared was `memory show <id>`'s `file:` line, one entry at a
+/// time. Naming the review dir matters most: 29 queued candidates sat there unreadable because
+/// nothing said they were on disk at all.
+fn memory_where_report() -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{}",
+        dir_count_line("entries", &crate::core::config::entries_dir(), "fact(s)")
+    );
+    let _ = writeln!(
+        s,
+        "{}",
+        dir_count_line("review", &crate::core::config::review_dir(), "awaiting")
+    );
+    let _ = writeln!(
+        s,
+        "{}",
+        dir_count_line("archive", &crate::core::config::archive_dir(), "retired")
+    );
+    let graph = crate::core::config::graph_path();
+    let edges = std::fs::read_to_string(&graph)
+        .map(|r| r.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
+    let _ = writeln!(s, "  {:<8}: {}   {edges} edge(s)", "graph", graph.display());
+    let _ = writeln!(
+        s,
+        "  {:<8}: {}",
+        "core",
+        crate::core::config::style_path().display()
+    );
+    let _ = write!(
+        s,
+        "{}",
+        style(
+            "\nEdit or delete files directly — they are plain markdown with a frontmatter header.\n\
+             Re-run `aizen memory doctor` afterwards to catch anything left dangling."
+        )
+        .dim()
+    );
+    s
+}
+
+/// Where skills are read from — all three roots, because `skill list`'s `[project]`/`[repo]` tags
+/// say which root a row came from without saying where that root is, and auto-learned skills land in
+/// the zone dir whose slug (`p/admin-5296147b`) is not guessable from the project name.
+fn skill_where_report() -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{}",
+        dir_count_line("global", &crate::skills::skills_dir(), "skill(s)")
+    );
+    let _ = writeln!(
+        s,
+        "{}",
+        dir_count_line("zone", &crate::skills::project_zone_dir(), "skill(s)")
+    );
+    let _ = writeln!(
+        s,
+        "  {}",
+        style(format!(
+            "         ↑ auto-learned skills for zone {}",
+            crate::core::config::project_slug()
+        ))
+        .dim()
+    );
+    let _ = write!(
+        s,
+        "{}",
+        dir_count_line("repo", &crate::skills::project_skills_dir(), "skill(s)")
+    );
+    s
 }
 
 /// The identity card — one honest surface for the questions that previously had none: which
@@ -2228,6 +2248,12 @@ fn where_report() -> String {
     );
     let _ = writeln!(s, "codebase idx : {}{}", idx.display(), exists(&idx));
     let _ = writeln!(s, "sessions     : {}", sessions_dir().display());
+    if let Some(n) = sessions_with_secrets() {
+        let _ = writeln!(
+            s,
+            "⚠ secrets     : {n} saved transcript(s) contain credential-shaped text — a key pasted into a chat is stored verbatim. Open the folder above and edit or delete them."
+        );
+    }
     if let Some(l) = crate::features::zones::quick_legacy_probe() {
         let _ = writeln!(
             s,
@@ -2235,6 +2261,35 @@ fn where_report() -> String {
         );
     }
     s.trim_end().to_string()
+}
+
+/// How many saved transcripts hold credential-shaped text, or `None` when none do.
+///
+/// Names are guarded at derivation (see [`suggest_session_name`]), but a key pasted into a chat is
+/// still in that file's message text: a saved session is a verbatim transcript, and nothing redacts
+/// it on the way to disk. Deleting or rewriting a user's own conversation history is not a call this
+/// tool makes on its own, so `/where` reports the count and names the folder — the number is
+/// actionable, and the values are never printed.
+///
+/// Uses the vendor-prefix test, NOT the shape test that guards name derivation. Measured on the 27
+/// real transcripts here: prefix matches 12 strings, all real keys; shape matched 5170, of which 4026
+/// were ISO timestamps (long, mixed-case, letters and digits — indistinguishable from key material by
+/// shape alone). A warning that fires on every file teaches the user to ignore it.
+///
+/// Counts FILES, not occurrences: the useful signal is "which files do I need to open".
+fn sessions_with_secrets() -> Option<usize> {
+    let rd = std::fs::read_dir(sessions_dir()).ok()?;
+    let n = rd
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+        .filter(|e| {
+            std::fs::read_to_string(e.path()).is_ok_and(|raw| {
+                raw.split(|c: char| c.is_whitespace() || matches!(c, '"' | ',' | '\\'))
+                    .any(crate::core::slug::has_vendor_key_prefix)
+            })
+        })
+        .count();
+    (n > 0).then_some(n)
 }
 
 fn run_zone(cmd: ZoneCmd) -> Result<()> {
@@ -2546,16 +2601,57 @@ fn run_time(cmd: TimeCmd) -> Result<()> {
             }
             Ok(())
         }
-        TimeCmd::Gc => {
-            let report = timemachine::doctor_gc()?;
-            println!(
-                "{} repo {} · worktree {} · {} checkpoint(s)",
-                style("🧹 time metadata cleaned:").color256(splash::ACCENT),
-                report.repo_id,
-                report.worktree_id,
-                report.checkpoints
-            );
-            Ok(())
+        TimeCmd::Gc { all, apply } => {
+            if all {
+                let report = timemachine::gc_all(apply)?;
+                let fmt_mb = |b: u64| format!("{:.1} MB", b as f64 / 1_048_576.0);
+                if report.orphans.is_empty() {
+                    println!(
+                        "{} {} store(s) scanned · no orphans (every source repo still exists)",
+                        style("🧹 time gc --all:").color256(splash::ACCENT),
+                        report.stores.len()
+                    );
+                } else {
+                    let total: u64 = report.orphans.iter().map(|o| o.bytes).sum();
+                    println!(
+                        "{} {} orphan store(s), {} reclaimable:",
+                        style("🧹 time gc --all:").color256(splash::ACCENT),
+                        report.orphans.len(),
+                        fmt_mb(total)
+                    );
+                    for o in &report.orphans {
+                        println!(
+                            "  {} · {} · {} checkpoint(s) · source gone: {}",
+                            o.repo_id,
+                            fmt_mb(o.bytes),
+                            o.checkpoints,
+                            o.source.as_deref().unwrap_or("(unknown)")
+                        );
+                    }
+                    if report.applied {
+                        println!(
+                            "  → moved to {}",
+                            report.trash_dir.as_deref().unwrap_or("(trash)")
+                        );
+                    } else {
+                        println!(
+                            "  (dry-run — re-run with {} to move these to .trash/)",
+                            style("--apply").bold()
+                        );
+                    }
+                }
+                Ok(())
+            } else {
+                let report = timemachine::doctor_gc()?;
+                println!(
+                    "{} repo {} · worktree {} · {} checkpoint(s)",
+                    style("🧹 time metadata cleaned:").color256(splash::ACCENT),
+                    report.repo_id,
+                    report.worktree_id,
+                    report.checkpoints
+                );
+                Ok(())
+            }
         }
         TimeCmd::Clear => {
             let n = timemachine::clear()?;
@@ -3107,79 +3203,6 @@ async fn discord_setup() -> Result<()> {
         "\n{}",
         style("Saved. Start the bot with:  aizen discord serve").color256(splash::ACCENT)
     );
-    Ok(())
-}
-
-/// `aizen discord serve` — the Discord bot daemon. A gateway task receives messages (heartbeating
-/// independently); this loop runs the agent one message at a time (per-channel history) and replies
-/// over REST. Mirrors `run_serve` (Telegram). NOTE: destructive-op approvals are not yet routed to
-/// Discord, so edits need `/yolo`/smart approval; read/research work as-is.
-async fn run_discord_serve() -> Result<()> {
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
-
-    let (client, cfg) =
-        discord::configured().context("Discord bot not configured — run `aizen discord setup`")?;
-    let (base_url, api_key, model) = resolve_endpoint(None, None, None)
-        .context("configure the model endpoint first (run `aizen config`)")?;
-    let http = http_client()?;
-    let token = cfg.resolved_token().context("no bot token")?;
-    let client = Arc::new(client);
-    eprintln!(
-        "{}",
-        style(format!(
-            "aizen serve — listening on Discord (Ctrl-C to stop). channels: {:?}",
-            cfg.allowed_channel_ids
-        ))
-        .dim()
-    );
-
-    let (tx, mut rx) = mpsc::channel::<discord::Incoming>(64);
-    let gw_cfg = cfg.clone();
-    let gw = tokio::spawn(async move { discord::run_gateway(token, gw_cfg, tx).await });
-
-    // Per-channel conversation history → follow-ups keep context (in-memory; /new resets).
-    let mut sessions: std::collections::HashMap<u64, Vec<Message>> =
-        std::collections::HashMap::new();
-    loop {
-        let inc = tokio::select! {
-            biased;
-            _ = tokio::signal::ctrl_c() => { eprintln!("\nshutting down…"); crate::agent::process::kill_all(); break; }
-            m = rx.recv() => match m { Some(m) => m, None => break },
-        };
-        let trimmed = inc.content.trim();
-        if trimmed == "/help" || trimmed == "/start" {
-            let _ = client.send_message(inc.channel_id, DISCORD_HELP).await;
-            continue;
-        }
-        if trimmed == "/new" || trimmed == "/reset" {
-            sessions.remove(&inc.channel_id);
-            let _ = client
-                .send_message(
-                    inc.channel_id,
-                    "🆕 started a fresh conversation — earlier context dropped.",
-                )
-                .await;
-            continue;
-        }
-        let (task, approval) = match trimmed.strip_prefix("/agent ") {
-            Some(rest) => (rest.trim().to_string(), ApprovalMode::Yolo),
-            None => (trimmed.to_string(), approval_mode()),
-        };
-        if task.is_empty() {
-            continue;
-        }
-        let _ = client.send_message(inc.channel_id, "⏳ working…").await;
-        let history = sessions.entry(inc.channel_id).or_default();
-        let reply = run_serve_turn(&http, &base_url, &api_key, &model, history, &task, approval)
-            .await
-            .unwrap_or_else(|e| format!("error: {e}"));
-        let shown = crate::ui::markdown::render_plain_blocks(&reply);
-        for piece in chunk_text(&shown, discord::MESSAGE_MAX) {
-            let _ = client.send_message(inc.channel_id, &piece).await;
-        }
-    }
-    gw.abort();
     Ok(())
 }
 
@@ -3806,7 +3829,7 @@ fn skill_delete_interactive(skills: &[skill::Skill]) {
                 .color256(splash::ACCENT)
             ),
             Ok(false) => println!("{}", style("(already gone)").dim()),
-            Err(e) => eprintln!("{} {e}", style("skill:").red()),
+            Err(e) => tui::note_line(&format!("{} {e}", style("skill:").red())),
         }
     }
 }
@@ -3889,15 +3912,15 @@ async fn skills_menu() -> Result<()> {
             println!("\n{}", style(skill::render_loaded(&skills[pick])).dim()); // view, then loop
         } else if pick == n {
             if let Err(e) = skill_new_interactive() {
-                eprintln!("{} {e}", style("skill:").red());
+                tui::note_line(&format!("{} {e}", style("skill:").red()));
             }
         } else if pick == n + 1 {
             if let Err(e) = skill_fetch_interactive().await {
-                eprintln!("{} {e}", style("skill:").red());
+                tui::note_line(&format!("{} {e}", style("skill:").red()));
             }
         } else if pick == n + 2 {
             if let Err(e) = skill_search_interactive().await {
-                eprintln!("{} {e}", style("skill:").red());
+                tui::note_line(&format!("{} {e}", style("skill:").red()));
             }
         } else if n > 0 && pick == n + 3 {
             skill_delete_interactive(&skills);
@@ -3927,7 +3950,7 @@ fn skill_restore_interactive(retired: &[skill::Skill]) {
             "{}",
             style(format!("restored '{}'", names[i])).color256(splash::ACCENT)
         ),
-        Err(e) => eprintln!("{} {e}", style("skill:").red()),
+        Err(e) => tui::note_line(&format!("{} {e}", style("skill:").red())),
     }
 }
 
@@ -4336,12 +4359,12 @@ async fn personas_menu(history: &mut Vec<Message>, model: &str) -> Result<()> {
         match actions[pick - n].as_str() {
             "+ New persona" => {
                 if let Err(e) = persona_new_interactive() {
-                    eprintln!("{} {e}", style("persona:").red());
+                    tui::note_line(&format!("{} {e}", style("persona:").red()));
                 }
             }
             "Paste a character prompt → auto-create" => {
                 if let Err(e) = persona_paste_interactive(history, model).await {
-                    eprintln!("{} {e}", style("persona:").red());
+                    tui::note_line(&format!("{} {e}", style("persona:").red()));
                 }
             }
             a if a.starts_with("Evolution:") => {
@@ -4420,7 +4443,7 @@ async fn personas_menu(history: &mut Vec<Message>, model: &str) -> Result<()> {
                             );
                         }
                         Ok(false) => println!("{}", style("(already gone)").dim()),
-                        Err(e) => eprintln!("{} {e}", style("persona:").red()),
+                        Err(e) => tui::note_line(&format!("{} {e}", style("persona:").red())),
                     }
                 }
             }
@@ -4955,7 +4978,10 @@ async fn first_run_onboarding() {
 
     if let Err(e) = config_wizard().await {
         // A cancelled/failed wizard shouldn't abort the launch — fall through into the menu.
-        eprintln!("{} {e}", style("setup:").color256(crate::ui::theme::WARN));
+        tui::note_line(&format!(
+            "{} {e}",
+            style("setup:").color256(crate::ui::theme::WARN)
+        ));
         eprintln!(
             "{}",
             style("You can finish later with `aizen config`.").color256(crate::ui::theme::FAINT)
@@ -4975,7 +5001,10 @@ async fn first_run_onboarding() {
         .unwrap_or(false);
     if connect {
         if let Err(e) = apps_menu().await {
-            eprintln!("{} {e}", style("apps:").color256(crate::ui::theme::WARN));
+            tui::note_line(&format!(
+                "{} {e}",
+                style("apps:").color256(crate::ui::theme::WARN)
+            ));
         }
     }
 
@@ -5157,6 +5186,45 @@ fn identity_banner() -> (String, Vec<String>) {
     (main, notes)
 }
 
+/// Re-slug memory ids the old ASCII-only slugifier shredded (76% of a measured real store), once per
+/// home, before any command reads the store.
+///
+/// Called from `main` rather than the REPL banner: `aizen memory list` is a CLI path that never
+/// builds a banner, so migrating there would have left the two surfaces disagreeing about what an id
+/// is — the CLI printing shredded names while the REPL printed readable ones, and `memory show <id>`
+/// working with only one of them.
+///
+/// It renames the user's files without asking, which they chose; it does not do so silently, which
+/// they did not. The count and the old→new map's path go to stderr so a piped `memory list` stays
+/// machine-readable.
+fn run_id_migration_once() {
+    if let Some(rep) = crate::memory::migrate_ids::run_once_at_startup() {
+        if let Some(n) = rep.notice() {
+            eprintln!("{}", style(n).dim());
+        }
+        for w in rep.warnings.iter().take(3) {
+            eprintln!(
+                "{} {w}",
+                style("⚠ memory id migration:").color256(theme::WARN)
+            );
+        }
+    }
+    // Persona self-memory filenames had the same defect, worse in proportion (45 of 89 files on the
+    // measured store) and less visible, because `/persona self` renders bodies rather than names.
+    // Separate pass, separate per-persona flag: a character created later still gets migrated.
+    if let Some(rep) = crate::persona::migrate_stems::run_once_at_startup() {
+        if let Some(n) = rep.notice() {
+            eprintln!("{}", style(n).dim());
+        }
+        for w in rep.warnings.iter().take(3) {
+            eprintln!(
+                "{} {w}",
+                style("⚠ persona stem migration:").color256(theme::WARN)
+            );
+        }
+    }
+}
+
 /// Startup update housekeeping, shared by both REPL surfaces.
 ///
 /// Sweeps the `.old-*` backups an earlier `/update` left behind (nothing holds them once that
@@ -5181,6 +5249,10 @@ async fn run_menu_sticky() -> Result<()> {
     let mut model_label = cli_config::load()
         .model
         .unwrap_or_else(|| "(no model)".to_string());
+    // Pin this window to the model it launched with, so another window's `/model` (which rewrites the
+    // shared cli-config.json) can't retarget this one on its next turn. Skipped when no model is set
+    // yet — a first-run window must still adopt whatever `/config`/`/model` configures here.
+    cli_config::pin_session_model(&model_label);
     let mut history: Vec<Message> = Vec::new();
     rebuild_system(&mut history, &model_label);
     let repo_scope = crate::core::recovery::current_repo_scope();
@@ -5210,6 +5282,12 @@ async fn run_menu_sticky() -> Result<()> {
         startup_update_probe();
     }
     crate::core::recovery::begin(repo_scope.clone(), current_session_slug());
+    // Housekeeping for everything the previous runs could not clean up after themselves: lease
+    // directories from abrupt shutdowns (the clean-exit path never ran) and staging files from a
+    // write that was killed mid-rename. Both are pure accumulation — neither affects correctness,
+    // and neither had any collector before.
+    crate::core::recovery::sweep_expired();
+    sweep_orphan_temps();
     // Publish this window to the repository's session registry so the OTHER aizen windows (and the
     // one that eventually reviews and commits) can see it exists, what it is doing, and which files
     // it has changed. Best-effort: a registry failure never blocks the REPL.
@@ -5392,6 +5470,15 @@ async fn run_menu_sticky() -> Result<()> {
                     );
                 }
                 model_label = model.clone();
+                // Seed the query-expansion endpoint from THIS turn's resolution so a non-English
+                // `codebase_search` can translate itself to English identifiers via the chore model.
+                // Re-seeded every turn so it follows a mid-session `/model` switch. Routes through the
+                // summarizer role internally; the LLM tier still stays behind `AIZEN_QUERY_EXPAND`.
+                agent::query_lang::set_expansion_endpoint(&cli_config::ResolvedEndpoint {
+                    base_url: base_url.clone(),
+                    api_key: api_key.clone(),
+                    model: model.clone(),
+                });
                 migrate_legacy_prompt_lanes(&mut history, &model);
                 // The rotating discoverability tip is emitted AFTER the turn finishes (see the
                 // success branch below) so it lands UNDER the model's final answer, not stranded
@@ -5833,6 +5920,7 @@ async fn run_menu_plain() -> Result<()> {
     let mut model_label = cli_config::load()
         .model
         .unwrap_or_else(|| "(no model)".to_string());
+    cli_config::pin_session_model(&model_label); // see the sticky REPL: per-window model, not per-disk
     let mut history: Vec<Message> = Vec::new();
     let mut input_history: Vec<String> = Vec::new(); // recallable past prompts (↑/↓ in the box)
     rebuild_system(&mut history, &model_label);
@@ -5940,6 +6028,12 @@ async fn run_menu_plain() -> Result<()> {
             }
         };
         model_label = model.clone();
+        // See the sticky REPL: seed the query-expansion endpoint per turn so it follows `/model`.
+        agent::query_lang::set_expansion_endpoint(&cli_config::ResolvedEndpoint {
+            base_url: base_url.clone(),
+            api_key: api_key.clone(),
+            model: model.clone(),
+        });
         migrate_legacy_prompt_lanes(&mut history, &model);
         // Per-turn reasoning-effort auto-detect (mirrors the sticky REPL): classify what the user
         // TYPED, not the expanded payload — see the sticky path for why. Falls back to the finalized
@@ -5992,7 +6086,7 @@ async fn run_menu_plain() -> Result<()> {
         ) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("{} {e}", style("error:").red());
+                tui::note_line(&format!("{} {e}", style("error:").red()));
                 history.pop();
                 continue;
             }
@@ -6128,7 +6222,7 @@ async fn run_menu_plain() -> Result<()> {
                 autosave_session(&history, &http, &base_url, &api_key, &model).await;
             }
             Err(e) => {
-                eprintln!("{} {e}", style("error:").red());
+                tui::note_line(&format!("{} {e}", style("error:").red()));
                 if history.last().map(|m| m.role == "user").unwrap_or(false) {
                     history.pop(); // drop the failed user turn so history stays consistent
                 }
@@ -6368,26 +6462,52 @@ async fn maybe_run_secretary(
     }
 
     // Skill — save fresh, or fold into the existing one when the model asked to refine.
+    // DEDUP (fix C, 2026-08-06): before auto-creating a NEW skill, compare the proposed `when` +
+    // `steps` against every existing skill with `match_similarity`. Three identical "verify GitHub
+    // Actions YAML" skills were observed on the same day because the only collision key was the slug,
+    // and minor wording changes in the name produced different slugs. Now a new skill whose trigger
+    // resembles an existing one gets routed to `refine` instead of spawning a duplicate.
     if let Some(sk) = out.skill.as_ref() {
         if auto_skill_learn_enabled() {
+            use crate::memory::learning::match_text;
             let slug = skill::sanitize_name(&sk.name);
-            let exists = skill::list()
+            let all_skills = skill::list();
+            let exact_exists = all_skills
                 .iter()
                 .any(|s| skill::sanitize_name(&s.name) == slug);
-            let done = if exists {
+            // Check if any existing skill has a semantically similar trigger.
+            let similar_skill = if !exact_exists {
+                all_skills.iter().find(|s| {
+                    let trigger_sim = match_text::match_similarity(&sk.when, &s.when);
+                    let body_sim = match_text::match_similarity(&sk.steps, &s.body);
+                    // Both trigger AND body must resemble — trigger alone would merge skills that
+                    // fire in the same situation but do different things.
+                    trigger_sim >= 0.45 && body_sim >= 0.35
+                })
+            } else {
+                None
+            };
+            let done = if exact_exists {
                 // Only fold when the model MEANT to; otherwise a same-named skill is a collision to
                 // leave alone, not a licence to overwrite the user's procedure.
                 sk.refine && skill::refine(&sk.name, &sk.steps, None, Some(&sk.when)).is_ok()
+            } else if let Some(existing) = similar_skill {
+                // Similar enough to refine rather than duplicate. Route to the existing skill.
+                skill::refine(&existing.name, &sk.steps, None, Some(&sk.when)).is_ok()
             } else {
                 skill::save_scoped(&sk.name, "", &sk.when, &sk.steps, true).is_ok()
             };
             if done {
+                let label = if exact_exists || similar_skill.is_some() {
+                    "refined"
+                } else {
+                    "learned"
+                };
+                let display_name = similar_skill.map(|s| s.name.as_str()).unwrap_or(&sk.name);
                 tui::emit_line(
                     &style(format!(
-                        "{}{} skill '{}' — /skills to view",
+                        "{}{label} skill '{display_name}' — /skills to view",
                         icons::g(icons::learned()),
-                        if exists { "refined" } else { "learned" },
-                        sk.name
                     ))
                     .color256(splash::ACCENT)
                     .to_string(),
@@ -6811,11 +6931,6 @@ fn hostbot_prompt_bundle(
         };
         system_prompt_bundle_in(model, &frozen, Some(root))
     })
-}
-
-/// Flattened active prompt for callers that still expect a single string.
-fn current_system_prompt(model: &str) -> String {
-    active_system_prompt_bundle(model).flatten()
 }
 
 /// Seed both system lanes for a brand-new conversation.
@@ -8070,7 +8185,8 @@ Commands:
   /init [--force|--status]  index the codebase into a semantic chunk index (SHA-256 incremental, secrets redacted); powers codebase_search + auto per-turn retrieval. --force rebuilds, --status shows state, Esc cancels
   /where             show THIS project's identity: root · zone slug · git executable · where memory/skills/sessions live (also `aizen where`, `aizen zone migrate`)
   /model             list the provider's models (with context windows) + pick one
-  /config            set endpoint + key + model (wizard)
+  /provider [name]   one-pick switch; `add` creates and `manage` edits/renames/deletes providers
+  /config            set endpoint + key + model and manage provider profiles
   /memory [query]    show your profile, or search memory; /memory remember <fact> to save
   /persona           pick the character the agent role-plays (list · select · new · clear · delete)
   /skills            saved procedures the agent can load (list · view · new · delete)
@@ -8084,7 +8200,7 @@ Commands:
   /import            resume a conversation started in another CLI (Claude Code or Codex) — pick from transcripts whose cwd matches this project
   /where             which project/zone you're in, and which file this conversation is saved to
   /workflows         multi-agent status — live task/workflow children, sub-agent slots (also /wf)
-  /agents            specialist sub-agents you can delegate to — list · set-model <name> <model> (routes model→endpoint)
+  /agents            specialist sub-agents — list · set-provider <agent> <provider> [model]
   /recover           a session interrupted by a crash/kill — restore its transcript + unsent draft, or /recover discard
   /timemachine       browse every checkpoint (▸ = current) and pick one to jump back to that code + chat; also /timeline · /tm · /undo · /redo
   /diff              what changed in the working tree since a checkpoint (read before you /undo)
@@ -8318,14 +8434,37 @@ fn fmt_time_ago(built_unix: u64) -> String {
     }
 }
 
-/// `/agents` — list installed specialists with their model pin; `/agents set-model <name> <model>`
-/// pins (or, with no model / `clear`, clears) the model a specialist runs on. The pin routes through
-/// the model→endpoint registry at dispatch, so it carries its own gateway (cross-provider).
+/// `/agents` — list installed specialists with their effective provider/model assignment. The normal
+/// write path is `/agents set-provider`; legacy card `set-model` remains available for compatibility.
 fn slash_agents(arg: &str) {
     let mut parts = arg.splitn(2, char::is_whitespace);
     let sub = parts.next().unwrap_or("").trim();
     let rest = parts.next().unwrap_or("").trim();
     match sub {
+        "set-provider" | "provider" => {
+            let mut rp = rest.split_whitespace();
+            let name = rp.next().unwrap_or("");
+            let provider = rp.next().unwrap_or("");
+            let model = rp.next();
+            if name.is_empty() || provider.is_empty() {
+                tui::emit_line(&style("usage: /agents set-provider <agent> <provider> [model]   ·   clear: /agents set-provider <agent> clear").dim().to_string());
+                return;
+            }
+            let mut cfg = cli_config::load();
+            let result = if provider.eq_ignore_ascii_case("clear") || provider == "-" {
+                cfg.set_agent_route(name, None, None)
+            } else {
+                cfg.set_agent_route(name, Some(provider.to_string()), model.map(str::to_string))
+            };
+            match result.and_then(|_| cli_config::save(&cfg)) {
+                Ok(()) => tui::emit_line(
+                    &style(format!("updated provider assignment for '{name}'"))
+                        .color256(theme::OK)
+                        .to_string(),
+                ),
+                Err(e) => tui::emit_line(&format!("{} {e:#}", style("agents:").red())),
+            }
+        }
         "set-model" | "model" => {
             let mut rp = rest.splitn(2, char::is_whitespace);
             let name = rp.next().unwrap_or("").trim();
@@ -8355,18 +8494,29 @@ fn slash_agents(arg: &str) {
             }
             let enabled = agents::enabled_set();
             let mut out = String::from("specialist agents (● pinned to <agents> index / ○ not):\n");
+            let cfg = cli_config::load();
             for def in &all {
                 let slug = def.slug();
                 let pin = enabled.as_ref().map(|s| s.contains(&slug)).unwrap_or(true);
                 let mark = if pin { "●" } else { "○" };
-                let model = def.model.as_deref().unwrap_or("(parent model)");
-                out.push_str(&format!("  {mark} {:<24} model: {model}\n", slug));
+                let route = cfg.agent_route(&slug);
+                let provider = route
+                    .and_then(|r| r.provider.as_deref())
+                    .unwrap_or("inherit");
+                let model = route
+                    .and_then(|r| r.model.as_deref())
+                    .or(def.model.as_deref())
+                    .unwrap_or("default");
+                out.push_str(&format!(
+                    "  {mark} {:<24} provider: {provider} · model: {model}\n",
+                    slug
+                ));
             }
-            out.push_str("\nset a model:  /agents set-model <name> <model>   ·   clear:  /agents set-model <name> clear");
+            out.push_str("\nset a provider: /agents set-provider <agent> <provider> [model]   ·   clear: ... <agent> clear");
             tui::emit_line(&out.trim_end().to_string());
         }
         other => {
-            tui::emit_line(&style(format!("unknown /agents subcommand '{other}' — try /agents or /agents set-model <name> <model>")).dim().to_string());
+            tui::emit_line(&style(format!("unknown /agents subcommand '{other}' — try /agents or /agents set-provider <agent> <provider> [model]")).dim().to_string());
         }
     }
 }
@@ -8980,12 +9130,12 @@ async fn handle_slash(
         }
         "sessions" => {
             if let Err(e) = sessions_menu(history, model_label).await {
-                eprintln!("{} {e}", style("sessions:").red());
+                tui::note_line(&format!("{} {e}", style("sessions:").red()));
             }
         }
         "import" => {
             if let Err(e) = import_menu(history, model_label).await {
-                eprintln!("{} {e}", style("import:").red());
+                tui::note_line(&format!("{} {e}", style("import:").red()));
             }
         }
         // One keystroke back into the last conversation. `/sessions` could already restore, but it
@@ -9351,12 +9501,58 @@ async fn handle_slash(
                 ),
             }
         }
+        "provider" | "providers" => {
+            let selected = if arg.eq_ignore_ascii_case("add") || arg.eq_ignore_ascii_case("manage") {
+                let mut cfg = cli_config::load();
+                config_edit_providers(&mut cfg).await.and_then(|_| {
+                    cli_config::save(&cfg)?;
+                    Ok(None)
+                })
+            } else if arg.is_empty() {
+                provider_menu().await
+            } else {
+                activate_provider_profile(arg).map(Some)
+            };
+            match selected {
+                Ok(Some(profile)) => {
+                    *model_label = profile.model.clone();
+                    cli_config::pin_session_model(&profile.model); // switching provider is a deliberate model change for THIS window
+                    refresh_prompt_lanes_in_place(history, model_label);
+                    tui::emit_line(
+                        &style(format!(
+                            "provider → {} · {} · {}",
+                            profile.name,
+                            profile.model,
+                            redact_url_userinfo(&profile.base_url)
+                        ))
+                        .color256(splash::ACCENT)
+                        .to_string(),
+                    );
+                    let overridden: Vec<&str> = ["BASE_URL", "API_KEY", "MODEL"]
+                        .into_iter()
+                        .filter(|name| cli_config::branded_env(name).is_some())
+                        .collect();
+                    if !overridden.is_empty() {
+                        tui::emit_line(
+                            &style(format!(
+                                "note: AIZEN_{} override the selected profile at runtime",
+                                overridden.join(" / AIZEN_")
+                            ))
+                            .color256(theme::WARN)
+                            .to_string(),
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tui::note_line(&format!("{} {e}", style("provider:").red())),
+            }
+        }
         "model" | "models" => {
             if let Err(e) = slash_model(model_label).await {
                 if tui::active() {
                     tui::emit_line(&format!("{} {e}", style("model:").red()));
                 } else {
-                    eprintln!("{} {e}", style("model:").red());
+                    tui::note_line(&format!("{} {e}", style("model:").red()));
                 }
             } else {
                 // Also in place: the help text promises `/model` "switches models mid-session", and a
@@ -9367,30 +9563,33 @@ async fn handle_slash(
         }
         "config" | "setup" => {
             if let Err(e) = config_wizard().await {
-                eprintln!("{} {e}", style("config:").red());
+                tui::note_line(&format!("{} {e}", style("config:").red()));
             }
             *model_label = cli_config::load().model.unwrap_or_else(|| model_label.clone());
+            // The wizard just wrote config for THIS window on purpose, so adopt its model as the new
+            // session pin rather than letting the startup pin override what the user just chose.
+            cli_config::pin_session_model(model_label);
             // Refresh IN PLACE — retuning settings mid-chat must not end the conversation.
             refresh_prompt_lanes_in_place(history, model_label);
         }
         "memory" | "mem" => {
             if let Err(e) = slash_memory(arg) {
-                eprintln!("{} {e}", style("memory:").red());
+                tui::note_line(&format!("{} {e}", style("memory:").red()));
             }
         }
         "persona" | "personas" | "character" => {
             if let Err(e) = personas_menu(history, model_label).await {
-                eprintln!("{} {e}", style("persona:").red());
+                tui::note_line(&format!("{} {e}", style("persona:").red()));
             }
         }
         "skills" | "skill" => {
             if let Err(e) = skills_menu().await {
-                eprintln!("{} {e}", style("skills:").red());
+                tui::note_line(&format!("{} {e}", style("skills:").red()));
             }
         }
         "apps" | "integrations" => {
             if let Err(e) = apps_menu().await {
-                eprintln!("{} {e}", style("apps:").red());
+                tui::note_line(&format!("{} {e}", style("apps:").red()));
             }
         }
         "mcp" => tui::emit_line(&crate::agent::mcp::summary()),
@@ -9416,13 +9615,13 @@ async fn handle_slash(
         },
         "telegram" | "tg" => {
             if let Err(e) = telegram_menu().await {
-                eprintln!("{} {e}", style("telegram:").red());
+                tui::note_line(&format!("{} {e}", style("telegram:").red()));
             }
         }
         // `/serve` kept as a direct shortcut to the daemon (also reachable via the Telegram menu).
         "serve" => {
             if let Err(e) = hostbot::run_serve(Vec::new()).await {
-                eprintln!("{} {e}", style("serve:").red());
+                tui::note_line(&format!("{} {e}", style("serve:").red()));
             }
         }
         // ── time machine (git snapshots) ──
@@ -9432,7 +9631,7 @@ async fn handle_slash(
         // leaves without touching anything).
         "timemachine" | "timeline" | "tm" => {
             if let Err(e) = timemachine_menu(history, model_label).await {
-                eprintln!("{} {e}", style("time:").red());
+                tui::note_line(&format!("{} {e}", style("time:").red()));
             }
         }
         // Capture the conversation alongside the tree so a pick in `/timemachine` can rewind chat as
@@ -9556,6 +9755,20 @@ fn session_save_name_error(raw: &str) -> Option<&'static str> {
 /// Suggest a human-readable session name from the conversation's first user turn, so the "Save as"
 /// prompt comes PRE-FILLED with the topic (Enter to accept, or edit) instead of a blank box. A short
 /// hyphenated slug of the first few meaningful words + a date suffix to keep same-topic saves distinct.
+///
+/// Two properties this has to hold, both learned from what was on disk:
+///
+/// **No credential ever becomes a filename.** A key pasted as the first line of a chat used to pass
+/// straight through — any token of 2+ chars was kept — and the derived stem is not just written to
+/// disk but PRINTED by `/sessions`. A real machine had a session file named after a 40-char
+/// vendor-prefixed token. Secret-shaped tokens are dropped here, before the name exists.
+/// This is a name-derivation guard only; it does not redact the transcript body.
+///
+/// **ASCII whole words.** Names are folded through [`core::slug`] like every other id, so a
+/// Vietnamese topic reads as `nguoi-dung-giao-tiep` rather than carrying diacritics into a filename
+/// that then differs by normalization form between platforms. Folding happens per word, so no word
+/// is ever cut apart. Existing accented files stay loadable — [`sanitize_name`] is unchanged, so it
+/// still maps an on-disk name to itself.
 fn suggest_session_name(history: &[Message]) -> String {
     let date = chrono::Local::now().format("%m%d").to_string();
     let first = history
@@ -9571,18 +9784,18 @@ fn suggest_session_name(history: &[Message]) -> String {
         .trim();
     let words: Vec<String> = line
         .split_whitespace()
-        .map(|w| {
-            w.chars()
-                .filter(|c| c.is_alphanumeric())
-                .collect::<String>()
-                .to_lowercase()
-        })
-        .filter(|w| w.len() >= 2)
+        .filter(|w| !crate::core::slug::looks_like_credential(w))
+        // Intra-word punctuation is not a word boundary: `don't` is one word, so the apostrophe is
+        // deleted rather than folded to `-` (which would leave a one-letter `t` fragment — exactly
+        // the shredding this pass exists to remove).
+        .map(|w| w.replace(['\'', '\u{2019}', '\u{02BC}'], ""))
+        .map(|w| crate::core::slug::slug_words(&w, 40))
+        .filter(|w| w.chars().count() >= 2)
         .take(5)
         .collect();
     let slug = words.join("-");
     // Cap length so long first messages don't produce an unwieldy default.
-    let slug: String = slug.chars().take(40).collect();
+    let slug = crate::core::slug::truncate_at_word(&slug, 40);
     let slug = slug.trim_matches('-');
     if slug.is_empty() {
         format!("chat-{date}")
@@ -9634,15 +9847,30 @@ struct SessionFileRef<'a> {
     messages: &'a [Message],
 }
 
-/// Parse either session format. `None` = unreadable/corrupt (callers surface that explicitly —
-/// a corrupt file must never masquerade as an empty conversation).
-fn parse_session_bytes(bytes: &[u8]) -> Option<(Vec<Message>, Option<SessionMeta>)> {
-    if let Ok(f) = serde_json::from_slice::<SessionFile>(bytes) {
-        return Some((f.messages, Some(f.meta)));
+/// Parse either session format, reporting WHY a file failed. `Err` = unreadable/corrupt (callers
+/// surface that explicitly — a corrupt file must never masquerade as an empty conversation).
+///
+/// The reason is not decoration. A silently-swallowed `serde` error is exactly how a real bug hid
+/// for months: our own `Serialize` wrote `content` as a multimodal parts array for any turn with a
+/// pasted image, `Option<String>` refused to read it back, and every such conversation simply became
+/// "(unreadable)" with nothing anywhere saying "invalid type: sequence". Naming the error makes the
+/// next asymmetry visible the first time it happens instead of after 29 files.
+fn parse_session_reason(bytes: &[u8]) -> Result<(Vec<Message>, Option<SessionMeta>), String> {
+    let envelope = match serde_json::from_slice::<SessionFile>(bytes) {
+        Ok(f) => return Ok((f.messages, Some(f.meta))),
+        Err(e) => e,
+    };
+    // Legacy bare-array format. Report the ENVELOPE's error when both fail: every file written since
+    // the v2 format landed is an envelope, so that is the diagnosis that actually helps.
+    match serde_json::from_slice::<Vec<Message>>(bytes) {
+        Ok(m) => Ok((m, None)),
+        Err(_) => Err(envelope.to_string()),
     }
-    serde_json::from_slice::<Vec<Message>>(bytes)
-        .ok()
-        .map(|m| (m, None))
+}
+
+/// [`parse_session_reason`] for the callers that only branch on success.
+fn parse_session_bytes(bytes: &[u8]) -> Option<(Vec<Message>, Option<SessionMeta>)> {
+    parse_session_reason(bytes).ok()
 }
 
 fn save_session(history: &[Message], name: &str, model: Option<&str>) -> Result<String> {
@@ -9780,7 +10008,8 @@ fn write_session(history: &[Message], name: &str, mut meta: SessionMeta) -> Resu
 fn load_session(history: &mut Vec<Message>, name: &str, model: &str) -> Result<usize> {
     let path = sessions_dir().join(format!("{}.json", sanitize_name(name)));
     let bytes = std::fs::read(&path).with_context(|| format!("no saved session '{name}'"))?;
-    let (loaded, meta) = parse_session_bytes(&bytes).context("parsing session file")?;
+    let (loaded, meta) = parse_session_reason(&bytes)
+        .map_err(|why| anyhow::anyhow!("session '{name}' is unreadable: {why}"))?;
     *history = loaded;
     // Rebuild BOTH prompt lanes for the CURRENT project + model. The stable lane saved in the file
     // reflects wherever the session was recorded — replaying it verbatim in another checkout
@@ -9871,6 +10100,39 @@ fn current_session_slug() -> Option<String> {
 }
 fn pretty_session_name(name: &str) -> String {
     name.replace('-', " ")
+}
+
+/// Remove `atomic_write` staging files abandoned by a killed process.
+///
+/// `persist::atomic_write` deletes its temp only when the write fails IN-PROCESS; a process killed
+/// between the staged write and the rename leaves `.{name}.aizen-tmp-{pid}-{seq}` behind with nothing
+/// to ever collect it. Harmless to readers (`stat_sessions` filters on the `.json` extension) but it
+/// accumulates silently for the life of the install.
+///
+/// Age-gated because the name is not enough: another aizen window may be mid-write RIGHT NOW, and its
+/// staging file is invisible to us. A minute is far longer than any staged write and far shorter than
+/// the interval at which anyone would notice clutter. Best-effort — never blocks startup.
+fn sweep_orphan_temps() {
+    let Ok(rd) = std::fs::read_dir(sessions_dir()) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with('.') || !name.contains(".aizen-tmp-") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|md| md.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age.as_secs() > 60);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// One row of the session pool, as scanned from disk.
@@ -10417,7 +10679,7 @@ async fn sessions_menu(history: &mut Vec<Message>, model_label: &str) -> Result<
                     agent::replay_transcript(history);
                     return Ok(());
                 }
-                Err(e) => eprintln!("{} {e}", style("restore:").red()),
+                Err(e) => tui::note_line(&format!("{} {e}", style("restore:").red())),
             }
         } else if items[pick].starts_with("+ Save") {
             let suggested = suggest_session_name(history);
@@ -10459,7 +10721,7 @@ async fn sessions_menu(history: &mut Vec<Message>, model_label: &str) -> Result<
                             style(format!("saved '{}'", name.trim())).color256(splash::ACCENT)
                         );
                     }
-                    Err(e) => eprintln!("{} {e}", style("save:").red()),
+                    Err(e) => tui::note_line(&format!("{} {e}", style("save:").red())),
                 }
             }
         } else if items[pick] == "Delete a session" {
@@ -10489,7 +10751,7 @@ async fn sessions_menu(history: &mut Vec<Message>, model_label: &str) -> Result<
                             style(format!("deleted '{pretty}'")).color256(splash::ACCENT)
                         );
                     }
-                    Err(e) => eprintln!("{} {e}", style("delete:").red()),
+                    Err(e) => tui::note_line(&format!("{} {e}", style("delete:").red())),
                 }
             }
         } else {
@@ -10698,6 +10960,49 @@ fn sniff_cli(bytes: &[u8]) -> features::foreign_session::Cli {
     features::foreign_session::Cli::Claude
 }
 
+/// Switch to one saved provider profile. Root endpoint fields are updated atomically, so the next
+/// turn, aside question, and health probe all see the same provider without restarting the REPL.
+fn activate_provider_profile(name: &str) -> Result<cli_config::ProviderProfile> {
+    let mut cfg = cli_config::load();
+    cfg.activate_provider(name)?;
+    let profile = cfg
+        .provider(name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("unknown provider profile: {name}"))?;
+    cli_config::save(&cfg)?;
+    tui::set_health(tui::HealthKind::Unknown);
+    spawn_health_probe_once();
+    Ok(profile)
+}
+
+async fn provider_menu() -> Result<Option<cli_config::ProviderProfile>> {
+    let mut cfg = cli_config::load();
+    let list = cfg.providers.clone().unwrap_or_default();
+    let mut items: Vec<String> = list.iter().map(|p| provider_row(&cfg, p)).collect();
+    items.push("＋ Add provider".to_string());
+    items.push("✎ Manage providers".to_string());
+    let default = cfg
+        .active_provider
+        .as_deref()
+        .and_then(|name| list.iter().position(|p| p.matches_name(name)))
+        .unwrap_or(0)
+        .min(items.len().saturating_sub(1));
+    let pick = Select::with_theme(&ui_theme())
+        .with_prompt("Provider — choose to switch (Esc keeps current)")
+        .items(&items)
+        .default(default)
+        .interact_opt()?;
+    match pick {
+        Some(i) if i < list.len() => activate_provider_profile(&list[i].name).map(Some),
+        Some(_) => {
+            config_edit_providers(&mut cfg).await?;
+            cli_config::save(&cfg)?;
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
 /// `/model` — fetch the provider's models, pick one (arrow-key), persist it. Also captures the
 /// context window when the provider reports it (→ a real `% context` HUD; else a name heuristic).
 async fn slash_model(model_label: &mut String) -> Result<()> {
@@ -10744,6 +11049,9 @@ async fn slash_model(model_label: &mut String) -> Result<()> {
     cfg.model_context_window = chosen.context_length; // Some ⇒ auto; None ⇒ HUD falls back to heuristic
     cli_config::save(&cfg)?;
     *model_label = chosen.id.clone();
+    // Re-pin: the save above sets the default for the NEXT window, the pin makes the switch stick in
+    // THIS one. Without it the startup pin would win and the user's pick would be ignored.
+    cli_config::pin_session_model(&chosen.id);
     let (window, auto) = resolve_ctx_window(&chosen.id);
     let winlabel = if window >= 1000 {
         format!("{}K", window / 1000)
@@ -10776,8 +11084,12 @@ fn resolve_endpoint(
         .or_else(|| cli_config::branded_env("API_KEY"))
         .or(cfg.api_key)
         .context("no API key — run `aizen config` (interactive setup), or pass --api-key / set AIZEN_API_KEY")?;
+    // Session pin sits between env and disk: a REPL window stays on the model IT resolved, so a
+    // sibling window running `/model` (which rewrites the shared cli-config.json) can't switch this
+    // one out from under it on the next turn. Non-REPL callers never pin ⇒ they read `cfg.model`.
     let model = model
         .or_else(|| cli_config::branded_env("MODEL"))
+        .or_else(cli_config::session_model)
         .or(cfg.model)
         .context("no model — run `aizen config` (interactive setup) or `aizen models` to list, or pass --model / set AIZEN_MODEL")?;
     Ok((base_url, api_key, model))
@@ -10919,15 +11231,54 @@ fn spawn_reconcile_pass() {
             .iter()
             .filter(|a| !matches!(a.action, memory::learning::reconcile::Action::Review { .. }))
             .count();
+        // Retirements are counted separately: "reconciled 3 facts" reads like bookkeeping, but a row
+        // leaving the active view is the change a user would want to know about, and it is the half
+        // that needs the undo hint. Only removals that reported no failure are counted.
+        let dropped = report
+            .applied
+            .iter()
+            .filter(|a| {
+                matches!(
+                    &a.action,
+                    memory::learning::reconcile::Action::Confirm {
+                        redundant: Some(_),
+                        ..
+                    }
+                ) && !a.note.contains("kept")
+            })
+            .count();
         if acted > 0 {
+            let what = if dropped > 0 {
+                format!("reconciled {acted} memory fact(s), retiring {dropped} duplicate(s)")
+            } else {
+                format!("reconciled {acted} memory fact(s)")
+            };
             tui::emit_line(
                 &style(format!(
-                    "⚖ reconciled {acted} memory fact(s) — `aizen memory list --superseded` to review, `revive <id>` to undo"
+                    "⚖ {what} — `aizen memory list --superseded` to review, `revive <id>` to undo"
                 ))
                 .dim()
                 .to_string(),
             );
         }
+    });
+}
+
+/// Probe the newly selected provider immediately instead of waiting for the next 60-second poll tick.
+fn spawn_health_probe_once() {
+    tokio::spawn(async move {
+        let kind = match (health_http_client(), resolve_base_key(None, None)) {
+            (Ok(http), Ok((base, key))) => {
+                let t0 = std::time::Instant::now();
+                classify_health_probe(
+                    client::probe_models(&http, &base, &key)
+                        .await
+                        .map(|_| t0.elapsed()),
+                )
+            }
+            _ => tui::HealthKind::Down,
+        };
+        tui::set_health(kind);
     });
 }
 
@@ -11239,6 +11590,8 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                 anyhow::bail!("nothing to set — pass at least one supported --flag (including --timemachine-keep / --timemachine-max-files / --timemachine-max-bytes / --timemachine-max-file-bytes)");
             }
             let mut cfg = cli_config::load();
+            let previous_url = cfg.base_url.clone();
+            let base_url_was_set = base_url.is_some();
             if let Some(v) = base_url {
                 cfg.base_url = Some(v.trim().trim_end_matches('/').to_string());
             }
@@ -11347,6 +11700,10 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             for spec in model_endpoint {
                 apply_model_endpoint(&mut cfg, &spec)?;
             }
+            if base_url_was_set {
+                cfg.detach_provider_if_url_changed(previous_url.as_deref());
+            }
+            cfg.sync_active_provider();
             cli_config::save(&cfg)?;
             println!(
                 "{} {}",
@@ -11356,6 +11713,7 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             print_config(&cfg);
             Ok(())
         }
+        ConfigCmd::Provider { cmd } => run_provider_config(cmd),
         ConfigCmd::Show => {
             print_config(&cli_config::load());
             Ok(())
@@ -11367,12 +11725,184 @@ async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
     }
 }
 
+fn provider_row(cfg: &cli_config::CliConfig, p: &cli_config::ProviderProfile) -> String {
+    let active = cfg
+        .active_provider
+        .as_deref()
+        .is_some_and(|name| name.eq_ignore_ascii_case(&p.name));
+    format!(
+        "{} {:<16} · {} · {} · key {}",
+        if active { "●" } else { "○" },
+        p.name,
+        p.model,
+        redact_url_userinfo(&p.base_url),
+        cli_config::mask(&p.api_key)
+    )
+}
+
+/// Manage named main endpoint profiles from the CLI.
+fn run_provider_config(cmd: ProviderConfigCmd) -> Result<()> {
+    let mut cfg = cli_config::load();
+    match cmd {
+        ProviderConfigCmd::Add {
+            name,
+            base_url,
+            api_key,
+            model,
+            context_window,
+            activate,
+        } => {
+            if cfg.provider(&name).is_some() {
+                anyhow::bail!("provider profile already exists: {name}");
+            }
+            let mut profile =
+                cli_config::ProviderProfile::normalized(&name, &base_url, &api_key, &model)?;
+            profile.model_context_window = context_window.filter(|n| *n > 0);
+            cfg.upsert_provider(profile.clone())?;
+            if activate {
+                cfg.activate_provider(&profile.name)?;
+            }
+            cli_config::save(&cfg)?;
+            println!(
+                "{} provider '{}' saved{}",
+                crate::ui::theme::ok("✓"),
+                profile.name,
+                if activate { " and active" } else { "" }
+            );
+        }
+        ProviderConfigCmd::Edit {
+            name,
+            base_url,
+            api_key,
+            model,
+            context_window,
+        } => {
+            let canonical = cfg
+                .provider(&name)
+                .map(|p| p.name.clone())
+                .ok_or_else(|| anyhow::anyhow!("unknown provider profile: {name}"))?;
+            let active = cfg
+                .active_provider
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(&canonical));
+            let mut profile =
+                cli_config::ProviderProfile::normalized(&canonical, &base_url, &api_key, &model)?;
+            profile.model_context_window = context_window.filter(|n| *n > 0);
+            cfg.upsert_provider(profile.clone())?;
+            if active {
+                cfg.activate_provider(&canonical)?;
+            }
+            cli_config::save(&cfg)?;
+            println!(
+                "{} provider '{}' updated",
+                crate::ui::theme::ok("✓"),
+                canonical
+            );
+        }
+        ProviderConfigCmd::Rename { name, new_name } => {
+            cfg.rename_provider(&name, &new_name)?;
+            cli_config::save(&cfg)?;
+            println!(
+                "{} provider '{}' renamed to '{}'",
+                crate::ui::theme::ok("✓"),
+                name,
+                new_name
+            );
+        }
+        ProviderConfigCmd::Use { name } => {
+            cfg.activate_provider(&name)?;
+            let active = cfg.active_provider.clone().unwrap_or(name);
+            cli_config::save(&cfg)?;
+            println!("{} provider '{}' active", crate::ui::theme::ok("✓"), active);
+            print_provider_env_override_note();
+        }
+        ProviderConfigCmd::List => {
+            let Some(list) = cfg.providers.as_ref() else {
+                println!("no provider profiles — add one with `aizen config provider add`");
+                return Ok(());
+            };
+            for p in list {
+                println!("{}", provider_row(&cfg, p));
+            }
+        }
+        ProviderConfigCmd::Remove {
+            name,
+            replace_with,
+            force,
+        } => {
+            let refs = cfg.provider_references(&name);
+            if !refs.is_empty() {
+                if let Some(replacement) = replace_with.as_deref() {
+                    if cfg.provider(replacement).is_none() {
+                        anyhow::bail!("unknown replacement provider profile: {replacement}");
+                    }
+                    cfg.replace_provider_references(&name, replacement)?;
+                } else if force {
+                    cfg.clear_provider_references(&name);
+                } else {
+                    anyhow::bail!(
+                        "provider '{}' is used by {} — pass --replace-with <provider> or --force to clear those assignments",
+                        name,
+                        refs.join(", ")
+                    );
+                }
+            }
+            let was_active = cfg
+                .active_provider
+                .as_deref()
+                .is_some_and(|active| active.eq_ignore_ascii_case(&name));
+            let removed = cfg.remove_provider(&name)?;
+            cli_config::save(&cfg)?;
+            println!(
+                "{} provider '{}' removed{}",
+                crate::ui::theme::ok("✓"),
+                removed.name,
+                if was_active {
+                    " (current endpoint kept)"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_provider_env_override_note() {
+    let vars = [
+        ("AIZEN_BASE_URL", "endpoint"),
+        ("AIZEN_API_KEY", "API key"),
+        ("AIZEN_MODEL", "model"),
+    ];
+    let overridden: Vec<&str> = vars
+        .iter()
+        .filter_map(|(var, label)| {
+            std::env::var(var)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(|_| *label)
+        })
+        .collect();
+    if !overridden.is_empty() {
+        println!(
+            "  note: environment variables override the saved provider's {}",
+            overridden.join(", ")
+        );
+    }
+}
+
 /// Render the saved config as a grouped, aligned "Studio" panel: a gold title rule with the file
 /// path, then sections (Endpoint / Session / Cost / Display) of `key   value` rows where the value's
 /// colour carries meaning (gold = a chosen value, green = on/ok, faint = off/unset). Shown at the end
-/// of the wizard, after `config set`, and on `aizen config show`. Plain `println!` (not the sticky
-/// emit): it always runs outside the pinned footer (suspended menu / one-shot CLI), and `console`
-/// auto-strips the colour under `NO_COLOR`/pipes.
+/// of the wizard, after `config set`, and on `aizen config show`.
+///
+/// Goes through `tui::emit_line`, NOT `println!`. The old claim that a plain print was safe here
+/// ("it always runs outside the pinned footer") held only while every caller suspended the renderer
+/// first — and suspending is not enough: the render thread keeps folding emissions into its block
+/// buffer while suspended and repaints from that buffer on resume, so a raw print is either wiped by
+/// the repaint or survives as foreign cells inside later frames. That is the `/config`-mid-chat
+/// layout corruption. `emit_line` degrades to plain stdout for the one-shot CLI, where `console`
+/// still auto-strips colour under `NO_COLOR`/pipes.
 fn print_config(cfg: &cli_config::CliConfig) {
     let width = tui::width().clamp(46, 72);
     let path = cli_config::config_path().display().to_string();
@@ -11381,18 +11911,25 @@ fn print_config(cfg: &cli_config::CliConfig) {
     let title = "config";
     let used = console::measure_text_width(title) + console::measure_text_width(&path);
     let gap = width.saturating_sub(used + 2).max(1);
-    println!(
+    tui::emit_line(&format!(
         "\n  {}{}{}",
         theme::accent(title).bold(),
         " ".repeat(gap),
         theme::faint(&path)
-    );
-    println!("  {}", theme::accent_dim("─".repeat(width)));
+    ));
+    tui::emit_line(&format!("  {}", theme::accent_dim("─".repeat(width))));
 
     // row/section helpers — keys aligned in a fixed column, values free-form (already styled).
-    let section =
-        |name: &str| println!("\n  {} {}", theme::accent("◆"), theme::accent(name).bold());
-    let row = |key: &str, val: String| println!("    {}  {val}", theme::muted(format!("{key:<8}")));
+    let section = |name: &str| {
+        tui::emit_line(&format!(
+            "\n  {} {}",
+            theme::accent("◆"),
+            theme::accent(name).bold()
+        ))
+    };
+    let row = |key: &str, val: String| {
+        tui::emit_line(&format!("    {}  {val}", theme::muted(format!("{key:<8}"))))
+    };
     let on = |b: bool| {
         if b {
             theme::ok("● on").to_string()
@@ -11427,6 +11964,27 @@ fn print_config(cfg: &cli_config::CliConfig) {
             Some(k) => format!("{}  {}", cli_config::mask(k), theme::ok("✓")),
             None => format!("{}  {}", unset(), theme::warn("required")),
         },
+    );
+    row(
+        "provider",
+        cfg.active_provider
+            .as_deref()
+            .map(|name| theme::accent(name).to_string())
+            .unwrap_or_else(|| theme::faint("direct endpoint").to_string()),
+    );
+    row(
+        "profiles",
+        cfg.providers
+            .as_ref()
+            .map(|list| {
+                let names = list
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{} · {}", list.len(), theme::faint(names))
+            })
+            .unwrap_or_else(|| "0 · save the current connection as a provider".to_string()),
     );
     match cfg.model.as_deref() {
         Some(m) => {
@@ -11652,6 +12210,9 @@ fn role_row_value(rc: Option<&cli_config::RoleModelConfig>) -> String {
         );
     };
     let mut parts: Vec<String> = Vec::new();
+    if let Some(provider) = rc.provider.as_deref().filter(|s| !s.trim().is_empty()) {
+        parts.push(theme::accent(format!("provider:{provider}")).to_string());
+    }
     if let Some(m) = rc.model.as_deref().filter(|s| !s.trim().is_empty()) {
         parts.push(theme::accent(m).to_string());
     }
@@ -11710,24 +12271,38 @@ fn print_roles_section(cfg: &cli_config::CliConfig) {
         "apply",
         role_row_value(roles.and_then(|r| r.apply.as_ref())),
     );
+    match cfg.agent_routes.as_deref().filter(|l| !l.is_empty()) {
+        Some(routes) => row(
+            "specialists",
+            theme::accent(format!("{} provider assignment(s)", routes.len())).to_string(),
+        ),
+        None => row(
+            "specialists",
+            format!(
+                "{}  {}",
+                theme::faint("— inherit").italic(),
+                theme::faint("· use subagent default")
+            ),
+        ),
+    }
     match cfg.model_endpoints.as_deref().filter(|l| !l.is_empty()) {
         Some(list) => {
             let names: Vec<&str> = list.iter().map(|e| e.model.as_str()).collect();
             row(
-                "registry",
+                "advanced",
                 format!(
                     "{}  {}",
-                    theme::accent(format!("{} model(s) mapped", list.len())),
+                    theme::warn(format!("{} model endpoint override(s)", list.len())),
                     theme::faint(format!("· {}", names.join(", ")))
                 ),
             );
         }
         None => row(
-            "registry",
+            "advanced",
             format!(
                 "{}  {}",
-                theme::faint("— empty").italic(),
-                theme::faint("· pinned models use the caller's gateway")
+                theme::faint("— none").italic(),
+                theme::faint("· provider routing is unmasked")
             ),
         ),
     }
@@ -11853,23 +12428,32 @@ async fn spin_while<T>(label: &str, fut: impl std::future::Future<Output = T>) -
     out
 }
 
+// The three status lines below go through `tui::emit_line` for the reason spelled out on
+// `print_config`: a raw print during a suspended menu is either wiped by resume's repaint or
+// survives as foreign cells in later frames. Outside the REPL `emit_line` is a plain stdout write,
+// so the one-shot `aizen config` path is unchanged.
+
 /// `  ✓ <msg>` in the ok colour.
 fn line_ok(msg: &str) {
-    println!("  {} {}", crate::ui::theme::ok("✓"), style(msg).dim());
+    tui::emit_line(&format!(
+        "  {} {}",
+        crate::ui::theme::ok("✓"),
+        style(msg).dim()
+    ));
 }
 
 /// `  ✗ <msg>` in red — a failure the user has to act on.
 fn line_bad(msg: &str) {
-    println!("  {} {}", style("✗").red(), style(msg).red());
+    tui::emit_line(&format!("  {} {}", style("✗").red(), style(msg).red()));
 }
 
 /// `  ! <msg>` in the warn colour — something to know, but not a stop.
 fn line_warn(msg: &str) {
-    println!(
+    tui::emit_line(&format!(
         "  {} {}",
         style("!").color256(crate::ui::theme::WARN),
         style(msg).color256(crate::ui::theme::WARN)
-    );
+    ));
 }
 
 /// Ask for a base URL until one actually answers as a models endpoint, then return it with the model
@@ -11934,7 +12518,7 @@ async fn prompt_validated_base_url(
             client::EndpointCheck::NotFound(detail) => {
                 line_bad(&format!("no model list at {base}/models"));
                 if !detail.is_empty() {
-                    println!("    {}", style(&detail).dim());
+                    tui::emit_line(&format!("    {}", style(&detail).dim()));
                 }
                 match missing_version_suffix(&base) {
                     Some(fixed) => {
@@ -11951,7 +12535,7 @@ async fn prompt_validated_base_url(
             client::EndpointCheck::Http(code, detail) => {
                 line_bad(&format!("HTTP {code}"));
                 if !detail.is_empty() {
-                    println!("    {}", style(&detail).dim());
+                    tui::emit_line(&format!("    {}", style(&detail).dim()));
                 }
                 suggestion = Some(base);
             }
@@ -12011,7 +12595,7 @@ async fn prompt_validated_api_key(
     keys_url: Option<&str>,
 ) -> Result<Option<(String, Vec<client::ModelInfo>)>> {
     if let Some(url) = keys_url {
-        println!("  {}", style(format!("get a key: {url}")).dim());
+        tui::emit_line(&format!("  {}", style(format!("get a key: {url}")).dim()));
     }
     loop {
         let prompt = match current {
@@ -12048,7 +12632,7 @@ async fn prompt_validated_api_key(
             client::EndpointCheck::Auth(detail) => {
                 line_bad("the endpoint rejected that key");
                 if !detail.is_empty() {
-                    println!("    {}", style(&detail).dim());
+                    tui::emit_line(&format!("    {}", style(&detail).dim()));
                 }
             }
             // Not the key's fault — don't make them re-paste a key that may be fine.
@@ -12126,11 +12710,6 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
     let theme = ui_theme();
     loop {
         // Glanceable current-value hints, one per row.
-        let key_h = if cfg.api_key.is_some() {
-            "set"
-        } else {
-            "missing"
-        };
         let model_h = cfg.model.clone().unwrap_or_else(|| "not set".into());
         let tavily_h = if cfg
             .reach
@@ -12160,8 +12739,17 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
         let visuals_h = cfg.response_visuals().to_string();
 
         let items = vec![
-            format!("Connection      · api key {key_h}"),
-            format!("Model & context · {model_h}"),
+            format!(
+                "Providers & connection · {} · {}",
+                cfg.active_provider
+                    .as_deref()
+                    .unwrap_or("unsaved connection"),
+                model_h
+            ),
+            format!(
+                "Main model & context · {}",
+                cfg.model.as_deref().unwrap_or("not set")
+            ),
             format!("Sub-agents      · {}", subagent_hint(&cfg)),
             format!("Web search      · tavily {tavily_h}"),
             format!("Memory          · {}", memory_hint(&cfg)),
@@ -12183,7 +12771,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
         };
         // Sections 0..=8 edit + save; 9 shows the panel; 10 (or Esc) exits.
         let edited = match pick {
-            0 => config_edit_connection(&mut cfg).await,
+            0 => config_edit_providers(&mut cfg).await,
             1 => config_edit_model(&mut cfg).await,
             2 => config_edit_subagents(&mut cfg).await,
             3 => config_edit_websearch(&mut cfg).await,
@@ -12200,14 +12788,14 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
         };
         match edited {
             Ok(()) => match cli_config::save(&cfg) {
-                Ok(_) => println!(
+                Ok(_) => tui::emit_line(&format!(
                     "  {} {}",
                     crate::ui::theme::ok("✓"),
                     style("saved").color256(splash::ACCENT)
-                ),
-                Err(e) => eprintln!("  {} {e}", style("save:").red()),
+                )),
+                Err(e) => tui::note_line(&format!("  {} {e}", style("save:").red())),
             },
-            Err(e) => eprintln!("  {} {e}", style("config:").red()),
+            Err(e) => tui::note_line(&format!("  {} {e}", style("config:").red())),
         }
     }
     Ok(())
@@ -12216,9 +12804,11 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
 /// Section editor: provider → base URL → API key, each step verified against the live endpoint
 /// before it is accepted. Nothing is written to `cfg` until a step actually passes, so a failed
 /// attempt leaves the previous working connection intact.
+#[allow(dead_code)]
 async fn config_edit_connection(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let theme = ui_theme();
     let http = http_client()?;
+    let previous_base = cfg.base_url.clone();
 
     let preset = prompt_provider(&theme, cfg.base_url.as_deref())?;
     // A preset's URL is already correct, so it only needs the reachability check — not the
@@ -12269,25 +12859,184 @@ async fn config_edit_connection(cfg: &mut cli_config::CliConfig) -> Result<()> {
             }
         }
     };
-    cfg.base_url = Some(base.clone());
+    let same_endpoint = previous_base
+        .as_deref()
+        .map(|url| url.trim().trim_end_matches('/'))
+        == Some(base.as_str());
 
     let keys_url = preset.map(|p| p.keys_url);
-    match prompt_validated_api_key(&theme, &http, &base, cfg.api_key.as_deref(), keys_url).await? {
-        Some((key, fetched)) => {
-            cfg.api_key = Some(key);
-            if !fetched.is_empty() {
-                infos = fetched;
-            }
-        }
-        None => return Ok(()),
+    let current_key = same_endpoint.then_some(cfg.api_key.as_deref()).flatten();
+    let (key, fetched) =
+        match prompt_validated_api_key(&theme, &http, &base, current_key, keys_url).await? {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+    if !fetched.is_empty() {
+        infos = fetched;
+    }
+
+    let mut draft = cfg.clone();
+    draft.base_url = Some(base);
+    draft.api_key = Some(key);
+    if !same_endpoint {
+        draft.model = None;
+        draft.model_context_window = None;
+        draft.active_provider = None;
     }
 
     // The key check already fetched the list — offering it here saves a redundant round-trip and
     // means a fresh connection lands on a working model instead of whatever was configured before.
     if !infos.is_empty() && yn(&theme, "Pick a model now?", true)? {
-        pick_model_from(&theme, cfg, &infos, preset.map(|p| p.sample_model))?;
+        pick_model_from(&theme, &mut draft, &infos, preset.map(|p| p.sample_model))?;
+    } else if draft.model.is_none() {
+        let mut input = Input::<String>::with_theme(&theme)
+            .with_prompt("Model id")
+            .allow_empty(true);
+        if let Some(sample) = preset.map(|p| p.sample_model.to_string()) {
+            input = input.default(sample);
+        }
+        let model = input.interact_text()?;
+        if model.trim().is_empty() {
+            line_warn("connection unchanged — a model is required for the new URL");
+            return Ok(());
+        }
+        draft.model = Some(model.trim().to_string());
     }
+    draft.sync_active_provider();
+    *cfg = draft;
     Ok(())
+}
+
+/// Manage provider profiles from the config hub. Adding/editing reuses the validated Connection flow;
+/// the complete resulting tuple is then stored under the chosen name.
+async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    let http = http_client()?;
+    loop {
+        let list = cfg.providers.clone().unwrap_or_default();
+        let mut items: Vec<String> = list.iter().map(|p| provider_row(cfg, p)).collect();
+        items.push("＋ Add provider".to_string());
+        items.push("Back".to_string());
+        let pick = match Select::with_theme(&theme)
+            .with_prompt("Providers (Esc when done)")
+            .items(&items)
+            .default(items.len().saturating_sub(2))
+            .interact_opt()?
+        {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        if pick == items.len() - 1 {
+            return Ok(());
+        }
+        if pick == list.len() {
+            let name: String = Input::with_theme(&theme)
+                .with_prompt("Provider name (no spaces)")
+                .allow_empty(true)
+                .interact_text()?;
+            if name.trim().is_empty() || cfg.provider(&name).is_some() {
+                line_bad("provider name is empty or already exists");
+                continue;
+            }
+            let base = match prompt_validated_base_url(&theme, &http, None, true).await? {
+                Some((url, _)) => url,
+                None => continue,
+            };
+            let (key, mut infos) =
+                match prompt_validated_api_key(&theme, &http, &base, None, None).await? {
+                    Some(v) => v,
+                    None => continue,
+                };
+            if infos.is_empty() {
+                if let Ok(fetched) = client::fetch_models_info(&http, &base, &key).await {
+                    infos = fetched;
+                }
+            }
+            let Some(model) = prompt_required_provider_model(&theme, &infos, None)? else {
+                continue;
+            };
+            let mut draft = cli_config::ProviderProfile::normalized(&name, &base, &key, &model)?;
+            draft.model_context_window = None;
+            cfg.upsert_provider(draft.clone())?;
+            if yn(&theme, "Use this provider now?", true)? {
+                cfg.activate_provider(&draft.name)?;
+            }
+            continue;
+        }
+
+        let existing = &list[pick];
+        let action = Select::with_theme(&theme)
+            .with_prompt(format!("{} (Esc cancels)", existing.name))
+            .items(&["use now", "edit endpoint + key + model", "rename", "remove"])
+            .default(0)
+            .interact_opt()?;
+        match action {
+            Some(0) => cfg.activate_provider(&existing.name)?,
+            Some(1) => {
+                let old = existing.clone();
+                let base = match prompt_validated_base_url(&theme, &http, Some(&old.base_url), true)
+                    .await?
+                {
+                    Some((url, _)) => url,
+                    None => continue,
+                };
+                let same = base.trim_end_matches('/') == old.base_url.trim_end_matches('/');
+                let current = same.then_some(old.api_key.as_str());
+                let (key, mut infos) =
+                    match prompt_validated_api_key(&theme, &http, &base, current, None).await? {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                if infos.is_empty() {
+                    if let Ok(fetched) = client::fetch_models_info(&http, &base, &key).await {
+                        infos = fetched;
+                    }
+                }
+                let Some(model) = prompt_required_provider_model(&theme, &infos, Some(&old.model))?
+                else {
+                    continue;
+                };
+                let mut replacement =
+                    cli_config::ProviderProfile::normalized(&old.name, &base, &key, &model)?;
+                replacement.model_context_window = old.model_context_window;
+                let active = cfg
+                    .active_provider
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&old.name));
+                cfg.upsert_provider(replacement)?;
+                if active {
+                    cfg.activate_provider(&old.name)?;
+                }
+            }
+            Some(2) => {
+                let new_name: String = Input::with_theme(&theme)
+                    .with_prompt("New provider name")
+                    .default(existing.name.clone())
+                    .interact_text()?;
+                cfg.rename_provider(&existing.name, &new_name)?;
+            }
+            Some(3) => {
+                let refs = cfg.provider_references(&existing.name);
+                if !refs.is_empty() {
+                    line_warn(&format!("used by {}", refs.join(", ")));
+                    let choices = ["clear assignments and remove", "cancel"];
+                    if Select::with_theme(&theme)
+                        .with_prompt("This provider is in use")
+                        .items(&choices)
+                        .default(1)
+                        .interact()?
+                        == 0
+                    {
+                        cfg.clear_provider_references(&existing.name);
+                    } else {
+                        continue;
+                    }
+                }
+                cfg.remove_provider(&existing.name)?;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Present `infos` as a picker and store the choice (plus its reported context window). Esc keeps the
@@ -12427,6 +13176,9 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
                 let cur = role_get(cfg, key)
                     .map(|rc| {
                         let mut bits: Vec<String> = Vec::new();
+                        if let Some(p) = rc.provider.as_deref() {
+                            bits.push(format!("provider {p}"));
+                        }
                         if let Some(m) = rc.model.as_deref() {
                             bits.push(m.to_string());
                         }
@@ -12447,8 +13199,8 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
             })
             .collect();
         items.push(format!(
-            "{:<22}· {} entr(ies)",
-            "Model → endpoint map",
+            "{:<22}· {} advanced entr(ies)",
+            "Advanced overrides",
             cfg.model_endpoints.as_deref().map_or(0, <[_]>::len)
         ));
         let installed = crate::agents::list().len();
@@ -12470,11 +13222,14 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
         match pick {
             i if i < ROLE_ROWS.len() => {
                 let (key, label, what) = ROLE_ROWS[i];
-                println!("  {}", style(what).dim());
+                tui::emit_line(&format!("  {}", style(what).dim()));
                 config_edit_one_role(cfg, key, label).await?;
             }
-            i if i == ROLE_ROWS.len() => config_edit_model_registry(cfg).await?,
-            i if i == ROLE_ROWS.len() + 1 => config_edit_agent_pins().await?,
+            i if i == ROLE_ROWS.len() => {
+                line_warn("advanced model→endpoint overrides can supersede provider-based routing");
+                config_edit_model_registry(cfg).await?
+            }
+            i if i == ROLE_ROWS.len() + 1 => config_edit_agent_pins(cfg).await?,
             _ => return Ok(()),
         }
     }
@@ -12604,104 +13359,108 @@ fn prompt_api_key_ref(theme: &ColorfulTheme, current: Option<&str>) -> Result<Op
     }
 }
 
-/// Pick a model from a probed list, or type one. Unlike [`pick_model_from`] this returns the choice
-/// instead of writing `cfg.model`, because a role's model must not touch the main model.
-fn prompt_role_model(
+fn prompt_required_provider_model(
     theme: &ColorfulTheme,
     infos: &[client::ModelInfo],
     current: Option<&str>,
 ) -> Result<Option<String>> {
     if !infos.is_empty() {
         let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
-        let mut items: Vec<String> = ids.clone();
+        let mut items = ids.clone();
         items.push(CUSTOM_MODEL_ITEM.to_string());
-        items.push("‹ inherit the main model ›".to_string());
-        let pick = match Select::with_theme(theme)
-            .with_prompt("Model (Esc keeps current)")
+        let Some(pick) = Select::with_theme(theme)
+            .with_prompt("Provider default model (Esc cancels)")
             .items(&items)
             .default(model_default_index(&ids, current))
             .interact_opt()?
-        {
-            Some(i) => i,
-            None => return Ok(current.map(str::to_string)),
+        else {
+            return Ok(None);
         };
         if pick < ids.len() {
             return Ok(Some(ids[pick].clone()));
         }
-        if pick == ids.len() + 1 {
-            return Ok(None);
-        }
     }
     let mut input = Input::<String>::with_theme(theme)
-        .with_prompt("Model id (empty = inherit the main model)")
+        .with_prompt("Provider default model id (empty cancels)")
         .allow_empty(true);
-    if let Some(c) = current {
-        input = input.default(c.to_string());
+    if let Some(model) = current {
+        input = input.default(model.to_string());
     }
-    let m = input.interact_text()?;
-    let m = m.trim();
-    Ok((!m.is_empty() && m != "-").then(|| m.to_string()))
+    let value = input.interact_text()?;
+    Ok((!value.trim().is_empty()).then(|| value.trim().to_string()))
 }
 
-/// Edit one role end-to-end: URL (probed) → key → model (picked from the probe when possible).
+/// Edit one role by choosing a saved provider and an optional model override. Direct URL/key fields
+/// are preserved only as advanced legacy overrides elsewhere.
 async fn config_edit_one_role(
     cfg: &mut cli_config::CliConfig,
     role: &str,
     label: &str,
 ) -> Result<()> {
     let theme = ui_theme();
-    let http = http_client()?;
-    let cur = role_get(cfg, role).cloned().unwrap_or_default();
-
-    println!("  {}", style(format!("— {label} —")).dim());
-    let probed = prompt_probed_base_url(
-        &theme,
-        &http,
-        cur.base_url.as_deref(),
-        "inherit the main endpoint",
-    )
-    .await?;
-    let (base_url, mut infos) = match probed {
-        Some((u, i)) => (Some(u), i),
-        None => (None, Vec::new()),
-    };
-    let api_key_ref = prompt_api_key_ref(&theme, cur.api_key_ref.as_deref())?;
-
-    // With a URL and a key in hand, re-fetch so the model picker lists what THIS endpoint serves
-    // rather than the main one's catalogue.
-    if infos.is_empty() {
-        if let Some(url) = base_url.as_deref() {
-            let key = api_key_ref
-                .as_deref()
-                .and_then(|k| match k.strip_prefix("env:") {
-                    Some(var) => std::env::var(var.trim()).ok(),
-                    None => Some(k.to_string()),
-                })
-                .or_else(|| cfg.api_key.clone())
-                .unwrap_or_default();
-            if !key.is_empty() {
-                if let Ok(fetched) = spin_while(
-                    "fetching models",
-                    client::fetch_models_info(&http, url, &key),
-                )
-                .await
-                {
-                    infos = fetched;
-                }
-            }
+    if cfg.providers.as_ref().is_none_or(Vec::is_empty) {
+        line_warn("no saved providers — add one first");
+        config_edit_providers(cfg).await?;
+        if cfg.providers.as_ref().is_none_or(Vec::is_empty) {
+            return Ok(());
         }
     }
-    let model = prompt_role_model(&theme, &infos, cur.model.as_deref())?;
-
+    let cur = role_get(cfg, role).cloned().unwrap_or_default();
+    let list = cfg.providers.clone().unwrap_or_default();
+    let mut items = vec!["‹ inherit the main provider ›".to_string()];
+    items.extend(list.iter().map(|p| provider_row(cfg, p)));
+    let default = cur
+        .provider
+        .as_deref()
+        .and_then(|name| list.iter().position(|p| p.matches_name(name)))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let Some(pick) = Select::with_theme(&theme)
+        .with_prompt(format!("{label} — provider (Esc keeps current)"))
+        .items(&items)
+        .default(default)
+        .interact_opt()?
+    else {
+        return Ok(());
+    };
+    let provider = (pick > 0).then(|| list[pick - 1].name.clone());
+    let selected = provider
+        .as_deref()
+        .and_then(|name| cfg.provider(name))
+        .cloned();
+    let model = if let Some(profile) = selected.as_ref() {
+        let options = [
+            format!("Use provider default · {}", profile.model),
+            "Enter another model id".to_string(),
+        ];
+        match Select::with_theme(&theme)
+            .with_prompt("Model")
+            .items(&options)
+            .default(if cur.model.is_some() { 1 } else { 0 })
+            .interact_opt()?
+        {
+            Some(0) => None,
+            Some(1) => {
+                let mut input = Input::<String>::with_theme(&theme).with_prompt("Model id");
+                if let Some(m) = cur.model.clone() {
+                    input = input.default(m);
+                }
+                let value = input.allow_empty(true).interact_text()?;
+                (!value.trim().is_empty()).then(|| value.trim().to_string())
+            }
+            None => return Ok(()),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let mut roles = cfg.roles.take().unwrap_or_default();
     let slot = role_slot(&mut roles, role);
-    *slot = (model.is_some() || base_url.is_some() || api_key_ref.is_some()).then_some(
-        cli_config::RoleModelConfig {
-            model,
-            base_url,
-            api_key_ref,
-        },
-    );
+    *slot = (provider.is_some() || model.is_some()).then_some(cli_config::RoleModelConfig {
+        provider,
+        model,
+        ..Default::default()
+    });
     cfg.roles = roles.has_any().then_some(roles);
     Ok(())
 }
@@ -12802,92 +13561,94 @@ async fn config_edit_model_registry(cfg: &mut cli_config::CliConfig) -> Result<(
     }
 }
 
-/// Pin a model (and optionally a gateway) onto ONE installed specialist card.
-///
-/// Writes frontmatter, not `cli-config.json`, so it lives with the agent and travels with the repo
-/// when the card is project-local. That is also why the key option here is `env:VAR` only — those
-/// directories get committed.
-async fn config_edit_agent_pins() -> Result<()> {
+/// Assign one installed specialist to a saved provider and optional model override.
+async fn config_edit_agent_pins(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let theme = ui_theme();
     let all = crate::agents::list();
     if all.is_empty() {
         line_warn("no specialists installed — `aizen agents install msitarzewski/agency-agents`");
         return Ok(());
     }
-    let items: Vec<String> = all
-        .iter()
-        .map(|d| {
-            format!(
-                "{:<24}· {}{}",
-                d.slug(),
-                d.model.as_deref().unwrap_or("(sub-agent default)"),
-                d.base_url
-                    .as_deref()
-                    .map(|u| format!(" · {u}"))
-                    .unwrap_or_default()
-            )
-        })
-        .collect();
-    let pick = match Select::with_theme(&theme)
-        .with_prompt("Pin a specialist (Esc when done)")
-        .items(&items)
-        .default(0)
-        .interact_opt()?
-    {
-        Some(i) => i,
-        None => return Ok(()),
-    };
-    let def = &all[pick];
-
-    let mut mi = Input::<String>::with_theme(&theme)
-        .with_prompt("Model id (empty = use the sub-agent default, `-` clears)")
-        .allow_empty(true);
-    if let Some(m) = def.model.as_deref() {
-        mi = mi.default(m.to_string());
-    }
-    let model = mi.interact_text()?;
-    let model = model.trim();
-
-    let mut ui = Input::<String>::with_theme(&theme)
-        .with_prompt("Base URL (empty = use the model→endpoint map, `-` clears)")
-        .allow_empty(true);
-    if let Some(u) = def.base_url.as_deref() {
-        ui = ui.default(u.to_string());
-    }
-    let base = ui.interact_text()?;
-    let base = base.trim().trim_end_matches('/');
-
-    let mut ki = Input::<String>::with_theme(&theme)
-        .with_prompt(
-            "API key env var (empty = inherit, `-` clears) — env only, cards get committed",
-        )
-        .allow_empty(true);
-    if let Some(v) = def
-        .api_key_ref
-        .as_deref()
-        .and_then(|k| k.strip_prefix("env:"))
-    {
-        ki = ki.default(v.to_string());
-    }
-    let var = ki.interact_text()?;
-    let var = var.trim().trim_start_matches("env:").trim();
-
-    // `-` means clear, empty means leave alone — matching the prompt text above.
-    let edit = |s: &str| -> Option<Option<String>> {
-        match s {
-            "" => None,
-            "-" => Some(None),
-            v => Some(Some(v.to_string())),
+    if cfg.providers.as_ref().is_none_or(Vec::is_empty) {
+        line_warn("no saved providers — add one first");
+        config_edit_providers(cfg).await?;
+        if cfg.providers.as_ref().is_none_or(Vec::is_empty) {
+            return Ok(());
         }
-    };
-    let path = crate::agents::set_endpoint(
-        &def.slug(),
-        edit(model),
-        edit(base),
-        edit(var).map(|v| v.map(|s| format!("env:{s}"))),
-    )?;
-    line_ok(&format!("wrote {}", path.display()));
-    Ok(())
+    }
+    loop {
+        let items: Vec<String> = all
+            .iter()
+            .map(|d| {
+                let route = cfg.agent_route(&d.slug());
+                format!(
+                    "{:<24}· {} · {}",
+                    d.slug(),
+                    route
+                        .and_then(|r| r.provider.as_deref())
+                        .unwrap_or("inherit sub-agent default"),
+                    route
+                        .and_then(|r| r.model.as_deref())
+                        .unwrap_or("default model")
+                )
+            })
+            .collect();
+        let Some(pick) = Select::with_theme(&theme)
+            .with_prompt("Specialist agent (Esc when done)")
+            .items(&items)
+            .default(0)
+            .interact_opt()?
+        else {
+            return Ok(());
+        };
+        let slug = all[pick].slug();
+        let current = cfg.agent_route(&slug).cloned().unwrap_or_default();
+        let providers = cfg.providers.clone().unwrap_or_default();
+        let mut choices = vec!["‹ inherit sub-agent default ›".to_string()];
+        choices.extend(providers.iter().map(|p| provider_row(cfg, p)));
+        let default = current
+            .provider
+            .as_deref()
+            .and_then(|name| providers.iter().position(|p| p.matches_name(name)))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let Some(pp) = Select::with_theme(&theme)
+            .with_prompt(format!("{slug} — provider"))
+            .items(&choices)
+            .default(default)
+            .interact_opt()?
+        else {
+            continue;
+        };
+        if pp == 0 {
+            cfg.set_agent_route(&slug, None, None)?;
+            continue;
+        }
+        let provider = &providers[pp - 1];
+        let model_choices = [
+            format!("Use provider default · {}", provider.model),
+            "Enter another model id".to_string(),
+        ];
+        let Some(mp) = Select::with_theme(&theme)
+            .with_prompt("Model")
+            .items(&model_choices)
+            .default(if current.model.is_some() { 1 } else { 0 })
+            .interact_opt()?
+        else {
+            continue;
+        };
+        let model = if mp == 0 {
+            None
+        } else {
+            let mut input = Input::<String>::with_theme(&theme).with_prompt("Model id");
+            if let Some(m) = current.model {
+                input = input.default(m);
+            }
+            let value = input.allow_empty(true).interact_text()?;
+            (!value.trim().is_empty()).then(|| value.trim().to_string())
+        };
+        cfg.set_agent_route(&slug, Some(provider.name.clone()), model)?;
+    }
 }
 
 /// Section editor: fetch the model list, pick one (Esc keeps current), then the context window.
@@ -12896,19 +13657,29 @@ async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let (base, key) = match (cfg.base_url.clone(), cfg.api_key.clone()) {
         (Some(b), Some(k)) => (b, k),
         _ => {
-            println!(
+            tui::emit_line(&format!(
                 "  {}",
                 style("set the Connection (base URL + key) first").color256(crate::ui::theme::WARN)
-            );
+            ));
             return Ok(());
         }
     };
     let http = http_client()?;
-    print!("{} {base} … ", style("Fetching models from").dim());
-    std::io::Write::flush(&mut std::io::stdout()).ok();
+    // One complete line per outcome rather than a bare `print!` prefix completed later: a partial
+    // line cannot be a transcript block, so under the retained renderer it was a raw write into cells
+    // the render thread believes it owns (the same corruption `print_config` was fixed for).
+    tui::emit_line(
+        &style(format!("Fetching models from {base} …"))
+            .dim()
+            .to_string(),
+    );
     match client::fetch_models_info(&http, &base, &key).await {
         Ok(infos) if !infos.is_empty() => {
-            println!("{}", style(format!("ok ({} found)", infos.len())).dim());
+            tui::emit_line(
+                &style(format!("ok ({} found)", infos.len()))
+                    .dim()
+                    .to_string(),
+            );
             let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
             let mut items: Vec<String> = ids.clone();
             items.push(CUSTOM_MODEL_ITEM.to_string());
@@ -12936,8 +13707,8 @@ async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
         }
         other => {
             match other {
-                Ok(_) => println!("{}", style("no models returned.").dim()),
-                Err(e) => println!("{}", style(format!("failed: {e}")).red()),
+                Ok(_) => tui::emit_line(&style("no models returned.").dim().to_string()),
+                Err(e) => tui::note_line(&style(format!("failed: {e}")).red().to_string()),
             }
             let mut mi =
                 Input::<String>::with_theme(&theme).with_prompt("Enter a model id manually");
@@ -12963,13 +13734,13 @@ async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
         } else {
             "estimated from the model name"
         };
-        println!(
+        tui::emit_line(&format!(
             "{}",
             style(format!(
                 "Context window — currently {shown} tokens ({note})."
             ))
             .dim()
-        );
+        ));
         let ctx_in = Input::<String>::with_theme(&theme)
             .with_prompt("Context window (tokens, e.g. 200000 / 128k, or `auto`)")
             .default(ctx_default)
@@ -12986,6 +13757,7 @@ async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
             _ => None, // "auto"/blank/garbage → detect-or-heuristic
         };
     }
+    cfg.sync_active_provider();
     Ok(())
 }
 
@@ -13019,7 +13791,10 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = crate::agent::reach::search::KeyCheck>,
 {
-    println!("  {}", style(format!("get a key: {keys_url}")).dim());
+    tui::emit_line(&format!(
+        "  {}",
+        style(format!("get a key: {keys_url}")).dim()
+    ));
     loop {
         let prompt = match current {
             Some(k) => format!(
@@ -13076,11 +13851,11 @@ where
 /// user discover it from a failed search.
 async fn config_edit_websearch(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let theme = ui_theme();
-    println!(
+    tui::emit_line(&format!(
         "{}",
         style("web_search is keyed-only: without a key it returns an error rather than guessing.")
             .dim()
-    );
+    ));
     // Say when the environment is in charge — otherwise editing this and seeing no change is baffling.
     for (var, what) in [
         ("AIZEN_TAVILY_API_KEY", "Tavily"),
@@ -13187,10 +13962,10 @@ fn config_edit_memory(cfg: &mut cli_config::CliConfig) -> Result<()> {
 
     if !dense_built {
         line_warn("this build has no semantic backend — recall is lexical only");
-        println!(
+        tui::emit_line(&format!(
             "  {}",
             style("(a `--features dense` build adds embedding-based recall for paraphrases)").dim()
-        );
+        ));
         return Ok(());
     }
     if let Ok(v) = std::env::var("AIZEN_MEM_DENSE") {
@@ -13200,10 +13975,10 @@ fn config_edit_memory(cfg: &mut cli_config::CliConfig) -> Result<()> {
     }
     if models.is_empty() {
         line_warn("no embedding model installed — dense recall is off");
-        println!(
+        tui::emit_line(&format!(
             "  {}",
             style("get one with: aizen memory model-download").dim()
-        );
+        ));
         return Ok(());
     }
     if active {
@@ -13442,28 +14217,31 @@ fn config_edit_display(cfg: &mut cli_config::CliConfig) -> Result<()> {
 async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let theme = ui_theme();
     let width = tui::width().clamp(46, 72);
-    println!();
-    println!("{}", style("Aizen · setup").bold().color256(splash::ACCENT));
-    println!(
+    tui::emit_line("");
+    tui::emit_line(&format!(
+        "{}",
+        style("Aizen · setup").bold().color256(splash::ACCENT)
+    ));
+    tui::emit_line(&format!(
         "{}",
         style(cli_config::config_path().display()).color256(crate::ui::theme::FAINT)
-    );
-    println!(
+    ));
+    tui::emit_line(&format!(
         "{}",
         style("Enter keeps the shown default at each step · Ctrl-C cancels")
             .color256(crate::ui::theme::FAINT)
-    );
-    println!(
+    ));
+    tui::emit_line(&format!(
         "{}",
         style("─".repeat(width)).color256(crate::ui::theme::ACCENT_DIM)
-    );
+    ));
     // Group the steps under gold section headers so the flow reads as Connection → Model → Behavior.
     let step = |label: &str| {
-        println!(
+        tui::emit_line(&format!(
             "\n{} {}",
             style("◆").color256(splash::ACCENT),
             style(label).color256(splash::ACCENT).bold()
-        );
+        ));
     };
 
     step("Connection");
@@ -13569,13 +14347,13 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
     } else {
         "estimated from the model name"
     };
-    println!(
+    tui::emit_line(&format!(
         "{}",
         style(format!(
             "Context window — currently {shown} tokens ({note})."
         ))
         .dim()
-    );
+    ));
     let ctx_in = Input::<String>::with_theme(&theme)
         .with_prompt("Context window (tokens, e.g. 200000 / 128k, or `auto`)")
         .default(ctx_default)
@@ -13597,11 +14375,11 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
     // signed up for anything. When a key IS given it gets verified with a real search, same as the
     // section editor.
     step("Web search");
-    println!(
+    tui::emit_line(&format!(
         "{}",
         style("Optional. web_search is keyed-only — skip now and add one later with `/config`.")
             .dim()
-    );
+    ));
     let cur_tavily = cfg.reach.as_ref().and_then(|r| r.tavily_api_key.clone());
     let edit = prompt_validated_reach_key(
         &theme,
@@ -13720,17 +14498,17 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
     icons::set_tier(cfg.icons.as_deref()); // apply immediately for the "Saved" preview below
 
     cli_config::save(cfg)?;
-    println!(
+    tui::emit_line(&format!(
         "\n{} {}",
         crate::ui::theme::ok("✓"),
         style("Saved.").color256(splash::ACCENT).bold()
-    );
+    ));
     print_config(cfg);
-    println!(
+    tui::emit_line(&format!(
         "{}",
         style("Ready — type a message, or run:  aizen chat -p \"hello\"")
             .color256(crate::ui::theme::FAINT)
-    );
+    ));
     Ok(())
 }
 
@@ -14057,6 +14835,10 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
         MemoryCmd::Compact => memory::cmd_compact(),
         MemoryCmd::Reconcile { apply } => run_memory_reconcile(apply).await,
         MemoryCmd::Doctor => memory::cmd_doctor(),
+        MemoryCmd::Where => {
+            println!("{}", memory_where_report());
+            Ok(())
+        }
         MemoryCmd::Health => memory::cmd_health(),
         MemoryCmd::Neighbors { id, k } => memory::cmd_neighbors(&id, k),
         MemoryCmd::ModelDownload { name } => memory::model_dl::download(name.as_deref())
@@ -14164,6 +14946,16 @@ fn run_persona(cmd: PersonaCmd) -> Result<()> {
                     names.join(", ")
                 );
             }
+            // Personas have no `where` sub-command of their own (one folder, no zoning), so the path
+            // goes here directly — the card and its `.self/` memory are plain files worth editing.
+            println!(
+                "{}",
+                style(format!(
+                    "\nfiles: {}   (`<name>.md` is the card, `<name>.self/` its memory)",
+                    persona::personas_dir().display()
+                ))
+                .dim()
+            );
             Ok(())
         }
         PersonaCmd::Show { name } => {
@@ -14441,7 +15233,8 @@ async fn run_skill(cmd: SkillCmd) -> Result<()> {
                 "{}",
                 style(
                     "`skill show <name>` reads one · `skill refine <name>` rewrites the steps · \
-                     `skill delete <name>` retires (restorable)"
+                     `skill delete <name>` retires (restorable)\n\
+                     `skill where` prints the three folders skills are read from"
                 )
                 .dim()
             );
@@ -14471,6 +15264,10 @@ async fn run_skill(cmd: SkillCmd) -> Result<()> {
             }
             None => anyhow::bail!("no skill named '{name}' (try `aizen skill list`)"),
         },
+        SkillCmd::Where => {
+            println!("{}", skill_where_report());
+            Ok(())
+        }
         SkillCmd::Add {
             name,
             description,
@@ -14717,6 +15514,43 @@ async fn run_agents(cmd: Option<AgentsCmd>) -> Result<()> {
         }
         Some(AgentsCmd::Enable { name, all }) => agents_set_enabled(name.as_deref(), all, true),
         Some(AgentsCmd::Disable { name, all }) => agents_set_enabled(name.as_deref(), all, false),
+        Some(AgentsCmd::SetProvider {
+            name,
+            provider,
+            model,
+            clear,
+        }) => {
+            let mut cfg = cli_config::load();
+            if agents::load(&name).is_none() {
+                anyhow::bail!("no agent named '{name}' (try `aizen agents list`)");
+            }
+            if clear {
+                cfg.set_agent_route(&name, None, None)?;
+                cli_config::save(&cfg)?;
+                println!(
+                    "{} cleared provider assignment on '{}'",
+                    crate::ui::theme::ok("✓"),
+                    name
+                );
+            } else {
+                let provider = provider
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .context("pass a saved provider name (or --clear)")?;
+                cfg.set_agent_route(&name, Some(provider.to_string()), model)?;
+                cli_config::save(&cfg)?;
+                let route = cfg.agent_route(&name).expect("route just saved");
+                println!(
+                    "{} assigned '{}' to provider {} · model {}",
+                    crate::ui::theme::ok("✓"),
+                    name,
+                    route.provider.as_deref().unwrap_or("inherit"),
+                    route.model.as_deref().unwrap_or("provider default")
+                );
+            }
+            Ok(())
+        }
         Some(AgentsCmd::SetModel { name, model, clear }) => {
             let new_model = if clear {
                 None
@@ -14785,6 +15619,7 @@ fn agents_list(
         all.retain(|a| is_enabled(&a.slug()));
     }
 
+    let cfg = cli_config::load();
     if json {
         let arr: Vec<serde_json::Value> = all
             .iter()
@@ -14796,6 +15631,8 @@ fn agents_list(
                     "division": a.division,
                     "source": a.source.label(),
                     "model": a.model,
+                    "provider": cfg.agent_route(&a.slug()).and_then(|r| r.provider.clone()),
+                    "route_model": cfg.agent_route(&a.slug()).and_then(|r| r.model.clone()),
                     "tools": a.tools,
                     "enabled": is_enabled(&a.slug()),
                     "path": a.source_path.display().to_string(),
@@ -14838,7 +15675,23 @@ fn agents_list(
                 style("○").dim().to_string()
             };
             let desc: String = a.description.chars().take(80).collect();
-            println!("  {} {}  —  {}", mark, a.slug(), desc.replace('\n', " "));
+            let route = cfg.agent_route(&a.slug());
+            let route_hint = route
+                .map(|r| {
+                    format!(
+                        " · provider {} · {}",
+                        r.provider.as_deref().unwrap_or("inherit"),
+                        r.model.as_deref().unwrap_or("default model")
+                    )
+                })
+                .unwrap_or_default();
+            println!(
+                "  {} {}  —  {}{}",
+                mark,
+                a.slug(),
+                desc.replace('\n', " "),
+                route_hint
+            );
         }
     }
     let hint = if enabled.is_some() {
@@ -15215,6 +16068,82 @@ fn finish_install(
 mod tests {
     use super::*;
 
+    #[test]
+    fn config_provider_subcommands_parse() {
+        for argv in [
+            vec![
+                "aizen",
+                "config",
+                "provider",
+                "add",
+                "backup",
+                "--base-url",
+                "https://backup/v1",
+                "--api-key",
+                "key",
+                "--model",
+                "model-b",
+                "--use",
+            ],
+            vec![
+                "aizen",
+                "config",
+                "provider",
+                "edit",
+                "backup",
+                "--base-url",
+                "https://backup-2/v1",
+                "--api-key",
+                "key-2",
+                "--model",
+                "model-c",
+            ],
+            vec![
+                "aizen",
+                "config",
+                "provider",
+                "rename",
+                "backup",
+                "secondary",
+            ],
+            vec!["aizen", "config", "provider", "use", "backup"],
+            vec!["aizen", "config", "provider", "list"],
+            vec!["aizen", "config", "provider", "remove", "backup", "--force"],
+        ] {
+            assert!(
+                matches!(
+                    Cli::try_parse_from(argv).expect("parse").command,
+                    Some(Commands::Config {
+                        cmd: Some(ConfigCmd::Provider { .. })
+                    })
+                ),
+                "provider command should parse"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["aizen", "config", "provider", "add", "missing-flags"]).is_err()
+        );
+    }
+
+    #[test]
+    fn agents_set_provider_parses() {
+        assert!(matches!(
+            Cli::try_parse_from([
+                "aizen",
+                "agents",
+                "set-provider",
+                "reviewer",
+                "backup",
+                "model-x"
+            ])
+            .expect("parse")
+            .command,
+            Some(Commands::Agents {
+                cmd: Some(AgentsCmd::SetProvider { .. })
+            })
+        ));
+    }
+
     /// `memory list current` and `memory list --scope current` must mean the same thing.
     ///
     /// The REPL has always taken the scope positionally (`/memory list current`), so that is the form
@@ -15257,6 +16186,74 @@ mod tests {
                 .is_err(),
             "two scopes at once is a mistake, not a precedence puzzle"
         );
+    }
+
+    /// The listings name only per-id verbs, so bulk editing needs the folder — and a folder that
+    /// does not exist yet has to say so rather than read as an empty one, which is the difference
+    /// between "nothing learned yet" and "look somewhere else".
+    #[test]
+    fn where_reports_name_every_store_and_flag_missing_dirs() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-whererep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+
+        let entries = crate::core::config::entries_dir();
+        std::fs::create_dir_all(&entries).unwrap();
+        std::fs::write(entries.join("a.md"), "---\nname: A\n---\nx").unwrap();
+        std::fs::write(entries.join("b.md"), "---\nname: B\n---\ny").unwrap();
+        // Not a fact — the count must not include it.
+        std::fs::write(entries.join("notes.txt"), "ignore me").unwrap();
+
+        let rep = memory_where_report();
+        assert!(rep.contains("2 fact(s)"), "{rep}");
+        assert!(
+            rep.contains(&entries.display().to_string()),
+            "entries path missing:\n{rep}"
+        );
+        // The review dir is the one that matters most — 29 queued items were invisible because
+        // nothing ever said they were on disk.
+        assert!(rep.contains("review"), "{rep}");
+        assert!(
+            rep.contains("(not created yet)"),
+            "an absent dir must not read as an empty one:\n{rep}"
+        );
+
+        // Skills live in THREE roots and the list's `[project]`/`[repo]` tags never say where.
+        let sk = skill_where_report();
+        for label in ["global", "zone", "repo"] {
+            assert!(sk.contains(label), "{label} root missing:\n{sk}");
+        }
+        assert!(
+            sk.contains(&crate::core::config::project_slug()),
+            "zone slug not spelled out:\n{sk}"
+        );
+
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Both `where` sub-commands have to be reachable, or the footers point at nothing.
+    #[test]
+    fn where_subcommands_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["aizen", "memory", "where"])
+                .expect("parse")
+                .command,
+            Some(Commands::Memory {
+                cmd: MemoryCmd::Where
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["aizen", "skill", "where"])
+                .expect("parse")
+                .command,
+            Some(Commands::Skill {
+                cmd: SkillCmd::Where
+            })
+        ));
     }
 
     /// A role's key must never reach the screen in the clear.
@@ -15714,6 +16711,57 @@ mod tests {
             !fresh.iter().any(|m| m.role != "system"),
             "rebuild_system is the /clear path and must still reset"
         );
+    }
+
+    /// A conversation containing a pasted image must survive save → load.
+    ///
+    /// This is the session-level half of the `Message` round-trip bug: the writer emitted `content`
+    /// as a multimodal parts array, `parse_session_bytes` could not read it back, and the file was
+    /// reported as "(unreadable)" for the rest of its life with the serde error discarded. Two real
+    /// transcripts were lost this way before it was noticed, so the reason string is asserted too —
+    /// a silent `None` is what let this hide.
+    #[test]
+    fn a_session_with_images_survives_save_and_load() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-img-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        set_session_slug(None);
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+
+        let history = vec![
+            Message::system("lane"),
+            Message::user_with_images(
+                "read this screenshot",
+                vec!["data:image/png;base64,iVBORw0KGgo=".to_string()],
+            ),
+            Message::assistant("it says hello"),
+        ];
+        save_session(&history, "with-image", Some("m")).unwrap();
+
+        let bytes = std::fs::read(sessions_dir().join("with-image.json")).unwrap();
+        let (msgs, _) =
+            parse_session_reason(&bytes).expect("a transcript we wrote ourselves must be readable");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1].content.as_deref(), Some("read this screenshot"));
+        assert_eq!(
+            msgs[1].images,
+            vec!["data:image/png;base64,iVBORw0KGgo=".to_string()],
+            "image attachments must come back out of the parts array"
+        );
+
+        // The picker must count it as a real conversation, not report it unreadable.
+        let (count, _) = read_session_row(&sessions_dir().join("with-image.json"));
+        assert_eq!(count, Some(2), "2 conversation turns after the system lane");
+
+        // And a genuinely corrupt file still fails — with a reason attached.
+        let why = parse_session_reason(b"{not json").expect_err("corrupt must not parse");
+        assert!(!why.is_empty(), "the failure must explain itself");
+
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// `/resume` and the startup hint must offer THIS project's newest session, not whichever
@@ -16390,40 +17438,6 @@ mod tests {
     }
 
     #[test]
-    fn chunk_text_splits_on_utf16_units_not_scalars() {
-        // 2100 emoji = 2100 scalars but 4200 UTF-16 units. Under a 3500-unit cap it MUST split —
-        // Telegram/Discord count length in UTF-16; naive char-splitting would wrongly keep it whole
-        // and the platform would 400 → the reply is silently dropped.
-        let s = "🚀".repeat(2100);
-        let chunks = chunk_text(&s, 3500);
-        assert!(
-            chunks.len() >= 2,
-            "over-the-UTF16-cap reply must split, got {}",
-            chunks.len()
-        );
-        for c in &chunks {
-            assert!(
-                c.encode_utf16().count() <= 3500,
-                "each chunk within the UTF-16 budget"
-            );
-        }
-        assert_eq!(chunks.concat(), s, "reassembles losslessly");
-        assert_eq!(
-            chunk_text("hello", 3500),
-            vec!["hello".to_string()],
-            "ASCII under cap stays whole"
-        );
-
-        let rows = "alpha row\nbeta row\ngamma row\n";
-        let chunks = chunk_text(rows, 20);
-        assert_eq!(chunks.concat(), rows, "line-aware splitting stays lossless");
-        assert!(
-            chunks[..chunks.len() - 1].iter().all(|c| c.ends_with('\n')),
-            "{chunks:?}"
-        );
-    }
-
-    #[test]
     fn default_index_points_at_the_saved_model() {
         assert_eq!(model_default_index(&models(), Some("sonnet-4-6")), 1);
         assert_eq!(model_default_index(&models(), Some("minimax-m3")), 2);
@@ -16563,42 +17577,6 @@ mod tests {
     }
 
     #[test]
-    fn cap_session_drops_oldest_whole_turns_at_user_boundary() {
-        // sys + 3 turns (each user + assistant). Cap to 5 → must drop the oldest whole turn(s),
-        // keep system[0], and always START the tail at a `user` message.
-        let mut h = vec![
-            Message::system("sys"),
-            Message::user("u1"),
-            Message::assistant("a1"),
-            Message::user("u2"),
-            Message::assistant("a2"),
-            Message::user("u3"),
-            Message::assistant("a3"),
-        ];
-        cap_session(&mut h, 5);
-        assert!(h.len() <= 5, "trimmed under the cap");
-        assert_eq!(h[0].role, "system", "system prompt is preserved");
-        assert_eq!(
-            h[1].role, "user",
-            "tail begins at a user boundary (no orphaned turn)"
-        );
-        // the most recent turn must survive
-        assert!(h.iter().any(|m| m.content.as_deref() == Some("u3")));
-    }
-
-    #[test]
-    fn cap_session_keeps_single_turn_even_if_over_cap() {
-        // One huge turn can't be split at a 2nd user boundary → left intact (loop guard handles size).
-        let mut h = vec![
-            Message::system("sys"),
-            Message::user("u1"),
-            Message::assistant("a1"),
-        ];
-        cap_session(&mut h, 2);
-        assert_eq!(h.len(), 3, "no safe cut point → keep the turn whole");
-    }
-
-    #[test]
     fn dead_end_recovery_detects_error_then_success() {
         let recovered = vec![
             Message::user("do it"),
@@ -16697,6 +17675,70 @@ mod tests {
         assert_eq!(sanitize_name("NUL"), "session_NUL");
         assert_eq!(sanitize_name(""), "session");
         assert!(sanitize_name(&"a".repeat(200)).len() <= 80);
+    }
+
+    /// `sanitize_name` maps an EXISTING on-disk name to itself, so the accented session files already
+    /// saved stay loadable and deletable. Only name *derivation* folds to ASCII; changing this would
+    /// orphan every file saved before the fold.
+    #[test]
+    fn sanitize_name_keeps_accented_files_addressable() {
+        assert_eq!(
+            sanitize_name("tại-sao-ổ-của-anh-0803"),
+            "tại-sao-ổ-của-anh-0803"
+        );
+        assert_eq!(
+            sanitize_name("anh-cần-em-viết-tài-0804"),
+            "anh-cần-em-viết-tài-0804"
+        );
+    }
+
+    /// A pasted credential must never become a filename. The derived stem is written to disk AND
+    /// printed by `/sessions`, so a key on the first line used to end up displayed in the picker.
+    #[test]
+    fn suggested_name_drops_credential_shaped_tokens() {
+        let keyish = [
+            "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "tvly-dev-abc123def456ghi789jkl012mno",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123",
+        ];
+        for k in keyish {
+            let name = suggest_session_name(&[Message::user(&format!("{k}"))]);
+            assert!(
+                name.starts_with("chat-"),
+                "a lone key must fall back to the generic stem, got {name}"
+            );
+            let core: String = k.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+            assert!(
+                !name.contains(&core.to_lowercase()),
+                "key material reached the name: {name}"
+            );
+            // With surrounding prose the topic survives and only the key is dropped.
+            let mixed = suggest_session_name(&[Message::user(&format!("set my api key to {k}"))]);
+            assert!(mixed.starts_with("set-my-api-key"), "topic lost: {mixed}");
+            assert!(
+                !mixed.contains(&core.to_lowercase()),
+                "key material reached the name: {mixed}"
+            );
+        }
+    }
+
+    /// Derived names are ASCII whole words: a Vietnamese topic must not carry diacritics into a
+    /// filename, and must not be cut apart mid-word doing so.
+    #[test]
+    fn suggested_name_folds_vietnamese_into_whole_words() {
+        let name = suggest_session_name(&[Message::user("Người dùng giao tiếp bằng tiếng Việt")]);
+        assert!(
+            name.starts_with("nguoi-dung-giao-tiep-bang-"),
+            "expected folded whole words, got {name}"
+        );
+        assert!(name.is_ascii(), "diacritics reached the filename: {name}");
+        assert!(
+            name.split('-').filter(|w| w.chars().count() == 1).count() == 0,
+            "shredded into one-letter fragments: {name}"
+        );
+        // An apostrophe is intra-word punctuation, not a boundary: `don't` must not leave a `t`.
+        let en = suggest_session_name(&[Message::user("don't break the build please")]);
+        assert!(en.starts_with("dont-break-the-build"), "got {en}");
     }
 
     /// `elide` is what every human-facing listing shortens with, so its contract is asserted here

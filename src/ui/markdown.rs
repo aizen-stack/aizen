@@ -408,9 +408,14 @@ fn separator_cell(cell: &str) -> Option<TableAlign> {
 }
 
 fn is_table_separator(line: &str, expected: usize) -> bool {
+    // A header candidate (>= 2 cells) followed by a row whose every cell is a delimiter (`---`,
+    // `:-:`, …) IS a table, even when the separator's column count doesn't match the header's.
+    // Models routinely emit a short separator under a wider header (`|---:|---|` beneath a
+    // 3-column head); requiring exact equality rejected those and dumped the raw pipes to screen.
+    // `parse_table` reconciles the counts (pad Left / truncate) once detection passes.
     expected >= 2
         && parse_table_row(line)
-            .is_some_and(|r| r.len() == expected && r.iter().all(|c| separator_cell(c).is_some()))
+            .is_some_and(|r| r.len() >= 2 && r.iter().all(|c| separator_cell(c).is_some()))
 }
 
 fn parse_table(lines: &[String]) -> Option<MarkdownTable> {
@@ -422,13 +427,19 @@ fn parse_table(lines: &[String]) -> Option<MarkdownTable> {
         return None;
     }
     let sep = parse_table_row(&lines[1])?;
-    if sep.len() != headers.len() {
+    if sep.len() < 2 {
         return None;
     }
-    let aligns = sep
+    // Every separator cell must be a delimiter, but the count need not equal the header's — a
+    // model may emit fewer (or more) delimiter cells than columns. Reconcile to `headers.len()`:
+    // extra separators are dropped, missing ones default to Left. Detection already confirmed the
+    // shape, so a count mismatch reshapes the alignment vector instead of discarding the table.
+    let mut aligns = sep
         .iter()
         .map(|c| separator_cell(c))
         .collect::<Option<Vec<_>>>()?;
+    aligns.resize(headers.len(), TableAlign::Left);
+    aligns.truncate(headers.len());
     let mut rows = Vec::new();
     for line in &lines[2..] {
         let mut row = parse_table_row(line)?;
@@ -1276,6 +1287,28 @@ mod tests {
                 "raw pipes must not leak for {sep:?}: {out}"
             );
         }
+    }
+
+    #[test]
+    fn separator_column_count_need_not_match_header() {
+        // The screenshot bug: a 3-column header (`| Loại | Số lượng | Ghi chú |`) with a 2-column
+        // separator (`|---:|---|`) failed the exact-count check and dumped raw pipes. A delimiter
+        // row that is short (or long) must still be detected; `parse_table` reconciles the columns.
+        let short = "| Loại | Số lượng | Ghi chú |\n|---:|---|\n| a | 1 | note |\n";
+        let out = strip_ansi_codes(&render_all(short)).to_string();
+        assert!(
+            out.contains('┼') && out.contains('╭'),
+            "mismatched separator must still render a box: {out}"
+        );
+        assert!(!out.contains("|---"), "raw pipes must not leak: {out}");
+        assert!(
+            out.contains("Ghi chú") && out.contains("note"),
+            "all three columns must survive: {out}"
+        );
+        // A separator wider than the header reconciles the other way (extra delimiter dropped).
+        let long = "| A | B |\n|---|---|---|\n| x | y |\n";
+        let out = strip_ansi_codes(&render_all(long)).to_string();
+        assert!(out.contains('┼') && !out.contains("|---"), "{out}");
     }
 
     #[test]

@@ -150,7 +150,10 @@ fn at_matches(draft: &[char]) -> Vec<String> {
         None => return Vec::new(),
     };
     // The prefix is everything after the `@` up to the end of draft (cursor always at end for this).
-    let prefix: String = s[at_pos + 1..].chars().take_while(|c| !c.is_whitespace()).collect();
+    let prefix: String = s[at_pos + 1..]
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect();
     // Avoid triggering on obvious non-path patterns like `@everyone`.
     // We return results even for an empty prefix (show recent/top files) but cap at 12.
     const LIMIT: usize = 12;
@@ -159,19 +162,32 @@ fn at_matches(draft: &[char]) -> Vec<String> {
         Err(_) => return Vec::new(),
     };
     // Walk up to ~2000 entries from cwd, collect relative paths that match the prefix.
-    let mut matches: Vec<String> = Vec::new();
     let lower_prefix = prefix.to_lowercase();
     // Use WalkDir-equivalent via std::fs recursive helper — no new dep.
-    fn collect_files(dir: &std::path::Path, root: &std::path::Path, depth: u8, out: &mut Vec<String>) {
-        if depth == 0 { return; }
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+    fn collect_files(
+        dir: &std::path::Path,
+        root: &std::path::Path,
+        depth: u8,
+        out: &mut Vec<String>,
+    ) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in rd.flatten() {
             let path = entry.path();
-            let ft = match entry.file_type() { Ok(t) => t, Err(_) => continue };
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
             // Skip hidden dirs and known noise dirs.
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') || matches!(name_str.as_ref(), "target" | "node_modules" | "__pycache__") {
+            if name_str.starts_with('.')
+                || matches!(name_str.as_ref(), "target" | "node_modules" | "__pycache__")
+            {
                 continue;
             }
             if ft.is_file() {
@@ -181,7 +197,9 @@ fn at_matches(draft: &[char]) -> Vec<String> {
             } else if ft.is_dir() {
                 collect_files(&path, root, depth - 1, out);
             }
-            if out.len() >= 2000 { return; }
+            if out.len() >= 2000 {
+                return;
+            }
         }
     }
     let mut all_files: Vec<String> = Vec::new();
@@ -190,7 +208,7 @@ fn at_matches(draft: &[char]) -> Vec<String> {
     if lower_prefix.is_empty() {
         // No prefix yet — show the most recently-modified files (up to LIMIT).
         // Simple heuristic: just take the first LIMIT from the walk (already breadth-first-ish).
-        matches = all_files.into_iter().take(LIMIT).collect();
+        all_files.into_iter().take(LIMIT).collect()
     } else {
         // Exact prefix matches first, then substring matches.
         let exact: Vec<_> = all_files
@@ -203,14 +221,21 @@ fn at_matches(draft: &[char]) -> Vec<String> {
             .iter()
             .map(|p| {
                 let fname = p.rsplit('/').next().unwrap_or(p);
-                let score = if fname.to_lowercase().starts_with(&lower_prefix) { 0 } else { 1 };
+                let score = if fname.to_lowercase().starts_with(&lower_prefix) {
+                    0
+                } else {
+                    1
+                };
                 (score, p)
             })
             .collect();
         scored.sort_by_key(|(s, _)| *s);
-        matches = scored.into_iter().map(|(_, p)| p.clone()).take(LIMIT).collect();
+        scored
+            .into_iter()
+            .map(|(_, p)| p.clone())
+            .take(LIMIT)
+            .collect()
     }
-    matches
 }
 
 /// Whether a direct retained informational overlay (`/workflows`, later panels) is open.
@@ -358,6 +383,8 @@ const TIPS: &[&str] = &[
     "set a Tavily key (`/config`) to unlock `web_search`",
     "`/apps` connects GitHub, Notion, Slack & more via MCP",
     "`/approval smart` auto-runs read-only tools; `yolo` pre-authorizes the rest",
+    "PgUp/PgDn scrolls back through the transcript, End returns to the live tail",
+    "drag over transcript text to copy it; Ctrl-C copies the highlight, or the draft you typed",
 ];
 /// Per-session tip cursor — advanced once per submitted turn so tips rotate rather than repeat.
 static TIP_SEED: AtomicUsize = AtomicUsize::new(0);
@@ -718,8 +745,13 @@ pub fn ask_approval(prompt_line: &str) -> bool {
 /// The render thread is the single source of truth here: it calls `autoresize` and stores the result,
 /// so this can never disagree with what was actually painted (the old second copy in `Render.cols`
 /// needed its own 250 ms poller to stay in step, and drifted between polls).
+///
+/// EXCEPT while suspended for a dialoguer menu: there is no frame then, so the stored size is frozen
+/// at whatever was last painted and a window resized during the menu would lay out at the old width
+/// (the config panel's rule and right-aligned path). While the renderer holds no screen, nothing has
+/// been "actually painted" to disagree with, so a live probe is strictly better.
 pub fn width() -> usize {
-    if retained::is_running() {
+    if retained::is_running() && retained::is_active() {
         retained::size().1 as usize
     } else {
         term_size().1 as usize
@@ -831,12 +863,21 @@ pub fn suspend() {
 }
 
 /// Whether the input thread should stand down because a `dialoguer` menu owns stdin.
+///
+/// Read by tests only — the input thread reads `KEYBOARD_PARKED` directly on its own hot path rather
+/// than through this accessor. It stays as the flag's documented reader so the park/release
+/// handshake keeps a test-visible surface.
+#[allow(dead_code)]
 pub fn keyboard_parked() -> bool {
     KEYBOARD_PARKED.load(Ordering::SeqCst)
 }
 
 /// Called by the input thread to report whether it currently holds the keyboard. [`suspend`] waits on
 /// this so a menu never opens while the reader is still mid-`poll`.
+///
+/// The input thread now stores `KEYBOARD_RELEASED` inline at its park/unpark points, so this setter
+/// has no callers. Kept as the writing half of the handshake [`suspend`] blocks on.
+#[allow(dead_code)]
 pub(crate) fn note_keyboard_released(released: bool) {
     KEYBOARD_RELEASED.store(released, Ordering::SeqCst);
 }
@@ -1392,6 +1433,11 @@ fn crossterm_to_console_key(ev: crossterm::event::KeyEvent) -> Option<Key> {
     })
 }
 
+/// Wrapped lines moved per wheel notch. Three is the usual terminal default (xterm's `scrollLines`),
+/// small enough that a drag-then-wheel misfire can't fling the viewport far, brisk enough to page a
+/// transcript without spinning.
+const WHEEL_LINES: usize = 3;
+
 /// Is screen cell (`col`, `row`) inside `rect`? Saturating throughout so a rect flush against the
 /// right/bottom edge can't wrap into a false miss.
 fn hit(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
@@ -1401,10 +1447,17 @@ fn hit(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
         && row < rect.y.saturating_add(rect.height)
 }
 
-/// Phase 3 mouse handler for the retained backend: wheel scroll, text selection (drag + copy-on-
-/// release), right-click Copy menu, and scrollbar thumb drag. Mutates `selecting` /
-/// `dragging_scrollbar` so state survives across successive mouse events. No-ops harmlessly when
-/// geometry is empty (first frame).
+/// Phase 3 mouse handler for the retained backend: wheel scroll, text selection (drag +
+/// copy-on-release) and scrollbar thumb drag. Mutates `selecting` / `dragging_scrollbar` so state
+/// survives across successive mouse events. No-ops harmlessly when geometry is empty (first frame).
+///
+/// The wheel scrolls the transcript (or the open overlay) EXCEPT while a scrollbar-thumb drag is in
+/// flight — see the `match` below for why that one carve-out matters and why a live text selection is
+/// deliberately NOT one. PageUp/PageDown and End still work as the keyboard path.
+///
+/// The RIGHT button is not handled either. It used to pop a one-item "Copy" box over the transcript,
+/// which was a floating surface to draw, clamp, hit-test and dismiss for an action Ctrl-C now does
+/// from the keyboard — and it stole the button the terminal itself uses for paste on Windows.
 fn handle_retained_mouse(
     kind: crossterm::event::MouseEventKind,
     col: u16,
@@ -1415,12 +1468,8 @@ fn handle_retained_mouse(
     use crossterm::event::{MouseButton, MouseEventKind};
     let (start, visible, total, area) = retained::last_transcript_geom();
     if area.width == 0 || area.height == 0 {
-        // Still allow wheel even before first paint — scroll is idempotent.
-        match kind {
-            MouseEventKind::ScrollUp => retained::scroll(-3),
-            MouseEventKind::ScrollDown => retained::scroll(3),
-            _ => {}
-        }
+        // Nothing painted yet: there is no line/column mapping to hit-test against, and the wheel is
+        // deliberately not a scroll input (see the match below), so every event is a no-op here.
         return;
     }
     // Scrollbar gutter = rightmost cell of the transcript area.
@@ -1433,34 +1482,28 @@ fn handle_retained_mouse(
         && row < area.y.saturating_add(area.height);
 
     match kind {
-        MouseEventKind::ScrollUp => retained::scroll(-3),
-        MouseEventKind::ScrollDown => retained::scroll(3),
+        // The wheel scrolls the transcript (or the open overlay — `Command::Scroll` routes there
+        // itself). It NEVER reaches the input line: it goes through `retained::scroll`, which moves
+        // only the viewport/overlay offset, never the draft. The only carve-out is an active
+        // scrollbar-thumb drag, where a wheel tick would fight the thumb the mouse is holding —
+        // and `dragging_scrollbar` is cleared reliably on mouse-up.
+        //
+        // We deliberately do NOT also gate on `selecting`. A missed mouse-up can leave `selecting`
+        // stuck at `Some` for the rest of the session (documented in the Esc arm above); gating the
+        // wheel on it would then silently kill scrolling for good. Selection endpoints are absolute
+        // line numbers, so a pure wheel scroll doesn't corrupt a live highlight anyway — reliable
+        // history scrolling outranks protecting the rare drag-then-wheel-then-move case.
+        //
+        // Mouse capture stays on regardless — it is what stops the terminal's "alternateScroll" from
+        // leaking wheel ticks through as ↑/↓ and walking input history behind the user's back.
+        MouseEventKind::ScrollUp if !*dragging_scrollbar => {
+            retained::scroll(-(WHEEL_LINES as i32)); // negative delta = up, toward history
+        }
+        MouseEventKind::ScrollDown if !*dragging_scrollbar => {
+            retained::scroll(WHEEL_LINES as i32); // positive delta = down, toward the live tail
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {} // suppressed only mid scrollbar drag
         MouseEventKind::Down(MouseButton::Left) => {
-            // The right-click Copy menu floats above everything, so it is hit-tested FIRST — a click
-            // on it must copy rather than start a new selection underneath it. `live_selection` is
-            // read (not `selecting`, which is `take()`n on mouse-up while the highlight stays up),
-            // so the text copied is exactly the text still painted.
-            if let Some(m) = retained::context_menu_rect() {
-                let on_menu = hit(m, col, row);
-                retained::close_context_menu();
-                if on_menu {
-                    if let Some(sel) = retained::live_selection() {
-                        let text = retained::extract_selection_text(sel);
-                        if !text.is_empty() {
-                            let ok = copy_to_os_clipboard(&text);
-                            note_copied(&text, ok);
-                        }
-                    }
-                    // The highlight stays: the copy is confirmed by the note, and keeping it lets a
-                    // second copy (or a wider drag from the same anchor) follow without re-selecting.
-                    *dragging_scrollbar = false;
-                    *selecting = None;
-                    return;
-                }
-                // A click anywhere else dismisses the menu and then lands normally, which is what a
-                // click-away is expected to do — falling through means it also starts a selection or
-                // hits the jump button, rather than being eaten as a "close the menu" no-op.
-            }
             // Floating "jump to bottom" button takes priority: a click anywhere on it lands the
             // viewport back on the live tail (only present while scrolled up off the tail).
             if let Some(b) = retained::jump_button_rect() {
@@ -1486,12 +1529,6 @@ fn handle_retained_mouse(
                 retained::scroll_to(desired.min(max_start));
             } else if in_transcript {
                 *dragging_scrollbar = false;
-                // Starting a fresh selection dismisses any menu unconditionally. The hit-test above
-                // only sees a menu the render thread has already PUBLISHED, so a click landing in the
-                // same frame as the right-click that opened it would otherwise fall through to here
-                // and leave the box drawn over the new selection. Every other click path reaches
-                // `clear_selection` (which closes the menu); this is the one that doesn't.
-                retained::close_context_menu();
                 let line = start.saturating_add(row.saturating_sub(area.y) as usize);
                 let c = col.saturating_sub(area.x) as usize;
                 let sel = retained::SelectionRange {
@@ -1581,31 +1618,21 @@ fn handle_retained_mouse(
             if *dragging_scrollbar {
                 *dragging_scrollbar = false;
             } else if let Some(sel) = selecting.take() {
-                // Keep highlight until next click; copy text to the OS clipboard on release.
+                // Keep highlight until next click; copy text to the OS clipboard on release and
+                // confirm with a one-line note so the user knows the copy landed.
                 retained::set_selection(sel);
                 let text = retained::extract_selection_text(sel);
                 if !text.is_empty() {
-                    copy_to_os_clipboard(&text);
+                    let ok = copy_to_os_clipboard(&text);
+                    note_copied(&text, ok);
                 }
             }
         }
-        // Right-click over a highlight offers an explicit "Copy" button. The drag-release above
-        // already copies silently, but that is invisible — there is no way to tell it happened, and
-        // no way to ask for it again without re-dragging. This is the discoverable path.
-        //
-        // Gated on there BEING a selection: a menu whose only item is Copy has nothing to offer
-        // otherwise, and popping an inert box on every right-click in the transcript would be noise.
-        // `live_selection` is the mirror of what is painted — `selecting` is already `take()`n by the
-        // mouse-up above, so it is `None` at exactly the moment someone reaches for the right button.
-        MouseEventKind::Down(MouseButton::Right) => {
-            if in_transcript && retained::live_selection().is_some() {
-                retained::open_context_menu(col, row);
-            } else if retained::context_menu_rect().is_some() {
-                // Right-click with nothing selected (or outside the transcript) dismisses an open
-                // menu rather than leaving it stranded.
-                retained::close_context_menu();
-            }
-        }
+        // Right-click is NOT a copy path anymore. It used to pop a floating "Copy" button over the
+        // highlight, which meant the one gesture people already know for copying (Ctrl-C) still quit
+        // the app while a mouse-only affordance did the copying. Ctrl-C is the copy key now — see the
+        // `Key::CtrlC` arm in the keyboard loop — so the menu, its layout clamp, and its hit-test rect
+        // are all gone rather than left as a second way to do the same thing.
         _ => {}
     }
 }
@@ -1614,9 +1641,9 @@ fn handle_retained_mouse(
 ///
 /// DESKTOP-ONLY: `arboard` is target-gated to Windows/macOS (Linux would need X11/Wayland libs at
 /// runtime, breaking the headless static binary — see Cargo.toml), so on Linux this is a no-op.
-/// It returns `bool` rather than `()` so the explicit right-click Copy can confirm honestly instead
-/// of printing "copied" on a platform where nothing was: a silent no-op is survivable for the
-/// incidental drag-release copy, but a button the user deliberately clicked must not lie.
+/// It returns `bool` rather than `()` so a deliberate Ctrl-C copy can confirm honestly instead of
+/// printing "copied" on a platform where nothing was — a key the user pressed on purpose must not
+/// lie about what it did, least of all when the alternative reading of that key is "quit".
 #[cfg(any(windows, target_os = "macos"))]
 fn copy_to_os_clipboard(text: &str) -> bool {
     match arboard::Clipboard::new() {
@@ -1629,22 +1656,88 @@ fn copy_to_os_clipboard(_text: &str) -> bool {
     false
 }
 
-/// Confirm (or honestly deny) an explicit right-click copy with one dim transcript line.
+/// Confirm (or honestly deny) a copy with one dim transcript line.
 ///
 /// Routed through `note_line`, never `eprintln!`: a raw write behind the render thread's back lands
 /// inside a retained frame and corrupts it, because ratatui's cell diff compares against its own
 /// last frame and never sees the foreign text.
 fn note_copied(text: &str, ok: bool) {
     let msg = if ok {
-        let chars = text.chars().count();
-        let rows = text.lines().count().max(1);
-        if rows > 1 {
-            format!("· copied {chars} chars ({rows} lines)")
-        } else {
-            format!("· copied {chars} chars")
-        }
+        format!("· copied {}", copy_size(text))
     } else {
         "· clipboard unavailable on this platform — nothing copied".to_string()
+    };
+    note_line(&style(msg).dim().to_string());
+}
+
+/// `12 chars` / `48 chars (3 lines)` — the size half of every copy confirmation.
+fn copy_size(text: &str) -> String {
+    let chars = text.chars().count();
+    let rows = text.lines().count().max(1);
+    if rows > 1 {
+        format!("{chars} chars ({rows} lines)")
+    } else {
+        format!("{chars} chars")
+    }
+}
+
+/// What a Ctrl-C press should copy, if anything, and the word to call it in the confirmation.
+///
+/// Order matters: a transcript highlight is an explicit, visible act of selection, so it outranks the
+/// draft. The draft is the fallback because "copy what I just typed" is the case with no other route
+/// at all — the input row is a single ratatui line, so the terminal's own mouse selection cannot reach
+/// the parts of a long draft that are scrolled out of the window.
+///
+/// `None` means there is nothing to copy, and the press keeps its original meaning: quit.
+fn ctrl_c_copy_target() -> Option<(String, &'static str)> {
+    if let Some(sel) = retained::live_selection() {
+        let text = retained::extract_selection_text(sel);
+        if !text.trim().is_empty() {
+            return Some((text, "selection"));
+        }
+    }
+    let draft: String = render().lock().unwrap().draft.iter().collect();
+    if !draft.trim().is_empty() {
+        return Some((draft, "draft"));
+    }
+    None
+}
+
+/// How long a Ctrl-C that copied stays "armed", so the next Ctrl-C quits instead of copying again.
+const CTRL_C_QUIT_WINDOW: Duration = Duration::from_millis(2000);
+
+/// What one Ctrl-C press means, given how long ago the previous press copied and whether there is
+/// anything to copy right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtrlC {
+    Copy,
+    Quit,
+}
+
+/// Resolve the two meanings of Ctrl-C. Pure so the arbitration is testable without a terminal, a
+/// clipboard, or a running input loop — the arm state is the only thing standing between "copy" and
+/// "the app exits", so it must not be verifiable by hand-play alone.
+///
+/// `since_copy` is `None` when no Ctrl-C has copied yet this session.
+fn ctrl_c_action(since_copy: Option<Duration>, has_target: bool) -> CtrlC {
+    let armed = since_copy.map(|d| d < CTRL_C_QUIT_WINDOW).unwrap_or(false);
+    if !armed && has_target {
+        CtrlC::Copy
+    } else {
+        CtrlC::Quit
+    }
+}
+
+/// Confirm a Ctrl-C copy AND say how to still quit — the two meanings of the key now share it, so the
+/// note has to resolve the ambiguity in the same breath it reports the copy.
+fn note_ctrl_c_copy(text: &str, ok: bool, what: &str) {
+    let msg = if ok {
+        format!(
+            "· copied {what} — {} · Ctrl-C again to quit",
+            copy_size(text)
+        )
+    } else {
+        "· clipboard unavailable on this platform · Ctrl-C again to quit".to_string()
     };
     note_line(&style(msg).dim().to_string());
 }
@@ -1671,6 +1764,11 @@ fn input_loop(
     // the wake key never edits the draft). `last_activity` is the wall-clock of the last event.
     let mut last_activity = Instant::now();
     let mut screensaver_up = false;
+    // When the last Ctrl-C copied something instead of quitting. Ctrl-C now means "copy" whenever
+    // there IS something to copy, so quitting needs a second press — and this timestamp is what makes
+    // the second press mean quit rather than copying the same text again. It expires
+    // (`CTRL_C_QUIT_WINDOW`) so a Ctrl-C minutes later is a fresh copy, not a surprise exit.
+    let mut ctrl_c_armed: Option<Instant> = None;
 
     // Startup card: show ONE rotating feature card over the landing screen the moment the sticky TUI
     // is up (retained only — the blit is a raw sixel the alt-screen renderer can't carry any other
@@ -1936,7 +2034,12 @@ fn input_loop(
                     let at = {
                         let r = render().lock().unwrap();
                         let m = at_matches(&r.draft);
-                        (!m.is_empty()).then(|| (m[r.at_sel.min(m.len() - 1)].clone(), draft_at_prefix_start(&r.draft)))
+                        (!m.is_empty()).then(|| {
+                            (
+                                m[r.at_sel.min(m.len() - 1)].clone(),
+                                draft_at_prefix_start(&r.draft),
+                            )
+                        })
                     };
                     if let Some((path, at_start)) = at {
                         let mut r = render().lock().unwrap();
@@ -2019,9 +2122,7 @@ fn input_loop(
                 // marker stripped. A refused aside (no worker / blank / oversized) also falls through,
                 // so the text is delivered either way and the model never sees the `?`. Not offered
                 // for a vision message (an image belongs to the main turn).
-                else if let Some(rest) =
-                    trimmed.strip_prefix('?').filter(|_| images == 0)
-                {
+                else if let Some(rest) = trimmed.strip_prefix('?').filter(|_| images == 0) {
                     if turn_in_flight() && crate::core::aside::ask(rest) {
                         continue;
                     }
@@ -2082,9 +2183,32 @@ fn input_loop(
                                                 // also flushes the submission queue for the same reason).
                     crate::core::steer::clear();
                 } else if matches!(key, Key::CtrlC | Key::Char('\u{3}')) {
-                    // Ctrl-C is THE way to quit the app (Esc no longer exits). Unconditional process
-                    // exit — it must not merely clear a draft first, or some Windows terminals kill us
-                    // before the REPL reaches its normal `deactivate()` cleanup path.
+                    // Ctrl-C carries TWO meanings, and copy takes the first press.
+                    //
+                    // The terminal's own Ctrl-C-copies-selection never reaches us: mouse capture is on
+                    // (it has to be — it is what stops `alternateScroll` leaking wheel ticks in as
+                    // ↑/↓), so the terminal has no selection of its own to copy, and the key arrives
+                    // here as a plain `\u{3}`. Copying therefore has to be implemented on this side.
+                    //
+                    // Quitting still owns the key, just not the first press when there is something to
+                    // copy: `ctrl_c_armed` makes the immediate next press quit, and expires so a press
+                    // long afterwards is a fresh copy rather than a surprise exit. With nothing to copy
+                    // (no highlight, empty draft) the first press quits exactly as before — which is
+                    // the state the key is pressed in when someone means to leave.
+                    let target = ctrl_c_copy_target();
+                    if ctrl_c_action(ctrl_c_armed.map(|t| t.elapsed()), target.is_some())
+                        == CtrlC::Copy
+                    {
+                        // `unwrap` is sound: `Copy` is only returned when `has_target` was true.
+                        let (text, what) = target.expect("Copy implies a target");
+                        let ok = copy_to_os_clipboard(&text);
+                        note_ctrl_c_copy(&text, ok, what);
+                        ctrl_c_armed = Some(Instant::now());
+                        continue;
+                    }
+                    // Nothing to copy, or the second press inside the window: quit. Unconditional
+                    // process exit — it must not merely clear a draft first, or some Windows terminals
+                    // kill us before the REPL reaches its normal `deactivate()` cleanup path.
                     let _ = sub_tx.send(Submission::Quit);
                     return;
                 } else {
@@ -2108,7 +2232,12 @@ fn input_loop(
                 let at = {
                     let r = render().lock().unwrap();
                     let m = at_matches(&r.draft);
-                    (!m.is_empty()).then(|| (m[r.at_sel.min(m.len() - 1)].clone(), draft_at_prefix_start(&r.draft)))
+                    (!m.is_empty()).then(|| {
+                        (
+                            m[r.at_sel.min(m.len() - 1)].clone(),
+                            draft_at_prefix_start(&r.draft),
+                        )
+                    })
                 };
                 if let Some((path, at_start)) = at {
                     let mut r = render().lock().unwrap();
@@ -2278,7 +2407,9 @@ fn input_loop(
                 if at_len > 0 {
                     let mut r = render().lock().unwrap();
                     if retained::is_active() {
-                        if r.at_sel + 1 < at_len { r.at_sel += 1; }
+                        if r.at_sel + 1 < at_len {
+                            r.at_sel += 1;
+                        }
                     } else {
                         r.at_sel = r.at_sel.saturating_sub(1);
                     }
@@ -2354,11 +2485,18 @@ pub fn model_menu_active() -> bool {
 }
 
 /// True when the sticky footer REPL should use the in-terminal `/model` overlay (not dialoguer).
+///
+/// The opening half of the in-terminal `/model` picker. Currently unreachable: `/model` goes through
+/// `pick_model_from` (dialoguer) instead. The *closing* half — `model_menu_active`, the slot, the key
+/// routing in the input thread — is still live, so deleting only the openers would leave a menu that
+/// can be driven but never shown. Kept whole so reconnecting the picker is a one-line call.
+#[allow(dead_code)]
 pub fn sticky_model_picker_available() -> bool {
     std::io::stdout().is_terminal() && !crate::core::cli_config::branded_flag("NO_STICKY")
 }
 
 /// Open the `/model` overlay immediately (loading state). Call [`model_menu_populate`] after fetch.
+#[allow(dead_code)]
 pub fn model_menu_begin() -> Option<oneshot::Receiver<Option<String>>> {
     if !sticky_model_picker_available() || !active() {
         return None;
@@ -2387,6 +2525,7 @@ pub fn model_menu_begin() -> Option<oneshot::Receiver<Option<String>>> {
 }
 
 /// Fill the model list after the provider responds (overlay must already be open).
+#[allow(dead_code)]
 pub fn model_menu_populate(models: Vec<String>, labels: Vec<String>, default_sel: usize) {
     if !model_menu_active() {
         return;
@@ -2414,6 +2553,7 @@ pub fn model_menu_populate(models: Vec<String>, labels: Vec<String>, default_sel
 }
 
 /// Cancel the overlay without picking (e.g. fetch failed).
+#[allow(dead_code)]
 pub fn model_menu_abort() {
     if model_menu_active() {
         model_menu_finish(None);
@@ -2421,6 +2561,7 @@ pub fn model_menu_abort() {
 }
 
 /// Open the model overlay with a ready list (used when data is already in hand).
+#[allow(dead_code)]
 pub fn model_menu_open(
     models: Vec<String>,
     labels: Vec<String>,
@@ -2481,6 +2622,10 @@ pub fn sessions_menu_active() -> bool {
 }
 
 /// True when the sticky footer REPL should use the in-terminal `/sessions` overlay (not dialoguer).
+///
+/// Unreachable for the same reason as the `/model` openers above: `/sessions` runs through
+/// `main.rs`'s own `sessions_menu`. The key routing and `sessions_menu_finish` remain live.
+#[allow(dead_code)]
 pub fn sessions_menu_available() -> bool {
     active()
         && std::io::stdout().is_terminal()
@@ -2489,6 +2634,7 @@ pub fn sessions_menu_available() -> bool {
 
 /// Open the `/sessions` overlay with a ready row list. Returns `None` (caller falls back to
 /// dialoguer) when the sticky footer isn't active or the list is empty.
+#[allow(dead_code)]
 pub fn sessions_menu_open(
     rows: Vec<(String, String)>,
     default_sel: usize,
@@ -2528,6 +2674,7 @@ pub fn sessions_menu_open(
 }
 
 /// Cancel the sessions overlay without picking.
+#[allow(dead_code)]
 pub fn sessions_menu_abort() {
     if sessions_menu_active() {
         sessions_menu_finish(None);
@@ -2556,6 +2703,11 @@ fn sessions_menu_finish(picked: Option<SessionsMenuChoice>) {
 }
 
 /// Begin intercepting [`emit`]/[`emit_line`] calls. Returns false if capture is already active.
+///
+/// Capture + [`text_overlay_open`] were the pair that showed a print-based command's output in a
+/// scrollable panel. No command routes through them now (they emit into the transcript directly), but
+/// `EMIT_CAPTURING` is still honoured inside `emit`, so the capture path itself is live code.
+#[allow(dead_code)]
 pub fn emit_capture_begin() -> bool {
     if EMIT_CAPTURING.swap(true, Ordering::SeqCst) {
         return false;
@@ -2566,6 +2718,7 @@ pub fn emit_capture_begin() -> bool {
 
 /// Stop capture and return the collected source lines. ANSI/C0 controls are removed before paint so
 /// captured config/provider text cannot move the terminal cursor or inject escape sequences.
+#[allow(dead_code)]
 pub fn emit_capture_take() -> Vec<String> {
     EMIT_CAPTURING.store(false, Ordering::SeqCst);
     std::mem::take(&mut *emit_capture_slot().lock().unwrap())
@@ -2656,6 +2809,7 @@ pub fn retained_overlay_close() {
 }
 
 /// True when the sticky REPL can show the native text overlay.
+#[allow(dead_code)]
 pub fn text_overlay_available() -> bool {
     active()
         && std::io::stdout().is_terminal()
@@ -2663,6 +2817,7 @@ pub fn text_overlay_available() -> bool {
 }
 
 /// Open captured pure-print output as a temporary scrollable overlay. Resolves when Esc/q closes it.
+#[allow(dead_code)]
 pub fn text_overlay_open(title: String, lines: Vec<String>) -> Option<oneshot::Receiver<()>> {
     if !text_overlay_available() || lines.is_empty() {
         return None;
@@ -2776,6 +2931,11 @@ pub fn restore_stdin_cooked() {
 
 /// Read one line with visible echo (types + paste show on screen). Uses `console::Term::read_line`
 /// so input works after sticky TUI / dialoguer on Windows; `std::io::stdin().read_line` often stays silent.
+///
+/// No current caller: every prompt that needed it now runs inside a `dialoguer` suspend window, which
+/// does its own echoing. Kept because the Windows behaviour it works around is a property of the
+/// platform, not of the call site that used to hit it.
+#[allow(dead_code)]
 pub fn read_visible_line(prompt: &str) -> std::io::Result<String> {
     restore_stdin_cooked();
     let term = Term::stdout();
@@ -2998,6 +3158,10 @@ pub fn slash_takes_stdin(input: &str) -> bool {
     )
         // `/timemachine` (and its `timeline`/`tm` aliases) is one command: it always opens the
         // checkpoint picker, so it claims stdin regardless of what follows.
+        || name == "provider"
+            && (arg.is_empty()
+                || arg.eq_ignore_ascii_case("add")
+                || arg.eq_ignore_ascii_case("manage"))
         || matches!(name, "timemachine" | "timeline" | "tm")
         || name == "effort" && arg.is_empty()
         // `/update` always opens a dialoguer picker over the published versions — it takes no
@@ -3481,9 +3645,51 @@ mod tests {
         assert_ne!(Submission::Quit, Submission::Slash("help".into()));
     }
 
+    /// Ctrl-C now means two things, and getting the arbitration wrong costs the user either their
+    /// clipboard or their session. The one path that must never regress: a press that copied cannot
+    /// also be the press that quits, and the very next press must still be able to leave.
+    #[test]
+    fn ctrl_c_copies_first_then_quits() {
+        // Nothing selected and an empty draft — the state someone is in when they mean to leave.
+        // The key keeps its original, unconditional meaning.
+        assert_eq!(ctrl_c_action(None, false), CtrlC::Quit);
+
+        // Something to copy: the first press copies rather than exiting.
+        assert_eq!(ctrl_c_action(None, true), CtrlC::Copy);
+
+        // Immediately after a copy the key is armed, so the next press leaves — even though there is
+        // still a selection sitting there. Without this, Ctrl-C would copy forever and the app could
+        // not be closed by the only key that closes it.
+        assert_eq!(
+            ctrl_c_action(Some(Duration::from_millis(0)), true),
+            CtrlC::Quit
+        );
+        assert_eq!(
+            ctrl_c_action(Some(CTRL_C_QUIT_WINDOW - Duration::from_millis(1)), true),
+            CtrlC::Quit
+        );
+
+        // The arm expires: a press long after copying is a fresh copy, not a surprise exit.
+        assert_eq!(
+            ctrl_c_action(Some(CTRL_C_QUIT_WINDOW), true),
+            CtrlC::Copy,
+            "the quit window must expire, or a copy an hour ago still closes the app"
+        );
+
+        // Expired arm with nothing left to copy still quits.
+        assert_eq!(
+            ctrl_c_action(Some(Duration::from_secs(60)), false),
+            CtrlC::Quit
+        );
+    }
+
     #[test]
     fn slash_parking_only_claims_direct_stdin_owners() {
         assert!(slash_takes_stdin("config"));
+        assert!(slash_takes_stdin("provider"));
+        assert!(slash_takes_stdin("provider add"));
+        assert!(slash_takes_stdin("provider manage"));
+        assert!(!slash_takes_stdin("provider backup"));
         assert!(slash_takes_stdin("sessions"));
         // `/import` was missing here while `/sessions` — the same dialoguer Select — was listed, so
         // the input thread kept the keyboard and the import picker could not be paged.

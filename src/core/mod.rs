@@ -18,6 +18,7 @@ pub mod proctree;
 pub mod read_ledger;
 pub mod recovery;
 pub mod repo_lock;
+pub mod slug;
 pub mod steer;
 pub mod types;
 pub mod workspace_txn;

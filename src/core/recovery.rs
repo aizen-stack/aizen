@@ -267,6 +267,87 @@ pub fn clear() {
     }
 }
 
+/// How long an abandoned lease directory is kept before it is swept. A lease older than this cannot
+/// be a useful offer: its conversation is already in the session pool (autosave writes every turn),
+/// and nobody returns to a week-old interrupted turn.
+const LEASE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Delete lease directories nobody will ever be offered again.
+///
+/// [`clear`] only runs on a CLEAN exit and [`scan_stale`] only ever LOOKS at leases whose
+/// `repo_scope` matches the current one — so every abrupt shutdown (window closed, Ctrl-C, killed
+/// process) left a directory behind, and one belonging to any other project was invisible to every
+/// code path that could remove it. They accumulated forever: a real install had **98** of them going
+/// back two weeks, with zero `consumed-*` or `quarantine-*` ever cleaned up.
+///
+/// Deliberately scope-BLIND, which is the whole point — the leak is precisely the leases this
+/// process would otherwise never look at. Safety comes from the lock plus the age check, not from
+/// scope: a directory is removed only if its lock can be taken exclusively (so no live process owns
+/// it) and it is older than [`LEASE_TTL_SECS`]. An unparseable manifest is dated by the directory's
+/// own mtime, so junk that can never become an offer still ages out instead of living forever.
+///
+/// Best-effort throughout: sweeping is housekeeping and must never block or fail a REPL start.
+pub fn sweep_expired() {
+    let root = recovery_root();
+    let Ok(rd) = fs::read_dir(&root) else { return };
+    let now = now_unix();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        // Never touch this process's own live lease.
+        if let Ok(g) = ACTIVE.lock() {
+            if g.as_ref().is_some_and(|a| a.dir == path) {
+                continue;
+            }
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // `consumed-*` / `quarantine-*` are already-dead byproducts: age them out by directory mtime
+        // (they hold no authoritative manifest to read a timestamp from).
+        let residue = name.starts_with("consumed-") || name.starts_with("quarantine-");
+        let stamp = if residue {
+            None
+        } else {
+            fs::read_to_string(manifest_path(&path))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<RecoveryManifest>(&raw).ok())
+                .map(|m| m.updated_unix)
+        };
+        let age_ok = match stamp {
+            Some(updated) => now.saturating_sub(updated) > LEASE_TTL_SECS,
+            // No readable manifest (residue, or corrupt/half-created): fall back to the directory's
+            // own mtime. If the filesystem won't say either, leave it alone rather than guess.
+            None => entry
+                .metadata()
+                .and_then(|md| md.modified())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .is_some_and(|d| now.saturating_sub(d.as_secs()) > LEASE_TTL_SECS),
+        };
+        if !age_ok {
+            continue;
+        }
+        // The lock is the liveness test: a running process holds its lease lock for its whole
+        // lifetime, so failing to acquire means "still in use" and we skip it.
+        //
+        // Then DROP it before removing. The lock owns an open handle to `lease.lock` INSIDE this
+        // directory, and Windows refuses to delete a directory containing an open file — holding the
+        // guard across `remove_dir_all` would make the sweep silently no-op on the very platform
+        // where the leak was measured. Releasing early is safe here: the directory is already older
+        // than the TTL, so there is no live process to race with.
+        match crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+            &lock_path(&path),
+            Duration::from_millis(50),
+        ) {
+            Ok(lock) => drop(lock),
+            Err(_) => continue,
+        }
+        let _ = fs::remove_dir_all(&path);
+    }
+}
+
 /// Scan for stale recovery leases from previous processes in exactly this repository/worktree.
 pub fn scan_stale(repo_scope: &str) -> Vec<RecoveryOffer> {
     let root = recovery_root();
@@ -481,6 +562,53 @@ mod tests {
             scan_stale("repo-b").is_empty(),
             "foreign repository lease is invisible"
         );
+        std::env::remove_var("AIZEN_HOME");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Abandoned leases must actually be collected, INCLUDING the ones belonging to other projects.
+    /// Those were the leak: `clear()` only runs on a clean exit and `scan_stale()` filters by
+    /// `repo_scope`, so a foreign lease was invisible to every path that could delete it. A real
+    /// install had accumulated 98 of them.
+    #[test]
+    fn sweep_collects_expired_leases_across_every_scope() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("aizen-sweep-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        std::env::set_var("AIZEN_HOME", &root);
+
+        let old_stamp = now_unix().saturating_sub(LEASE_TTL_SECS + 3600);
+
+        // An expired lease from ANOTHER repository — the case scan_stale can never see.
+        let foreign = recovery_root().join("expired-foreign");
+        fs::create_dir_all(&foreign).unwrap();
+        let mut m = manifest("some-other-repo", 3, 2);
+        m.updated_unix = old_stamp;
+        write_manifest(&foreign, &m).unwrap();
+
+        // A fresh lease in the same scope — must be left alone.
+        let fresh = recovery_root().join("fresh-here");
+        fs::create_dir_all(&fresh).unwrap();
+        let mut fm = manifest("some-other-repo", 3, 2);
+        fm.updated_unix = now_unix();
+        write_manifest(&fresh, &fm).unwrap();
+
+        // Residue with no manifest at all, dated by directory mtime (NOW here) — the age gate must
+        // keep it, which is what pins the rule to age rather than to the name prefix.
+        let residue = recovery_root().join("consumed-old-run");
+        fs::create_dir_all(&residue).unwrap();
+
+        sweep_expired();
+
+        assert!(!foreign.exists(), "an expired foreign lease must be swept");
+        assert!(fresh.exists(), "a fresh lease must survive the sweep");
+        assert!(
+            residue.exists(),
+            "freshly-created residue is not yet expired"
+        );
+
         std::env::remove_var("AIZEN_HOME");
         let _ = fs::remove_dir_all(&root);
     }

@@ -622,16 +622,11 @@ fn host_matches(host: Option<&str>) -> bool {
 }
 
 impl TelegramPlatform {
-    /// Build from `cli-config.json`'s `telegram` section, hosting every bot this machine may run.
+    /// Build from `cli-config.json`'s `telegram` section, hosting the named extra bots
+    /// (`serve --bots a,b`); an empty list means "every bot this host is allowed to run".
+    ///
     /// `menu` is the daemon's command surface (published to each bot via `setMyCommands`). Only a
     /// TOKEN is required — an empty allowlist is fine (the daemon then boots in pairing mode).
-    #[cfg(test)]
-    pub fn from_config(menu: Vec<(String, String)>) -> Result<Self> {
-        Self::from_config_selecting(menu, Vec::new())
-    }
-
-    /// As `from_config`, but hosting only the named extra bots (`serve --bots a,b`). An empty list
-    /// means "every bot this host is allowed to run".
     pub fn from_config_selecting(menu: Vec<(String, String)>, wanted: Vec<String>) -> Result<Self> {
         let cfg = cli_config::load().telegram.unwrap_or_default();
         let token = cfg.resolved_token().context(

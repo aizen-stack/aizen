@@ -105,6 +105,10 @@ fn core_eligible(e: &MemoryEntry, this_device: &str) -> bool {
 
 /// Does the user's current region (`current`) fall under an entry's `subpath` tag (segment-safe)?
 /// Shared with the search-path boost (`search_filtered_scoped`).
+///
+/// Both callers now go through `path_scope`'s own matcher; kept here as the segment-safe reference
+/// (a plain `starts_with` would match `src/foo` against `src/foobar`).
+#[allow(dead_code)]
 pub(crate) fn subpath_matches(entry_subpath: &str, current: &str) -> bool {
     current == entry_subpath
         || current

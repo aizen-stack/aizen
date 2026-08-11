@@ -7,7 +7,7 @@
 //! three-turn-old idea of the content. Every lock is honored at every instant and the read-modify-
 //! write is still torn.
 //!
-//! `file_edit` / `multi_edit` survive that on their own: `old_string` is matched against a FRESH read,
+//! `file_edit` (both forms) survives that on its own: `old_string` is matched against a FRESH read,
 //! so a rewritten region simply fails to match. `file_write` has no such anchor — it is a whole-file
 //! overwrite whose CAS passes against whatever is on disk right now, so the other window's work
 //! vanishes with no error. This ledger is the anchor: record the fingerprint at every read, and let a

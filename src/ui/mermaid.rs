@@ -2,6 +2,12 @@
 //!
 //! Unsupported syntax deliberately returns `None`; callers keep the original fenced source instead
 //! of pretending a partial diagram is authoritative.
+//!
+//! Not wired into the Markdown renderer yet: nothing detects a ```mermaid fence and routes it here,
+//! so every item below is unreachable from the binary. The renderer side is the missing half, not
+//! this one — the parser is complete and covered by its own tests, so it is kept whole rather than
+//! deleted and rewritten later. Remove the allow the moment a fence handler calls [`render`].
+#![allow(dead_code)]
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Edge {

@@ -299,7 +299,6 @@ fn astronaut(c: &mut Canvas, cx: f64, feet_y: f64, ah: f64) {
     // Flag pole to the right + right arm reaching to grip it.
     let pole_x = cx + aw * 2.05;
     let pole_top = top - ah * 0.06;
-    let grip_y = top + ah * 0.30;
     c.line(pole_x, feet_y + ah * 0.02, pole_x, pole_top, bright);
     c.plotf(pole_x, pole_top - 1.0, mid); // finial
                                           // Right arm: shoulder → grip on the pole.

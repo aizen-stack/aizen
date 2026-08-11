@@ -56,6 +56,11 @@ pub struct SymbolEditPlan {
     pub old_body: String,
     pub new_content: String,
     pub base_fingerprint: crate::core::persist::FileFingerprint,
+    /// Which edit shape produced this plan. The planner already resolved it into `start_line`/
+    /// `end_line`/`new_content`, so the applying tool writes the range without re-reading the kind;
+    /// it stays on the plan because a reader (or a log line) cannot tell an insert from a replace
+    /// from line numbers alone.
+    #[allow(dead_code)]
     pub kind: SymbolEditKind,
     pub symbol: String,
 }

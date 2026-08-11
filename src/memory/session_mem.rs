@@ -13,6 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionNoteKind {
     /// Working scratch (tool/context notes).
+    ///
+    /// Nothing files a note under this kind yet — every writer records a `Candidate`. Kept because
+    /// the L2 tier's whole point is holding both, and the distinction is what promotion reads.
+    #[allow(dead_code)]
     Working,
     /// Candidate fact inferred this session (may be promoted later by explicit path).
     Candidate,
@@ -57,10 +61,14 @@ impl SessionMem {
         Self { notes: Vec::new() }
     }
 
+    /// Read access to the notes. The prompt path builds its own ranked view, so nothing reads the
+    /// raw list yet; it is the tier's inspection surface (and what the tests assert on).
+    #[allow(dead_code)]
     pub fn list(&self) -> &[SessionNote] {
         &self.notes
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.notes.is_empty()
     }
@@ -126,6 +134,7 @@ impl SessionMem {
 
     /// Notes that could be promoted to durable (high-importance candidates). Default policy
     /// does **not** auto-promote — callers only use this for inspection / future CLI.
+    #[allow(dead_code)]
     pub fn candidates_for_promote(&self) -> Vec<&SessionNote> {
         self.notes
             .iter()
@@ -178,22 +187,13 @@ impl SessionMem {
     }
 }
 
+/// A short readable id for a session note. Not a filename (this store is process-local), but the id
+/// is rendered into the prompt block the model reads and can be quoted back by the user, so it gets
+/// the same whole-word treatment as every other id: fold the accents off, then split on word
+/// boundaries. Testing `is_ascii_alphanumeric` per codepoint made every accented letter a separator,
+/// so a Vietnamese note came out as one-letter fragments.
 fn slug_id(body: &str) -> String {
-    let mut s = String::new();
-    let mut last_dash = true;
-    for c in body.chars() {
-        if c.is_ascii_alphanumeric() {
-            s.push(c.to_ascii_lowercase());
-            last_dash = false;
-        } else if !last_dash {
-            s.push('-');
-            last_dash = true;
-        }
-        if s.len() >= 40 {
-            break;
-        }
-    }
-    let s = s.trim_matches('-');
+    let s = crate::core::slug::slug_words(body, 40);
     if s.is_empty() {
         format!("n-{}", simple_hash(body))
     } else {

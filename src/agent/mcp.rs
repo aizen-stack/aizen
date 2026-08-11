@@ -1446,6 +1446,9 @@ async fn connect_stdio(cfg: &ServerConfig) -> Result<Transport> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // Windows: no console window for the `cmd /C npx …` shim (and no desktop-heap allocation that
+    // could trip 0xc0000142). Unix: `setsid` so the tree can be group-killed. See `proctree`.
+    crate::core::proctree::prepare_tokio(&mut cmd);
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawning MCP server `{command}`"))?;

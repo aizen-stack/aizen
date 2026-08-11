@@ -44,6 +44,9 @@ impl std::error::Error for LockBusy {}
 #[derive(Debug)]
 pub struct RepoTxnLock {
     file: File,
+    /// Shared vs exclusive. Never read after acquisition — the OS holds the real lock state and
+    /// `Drop` releases whatever was taken — but kept so a held lock can say which kind it is.
+    #[allow(dead_code)]
     mode: LockMode,
 }
 
@@ -106,6 +109,8 @@ impl RepoTxnLock {
         }
     }
 
+    /// Which mode this lock was taken in.
+    #[allow(dead_code)]
     pub fn mode(&self) -> LockMode {
         self.mode
     }

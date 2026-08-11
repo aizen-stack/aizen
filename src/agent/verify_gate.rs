@@ -366,6 +366,192 @@ const MAX_ERRORS: usize = 10;
 /// Hard cap on the shaped text.
 const MAX_SHAPED_CHARS: usize = 3_000;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Diagnostic {
+    pub key: String,
+    pub rendered: String,
+}
+
+/// Immutable pre-edit compiler state. `diagnostics=None` means the failing output was not a shape we
+/// can compare safely; callers must keep the old conservative raw pass/fail policy.
+#[derive(Debug, Clone)]
+pub struct VerifyBaseline {
+    pub command: String,
+    pub passed: bool,
+    pub diagnostics: Option<Vec<Diagnostic>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifyDelta {
+    pub passed: bool,
+    #[allow(dead_code)] // reported to parent via `note`; field kept for future diagnostic tooling
+    pub preexisting: usize,
+    pub new_diagnostics: Vec<Diagnostic>,
+    pub note: Option<String>,
+}
+
+/// Extract stable diagnostics for baseline comparison. TSC keys ignore line/column movement and use
+/// normalized path + error code + whitespace-normalized message. Cargo keys use the error header plus
+/// the first primary `--> path:line:col` location in its block when present.
+pub fn parse_diagnostics(raw: &str) -> Option<Vec<Diagnostic>> {
+    parse_tsc_diagnostics(raw).or_else(|| parse_cargo_diagnostics(raw))
+}
+
+fn normalize_diag_text(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_diag_path(s: &str) -> String {
+    s.trim().replace('\\', "/").to_ascii_lowercase()
+}
+
+fn parse_tsc_diagnostics(raw: &str) -> Option<Vec<Diagnostic>> {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+    static RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?m)^(.+)\((\d+),(\d+)\): error (TS\d+): (.*)$").unwrap());
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for c in RE.captures_iter(raw) {
+        let path = normalize_diag_path(&c[1]);
+        let message = normalize_diag_text(&c[5]);
+        let key = format!("tsc|{path}|{}|{message}", &c[4]);
+        if seen.insert(key.clone()) {
+            out.push(Diagnostic {
+                key,
+                rendered: format!("{} {}:{}  {} {}", &c[1], &c[2], &c[3], &c[4], &c[5]),
+            });
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn parse_cargo_diagnostics(raw: &str) -> Option<Vec<Diagnostic>> {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+    static LOC: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\s*-->\s+(.+?):\d+:\d+\s*$").unwrap());
+    let lines: Vec<&str> = raw.lines().collect();
+    let is_start = |l: &str| l.starts_with("error[") || l.starts_with("error:");
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        if !is_start(lines[i]) {
+            i += 1;
+            continue;
+        }
+        let header = normalize_diag_text(lines[i]);
+        let mut loc = String::new();
+        let mut block = vec![lines[i]];
+        let mut j = i + 1;
+        while j < lines.len() && !is_start(lines[j]) {
+            if loc.is_empty() {
+                if let Some(c) = LOC.captures(lines[j]) {
+                    loc = normalize_diag_path(&c[1]);
+                }
+            }
+            if !lines[j].trim().is_empty() && block.len() < 6 {
+                block.push(lines[j]);
+            }
+            j += 1;
+        }
+        let key = format!("cargo|{loc}|{header}");
+        if seen.insert(key.clone()) {
+            out.push(Diagnostic {
+                key,
+                rendered: block.join("\n"),
+            });
+        }
+        i = j;
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+pub fn baseline_from_result(result: &VerifyGateResult) -> VerifyBaseline {
+    VerifyBaseline {
+        command: result.command.clone(),
+        passed: result.passed,
+        diagnostics: (!result.passed)
+            .then(|| parse_diagnostics(&result.output))
+            .flatten(),
+    }
+}
+
+/// Compare the current compiler state to the immutable pre-edit baseline.
+///
+/// A red baseline with no new diagnostic is accepted: the task did not regress the project. A clean
+/// baseline, unparseable failing output, command mismatch, timeout, or unstable result stays
+/// conservative and requires a clean exit.
+pub fn compare_to_baseline(baseline: &VerifyBaseline, current: &VerifyGateResult) -> VerifyDelta {
+    if current.passed {
+        return VerifyDelta {
+            passed: true,
+            preexisting: baseline.diagnostics.as_ref().map_or(0, Vec::len),
+            new_diagnostics: Vec::new(),
+            note: None,
+        };
+    }
+    if !current.stable || baseline.command != current.command || baseline.passed {
+        return VerifyDelta {
+            passed: false,
+            preexisting: 0,
+            new_diagnostics: parse_diagnostics(&current.output).unwrap_or_default(),
+            note: None,
+        };
+    }
+    let (Some(before), Some(after)) = (
+        baseline.diagnostics.as_ref(),
+        parse_diagnostics(&current.output),
+    ) else {
+        return VerifyDelta {
+            passed: false,
+            preexisting: 0,
+            new_diagnostics: Vec::new(),
+            note: None,
+        };
+    };
+    let old: std::collections::HashSet<&str> = before.iter().map(|d| d.key.as_str()).collect();
+    let new_diagnostics: Vec<Diagnostic> = after
+        .into_iter()
+        .filter(|d| !old.contains(d.key.as_str()))
+        .collect();
+    let passed = new_diagnostics.is_empty();
+    VerifyDelta {
+        passed,
+        preexisting: before.len(),
+        note: passed.then(|| {
+            format!(
+                "verification remains red with {} pre-existing diagnostic(s), 0 new",
+                before.len()
+            )
+        }),
+        new_diagnostics,
+    }
+}
+
+pub fn format_delta_failure(result: &VerifyGateResult, delta: &VerifyDelta) -> String {
+    if delta.new_diagnostics.is_empty() {
+        return format_gate_failure(result);
+    }
+    let total = delta.new_diagnostics.len();
+    let shown = total.min(MAX_ERRORS);
+    let mut body = delta.new_diagnostics[..shown]
+        .iter()
+        .map(|d| d.rendered.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if total > shown {
+        body.push_str(&format!(
+            "\n(+{} more NEW error(s) suppressed)",
+            total - shown
+        ));
+    }
+    format!(
+        "[aizen verify] `{}` introduced {} NEW diagnostic(s) ({} ms). Fix only these regressions before reporting the task done:\n\n{}",
+        result.command, total, result.duration_ms, head_chars(&body, MAX_SHAPED_CHARS)
+    )
+}
+
 /// Shape a failing verify output: cargo-style error blocks (deduped by header, ≤5 lines each) or
 /// tsc-style error rows (deduped), capped at [`MAX_ERRORS`] with a suppressed-count note; an
 /// unrecognized shape falls back to the raw tail (behavior-preserving floor).

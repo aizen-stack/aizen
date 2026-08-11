@@ -22,6 +22,21 @@
 use std::process::{Child, Command};
 use std::time::Duration;
 
+/// `CREATE_NO_WINDOW` (winbase.h): a spawned console child (git.exe, cmd.exe, a build tool) gets no
+/// console window of its own. Applied to every child Aizen spawns through [`prepare`] /
+/// [`prepare_tokio`]. Two reasons, both load-bearing:
+///
+///  * No console flash when Aizen runs under a TUI/alt-screen or fully headless (`aizen serve`).
+///  * Every console child consumes the window station's shared **desktop heap**. A fan-out of git
+///    checkpoints + subagents can exhaust it, and `CreateProcess` then fails during loader init with
+///    `STATUS_DLL_INIT_FAILED` (0xc0000142) — the modal "unable to start correctly" dialog. A
+///    windowless child sidesteps that allocation entirely.
+///
+/// Output is captured through pipes regardless, so no console is ever needed. Same flag the LSP
+/// client already uses (`agent::lsp::server`).
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// A handle keeping a spawned tree contained. Hold it for as long as the child may live; dropping it
 /// on Windows kills the whole tree (kill-on-close), which is also the crash-safety property.
 pub enum Containment {
@@ -70,7 +85,15 @@ pub fn prepare(cmd: &mut Command) {
             });
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Merge, don't clobber: `creation_flags` REPLACES the whole flag word, but no caller of
+        // `prepare` sets other flags first, so a plain set is correct here (the LSP path sets its
+        // own flags and does not call `prepare`).
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = cmd;
     }
@@ -286,7 +309,13 @@ pub fn prepare_tokio(cmd: &mut tokio::process::Command) {
             });
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // tokio's Command exposes `creation_flags` inherently on Windows (no trait import). See
+        // `CREATE_NO_WINDOW` for why every spawned child gets it.
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = cmd;
     }
