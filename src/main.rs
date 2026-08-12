@@ -5164,6 +5164,24 @@ async fn cancellable_slash<T>(fut: impl std::future::Future<Output = T>) -> Opti
     out
 }
 
+/// Like [`cancellable_slash`] but shows a specific caption in the working pill instead of the
+/// default whimsical verb — so post-turn housekeeping ("learning from this turn…") is visually
+/// distinct from the main agent turn ("Pondering…"), and the user knows Esc will skip optional
+/// work, not abort the answer they already received.
+async fn cancellable_slash_labeled<T>(
+    label: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let token = crate::core::cancel::TurnCancel::new();
+    tui::arm_cancel(token.clone());
+    let _guard = TurnCancelGuard(token.clone());
+    tui::set_working(true);
+    tui::set_work_caption(label);
+    let out = crate::core::cancel::race(&token, fut).await;
+    tui::set_working(false);
+    out
+}
+
 /// The startup identity banner: one line saying which project root + zone slug THIS launch is
 /// bound to (the audit's top visibility gap: no surface printed either), plus loud notes when git
 /// resolved unusually or a legacy zone from the old slug keying still holds data.
@@ -5838,13 +5856,21 @@ async fn run_menu_sticky() -> Result<()> {
                         // consumed no input. To the user the turn had visibly ENDED and the app was
                         // wedged anyway. Re-arm for the duration; cancelling skips the remaining
                         // learning, which is always optional work.
-                        let learned = cancellable_slash(async {
-                            maybe_run_secretary(&history, &http, &base_url, &api_key, &model).await;
-                            maybe_evolve_persona(&http, &base_url, &api_key, &model).await;
-                            maybe_auto_compact(&mut history, &http, &base_url, &api_key, &model)
+                        let learned =
+                            cancellable_slash_labeled("learning from this turn…", async {
+                                maybe_run_secretary(&history, &http, &base_url, &api_key, &model)
+                                    .await;
+                                maybe_evolve_persona(&http, &base_url, &api_key, &model).await;
+                                maybe_auto_compact(
+                                    &mut history,
+                                    &http,
+                                    &base_url,
+                                    &api_key,
+                                    &model,
+                                )
                                 .await;
-                        })
-                        .await;
+                            })
+                            .await;
                         if learned.is_none() {
                             tui::emit_line(
                                 &theme::muted("⏹ skipped the post-turn learning passes.")
@@ -5869,6 +5895,8 @@ async fn run_menu_sticky() -> Result<()> {
                         if history.last().map(|m| m.role == "user").unwrap_or(false) {
                             history.pop();
                         }
+                        // Persist the failed turn so quitting doesn't lose it
+                        autosave_last(&history, Some(&model));
                     }
                 }
                 tui::set_status(&status_text(&history, &model_label));
