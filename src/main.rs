@@ -5098,17 +5098,20 @@ fn cache_hit_label() -> Option<String> {
     Some(format!("⛁ {}% cached", cached * 100 / prompt))
 }
 
-/// Disarms the interactive cancel token however a turn ends — normal completion, an early `continue`
-/// from a prep failure, or a panic unwinding out of the arm. `disarm_cancel` is identity-checked, so
-/// this can never clear a NEWER turn's token and double-disarming is harmless.
+/// Disarms the interactive cancel token AND resets working state however a turn ends — normal
+/// completion, an early `continue` from a prep failure, or a panic unwinding out of the arm.
+/// `disarm_cancel` is identity-checked, so this can never clear a NEWER turn's token and
+/// double-disarming is harmless. `set_working(false)` is idempotent so a second reset is safe.
 ///
-/// This exists because the token is now armed BEFORE the turn's prep work (see the Chat arm), and an
-/// armed token is what `tui::turn_in_flight` reports. Leaking one past a `continue` would leave the
-/// REPL idle while Esc still behaved like "cancel", so every exit path must disarm.
+/// This exists because the token AND working indicator are now armed BEFORE the turn's prep work
+/// (see the Chat arm), and an armed token is what `tui::turn_in_flight` reports. Leaking one past a
+/// `continue` would leave the REPL idle while Esc still behaved like "cancel" and the UI showed
+/// "working", so every exit path must disarm AND reset.
 struct TurnCancelGuard(crate::core::cancel::TurnCancel);
 
 impl Drop for TurnCancelGuard {
     fn drop(&mut self) {
+        tui::set_working(false);
         tui::disarm_cancel(&self.0);
     }
 }
@@ -5416,7 +5419,11 @@ async fn run_menu_sticky() -> Result<()> {
                 if line.is_empty() && images.is_empty() {
                     continue;
                 }
-                // ARM CANCEL FIRST — before any prep. Everything between here and `set_working(true)`
+                // SET WORKING EARLY — user just submitted, show the indicator immediately so typing
+                // feels responsive. The prep work below (codebase RAG, LSP, registry) is real and
+                // visible latency; showing "working" throughout it is honest UX.
+                tui::set_working(true);
+                // ARM CANCEL FIRST — before any prep. Everything between here and the agent loop
                 // is real latency the user can see and will try to interrupt: `@file` expansion, the
                 // dynamic prompt-lane rebuild, codebase retrieval, the recovery checkpoint, LSP
                 // spawn, registry construction. The token being armed is what makes `turn_in_flight`
@@ -5609,10 +5616,6 @@ async fn run_menu_sticky() -> Result<()> {
                 while input.cancel.try_recv().is_ok() {} // drain any stale wake-up
                                                          // NOTE: the "✦ Pondering…" turn-start verb is now the bottom-of-transcript working
                                                          // line (see `working_line` in retained.rs) — no separate emit needed here.
-                                                         // Arm LAST: the keyboard thread only queues a cancel once WORKING is true, so flipping
-                                                         // it after the clear+drain guarantees no Esc meant for THIS turn gets swallowed in the
-                                                         // arming window.
-                tui::set_working(true);
                 crate::core::recovery::set_phase(
                     crate::core::recovery::RecoveryPhase::WaitingModel,
                 );
