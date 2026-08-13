@@ -5098,17 +5098,20 @@ fn cache_hit_label() -> Option<String> {
     Some(format!("⛁ {}% cached", cached * 100 / prompt))
 }
 
-/// Disarms the interactive cancel token however a turn ends — normal completion, an early `continue`
-/// from a prep failure, or a panic unwinding out of the arm. `disarm_cancel` is identity-checked, so
-/// this can never clear a NEWER turn's token and double-disarming is harmless.
+/// Disarms the interactive cancel token AND resets working state however a turn ends — normal
+/// completion, an early `continue` from a prep failure, or a panic unwinding out of the arm.
+/// `disarm_cancel` is identity-checked, so this can never clear a NEWER turn's token and
+/// double-disarming is harmless. `set_working(false)` is idempotent so a second reset is safe.
 ///
-/// This exists because the token is now armed BEFORE the turn's prep work (see the Chat arm), and an
-/// armed token is what `tui::turn_in_flight` reports. Leaking one past a `continue` would leave the
-/// REPL idle while Esc still behaved like "cancel", so every exit path must disarm.
+/// This exists because the token AND working indicator are now armed BEFORE the turn's prep work
+/// (see the Chat arm), and an armed token is what `tui::turn_in_flight` reports. Leaking one past a
+/// `continue` would leave the REPL idle while Esc still behaved like "cancel" and the UI showed
+/// "working", so every exit path must disarm AND reset.
 struct TurnCancelGuard(crate::core::cancel::TurnCancel);
 
 impl Drop for TurnCancelGuard {
     fn drop(&mut self) {
+        tui::set_working(false);
         tui::disarm_cancel(&self.0);
     }
 }
@@ -5159,6 +5162,27 @@ async fn cancellable_slash<T>(fut: impl std::future::Future<Output = T>) -> Opti
     tui::arm_cancel(token.clone());
     let _guard = TurnCancelGuard(token.clone());
     tui::set_working(true);
+    let out = crate::core::cancel::race(&token, fut).await;
+    tui::set_working(false);
+    out
+}
+
+/// Like [`cancellable_slash`] but shows a specific caption in the working pill instead of the
+/// default whimsical verb — so post-turn housekeeping ("learning from this turn…") is visually
+/// distinct from the main agent turn ("Pondering…"), and the user knows Esc will skip optional
+/// work, not abort the answer they already received.
+async fn cancellable_slash_labeled<T>(
+    label: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let token = crate::core::cancel::TurnCancel::new();
+    tui::arm_cancel(token.clone());
+    let _guard = TurnCancelGuard(token.clone());
+    // Set working BEFORE caption: Working(true) seeds a random verb and calls set_work_caption
+    // internally, so sending WorkCaption first would be overwritten. Sending WorkCaption AFTER
+    // Working(true) replaces the verb with the intended label.
+    tui::set_working(true);
+    tui::set_work_caption(label);
     let out = crate::core::cancel::race(&token, fut).await;
     tui::set_working(false);
     out
@@ -5398,7 +5422,11 @@ async fn run_menu_sticky() -> Result<()> {
                 if line.is_empty() && images.is_empty() {
                     continue;
                 }
-                // ARM CANCEL FIRST — before any prep. Everything between here and `set_working(true)`
+                // SET WORKING EARLY — user just submitted, show the indicator immediately so typing
+                // feels responsive. The prep work below (codebase RAG, LSP, registry) is real and
+                // visible latency; showing "working" throughout it is honest UX.
+                tui::set_working(true);
+                // ARM CANCEL FIRST — before any prep. Everything between here and the agent loop
                 // is real latency the user can see and will try to interrupt: `@file` expansion, the
                 // dynamic prompt-lane rebuild, codebase retrieval, the recovery checkpoint, LSP
                 // spawn, registry construction. The token being armed is what makes `turn_in_flight`
@@ -5591,10 +5619,6 @@ async fn run_menu_sticky() -> Result<()> {
                 while input.cancel.try_recv().is_ok() {} // drain any stale wake-up
                                                          // NOTE: the "✦ Pondering…" turn-start verb is now the bottom-of-transcript working
                                                          // line (see `working_line` in retained.rs) — no separate emit needed here.
-                                                         // Arm LAST: the keyboard thread only queues a cancel once WORKING is true, so flipping
-                                                         // it after the clear+drain guarantees no Esc meant for THIS turn gets swallowed in the
-                                                         // arming window.
-                tui::set_working(true);
                 crate::core::recovery::set_phase(
                     crate::core::recovery::RecoveryPhase::WaitingModel,
                 );
@@ -5838,13 +5862,42 @@ async fn run_menu_sticky() -> Result<()> {
                         // consumed no input. To the user the turn had visibly ENDED and the app was
                         // wedged anyway. Re-arm for the duration; cancelling skips the remaining
                         // learning, which is always optional work.
-                        let learned = cancellable_slash(async {
-                            maybe_run_secretary(&history, &http, &base_url, &api_key, &model).await;
-                            maybe_evolve_persona(&http, &base_url, &api_key, &model).await;
-                            maybe_auto_compact(&mut history, &http, &base_url, &api_key, &model)
+                        //
+                        // OVERALL TIMEOUT (600s = 10 minutes): each call has its own timeout (300s via
+                        // chore_chat → subagent_call_timeout), but the COMBINED block needs a ceiling so a
+                        // hung stream in one pass doesn't strand the REPL for >15 minutes. If the timeout
+                        // fires, the user sees "· skipped" instead of an infinite spinner.
+                        const POST_TURN_OVERALL_TIMEOUT_SECS: u64 = 600;
+                        let learning_fut = cancellable_slash_labeled("learning from this turn…", async {
+                            maybe_run_secretary(&history, &http, &base_url, &api_key, &model)
                                 .await;
-                        })
-                        .await;
+                            maybe_evolve_persona(&http, &base_url, &api_key, &model).await;
+                            maybe_auto_compact(
+                                &mut history,
+                                &http,
+                                &base_url,
+                                &api_key,
+                                &model,
+                            )
+                            .await;
+                        });
+                        let learned = match tokio::time::timeout(
+                            std::time::Duration::from_secs(POST_TURN_OVERALL_TIMEOUT_SECS),
+                            learning_fut,
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                tui::emit_line(
+                                    &theme::muted(
+                                        "⏱ post-turn learning exceeded timeout — skipped.",
+                                    )
+                                    .to_string(),
+                                );
+                                None
+                            }
+                        };
                         if learned.is_none() {
                             tui::emit_line(
                                 &theme::muted("⏹ skipped the post-turn learning passes.")
@@ -5869,6 +5922,8 @@ async fn run_menu_sticky() -> Result<()> {
                         if history.last().map(|m| m.role == "user").unwrap_or(false) {
                             history.pop();
                         }
+                        // Persist the failed turn so quitting doesn't lose it
+                        autosave_last(&history, Some(&model));
                     }
                 }
                 tui::set_status(&status_text(&history, &model_label));
