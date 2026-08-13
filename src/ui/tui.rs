@@ -1951,10 +1951,22 @@ fn input_loop(
         // apart) is never mistaken for a paste (arrivals < 1 ms apart), regardless of how busy the turn
         // is. Consumed only by the `Key::Enter if buffered` arm → a newline inside a paste becomes a
         // literal `\n` instead of firing one message per line.
+        //
+        // IME FIX: When typing Vietnamese (Telex/VNI), Windows IME sends `Backspace` + new composed
+        // char within <50ms (e.g., `a` → backspace → `á`). Without filtering, this looks like a paste
+        // burst → the composed char's repaint is skipped → the char is hidden until next keystroke.
+        // A real paste never contains Backspace/Del, so reset `last_arrival` after seeing them to
+        // break the burst chain. The next char (IME-committed) arrives with no "prev" timestamp → not
+        // buffered → repaint happens immediately.
         let now = Instant::now();
-        let buffered = last_arrival
-            .map(|t| now.duration_since(t) < Duration::from_millis(PASTE_COALESCE_MS))
-            .unwrap_or(false);
+        let is_ime_edit = matches!(key, Key::Backspace | Key::Del);
+        let buffered = if is_ime_edit {
+            false // Backspace/Del during IME composition are NOT part of a paste burst
+        } else {
+            last_arrival
+                .map(|t| now.duration_since(t) < Duration::from_millis(PASTE_COALESCE_MS))
+                .unwrap_or(false)
+        };
         // Repaint throttle: during a paste burst, skip per-char repaint. Only redraw when the burst
         // ends (first event that is NOT buffered after a buffered one). Without this, pasting 500 chars
         // queues 500 retained::update_input calls → visible char-by-char lag. With it: one final repaint
@@ -1966,7 +1978,9 @@ fn input_loop(
             })
             .unwrap_or(false);
         last_arrival_prev = last_arrival;
-        last_arrival = Some(now);
+        // Reset the timestamp chain after Backspace/Del so the next char (IME-committed) is not
+        // mistaken for part of a burst.
+        last_arrival = if is_ime_edit { None } else { Some(now) };
         // in_paste_burst: we are mid-burst → skip repaint this keystroke.
         // paste_just_ended: first keystroke outside the burst → repaint once to flush.
         let in_paste_burst = buffered && prev_buffered;

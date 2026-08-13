@@ -5178,6 +5178,9 @@ async fn cancellable_slash_labeled<T>(
     let token = crate::core::cancel::TurnCancel::new();
     tui::arm_cancel(token.clone());
     let _guard = TurnCancelGuard(token.clone());
+    // Set working BEFORE caption: Working(true) seeds a random verb and calls set_work_caption
+    // internally, so sending WorkCaption first would be overwritten. Sending WorkCaption AFTER
+    // Working(true) replaces the verb with the intended label.
     tui::set_working(true);
     tui::set_work_caption(label);
     let out = crate::core::cancel::race(&token, fut).await;
@@ -5859,21 +5862,42 @@ async fn run_menu_sticky() -> Result<()> {
                         // consumed no input. To the user the turn had visibly ENDED and the app was
                         // wedged anyway. Re-arm for the duration; cancelling skips the remaining
                         // learning, which is always optional work.
-                        let learned =
-                            cancellable_slash_labeled("learning from this turn…", async {
-                                maybe_run_secretary(&history, &http, &base_url, &api_key, &model)
-                                    .await;
-                                maybe_evolve_persona(&http, &base_url, &api_key, &model).await;
-                                maybe_auto_compact(
-                                    &mut history,
-                                    &http,
-                                    &base_url,
-                                    &api_key,
-                                    &model,
-                                )
+                        //
+                        // OVERALL TIMEOUT (600s = 10 minutes): each call has its own timeout (300s via
+                        // chore_chat → subagent_call_timeout), but the COMBINED block needs a ceiling so a
+                        // hung stream in one pass doesn't strand the REPL for >15 minutes. If the timeout
+                        // fires, the user sees "· skipped" instead of an infinite spinner.
+                        const POST_TURN_OVERALL_TIMEOUT_SECS: u64 = 600;
+                        let learning_fut = cancellable_slash_labeled("learning from this turn…", async {
+                            maybe_run_secretary(&history, &http, &base_url, &api_key, &model)
                                 .await;
-                            })
+                            maybe_evolve_persona(&http, &base_url, &api_key, &model).await;
+                            maybe_auto_compact(
+                                &mut history,
+                                &http,
+                                &base_url,
+                                &api_key,
+                                &model,
+                            )
                             .await;
+                        });
+                        let learned = match tokio::time::timeout(
+                            std::time::Duration::from_secs(POST_TURN_OVERALL_TIMEOUT_SECS),
+                            learning_fut,
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                tui::emit_line(
+                                    &theme::muted(
+                                        "⏱ post-turn learning exceeded timeout — skipped.",
+                                    )
+                                    .to_string(),
+                                );
+                                None
+                            }
+                        };
                         if learned.is_none() {
                             tui::emit_line(
                                 &theme::muted("⏹ skipped the post-turn learning passes.")
