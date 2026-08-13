@@ -7,6 +7,95 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+## [0.6.4] — 2026-08-11
+
+The time machine grows a brain — checkpoints classified by value instead of hoarded uniformly, a
+registry that recognizes a moved repository, and honest docs about what a restore can and cannot
+guarantee — plus three sticky-REPL fixes that were biting daily use: Vietnamese input, the
+post-turn spinner, and a working pill that could wedge after a stream error.
+
+### Added
+- **Checkpoints are classified, not hoarded.** Every snapshot now carries a kind — `Milestone`
+  (named phases), `SafetyNet` (the `before agent edits` anchors), or `Recovery` — and retention
+  prunes in two passes: old safety nets thin down to a floor first (default 5,
+  `timemachine_keep_safety`), then the oldest droppable snapshots make room for the budget.
+  `time list` keeps the descriptive milestones and sheds the transient nets, so a long session
+  reads as a timeline instead of a wall of `pre-edit` rows; the current run's anchors are
+  protected mid-run.
+- **A home-level identity registry reconnects a moved repository.** Stores are keyed by
+  root-commit OID in `~/.aizen/timemachine/registry.json`: move the repo and the timeline
+  follows; clone or `cp -r` it while the original still exists and the copy gets its own.
+  Linked worktrees share one repo id with distinct worktree ids. Existing hash-path stores are
+  grandfathered with zero migration, and any registry error fails open to the legacy id — it
+  never blocks.
+- **`aizen time gc --all` sweeps orphan stores** left behind by repos deleted or moved before the
+  registry existed. Dry-run by default (orphans + reclaimable MB); `--apply` moves them to a
+  timestamped trash dir you delete by hand, so nothing is ever force-removed.
+- **`aizen time diff` and `/diff` show what changed between two points in time** — checkpoint
+  ids, or `working` for the live tree.
+
+### Fixed
+- **Vietnamese (Telex/VNI) input no longer hides composed characters.** The IME commits `á` as
+  `Backspace` + the composed char within ~50 ms, which the paste-burst detector read as a paste
+  and skipped the repaint for — the char only appeared at the next keystroke. Backspace/Del now
+  break the arrival-time chain, so IME-committed characters render immediately while real pastes
+  still coalesce into one repaint.
+- **The post-turn learning phase shows its own caption.** The retained renderer's
+  `Working(true)` handler seeds a whimsical verb and overwrites the caption, so a label sent
+  before it was clobbered — users saw "Pondering…" after the answer had already arrived. The
+  caption is now sent after the working flag, so the pill reads "learning from this turn…" and
+  Esc skips the optional passes.
+- **The whole post-turn learning block has a 600 s ceiling.** Each pass carries its own 300 s
+  timeout, but combined they could strand the REPL past fifteen minutes; the block now reports
+  "skipped" instead of spinning forever.
+- **A stream error no longer leaves the working pill up.** `set_working(false)` only ran on the
+  success path, so an errored turn blocked new submissions until restart; the cancel guard now
+  resets the flag on every exit path.
+- **The working indicator appears at submit, not after prep.** The pill used to rise only after
+  retrieval, prompt-lane rebuild, and registry construction — 1–3 s of silence; it now goes up
+  the moment Enter is pressed.
+
+### Changed
+- **Restore-tree honesty.** The time machine docs now say plainly what a restore guarantees: the
+  working tree always comes back; full independence from the source repo is best-effort, since
+  alternates and unchanged blobs may still live in the source `.git/objects`.
+
+## [0.6.3] — 2026-08-10
+
+Codebase retrieval was English-only in practice — a Vietnamese (or CJK, Cyrillic) question
+matched zero chunks and the `/init` index went unused. This release normalizes the query, not
+the index.
+
+### Added
+- **Queries in any language expand into the English identifiers they imply**, on every turn and
+  at zero cost: a multilingual glossary (no-op for English queries, no-IME spellings folded,
+  ambiguous keys like "doc"/"bang" requiring corroboration so English never drifts), wired into
+  both the auto retrieval path and the `codebase_search` tool.
+- **Opt-in model translation for arbitrary phrasing** (`AIZEN_QUERY_EXPAND=1`, tool path only):
+  a cached chore-model call renders the query as ≤12 whitelisted English keywords that feed
+  BM25 — never a prompt, never a shell.
+- **`codebase_search` nudges the model** to search with the English terms the code uses when the
+  user asks in another language.
+
+### Fixed
+- **A second window's `/model` no longer retargets a running one.** The choice rewrites the
+  shared cli-config.json; a process-local session pin now keeps each window on the model it
+  chose.
+
+## [0.6.2] — 2026-08-09
+
+### Fixed
+- **Git and other console children no longer pop the Windows 0xc0000142 dialog.** Every console
+  child allocated its own conhost, and a fan-out of checkpoints plus sub-agents could exhaust the
+  window station's desktop heap; a child that then failed loader init raised a modal hard-error
+  box a headless agent can neither see nor dismiss, hanging the turn. Every spawn path now sets
+  `CREATE_NO_WINDOW` and the process starts with `SEM_FAILCRITICALERRORS`, so a failing child
+  returns a status the agent reads instead of a dialog.
+
+### Changed
+- Carries the delegated-agent overhaul (total budgets for `task`/`workflow`, baseline-aware
+  verify gate, scoped process pool, quiet heartbeat) and the hostbot daemon work.
+
 ## [0.6.1] — 2026-08-09
 
 A maintenance release about the parts of the agent that were quietly doing the wrong thing: a stream
