@@ -571,9 +571,16 @@ impl ProviderProfile {
             anyhow::bail!("provider base URL must start with http:// or https://");
         }
         let api_key = api_key.trim();
-        if api_key.is_empty() {
+        // Codex OAuth profiles store tokens out-of-band; api_key may be a placeholder.
+        let codex = crate::llm::oauth_codex::is_codex_base_url(base_url);
+        if api_key.is_empty() && !codex {
             anyhow::bail!("provider API key must not be empty");
         }
+        let api_key = if api_key.is_empty() && codex {
+            "codex-oauth"
+        } else {
+            api_key
+        };
         let model = model.trim();
         if model.is_empty() {
             anyhow::bail!("provider model must not be empty");

@@ -96,6 +96,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: Option<ConfigCmd>,
     },
+    /// Provider sign-in (experimental). Currently: ChatGPT Codex OAuth.
+    Auth {
+        #[command(subcommand)]
+        cmd: AuthCmd,
+    },
     /// List the models the provider advertises (GET {base}/models).
     Models(ModelsArgs),
     /// Crawl a website (katana-style): BFS over HTTP, extract links from HTML + endpoints from JS.
@@ -708,6 +713,20 @@ struct CrawlArgs {
     show_source: bool,
 }
 
+/// `aizen auth …` — experimental provider OAuth (ChatGPT Codex).
+#[derive(Subcommand, Debug)]
+enum AuthCmd {
+    /// Browser PKCE login for ChatGPT Codex (experimental / ToS risk).
+    Login {
+        /// Provider id. Only `codex` is supported today.
+        provider: String,
+    },
+    /// Show login state (never prints raw tokens).
+    Status,
+    /// Delete cached tokens for a provider.
+    Logout { provider: String },
+}
+
 #[derive(Subcommand, Debug)]
 enum ConfigCmd {
     /// Set one or more config fields (only the flags you pass are changed).
@@ -1256,6 +1275,7 @@ async fn main() -> Result<()> {
             BenchCmd::Loop => bench::loop_eval::run().await,
         },
         Commands::Config { cmd } => run_config(cmd).await,
+        Commands::Auth { cmd } => run_auth(cmd).await,
         Commands::Models(args) => run_models(args).await,
         Commands::Crawl(args) => run_crawl(args).await,
         Commands::Reach { cmd } => run_reach(cmd).await,
@@ -11552,6 +11572,53 @@ fn apply_role_flags(
     *slot = (rc.model.is_some() || rc.base_url.is_some() || rc.api_key_ref.is_some()).then_some(rc);
 }
 
+async fn run_auth(cmd: AuthCmd) -> Result<()> {
+    match cmd {
+        AuthCmd::Login { provider } => {
+            let p = provider.trim().to_ascii_lowercase();
+            if p != "codex" && p != "chatgpt" && p != "chatgpt-codex" {
+                anyhow::bail!(
+                    "unknown auth provider '{provider}' — supported: codex (ChatGPT Codex OAuth, experimental)"
+                );
+            }
+            if crate::llm::oauth_codex::codex_disabled() {
+                anyhow::bail!("Codex OAuth disabled via AIZEN_DISABLE_CODEX");
+            }
+            println!("{}", crate::llm::oauth_codex::risk_notice());
+            println!();
+            let set = crate::llm::oauth_codex::login_interactive().await?;
+            let who = set.label.as_deref().unwrap_or("(signed in)");
+            println!("✓ Codex login saved for {who}");
+            println!(
+                "  token file: {}",
+                crate::llm::oauth_codex::token_path().display()
+            );
+            println!("  next: aizen config  → pick 'ChatGPT Codex (experimental)' or:");
+            println!(
+                "        aizen config set --base-url {} --api-key codex-oauth --model {}",
+                crate::llm::oauth_codex::CODEX_BASE_URL,
+                crate::llm::codex_models::default_model()
+            );
+            Ok(())
+        }
+        AuthCmd::Status => {
+            for line in crate::llm::oauth_codex::status_lines() {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        AuthCmd::Logout { provider } => {
+            let p = provider.trim().to_ascii_lowercase();
+            if p != "codex" && p != "chatgpt" && p != "chatgpt-codex" {
+                anyhow::bail!("unknown auth provider '{provider}' — supported: codex");
+            }
+            crate::llm::oauth_codex::clear_token();
+            println!("✓ Codex tokens removed");
+            Ok(())
+        }
+    }
+}
+
 async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
     let cmd = match cmd {
         Some(c) => c,
@@ -12444,6 +12511,12 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         base: "https://api.openai.com/v1",
         keys_url: "https://platform.openai.com/api-keys",
         sample_model: "gpt-4o",
+    },
+    ProviderPreset {
+        label: "ChatGPT Codex (experimental)",
+        base: crate::llm::oauth_codex::CODEX_BASE_URL,
+        keys_url: "run: aizen auth login codex  (experimental ChatGPT OAuth — see docs RISK)",
+        sample_model: "gpt-5.4-mini",
     },
     ProviderPreset {
         label: "Anthropic (Claude)",
@@ -14591,6 +14664,23 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
 
 async fn run_models(args: ModelsArgs) -> Result<()> {
     let (base_url, api_key) = resolve_base_key(args.base_url, args.api_key)?;
+    // Codex has no stable OpenAI-style /models; print the curated experimental catalog.
+    if crate::llm::oauth_codex::is_codex_base_url(&base_url) {
+        let current = cli_config::load().model;
+        println!("ChatGPT Codex models (experimental catalog):");
+        for (id, label) in crate::llm::codex_models::CODEX_MODELS {
+            let mark = if current.as_deref() == Some(*id) {
+                " (default)"
+            } else {
+                ""
+            };
+            println!("{id}  · {label}  · codex{mark}");
+        }
+        if !crate::llm::oauth_codex::has_token() {
+            println!("(not logged in — run: aizen auth login codex)");
+        }
+        return Ok(());
+    }
     let http = http_client()?;
     let infos = client::fetch_models_info(&http, &base_url, &api_key)
         .await
@@ -16222,6 +16312,17 @@ mod tests {
             "the sample must be a free-tier id, got {}",
             p.sample_model
         );
+    }
+
+    #[test]
+    fn codex_experimental_preset_is_registered() {
+        let p = PROVIDER_PRESETS
+            .iter()
+            .find(|p| p.label == "ChatGPT Codex (experimental)")
+            .expect("codex preset");
+        assert_eq!(p.base, crate::llm::oauth_codex::CODEX_BASE_URL);
+        assert!(p.keys_url.contains("auth login codex"));
+        assert!(!p.sample_model.is_empty());
     }
 
     #[test]

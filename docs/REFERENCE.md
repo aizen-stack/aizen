@@ -212,7 +212,10 @@ It needs a CNI that enforces NetworkPolicy (Calico, Cilium, Antrea); on a cluste
 object is accepted and enforces nothing. The manifest also sets `automountServiceAccountToken: false`,
 since a shell that can read the projected token can talk to the API server as the pod.
 
-## Configure
+## Config
+
+**ChatGPT Codex (experimental)** uses ChatGPT/Codex *consumer* OAuth (not the OpenAI Platform API key). Run `aizen auth login codex`, then pick the preset (base `https://chatgpt.com/backend-api/codex`) or `aizen config set --base-url https://chatgpt.com/backend-api/codex --api-key codex-oauth --model gpt-5.4-mini`. Tokens live in `~/.aizen/provider-tokens/codex.json`. Kill-switch: `AIZEN_DISABLE_CODEX=1`. **Risk:** private backend APIs may break or conflict with vendor terms; prefer Platform API keys / OpenRouter for supported production use. Logout: `aizen auth logout codex`.
+ure
 
 All network commands read three settings, as flags or env vars:
 
