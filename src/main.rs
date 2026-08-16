@@ -16298,7 +16298,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn opencode_free_preset_is_registered() {
         let p = PROVIDER_PRESETS
             .iter()
@@ -16313,6 +16312,8 @@ mod tests {
             "the sample must be a free-tier id, got {}",
             p.sample_model
         );
+    }
+
     #[test]
     fn codex_experimental_preset_is_registered() {
         let p = PROVIDER_PRESETS
