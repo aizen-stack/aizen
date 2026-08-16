@@ -22,6 +22,8 @@ code, runs your shell, verifies its own work, and remembers how *you* like thing
 ![34 MB](https://img.shields.io/badge/binary-34%20MB-6c5ce7?style=flat-square)
 ![10 ms](https://img.shields.io/badge/startup-10%20ms-6c5ce7?style=flat-square)
 
+**English** · [Tiếng Việt](README.vi.md) · [简体中文](README.zh-CN.md)
+
 </div>
 
 https://github.com/user-attachments/assets/45bbdfc8-09a3-4995-870f-eb92452743c9
