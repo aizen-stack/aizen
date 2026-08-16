@@ -7,6 +7,15 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+### Added
+- **OpenCode (free) preset.** OpenCode's zen gateway (`https://opencode.ai/zen/v1`) joins the
+  provider picker: the free tier authenticates with the literal shared token `public` (no sign-up),
+  and Aizen attaches the `x-opencode-client` header automatically. Free models there are the
+  `-free`-suffixed ids (plus `big-pickle`), and both `aizen models` and the model pickers tag those
+  rows `· free` so they stand out from the paid ids in the same list. Setup's chat-path key probe
+  now prefers a `-free` variant when the list has one — probing a paid model with a free-tier
+  credential could draw a 403 that read as "bad key" (OpenRouter benefits from the same fix).
+
 ## [0.6.4] — 2026-08-11
 
 The time machine grows a brain — checkpoints classified by value instead of hoarded uniformly, a

@@ -222,9 +222,40 @@ pub fn is_anthropic_endpoint(base_url: &str) -> bool {
     host == "api.anthropic.com" || host.ends_with(".api.anthropic.com")
 }
 
+/// Same host test for OpenCode's zen gateway. Its free tier is reachable with the literal shared
+/// token `public` but only identifies clients that say who they are, so requests to this host carry
+/// `x-opencode-client` — see [`with_provider_auth`]. Host-matched for the same reason as
+/// [`is_anthropic_endpoint`]: a proxy whose path mentions opencode is not first-party.
+pub fn is_opencode_endpoint(base_url: &str) -> bool {
+    let after_scheme = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    let host = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .split('@') // strip any userinfo
+        .next_back()
+        .unwrap_or("")
+        .split(':') // strip the port
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    host == "opencode.ai" || host.ends_with(".opencode.ai")
+}
+
+/// Free-tier variants on shared gateways (OpenCode zen, OpenRouter) carry a `-free` id suffix.
+/// Names the convention once for the places that care: the key-probe model choice below and the
+/// free tags in model listings.
+pub fn is_free_model_id(id: &str) -> bool {
+    id.ends_with("-free")
+}
+
 /// Attach auth for `base_url`: always Bearer (what every OpenAI-compatible gateway wants), plus
 /// Anthropic's native pair when the host is theirs. Sending both is safe — each side ignores the
-/// header it doesn't use — and it means one code path serves both wire dialects.
+/// header it doesn't use — and it means one code path serves both wire dialects. OpenCode's gateway
+/// gets its client-identification header the same way.
 fn with_provider_auth(
     rb: reqwest::RequestBuilder,
     base_url: &str,
@@ -234,6 +265,8 @@ fn with_provider_auth(
     if is_anthropic_endpoint(base_url) {
         rb.header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
+    } else if is_opencode_endpoint(base_url) {
+        rb.header("x-opencode-client", "desktop")
     } else {
         rb
     }
@@ -311,8 +344,14 @@ async fn check_endpoint_with_deadline(
         // to anyone, so a corrupted key sails through validation and only fails on the first real
         // turn. When we have a key, confirm it on the endpoint that enforces auth.
         if let Some(k) = api_key {
+            // Prefer a `-free` variant when the list has one: free-tier gateways (OpenCode zen,
+            // OpenRouter) mix paid models into the same list, and probing a paid one with a
+            // free-tier credential can draw a 403 — which would read here as "bad key" and send
+            // the user off to re-paste a token that was fine.
             let probe_model = infos
-                .first()
+                .iter()
+                .find(|m| is_free_model_id(&m.id))
+                .or_else(|| infos.first())
                 .map(|m| m.id.as_str())
                 .unwrap_or("gpt-4o-mini");
             if let Some(detail) =
@@ -1954,6 +1993,38 @@ mod tests {
     }
 
     #[test]
+    fn opencode_endpoint_is_matched_on_host_not_substring() {
+        // First-party zen paths, with scheme/case/port variations.
+        for b in [
+            "https://opencode.ai/zen/v1",
+            "https://opencode.ai/zen/v1/",
+            "https://OpenCode.AI/zen/v1",
+            "http://opencode.ai:443/zen/go/v1",
+        ] {
+            assert!(is_opencode_endpoint(b), "{b} is first-party OpenCode");
+        }
+        // A proxy that merely MENTIONS opencode in its path is NOT first-party — misclassifying it
+        // would pin zen-gateway behaviour (the client header) onto a third-party server.
+        for b in [
+            "https://gw.example.com/opencode/v1",
+            "https://opencode.ai.evil.test/v1",
+            "https://api.anthropic.com/v1",
+            "http://localhost:11434/v1",
+        ] {
+            assert!(!is_opencode_endpoint(b), "{b} must not be first-party");
+        }
+    }
+
+    #[test]
+    fn free_model_id_is_the_suffix_convention() {
+        assert!(is_free_model_id("deepseek-v4-flash-free"));
+        assert!(is_free_model_id("mimo-v2.5-free"));
+        // Position matters: a leading or embedded "free" is not the tier marker.
+        assert!(!is_free_model_id("free-big-pickle"));
+        assert!(!is_free_model_id("claude-fable-5"));
+    }
+
+    #[test]
     fn cache_enabled_auto_and_forced() {
         assert!(cache_enabled(None, "opus-4-8"), "AUTO on for Anthropic");
         assert!(!cache_enabled(None, "gpt-4o"), "AUTO off for non-Anthropic");
@@ -2513,6 +2584,61 @@ mod tests {
         assert!(
             matches!(got, EndpointCheck::Ok(_)),
             "a 400 proves nothing about the key, got {got:?}"
+        );
+    }
+
+    /// The chat-path key probe must prefer a `-free` variant when the list has one. Free-tier
+    /// gateways (OpenCode zen, OpenRouter) mix paid ids into the same `/models` list, and probing a
+    /// paid one with the shared free-tier credential can draw a 403 — which setup would report as
+    /// "bad key" even though the token is exactly what that tier hands out.
+    #[tokio::test]
+    async fn key_probe_prefers_a_free_variant_over_the_first_paid_model() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let probed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = probed.clone();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (status, body) = if req.contains("/chat/completions") {
+                    seen.lock().unwrap().push(req.clone());
+                    (
+                        200,
+                        r#"{"choices":[{"message":{"content":"ok"}}]}"#.to_string(),
+                    )
+                } else {
+                    // Paid model FIRST, so `infos.first()` — the old probe choice — is the paid id.
+                    (
+                        200,
+                        r#"{"object":"list","data":[{"id":"claude-fable-5"},{"id":"deepseek-v4-flash-free"}]}"#
+                            .to_string(),
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let http = reqwest::Client::new();
+        let got = check_endpoint(&http, &base, Some("public")).await;
+        srv.abort();
+        assert!(matches!(got, EndpointCheck::Ok(_)), "got {got:?}");
+        let posts = probed.lock().unwrap();
+        assert_eq!(posts.len(), 1, "exactly one probe POST expected");
+        assert!(
+            posts[0].contains("\"model\":\"deepseek-v4-flash-free\""),
+            "probe must target the -free variant, got: {}",
+            posts[0]
         );
     }
 
