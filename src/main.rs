@@ -5868,19 +5868,20 @@ async fn run_menu_sticky() -> Result<()> {
                         // hung stream in one pass doesn't strand the REPL for >15 minutes. If the timeout
                         // fires, the user sees "· skipped" instead of an infinite spinner.
                         const POST_TURN_OVERALL_TIMEOUT_SECS: u64 = 600;
-                        let learning_fut = cancellable_slash_labeled("learning from this turn…", async {
-                            maybe_run_secretary(&history, &http, &base_url, &api_key, &model)
+                        let learning_fut =
+                            cancellable_slash_labeled("learning from this turn…", async {
+                                maybe_run_secretary(&history, &http, &base_url, &api_key, &model)
+                                    .await;
+                                maybe_evolve_persona(&http, &base_url, &api_key, &model).await;
+                                maybe_auto_compact(
+                                    &mut history,
+                                    &http,
+                                    &base_url,
+                                    &api_key,
+                                    &model,
+                                )
                                 .await;
-                            maybe_evolve_persona(&http, &base_url, &api_key, &model).await;
-                            maybe_auto_compact(
-                                &mut history,
-                                &http,
-                                &base_url,
-                                &api_key,
-                                &model,
-                            )
-                            .await;
-                        });
+                            });
                         let learned = match tokio::time::timeout(
                             std::time::Duration::from_secs(POST_TURN_OVERALL_TIMEOUT_SECS),
                             learning_fut,

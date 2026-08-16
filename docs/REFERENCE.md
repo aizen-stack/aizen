@@ -267,7 +267,7 @@ endpoint's credential. Cancelling any wizard step leaves the complete saved prof
 **OpenCode (free)** is a preset for OpenCode's zen gateway — a zero-cost way to try an agent before
 bringing a key. The base URL is `https://opencode.ai/zen/v1` and the free tier's shared token is the
 literal string `public` (type it at the key step; no sign-up anywhere). Its free models are the
-`-free`-suffixed ids in the live list (`deepseek-v4-flash-free`, `mimo-v2.5-free`, …) plus
+`-free`-suffixed ids in the live list (`deepseek-v4-flash-free`, `mimo-v2.5-free`, `hy3-free`, …) plus
 `big-pickle`; `aizen models` and the model pickers tag those rows with `· free` so a free-tier id
 stands out from the paid ones in the same list. Expect free-tier rate limits — a 429 is retried with
 the gateway's `Retry-After` like any other transient failure. The gateway reports no context

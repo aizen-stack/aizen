@@ -249,7 +249,8 @@ pub fn is_opencode_endpoint(base_url: &str) -> bool {
 /// Names the convention once for the places that care: the key-probe model choice below and the
 /// free tags in model listings.
 pub fn is_free_model_id(id: &str) -> bool {
-    id.ends_with("-free")
+    // OpenCode zen's free catalog is mostly *-free, plus the unsuffixed free id big-pickle.
+    id.ends_with("-free") || id == "big-pickle"
 }
 
 /// Attach auth for `base_url`: always Bearer (what every OpenAI-compatible gateway wants), plus
@@ -2019,6 +2020,8 @@ mod tests {
     fn free_model_id_is_the_suffix_convention() {
         assert!(is_free_model_id("deepseek-v4-flash-free"));
         assert!(is_free_model_id("mimo-v2.5-free"));
+        // OpenCode zen also ships one unsuffixed free id.
+        assert!(is_free_model_id("big-pickle"));
         // Position matters: a leading or embedded "free" is not the tier marker.
         assert!(!is_free_model_id("free-big-pickle"));
         assert!(!is_free_model_id("claude-fable-5"));
