@@ -71,6 +71,10 @@ That's the whole setup. No env vars, no config file to hand-edit.
 ## Cobase index && Sematic && Lsp server
 <img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/211027cf-cbd2-4675-be00-ff6c616f900a" />
 
+## Multi‑Bot Host System
+<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/9331f184-a829-413e-88b7-adb36432bd75" />
+
+
 ## Why Aizen
 
 |  | |
