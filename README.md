@@ -56,6 +56,16 @@ That's the whole setup. No env vars, no config file to hand-edit.
 `cargo install --git https://github.com/aizen-stack/aizen`. Upgrade or roll back any time with
 `aizen update`. The Windows `.exe` is unsigned, so SmartScreen will ask: *More info → Run anyway*.</sub>
 
+## System Architecture
+
+<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/6bc4fb5e-ae8b-4aab-9aef-bbd1004bb095" />
+
+## Persona & Self‑Evolution
+
+<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/03f96b4b-c587-4426-8f4d-c7ef1945b521" />
+
+
+
 ## Why Aizen
 
 |  | |
