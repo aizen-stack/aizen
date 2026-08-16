@@ -1,6 +1,7 @@
-<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/c9bcbf44-7ead-4d3b-8139-3c1ccd3978bd" /><div align="center">
 
-<img width="200" height="200" alt="aizen" src="https://github.com/user-attachments/assets/4e38d4f9-29af-4a97-af0e-2c7dd7bdf697" />
+
+<img width="200" height="200" alt="image" src="https://github.com/user-attachments/assets/3fc117bb-84cf-4b85-8302-7bec1eabb65e" />
+
 
 ### The terminal-native coding agent that actually *lives* on your machine.
 
