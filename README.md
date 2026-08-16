@@ -1,4 +1,4 @@
-<div align="center">
+<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/c9bcbf44-7ead-4d3b-8139-3c1ccd3978bd" /><div align="center">
 
 <img width="200" height="200" alt="aizen" src="https://github.com/user-attachments/assets/4e38d4f9-29af-4a97-af0e-2c7dd7bdf697" />
 
@@ -64,7 +64,11 @@ That's the whole setup. No env vars, no config file to hand-edit.
 
 <img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/03f96b4b-c587-4426-8f4d-c7ef1945b521" />
 
+## Knowledge System
+<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/6d004bcc-15d4-450f-9beb-652d8633777a" />
 
+## Cobase index && Sematic && Lsp server
+<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/211027cf-cbd2-4675-be00-ff6c616f900a" />
 
 ## Why Aizen
 
