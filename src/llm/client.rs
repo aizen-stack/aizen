@@ -1044,6 +1044,15 @@ pub async fn chat_with_tools_effort(
     tools: &[ToolDef],
     effort: Option<String>,
 ) -> Result<ChatTurn> {
+    if crate::llm::oauth_codex::is_codex_base_url(base_url) {
+        let _ = api_key;
+        let session = std::env::var("AIZEN_CODEX_SESSION")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("aizen-{}-{model}", std::process::id()));
+        return crate::llm::responses_codex::stream_turn(client, model, messages, tools, &session)
+            .await;
+    }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let cfg = crate::core::cli_config::load();
     let mut msgs = messages.to_vec();
@@ -1333,6 +1342,16 @@ pub async fn stream_chat_with_tools_eager(
     tools: &[ToolDef],
     eager_hook: Option<EagerStartFn<'_>>,
 ) -> Result<ChatTurn> {
+    // Experimental ChatGPT Codex path — full Responses dialect (not /chat/completions).
+    if crate::llm::oauth_codex::is_codex_base_url(base_url) {
+        let _ = (api_key, &eager_hook); // bearer comes from the OAuth token store
+        let session = std::env::var("AIZEN_CODEX_SESSION")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("aizen-{}-{model}", std::process::id()));
+        return crate::llm::responses_codex::stream_turn(client, model, messages, tools, &session)
+            .await;
+    }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let cfg = crate::core::cli_config::load();
     let mut msgs = messages.to_vec();

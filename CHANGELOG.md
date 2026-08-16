@@ -15,6 +15,7 @@ development log lives in that monorepo's history.
   rows `· free` so they stand out from the paid ids in the same list. Setup's chat-path key probe
   now prefers a `-free` variant when the list has one — probing a paid model with a free-tier
   credential could draw a 403 that read as "bad key" (OpenRouter benefits from the same fix).
+- **ChatGPT Codex OAuth (experimental).** `aizen auth login|status|logout codex` browser PKCE; Codex Responses backend for the agent loop. Kill-switch `AIZEN_DISABLE_CODEX=1`. Private/compatibility surface — see docs RISK.
 
 ## [0.6.4] — 2026-08-11
 
