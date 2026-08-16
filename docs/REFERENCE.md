@@ -264,6 +264,15 @@ saved selection; Aizen prints a note when those environment variables mask a swi
 Changing an existing provider's endpoint asks for a new key instead of offering the previous
 endpoint's credential. Cancelling any wizard step leaves the complete saved profile unchanged.
 
+**OpenCode (free)** is a preset for OpenCode's zen gateway — a zero-cost way to try an agent before
+bringing a key. The base URL is `https://opencode.ai/zen/v1` and the free tier's shared token is the
+literal string `public` (type it at the key step; no sign-up anywhere). Its free models are the
+`-free`-suffixed ids in the live list (`deepseek-v4-flash-free`, `mimo-v2.5-free`, `hy3-free`, …) plus
+`big-pickle`; `aizen models` and the model pickers tag those rows with `· free` so a free-tier id
+stands out from the paid ones in the same list. Expect free-tier rate limits — a 429 is retried with
+the gateway's `Retry-After` like any other transient failure. The gateway reports no context
+windows, so the HUD estimates them from the model name until you set one.
+
 Sub-agent configuration uses the same provider list. In `/config` → **Sub-agents**, choose a saved
 provider and either its default model or a model override for Sub-agent default, Summarizer, Oracle,
 Apply, or an installed specialist. No endpoint/key is retyped. Scriptable specialist equivalent:

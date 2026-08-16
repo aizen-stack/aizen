@@ -5868,19 +5868,20 @@ async fn run_menu_sticky() -> Result<()> {
                         // hung stream in one pass doesn't strand the REPL for >15 minutes. If the timeout
                         // fires, the user sees "· skipped" instead of an infinite spinner.
                         const POST_TURN_OVERALL_TIMEOUT_SECS: u64 = 600;
-                        let learning_fut = cancellable_slash_labeled("learning from this turn…", async {
-                            maybe_run_secretary(&history, &http, &base_url, &api_key, &model)
+                        let learning_fut =
+                            cancellable_slash_labeled("learning from this turn…", async {
+                                maybe_run_secretary(&history, &http, &base_url, &api_key, &model)
+                                    .await;
+                                maybe_evolve_persona(&http, &base_url, &api_key, &model).await;
+                                maybe_auto_compact(
+                                    &mut history,
+                                    &http,
+                                    &base_url,
+                                    &api_key,
+                                    &model,
+                                )
                                 .await;
-                            maybe_evolve_persona(&http, &base_url, &api_key, &model).await;
-                            maybe_auto_compact(
-                                &mut history,
-                                &http,
-                                &base_url,
-                                &api_key,
-                                &model,
-                            )
-                            .await;
-                        });
+                            });
                         let learned = match tokio::time::timeout(
                             std::time::Duration::from_secs(POST_TURN_OVERALL_TIMEOUT_SECS),
                             learning_fut,
@@ -12431,6 +12432,12 @@ struct ProviderPreset {
 /// `authorization` is fully supported). So this preset needs no new wire protocol. The one wrinkle is
 /// `GET /v1/models`, which is the NATIVE endpoint and wants `x-api-key` + `anthropic-version` —
 /// handled in `client::with_provider_auth`, not here.
+///
+/// OpenCode's zen gateway is the other entry with a wrinkle: its free tier authenticates with the
+/// literal shared token `public` (the `keys_url` row says so, mirroring the Ollama no-key pattern)
+/// and expects the `x-opencode-client` header — also attached in `client::with_provider_auth`. Its
+/// free models are the `-free`-suffixed ids in the live `/models` list; `sample_model` is only the
+/// manual-entry default if that fetch fails.
 const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         label: "OpenAI",
@@ -12461,6 +12468,12 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         base: "https://api.deepseek.com/v1",
         keys_url: "https://platform.deepseek.com/api_keys",
         sample_model: "deepseek-chat",
+    },
+    ProviderPreset {
+        label: "OpenCode (free)",
+        base: "https://opencode.ai/zen/v1",
+        keys_url: "no key needed — free tier: enter the shared token `public`",
+        sample_model: "deepseek-v4-flash-free",
     },
     ProviderPreset {
         label: "Ollama (local)",
@@ -13105,9 +13118,18 @@ fn pick_model_from(
     let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
     let mut items: Vec<String> = infos
         .iter()
-        .map(|m| match m.context_length {
-            Some(n) => format!("{}  ({} ctx)", m.id, n),
-            None => m.id.clone(),
+        .map(|m| {
+            // Free-tier ids get a tag so someone on a free gateway doesn't pick a paid model by
+            // accident — the failure would only surface on the first real turn.
+            let free = if client::is_free_model_id(&m.id) {
+                "  · free"
+            } else {
+                ""
+            };
+            match m.context_length {
+                Some(n) => format!("{}{free}  ({} ctx)", m.id, n),
+                None => format!("{}{free}", m.id),
+            }
         })
         .collect();
     items.push(CUSTOM_MODEL_ITEM.to_string());
@@ -14585,12 +14607,17 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
         } else {
             ""
         };
+        let free = if client::is_free_model_id(&m.id) {
+            "  · free"
+        } else {
+            ""
+        };
         let ctx = match m.context_length {
             Some(n) if n >= 1000 => format!("  · ctx {}K", n / 1000),
             Some(n) => format!("  · ctx {n}"),
             None => String::new(),
         };
-        println!("{}{ctx}{mark}", m.id);
+        println!("{}{free}{ctx}{mark}", m.id);
     }
     if !any_ctx {
         println!(
@@ -16177,6 +16204,23 @@ mod tests {
         }
         assert!(
             Cli::try_parse_from(["aizen", "config", "provider", "add", "missing-flags"]).is_err()
+        );
+    }
+
+    #[test]
+    fn opencode_free_preset_is_registered() {
+        let p = PROVIDER_PRESETS
+            .iter()
+            .find(|p| p.label == "OpenCode (free)")
+            .expect("the OpenCode free preset exists");
+        assert_eq!(p.base, "https://opencode.ai/zen/v1");
+        // The free tier's shared token is `public`; the hint must say so or a first-run user has no
+        // way to guess the value the gateway expects.
+        assert!(p.keys_url.contains("public"));
+        assert!(
+            p.sample_model.ends_with("-free"),
+            "the sample must be a free-tier id, got {}",
+            p.sample_model
         );
     }
 
