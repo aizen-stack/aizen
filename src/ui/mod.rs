@@ -4,12 +4,18 @@
 
 pub mod cards;
 pub mod channel_markdown;
+pub mod config_ui;
+pub mod context_report;
+pub mod effort_ui;
 pub mod icons;
 pub mod image_input;
 pub mod links;
 pub mod markdown;
+pub mod menus;
 pub mod mermaid;
 pub mod moonscape;
+pub mod plain_input;
+pub mod provider_ui;
 pub mod spinner;
 pub mod splash;
 pub mod theme;

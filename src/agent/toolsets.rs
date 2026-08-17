@@ -92,41 +92,13 @@ pub const CATALOG: &[ToolsetInfo] = &[
 ];
 
 /// Map a registered tool name → bundle id. `None` = unknown (left visible when filtering).
+///
+/// A VIEW over [`crate::agent::tool_routing::lane_for`], which is the single name→capability table.
+/// It used to be a second hand-maintained match, and the prompt's tool catalog was a third; keeping
+/// one table is what stops "this tool is in the `lsp` bundle" and "this tool is an editing tool" from
+/// disagreeing.
 pub fn classify_tool(name: &str) -> Option<&'static str> {
-    if name.starts_with("mcp_") {
-        return Some("mcp");
-    }
-    match name {
-        "memory_search" | "memory_list" | "memory_profile" | "memory_ask" | "memory_save"
-        | "memory_update" | "memory_forget" => Some("memory"),
-        "file_read" | "file_glob" | "search_files" | "file_edit" | "file_write" | "file_move" => {
-            Some("file")
-        }
-        "shell_run" | "process" => Some("terminal"),
-        "web_search" | "web_fetch" | "web_crawl" => Some("web"),
-        "skill_load" | "skill_save" | "skill_refine" | "skill_forget" | "skill_search"
-        | "skill_install" => Some("skills"),
-        "task" | "workflow" | "team_status" => Some("delegation"),
-        "todo_write" | "goal_complete" => Some("todo"),
-        "clarify" => Some("clarify"),
-        "checkpoint" | "checkpoint_view" => Some("checkpoint"),
-        "telegram_send" | "telegram_ask" | "bot_admin" | "notify" => Some("messaging"),
-        "persona_create" => Some("persona"),
-        "lsp_references"
-        | "lsp_definition"
-        | "codebase_search"
-        | "read_symbol"
-        | "lsp_hover"
-        | "lsp_document_symbols"
-        | "lsp_workspace_symbol"
-        | "lsp_diagnostics"
-        | "symbol_replace"
-        | "symbol_insert"
-        | "repo_map" => Some("lsp"),
-        "browser_navigate" | "browser_snapshot" | "browser_click" | "browser_type"
-        | "browser_eval" => Some("browser"),
-        _ => None,
-    }
+    crate::agent::tool_routing::lane_for(name).map(crate::agent::tool_routing::Lane::toolset)
 }
 
 fn list_match(hay: &str, list: &[String]) -> bool {

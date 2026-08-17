@@ -253,18 +253,32 @@ const CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// end open indefinitely. That hang would land on the REPL's own thread — the whole UI, not one tool
 /// call — so a `git log` on a repo with a wedged credential helper could freeze the session.
 fn run_capture(command: &str, dir: &Path) -> String {
-    use std::process::Command;
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(format!("chcp 65001>nul & {command}"));
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(command);
-        c
+    // Through the sandbox runner: a custom command's `` !`cmd` `` body ships with the REPOSITORY
+    // (./.aizen/commands/), so it is exactly the repo-influenced surface the sandbox exists for —
+    // the read-only classify gate above stays, and the env scrub keeps secrets out of it.
+    let mut sbx = match crate::sandbox::runner::prepare_std(
+        crate::sandbox::request::SandboxRequest::shell(
+            crate::sandbox::CommandOrigin::CustomCommand,
+            command,
+            dir.to_path_buf(),
+            dir.to_path_buf(),
+        )
+        .wall_timeout(CAPTURE_TIMEOUT),
+    ) {
+        Ok(s) => s,
+        Err(e) => return format!("[refused: {e}]"),
     };
-    cmd.current_dir(dir);
-    match crate::core::proctree::output_bounded(&mut cmd, CAPTURE_TIMEOUT, CAPTURE_DRAIN_GRACE) {
+    let bounded = crate::core::proctree::output_bounded(
+        &mut sbx.command,
+        CAPTURE_TIMEOUT,
+        CAPTURE_DRAIN_GRACE,
+    );
+    sbx.finish(match &bounded {
+        Ok(o) if o.timed_out => crate::sandbox::runner::Outcome::Timeout,
+        Ok(o) => crate::sandbox::runner::Outcome::Exit(o.code),
+        Err(_) => crate::sandbox::runner::Outcome::SpawnFailed,
+    });
+    match bounded {
         Ok(o) if o.timed_out => format!(
             "[command timed out after {}s and was killed: {command}]",
             CAPTURE_TIMEOUT.as_secs()

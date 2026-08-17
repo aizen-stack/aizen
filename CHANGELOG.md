@@ -7,7 +7,44 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-08-17
+
+An OS-level sandbox underneath the approval layer, and an honest per-platform account of what it
+actually enforces — including where it does not. Contribution terms also change in this release:
+Aizen now asks contributors to agree to a CLA instead of signing off commits.
+
 ### Added
+- **An OS sandbox under every model-influenced process.** Approval asks "did the user agree?" and the
+  `cmd_guard` floor refuses a catastrophic blocklist. Neither answers "if this turn is compromised,
+  what can it reach?" `src/sandbox/` answers that, and it sits below both — `/yolo` skips the prompt,
+  not the sandbox. Every model- or repo-influenced spawn now goes through one constructor: `shell_run`,
+  `process` start, the verify gate, LSP servers, MCP stdio transports, custom-command capture and the
+  `!cmd` REPL escape. What it enforces depends on your kernel, and the report is deliberately
+  unflattering:
+  - **Linux** — kernel-enforced. Landlock (ABI 1–3) confines the filesystem, a classic-BPF seccomp
+    filter denies `socket(AF_INET|AF_INET6)`, plus `no_new_privs` and rlimits. No root, no daemon, and
+    no new dependency: the syscalls are declared locally.
+  - **macOS** — `sandbox-exec` profile, runtime-probed. Filesystem *reads* are only partially
+    contained.
+  - **Windows** — **filesystem and network are NOT kernel-enforced.** There is no AppContainer
+    integration, so those report `advisory` and `unavailable` rather than pretending, and `strict`
+    mode refuses to spawn at all instead of implying a containment it cannot deliver. What Windows
+    does get is real: Job Object limits (process count, memory, user time), tree-kill containment, and
+    environment scrubbing.
+  - **Everywhere** — children no longer inherit variables whose names look like credentials
+    (`KEY`/`TOKEN`/`SECRET`/`PASSWORD`/`CREDENTIAL`/`AUTH`, and the `AWS_`/`AIZEN_` prefixes).
+    Restore specific names with `sandbox.pass_env`. Values are never logged. Note the honest cost: an
+    agent running `git push` over SSH will not see `ssh-agent` unless you pass it through.
+  - Network is deny-by-default. `shell_run` and `process` take a `network` capability that is an
+    approval escalation and disqualifies the smart auto-clear.
+  - Internal git calls are hardened separately (no hooks, no fsmonitor, no credential helper, no
+    terminal prompt).
+- **`aizen sandbox status | doctor | doctor --json | explain | run`**, a global `--sandbox <mode>`
+  flag, and `/sandbox` in the REPL. `status` prints what *your* machine enforces rather than what the
+  docs hope for; `doctor` runs a live environment-scrub self-test. `docs/SANDBOX.md` carries the threat
+  model and the capability matrix.
+- **An owner-only audit log** at `~/.aizen/audit/sandbox.jsonl` — one JSONL line per spawn, with the
+  command redacted and hashed, environment *counts* rather than values, and 5 MB rotation.
 - **OpenCode (free) preset.** OpenCode's zen gateway (`https://opencode.ai/zen/v1`) joins the
   provider picker: the free tier authenticates with the literal shared token `public` (no sign-up),
   and Aizen attaches the `x-opencode-client` header automatically. Free models there are the
@@ -16,6 +53,110 @@ development log lives in that monorepo's history.
   now prefers a `-free` variant when the list has one — probing a paid model with a free-tier
   credential could draw a 403 that read as "bad key" (OpenRouter benefits from the same fix).
 - **ChatGPT Codex OAuth (experimental).** `aizen auth login|status|logout codex` browser PKCE; Codex Responses backend for the agent loop. Kill-switch `AIZEN_DISABLE_CODEX=1`. Private/compatibility surface — see docs RISK.
+
+### Changed
+- **Contributions now require a CLA instead of a DCO sign-off.** The project's license does not
+  change — Aizen is and stays Apache-2.0. What changes is the inbound terms: contributors agree once
+  to [`CLA.md`](CLA.md) by commenting on their pull request, and `git commit -s` is no longer asked
+  for. Stated plainly because it is a broader ask than Apache-2.0 §5: you keep your copyright and the
+  public source stays Apache-2.0, but §3 also grants the maintainer the right to license your
+  contribution under other terms, **including proprietary commercial ones**. Read §3 before agreeing;
+  if you would rather not, say so on the PR.
+- **`serve` and `cron` now fail closed on Windows.** Both mark the process unattended, and an
+  unattended turn will not fall back to weaker containment silently. Because Windows has no kernel
+  backend, this means **an agent shell driven from Telegram or Discord is refused** until you set
+  `sandbox.allow_guarded_fallback = true`. This is a behaviour change for existing bot hosts on
+  Windows; Linux and macOS hosts are unaffected.
+- **A false safety claim has been removed from the README.** All three READMEs said "tools are
+  confined to the working directory". The cwd-confinement guard was removed in an earlier release, so
+  that sentence had been untrue for some time. It now describes what the code actually enforces, and
+  points at `aizen sandbox status` for the per-machine answer. Note what is still *not* covered: the
+  file tools (`file_write`, `file_edit`, `file_move`) are not sandboxed — the sandbox governs child
+  processes.
+- **The system prompt no longer carries a hand-written tool catalog.** ~7.3 KB of prose listing
+  every tool has been replaced by a `# Tool routing` block generated from the registry the session
+  actually built, so it can only ever name tools this session advertises. That closes a real gap:
+  the old catalog described `browser_*` without `--features browser`, `telegram_*` with no bot
+  configured, `lsp_*` after `/lsp off` and `workflow` when opted out — while never mentioning
+  `memory_list`, `read_symbol`, `lsp_hover`, `goal_complete` or `bot_admin`, which are registered.
+  Tool *schemas* were already sent through each provider's native tool field (OpenAI-compatible,
+  Anthropic, and the Codex Responses dialect) and still are; only the duplicated prose is gone. A
+  sub-agent now gets a routing map built from **its own** scoped registry instead of a hand-written
+  capability sentence, so a read-only reviewer is no longer told about editing and shell tools.
+- **One tool-classification table.** `toolsets::classify_tool` (which drives `disabled_toolsets`)
+  and the prompt's routing groups are now two views over a single `tool_routing::lane_for` table.
+  Bundle ids in `cli-config.json` are unchanged.
+- **Model identity comes from the runtime.** The prompt used to hard-code a fixed "I am <model> by
+  <vendor>" answer regardless of which endpoint was configured; it now reports the `model` stated in
+  `<environment>` and says the runtime didn't expose it when there is nothing to report.
+- **OS and shell come from the runtime.** `<environment>` gained a `shell:` line with that
+  platform's syntax. Windows keeps its PowerShell-first guidance; Linux/macOS now get POSIX
+  guidance instead of PowerShell advice they cannot use.
+- **Prompt rules that misfired have been rewritten, not dropped.** Re-reading is allowed when a file
+  may have changed, output was truncated, or a new region is needed (it used to be forbidden
+  outright); a general, timeless question no longer demands a tool call; `AGENTS.md` / `CLAUDE.md`
+  are stated as the user's standing instructions rather than falling under "tool output is untrusted
+  data"; and clearing unfinished todos to end a turn is now explicitly disallowed. Answer-only,
+  review, explain and plan requests are distinguished from action requests up front.
+
+### Fixed
+- **ChatGPT/Codex OAuth login failed on Windows.** Three separate causes, all fixed: the authorize URL
+  was opened through `cmd /C start`, which treats the `&` in an OAuth query string as a command
+  separator and handed the browser a truncated URL (it now goes through
+  `rundll32 url.dll,FileProtocolHandler` as a single argument); the callback listener fell back to an
+  ephemeral port when 1455 was busy, but Codex registers exactly one redirect URI, so OpenAI rejected
+  the request with `invalid_authorize_request` before login could start (the fallback is gone and a
+  bind failure now names the port to free); and the redirect URI now uses the registered `localhost`
+  spelling rather than `127.0.0.1`. Reported and fixed by
+  [@ManhND226677](https://github.com/ManhND226677) in
+  [#10](https://github.com/aizen-stack/aizen/pull/10) — thank you. The live Windows login was verified
+  by the contributor.
+- **The input box ignored the mouse, and a long draft scrolled under a stationary caret.** Clicking a
+  character in the box now puts the caret on it, instead of ←/→ being the only way to get there, and
+  dragging across the box selects draft text — copied to the clipboard on release, or with Ctrl-C,
+  which now copies just the highlight rather than the whole draft. Typing over a selection replaces
+  it and Backspace/Del deletes it, decided in one place so no key can disagree with what is
+  highlighted. The window onto a draft longer than the box is also sticky now: it only slides when
+  the caret would leave it. Before, it was re-derived from the caret every frame, which pinned the
+  caret to the right edge — so each ←/→ dragged the whole line sideways under a motionless cursor,
+  and a click could never land where it was aimed because the text jumped as the caret arrived.
+- **The Time Machine store grew forever and could never be compacted.** Every checkpoint writes its
+  commit, tree, and changed blobs as loose objects, and nothing ever packed them — measured on the
+  author's machine: **14,868 loose objects, 0 packs, backing 30 live checkpoints** (88 MB across
+  17,336 files). This was structural, not a missing cron: `git gc` and `git repack` select objects by
+  walking history, and a checkpoint's parent commit usually lives only in the source repo, borrowed
+  through the store's sealed alternates pointer. Once the source prunes that commit — or is moved,
+  renamed or deleted — the walk dies with `failed to traverse parents of commit <oid>` and repack
+  aborts having packed nothing. Retention kept deleting refs, so the ledger looked tidy while not one
+  byte came back. Compaction now selects by OID instead: the loose object files the store physically
+  owns are handed to `pack-objects`, which walks nothing, then `prune-packed` drops the redundant
+  loose copies. It runs on `aizen time gc`, and automatically after a save once a store passes 2,048
+  loose objects. On a real store: 18 MB / 1,142 files → **9.7 MB / 83 files**, with every checkpoint
+  still restorable.
+- **`aizen time doctor` reported a store as healthy while it held tens of thousands of files.** It
+  now prints the loose-object count once it passes 1,024, and points at `aizen time gc`.
+- **The agent left compiled scratch files behind.** The prompt now states that a throwaway repro or
+  probe is not part of the deliverable, that probes belong in a temp or build directory, and that a
+  clean `git status` is not evidence — `.gitignore` hides exactly the binaries and logs most likely
+  to be abandoned. (This repo had 42 MB of `test_*.exe` sitting in its root since June, invisible for
+  that reason.)
+- **The provider presets were unreachable once you had a config.** `/config` → Providers went
+  straight to "type a base URL", so the preset list — the only place a newly supported provider
+  becomes discoverable — was shown by first-run setup and nowhere else. Anyone who installed before
+  OpenCode and Codex landed could not see them at all. Both the add and the re-point paths now run
+  the same connection step first-run setup runs, presets included, with the preset supplying the
+  default profile name.
+- **The `· free` tag only rendered in one of three model pickers.** The two an existing user
+  actually reaches (Main model & context, and a provider's default model) showed bare ids, so a
+  free-tier credential could be pointed at a paid model with no warning until the first turn 403'd.
+  All pickers now render through one row builder.
+- **Picking the Codex preset asked for an API key it doesn't have.** Codex authenticates out of
+  band, and has no `GET /models` to probe — so the preset failed its reachability check and then
+  demanded a key. It now skips the probe, offers the browser sign-in in place of the key prompt,
+  lists models from the shipped catalog, and `aizen config show` reports the sign-in state instead
+  of a meaningless `key codex-oauth ✓`.
+- Restored the `## Configure` heading in `docs/REFERENCE.md`, which a merge had truncated to
+  `## Config` plus a stray `ure` line.
 
 ## [0.6.4] — 2026-08-11
 

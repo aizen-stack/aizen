@@ -27,9 +27,14 @@ Please include:
 
 ## Scope
 
-Aizen's threat model already documents several deliberate safety floors (a destructive-command
-blocklist, an SSRF guard on the web tools, owner-only secret files, tool-output-as-data). Reports
-that strengthen or bypass these are especially welcome. See the **Safety model** section of the
-[README](README.md) for the current guarantees.
+Aizen's threat model documents several deliberate safety layers: an OS sandbox around
+model/repo-influenced child processes (environment scrubbing everywhere; Landlock + seccomp on
+Linux; Seatbelt on macOS; Job-Object containment on Windows — capabilities are reported honestly
+per platform, never inflated), a destructive-command blocklist that survives `/yolo`, an SSRF
+guard on the web tools, owner-only secret files, hardened internal git (repo hooks / fsmonitor /
+credential helpers disabled), and tool-output-as-data. Reports that strengthen or bypass any of
+these are especially welcome — a sandbox escape on a platform whose matrix says `enforced` is a
+vulnerability; the documented `advisory`/`unavailable` gaps on Windows are known limitations, not
+bugs. See [docs/SANDBOX.md](docs/SANDBOX.md) for the full threat model and per-platform matrix.
 
 Please give the maintainer a reasonable chance to ship a fix before public disclosure.

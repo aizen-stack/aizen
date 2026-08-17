@@ -1036,6 +1036,61 @@ pub async fn stream_chat_with_visual_contract(
     Ok(full)
 }
 
+/// Build the `/chat/completions` request body — the ONE place the OpenAI-compatible wire shape is
+/// assembled, shared by the streaming and non-streaming paths.
+///
+/// The registry's tool definitions go out through the provider's NATIVE `tools` field (each a
+/// `{"type":"function","function":{name,description,parameters}}` object with a real JSON Schema);
+/// they are never rendered into the system prompt as prose. `tool_choice`/`parallel_tool_calls` are
+/// omitted entirely when the surface is empty so a plain chat request stays byte-identical to one
+/// from a build without tools.
+///
+/// Anthropic is served through this same path: `api.anthropic.com/v1` exposes an OpenAI-compatible
+/// chat-completions surface, and [`with_provider_auth`] adds its native `x-api-key` +
+/// `anthropic-version` headers. The ChatGPT Codex endpoint does NOT come through here — it speaks the
+/// Responses dialect and is branched off upstream to
+/// [`crate::llm::responses_codex::build_request_body`], which maps the same `ToolDef`s onto that
+/// provider's own native tool shape.
+///
+/// `cfg` is passed in rather than re-read: `load()` hits the filesystem, and both call sites already
+/// hold the config they resolved `effort` from.
+pub(crate) fn build_chat_body(
+    cfg: &crate::core::cli_config::CliConfig,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    stream: bool,
+    effort: Option<String>,
+) -> ChatRequest {
+    let mut msgs = messages.to_vec();
+    let mut tool_defs = tools.to_vec();
+    // Stamp on cache_enabled alone — the system/history breakpoints pay off even with no tools
+    // (summaries, persona/skill learning, sub-tasks); the last-tool-def breakpoint inside is a
+    // no-op when tools is empty.
+    if cache_enabled(cfg.prompt_cache, model) {
+        apply_cache_breakpoints(&mut msgs, &mut tool_defs);
+    }
+    ChatRequest {
+        model: model.to_string(),
+        messages: msgs,
+        stream,
+        temperature: None,
+        max_tokens: cfg.max_tokens,
+        tools: tool_defs,
+        tool_choice: if tools.is_empty() {
+            None
+        } else {
+            Some("auto".to_string())
+        },
+        parallel_tool_calls: if tools.is_empty() { None } else { Some(true) },
+        // Streaming asks for a final usage chunk; non-streaming responses carry `usage` natively.
+        stream_options: stream.then_some(StreamOptions {
+            include_usage: true,
+        }),
+        reasoning_effort: effort,
+    }
+}
+
 /// One non-streaming chat turn WITH tools advertised. Returns the assistant's content
 /// and/or the tool calls it wants executed. Used by the `task` sub-agent (which runs silently
 /// and returns only its final text) and the workflow fan-out; the streaming counterpart
@@ -1082,31 +1137,14 @@ pub async fn chat_with_tools_effort(
             .await;
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let cfg = crate::core::cli_config::load();
-    let mut msgs = messages.to_vec();
-    let mut tool_defs = tools.to_vec();
-    // Stamp on cache_enabled alone — the system/history breakpoints pay off even with no tools
-    // (summaries, persona/skill learning, sub-tasks); the last-tool-def breakpoint inside is a
-    // no-op when tools is empty.
-    if cache_enabled(cfg.prompt_cache, model) {
-        apply_cache_breakpoints(&mut msgs, &mut tool_defs);
-    }
-    let body = ChatRequest {
-        model: model.to_string(),
-        messages: msgs,
-        stream: false,
-        temperature: None,
-        max_tokens: cfg.max_tokens,
-        tools: tool_defs,
-        tool_choice: if tools.is_empty() {
-            None
-        } else {
-            Some("auto".to_string())
-        },
-        parallel_tool_calls: if tools.is_empty() { None } else { Some(true) },
-        stream_options: None, // non-streaming responses carry `usage` natively
-        reasoning_effort: effort,
-    };
+    let body = build_chat_body(
+        &crate::core::cli_config::load(),
+        model,
+        messages,
+        tools,
+        false,
+        effort,
+    );
 
     let resp = send_chat(client, &url, api_key, body).await?;
 
@@ -1381,33 +1419,10 @@ pub async fn stream_chat_with_tools_eager(
             .await;
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    // ONE config read for the whole request: the effort tier and the body are resolved from it.
     let cfg = crate::core::cli_config::load();
-    let mut msgs = messages.to_vec();
-    let mut tool_defs = tools.to_vec();
-    // See chat_with_tools: stamp on cache_enabled alone (system/history breakpoints help no-tool calls too).
-    if cache_enabled(cfg.prompt_cache, model) {
-        apply_cache_breakpoints(&mut msgs, &mut tool_defs);
-    }
-    let body = ChatRequest {
-        model: model.to_string(),
-        messages: msgs,
-        stream: true,
-        temperature: None,
-        max_tokens: cfg.max_tokens,
-        tools: tool_defs,
-        tool_choice: if tools.is_empty() {
-            None
-        } else {
-            Some("auto".to_string())
-        },
-        parallel_tool_calls: if tools.is_empty() { None } else { Some(true) },
-        stream_options: Some(StreamOptions {
-            include_usage: true,
-        }), // ask for a final usage chunk
-        reasoning_effort: crate::core::cli_config::resolved_reasoning_effort(
-            cfg.reasoning_effort.clone(),
-        ),
-    };
+    let effort = crate::core::cli_config::resolved_reasoning_effort(cfg.reasoning_effort.clone());
+    let body = build_chat_body(&cfg, model, messages, tools, true, effort);
 
     // BLANK-STREAM REPLAY. The request layer (`send_with_retry`) only covers failures that happen
     // before the 200; a stream that is accepted and then dies or goes silent used to leave the turn

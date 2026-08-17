@@ -84,6 +84,18 @@ impl Drop for EnvGuard {
 /// `/.aizen`. When no env override is set, a pre-rebrand `~/.aizen` is migrated to `~/.aizen`
 /// on first use (atomic same-parent rename) so memory/personas/soul/config carry over. The fn
 /// name stays `aizen_home` (internal; called everywhere) — only the path + brand changed.
+/// The user's HOME directory (`USERPROFILE`/`HOME`), falling back to the process cwd when neither
+/// is set. This is the anchor for the sandbox policy's credential-directory deny list and
+/// toolchain-cache roots — distinct from [`aizen_home`], which is the `~/.aizen` DATA root.
+pub fn home_dir() -> PathBuf {
+    std::env::var("USERPROFILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("HOME").ok().filter(|s| !s.trim().is_empty()))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 pub fn aizen_home() -> PathBuf {
     for var in ["AIZEN_HOME", "AIZEN_HOME"] {
         if let Ok(v) = std::env::var(var) {

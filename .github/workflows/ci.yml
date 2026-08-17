@@ -23,7 +23,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # macOS is here for the sandbox backend (Seatbelt) as much as for the build: the sandbox
+        # test suite exercises Landlock/seccomp on Linux and sandbox-exec on macOS — platforms the
+        # maintainer's Windows machine cannot runtime-verify.
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -45,6 +48,11 @@ jobs:
 
       - name: Test
         run: cargo test --bin aizen
+
+      # What the sandbox can actually enforce on THIS runner, in the job log — the per-platform
+      # capability matrix in docs/SANDBOX.md is checked against these outputs at release time.
+      - name: Sandbox capability probe
+        run: cargo run --bin aizen -- sandbox doctor --json
 
   lint:
     name: fmt + clippy (advisory)

@@ -6,8 +6,6 @@
 # same, for the dense-feature build (`--features dense` pulls model2vec + tokenizers, so it gets its
 # own dir rather than thrashing the plain msvc cache). Multiple GB — never ship it.
 /target-msvc-dense
-# scratch/debug programs left at the repo root (not part of the build)
-/test_*.rs
 *.exe
 
 # local code-review scratch (never ship)
@@ -34,3 +32,7 @@ main_diff*.txt
 .audit-out/
 # local task-runner config for this checkout (machine-specific paths, not part of the build)
 .1devtool/
+
+# coding-agent scratch: per-agent git worktrees (hundreds of MB) and this checkout's local tool
+# settings. Machine-specific and regenerated on demand — an accidental `git add -A` must not sweep it.
+.claude/

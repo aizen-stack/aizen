@@ -277,19 +277,33 @@ impl LspServer {
         let service = CatchUnwindLayer::default().layer(router);
         let (mainloop, socket) = MainLoop::new_client(move |_server| service);
 
-        let mut cmd = tokio::process::Command::new(bin);
-        cmd.args(spec.args)
-            .current_dir(root)
+        // Through the sandbox runner: a language server's INPUT is repository content, so it runs
+        // env-scrubbed and (where the platform enforces it) without network — no LSP server we
+        // launch needs a socket. The runner also applies `CREATE_NO_WINDOW`/`setsid`.
+        let mut sbx =
+            crate::sandbox::runner::prepare_tokio(crate::sandbox::request::SandboxRequest::exec(
+                crate::sandbox::CommandOrigin::Lsp,
+                bin.to_path_buf(),
+                spec.args.iter().map(|a| a.to_string()).collect(),
+                root.to_path_buf(),
+                root.to_path_buf(),
+            ))?;
+        sbx.command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null()) // the server's own logs aren't useful to the agent
             .kill_on_drop(true);
-        #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — no console flash
 
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawning language server {}", bin.display()))?;
+        let mut child = match sbx.command.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                sbx.finish(crate::sandbox::runner::Outcome::SpawnFailed);
+                return Err(e)
+                    .with_context(|| format!("spawning language server {}", bin.display()));
+            }
+        };
+        let mut sandbox_guard = sbx.into_guard();
+        sandbox_guard.finish(crate::sandbox::runner::Outcome::Spawned);
         let stdout = child.stdout.take().context("child has no stdout")?.compat();
         let stdin = child
             .stdin
@@ -306,11 +320,13 @@ impl LspServer {
         // The mainloop task OWNS the child (and its Job Object): when it ends (graceful Stop or
         // `abort()`), both drop and the server process tree is reaped. A transport error just ends
         // the loop → the next query sees a dead server (`is_alive`) and the manager respawns or
-        // degrades cleanly.
+        // degrades cleanly. The sandbox guard rides along so the server's private temp lives
+        // exactly as long as the server does.
         let mainloop_handle = tokio::spawn(async move {
             #[cfg(windows)]
             let _job = job;
             let _child = child;
+            let _sandbox = sandbox_guard;
             let _ = mainloop.run_buffered(stdout, stdin).await;
         });
 

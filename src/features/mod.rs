@@ -9,6 +9,7 @@ pub mod crawl;
 pub mod cron;
 pub mod foreign_session;
 pub mod slash;
+pub mod slash_handlers;
 pub mod timemachine;
 pub mod update;
 pub mod zones;

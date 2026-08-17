@@ -222,6 +222,11 @@ pub struct CliConfig {
     /// raise limits / unlock extras. See `agent::reach` and `/reach`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reach: Option<ReachConfig>,
+    /// OS-level sandbox for model/repo-influenced child processes: mode, network default, roots,
+    /// pass-through env, resource limits. `None` ⇒ all defaults (`auto`, network deny). See
+    /// `sandbox::policy::SandboxSettings` and `docs/SANDBOX.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<crate::sandbox::policy::SandboxSettings>,
     /// Hermes-style tool bundles to **disable** on the top-level agent (e.g. `web`, `browser`,
     /// `delegation`, `mcp`). Shrinks the tool schema sent to the model each turn. Sub-agent
     /// registries are unaffected. See `agent::toolsets::CATALOG`.

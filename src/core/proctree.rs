@@ -380,8 +380,29 @@ pub mod windows_job {
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
+
+    /// Resource ceilings a job may carry on top of kill-on-close. All optional: `default()` is
+    /// exactly the old behavior. Set by the sandbox runner from the resolved policy.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct JobLimits {
+        /// Max simultaneously-live processes in the job (fork-bomb stop).
+        pub active_process_limit: Option<u32>,
+        /// Committed-memory ceiling for the WHOLE job, bytes.
+        pub job_memory_bytes: Option<u64>,
+        /// User-mode CPU-time ceiling for the whole job; the job is terminated when exceeded.
+        pub job_user_time: Option<std::time::Duration>,
+    }
+
+    impl JobLimits {
+        fn is_default(&self) -> bool {
+            self.active_process_limit.is_none()
+                && self.job_memory_bytes.is_none()
+                && self.job_user_time.is_none()
+        }
+    }
 
     /// An owned kill-on-close job handle. Dropping it — or the process dying, even on a hard crash —
     /// terminates every process assigned to it.
@@ -394,6 +415,10 @@ pub mod windows_job {
 
     impl Job {
         fn kill_on_close() -> Option<Self> {
+            Self::kill_on_close_with(&JobLimits::default())
+        }
+
+        fn kill_on_close_with(limits: &JobLimits) -> Option<Self> {
             // SAFETY: null attributes + null name are the documented "anonymous job" arguments; the
             // handle is checked before use and owned by `Job` (closed exactly once in Drop).
             let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -403,6 +428,19 @@ pub mod windows_job {
             let job = Job(handle);
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if let Some(n) = limits.active_process_limit {
+                info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+                info.BasicLimitInformation.ActiveProcessLimit = n;
+            }
+            if let Some(bytes) = limits.job_memory_bytes {
+                info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+                info.JobMemoryLimit = bytes as usize;
+            }
+            if let Some(t) = limits.job_user_time {
+                // 100-nanosecond units, per the JOBOBJECT_BASIC_LIMIT_INFORMATION contract.
+                info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_TIME;
+                info.BasicLimitInformation.PerJobUserTimeLimit = (t.as_nanos() / 100) as i64;
+            }
             // SAFETY: `info` is initialized and the size argument is exactly its size — the
             // (pointer, length) pair the API requires.
             let ok = unsafe {
@@ -436,6 +474,11 @@ pub mod windows_job {
         assign(child.as_raw_handle() as HANDLE)
     }
 
+    /// [`contain`], with resource ceilings from the sandbox policy on the same job.
+    pub fn contain_with_limits(child: &std::process::Child, limits: &JobLimits) -> Containment {
+        assign_with(child.as_raw_handle() as HANDLE, limits)
+    }
+
     /// Same, for a `tokio::process::Child` (the async spawn path — the verify gate).
     pub fn contain_tokio(child: &tokio::process::Child) -> Containment {
         match child.raw_handle() {
@@ -444,8 +487,30 @@ pub mod windows_job {
         }
     }
 
+    /// [`contain_tokio`] with resource ceilings.
+    pub fn contain_tokio_with_limits(
+        child: &tokio::process::Child,
+        limits: &JobLimits,
+    ) -> Containment {
+        match child.raw_handle() {
+            Some(h) => assign_with(h as HANDLE, limits),
+            None => Containment::None,
+        }
+    }
+
     fn assign(process: HANDLE) -> Containment {
-        let Some(job) = Job::kill_on_close() else {
+        assign_with(process, &JobLimits::default())
+    }
+
+    fn assign_with(process: HANDLE, limits: &JobLimits) -> Containment {
+        let job = if limits.is_default() {
+            Job::kill_on_close()
+        } else {
+            // A job that refuses the limits still gets kill-on-close: containment must never be
+            // LOST because a ceiling could not be set (the ceiling is the add-on, not the core).
+            Job::kill_on_close_with(limits).or_else(Job::kill_on_close)
+        };
+        let Some(job) = job else {
             return Containment::None;
         };
         // SAFETY: both handles are live — the job is owned locally, the process handle belongs to a

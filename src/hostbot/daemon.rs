@@ -353,6 +353,20 @@ async fn run_serve_turn(
     shared: &lane::LaneShared,
 ) -> Result<String> {
     let lead = crate::agent::compact::leading_system_count(history);
+    // Default-ON lazy LSP (same as REPL/agent CLI) so remote coding turns get symbol tools. Armed —
+    // and the registry built — BEFORE the prompt bundle: building the registry publishes this lane's
+    // live tool surface, which is what the bundle's tool-routing map is generated from.
+    crate::agent::lsp::LSP.set_request_timeout(AgentConfig::default().lsp_request_timeout_secs);
+    let _ = crate::agent::lsp::LSP.enable();
+    let registry = agent::builtin::default_registry_with_task(
+        http.clone(),
+        base_url.to_string(),
+        api_key.to_string(),
+        model.to_string(),
+        approval_mode,
+        crate::resolve_ctx_window(model).0,
+        Some(lane.root.clone()), // this bot's directory, not the process cwd
+    )?;
     // A brand-new or legacy-restored thread is a conversation boundary and may adopt pending
     // memory. Ordinary messages in an established thread must keep the active core byte-stable.
     // The bundle states THIS lane's cwd and wears THIS lane's persona.
@@ -386,18 +400,6 @@ async fn run_serve_turn(
     }
     history.push(Message::user(task.to_string()));
 
-    // Default-ON lazy LSP (same as REPL/agent CLI) so remote coding turns get symbol tools.
-    crate::agent::lsp::LSP.set_request_timeout(AgentConfig::default().lsp_request_timeout_secs);
-    let _ = crate::agent::lsp::LSP.enable();
-    let registry = agent::builtin::default_registry_with_task(
-        http.clone(),
-        base_url.to_string(),
-        api_key.to_string(),
-        model.to_string(),
-        approval_mode,
-        crate::resolve_ctx_window(model).0,
-        Some(lane.root.clone()), // this bot's directory, not the process cwd
-    )?;
     let turn_cancel = crate::core::cancel::TurnCancel::new();
     // Identity + approval routing ride on the context so a tool body — and the approval gate on the
     // driver — read THIS lane's values rather than whichever lane wrote a global last. The workspace

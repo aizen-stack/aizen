@@ -26,6 +26,13 @@ The chat box is a small line editor: type / Backspace / Del at the cursor, **←
 jump, **↑/↓** recall past prompts, Enter sends. A braille spinner (`⠹ thinking`) shows while the
 model is responding, clearing the moment the first token streams.
 
+The **mouse works in the box too**: click to put the caret on the character you clicked instead of
+walking there with ←/→, and drag across the text to select it — the selection is copied to the
+clipboard on release, and **Ctrl-C** copies it too (with nothing selected, Ctrl-C copies the whole
+draft). Typing over a selection replaces it; Backspace/Del deletes it. On a draft longer than the box
+the view only scrolls when the caret would leave it, so the text stays put under the cursor while you
+move around in it.
+
 **Attach an image** (vision) — two ways, because Ctrl-V can't be used (Windows Terminal intercepts
 it for its own paste, so the keystroke never reaches `aizen`):
 - **Ctrl-O** — grab a copied screenshot from the clipboard (Win+Shift+S, or "Copy image" in a
@@ -64,7 +71,7 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | `/sessions` | saved conversations — restore · save · delete (the chat also auto-saves as `last`) |
 | `/compact` | summarize older turns now to free context |
 | `/approval [ask|smart|yolo]` | one approval setting: ask every time, auto-run read-only shell, or pre-authorize tools after the hard safety floor |
-| `/timemachine` · `/checkpoint [note]` · `/diff` | `/timemachine` lists every crash-recoverable, worktree-scoped Git checkpoint and jumps back to the code **and** chat of the one you pick (one gesture, reversible); `/checkpoint` saves one now; `/diff` (or `aizen time diff`) shows what changed between two checkpoints, or `working` for the live tree. CLI: `aizen time doctor` inspects without touching the tree; `aizen time gc --all` sweeps orphaned stores left by deleted/moved repos (dry-run by default, `--apply` moves them to a trash dir) |
+| `/timemachine` · `/checkpoint [note]` · `/diff` | `/timemachine` lists every crash-recoverable, worktree-scoped Git checkpoint and jumps back to the code **and** chat of the one you pick (one gesture, reversible); `/checkpoint` saves one now; `/diff` (or `aizen time diff`) shows what changed between two checkpoints, or `working` for the live tree. CLI: `aizen time doctor` inspects without touching the tree and reports loose objects once they pile up; `aizen time gc` compacts this repo's store (packs loose objects — a save does it automatically past 2,048); `aizen time gc --all` sweeps orphaned stores left by deleted/moved repos (dry-run by default, `--apply` moves them to a trash dir, which you then delete to reclaim the space) |
 | `/update` | list every published version (the one you're running is marked) and install whichever you pick — newer or older, so the same command is the rollback |
 | `/cost` | session token usage + a $ estimate (real provider usage when reported; set rates via `aizen config set --price-in/--price-out`) |
 | `/clear` | fresh conversation · `/tokens` usage · `/quit` exit |
@@ -212,10 +219,9 @@ It needs a CNI that enforces NetworkPolicy (Calico, Cilium, Antrea); on a cluste
 object is accepted and enforces nothing. The manifest also sets `automountServiceAccountToken: false`,
 since a shell that can read the projected token can talk to the API server as the pod.
 
-## Config
+## Configure
 
-**ChatGPT Codex (experimental)** uses ChatGPT/Codex *consumer* OAuth (not the OpenAI Platform API key). Run `aizen auth login codex`, then pick the preset (base `https://chatgpt.com/backend-api/codex`) or `aizen config set --base-url https://chatgpt.com/backend-api/codex --api-key codex-oauth --model gpt-5.4-mini`. Tokens live in `~/.aizen/provider-tokens/codex.json`. Kill-switch: `AIZEN_DISABLE_CODEX=1`. **Risk:** private backend APIs may break or conflict with vendor terms; prefer Platform API keys / OpenRouter for supported production use. Logout: `aizen auth logout codex`.
-ure
+**ChatGPT Codex (experimental)** uses ChatGPT/Codex *consumer* OAuth (not the OpenAI Platform API key). Pick **ChatGPT Codex (experimental)** in `aizen config` → Providers & connection: it skips the API-key prompt and offers the browser sign-in in place of it, so no separate command is needed. The manual equivalents still work — `aizen auth login codex`, or `aizen config set --base-url https://chatgpt.com/backend-api/codex --api-key codex-oauth --model gpt-5.4-mini`. Model ids come from a shipped catalog, since the Codex backend has no `GET /models`. Tokens live in `~/.aizen/provider-tokens/codex.json` and `aizen config show` reports whether you are still signed in. Kill-switch: `AIZEN_DISABLE_CODEX=1`. **Risk:** private backend APIs may break or conflict with vendor terms; prefer Platform API keys / OpenRouter for supported production use. Logout: `aizen auth logout codex`.
 
 All network commands read three settings, as flags or env vars:
 
@@ -263,6 +269,11 @@ Inside the REPL, `/provider` is the fast one-pick switcher. `/provider add` open
 `/provider manage` opens Use/Edit/Rename/Delete, and `/provider backup` switches directly. The next turn and health probe use the selected URL, key, and model. This is manual failover, not an
 automatic retry/failover chain. `AIZEN_BASE_URL`, `AIZEN_API_KEY`, and `AIZEN_MODEL` still override the
 saved selection; Aizen prints a note when those environment variables mask a switch.
+
+Adding or re-pointing a provider starts from the preset list (OpenAI, ChatGPT Codex, Anthropic,
+OpenRouter, Groq, DeepSeek, OpenCode, Ollama, or **Custom gateway** to type your own URL) — the same
+list first-run setup shows, so a provider added in a later release is reachable without reinstalling.
+The preset also supplies the default profile name, and its URL already carries the version suffix.
 
 Changing an existing provider's endpoint asks for a new key instead of offering the previous
 endpoint's credential. Cancelling any wizard step leaves the complete saved profile unchanged.
@@ -341,6 +352,14 @@ aizen agent --yes "fix the failing test in src/parse.rs"   # pre-approve file/sh
 aizen agent --max-iters 40 "..."                            # raise the step cap
 ```
 Behavior worth knowing:
+- **How tools reach the model** — the session's tool registry is the single source of truth. Its
+  definitions (name, description, JSON Schema) are sent through the provider's **native** tool field:
+  OpenAI-compatible gateways and Anthropic get `tools[{type:"function",function:{…}}]`, the ChatGPT
+  Codex endpoint gets the same tools in the Responses dialect's flat shape. The system prompt carries
+  only a compact **`# Tool routing`** map — capability → the exact tool names enabled *right now* —
+  generated from that same registry, never the schemas. So `/tools`, `/lsp off`, `/apps`, a missing
+  Telegram token or a build without `--features browser` all remove a tool from the prompt and the
+  request together, and the model is never told about a tool it cannot call.
 - **Parallel reads** — when a turn only reads (file_read/glob/memory), the calls run
   concurrently; any turn that edits or runs shell stays serial (and approval-gated).
 - **Approval** — destructive tools (`file_edit`, `shell_run`) prompt before running. In the sticky
@@ -397,6 +416,21 @@ aizen crawl https://example.com --json                # [{url, depth, via}]
 ```
 Only GET requests; scope defaults to the seed host (`--scope subs` for subdomains); `--max-pages`
 is a hard ceiling. Also exposed to the agent as the `web_crawl` tool.
+
+### `aizen sandbox` — the OS sandbox around model-run commands
+
+```bash
+aizen sandbox status          # live capability matrix: enforced / partial / advisory / unavailable
+aizen sandbox doctor [--json] # probe backend, audit-log check, real env-scrub self-test, tmp sweep
+aizen sandbox explain         # how the next shell_run would be sandboxed, step by step
+aizen sandbox run -- <cmd>    # run one command under the sandbox by hand
+aizen --sandbox strict …      # per-invocation mode override (also AIZEN_SANDBOX, /sandbox, config)
+```
+
+Modes: `auto` (default — strongest backend, guarded fallback for interactive sessions only) ·
+`strict` (kernel enforcement or refusal) · `guarded` (software guards, said plainly) · `off`.
+Config lives under `"sandbox": {…}` in `~/.aizen/cli-config.json`. Threat model, per-platform
+matrix and limitations: [SANDBOX.md](SANDBOX.md).
 
 ### `/persona` — a character that evolves
 A **persona** is *who the agent is* — a third identity layer alongside **user_memory** (who you are)
@@ -651,19 +685,31 @@ aizen bench dialectic                                   # golden set incl. absta
 returns `0` even if it stops on the step limit or divergence — it prints the reason to stderr.
 
 ## Safety model
-File and shell tools are confined to the working directory (a path-traversal guard rejects
-escapes). Destructive ops are approval-gated (non-TTY safe-deny; `--yes` to pre-authorize, which
-applies transitively to sub-agents). Beneath approval sits a **hard safety floor** — a deterministic
-blocklist (`rm -rf /` incl. GNU long flags like `rm --recursive --force /`, `mkfs`, `dd of=/dev/…`,
-fork bombs, `curl|sh`, `format C:`, …) that runs *before* the `/yolo` short-circuit, so catastrophic
-commands are refused **even under auto-approve** (and the same check applies to background `process
-start` + `` !`cmd` `` in custom commands). The web tools (`web_fetch`/`web_crawl`/`aizen crawl`) carry an
-**SSRF floor**: a URL that resolves to a loopback/private/link-local address (incl. the cloud
-metadata endpoint `169.254.169.254`) is refused — set `AIZEN_ALLOW_PRIVATE_NET=1` to allow
-local/internal targets. Long-lived secret files (`cli-config.json`, OAuth/MCP token caches, saved
-sessions) are written owner-only (0600) on Unix. MCP and other external tools are
-destructive-by-default. `shell_run` is wall-clock capped at 120s. Tool results and file contents are
-treated as data, never as instructions.
+Three layers, bottom to top. (1) A **hard safety floor** — a deterministic blocklist (`rm -rf /`
+incl. GNU long flags like `rm --recursive --force /`, `mkfs`, `dd of=/dev/…`, fork bombs,
+`curl|sh`, `format C:`, …) that runs *before* the `/yolo` short-circuit, so catastrophic commands
+are refused **even under auto-approve** (the same check applies to background `process start` +
+`` !`cmd` `` in custom commands). (2) **Approval**: destructive ops are approval-gated (non-TTY
+safe-deny; `--yes` pre-authorizes, transitively for sub-agents); a command that requests the
+`network` capability is an escalation `smart` never auto-clears. (3) An **OS sandbox** under both:
+every model/repo-influenced child runs with Aizen's secrets scrubbed from its environment, a
+private per-run temp, deny-by-default network, and a workspace-write filesystem policy —
+kernel-enforced on Linux (Landlock + seccomp) and macOS (Seatbelt), software-guarded on Windows
+(Job-Object containment + resource ceilings; honestly reported as `partial`). `strict` mode fails
+closed instead of degrading; unattended runs (cron, hosted bots) fail closed by default on
+platforms without a kernel backend. `aizen sandbox status|doctor|explain` show what *your*
+machine enforces; every spawn lands in an owner-only audit log. Full detail: [SANDBOX.md](SANDBOX.md).
+
+File tools resolve paths anywhere on disk by explicit user decision (the old cwd-confinement
+guard was removed) — the sandbox above confines *child processes*, not the file tools. The web
+tools (`web_fetch`/`web_crawl`/`aizen crawl`) carry an **SSRF floor**: a URL that resolves to a
+loopback/private/link-local address (incl. the cloud metadata endpoint `169.254.169.254`) is
+refused — set `AIZEN_ALLOW_PRIVATE_NET=1` to allow local/internal targets. Long-lived secret
+files (`cli-config.json`, OAuth/MCP token caches, saved sessions) are written owner-only. MCP and
+other external tools are destructive-by-default. `shell_run` is wall-clock capped at 120s.
+Internal git plumbing runs with repo hooks, fsmonitor and credential helpers disabled, so a
+checkout's `.git/hooks` never executes because Aizen made a checkpoint. Tool results and file
+contents are treated as data, never as instructions.
 
 ## Remote control & notifications
 `aizen serve` / `aizen discord serve` run long-lived daemons that drive the agent from Telegram or a

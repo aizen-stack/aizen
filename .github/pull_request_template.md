@@ -19,7 +19,7 @@ Closes #
 - [ ] I ran `cargo fmt` and `cargo clippy` and cleared anything I introduced.
 - [ ] I added or updated tests for my change.
 - [ ] My change keeps the **pure-Rust single-static-binary** posture (no new C/native deps).
-- [ ] My commits are **signed off** (`git commit -s`) per the [DCO](https://developercertificate.org/) — my contribution is licensed under [Apache-2.0](../blob/main/LICENSE).
+- [ ] I have agreed to the [CLA](../blob/main/CLA.md) (a bot will ask on this PR if I haven't). I read **§3**: the project stays [Apache-2.0](../blob/main/LICENSE), and I also grant the maintainer the right to license my contribution under commercial terms.
 
 ## Notes for the reviewer
 

@@ -86,7 +86,7 @@ That's the whole setup. No env vars, no config file to hand-edit.
 | **It finishes the job** | Reads, edits, runs your shell — then **verifies before claiming done**: it runs your typecheck and tests, and fixes what it broke. |
 | **It remembers you** | An offline, BM25-ranked memory brain that learns from reuse — plus a persona, a durable SOUL identity, and skills it writes for itself after real work. |
 | **It runs where you aren't** | `aizen serve` drives the agent from Telegram or Discord and asks your phone to approve risky edits. Host it on systemd, Docker, or Kubernetes — behind NAT, no inbound port. |
-| **Safe by construction** | Tools are confined to the working directory, secrets are owner-only and never printed, and a hard command floor refuses catastrophic commands **even under auto-approve**. |
+| **Safe by construction** | An OS sandbox under the approval layer: children never inherit your API keys, network is deny-by-default, and the filesystem policy is kernel-enforced on Linux (Landlock+seccomp) and macOS (Seatbelt) — Windows gets Job-Object containment and honest `partial` reporting, not pretend enforcement. A hard command floor refuses catastrophic commands **even under auto-approve**. `aizen sandbox status` shows exactly what *your* machine enforces — see [docs/SANDBOX.md](docs/SANDBOX.md). |
 
 ## What it can do
 
@@ -115,8 +115,9 @@ browser tools, and the safety model in detail.
 
 ## Contributing
 
-Issues and PRs are welcome. There is **no CLA** — contributions come in under Apache-2.0 §5, and we
-only ask you to sign off your commits (`git commit -s`). See [CONTRIBUTING.md](CONTRIBUTING.md).
+Issues and PRs are welcome. Contributors agree to the [CLA](CLA.md) once — the project stays
+Apache-2.0, and §3 also grants the maintainer the right to license contributions commercially. Read it
+before you sign. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

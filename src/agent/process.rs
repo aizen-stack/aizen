@@ -30,7 +30,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -149,6 +149,9 @@ struct ProcEntry {
     /// this is also crash insurance — if Aizen dies without running `kill_all`, the OS closes the job
     /// handle and the kernel reaps every descendant, so a `npm run dev` cannot outlive the CLI.
     containment: Arc<crate::core::proctree::Containment>,
+    /// Sandbox bookkeeping: finishes the audit line on exit/kill and keeps the run's private temp
+    /// directory alive for as long as the process may use it.
+    sandbox: Arc<Mutex<crate::sandbox::runner::SpawnGuard>>,
 }
 
 impl ProcEntry {
@@ -219,7 +222,13 @@ fn render_delta(id: &str, status: &str, cursor: u64, d: &LogDelta) -> String {
 
 /// Spawn `command` in the background, confined to `root` (optionally a `cwd` subdir), owned by
 /// `scope`. Returns the new `proc_<n>` id.
-fn start(root: &PathBuf, command: &str, cwd: Option<&str>, scope: &str) -> Result<String> {
+fn start(
+    root: &PathBuf,
+    command: &str,
+    cwd: Option<&str>,
+    scope: &str,
+    network: bool,
+) -> Result<String> {
     let dir = match cwd {
         Some(c) => confine(root, c, true)?,
         None => root.clone(),
@@ -247,27 +256,34 @@ fn start(root: &PathBuf, command: &str, cwd: Option<&str>, scope: &str) -> Resul
         }
     }
 
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(format!("chcp 65001>nul & {command}"));
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(command);
-        c
-    };
-    cmd.current_dir(&dir)
+    // One construction path with `shell_run`: the sandbox runner wraps the shell, scrubs the
+    // environment and applies policy — going background must never sidestep the sandbox.
+    let mut sbx = crate::sandbox::runner::prepare_std(
+        crate::sandbox::request::SandboxRequest::shell(
+            crate::sandbox::CommandOrigin::ProcessStart,
+            command,
+            dir.clone(),
+            root.clone(),
+        )
+        .network(network)
+        .background(true),
+    )?;
+    sbx.command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Contain the tree at spawn. A background command is the WORST case for the orphan problem this
     // guards: `process start` is what runs dev servers and watchers, i.e. exactly the processes that
     // spawn real children behind the `cmd.exe`/`sh` wrapper and keep holding a port after a kill.
-    crate::core::proctree::prepare(&mut cmd);
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawning background `{command}`"))?;
-    let containment = Arc::new(crate::core::proctree::contain(&child));
+    let mut child = match sbx.command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            sbx.finish(crate::sandbox::runner::Outcome::SpawnFailed);
+            return Err(e).with_context(|| format!("spawning background `{command}`"));
+        }
+    };
+    let containment = Arc::new(sbx.contain(&child));
+    let sandbox = Arc::new(Mutex::new(sbx.into_guard()));
     let pid = child.id();
 
     let out = Arc::new(Mutex::new(RingBuf::new(OUTPUT_CAP)));
@@ -291,6 +307,7 @@ fn start(root: &PathBuf, command: &str, cwd: Option<&str>, scope: &str) -> Resul
         let done = Arc::clone(&done);
         let notify = Arc::clone(&notify);
         let finished_at = Arc::clone(&finished_at);
+        let sandbox = Arc::clone(&sandbox);
         std::thread::spawn(move || loop {
             if done.load(Ordering::Relaxed) {
                 signal_done(&notify);
@@ -303,6 +320,10 @@ fn start(root: &PathBuf, command: &str, cwd: Option<&str>, scope: &str) -> Resul
                         Some(status.code().unwrap_or(-1));
                     *finished_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
                     done.store(true, Ordering::Relaxed);
+                    sandbox
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .finish(crate::sandbox::runner::Outcome::Exit(status.code()));
                     signal_done(&notify);
                     break;
                 }
@@ -330,6 +351,7 @@ fn start(root: &PathBuf, command: &str, cwd: Option<&str>, scope: &str) -> Resul
         stdin: Arc::new(Mutex::new(stdin)),
         finished_at,
         containment,
+        sandbox,
     };
     REGISTRY
         .lock()
@@ -367,6 +389,11 @@ fn kill_tree(entry: &ProcEntry) {
     let mut child = entry.child.lock().unwrap_or_else(|e| e.into_inner());
     crate::core::proctree::kill_tree(&mut child, &entry.containment);
     entry.done.store(true, Ordering::Relaxed);
+    entry
+        .sandbox
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .finish(crate::sandbox::runner::Outcome::Exit(None));
     if entry
         .finished_at
         .lock()
@@ -409,9 +436,9 @@ impl Tool for Process {
     }
     fn description(&self) -> &str {
         "Run and manage LONG-RUNNING background commands (dev servers, watchers, long builds) that \
-         shell_run's foreground wall-clock cap would kill. action=start returns a proc_<n> handle at \
-         once; then wait (blocks until exit), log (pass cursor=<next_cursor> for ONLY new output), \
-         status/kill/write. Use shell_run for quick commands. Handles are private to this agent."
+         shell_run's cap would kill. action=start returns a proc_<n> handle; then wait (blocks \
+         until exit), log (cursor=<next_cursor> → only new output), status/kill/write. Use \
+         shell_run for quick commands. Handles are private to this agent."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -420,12 +447,13 @@ impl Tool for Process {
             "properties": {
                 "action": {"type": "string", "enum": ["start", "list", "log", "status", "wait", "kill", "write"]},
                 "command": {"type": "string", "description": "the command (action=start)"},
-                "cwd": {"type": "string", "description": "optional working dir for the process (a subdir, or a ../ or absolute path elsewhere) (action=start)"},
+                "cwd": {"type": "string", "description": "optional working dir (subdir, ../ or absolute) (action=start)"},
+                "network": {"type": "boolean", "description": "request network access (action=start; default false; approval-gated). Any socket — even binding a port — needs it."},
                 "id": {"type": "string", "description": "a proc_<n> handle (all actions except start/list)"},
                 "cursor": {"type": "integer", "description": "resume point from a previous next_cursor; returns only newer output (action=log/wait)"},
                 "timeout_secs": {"type": "integer", "description": "max seconds to block (action=wait; default 30)"},
-                "input": {"type": "string", "description": "text to send to the process stdin (action=write)"},
-                "enter": {"type": "boolean", "description": "append a newline after input (action=write; default true)"}
+                "input": {"type": "string", "description": "text for the process stdin (action=write)"},
+                "enter": {"type": "boolean", "description": "append newline (action=write; default true)"}
             },
             "required": ["action"]
         })
@@ -456,7 +484,11 @@ impl Tool for Process {
                     .and_then(|v| v.as_str())
                     .context("start needs `command`")?;
                 let cwd = args.get("cwd").and_then(|v| v.as_str());
-                let id = start(&self.root, command, cwd, &scope)?;
+                let network = args
+                    .get("network")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let id = start(&self.root, command, cwd, &scope, network)?;
                 let pid = REGISTRY
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())

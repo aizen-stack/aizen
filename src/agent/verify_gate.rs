@@ -167,17 +167,24 @@ fn detect_npm_typecheck_script(pkg: &Path) -> Option<String> {
         .map(String::from)
 }
 
-/// Build a shell command (matches `ShellRun`'s platform handling so npm/npx `.cmd` shims resolve).
-fn shell_command(command_line: &str) -> Command {
-    if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(command_line);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(command_line);
-        c
-    }
+/// Build the sandboxed shell command for one verify run (same platform-shell wrapping as
+/// `shell_run`, via the central runner — the verify gate must not be a sandbox bypass: its command
+/// list is repository-influenced through manifests and `.aizen/verify.json`).
+fn sandboxed_verify(
+    cwd: &Path,
+    command_line: &str,
+    timeout_secs: u64,
+) -> Option<crate::sandbox::runner::Sandboxed<Command>> {
+    crate::sandbox::runner::prepare_tokio(
+        crate::sandbox::request::SandboxRequest::shell(
+            crate::sandbox::CommandOrigin::VerifyGate,
+            command_line,
+            cwd.to_path_buf(),
+            cwd.to_path_buf(),
+        )
+        .wall_timeout(Duration::from_secs(timeout_secs.max(1))),
+    )
+    .ok() // a policy refusal degrades to "no verify ran" — the gate is best-effort by contract
 }
 
 /// Run the project's verify command LIST in order, stopping at the first failure (its result is
@@ -224,9 +231,8 @@ async fn run_one_verify(
     let command_line = cmd.command_line();
     let start = Instant::now();
 
-    let mut command = shell_command(&command_line);
-    command
-        .current_dir(cwd)
+    let mut sbx = sandboxed_verify(cwd, &command_line, timeout_secs)?;
+    sbx.command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true); // a dropped (timed-out) future kills the child.
@@ -234,10 +240,15 @@ async fn run_one_verify(
                              // (`cargo check`, `tsc`, `npm test`), so the surviving grandchild is a compiler holding a lock on
                              // `target/` — the next verify then blocks on that lock and times out too, and the timeouts
                              // compound instead of clearing. Containment makes the timeout actually stop the work.
-    crate::core::proctree::prepare_tokio(&mut command);
 
-    let child = command.spawn().ok()?; // spawn failure (no toolchain) → silent no-op.
-    let containment = crate::core::proctree::contain_tokio(&child);
+    let child = match sbx.command.spawn() {
+        Ok(c) => c,
+        Err(_) => {
+            sbx.finish(crate::sandbox::runner::Outcome::SpawnFailed);
+            return None; // spawn failure (no toolchain) → silent no-op.
+        }
+    };
+    let containment = sbx.contain_tokio(&child);
     let dur = Duration::from_secs(timeout_secs.max(1));
     // `wait_with_output` consumes the child, so the tree is killed through the containment handle
     // rather than a `&mut Child` we no longer have.
@@ -245,6 +256,11 @@ async fn run_one_verify(
     if outcome.is_err() {
         crate::core::proctree::terminate_tree(&containment);
     }
+    sbx.finish(match &outcome {
+        Ok(Ok(output)) => crate::sandbox::runner::Outcome::Exit(output.status.code()),
+        Ok(Err(_)) => crate::sandbox::runner::Outcome::SpawnFailed,
+        Err(_) => crate::sandbox::runner::Outcome::Timeout,
+    });
     match outcome {
         Ok(Ok(output)) => {
             let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();

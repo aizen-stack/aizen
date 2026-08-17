@@ -65,7 +65,7 @@ aizen            # 直接进入 REPL,开始输入
 | **把活干完** | 读代码、改代码、运行你的 shell——然后在宣称"完成"之前**先自我验证**:跑你的类型检查和测试,弄坏了就自己修好。 |
 | **记得你** | 一套离线的、BM25 排序的记忆大脑,从复用中学习——外加 persona、持久的 SOUL 身份,以及它在真实工作后为自己编写的技能。 |
 | **在你不在的地方运行** | `aizen serve` 通过 Telegram 或 Discord 驱动智能体,有风险的修改会请求你在手机上批准。可托管在 systemd、Docker 或 Kubernetes 上——即使处于 NAT 之后,也无需开放任何入站端口。 |
-| **构造上即安全** | 工具被限制在工作目录内,密钥仅所有者可读且绝不打印,一道硬性命令底线即使在自动批准模式下也拒绝灾难性命令。 |
+| **构造上即安全** | 审批层之下还有一个操作系统级沙箱:子进程不会继承你的 API 密钥,网络默认拒绝,文件系统策略在 Linux(Landlock+seccomp)和 macOS(Seatbelt)上由内核强制执行 — Windows 提供 Job-Object 进程约束并如实报告为 `partial`,绝不假装强制。硬性命令底线即使在自动批准模式下也拒绝灾难性命令。`aizen sandbox status` 显示你的机器实际强制执行了什么 — 见 [docs/SANDBOX.md](docs/SANDBOX.md)。 |
 
 ## 它能做什么
 
@@ -94,8 +94,8 @@ aizen            # 直接进入 REPL,开始输入
 
 ## 参与贡献
 
-欢迎提交 Issue 和 PR。本项目**没有 CLA**——贡献按 Apache-2.0 §5 授权(inbound = outbound),
-我们只要求你对提交做 DCO 签名(`git commit -s`)。详见
+欢迎提交 Issue 和 PR。贡献者需要一次性同意 [CLA](CLA.md)——项目本身仍是 Apache-2.0,
+但 §3 同时授予维护者以商业条款许可你的贡献的权利。请在签署前阅读。详见
 [CONTRIBUTING.md](CONTRIBUTING.md)(英文)。
 
 ## 许可证
