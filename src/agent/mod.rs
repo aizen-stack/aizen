@@ -32,6 +32,7 @@ pub mod repo_map;
 pub mod search;
 pub mod task_tool;
 pub mod todo;
+pub mod tool_routing;
 pub mod tools;
 pub mod toolsets;
 pub mod verify_gate;
@@ -157,6 +158,23 @@ impl PromptBundle {
     }
 }
 
+/// The shell `shell_run` will actually spawn on `os`, plus the syntax that shell needs.
+///
+/// This used to be a sentence in the static prompt ("You operate primarily on Windows/PowerShell"),
+/// which is wrong on the two platforms it isn't. Deriving it from the `os` the caller reports keeps
+/// PowerShell-first behavior on Windows and stops the model writing `$env:X` into a bash command on
+/// Linux. Pure in `os` so it is testable without a platform.
+fn shell_line(os: &str) -> &'static str {
+    match os {
+        "windows" => {
+            "powershell — $env:VAR, chain with `;` and `if ($?) { }`, Test-Path, backtick escapes; \
+             no bash-isms, and `&&`/`||` are not available"
+        }
+        "macos" => "sh (POSIX) — $VAR, chain with `&&`, `test -f`; open a file/URL with `open`",
+        _ => "sh (POSIX) — $VAR, chain with `&&`, `test -f`; open a file/URL with `xdg-open`",
+    }
+}
+
 /// Assemble the full system prompt: static base → stable-dynamic `<environment>` →
 /// volatile `<user_memory>` (the frozen core). Ordered for prefix-cache stability — the
 /// static base stays byte-identical across turns/sessions so the upstream prefix stays warm.
@@ -190,7 +208,8 @@ pub fn build_system_prompt_bundle(
     let mut stable = String::from(base.trim_end());
     stable.push_str("\n\n<environment>\n");
     stable.push_str(&format!(
-        "cwd: {cwd}\nos: {os}\ndate: {date}\nmodel: {model}\n"
+        "cwd: {cwd}\nos: {os}\nshell: {}\ndate: {date}\nmodel: {model}\n",
+        shell_line(os)
     ));
     stable.push_str("</environment>\n");
 
@@ -232,9 +251,9 @@ pub fn build_system_prompt_bundle(
     PromptBundle { stable, dynamic }
 }
 
-/// The generic (role-less) sub-agent base, kept for tests and any caller with no role to scope by.
-/// Production dispatches go through [`build_role_scoped_subagent_base_prompt`] with the resolved
-/// role, which is the documented shape.
+/// The generic (tool-less) sub-agent base, kept for tests and any caller with no registry to scope
+/// by. Production dispatches go through [`build_role_scoped_subagent_base_prompt`] with the resolved
+/// registry's names, which is the documented shape.
 #[cfg(test)]
 pub fn build_subagent_base_prompt(
     cwd: &str,
@@ -244,65 +263,44 @@ pub fn build_subagent_base_prompt(
     include_project_context: bool,
     task: Option<&str>,
 ) -> String {
-    build_role_scoped_subagent_base_prompt(
-        "assistant",
-        cwd,
-        os,
-        date,
-        model,
-        include_project_context,
-        task,
-    )
+    build_role_scoped_subagent_base_prompt(&[], cwd, os, date, model, include_project_context, task)
 }
 
-/// Swap the top-level tool CATALOG for the capability family this role actually holds.
+/// State the child's OWN tool surface, generated from the registry it was actually given.
 ///
-/// The catalog earns its ~7.3 KB at the top level: it is written once into a prefix the provider
-/// cache amortizes across a whole session, and the interactive model really can reach every tool in
-/// it. Neither is true of a child. Every dispatch is a fresh uncached request, so the catalog is
-/// re-billed per spawn — and a `reviewer` holds a read-only registry, so most of what the catalog
-/// describes (edit/write/shell/checkpoint/delegation/browser) is advice it cannot act on. Describing
-/// tools a child does not have is worse than silent: it invites a call that can only come back as
-/// "unknown tool".
+/// This used to be a hand-written capability sentence per role ("read/glob/search, LSP navigation,
+/// shell, memory, web") sitting next to a strip of the top-level `# Tool catalog`. Both were wrong in
+/// the same way: the sentence drifted from `role_registry` (it never mentioned `process`, `notify`,
+/// `codebase_search`, or the scoped todo list a child really holds), and the catalog described
+/// edit/shell/delegation tools a `reviewer` cannot call at all. Describing a tool a child does not
+/// have is worse than silent — it invites a call that can only come back as `error: unknown tool`.
 ///
-/// The per-tool `ToolDef` descriptions still ride on the request, so selection guidance is not lost —
-/// only the duplicate prose. The `# Memory (your edge)` heading is the stable end marker; if either
-/// marker ever moves, the strip silently no-ops and the child simply keeps the old (larger) prompt,
-/// which is the safe direction to fail.
-fn append_role_tool_guidance(s: &mut String, role: &str) {
-    // The full top-level catalog is valuable once, in the interactive loop, but every child is a
-    // fresh uncached request. Remove it for the child path and replace it with the capability family
-    // the role can use; the ToolDef descriptions remain on the request itself.
-    if let (Some(start), Some(end)) = (s.find("# Tool catalog"), s.find("# Memory (your edge)")) {
-        if start < end {
-            s.replace_range(start..end, "");
-        }
+/// `tools` is the child registry's advertised names, so the map and the request's `tools` array are
+/// the same list. An empty registry yields nothing rather than an empty heading.
+pub(crate) fn append_tool_routing(s: &mut String, tools: &[String]) {
+    if let Some(map) = tool_routing::routing_map(tools) {
+        s.push_str("\n\n");
+        s.push_str(&map);
     }
-    s.push_str("\n\n# Available tools in this role\n");
-    match role {
-        "coder" => s.push_str("read/glob/search, LSP navigation and symbolic edits, file edits/writes/moves, shell, memory, web, skills\n"),
-        "tester" => s.push_str("read/glob/search, LSP navigation, shell, memory, web\n"),
-        "planner" | "reviewer" => s.push_str("read/glob/search, LSP navigation, memory, web\n"),
-        _ => s.push_str("read/glob/search, memory, web\n"),
-    }
-    s.push_str("Use only tools actually advertised in this request.\n");
 }
 
-/// The SLIM sub-agent base: static base (tiered, with the top-level catalog swapped for this role's
-/// capability family) + `<environment>` + `<skills>` — deliberately NO soul / persona / self /
-/// user_memory (a focused sub-agent pays no identity-costume tax: up to ~1.1K tokens saved per spawn,
-/// and personal facts never leak into task context) and NO `<agents>` / auto `<project_context>`
-/// (top-level-only concerns). `include_project_context` opts a role in explicitly — build/test
-/// conventions are exactly what coder/tester need.
+/// The SLIM sub-agent base: static base (tiered) + this child's OWN tool-routing map +
+/// `<environment>` + `<skills>` — deliberately NO soul / persona / self / user_memory (a focused
+/// sub-agent pays no identity-costume tax: up to ~1.1K tokens saved per spawn, and personal facts
+/// never leak into task context) and NO `<agents>` / auto `<project_context>` (top-level-only
+/// concerns). `include_project_context` opts a role in explicitly — build/test conventions are
+/// exactly what coder/tester need.
+///
+/// `tools` is the advertised names of the registry this child was given ([`builtin::role_registry`]),
+/// so the routing map can never describe a capability the child does not hold.
 ///
 /// `task` is the sub-agent's assignment, when the caller has it. A sub-agent is spawned for ONE
 /// stated job, and unlike the REPL it gets no cached prefix to amortize a broad index across turns —
 /// every spawn re-bills the whole prompt. So when the task is known, the index is narrowed to the
 /// procedures that actually cover it ([`crate::skills::gated_index`]); `None` keeps the full
-/// applicable list, which is the right default when there is nothing to narrow against. The same
-/// no-cache-to-amortize logic is why [`append_role_tool_guidance`] trims the catalog here.
+/// applicable list, which is the right default when there is nothing to narrow against.
 pub(crate) fn build_role_scoped_subagent_base_prompt(
-    role: &str,
+    tools: &[String],
     cwd: &str,
     os: &str,
     date: &str,
@@ -318,10 +316,11 @@ pub(crate) fn build_role_scoped_subagent_base_prompt(
         PromptTier::Full => system_base(),
     };
     let mut s = String::from(base.trim_end());
-    append_role_tool_guidance(&mut s, role);
+    append_tool_routing(&mut s, tools);
     s.push_str("\n<environment>\n");
     s.push_str(&format!(
-        "cwd: {cwd}\nos: {os}\ndate: {date}\nmodel: {model}\n"
+        "cwd: {cwd}\nos: {os}\nshell: {}\ndate: {date}\nmodel: {model}\n",
+        shell_line(os)
     ));
     s.push_str("</environment>\n");
     if let Some(idx) = crate::skills::gated_index(task) {
@@ -400,6 +399,21 @@ pub fn build_top_level_system_prompt_bundle(
     frozen_core: Option<&str>,
 ) -> PromptBundle {
     let mut bundle = build_system_prompt_bundle(cwd, os, date, model, frozen_core);
+    // The live tool surface, generated from the registry this session actually built (published by
+    // `builtin::default_registry_with_task`). It rides the DYNAMIC lane, not the stable one: the
+    // surface changes with `/lsp off`, `/tools`, `/apps`, and a `workflow_tool` flip, and lane 1 is
+    // the lane already rewritten at every user-turn boundary. It is byte-identical across turns
+    // whenever the surface is unchanged, so this costs no extra cache churn. TOP-LEVEL only — a
+    // sub-agent gets a map built from ITS OWN registry (see `build_role_scoped_subagent_base_prompt`),
+    // never the parent's. `None` before any registry exists (a prompt assembled at startup, or an
+    // offline `prompt-size` run) ⇒ no block at all, which is the safe direction to fail: better
+    // silent than naming tools that may not be registered.
+    if let Some(block) =
+        builtin::active_tool_surface().and_then(|names| tool_routing::routing_map(&names))
+    {
+        bundle.dynamic.push('\n');
+        bundle.dynamic.push_str(&block);
+    }
     // Project conventions (AGENTS.md / CLAUDE.md), top-level only: coder turns inherit the repo's
     // build/test commands and house rules. Kept in the stable lane so they don't thrash the cache
     // every persona/memory refresh.
@@ -9647,6 +9661,9 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // The published tool surface is process-global; pin it to "no registry built yet" so the
+        // top-level prompt is deterministic no matter which test ran before this one.
+        let prior_tools = builtin::swap_active_tools_for_test(None);
         let root = std::env::temp_dir().join(format!("aizen-tlp-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
@@ -9660,6 +9677,7 @@ mod tests {
             ("AIZEN_PROJECT_ROOT", root.join("proj")),
         ]);
         let out = f(&root);
+        builtin::swap_active_tools_for_test(prior_tools);
         drop(_env);
         let _ = std::fs::remove_dir_all(&root);
         out
@@ -9707,14 +9725,17 @@ mod tests {
     }
 
     #[test]
-    fn role_scoped_subagent_prompt_drops_top_level_catalog_tax() {
-        // The full-tier base carries the top-level `# Tool catalog`; a sub-agent prompt strips it and
-        // substitutes the role's own capability line. Measure against the RAW base (which still holds
-        // the catalog) — the generic `build_subagent_base_prompt` strips it too, so comparing the two
-        // stripped prompts would only show the role-line delta, not the reclaimed catalog.
-        let raw_base = system_base().trim_end().len();
+    fn role_scoped_subagent_prompt_routes_only_its_own_tools() {
+        // A child's routing map is generated from the registry the child was GIVEN. A reviewer holds
+        // a read-only scope, so nothing in its prompt may advertise editing, shell, or delegation —
+        // describing a tool a child does not have invites a call that can only come back as
+        // `error: unknown tool`.
+        let reviewer_tools: Vec<String> = ["memory_search", "file_read", "lsp_references"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let reviewer = build_role_scoped_subagent_base_prompt(
-            "reviewer",
+            &reviewer_tools,
             "/w",
             "linux",
             "2026-06-20",
@@ -9722,21 +9743,22 @@ mod tests {
             false,
             None,
         );
-        assert!(
-            system_base().contains("# Tool catalog"),
-            "full base carries the catalog"
-        );
-        assert!(
-            !reviewer.contains("# Tool catalog"),
-            "sub-agent prompt drops it"
-        );
-        assert!(reviewer.contains("# Available tools in this role"));
-        assert!(reviewer.contains("LSP navigation"));
-        assert!(
-            reviewer.len() + 5_000 < raw_base,
-            "role-scoped prompt should reclaim the large catalog: raw_base={raw_base} scoped={}",
-            reviewer.len()
-        );
+        assert!(reviewer.contains(tool_routing::ROUTING_HEADING));
+        for t in &reviewer_tools {
+            assert!(reviewer.contains(&format!("`{t}`")), "{t} must be routed");
+        }
+        for absent in ["file_edit", "shell_run", "task", "workflow", "checkpoint"] {
+            assert!(
+                !reviewer.contains(&format!("`{absent}`")),
+                "read-only child must not be told about {absent}"
+            );
+        }
+        // The static base no longer carries a hand-written catalog at all — that was the drift
+        // source this replaced.
+        assert!(!system_base().contains("# Tool catalog"));
+        // A registry-less caller gets no map rather than an empty or stale one.
+        let none = build_subagent_base_prompt("/w", "linux", "2026-06-20", "m", false, None);
+        assert!(!none.contains(tool_routing::ROUTING_HEADING));
     }
     #[test]
     fn top_level_prompt_adds_agents_block_and_keeps_base_prefix() {
@@ -9772,3 +9794,7 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/tool_surface.rs"]
+mod tool_surface_tests;

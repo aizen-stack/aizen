@@ -345,6 +345,14 @@ aizen agent --yes "fix the failing test in src/parse.rs"   # pre-approve file/sh
 aizen agent --max-iters 40 "..."                            # raise the step cap
 ```
 Behavior worth knowing:
+- **How tools reach the model** — the session's tool registry is the single source of truth. Its
+  definitions (name, description, JSON Schema) are sent through the provider's **native** tool field:
+  OpenAI-compatible gateways and Anthropic get `tools[{type:"function",function:{…}}]`, the ChatGPT
+  Codex endpoint gets the same tools in the Responses dialect's flat shape. The system prompt carries
+  only a compact **`# Tool routing`** map — capability → the exact tool names enabled *right now* —
+  generated from that same registry, never the schemas. So `/tools`, `/lsp off`, `/apps`, a missing
+  Telegram token or a build without `--features browser` all remove a tool from the prompt and the
+  request together, and the model is never told about a tool it cannot call.
 - **Parallel reads** — when a turn only reads (file_read/glob/memory), the calls run
   concurrently; any turn that edits or runs shell stays serial (and approval-gated).
 - **Approval** — destructive tools (`file_edit`, `shell_run`) prompt before running. In the sticky

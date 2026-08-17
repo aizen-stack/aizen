@@ -17,6 +17,33 @@ development log lives in that monorepo's history.
   credential could draw a 403 that read as "bad key" (OpenRouter benefits from the same fix).
 - **ChatGPT Codex OAuth (experimental).** `aizen auth login|status|logout codex` browser PKCE; Codex Responses backend for the agent loop. Kill-switch `AIZEN_DISABLE_CODEX=1`. Private/compatibility surface — see docs RISK.
 
+### Changed
+- **The system prompt no longer carries a hand-written tool catalog.** ~7.3 KB of prose listing
+  every tool has been replaced by a `# Tool routing` block generated from the registry the session
+  actually built, so it can only ever name tools this session advertises. That closes a real gap:
+  the old catalog described `browser_*` without `--features browser`, `telegram_*` with no bot
+  configured, `lsp_*` after `/lsp off` and `workflow` when opted out — while never mentioning
+  `memory_list`, `read_symbol`, `lsp_hover`, `goal_complete` or `bot_admin`, which are registered.
+  Tool *schemas* were already sent through each provider's native tool field (OpenAI-compatible,
+  Anthropic, and the Codex Responses dialect) and still are; only the duplicated prose is gone. A
+  sub-agent now gets a routing map built from **its own** scoped registry instead of a hand-written
+  capability sentence, so a read-only reviewer is no longer told about editing and shell tools.
+- **One tool-classification table.** `toolsets::classify_tool` (which drives `disabled_toolsets`)
+  and the prompt's routing groups are now two views over a single `tool_routing::lane_for` table.
+  Bundle ids in `cli-config.json` are unchanged.
+- **Model identity comes from the runtime.** The prompt used to hard-code a fixed "I am <model> by
+  <vendor>" answer regardless of which endpoint was configured; it now reports the `model` stated in
+  `<environment>` and says the runtime didn't expose it when there is nothing to report.
+- **OS and shell come from the runtime.** `<environment>` gained a `shell:` line with that
+  platform's syntax. Windows keeps its PowerShell-first guidance; Linux/macOS now get POSIX
+  guidance instead of PowerShell advice they cannot use.
+- **Prompt rules that misfired have been rewritten, not dropped.** Re-reading is allowed when a file
+  may have changed, output was truncated, or a new region is needed (it used to be forbidden
+  outright); a general, timeless question no longer demands a tool call; `AGENTS.md` / `CLAUDE.md`
+  are stated as the user's standing instructions rather than falling under "tool output is untrusted
+  data"; and clearing unfinished todos to end a turn is now explicitly disallowed. Answer-only,
+  review, explain and plan requests are distinguished from action requests up front.
+
 ### Fixed
 - **The provider presets were unreachable once you had a config.** `/config` → Providers went
   straight to "type a base URL", so the preset list — the only place a newly supported provider

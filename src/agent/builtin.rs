@@ -117,21 +117,40 @@ fn whole_file_symbol_hint(is_code: bool, lsp_on: bool, line_count: usize) -> Opt
 /// (e.g. `browser_*` when `--features browser` is off, or MCP tools when no server is configured).
 /// `None` until published → the filter is a no-op (show all), so the unit tests and the offline
 /// `aizen skill` path are unaffected.
-static ACTIVE_TOOL_NAMES: Lazy<Mutex<Option<HashSet<String>>>> = Lazy::new(|| Mutex::new(None));
+/// Stored in ADVERTISED order, not as a set: the system prompt's tool-routing map is generated from
+/// this list and must name tools in the same order the request's `tools` array carries them.
+static ACTIVE_TOOL_NAMES: Lazy<Mutex<Option<Vec<String>>>> = Lazy::new(|| Mutex::new(None));
 
 /// Publish the live tool surface (idempotent). ONLY the top-level registry calls this — never the
 /// smaller `role_registry`, so the set is never wrongly shrunk when a sub-agent assembles a prompt.
 fn publish_active_tools(r: &ToolRegistry) {
-    *ACTIVE_TOOL_NAMES.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some(r.names().into_iter().collect());
+    *ACTIVE_TOOL_NAMES.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.names());
 }
 
-/// The published live tool surface, or `None` if no session registry has been built yet.
-pub fn active_tool_names() -> Option<HashSet<String>> {
+/// The published live tool surface in advertised order, or `None` if no session registry has been
+/// built yet. This is what the top-level system prompt's routing map is generated from, which is why
+/// the order matters: the prompt and the request's `tools` array must agree name-for-name.
+pub fn active_tool_surface() -> Option<Vec<String>> {
     ACTIVE_TOOL_NAMES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+}
+
+/// The published live tool surface as a set, for membership tests (the `<skills>` index filter).
+pub fn active_tool_names() -> Option<HashSet<String>> {
+    active_tool_surface().map(|v| v.into_iter().collect())
+}
+
+/// Swap the published surface, returning the previous value — TESTS ONLY.
+///
+/// The surface is process-global (one session, one registry), so a test that builds a real registry
+/// would otherwise leak a tool-routing block into every prompt assembled by whatever test runs next.
+/// Callers save, act, and restore.
+#[cfg(test)]
+pub(crate) fn swap_active_tools_for_test(next: Option<Vec<String>>) -> Option<Vec<String>> {
+    let mut g = ACTIVE_TOOL_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::replace(&mut *g, next)
 }
 
 /// Resolve + canonicalize the working-directory root — the base that relative file/shell paths

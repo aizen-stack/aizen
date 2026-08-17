@@ -230,9 +230,10 @@ fn run_prompt_size(model: Option<String>, show_tools: bool, as_json: bool) -> Re
         .or_else(|| cli_config::load().model)
         .unwrap_or_else(|| "gpt-4o".to_string());
 
-    // Same lanes a turn would send: static base + <environment> (stable) and the memory/persona
-    // blocks (dynamic). LSP is armed first so the registry advertises the symbolic-edit tools.
-    let bundle = active_system_prompt_bundle(&model);
+    // Same lanes a turn would send: static base + <environment> (stable) and the memory/persona/
+    // tool-routing blocks (dynamic). LSP is armed first so the registry advertises the symbolic-edit
+    // tools; the registry is built BEFORE the lanes because it publishes the tool surface the routing
+    // map is generated from — measuring the lanes first would under-report the real per-turn cost.
     arm_lsp_session();
     let registry = agent::builtin::default_registry_with_task(
         reqwest::Client::new(),
@@ -243,6 +244,7 @@ fn run_prompt_size(model: Option<String>, show_tools: bool, as_json: bool) -> Re
         resolve_ctx_window(&model).0,
         None,
     )?;
+    let bundle = active_system_prompt_bundle(&model);
     let defs = registry.defs();
     let tools_json = serde_json::to_string(&defs)?;
 
@@ -874,13 +876,9 @@ async fn run_agent_capture(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let system = agent::build_top_level_system_prompt(
-        &cwd,
-        std::env::consts::OS,
-        &date,
-        model,
-        Some(&frozen),
-    );
+    // Registry BEFORE prompt: building it publishes this session's live tool surface, which is what
+    // the prompt's tool-routing map is generated from. Assembling the prompt first would emit a
+    // routing map for whatever surface a previous run left published — or none at all on the first.
     let registry = agent::builtin::default_registry_with_task(
         http.clone(),
         base_url.to_string(),
@@ -890,6 +888,13 @@ async fn run_agent_capture(
         resolve_ctx_window(model).0,
         None, // cwd IS the project on the CLI path
     )?;
+    let system = agent::build_top_level_system_prompt(
+        &cwd,
+        std::env::consts::OS,
+        &date,
+        model,
+        Some(&frozen),
+    );
     let cfg = AgentConfig {
         approval_mode,
         quiet: true,
@@ -3150,22 +3155,27 @@ async fn run_menu_sticky() -> Result<()> {
                             .to_string(),
                     );
                 }
+                let persona_before = cli_config::load().persona;
+                // Arm LSP BEFORE building the registry — tools only register while enabled.
+                arm_lsp_session();
+                // Registry BEFORE the user message is seated: building it publishes this turn's live
+                // tool surface, and `seat_user_message` rewrites the dynamic prompt lane, which is
+                // where the routing map generated from that surface lives. Seating first would ship a
+                // map for the PREVIOUS turn's surface (and none at all on the first turn after
+                // `/lsp on`, `/apps` or a `/tools` change). Nothing here reads `history`, so the move
+                // is behaviour-neutral for everything else; on failure nothing has been pushed yet.
+                let registry = match build_turn_registry(&http, &ep) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tui::emit_line(&format!("{} {e}", theme::err("error:")));
+                        continue;
+                    }
+                };
                 // Fold memory recall + codebase RAG into the SENT content (not the dynamic system
                 // lane) so index 1 stays byte-stable and the transcript-tail prefix cache holds.
                 // `line` itself is unchanged → checkpoint / display / persisted history keep the
                 // clean user text.
                 seat_user_message(&line, images, &mut history, &model);
-                let persona_before = cli_config::load().persona;
-                // Arm LSP BEFORE building the registry — tools only register while enabled.
-                arm_lsp_session();
-                let registry = match build_turn_registry(&http, &ep) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tui::emit_line(&format!("{} {e}", theme::err("error:")));
-                        history.pop();
-                        continue;
-                    }
-                };
                 let cfg = turn_agent_config(turn_cancel.clone(), &model, true);
 
                 // Esc pressed DURING prep already cancelled this token — honour it instead of firing
@@ -3471,22 +3481,24 @@ async fn run_menu_plain() -> Result<()> {
         let eff = resolve_turn_effort(effort_src);
         cli_config::set_effort_override(eff.clone());
         println!("{}", effort_turn_line(eff.as_deref()));
-        // Fold memory recall + codebase-index retrieval into the SENT content (not the cached
-        // system lane) — see `fold_context_into_query`. `line` stays the original for persisted
-        // history / display.
-        seat_user_message(&line, images, &mut history, &model);
         // Snapshot the active persona so we can detect an in-turn switch (the `persona_create` tool)
         // and resync the system prompt at the turn boundary — prefix-cache safe, takes effect next msg.
         let persona_before = cli_config::load().persona;
         arm_lsp_session();
+        // Registry BEFORE the user message is seated — it publishes the live tool surface that
+        // `seat_user_message`'s dynamic-lane rewrite turns into the routing map. Same ordering as the
+        // retained REPL above, for the same reason.
         let registry = match build_turn_registry(&http, &ep) {
             Ok(r) => r,
             Err(e) => {
                 tui::note_line(&format!("{} {e}", style("error:").red()));
-                history.pop();
                 continue;
             }
         };
+        // Fold memory recall + codebase-index retrieval into the SENT content (not the cached
+        // system lane) — see `fold_context_into_query`. `line` stays the original for persisted
+        // history / display.
+        seat_user_message(&line, images, &mut history, &model);
         // Unified ask/smart/yolo approval, with AIZEN_YES forcing yolo.
         let turn_cancel = crate::core::cancel::TurnCancel::new();
         let cfg = turn_agent_config(turn_cancel, &model, false);
@@ -5473,13 +5485,6 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let system = agent::build_top_level_system_prompt(
-        &cwd,
-        std::env::consts::OS,
-        &date,
-        &model,
-        Some(&frozen),
-    );
 
     // Registry includes the `task` sub-agent tool (depth 0); a spawned sub-agent uses a
     // role-scoped registry WITHOUT `task` (no recursion).
@@ -5489,6 +5494,7 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         ApprovalMode::Ask
     };
     arm_lsp_session();
+    // Built BEFORE the prompt: it publishes the live tool surface the routing map is generated from.
     let registry = agent::builtin::default_registry_with_task(
         http.clone(),
         base_url.clone(),
@@ -5498,6 +5504,13 @@ async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         resolve_ctx_window(&model).0,
         None, // cwd IS the project on the CLI path
     )?;
+    let system = agent::build_top_level_system_prompt(
+        &cwd,
+        std::env::consts::OS,
+        &date,
+        &model,
+        Some(&frozen),
+    );
     let max = args.max_iters.unwrap_or(25).max(1);
     let cfg = AgentConfig {
         max_iters: max,

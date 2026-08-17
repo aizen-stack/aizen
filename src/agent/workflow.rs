@@ -673,26 +673,27 @@ async fn run_one_task(
                 .or(def.model.as_deref())
                 .unwrap_or(model);
             let ep = crate::core::cli_config::endpoint_for_model(m, &caller);
-            let system = build_agent_subagent_prompt(def, root, &ep.model, date, None);
-            (def.slug(), ep, agent_registry(def, root), system)
+            // Registry FIRST: the prompt's tool-routing map is generated from the very names whose
+            // schemas ride on this child's request, so the two can never disagree.
+            let registry = agent_registry(def, root);
+            let system =
+                build_agent_subagent_prompt(def, &registry.names(), root, &ep.model, date, None);
+            (def.slug(), ep, registry, system)
         }
         None => {
             let m = task.model.as_deref().unwrap_or(model);
             let ep = crate::core::cli_config::endpoint_for_model(m, &caller);
+            let registry = role_registry(&task.role, root);
             let system = build_subagent_prompt(
                 &task.role,
+                &registry.names(),
                 root,
                 &ep.model,
                 date,
                 None,
                 Some(task.prompt.as_str()),
             );
-            (
-                task.role.clone(),
-                ep,
-                role_registry(&task.role, root),
-                system,
-            )
+            (task.role.clone(), ep, registry, system)
         }
     };
 
