@@ -29,9 +29,16 @@ commercial use is allowed.
 - `Cargo.toml` uses `license = "Apache-2.0"` (the SPDX id), **not** `license-file`. Using
   `license-file` makes crates.io and GitHub report an unrecognized license.
 - `NOTICE` must ship with any redistribution (Apache §4d). Keep it in sync when attribution changes.
-- **There is no CLA.** Contributions come in under **Apache-2.0 §5** (inbound=outbound) plus a DCO
-  sign-off checked by `.github/workflows/dco.yml`. `CLA.md` and `.github/workflows/cla.yml` were
-  deleted on purpose — **do not restore them.**
+- **There IS a CLA, as of 2026-08-17.** `CLA.md` (v2.0) is enforced by
+  `.github/workflows/cla.yml`; contributors agree once by commenting the sign sentence on their PR.
+  **`.github/workflows/dco.yml` was deleted and the DCO sign-off is no longer asked for** — don't tell
+  contributors to `git commit -s`, and don't restore that workflow.
+  - History, so nobody "fixes" this back and forth: a CLA v1.0 existed under PolyForm, was deleted at
+    the Apache relicense (`586b7e9`) in favour of Apache-2.0 §5 + DCO, and was reinstated as v2.0 by
+    maintainer decision. v2.0 differs from v1.0 in naming Apache-2.0 as the public license.
+  - The point of §3 is the **commercial relicensing grant** — it is what keeps a paid edition
+    possible. It is a broader ask than Apache-2.0 §5, so user-facing text must say so plainly rather
+    than describing the CLA as a formality.
 - Trademark: Apache §6 grants no rights to the "Aizen" name or logo. Forks may use the code, not the
   brand.
 - Releases **up to and including v0.5.5** went out under PolyForm Noncommercial. That is history and
@@ -65,7 +72,7 @@ public  → https://github.com/dawnofcd/aizen.git         (PUBLIC — redirects 
 | `src/features/update.rs` | self-update; `DEFAULT_REPO` lives here |
 | `src/sandbox/` | OS sandbox under approval/cmd_guard: policy · runner · audit · per-platform backends (Landlock/seccomp · Job Object · Seatbelt). Every model/repo-influenced spawn goes through `runner::prepare_*` — never add a bare `Command::new` for those. `docs/SANDBOX.md` is the contract; keep its capability matrix honest |
 | `install.ps1` / `install.sh` | one-line installers; repo slug is hardcoded in both |
-| `.github/workflows/dco.yml` | DCO sign-off check (replaced the CLA bot) |
+| `CLA.md` + `.github/workflows/cla.yml` | the CLA and its bot (signatures land in the `cla-signatures` branch); replaced the DCO check |
 | `dist/` | assets for the public download channel |
 | `docs/` | design + audit notes |
 | `bench-fixtures/` | fixtures for `aizen bench` |

@@ -5,8 +5,9 @@ The project instructions for coding agents live in **[CLAUDE.md](CLAUDE.md)** �
 It is the single source of truth for:
 
 - the hard constraints (pure-Rust single static binary, rustls-only, startup/size budget),
-- the **license: Apache-2.0** since 2026-08-03 — *not* PolyForm Noncommercial, and **no CLA**
-  (contributions come in under Apache §5 + a DCO sign-off),
+- the **license: Apache-2.0** since 2026-08-03 — *not* PolyForm Noncommercial — and the **CLA**
+  every contributor agrees to (`CLA.md`, enforced by `.github/workflows/cla.yml`; the DCO sign-off it
+  replaced is gone),
 - the **two git remotes** (`origin` = private `dawnofcd/Aizen_agent`, `public` = `aizen-stack/aizen`)
   and which slug belongs in user-facing URLs,
 - build/verify commands and the known distribution gaps.

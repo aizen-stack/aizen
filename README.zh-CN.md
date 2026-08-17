@@ -94,8 +94,8 @@ aizen            # 直接进入 REPL,开始输入
 
 ## 参与贡献
 
-欢迎提交 Issue 和 PR。本项目**没有 CLA**——贡献按 Apache-2.0 §5 授权(inbound = outbound),
-我们只要求你对提交做 DCO 签名(`git commit -s`)。详见
+欢迎提交 Issue 和 PR。贡献者需要一次性同意 [CLA](CLA.md)——项目本身仍是 Apache-2.0,
+但 §3 同时授予维护者以商业条款许可你的贡献的权利。请在签署前阅读。详见
 [CONTRIBUTING.md](CONTRIBUTING.md)(英文)。
 
 ## 许可证

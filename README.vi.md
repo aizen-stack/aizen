@@ -96,9 +96,9 @@ tự host, MCP, công cụ browser, và mô hình an toàn, nói rõ từng chi 
 
 ## Đóng góp
 
-Issue và PR đều được chào đón. Dự án **không có CLA** — đóng góp vào theo Apache-2.0 §5, chúng tôi
-chỉ đề nghị bạn sign-off commit của mình (`git commit -s`). Xem
-[CONTRIBUTING.md](CONTRIBUTING.md) (tiếng Anh).
+Issue và PR đều được chào đón. Người đóng góp cần đồng ý [CLA](CLA.md) một lần — dự án vẫn là
+Apache-2.0, và §3 đồng thời cho maintainer quyền license đóng góp theo điều khoản thương mại. Hãy đọc
+trước khi ký. Xem [CONTRIBUTING.md](CONTRIBUTING.md) (tiếng Anh).
 
 ## Giấy phép
 

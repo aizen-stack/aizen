@@ -115,8 +115,9 @@ browser tools, and the safety model in detail.
 
 ## Contributing
 
-Issues and PRs are welcome. There is **no CLA** — contributions come in under Apache-2.0 §5, and we
-only ask you to sign off your commits (`git commit -s`). See [CONTRIBUTING.md](CONTRIBUTING.md).
+Issues and PRs are welcome. Contributors agree to the [CLA](CLA.md) once — the project stays
+Apache-2.0, and §3 also grants the maintainer the right to license contributions commercially. Read it
+before you sign. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
