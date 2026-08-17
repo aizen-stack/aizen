@@ -32,3 +32,7 @@ main_diff*.txt
 .audit-out/
 # local task-runner config for this checkout (machine-specific paths, not part of the build)
 .1devtool/
+
+# coding-agent scratch: per-agent git worktrees (hundreds of MB) and this checkout's local tool
+# settings. Machine-specific and regenerated on demand — an accidental `git add -A` must not sweep it.
+.claude/
