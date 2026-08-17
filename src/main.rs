@@ -13194,7 +13194,7 @@ fn pick_model_from(
         .map(|m| {
             // Free-tier ids get a tag so someone on a free gateway doesn't pick a paid model by
             // accident — the failure would only surface on the first real turn.
-            let free = if client::is_free_model_id(&m.id) {
+            let free = if m.is_free || client::is_free_model_id(&m.id) {
                 "  · free"
             } else {
                 ""
@@ -14697,7 +14697,7 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
         } else {
             ""
         };
-        let free = if client::is_free_model_id(&m.id) {
+        let free = if m.is_free || client::is_free_model_id(&m.id) {
             "  · free"
         } else {
             ""
