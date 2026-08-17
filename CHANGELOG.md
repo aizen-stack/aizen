@@ -17,6 +17,25 @@ development log lives in that monorepo's history.
   credential could draw a 403 that read as "bad key" (OpenRouter benefits from the same fix).
 - **ChatGPT Codex OAuth (experimental).** `aizen auth login|status|logout codex` browser PKCE; Codex Responses backend for the agent loop. Kill-switch `AIZEN_DISABLE_CODEX=1`. Private/compatibility surface — see docs RISK.
 
+### Fixed
+- **The provider presets were unreachable once you had a config.** `/config` → Providers went
+  straight to "type a base URL", so the preset list — the only place a newly supported provider
+  becomes discoverable — was shown by first-run setup and nowhere else. Anyone who installed before
+  OpenCode and Codex landed could not see them at all. Both the add and the re-point paths now run
+  the same connection step first-run setup runs, presets included, with the preset supplying the
+  default profile name.
+- **The `· free` tag only rendered in one of three model pickers.** The two an existing user
+  actually reaches (Main model & context, and a provider's default model) showed bare ids, so a
+  free-tier credential could be pointed at a paid model with no warning until the first turn 403'd.
+  All pickers now render through one row builder.
+- **Picking the Codex preset asked for an API key it doesn't have.** Codex authenticates out of
+  band, and has no `GET /models` to probe — so the preset failed its reachability check and then
+  demanded a key. It now skips the probe, offers the browser sign-in in place of the key prompt,
+  lists models from the shipped catalog, and `aizen config show` reports the sign-in state instead
+  of a meaningless `key codex-oauth ✓`.
+- Restored the `## Configure` heading in `docs/REFERENCE.md`, which a merge had truncated to
+  `## Config` plus a stray `ure` line.
+
 ## [0.6.4] — 2026-08-11
 
 The time machine grows a brain — checkpoints classified by value instead of hoarded uniformly, a

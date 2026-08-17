@@ -212,10 +212,9 @@ It needs a CNI that enforces NetworkPolicy (Calico, Cilium, Antrea); on a cluste
 object is accepted and enforces nothing. The manifest also sets `automountServiceAccountToken: false`,
 since a shell that can read the projected token can talk to the API server as the pod.
 
-## Config
+## Configure
 
-**ChatGPT Codex (experimental)** uses ChatGPT/Codex *consumer* OAuth (not the OpenAI Platform API key). Run `aizen auth login codex`, then pick the preset (base `https://chatgpt.com/backend-api/codex`) or `aizen config set --base-url https://chatgpt.com/backend-api/codex --api-key codex-oauth --model gpt-5.4-mini`. Tokens live in `~/.aizen/provider-tokens/codex.json`. Kill-switch: `AIZEN_DISABLE_CODEX=1`. **Risk:** private backend APIs may break or conflict with vendor terms; prefer Platform API keys / OpenRouter for supported production use. Logout: `aizen auth logout codex`.
-ure
+**ChatGPT Codex (experimental)** uses ChatGPT/Codex *consumer* OAuth (not the OpenAI Platform API key). Pick **ChatGPT Codex (experimental)** in `aizen config` → Providers & connection: it skips the API-key prompt and offers the browser sign-in in place of it, so no separate command is needed. The manual equivalents still work — `aizen auth login codex`, or `aizen config set --base-url https://chatgpt.com/backend-api/codex --api-key codex-oauth --model gpt-5.4-mini`. Model ids come from a shipped catalog, since the Codex backend has no `GET /models`. Tokens live in `~/.aizen/provider-tokens/codex.json` and `aizen config show` reports whether you are still signed in. Kill-switch: `AIZEN_DISABLE_CODEX=1`. **Risk:** private backend APIs may break or conflict with vendor terms; prefer Platform API keys / OpenRouter for supported production use. Logout: `aizen auth logout codex`.
 
 All network commands read three settings, as flags or env vars:
 
@@ -263,6 +262,11 @@ Inside the REPL, `/provider` is the fast one-pick switcher. `/provider add` open
 `/provider manage` opens Use/Edit/Rename/Delete, and `/provider backup` switches directly. The next turn and health probe use the selected URL, key, and model. This is manual failover, not an
 automatic retry/failover chain. `AIZEN_BASE_URL`, `AIZEN_API_KEY`, and `AIZEN_MODEL` still override the
 saved selection; Aizen prints a note when those environment variables mask a switch.
+
+Adding or re-pointing a provider starts from the preset list (OpenAI, ChatGPT Codex, Anthropic,
+OpenRouter, Groq, DeepSeek, OpenCode, Ollama, or **Custom gateway** to type your own URL) — the same
+list first-run setup shows, so a provider added in a later release is reachable without reinstalling.
+The preset also supplies the default profile name, and its URL already carries the version suffix.
 
 Changing an existing provider's endpoint asks for a new key instead of offering the previous
 endpoint's credential. Cancelling any wizard step leaves the complete saved profile unchanged.

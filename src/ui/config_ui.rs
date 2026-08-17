@@ -623,6 +623,37 @@ fn print_config(cfg: &cli_config::CliConfig) {
             None => format!("{}  {}", unset(), theme::warn("required")),
         },
     );
+    // Codex authenticates out of band, so the `key` row above says nothing useful about it — a Codex
+    // user would read "key: codex-oauth ✓" whether or not they are actually signed in. Shown when a
+    // token exists too, so `config show` can answer "am I still logged in?" without a second command.
+    let codex_here = cfg
+        .base_url
+        .as_deref()
+        .is_some_and(crate::llm::oauth_codex::is_codex_base_url)
+        || cfg
+            .providers
+            .iter()
+            .flatten()
+            .any(|p| crate::llm::oauth_codex::is_codex_base_url(&p.base_url));
+    if codex_here || crate::llm::oauth_codex::has_token() {
+        let detail = crate::llm::oauth_codex::status_lines()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "codex: not logged in".to_string());
+        let detail = detail.trim_start_matches("codex: ").to_string();
+        row(
+            "codex",
+            if crate::llm::oauth_codex::has_token() {
+                format!("{}  {}", theme::ok("✓"), theme::faint(detail))
+            } else {
+                format!(
+                    "{}  {}",
+                    theme::warn("!"),
+                    theme::faint(format!("{detail} · aizen auth login codex"))
+                )
+            },
+        );
+    }
     row(
         "provider",
         cfg.active_provider
@@ -990,6 +1021,25 @@ pub(crate) fn model_default_index(models: &[String], current: Option<&str>) -> u
 
 const CUSTOM_MODEL_ITEM: &str = "‹ type a custom id ›";
 
+/// One row of a model picker: the id, a free-tier tag, and the reported context window.
+///
+/// Every picker renders through here so the tag can't be present in one list and missing from the
+/// next — which is exactly what happened when only the first-run wizard's picker knew about it, and
+/// the two pickers an existing user actually reaches showed bare ids. On a shared gateway that
+/// difference is not cosmetic: picking a paid id with a free-tier credential fails on the first real
+/// turn, long after the choice was made.
+pub(crate) fn model_row(m: &client::ModelInfo) -> String {
+    let free = if m.is_free || client::is_free_model_id(&m.id) {
+        "  · free"
+    } else {
+        ""
+    };
+    match m.context_length {
+        Some(n) => format!("{}{free}  ({} ctx)", m.id, n),
+        None => format!("{}{free}", m.id),
+    }
+}
+
 /// `aizen config` / `/config` / menu → Setup. A fresh install (no endpoint yet) gets the guided
 /// linear setup once so nothing required is missed; an already-configured user gets the HUB menu —
 /// jump to the one section you want, edit just it, it saves on the spot, you're back at the menu. No
@@ -1019,6 +1069,10 @@ fn yn(theme: &ColorfulTheme, prompt: &str, default: bool) -> Result<bool> {
 /// of a preset: the `/v1` that people forget is baked in and can't be forgotten.
 struct ProviderPreset {
     label: &'static str,
+    /// Default name for a saved provider profile picked from this row — one word, no spaces, so it
+    /// satisfies `ProviderProfile::normalized` as typed. Without it every preset user has to invent
+    /// a name for a provider the project already knows the name of.
+    slug: &'static str,
     base: &'static str,
     /// Where to get a key, shown right before we ask for one.
     keys_url: &'static str,
@@ -1043,53 +1097,76 @@ struct ProviderPreset {
 const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         label: "OpenAI",
+        slug: "openai",
         base: "https://api.openai.com/v1",
         keys_url: "https://platform.openai.com/api-keys",
         sample_model: "gpt-4o",
     },
     ProviderPreset {
         label: "ChatGPT Codex (experimental)",
+        slug: "codex",
         base: crate::llm::oauth_codex::CODEX_BASE_URL,
-        keys_url: "run: aizen auth login codex  (experimental ChatGPT OAuth — see docs RISK)",
+        keys_url: "signs in through your browser — no API key",
         sample_model: "gpt-5.4-mini",
     },
     ProviderPreset {
         label: "Anthropic (Claude)",
+        slug: "anthropic",
         base: "https://api.anthropic.com/v1",
         keys_url: "https://console.anthropic.com/settings/keys",
         sample_model: "claude-opus-5",
     },
     ProviderPreset {
         label: "OpenRouter",
+        slug: "openrouter",
         base: "https://openrouter.ai/api/v1",
         keys_url: "https://openrouter.ai/keys",
         sample_model: "anthropic/claude-opus-5",
     },
     ProviderPreset {
         label: "Groq",
+        slug: "groq",
         base: "https://api.groq.com/openai/v1",
         keys_url: "https://console.groq.com/keys",
         sample_model: "llama-3.3-70b-versatile",
     },
     ProviderPreset {
         label: "DeepSeek",
+        slug: "deepseek",
         base: "https://api.deepseek.com/v1",
         keys_url: "https://platform.deepseek.com/api_keys",
         sample_model: "deepseek-chat",
     },
     ProviderPreset {
         label: "OpenCode (free)",
+        slug: "opencode",
         base: "https://opencode.ai/zen/v1",
         keys_url: "no key needed — free tier: enter the shared token `public`",
         sample_model: "deepseek-v4-flash-free",
     },
     ProviderPreset {
         label: "Ollama (local)",
+        slug: "ollama",
         base: "http://localhost:11434/v1",
         keys_url: "no key needed — enter anything (e.g. `ollama`)",
         sample_model: "llama3.2",
     },
 ];
+
+/// Codex has no `GET /models` to discover — the backend is a Responses-API surface, not an
+/// OpenAI-compatible one — so the picker is fed from the curated catalog instead of the wire. Free
+/// is false because these ids cost whatever the signed-in ChatGPT plan costs, which is not "free"
+/// in the sense the tag means (a gateway's no-charge tier).
+fn codex_model_infos() -> Vec<client::ModelInfo> {
+    crate::llm::codex_models::CODEX_MODELS
+        .iter()
+        .map(|(id, _)| client::ModelInfo {
+            id: (*id).to_string(),
+            context_length: None,
+            is_free: false,
+        })
+        .collect()
+}
 
 /// Await `fut` while a spinner animates on the line, then clear it. The verdict is the caller's to
 /// print — this only owns the "something is happening" gap.
@@ -1362,15 +1439,20 @@ fn prompt_provider(
             .unwrap_or("self-hosted / proxy / any OpenAI-compatible — type a URL")
     ));
     // Land on the preset the user is already using, so re-entering the section doesn't silently
-    // propose a different provider.
-    let default = current_base
-        .and_then(|b| {
+    // propose a different provider. An endpoint that matches nothing is the custom row.
+    let default = match current_base {
+        Some(b) => {
             let b = b.trim_end_matches('/');
             PROVIDER_PRESETS
                 .iter()
                 .position(|p| p.base.trim_end_matches('/') == b)
-        })
-        .unwrap_or(items.len() - 1);
+                .unwrap_or(items.len() - 1)
+        }
+        // Nothing configured yet (a fresh install, or "＋ Add provider"): start on the first preset
+        // rather than on "type a URL yourself". The presets are the reason this screen exists, and
+        // defaulting past them is how they stayed invisible.
+        None => 0,
+    };
     let pick = Select::with_theme(theme)
         .with_prompt("Provider")
         .items(&items)
@@ -1477,110 +1559,183 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
     Ok(())
 }
 
-/// Section editor: provider → base URL → API key, each step verified against the live endpoint
-/// before it is accepted. Nothing is written to `cfg` until a step actually passes, so a failed
-/// attempt leaves the previous working connection intact.
-#[allow(dead_code)]
-async fn config_edit_connection(cfg: &mut cli_config::CliConfig) -> Result<()> {
-    let theme = ui_theme();
-    let http = http_client()?;
-    let previous_base = cfg.base_url.clone();
+/// A resolved connection: where to talk, what credential to use, and whatever the endpoint already
+/// told us about its models.
+struct Connection {
+    base: String,
+    key: String,
+    /// Models the reachability/key check already fetched — empty when the endpoint listed none, so
+    /// callers know whether they still owe the user a manual model prompt.
+    models: Vec<client::ModelInfo>,
+    /// The preset this came from, when it came from one. Carries `sample_model` and `slug`.
+    preset: Option<&'static ProviderPreset>,
+}
 
-    let preset = prompt_provider(&theme, cfg.base_url.as_deref())?;
-    // A preset's URL is already correct, so it only needs the reachability check — not the
-    // type-it-again loop. A custom endpoint goes through the full prompt.
-    let (base, mut infos) = match preset {
-        Some(p) => {
-            let check = spin_while(
-                &format!("checking {}", p.base),
-                client::check_endpoint(&http, p.base, None),
-            )
-            .await;
-            match check {
-                client::EndpointCheck::Ok(infos) => {
-                    line_ok(&format!("reachable — {} models", infos.len()));
-                    (p.base.to_string(), infos)
-                }
-                client::EndpointCheck::Auth(_) => {
-                    line_ok("reachable (needs a key — next step)");
-                    (p.base.to_string(), Vec::new())
-                }
-                // Even a preset can be unreachable (Ollama not running, network down, provider
-                // outage). Say so and let them keep it or type something else, rather than pretending.
-                other => {
-                    let what = match &other {
-                        client::EndpointCheck::NotFound(d) => format!("no model list there ({d})"),
-                        client::EndpointCheck::Unreachable(d) => {
-                            format!("could not reach it ({d})")
-                        }
-                        client::EndpointCheck::Http(c, d) => format!("HTTP {c} ({d})"),
-                        _ => unreachable!(),
-                    };
-                    line_warn(&format!("{} — {what}", p.label));
-                    if yn(&theme, "Use this URL anyway?", true)? {
-                        (p.base.to_string(), Vec::new())
-                    } else {
-                        match prompt_validated_base_url(&theme, &http, Some(p.base), true).await? {
-                            Some(v) => v,
-                            None => return Ok(()),
-                        }
-                    }
-                }
-            }
+/// The connection step: pick a provider, prove the endpoint answers, get a credential for it.
+///
+/// Both first-run setup and the provider editor come through here, and that is the whole point. The
+/// preset list is the ONLY place a newly supported provider becomes discoverable, and
+/// `config_setup_full` runs once per install — so an editor that jumped straight to "type a base URL"
+/// hid every provider added after the user's first day. That is exactly what happened to the OpenCode
+/// and Codex presets: they shipped, and nobody with an existing config could see them.
+///
+/// Sharing the step also means the two flows cannot drift on how a preset is probed or how Codex
+/// authenticates — the same duplication the two REPL loops used to carry.
+///
+/// `allow_skip` separates the callers: setup cannot proceed without an endpoint, so an empty entry
+/// re-asks and a hard cancel is an error; the editor treats Esc/empty as "never mind" → `None`.
+async fn prompt_connection(
+    theme: &ColorfulTheme,
+    http: &reqwest::Client,
+    current_base: Option<&str>,
+    current_key: Option<&str>,
+    allow_skip: bool,
+) -> Result<Option<Connection>> {
+    let preset = prompt_provider(theme, current_base)?;
+    let (base, mut models) = match preset {
+        // Codex has nothing to probe: the backend is a Responses surface with no `GET /models`, and
+        // a reachability check against it would report a perfectly working provider as broken.
+        Some(p) if crate::llm::oauth_codex::is_codex_base_url(p.base) => {
+            (p.base.to_string(), codex_model_infos())
         }
-        None => {
-            match prompt_validated_base_url(&theme, &http, cfg.base_url.as_deref(), true).await? {
-                Some(v) => v,
-                None => return Ok(()),
+        // A preset's URL is already correct, so it only needs the reachability check — not the
+        // type-it-again loop. A custom endpoint goes through the full prompt.
+        Some(p) => match probe_preset(theme, http, p, allow_skip).await? {
+            Some(v) => v,
+            None => return Ok(None),
+        },
+        None => match prompt_validated_base_url(theme, http, current_base, allow_skip).await? {
+            Some(v) => v,
+            None if allow_skip => return Ok(None),
+            None => anyhow::bail!("base URL is required"),
+        },
+    };
+
+    // The stored key belongs to the OLD endpoint. Offering it as the default for a DIFFERENT one
+    // invites an Enter that keeps a credential the new host will reject.
+    let current_key = (current_base.map(|b| b.trim().trim_end_matches('/'))
+        == Some(base.trim_end_matches('/')))
+    .then_some(current_key)
+    .flatten();
+
+    let key = if crate::llm::oauth_codex::is_codex_base_url(&base) {
+        match prompt_codex_login(theme).await? {
+            Some(k) => k.to_string(),
+            None if allow_skip => return Ok(None),
+            None => anyhow::bail!("Codex sign-in is required for this endpoint"),
+        }
+    } else {
+        let keys_url = preset.map(|p| p.keys_url);
+        match prompt_validated_api_key(theme, http, &base, current_key, keys_url).await? {
+            Some((key, fetched)) => {
+                if !fetched.is_empty() {
+                    models = fetched;
+                }
+                key
             }
+            None if allow_skip => return Ok(None),
+            None => anyhow::bail!("API key is required"),
         }
     };
-    let same_endpoint = previous_base
-        .as_deref()
-        .map(|url| url.trim().trim_end_matches('/'))
-        == Some(base.as_str());
 
-    let keys_url = preset.map(|p| p.keys_url);
-    let current_key = same_endpoint.then_some(cfg.api_key.as_deref()).flatten();
-    let (key, fetched) =
-        match prompt_validated_api_key(&theme, &http, &base, current_key, keys_url).await? {
-            Some(v) => v,
-            None => return Ok(()),
-        };
-    if !fetched.is_empty() {
-        infos = fetched;
-    }
+    Ok(Some(Connection {
+        base,
+        key,
+        models,
+        preset,
+    }))
+}
 
-    let mut draft = cfg.clone();
-    draft.base_url = Some(base);
-    draft.api_key = Some(key);
-    if !same_endpoint {
-        draft.model = None;
-        draft.model_context_window = None;
-        draft.active_provider = None;
-    }
-
-    // The key check already fetched the list — offering it here saves a redundant round-trip and
-    // means a fresh connection lands on a working model instead of whatever was configured before.
-    if !infos.is_empty() && yn(&theme, "Pick a model now?", true)? {
-        pick_model_from(&theme, &mut draft, &infos, preset.map(|p| p.sample_model))?;
-    } else if draft.model.is_none() {
-        let mut input = Input::<String>::with_theme(&theme)
-            .with_prompt("Model id")
-            .allow_empty(true);
-        if let Some(sample) = preset.map(|p| p.sample_model.to_string()) {
-            input = input.default(sample);
+/// Check a preset's URL and report the verdict. Even a preset can be unreachable (Ollama not
+/// running, network down, provider outage), so say which and let the user keep it or type something
+/// else, rather than pretending it answered.
+async fn probe_preset(
+    theme: &ColorfulTheme,
+    http: &reqwest::Client,
+    p: &'static ProviderPreset,
+    allow_skip: bool,
+) -> Result<Option<(String, Vec<client::ModelInfo>)>> {
+    let check = spin_while(
+        &format!("checking {}", p.base),
+        client::check_endpoint(http, p.base, None),
+    )
+    .await;
+    match check {
+        client::EndpointCheck::Ok(infos) => {
+            line_ok(&format!("reachable — {} models", infos.len()));
+            Ok(Some((p.base.to_string(), infos)))
         }
-        let model = input.interact_text()?;
-        if model.trim().is_empty() {
-            line_warn("connection unchanged — a model is required for the new URL");
-            return Ok(());
+        client::EndpointCheck::Auth(_) => {
+            line_ok("reachable (needs a key — next step)");
+            Ok(Some((p.base.to_string(), Vec::new())))
         }
-        draft.model = Some(model.trim().to_string());
+        other => {
+            let what = match &other {
+                client::EndpointCheck::NotFound(d) => format!("no model list there ({d})"),
+                client::EndpointCheck::Unreachable(d) => format!("could not reach it ({d})"),
+                client::EndpointCheck::Http(c, d) => format!("HTTP {c} ({d})"),
+                client::EndpointCheck::Ok(_) | client::EndpointCheck::Auth(_) => {
+                    unreachable!("handled above")
+                }
+            };
+            line_warn(&format!("{} — {what}", p.label));
+            if yn(theme, "Use this URL anyway?", true)? {
+                Ok(Some((p.base.to_string(), Vec::new())))
+            } else {
+                prompt_validated_base_url(theme, http, Some(p.base), allow_skip).await
+            }
+        }
     }
-    draft.sync_active_provider();
-    *cfg = draft;
-    Ok(())
+}
+
+/// Codex's credential is an OAuth token in `~/.aizen/provider-tokens/codex.json`, not a key anyone
+/// can paste — so this step signs in instead of prompting. Returns the placeholder that goes into the
+/// config (`ProviderProfile::normalized` and the endpoint resolver both recognise it), or `None` to
+/// abandon the connection.
+async fn prompt_codex_login(theme: &ColorfulTheme) -> Result<Option<&'static str>> {
+    use crate::llm::oauth_codex;
+    const PLACEHOLDER: &str = "codex-oauth";
+
+    if oauth_codex::codex_disabled() {
+        line_bad("Codex is turned off by AIZEN_DISABLE_CODEX — unset it to use this provider");
+        return Ok(None);
+    }
+    tui::emit_line(&format!(
+        "  {}",
+        style(oauth_codex::risk_notice()).color256(crate::ui::theme::WARN)
+    ));
+    if oauth_codex::has_token() {
+        for l in oauth_codex::status_lines() {
+            line_ok(&l);
+        }
+        if !yn(theme, "Sign in again (replaces the stored token)?", false)? {
+            return Ok(Some(PLACEHOLDER));
+        }
+    }
+    line_warn("opening a browser to sign in to ChatGPT …");
+    match oauth_codex::login_interactive().await {
+        Ok(set) => {
+            line_ok(&format!(
+                "signed in as {}",
+                set.label.as_deref().unwrap_or("(no email claim)")
+            ));
+            Ok(Some(PLACEHOLDER))
+        }
+        Err(e) => {
+            line_bad(&format!("sign-in failed: {e}"));
+            // The endpoint itself is fine and the token can be added later, so don't throw away a
+            // provider the user deliberately picked over one failed browser round-trip.
+            if yn(
+                theme,
+                "Keep this provider anyway (finish later with `aizen auth login codex`)?",
+                true,
+            )? {
+                Ok(Some(PLACEHOLDER))
+            } else {
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Manage provider profiles from the config hub. Adding/editing reuses the validated Connection flow;
@@ -1606,32 +1761,21 @@ pub(crate) async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Re
             return Ok(());
         }
         if pick == list.len() {
-            let name: String = Input::with_theme(&theme)
-                .with_prompt("Provider name (no spaces)")
-                .allow_empty(true)
-                .interact_text()?;
-            if name.trim().is_empty() || cfg.provider(&name).is_some() {
-                line_bad("provider name is empty or already exists");
-                continue;
-            }
-            let base = match prompt_validated_base_url(&theme, &http, None, true).await? {
-                Some((url, _)) => url,
-                None => continue,
-            };
-            let (key, mut infos) =
-                match prompt_validated_api_key(&theme, &http, &base, None, None).await? {
-                    Some(v) => v,
-                    None => continue,
-                };
-            if infos.is_empty() {
-                if let Ok(fetched) = client::fetch_models_info(&http, &base, &key).await {
-                    infos = fetched;
-                }
-            }
-            let Some(model) = prompt_required_provider_model(&theme, &infos, None)? else {
+            // Connection FIRST, name second: the preset knows what the provider is called, so the
+            // name prompt can default to it instead of asking the user to invent one.
+            let Some(conn) = prompt_connection(&theme, &http, None, None, true).await? else {
                 continue;
             };
-            let mut draft = cli_config::ProviderProfile::normalized(&name, &base, &key, &model)?;
+            let Some(name) = prompt_provider_name(&theme, cfg, &conn, None)? else {
+                continue;
+            };
+            let infos = fill_models(&http, &conn).await;
+            let sample = conn.preset.map(|p| p.sample_model);
+            let Some(model) = prompt_required_provider_model(&theme, &infos, sample)? else {
+                continue;
+            };
+            let mut draft =
+                cli_config::ProviderProfile::normalized(&name, &conn.base, &conn.key, &model)?;
             draft.model_context_window = None;
             cfg.upsert_provider(draft.clone())?;
             if yn(&theme, "Use this provider now?", true)? {
@@ -1650,30 +1794,20 @@ pub(crate) async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Re
             Some(0) => cfg.activate_provider(&existing.name)?,
             Some(1) => {
                 let old = existing.clone();
-                let base = match prompt_validated_base_url(&theme, &http, Some(&old.base_url), true)
-                    .await?
-                {
-                    Some((url, _)) => url,
-                    None => continue,
+                let Some(conn) =
+                    prompt_connection(&theme, &http, Some(&old.base_url), Some(&old.api_key), true)
+                        .await?
+                else {
+                    continue;
                 };
-                let same = base.trim_end_matches('/') == old.base_url.trim_end_matches('/');
-                let current = same.then_some(old.api_key.as_str());
-                let (key, mut infos) =
-                    match prompt_validated_api_key(&theme, &http, &base, current, None).await? {
-                        Some(v) => v,
-                        None => continue,
-                    };
-                if infos.is_empty() {
-                    if let Ok(fetched) = client::fetch_models_info(&http, &base, &key).await {
-                        infos = fetched;
-                    }
-                }
+                let infos = fill_models(&http, &conn).await;
                 let Some(model) = prompt_required_provider_model(&theme, &infos, Some(&old.model))?
                 else {
                     continue;
                 };
-                let mut replacement =
-                    cli_config::ProviderProfile::normalized(&old.name, &base, &key, &model)?;
+                let mut replacement = cli_config::ProviderProfile::normalized(
+                    &old.name, &conn.base, &conn.key, &model,
+                )?;
                 replacement.model_context_window = old.model_context_window;
                 let active = cfg
                     .active_provider
@@ -1715,6 +1849,60 @@ pub(crate) async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Re
     }
 }
 
+/// The models to offer for a connection. The key check usually returned the list already; when it
+/// didn't — an endpoint that answered the probe but not the list, or a key kept despite an
+/// unverifiable check — try once more now that we hold the credential. Codex arrives with its
+/// catalog already filled, so it returns before any request is made.
+async fn fill_models(http: &reqwest::Client, conn: &Connection) -> Vec<client::ModelInfo> {
+    if !conn.models.is_empty() {
+        return conn.models.clone();
+    }
+    client::fetch_models_info(http, &conn.base, &conn.key)
+        .await
+        .unwrap_or_default()
+}
+
+/// Name for a saved provider profile. A preset already knows what it is called, so that is the
+/// default and Enter accepts it. The loop exists only because the name has to be unique and
+/// space-free — conditions `ProviderProfile::normalized` would otherwise reject after the user has
+/// already answered every other question.
+///
+/// `editing` is the profile's current name when renaming, so a profile doesn't collide with itself.
+fn prompt_provider_name(
+    theme: &ColorfulTheme,
+    cfg: &cli_config::CliConfig,
+    conn: &Connection,
+    editing: Option<&str>,
+) -> Result<Option<String>> {
+    loop {
+        let mut input = Input::<String>::with_theme(theme)
+            .with_prompt("Provider name (no spaces, empty cancels)")
+            .allow_empty(true);
+        if let Some(d) = editing
+            .map(str::to_string)
+            .or_else(|| conn.preset.map(|p| p.slug.to_string()))
+        {
+            input = input.default(d);
+        }
+        let name = input.interact_text()?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(None);
+        }
+        if name.chars().any(char::is_whitespace) {
+            line_bad("a provider name must not contain spaces");
+            continue;
+        }
+        if cfg.provider(name).is_some()
+            && !editing.is_some_and(|old| old.eq_ignore_ascii_case(name))
+        {
+            line_bad(&format!("`{name}` already exists — pick another name"));
+            continue;
+        }
+        return Ok(Some(name.to_string()));
+    }
+}
+
 /// Present `infos` as a picker and store the choice (plus its reported context window). Esc keeps the
 /// current model. The last row is a manual-id escape hatch for a model the provider doesn't list.
 fn pick_model_from(
@@ -1724,22 +1912,7 @@ fn pick_model_from(
     sample_model: Option<&str>,
 ) -> Result<()> {
     let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
-    let mut items: Vec<String> = infos
-        .iter()
-        .map(|m| {
-            // Free-tier ids get a tag so someone on a free gateway doesn't pick a paid model by
-            // accident — the failure would only surface on the first real turn.
-            let free = if m.is_free || client::is_free_model_id(&m.id) {
-                "  · free"
-            } else {
-                ""
-            };
-            match m.context_length {
-                Some(n) => format!("{}{free}  ({} ctx)", m.id, n),
-                None => format!("{}{free}", m.id),
-            }
-        })
-        .collect();
+    let mut items: Vec<String> = infos.iter().map(model_row).collect();
     items.push(CUSTOM_MODEL_ITEM.to_string());
     let pick = match Select::with_theme(theme)
         .with_prompt("Model (Esc keeps current)")
@@ -2051,7 +2224,7 @@ fn prompt_required_provider_model(
 ) -> Result<Option<String>> {
     if !infos.is_empty() {
         let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
-        let mut items = ids.clone();
+        let mut items: Vec<String> = infos.iter().map(model_row).collect();
         items.push(CUSTOM_MODEL_ITEM.to_string());
         let Some(pick) = Select::with_theme(theme)
             .with_prompt("Provider default model (Esc cancels)")
@@ -2350,15 +2523,22 @@ async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
         }
     };
     let http = http_client()?;
-    // One complete line per outcome rather than a bare `print!` prefix completed later: a partial
-    // line cannot be a transcript block, so under the retained renderer it was a raw write into cells
-    // the render thread believes it owns (the same corruption `print_config` was fixed for).
-    tui::emit_line(
-        &style(format!("Fetching models from {base} …"))
-            .dim()
-            .to_string(),
-    );
-    match client::fetch_models_info(&http, &base, &key).await {
+    // Codex has no model list on the wire; asking for one would print a failure and drop the user
+    // into manual entry for ids we already ship.
+    let listed = if crate::llm::oauth_codex::is_codex_base_url(&base) {
+        Ok(codex_model_infos())
+    } else {
+        // One complete line per outcome rather than a bare `print!` prefix completed later: a partial
+        // line cannot be a transcript block, so under the retained renderer it was a raw write into
+        // cells the render thread believes it owns (the same corruption `print_config` was fixed for).
+        tui::emit_line(
+            &style(format!("Fetching models from {base} …"))
+                .dim()
+                .to_string(),
+        );
+        client::fetch_models_info(&http, &base, &key).await
+    };
+    match listed {
         Ok(infos) if !infos.is_empty() => {
             tui::emit_line(
                 &style(format!("ok ({} found)", infos.len()))
@@ -2366,7 +2546,7 @@ async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
                     .to_string(),
             );
             let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
-            let mut items: Vec<String> = ids.clone();
+            let mut items: Vec<String> = infos.iter().map(model_row).collect();
             items.push(CUSTOM_MODEL_ITEM.to_string());
             let pick = match Select::with_theme(&theme)
                 .with_prompt("Pick a model (Esc keeps current)")
@@ -2407,42 +2587,53 @@ async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
             }
         }
     }
-    // context window — drives the `% context` HUD + auto-compact trigger.
-    if let Some(model) = cfg.model.clone() {
-        let (shown, was_cfg) = effective_ctx_window(&model, cfg.model_context_window);
-        let ctx_default = cfg
-            .model_context_window
-            .map(|w| w.to_string())
-            .unwrap_or_else(|| "auto".to_string());
-        let note = if was_cfg {
-            "auto-detected from the provider"
-        } else {
-            "estimated from the model name"
-        };
-        tui::emit_line(&format!(
-            "{}",
-            style(format!(
-                "Context window — currently {shown} tokens ({note})."
-            ))
-            .dim()
-        ));
-        let ctx_in = Input::<String>::with_theme(&theme)
-            .with_prompt("Context window (tokens, e.g. 200000 / 128k, or `auto`)")
-            .default(ctx_default)
-            .allow_empty(true)
-            .interact_text()?;
-        cfg.model_context_window = match ctx_in
-            .trim()
-            .to_ascii_lowercase()
-            .replace('_', "")
-            .replace('k', "000")
-            .parse::<usize>()
-        {
-            Ok(n) if n >= 1000 => Some(n),
-            _ => None, // "auto"/blank/garbage → detect-or-heuristic
-        };
-    }
+    prompt_context_window(&theme, cfg)?;
     cfg.sync_active_provider();
+    Ok(())
+}
+
+/// Ask for the context window. Drives the `% context` HUD and the auto-compact trigger — and it is
+/// deliberately NOT a cap, the provider enforces the real limit. `auto`/blank/garbage clears it back
+/// to detect-or-heuristic rather than keeping a number the user just tried to remove.
+///
+/// A no-op when no model is set: the prompt shows the CURRENT model's window, so asking without one
+/// would be asking about nothing.
+fn prompt_context_window(theme: &ColorfulTheme, cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let Some(model) = cfg.model.clone() else {
+        return Ok(());
+    };
+    let (shown, was_cfg) = effective_ctx_window(&model, cfg.model_context_window);
+    let ctx_default = cfg
+        .model_context_window
+        .map(|w| w.to_string())
+        .unwrap_or_else(|| "auto".to_string());
+    let note = if was_cfg {
+        "auto-detected from the provider"
+    } else {
+        "estimated from the model name"
+    };
+    tui::emit_line(&format!(
+        "{}",
+        style(format!(
+            "Context window — currently {shown} tokens ({note})."
+        ))
+        .dim()
+    ));
+    let ctx_in = Input::<String>::with_theme(theme)
+        .with_prompt("Context window (tokens, e.g. 200000 / 128k, or `auto`)")
+        .default(ctx_default)
+        .allow_empty(true)
+        .interact_text()?;
+    cfg.model_context_window = match ctx_in
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "")
+        .replace('k', "000")
+        .parse::<usize>()
+    {
+        Ok(n) if n >= 1000 => Some(n),
+        _ => None, // "auto"/blank/garbage → detect-or-heuristic
+    };
     Ok(())
 }
 
@@ -2529,6 +2720,41 @@ where
     }
 }
 
+/// Ask for the Tavily key and store the answer; returns whether one is configured afterwards.
+///
+/// `web_search` is keyed-only, so this single prompt is the difference between the agent being able
+/// to search and not — which is why first-run setup asks it too rather than leaving it to a section
+/// the user may never open.
+async fn prompt_tavily_key(theme: &ColorfulTheme, cfg: &mut cli_config::CliConfig) -> Result<bool> {
+    let current = cfg.reach.as_ref().and_then(|r| r.tavily_api_key.clone());
+    let edit = prompt_validated_reach_key(
+        theme,
+        "Tavily",
+        "https://app.tavily.com (free tier)",
+        current.as_deref(),
+        |k| async move { crate::agent::reach::search::check_tavily_key(&k).await },
+    )
+    .await?;
+    match edit {
+        ReachKeyEdit::Set(k) => {
+            cfg.reach
+                .get_or_insert_with(Default::default)
+                .tavily_api_key = Some(k)
+        }
+        ReachKeyEdit::Cleared => {
+            cfg.reach
+                .get_or_insert_with(Default::default)
+                .tavily_api_key = None
+        }
+        ReachKeyEdit::Unchanged => {}
+    }
+    Ok(cfg
+        .reach
+        .as_ref()
+        .and_then(|r| r.tavily_api_key.as_deref())
+        .is_some_and(|k| !k.trim().is_empty()))
+}
+
 /// Section editor: the web-search keys (Tavily, and Jina as a fallback), each verified live.
 ///
 /// Both are optional, but `web_search` is KEYED-ONLY: with neither key the tool returns an
@@ -2555,37 +2781,17 @@ async fn config_edit_websearch(cfg: &mut cli_config::CliConfig) -> Result<()> {
         }
     }
 
-    let cur_tavily = cfg.reach.as_ref().and_then(|r| r.tavily_api_key.clone());
-    let edit = prompt_validated_reach_key(
-        &theme,
-        "Tavily",
-        "https://app.tavily.com (free tier)",
-        cur_tavily.as_deref(),
-        |k| async move { crate::agent::reach::search::check_tavily_key(&k).await },
-    )
-    .await?;
-    match edit {
-        ReachKeyEdit::Set(k) => {
-            cfg.reach
-                .get_or_insert_with(Default::default)
-                .tavily_api_key = Some(k)
-        }
-        ReachKeyEdit::Cleared => {
-            cfg.reach
-                .get_or_insert_with(Default::default)
-                .tavily_api_key = None
-        }
-        ReachKeyEdit::Unchanged => {}
-    }
+    let has_tavily = prompt_tavily_key(&theme, cfg).await?;
 
     let cur_jina = cfg.reach.as_ref().and_then(|r| r.jina_api_key.clone());
     // Only worth offering when there's a reason to: as a fallback next to Tavily, or as the only
-    // backend when Tavily is absent.
+    // backend when Tavily is absent. Keyed off the state AFTER the Tavily step — someone who just
+    // pasted a Tavily key is not the person who needs a fallback pushed at them.
     if cur_jina.is_some()
         || yn(
             &theme,
             "Add a Jina key too? (a search fallback + a better page reader)",
-            cur_tavily.is_none(),
+            !has_tavily,
         )?
     {
         let edit = prompt_validated_reach_key(
@@ -2711,27 +2917,57 @@ fn config_edit_memory(cfg: &mut cli_config::CliConfig) -> Result<()> {
     Ok(())
 }
 
-/// Section editor: session behavior — auto-compact %, skill/memory/persona learning, checkpoints.
-fn config_edit_session(cfg: &mut cli_config::CliConfig) -> Result<()> {
-    let theme = ui_theme();
-    let cur_ac = cfg.compact_threshold_pct.unwrap_or(80);
-    let ac_default = if cur_ac == 0 {
+/// Ask at what fill level older turns get summarized away. `off` (or 0) disables auto-compaction;
+/// anything unparseable keeps the current setting rather than silently choosing a number.
+fn prompt_compact_threshold(theme: &ColorfulTheme, cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let cur = cfg.compact_threshold_pct.unwrap_or(80);
+    let default = if cur == 0 {
         "off".to_string()
     } else {
-        cur_ac.to_string()
+        cur.to_string()
     };
-    let ac_in = Input::<String>::with_theme(&theme)
+    let entered = Input::<String>::with_theme(theme)
         .with_prompt("Auto-compact at what % of context? (10–95, or `off`)")
-        .default(ac_default)
+        .default(default)
         .allow_empty(true)
         .interact_text()?;
-    cfg.compact_threshold_pct = match ac_in.trim().to_ascii_lowercase().as_str() {
+    cfg.compact_threshold_pct = match entered.trim().to_ascii_lowercase().as_str() {
         "off" | "false" | "0" => Some(0),
         s => match s.trim_end_matches('%').parse::<u8>() {
             Ok(p) if (10..=95).contains(&p) => Some(p),
-            _ => Some(cur_ac),
+            _ => Some(cur), // blank/garbage → keep current
         },
     };
+    Ok(())
+}
+
+/// Ask how many code checkpoints the time machine keeps before pruning the oldest. `unlimited`/`all`
+/// store 0, which the pruner reads as "never".
+fn prompt_timemachine_keep(theme: &ColorfulTheme, cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let cur = cfg.timemachine_keep.unwrap_or(50);
+    let entered = Input::<String>::with_theme(theme)
+        .with_prompt("Time-machine checkpoints to keep? (a number, or `unlimited`)")
+        .default(if cur == 0 {
+            "unlimited".to_string()
+        } else {
+            cur.to_string()
+        })
+        .allow_empty(true)
+        .interact_text()?;
+    cfg.timemachine_keep = match entered.trim().to_ascii_lowercase().as_str() {
+        "unlimited" | "all" | "0" => Some(0),
+        s => match s.parse::<usize>() {
+            Ok(n) => Some(n),
+            _ => Some(cur), // blank/garbage → keep current
+        },
+    };
+    Ok(())
+}
+
+/// Section editor: session behavior — auto-compact %, skill/memory/persona learning, checkpoints.
+fn config_edit_session(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    prompt_compact_threshold(&theme, cfg)?;
     cfg.auto_skill_learn = Some(yn(
         &theme,
         "Auto-learn skills from completed tasks?",
@@ -2744,23 +2980,7 @@ fn config_edit_session(cfg: &mut cli_config::CliConfig) -> Result<()> {
         "Persona evolution (learn a voice over time)?",
         cfg.persona_evolve.unwrap_or(true),
     )?);
-    let cur_tm = cfg.timemachine_keep.unwrap_or(50);
-    let tm_in = Input::<String>::with_theme(&theme)
-        .with_prompt("Time-machine checkpoints to keep? (a number, or `unlimited`)")
-        .default(if cur_tm == 0 {
-            "unlimited".to_string()
-        } else {
-            cur_tm.to_string()
-        })
-        .allow_empty(true)
-        .interact_text()?;
-    cfg.timemachine_keep = match tm_in.trim().to_ascii_lowercase().as_str() {
-        "unlimited" | "all" | "0" => Some(0),
-        s => match s.parse::<usize>() {
-            Ok(n) => Some(n),
-            _ => Some(cur_tm),
-        },
-    };
+    prompt_timemachine_keep(&theme, cfg)?;
     Ok(())
 }
 
@@ -2931,68 +3151,22 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
 
     step("Connection");
     let http = http_client()?;
-    // 1) provider → base URL. A preset carries the right version suffix already; a custom URL is
-    //    checked (and re-asked) until it answers as a models endpoint.
-    let preset = prompt_provider(&theme, cfg.base_url.as_deref())?;
-    let (base, mut infos) = match preset {
-        Some(p) => {
-            let check = spin_while(
-                &format!("checking {}", p.base),
-                client::check_endpoint(&http, p.base, None),
-            )
-            .await;
-            match check {
-                client::EndpointCheck::Ok(infos) => {
-                    line_ok(&format!("reachable — {} models", infos.len()));
-                    (p.base.to_string(), infos)
-                }
-                client::EndpointCheck::Auth(_) => {
-                    line_ok("reachable (needs a key — next step)");
-                    (p.base.to_string(), Vec::new())
-                }
-                other => {
-                    let what = match &other {
-                        client::EndpointCheck::NotFound(d) => format!("no model list there ({d})"),
-                        client::EndpointCheck::Unreachable(d) => {
-                            format!("could not reach it ({d})")
-                        }
-                        client::EndpointCheck::Http(c, d) => format!("HTTP {c} ({d})"),
-                        _ => unreachable!(),
-                    };
-                    line_warn(&format!("{} — {what}", p.label));
-                    if yn(&theme, "Use this URL anyway?", true)? {
-                        (p.base.to_string(), Vec::new())
-                    } else {
-                        prompt_validated_base_url(&theme, &http, Some(p.base), false)
-                            .await?
-                            .ok_or_else(|| anyhow::anyhow!("base URL is required"))?
-                    }
-                }
-            }
-        }
-        // `allow_skip: false` — first-run setup cannot proceed without an endpoint, so an empty entry
-        // re-asks rather than silently leaving the install unconfigured.
-        None => prompt_validated_base_url(&theme, &http, cfg.base_url.as_deref(), false)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("base URL is required"))?,
-    };
-    cfg.base_url = Some(base.clone());
-
-    // 2) API key — verified against the endpoint before it's accepted, and visible while typing so a
-    //    truncated paste is obvious.
-    let (key, fetched) = prompt_validated_api_key(
+    // 1+2) provider → base URL → credential, all in the step the provider editor also uses.
+    //      `allow_skip: false` — first-run setup cannot proceed without an endpoint, so an empty
+    //      entry re-asks rather than silently leaving the install unconfigured.
+    let conn = prompt_connection(
         &theme,
         &http,
-        &base,
+        cfg.base_url.as_deref(),
         cfg.api_key.as_deref(),
-        preset.map(|p| p.keys_url),
+        false,
     )
     .await?
-    .ok_or_else(|| anyhow::anyhow!("API key is required"))?;
-    cfg.api_key = Some(key);
-    if !fetched.is_empty() {
-        infos = fetched;
-    }
+    .ok_or_else(|| anyhow::anyhow!("a connection is required"))?;
+    cfg.base_url = Some(conn.base.clone());
+    cfg.api_key = Some(conn.key.clone());
+    let infos = conn.models;
+    let preset = conn.preset;
 
     step("Model & context");
     // 3) pick a model from the list the key check already fetched — no second round-trip.
@@ -3018,151 +3192,42 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
         anyhow::bail!("a model is required (run `aizen models` to list them)");
     }
 
-    // 4) context window — drives the `% context` HUD + the auto-compact trigger. The model pick
-    //    above pre-filled `model_context_window` from the provider when it reported one; show that
-    //    (or `auto`) as the default. A number overrides it; `auto` clears back to detect/heuristic.
-    let model = cfg.model.clone().unwrap();
-    let (shown, was_cfg) = effective_ctx_window(&model, cfg.model_context_window);
-    let ctx_default = cfg
-        .model_context_window
-        .map(|w| w.to_string())
-        .unwrap_or_else(|| "auto".to_string());
-    let note = if was_cfg {
-        "auto-detected from the provider"
-    } else {
-        "estimated from the model name"
-    };
-    tui::emit_line(&format!(
-        "{}",
-        style(format!(
-            "Context window — currently {shown} tokens ({note})."
-        ))
-        .dim()
-    ));
-    let ctx_in = Input::<String>::with_theme(&theme)
-        .with_prompt("Context window (tokens, e.g. 200000 / 128k, or `auto`)")
-        .default(ctx_default)
-        .allow_empty(true)
-        .interact_text()?;
-    cfg.model_context_window = match ctx_in
-        .trim()
-        .to_ascii_lowercase()
-        .replace('_', "")
-        .replace('k', "000")
-        .parse::<usize>()
-    {
-        Ok(n) if n >= 1000 => Some(n),
-        _ => None, // "auto"/blank/garbage → detect-or-heuristic
-    };
+    // 4) context window. The model pick above pre-filled `model_context_window` from the provider
+    //    when it reported one, so the prompt's default already reflects it.
+    prompt_context_window(&theme, cfg)?;
 
     // Web search key (Tavily) — web_search is KEYED-ONLY, so without a key it can't search at all.
     // Optional here (Enter skips): a fresh install should be usable before the user has gone and
-    // signed up for anything. When a key IS given it gets verified with a real search, same as the
-    // section editor.
+    // signed up for anything. When a key IS given it gets verified with a real search — literally the
+    // same step the section editor runs.
     step("Web search");
     tui::emit_line(&format!(
         "{}",
         style("Optional. web_search is keyed-only — skip now and add one later with `/config`.")
             .dim()
     ));
-    let cur_tavily = cfg.reach.as_ref().and_then(|r| r.tavily_api_key.clone());
-    let edit = prompt_validated_reach_key(
-        &theme,
-        "Tavily",
-        "https://app.tavily.com (free tier)",
-        cur_tavily.as_deref(),
-        |k| async move { crate::agent::reach::search::check_tavily_key(&k).await },
-    )
-    .await?;
-    match edit {
-        ReachKeyEdit::Set(k) => {
-            cfg.reach
-                .get_or_insert_with(Default::default)
-                .tavily_api_key = Some(k)
-        }
-        ReachKeyEdit::Cleared => {
-            cfg.reach
-                .get_or_insert_with(Default::default)
-                .tavily_api_key = None
-        }
-        ReachKeyEdit::Unchanged => {}
-    }
+    prompt_tavily_key(&theme, cfg).await?;
 
     step("Behavior");
     // 5) auto-compact threshold — % of the window at which older turns get summarized (`off` = 0).
-    let cur_ac = cfg.compact_threshold_pct.unwrap_or(80);
-    let ac_default = if cur_ac == 0 {
-        "off".to_string()
-    } else {
-        cur_ac.to_string()
-    };
-    let ac_in = Input::<String>::with_theme(&theme)
-        .with_prompt("Auto-compact at what % of context? (10–95, or `off`)")
-        .default(ac_default)
-        .allow_empty(true)
-        .interact_text()?;
-    cfg.compact_threshold_pct = match ac_in.trim().to_ascii_lowercase().as_str() {
-        "off" | "false" | "0" => Some(0),
-        s => match s.trim_end_matches('%').parse::<u8>() {
-            Ok(p) if (10..=95).contains(&p) => Some(p),
-            _ => Some(cur_ac), // blank/garbage → keep current
-        },
-    };
+    prompt_compact_threshold(&theme, cfg)?;
 
-    // 6) auto-learn skills — distill completed multi-step tasks into reusable skills.
-    let cur_sk = cfg.auto_skill_learn.unwrap_or(true);
-    let sk_default = if cur_sk {
-        "yes".to_string()
-    } else {
-        "no".to_string()
-    };
-    let sk_in = Input::<String>::with_theme(&theme)
-        .with_prompt("Auto-learn skills from completed tasks? (yes/no)")
-        .default(sk_default)
-        .allow_empty(true)
-        .interact_text()?;
-    cfg.auto_skill_learn = match sk_in.trim().to_ascii_lowercase().as_str() {
-        "no" | "n" | "off" | "false" => Some(false),
-        "yes" | "y" | "on" | "true" => Some(true),
-        _ => Some(cur_sk), // blank/garbage → keep current
-    };
-
-    // 7) auto-learn memory — passively learn durable user/project facts from each turn (free).
-    let cur_ml = cfg.memory_auto_learn.unwrap_or(true);
-    let ml_default = if cur_ml {
-        "yes".to_string()
-    } else {
-        "no".to_string()
-    };
-    let ml_in = Input::<String>::with_theme(&theme)
-        .with_prompt("Auto-learn memory (durable facts) from each turn? (yes/no)")
-        .default(ml_default)
-        .allow_empty(true)
-        .interact_text()?;
-    cfg.memory_auto_learn = match ml_in.trim().to_ascii_lowercase().as_str() {
-        "no" | "n" | "off" | "false" => Some(false),
-        "yes" | "y" | "on" | "true" => Some(true),
-        _ => Some(cur_ml), // blank/garbage → keep current
-    };
+    // 6+7) the two passive learners. Asked with `yn` rather than a typed yes/no so the wording and
+    //      the accepted answers match the section editors that own these same fields — Session for
+    //      skills, Memory for durable facts.
+    cfg.auto_skill_learn = Some(yn(
+        &theme,
+        "Auto-learn skills from completed tasks?",
+        cfg.auto_skill_learn.unwrap_or(true),
+    )?);
+    cfg.memory_auto_learn = Some(yn(
+        &theme,
+        "Auto-learn durable facts from each turn?",
+        cfg.memory_auto_learn.unwrap_or(true),
+    )?);
 
     // 8) time machine — how many code checkpoints to keep before auto-pruning the oldest.
-    let cur_tm = cfg.timemachine_keep.unwrap_or(50);
-    let tm_in = Input::<String>::with_theme(&theme)
-        .with_prompt("Time-machine checkpoints to keep? (a number, or `unlimited`)")
-        .default(if cur_tm == 0 {
-            "unlimited".to_string()
-        } else {
-            cur_tm.to_string()
-        })
-        .allow_empty(true)
-        .interact_text()?;
-    cfg.timemachine_keep = match tm_in.trim().to_ascii_lowercase().as_str() {
-        "unlimited" | "all" | "0" => Some(0),
-        s => match s.parse::<usize>() {
-            Ok(n) => Some(n),
-            _ => Some(cur_tm), // blank/garbage → keep current
-        },
-    };
+    prompt_timemachine_keep(&theme, cfg)?;
 
     step("Display");
     // 8) icon style — nerd (default; crisp monochrome glyphs, needs a Nerd Font) / emoji (colour,

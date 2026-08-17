@@ -34,8 +34,91 @@ fn codex_experimental_preset_is_registered() {
         .find(|p| p.label == "ChatGPT Codex (experimental)")
         .expect("codex preset");
     assert_eq!(p.base, crate::llm::oauth_codex::CODEX_BASE_URL);
-    assert!(p.keys_url.contains("auth login codex"));
     assert!(!p.sample_model.is_empty());
+    // The preset used to tell the user to go and run `aizen auth login codex` themselves. It no
+    // longer has to: `prompt_connection` recognises this base URL and offers the browser sign-in in
+    // place of the API-key prompt, so the hint describes what happens rather than assigning homework.
+    assert!(
+        !p.keys_url.contains("auth login"),
+        "the sign-in is offered inline now, not delegated to a second command: {}",
+        p.keys_url
+    );
+}
+
+/// Every preset must be usable as a saved provider profile without the user renaming it, and the
+/// names must not collide — two presets defaulting to the same name would make the second one look
+/// like it "already exists" for no reason the user can see.
+#[test]
+fn every_preset_offers_a_usable_profile_name() {
+    let mut seen = std::collections::BTreeSet::new();
+    for p in PROVIDER_PRESETS {
+        assert!(
+            cli_config::ProviderProfile::normalized(p.slug, p.base, "k", p.sample_model).is_ok(),
+            "preset {} cannot be saved as typed (slug {:?}, base {:?})",
+            p.label,
+            p.slug,
+            p.base
+        );
+        assert!(
+            seen.insert(p.slug),
+            "two presets both default to the name {:?}",
+            p.slug
+        );
+    }
+}
+
+/// The free tag is the only warning a user gets before picking a paid model with a free-tier
+/// credential — a mistake that surfaces as a 403 on the first real turn, long after the choice.
+/// It regressed once by living in one picker's body instead of a shared row renderer.
+#[test]
+fn model_row_tags_free_tiers_from_either_signal() {
+    let row = |id: &str, is_free: bool| {
+        model_row(&client::ModelInfo {
+            id: id.to_string(),
+            context_length: None,
+            is_free,
+        })
+    };
+    // Pricing-derived (OpenRouter reports 0/0) and id-derived (OpenCode's `-free`, OpenRouter's
+    // `:free`) both have to tag, because only one of the two is available depending on the gateway.
+    assert!(row("anthropic/claude-3-haiku", true).contains("· free"));
+    assert!(row("deepseek-v4-flash-free", false).contains("· free"));
+    assert!(row("meta-llama/llama-3.3-70b:free", false).contains("· free"));
+    assert!(row("big-pickle", false).contains("· free"));
+    // A paid id must NOT be tagged — a false "free" is worse than no tag at all.
+    assert!(!row("gpt-4o", false).contains("free"));
+
+    let ctx = model_row(&client::ModelInfo {
+        id: "some-model-free".into(),
+        context_length: Some(200_000),
+        is_free: false,
+    });
+    assert!(ctx.contains("· free") && ctx.contains("200000 ctx"));
+}
+
+/// Codex has no `GET /models`, so its picker is fed from the shipped catalog. An empty catalog would
+/// silently drop the user into manual id entry for ids the binary already knows.
+#[test]
+fn codex_models_come_from_the_shipped_catalog() {
+    let infos = codex_model_infos();
+    assert!(!infos.is_empty(), "the Codex catalog must not be empty");
+    let ids: Vec<&str> = infos.iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        ids.contains(&crate::llm::codex_models::default_model()),
+        "the default model {:?} is not in the catalog it is picked from",
+        crate::llm::codex_models::default_model()
+    );
+    // Plan-priced, not a gateway's no-charge tier — tagging these `free` would be a lie.
+    assert!(infos.iter().all(|m| !m.is_free));
+    let preset = PROVIDER_PRESETS
+        .iter()
+        .find(|p| p.slug == "codex")
+        .expect("codex preset");
+    assert!(
+        ids.contains(&preset.sample_model),
+        "the preset's sample model {:?} is not one the picker offers",
+        preset.sample_model
+    );
 }
 /// A role's key must never reach the screen in the clear.
 ///
