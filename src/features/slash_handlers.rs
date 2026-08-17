@@ -14,6 +14,7 @@ use crate::core::{cli_config, types};
 use crate::features::slash::{self, SlashId};
 use crate::features::{commands, coop, timemachine};
 use crate::memory;
+use crate::ui::menus::{personas_menu, skills_menu, telegram_menu};
 use crate::ui::{config_ui, icons, splash, theme, tui};
 use crate::*;
 use anyhow::Result;

@@ -9,6 +9,7 @@ pub mod icons;
 pub mod image_input;
 pub mod links;
 pub mod markdown;
+pub mod menus;
 pub mod mermaid;
 pub mod moonscape;
 pub mod spinner;
