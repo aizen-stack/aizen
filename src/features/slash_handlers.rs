@@ -22,6 +22,12 @@ use console::style;
 use dialoguer::{Confirm, Select};
 use types::Message;
 
+/// `/memory <sub>` — the in-REPL view of the same store the agent writes through, so the user can
+/// audit and correct it without dropping to the CLI. Sub-commands mirror `aizen memory <sub>` 1:1
+/// (same functions, same ids) rather than reimplementing a second, drifting surface.
+///
+/// `forget` here is the SOFT delete (archive → restorable); hard `purge` is CLI-only on purpose, so
+/// nothing typed mid-chat can destroy a fact irreversibly.
 fn slash_memory(arg: &str) -> Result<()> {
     let (sub, rest) = match arg.split_once(char::is_whitespace) {
         Some((s, r)) => (s.trim(), r.trim()),
