@@ -1524,12 +1524,20 @@ fn run_time(cmd: TimeCmd) -> Result<()> {
                 // Report bytes actually returned, not objects touched: packing 14k objects sounds
                 // like work, but the number the user came for is how much smaller the store got.
                 if let Some(c) = compacted.filter(|c| c.packed > 0) {
-                    let mb = |b: u64| b as f64 / 1_048_576.0;
+                    // Scale the unit: a small store printed as "0.0 MB → 0.0 MB" reads as a no-op
+                    // when 36 objects were in fact packed.
+                    let size = |b: u64| {
+                        if b >= 1_048_576 {
+                            format!("{:.1} MB", b as f64 / 1_048_576.0)
+                        } else {
+                            format!("{:.0} KB", b as f64 / 1024.0)
+                        }
+                    };
                     println!(
-                        "  packed {} loose object(s) · {:.1} MB → {:.1} MB",
+                        "  packed {} loose object(s) · {} → {}",
                         c.packed,
-                        mb(c.before_bytes),
-                        mb(c.after_bytes)
+                        size(c.before_bytes),
+                        size(c.after_bytes)
                     );
                 }
                 Ok(())

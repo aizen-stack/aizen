@@ -580,7 +580,7 @@ pub(crate) enum TimeCmd {
         #[arg(long)]
         apply: bool,
     },
-    /// Delete ALL checkpoints (Git objects are reclaimed later by normal Git maintenance).
+    /// Delete ALL checkpoints (run `aizen time gc` afterwards to reclaim the disk they used).
     Clear,
 }
 
