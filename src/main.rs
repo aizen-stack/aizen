@@ -4095,6 +4095,299 @@ fn startup_update_probe() {
     }
 }
 
+/// The "⟲ last conversation ..." line both REPLs offer at startup, or `None` when this project
+/// has nothing saved to come back to.
+///
+/// Every turn is already autosaved, but nothing on a reopened terminal SAID so - it looked like a
+/// blank slate, the transcript sat on disk unmentioned, and the user retyped their context. A
+/// session from ANOTHER project is only offered when this one has none, and is labelled so that
+/// resuming it stays a visible choice.
+fn resume_hint() -> Option<String> {
+    let (name, n, origin) = most_recent_session()?;
+    let origin_note = origin.map(|o| format!(", {o}")).unwrap_or_default();
+    Some(format!(
+        "⟲ last conversation “{}” ({n} messages{origin_note}) — /resume to continue it",
+        pretty_session_name(&name)
+    ))
+}
+
+/// Pull drag-dropped / pasted image paths out of a typed line, leaving the prose behind.
+///
+/// The other half of Ctrl-O clipboard attach: only real image files are lifted, so a message that
+/// merely mentions a path keeps its text intact.
+fn lift_image_attachments(line: &mut String, images: &mut Vec<String>) {
+    if line.is_empty() {
+        return;
+    }
+    let (cleaned, from_line) = image_input::extract_image_attachments(line);
+    if !from_line.is_empty() {
+        images.extend(from_line);
+        *line = cleaned;
+    }
+}
+
+/// Build this turn's tool registry against the resolved endpoint.
+fn build_turn_registry(
+    http: &reqwest::Client,
+    ep: &cli_config::ResolvedEndpoint,
+) -> Result<agent::tools::ToolRegistry> {
+    agent::builtin::default_registry_with_task(
+        http.clone(),
+        ep.base_url.clone(),
+        ep.api_key.clone(),
+        ep.model.clone(),
+        approval_mode(),
+        resolve_ctx_window(&ep.model).0,
+        None, // cwd IS the project in the REPL
+    )
+}
+
+/// The agent config for one interactive turn.
+///
+/// `enable_steering` is the only thing the two surfaces disagree on: the retained REPL has a
+/// mailbox the user can type into mid-turn, the plain one does not. Everything else — approval
+/// mode, context window, self-review, LSP state, goal mode, the mid-turn snapshot — is a reading of
+/// live config that must not be allowed to differ between them, which is why it is written once.
+fn turn_agent_config(
+    cancel: crate::core::cancel::TurnCancel,
+    model: &str,
+    enable_steering: bool,
+) -> AgentConfig {
+    AgentConfig {
+        approval_mode: approval_mode(),
+        cancel,
+        context_window: resolve_ctx_window(model).0,
+        enable_self_review: cli_config::self_review_enabled(&cli_config::load()),
+        // Reflect the live manager state (honours `/lsp off` for this turn).
+        enable_lsp: crate::agent::lsp::LSP.is_enabled(),
+        // Goal mode (set by `/goal <text>`): threads the live goal into this turn so the loop runs
+        // cap-free with smart retry until the goal is declared and verified.
+        goal: crate::agent::goal::current_goal(),
+        // Only the interactive top-level turn reads the steering mailbox — a course correction the
+        // user typed is aimed at THIS task, not at whatever a delegated sub-agent is doing.
+        enable_steering,
+        // Keep the exit-flush snapshot current DURING the turn, not just at its edges.
+        on_progress: Some(publish_live_history),
+        // The user is sitting here waiting: retry a 429/5xx blip many times (like the Claude CLI)
+        // with FAST backoff (`interactive_backoff_ms`), so the whole chain still fits in ~30–40s and
+        // then reports a clear error. 10 is a CEILING, not a cost — a gateway that recovers on try 2
+        // stops at 2. `/goal` does not take this branch (goal mode retries transient errors
+        // indefinitely, see agent/mod.rs), so raising this never shortens a goal run.
+        max_transient_retries: 10,
+        ..AgentConfig::default()
+    }
+}
+
+/// Fold this turn's retrieved context into the outgoing message and seat it in history.
+///
+/// `line` stays the clean text the user typed — the fold only affects what is SENT, so the
+/// checkpoint, the display and the persisted transcript all keep the original. The dynamic prompt
+/// lane is refreshed AFTER the fold, never before: recall seats this turn's handle→id ledger and the
+/// `<skills>` lane ranks itself by affinity to exactly those facts, so refreshing first would build
+/// the index against the PREVIOUS turn's recall.
+fn seat_user_message(line: &str, images: Vec<String>, history: &mut Vec<Message>, model: &str) {
+    let sent = fold_context_into_query(line);
+    refresh_dynamic_prompt_lane(history, model);
+    if images.is_empty() {
+        history.push(Message::user(sent));
+    } else {
+        tui::emit_line(
+            &style(format!("📎 {} image(s) attached", images.len()))
+                .color256(splash::ACCENT)
+                .to_string(),
+        );
+        history.push(Message::user_with_images(sent, images));
+    }
+    // Refresh the exit-flush snapshot the moment the user turn lands, so an abrupt window close
+    // mid-turn still persists the question (the per-turn autosave only runs on success).
+    update_live_history(history);
+}
+
+// ── the shared turn: everything both REPL surfaces do identically ─────────────────────────────
+// `run_menu_sticky` and `run_menu_plain` differ in exactly two things — how a line arrives, and
+// whether Esc can race the model call. Everything else about a turn is the same work, and it used
+// to be written out twice. It drifted: the plain loop once ran the skill, persona and memory passes
+// in a different order than the retained one, and to this day it was the copy that never learned
+// about goal-mode completion, the post-turn timeout ceiling, or the recovery checkpoints. The two
+// functions below are the parts that were always meant to be one thing.
+//
+// They are surface-agnostic because `tui::emit_line` already is: it renders through the retained
+// backend when one is running and prints append-only when none is, so the same call reads correctly
+// on both. Nothing here may use `println!` — see `tui::note_line`.
+
+/// Run one agent turn against `ep`, with the model wiring both REPLs were building by hand.
+///
+/// The three closures (stream the turn, summarize for mid-loop compaction, optionally consult the
+/// `oracle` role for self-review) are pure functions of the endpoint, so there was never a reason
+/// for two copies. The caller keeps ownership of cancellation: the retained REPL races this future
+/// against Esc, the plain one simply awaits it.
+async fn run_agent_turn(
+    http: &reqwest::Client,
+    ep: &cli_config::ResolvedEndpoint,
+    cfg: &AgentConfig,
+    registry: &agent::tools::ToolRegistry,
+    history: &mut Vec<Message>,
+) -> Result<AgentOutcome> {
+    let base = ep.base_url.as_str();
+    let key = ep.api_key.as_str();
+    let model = ep.model.as_str();
+    let eager_on = eager_enabled();
+    let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
+        if eager_on {
+            // Read-only calls start the moment their streamed args complete.
+            let starter = agent::eager_starter(registry, cfg);
+            client::stream_chat_with_tools_eager(
+                http,
+                base,
+                key,
+                model,
+                &msgs,
+                &defs,
+                Some(&starter),
+            )
+            .await
+        } else {
+            client::stream_chat_with_tools(http, base, key, model, &msgs, &defs).await
+        }
+    };
+    // Non-streaming summarizer for mid-loop auto-compaction (keeps the streamed display clean).
+    let sum_ep = summarizer_endpoint(base, key, model);
+    let summarize = move |msgs: Vec<Message>| {
+        let ep = sum_ep.clone();
+        async move {
+            chore_chat(http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+                .await
+                .map(|t| t.content.unwrap_or_default())
+        }
+    };
+    // Optional oracle for self-review: only when `roles.oracle` names a stronger reviewer model;
+    // otherwise the loop falls back to nudge-mode.
+    let oracle = cli_config::role_configured("oracle")
+        .then(|| cli_config::resolve_role("oracle", ep))
+        .map(|role| {
+            move |msgs: Vec<Message>| {
+                let role = role.clone();
+                async move {
+                    chore_chat(http, &role.base_url, &role.api_key, &role.model, &msgs, &[])
+                        .await
+                        .map(|t| t.content.unwrap_or_default())
+                }
+            }
+        });
+    agent::run_agent_loop_full(chat, summarize, oracle, cfg, registry, history).await
+}
+
+/// How long the post-turn learning passes may take in total before the REPL gives up on them.
+///
+/// Each call already has its own 300s ceiling (`chore_chat` → `subagent_call_timeout`), but three of
+/// them in a row can strand an idle-looking REPL for fifteen minutes. On timeout the user sees a
+/// skip line instead of a spinner that never stops.
+const POST_TURN_OVERALL_TIMEOUT_SECS: u64 = 600;
+
+/// Everything a turn that reached the model must do afterwards, on either surface.
+///
+/// Ordering is load-bearing and was the thing that drifted: the learning passes read the FULL detail
+/// of the turn, so they must run before auto-compaction summarizes it away, and persistence must
+/// happen last and unconditionally — a cancelled learning pass is not a reason to lose the
+/// transcript.
+async fn finish_turn(
+    outcome: &AgentOutcome,
+    persona_before: Option<String>,
+    history: &mut Vec<Message>,
+    http: &reqwest::Client,
+    ep: &cli_config::ResolvedEndpoint,
+) {
+    // ABNORMAL STOP, SAID OUT LOUD. The loop can end for reasons that are NOT success — the repair
+    // budget ran out with the tree still broken, the step cap was hit mid-task, the model started
+    // repeating itself — and in each case it has usually already streamed a confident closing
+    // paragraph. Silence here makes those read exactly like `Done`, and the passes below would then
+    // file a red tree as a finished task.
+    surface_abnormal_stop(outcome);
+    // Goal mode finishes only on a verify-passing `Done`. Clear it here so the next turn is an
+    // ordinary capped turn again; Esc leaves the goal armed on purpose, so the user can retry.
+    if crate::agent::goal::current_goal().is_some() && matches!(outcome.stop, StopReason::Done) {
+        crate::agent::goal::set_goal(None);
+        crate::agent::goal::arm(false);
+        crate::agent::goal::clear();
+        tui::emit_line(
+            &style("🎯 goal complete — verified. goal mode off.")
+                .color256(splash::ACCENT)
+                .to_string(),
+        );
+    }
+    // An EMPTY answer from a SINGLE model call (no tool work, no streamed text) used to vanish
+    // silently — a rate limit swallowed into an empty 200, a content filter, or a gateway that
+    // streams `[DONE]` with no deltas looked identical to "still idle". `iters <= 1` keeps a turn
+    // that DID do tool work and merely ended without a closing sentence from being flagged.
+    let empty = outcome
+        .final_text
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty();
+    if empty && outcome.iters <= 1 {
+        tui::emit_line(&format!(
+            "{} the model returned an empty response — no text and no tool calls. Likely a rate limit, content filter, or a gateway that closed the stream early. Try again, or /model to switch.",
+            theme::warn("⚠ empty reply:")
+        ));
+    }
+    // The agent may have created or switched personas mid-turn (the `persona_create` tool). Resync
+    // the system prompt at the turn boundary so the new character is live from the next message —
+    // prefix-cache safe, because index 1 is rewritten between turns rather than during one.
+    let persona_after = cli_config::load().persona;
+    if persona_after != persona_before {
+        update_system_prompt(history, &ep.model);
+        if let Some(name) = persona_after {
+            tui::emit_line(
+                &style(format!("🎭 now playing: {name} (from your next message)"))
+                    .color256(splash::ACCENT)
+                    .to_string(),
+            );
+        }
+    }
+    // The learning passes are model calls made after the turn's own token was disarmed, so without
+    // re-arming, Esc would take the idle branch while the REPL sat awaiting them: to the user the
+    // turn had visibly ended and the app was wedged anyway. Cancelling here skips the remaining
+    // learning, which is always optional work.
+    let learning = cancellable_slash_labeled("learning from this turn…", async {
+        maybe_run_secretary(history, http, &ep.base_url, &ep.api_key, &ep.model).await;
+        maybe_evolve_persona(http, &ep.base_url, &ep.api_key, &ep.model).await;
+        maybe_auto_compact(history, http, &ep.base_url, &ep.api_key, &ep.model).await;
+    });
+    let learned = match tokio::time::timeout(
+        std::time::Duration::from_secs(POST_TURN_OVERALL_TIMEOUT_SECS),
+        learning,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            tui::emit_line(
+                &theme::muted("⏱ post-turn learning exceeded timeout — skipped.").to_string(),
+            );
+            None
+        }
+    };
+    if learned.is_none() {
+        tui::emit_line(&theme::muted("⏹ skipped the post-turn learning passes.").to_string());
+    }
+    // Persistence is NOT optional, so it sits outside that block: a cancelled learning pass must
+    // still leave the conversation on disk. `autosave_session` names the session with a model call,
+    // so it is cancellable too — the local-only writer keeps the transcript either way.
+    if cancellable_slash(autosave_session(
+        history,
+        http,
+        &ep.base_url,
+        &ep.api_key,
+        &ep.model,
+    ))
+    .await
+    .is_none()
+    {
+        autosave_last(history, Some(&ep.model));
+    }
+}
+
 /// The sticky-TUI REPL: a background keyboard thread feeds a submission queue while the agent runs,
 /// the input box stays pinned at the bottom, and Esc/Ctrl-C cancels an in-flight turn.
 async fn run_menu_sticky() -> Result<()> {
@@ -4162,23 +4455,11 @@ async fn run_menu_sticky() -> Result<()> {
                 .dim()
                 .to_string(),
         );
-    } else if let Some((name, n, origin)) = most_recent_session() {
-        // OFFER the previous conversation instead of waiting to be asked. Every turn was already
-        // autosaved, but nothing on this screen said so — a reopened terminal looked like a blank
-        // slate, so the transcript sat on disk unmentioned and the user retyped their context.
-        // Suppressed when a crash-recovery offer is showing: two competing restore prompts in a row
-        // is worse than one, and `/recover` (which carries an unsent draft + checkpoint id) wins.
-        // A session from ANOTHER project is only offered when this one has none — labeled, so
-        // resuming it is a visible choice.
-        let origin_note = origin.map(|o| format!(", {o}")).unwrap_or_default();
-        tui::emit_line(
-            &style(format!(
-                "⟲ last conversation “{}” ({n} messages{origin_note}) — /resume to continue it",
-                pretty_session_name(&name)
-            ))
-            .dim()
-            .to_string(),
-        );
+    } else if let Some(hint) = resume_hint() {
+        // Suppressed when a crash-recovery offer is showing: two competing restore prompts in a
+        // row is worse than one, and `/recover` (which carries an unsent draft + checkpoint id)
+        // wins.
+        tui::emit_line(&style(hint).dim().to_string());
     }
     // Background model health poller: colours the idle `● ready` chip green/yellow/red from a real
     // GET /models probe every 60s (plus once immediately). Independent of the chat HTTP client so a
@@ -4241,13 +4522,7 @@ async fn run_menu_sticky() -> Result<()> {
             tui::Submission::Chat(line, images) => {
                 let mut line = line.trim().to_string();
                 let mut images = images;
-                if !line.is_empty() {
-                    let (cleaned, file_imgs) = image_input::extract_image_attachments(&line);
-                    if !file_imgs.is_empty() {
-                        images.extend(file_imgs);
-                        line = cleaned;
-                    }
-                }
+                lift_image_attachments(&mut line, &mut images);
                 if line.is_empty() && images.is_empty() {
                     continue;
                 }
@@ -4327,15 +4602,17 @@ async fn run_menu_sticky() -> Result<()> {
                     );
                 }
                 model_label = model.clone();
-                // Seed the query-expansion endpoint from THIS turn's resolution so a non-English
-                // `codebase_search` can translate itself to English identifiers via the chore model.
-                // Re-seeded every turn so it follows a mid-session `/model` switch. Routes through the
-                // summarizer role internally; the LLM tier still stays behind `AIZEN_QUERY_EXPAND`.
-                agent::query_lang::set_expansion_endpoint(&cli_config::ResolvedEndpoint {
+                // This turn's endpoint, resolved once and shared by everything downstream: query
+                // expansion, the agent loop, and the post-turn passes all read the same triple.
+                let ep = cli_config::ResolvedEndpoint {
                     base_url: base_url.clone(),
                     api_key: api_key.clone(),
                     model: model.clone(),
-                });
+                };
+                // Seed the query-expansion endpoint from THIS turn's resolution so a non-English
+                // `codebase_search` can translate itself to English identifiers via the chore model.
+                // Re-seeded every turn so it follows a mid-session `/model` switch.
+                agent::query_lang::set_expansion_endpoint(&ep);
                 migrate_legacy_prompt_lanes(&mut history, &model);
                 // The rotating discoverability tip is emitted AFTER the turn finishes (see the
                 // success branch below) so it lands UNDER the model's final answer, not stranded
@@ -4368,38 +4645,11 @@ async fn run_menu_sticky() -> Result<()> {
                 // lane) so index 1 stays byte-stable and the transcript-tail prefix cache holds.
                 // `line` itself is unchanged → checkpoint / display / persisted history keep the
                 // clean user text.
-                let sent = fold_context_into_query(&line);
-                // AFTER the fold: recall seats this turn's ledger, and the `<skills>` lane ranks
-                // itself by affinity to exactly those facts. With `AIZEN_SKILL_GRAPH_RANK` unset the
-                // affinity map is empty, so the lane's BYTES are unchanged and the prefix cache above
-                // still holds — the reorder costs a cache miss only for someone who opts in.
-                refresh_dynamic_prompt_lane(&mut history, &model);
-                if images.is_empty() {
-                    history.push(Message::user(sent));
-                } else {
-                    tui::emit_line(
-                        &style(format!("📎 {} image(s) attached", images.len()))
-                            .color256(splash::ACCENT)
-                            .to_string(),
-                    );
-                    history.push(Message::user_with_images(sent, images));
-                }
-                // Refresh the exit-flush snapshot the moment the turn's user message lands, so an
-                // abrupt window close mid-turn still persists the question (per-turn autosave only
-                // runs on success).
-                update_live_history(&history);
+                seat_user_message(&line, images, &mut history, &model);
                 let persona_before = cli_config::load().persona;
                 // Arm LSP BEFORE building the registry — tools only register while enabled.
                 arm_lsp_session();
-                let registry = match agent::builtin::default_registry_with_task(
-                    http.clone(),
-                    base_url.clone(),
-                    api_key.clone(),
-                    model.clone(),
-                    approval_mode(),
-                    resolve_ctx_window(&model).0,
-                    None, // cwd IS the project in the REPL
-                ) {
+                let registry = match build_turn_registry(&http, &ep) {
                     Ok(r) => r,
                     Err(e) => {
                         tui::emit_line(&format!("{} {e}", theme::err("error:")));
@@ -4407,32 +4657,7 @@ async fn run_menu_sticky() -> Result<()> {
                         continue;
                     }
                 };
-                let cfg = AgentConfig {
-                    approval_mode: approval_mode(),
-                    cancel: turn_cancel.clone(),
-                    context_window: resolve_ctx_window(&model).0,
-                    enable_self_review: cli_config::self_review_enabled(&cli_config::load()),
-                    // Reflect the live manager state (honors `/lsp off` for this turn).
-                    enable_lsp: crate::agent::lsp::LSP.is_enabled(),
-                    // Goal mode (set by `/goal <text>`): threads the live goal into this turn so the
-                    // loop runs cap-free with smart retry until the goal is declared + verified.
-                    goal: crate::agent::goal::current_goal(),
-                    // Only the interactive top-level turn reads the steering mailbox — a course
-                    // correction the user typed is aimed at THIS task, not at whatever a delegated
-                    // sub-agent happens to be doing (children keep the `false` default).
-                    enable_steering: true,
-                    // Keep the exit-flush snapshot current DURING the turn, not just at its edges.
-                    on_progress: Some(publish_live_history),
-                    // The user is sitting here waiting: retry a 429/5xx blip many times (like the
-                    // Claude CLI) before giving up, with FAST backoff (`interactive_backoff_ms`) so
-                    // the whole chain still fits in ~30–40s and then reports a clear error. 10 is a
-                    // CEILING, not a cost — a gateway that recovers on try 2 stops at 2, so the happy
-                    // path is unchanged. `/goal` does NOT take this branch (goal_mode retries
-                    // transient errors indefinitely — see agent/mod.rs), so raising this never
-                    // shortens a goal run.
-                    max_transient_retries: 10,
-                    ..AgentConfig::default()
-                };
+                let cfg = turn_agent_config(turn_cancel.clone(), &model, true);
 
                 // Esc pressed DURING prep already cancelled this token — honour it instead of firing
                 // the request anyway. Without this, cancelling in the prep window (the very thing the
@@ -4462,89 +4687,20 @@ async fn run_menu_sticky() -> Result<()> {
                 // tool-call turn and one placeholder result per call are appended in a single
                 // synchronous block before any tool await, and real results overwrite the
                 // placeholders as they land (see agent::execute_calls).
+                // Run the turn racing a cancel signal; on cancel the future is DROPPED at its
+                // current await (model stream / tool batch / verify gate), which aborts the
+                // in-flight request. History stays consistent under the drop because the loop
+                // PRE-FILLS: the assistant tool-call turn and one placeholder result per call are
+                // appended in a single synchronous block before any tool await, and real results
+                // overwrite the placeholders as they land (see agent::execute_calls).
                 let result = {
-                    let http_ref = &http;
-                    let base = base_url.as_str();
-                    let key = api_key.as_str();
-                    let model_ref = model.as_str();
-                    let registry_ref = &registry;
-                    let cfg_ref = &cfg;
-                    let eager_on = eager_enabled();
-                    let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
-                        if eager_on {
-                            // Read-only calls start the moment their streamed args complete.
-                            let starter = agent::eager_starter(registry_ref, cfg_ref);
-                            client::stream_chat_with_tools_eager(
-                                http_ref,
-                                base,
-                                key,
-                                model_ref,
-                                &msgs,
-                                &defs,
-                                Some(&starter),
-                            )
-                            .await
-                        } else {
-                            client::stream_chat_with_tools(
-                                http_ref, base, key, model_ref, &msgs, &defs,
-                            )
-                            .await
-                        }
-                    };
-                    // Non-streaming summarizer for mid-loop auto-compaction (keeps the streamed display clean).
-                    let sum_ep = summarizer_endpoint(base, key, model_ref);
-                    let summarize = move |msgs: Vec<Message>| {
-                        let ep = sum_ep.clone();
-                        async move {
-                            chore_chat(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
-                                .await
-                                .map(|t| t.content.unwrap_or_default())
-                        }
-                    };
-                    // Optional oracle for self-review: only when `roles.oracle` is explicitly
-                    // configured (a stronger reviewer model); otherwise nudge-mode.
-                    let oracle = cli_config::role_configured("oracle")
-                        .then(|| {
-                            cli_config::resolve_role(
-                                "oracle",
-                                &cli_config::ResolvedEndpoint {
-                                    base_url: base.to_string(),
-                                    api_key: key.to_string(),
-                                    model: model_ref.to_string(),
-                                },
-                            )
-                        })
-                        .map(|ep| {
-                            move |msgs: Vec<Message>| {
-                                let ep = ep.clone();
-                                async move {
-                                    chore_chat(
-                                        http_ref,
-                                        &ep.base_url,
-                                        &ep.api_key,
-                                        &ep.model,
-                                        &msgs,
-                                        &[],
-                                    )
-                                    .await
-                                    .map(|t| t.content.unwrap_or_default())
-                                }
-                            }
-                        });
-                    let fut = agent::run_agent_loop_full(
-                        chat,
-                        summarize,
-                        oracle,
-                        &cfg,
-                        &registry,
-                        &mut history,
-                    );
+                    let fut = run_agent_turn(&http, &ep, &cfg, &registry, &mut history);
                     tokio::select! {
                         r = fut => Some(r),
-                        // Match only a REAL signal: if the keyboard thread exits (read_key error/EOF)
-                        // its cancel_tx drops and recv() resolves to None — the `Some(())` pattern
-                        // fails, tokio disables this branch, and the turn completes instead of being
-                        // spuriously killed with "(interrupted by user)".
+                        // Match only a REAL signal: if the keyboard thread exits (read_key error or
+                        // EOF) its cancel_tx drops and recv() resolves to None — the `Some(())`
+                        // pattern fails, tokio disables this branch, and the turn completes instead
+                        // of being spuriously killed with "(interrupted by user)".
                         Some(()) = input.cancel.recv() => None,
                     }
                 };
@@ -4632,120 +4788,7 @@ async fn run_menu_sticky() -> Result<()> {
                         // tree is remembered as a finished task. The one-shot `aizen agent` path has
                         // reported these since it was written (see the `match outcome.stop` in
                         // `run_agent_cmd`); the REPL — where the user actually lives — never did.
-                        surface_abnormal_stop(&outcome);
-                        // Goal mode finishes only on a verify-passing `Done` (the goal gate lets the
-                        // turn reach Done solely after `goal_complete` + a green verify gate). Clear it
-                        // here so the next turn is an ordinary capped turn again. Esc (Cancelled) lands
-                        // in the `None` arm and intentionally leaves the goal armed — the user can retry.
-                        if crate::agent::goal::current_goal().is_some()
-                            && matches!(outcome.stop, StopReason::Done)
-                        {
-                            crate::agent::goal::set_goal(None);
-                            crate::agent::goal::arm(false);
-                            crate::agent::goal::clear();
-                            tui::emit_line(
-                                &style("🎯 goal complete — verified. goal mode off.")
-                                    .color256(splash::ACCENT)
-                                    .to_string(),
-                            );
-                        }
-                        // An EMPTY answer from a SINGLE model call (no tool work, no streamed text)
-                        // used to vanish silently — a blank turn (a rate-limit swallowed into an empty
-                        // 200, a content filter, a dead endpoint that streams `[DONE]` with no deltas)
-                        // looked identical to "still idle". Surface it so a failed/empty call never
-                        // passes for success. Gated on `iters <= 1` so a turn that DID do tool work and
-                        // simply ended without a closing sentence isn't wrongly flagged.
-                        let empty = outcome
-                            .final_text
-                            .as_deref()
-                            .map(str::trim)
-                            .unwrap_or("")
-                            .is_empty();
-                        if empty && outcome.iters <= 1 {
-                            // A blank turn is a FAILURE, not idle — surface it loudly (warn colour, not
-                            // a dim aside) so an empty 200 / content filter / rate-limit-swallowed-as-200
-                            // / dead endpoint that streams `[DONE]` with no deltas can never pass silently
-                            // for success. This is the "don't swallow API errors" contract.
-                            tui::emit_line(&format!(
-                                "{} the model returned an empty response — no text and no tool calls. Likely a rate limit, content filter, or a gateway that closed the stream early. Try again, or /model to switch.",
-                                theme::warn("⚠ empty reply:")
-                            ));
-                        }
-                        let persona_after = cli_config::load().persona;
-                        if persona_after != persona_before {
-                            update_system_prompt(&mut history, &model);
-                            if let Some(name) = persona_after {
-                                tui::emit_line(
-                                    &style(format!(
-                                        "🎭 now playing: {name} (from your next message)"
-                                    ))
-                                    .color256(splash::ACCENT)
-                                    .to_string(),
-                                );
-                            }
-                        }
-                        // The post-turn passes are model calls (the secretary, persona reflection,
-                        // auto-compaction) and they run here, after `set_working(false)` and after
-                        // the turn's token was disarmed. So the pill was down, `turn_in_flight()`
-                        // was false, and Esc took the idle branch — while the REPL sat awaiting them and
-                        // consumed no input. To the user the turn had visibly ENDED and the app was
-                        // wedged anyway. Re-arm for the duration; cancelling skips the remaining
-                        // learning, which is always optional work.
-                        //
-                        // OVERALL TIMEOUT (600s = 10 minutes): each call has its own timeout (300s via
-                        // chore_chat → subagent_call_timeout), but the COMBINED block needs a ceiling so a
-                        // hung stream in one pass doesn't strand the REPL for >15 minutes. If the timeout
-                        // fires, the user sees "· skipped" instead of an infinite spinner.
-                        const POST_TURN_OVERALL_TIMEOUT_SECS: u64 = 600;
-                        let learning_fut =
-                            cancellable_slash_labeled("learning from this turn…", async {
-                                maybe_run_secretary(&history, &http, &base_url, &api_key, &model)
-                                    .await;
-                                maybe_evolve_persona(&http, &base_url, &api_key, &model).await;
-                                maybe_auto_compact(
-                                    &mut history,
-                                    &http,
-                                    &base_url,
-                                    &api_key,
-                                    &model,
-                                )
-                                .await;
-                            });
-                        let learned = match tokio::time::timeout(
-                            std::time::Duration::from_secs(POST_TURN_OVERALL_TIMEOUT_SECS),
-                            learning_fut,
-                        )
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => {
-                                tui::emit_line(
-                                    &theme::muted(
-                                        "⏱ post-turn learning exceeded timeout — skipped.",
-                                    )
-                                    .to_string(),
-                                );
-                                None
-                            }
-                        };
-                        if learned.is_none() {
-                            tui::emit_line(
-                                &theme::muted("⏹ skipped the post-turn learning passes.")
-                                    .to_string(),
-                            );
-                        }
-                        // Persistence is NOT optional, so it sits outside that block: a cancelled
-                        // learning pass must still leave the conversation on disk. `autosave_session`
-                        // names the session with a model call, so it's cancellable too — falling back
-                        // to the local-only writer keeps the transcript either way.
-                        if cancellable_slash(autosave_session(
-                            &history, &http, &base_url, &api_key, &model,
-                        ))
-                        .await
-                        .is_none()
-                        {
-                            autosave_last(&history, Some(&model));
-                        }
+                        finish_turn(&outcome, persona_before, &mut history, &http, &ep).await;
                     }
                     Some(Err(e)) => {
                         tui::emit_line(&format!("{} {e}", theme::err("error:")));
@@ -4810,16 +4853,8 @@ async fn run_menu_plain() -> Result<()> {
     let mut input_history: Vec<String> = Vec::new(); // recallable past prompts (↑/↓ in the box)
     rebuild_system(&mut history, &model_label);
     install_exit_flush_handler(); // flush the live chat if the terminal window is closed (Windows ✕)
-    if let Some((name, n, origin)) = most_recent_session() {
-        let origin_note = origin.map(|o| format!(", {o}")).unwrap_or_default();
-        println!(
-            "{}",
-            style(format!(
-                "⟲ last conversation “{}” ({n} messages{origin_note}) — /resume to continue it",
-                pretty_session_name(&name)
-            ))
-            .dim()
-        );
+    if let Some(hint) = resume_hint() {
+        tui::emit_line(&style(hint).dim().to_string());
     }
 
     loop {
@@ -4832,13 +4867,7 @@ async fn run_menu_plain() -> Result<()> {
         let mut line = line.trim().to_string();
         // Drag-drop / typed / pasted image-file paths on the line → vision attachments (the other
         // half of Ctrl-O clipboard attach). Only real image files are pulled; prose is preserved.
-        if !line.is_empty() {
-            let (cleaned, file_imgs) = image_input::extract_image_attachments(&line);
-            if !file_imgs.is_empty() {
-                images.extend(file_imgs);
-                line = cleaned;
-            }
-        }
+        lift_image_attachments(&mut line, &mut images);
         if line.is_empty() && images.is_empty() {
             continue;
         }
@@ -4913,12 +4942,14 @@ async fn run_menu_plain() -> Result<()> {
             }
         };
         model_label = model.clone();
-        // See the sticky REPL: seed the query-expansion endpoint per turn so it follows `/model`.
-        agent::query_lang::set_expansion_endpoint(&cli_config::ResolvedEndpoint {
+        // One resolved endpoint for the whole turn — the same value the retained REPL builds,
+        // now that both hand the identical triple to the shared turn helpers.
+        let ep = cli_config::ResolvedEndpoint {
             base_url: base_url.clone(),
             api_key: api_key.clone(),
             model: model.clone(),
-        });
+        };
+        agent::query_lang::set_expansion_endpoint(&ep);
         migrate_legacy_prompt_lanes(&mut history, &model);
         // Per-turn reasoning-effort auto-detect (mirrors the sticky REPL): classify what the user
         // TYPED, not the expanded payload — see the sticky path for why. Falls back to the finalized
@@ -4934,41 +4965,12 @@ async fn run_menu_plain() -> Result<()> {
         // Fold memory recall + codebase-index retrieval into the SENT content (not the cached
         // system lane) — see `fold_context_into_query`. `line` stays the original for persisted
         // history / display.
-        let sent = fold_context_into_query(&line);
-        // AFTER the fold, never before: recall seats this turn's handle→id ledger, and the `<skills>`
-        // lane ranks itself by graph affinity to exactly those facts. Refreshing first meant the
-        // index was always built against the PREVIOUS turn's recall.
-        refresh_dynamic_prompt_lane(&mut history, &model);
-        if images.is_empty() {
-            history.push(Message::user(sent));
-        } else {
-            println!(
-                "{}",
-                style(format!(
-                    "📎 {} image{} attached",
-                    images.len(),
-                    if images.len() == 1 { "" } else { "s" }
-                ))
-                .color256(splash::ACCENT)
-            );
-            history.push(Message::user_with_images(sent, images));
-        }
-        // Refresh the exit-flush snapshot the moment the user turn lands — so a window close mid-turn
-        // (before the per-turn autosave) still persists this message.
-        update_live_history(&history);
+        seat_user_message(&line, images, &mut history, &model);
         // Snapshot the active persona so we can detect an in-turn switch (the `persona_create` tool)
         // and resync the system prompt at the turn boundary — prefix-cache safe, takes effect next msg.
         let persona_before = cli_config::load().persona;
         arm_lsp_session();
-        let registry = match agent::builtin::default_registry_with_task(
-            http.clone(),
-            base_url.clone(),
-            api_key.clone(),
-            model.clone(),
-            approval_mode(),
-            resolve_ctx_window(&model).0,
-            None, // cwd IS the project in the REPL
-        ) {
+        let registry = match build_turn_registry(&http, &ep) {
             Ok(r) => r,
             Err(e) => {
                 tui::note_line(&format!("{} {e}", style("error:").red()));
@@ -4978,83 +4980,8 @@ async fn run_menu_plain() -> Result<()> {
         };
         // Unified ask/smart/yolo approval, with AIZEN_YES forcing yolo.
         let turn_cancel = crate::core::cancel::TurnCancel::new();
-        let cfg = AgentConfig {
-            approval_mode: approval_mode(),
-            cancel: turn_cancel,
-            context_window: resolve_ctx_window(&model).0,
-            enable_self_review: cli_config::self_review_enabled(&cli_config::load()),
-            enable_lsp: crate::agent::lsp::LSP.is_enabled(),
-            // Goal mode (set by `/goal <text>`): threads the live goal so the loop runs cap-free
-            // with smart retry until the goal is declared + verified.
-            goal: crate::agent::goal::current_goal(),
-            // Same mid-turn snapshot as the sticky REPL: an abrupt close mid-turn keeps the work
-            // done so far instead of only the question.
-            on_progress: Some(publish_live_history),
-            // User is sitting here waiting: retry a 429/5xx blip many times (like Claude CLI) with
-            // FAST backoff (interactive_backoff_ms), so the whole chain stays inside ~30–40s then
-            // reports a clean error. `/goal` does NOT take this path (goal_mode is separate, retries
-            // transient forever) — see agent/mod.rs. This is only a CEILING: a blip that clears on
-            // retry 2 stops at 2, so the success path is not slowed.
-            max_transient_retries: 10,
-            ..AgentConfig::default()
-        };
-        let http_ref = &http;
-        let base = base_url.as_str();
-        let key = api_key.as_str();
-        let model_ref = model.as_str();
-        let registry_ref = &registry;
-        let cfg_ref = &cfg;
-        let eager_on = eager_enabled();
-        let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
-            if eager_on {
-                let starter = agent::eager_starter(registry_ref, cfg_ref);
-                client::stream_chat_with_tools_eager(
-                    http_ref,
-                    base,
-                    key,
-                    model_ref,
-                    &msgs,
-                    &defs,
-                    Some(&starter),
-                )
-                .await
-            } else {
-                client::stream_chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
-            }
-        };
-        let sum_ep = summarizer_endpoint(base, key, model_ref);
-        let summarize = move |msgs: Vec<Message>| {
-            let ep = sum_ep.clone();
-            async move {
-                chore_chat(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
-                    .await
-                    .map(|t| t.content.unwrap_or_default())
-            }
-        };
-        let oracle = cli_config::role_configured("oracle")
-            .then(|| {
-                cli_config::resolve_role(
-                    "oracle",
-                    &cli_config::ResolvedEndpoint {
-                        base_url: base.to_string(),
-                        api_key: key.to_string(),
-                        model: model_ref.to_string(),
-                    },
-                )
-            })
-            .map(|ep| {
-                move |msgs: Vec<Message>| {
-                    let ep = ep.clone();
-                    async move {
-                        chore_chat(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
-                            .await
-                            .map(|t| t.content.unwrap_or_default())
-                    }
-                }
-            });
-        match agent::run_agent_loop_full(chat, summarize, oracle, &cfg, &registry, &mut history)
-            .await
-        {
+        let cfg = turn_agent_config(turn_cancel, &model, false);
+        match run_agent_turn(&http, &ep, &cfg, &registry, &mut history).await {
             // `clarify` paused the turn — show the question, loop back for the answer (the next
             // typed message continues this conversation). No post-turn learning: not done yet.
             Ok(AgentOutcome {
@@ -5065,46 +4992,7 @@ async fn run_menu_plain() -> Result<()> {
                 autosave_last(&history, Some(&model)); // mirror of the sticky path: a paused turn is still a transcript
             }
             Ok(outcome) => {
-                // Mirror of the sticky path: a non-`Done` stop is not success and must not render as
-                // one. See `surface_abnormal_stop`.
-                surface_abnormal_stop(&outcome);
-                // Surface an empty single-call turn (empty 200 / content filter / gateway that
-                // closed the stream early) as a visible warning instead of a silent no-op — the
-                // plain-REPL mirror of the sticky path's `⚠ empty reply` line.
-                let empty = outcome
-                    .final_text
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or("")
-                    .is_empty();
-                if empty && outcome.iters <= 1 {
-                    eprintln!(
-                        "{} the model returned an empty response — no text and no tool calls. Likely a rate limit, content filter, or a gateway that closed the stream early. Try again, or /model to switch.",
-                        style("⚠ empty reply:").yellow()
-                    );
-                }
-                // The agent may have created/switched personas mid-turn (persona_create tool).
-                // Resync the system prompt now so the new character is live from the next message.
-                let persona_after = cli_config::load().persona;
-                if persona_after != persona_before {
-                    update_system_prompt(&mut history, &model);
-                    if let Some(name) = persona_after {
-                        println!(
-                            "{}",
-                            style(format!("🎭 now playing: {name} (from your next message)"))
-                                .color256(splash::ACCENT)
-                        );
-                    }
-                }
-                // File what the turn was worth, from the full detail BEFORE compaction summarizes
-                // it away. ONE call for facts + episode + skill — this loop used to run skill,
-                // persona and memory in a different order than the retained loop above.
-                maybe_run_secretary(&history, &http, &base_url, &api_key, &model).await;
-                // Periodic: distill accumulated episodes into durable character insights.
-                maybe_evolve_persona(&http, &base_url, &api_key, &model).await;
-                maybe_auto_compact(&mut history, &http, &base_url, &api_key, &model).await;
-                // Auto-checkpoint so /sessions can always restore where you left off (no manual save).
-                autosave_session(&history, &http, &base_url, &api_key, &model).await;
+                finish_turn(&outcome, persona_before, &mut history, &http, &ep).await;
             }
             Err(e) => {
                 tui::note_line(&format!("{} {e}", style("error:").red()));
