@@ -10,6 +10,7 @@ pub mod config;
 pub mod convo;
 pub mod device;
 pub mod effort;
+pub mod endpoint;
 pub mod exec_ctx;
 pub mod gitx;
 pub mod net_guard;

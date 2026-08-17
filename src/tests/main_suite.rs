@@ -2,7 +2,8 @@
 //! Kept as a `#[path]` child module so `use super::*` still resolves to the crate root.
 
 use super::*;
-use anyhow::anyhow; // `main.rs` no longer needs it now that `apps` moved out; these tests still do.
+use crate::core::config;
+use anyhow::anyhow; // `main.rs` no longer needs it now that `apps` moved out; these tests still do. // ditto: `main.rs` stopped needing it once the subcommands moved out.
 
 #[test]
 fn config_provider_subcommands_parse() {
