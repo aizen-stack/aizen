@@ -42,6 +42,16 @@ const DEFAULT_KEEP: usize = 50;
 /// without ever touching a milestone until the total budget itself is exceeded. Override with
 /// `timemachine_keep_safety` in config.
 const DEFAULT_KEEP_SAFETY: usize = 5;
+/// How many LOOSE objects may pile up in a store before a save pays for a compaction pass.
+///
+/// Every checkpoint writes its commit, its tree, and one blob per changed file as separate loose
+/// files, and nothing in git's own housekeeping will ever pack them here — see
+/// [`RepoContext::compact_objects`] for why `gc` cannot run against this store. Left alone the pile
+/// grows without bound: 14,868 loose objects for 30 live checkpoints on the author's machine.
+///
+/// The threshold trades a rare ~1 s pause against unbounded growth. Below it a store costs a few MB,
+/// so compacting would spend more time than it saves.
+const LOOSE_COMPACT_THRESHOLD: usize = 2048;
 /// Label of the once-per-run pre-edit auto-checkpoint. Shared with the agent loop's call site so the
 /// SafetyNet classification keys off a single source of truth, not a copy-pasted string literal.
 pub(crate) const PRE_EDIT_LABEL: &str = "before agent edits";
@@ -641,6 +651,33 @@ impl RepoContext {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        let mut cmd = self.git_cmd_for(index, args);
+        run_git_bounded(&mut cmd, "internal git operation")
+    }
+
+    /// Same command hygiene as [`RepoContext::git_output`], but feeds `stdin_bytes` to the process.
+    /// Used by [`RepoContext::compact_objects`], which hands `pack-objects` an object list far too
+    /// long for an argument vector.
+    fn git_output_stdin<I, S>(&self, args: I, stdin_bytes: &[u8], what: &str) -> Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut cmd = self.git_cmd_for(None, args);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        run_git_piped_bounded(&mut cmd, stdin_bytes, what)
+    }
+
+    /// The plumbing `Command` shared by both runners: private store as `GIT_DIR`, source tree as the
+    /// work tree, and every hook/filter/config channel that could run repository-controlled code shut
+    /// off before an approval gate.
+    fn git_cmd_for<I, S>(&self, index: Option<&Path>, args: I) -> Command
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let mut cmd = git_cmd();
         let hooks = strip_windows_verbatim(&self.hooks_dir)
             .to_string_lossy()
@@ -688,7 +725,7 @@ impl RepoContext {
         } else {
             cmd.env_remove("GIT_INDEX_FILE");
         }
-        run_git_bounded(&mut cmd, "internal git operation")
+        cmd
     }
 
     /// Probe the **source** repository for external filter drivers (not the private store).
@@ -1055,6 +1092,113 @@ impl RepoContext {
             let _ = self.git(None, ["cat-file", "-e", &format!("{commit}^{{commit}}")])?;
         }
         Ok(())
+    }
+
+    /// Every loose object this store PHYSICALLY owns, as full OIDs.
+    ///
+    /// Read off the filesystem rather than asked of git, because that is the one enumeration with no
+    /// reachability walk in it and no dependence on alternates: `objects/<2 hex>/<rest hex>` is a
+    /// loose object of this store and nothing else. `pack/`, `info/`, and git's `tmp_obj_*` scratch
+    /// files fail the hex test and are skipped.
+    fn loose_object_ids(&self) -> Vec<String> {
+        let objects = self.store_git_dir.join("objects");
+        let mut oids = Vec::new();
+        let Ok(fanout) = fs::read_dir(&objects) else {
+            return oids;
+        };
+        for dir in fanout.flatten() {
+            let name = dir.file_name();
+            let Some(prefix) = name.to_str() else {
+                continue;
+            };
+            if prefix.len() != 2 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            let Ok(rd) = fs::read_dir(dir.path()) else {
+                continue;
+            };
+            for obj in rd.flatten() {
+                let rest = obj.file_name();
+                let Some(rest) = rest.to_str() else { continue };
+                if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_hexdigit()) {
+                    continue;
+                }
+                oids.push(format!("{prefix}{rest}"));
+            }
+        }
+        oids
+    }
+
+    /// Compact the store's loose objects into a pack.
+    ///
+    /// `git gc` and `git repack` cannot do this job here, and that is not a tuning problem — it is
+    /// structural. Both select objects by WALKING history, and a checkpoint commit's parent often
+    /// lives only in the source repository, reachable through the sealed alternates pointer. As soon
+    /// as the source prunes that commit — or is moved, renamed, or deleted — the walk dies with
+    /// `failed to traverse parents of commit <oid>` and repack aborts having packed nothing. Retention
+    /// still deletes refs, so the ledger looks tidy while not one byte is ever reclaimed. Measured on
+    /// the author's machine before this fix: 14,868 loose objects and 0 packs backing 30 live
+    /// checkpoints, 88 MB across 17,336 files.
+    ///
+    /// So select by OID instead of by reachability. [`RepoContext::loose_object_ids`] lists exactly
+    /// what the store owns, and `pack-objects` takes that list on stdin without walking anything, so a
+    /// dangling parent cannot abort it. `prune-packed` then drops the loose copies — it removes only
+    /// objects it has confirmed are in a pack, so an interrupted run leaves duplicates, never a gap.
+    ///
+    /// Unreachable objects are preserved on purpose: they are the recovery evidence an interrupted
+    /// prune or restore leaves behind, and `doctor` reports them. This reclaims space, it does not
+    /// decide what is garbage.
+    ///
+    /// Caller must hold the store lease. Errors are the caller's to swallow — failing to compact is
+    /// never a reason to fail the operation that triggered it.
+    fn compact_objects(&self) -> Result<CompactReport> {
+        let objects = self.store_git_dir.join("objects");
+        let before_bytes = dir_size_bytes(&objects);
+        let oids = self.loose_object_ids();
+        if oids.is_empty() {
+            return Ok(CompactReport {
+                packed: 0,
+                before_bytes,
+                after_bytes: before_bytes,
+            });
+        }
+        let mut stdin = String::with_capacity(oids.len() * 41);
+        for oid in &oids {
+            stdin.push_str(oid);
+            stdin.push('\n');
+        }
+        // Write into the store's own pack dir. `pack-objects <base>` renames the finished pack into
+        // place, so a crash mid-write leaves a `tmp_pack_*` git itself ignores, not a torn pack.
+        let pack_base = strip_windows_verbatim(&objects.join("pack").join("pack"))
+            .to_string_lossy()
+            .replace('\\', "/");
+        fs::create_dir_all(objects.join("pack"))
+            .with_context(|| format!("creating pack dir {}", objects.join("pack").display()))?;
+        let out = self.git_output_stdin(
+            ["pack-objects", "--non-empty", "-q", &pack_base],
+            stdin.as_bytes(),
+            "private-store pack-objects (compact)",
+        )?;
+        if !out.status.success() {
+            bail!(
+                "compacting the time-machine object store failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        // Only now are the loose copies redundant. `prune-packed` re-verifies each one is packed
+        // before unlinking it, so this cannot outrun the write above.
+        let pruned = self.git_output(None, ["prune-packed", "-q"])?;
+        if !pruned.status.success() {
+            bail!(
+                "dropping packed-away loose objects failed: {}",
+                String::from_utf8_lossy(&pruned.stderr).trim()
+            );
+        }
+        Ok(CompactReport {
+            packed: oids.len(),
+            before_bytes,
+            after_bytes: dir_size_bytes(&objects),
+        })
     }
 
     fn update_ref_create(&self, name: &str, oid: &str) -> Result<()> {
@@ -2110,6 +2254,7 @@ pub fn save(label: &str, auto: bool) -> Result<Snapshot> {
     let keep = cfg.timemachine_keep.unwrap_or(DEFAULT_KEEP);
     let keep_safety = cfg.timemachine_keep_safety.unwrap_or(DEFAULT_KEEP_SAFETY);
     prune_after_save(&ctx, keep, keep_safety, &[snap.id])?;
+    compact_if_loose(&ctx);
     Ok(snap)
 }
 
@@ -2120,7 +2265,30 @@ pub fn save_with_chat(label: &str, auto: bool, chat: &[Message]) -> Result<Snaps
     let keep = cfg.timemachine_keep.unwrap_or(DEFAULT_KEEP);
     let keep_safety = cfg.timemachine_keep_safety.unwrap_or(DEFAULT_KEEP_SAFETY);
     prune_after_save(&ctx, keep, keep_safety, &[snap.id])?;
+    compact_if_loose(&ctx);
     Ok(snap)
+}
+
+/// Pack the store's loose objects once they pass [`LOOSE_COMPACT_THRESHOLD`].
+///
+/// Called after a save has RELEASED its leases: compaction wants the store exclusively, and taking it
+/// while `prune_after_save` still holds the shared lease would deadlock against ourselves.
+///
+/// Best-effort throughout. Housekeeping must never be able to fail a checkpoint that already
+/// succeeded, so a busy store, a missing git, or a failed pack all just mean "not this time" — the
+/// next save re-checks and the pile is still bounded.
+fn compact_if_loose(ctx: &RepoContext) {
+    if ctx.loose_object_ids().len() < LOOSE_COMPACT_THRESHOLD {
+        return;
+    }
+    let Ok(_store) = ctx.store_exclusive() else {
+        return;
+    };
+    // Re-count under the lease: a sibling worktree may have compacted this store while we queued.
+    if ctx.loose_object_ids().len() < LOOSE_COMPACT_THRESHOLD {
+        return;
+    }
+    let _ = ctx.compact_objects();
 }
 
 fn prune_after_save(
@@ -3000,6 +3168,10 @@ pub struct DoctorReport {
     pub worktree_id: String,
     pub store: String,
     pub checkpoints: usize,
+    /// Loose objects sitting in the store right now. Reported because this is the number that used to
+    /// grow forever with nothing surfacing it: a store can be perfectly healthy and still be tens of
+    /// thousands of files. `aizen time gc` packs them.
+    pub loose_objects: usize,
     pub issues: Vec<String>,
 }
 
@@ -3031,6 +3203,8 @@ pub fn doctor() -> Result<DoctorReport> {
         }
         Err(e) => issues.push(format!("private store alternates unreadable: {e}")),
     }
+    // Counted before the report is built: both constructions below move fields out of `ctx`.
+    let loose_objects = ctx.loose_object_ids().len();
     let ledger = match ctx.load_ledger() {
         Ok(l) => l,
         Err(e) => {
@@ -3041,6 +3215,7 @@ pub fn doctor() -> Result<DoctorReport> {
                 worktree_id: ctx.worktree_id,
                 store: ctx.store_git_dir.display().to_string(),
                 checkpoints: 0,
+                loose_objects,
                 issues,
             });
         }
@@ -3072,6 +3247,7 @@ pub fn doctor() -> Result<DoctorReport> {
         worktree_id: ctx.worktree_id,
         store: ctx.store_git_dir.display().to_string(),
         checkpoints: ledger.snapshots.len(),
+        loose_objects,
         issues,
     })
 }
@@ -3085,7 +3261,10 @@ pub fn doctor_repair() -> Result<DoctorReport> {
     doctor()
 }
 
-pub fn doctor_gc() -> Result<DoctorReport> {
+/// Returns the health report plus what compaction reclaimed, so the CLI can report bytes rather than
+/// only "cleaned". The compaction half is `None` when packing could not run — a store that will not
+/// compact is still a store worth reporting on.
+pub fn doctor_gc() -> Result<(DoctorReport, Option<CompactReport>)> {
     let ctx = RepoContext::current()?;
     // Whole-store sweep: block every sibling worktree's ref creation/deletion for the scan+reap so a
     // concurrent `save` can't slip a ref past `for-each-ref`. Store-exclusive ordered before the
@@ -3170,8 +3349,13 @@ pub fn doctor_gc() -> Result<DoctorReport> {
     journal.phase = JournalPhase::LedgerCommitted;
     ctx.save_journal(&journal)?;
     ctx.clear_journal()?;
+    // Refs are reaped; now reclaim the bytes. This is the one place holding the store EXCLUSIVELY,
+    // and an explicit `gc` is exactly when the user is asking for space back — so compact
+    // unconditionally here rather than waiting for `LOOSE_COMPACT_THRESHOLD`. Best-effort: a store
+    // that cannot be packed is still a healthy store, and `doctor()` below reports what it finds.
+    let compacted = ctx.compact_objects().ok();
     drop(_lock);
-    doctor()
+    Ok((doctor()?, compacted))
 }
 
 /// One private store found while sweeping `~/.aizen/timemachine/`. `source_exists == false` marks an
@@ -3185,6 +3369,17 @@ pub struct StoreEntry {
     pub source_exists: bool,
     pub bytes: u64,
     pub checkpoints: usize,
+}
+
+/// What one [`RepoContext::compact_objects`] pass moved into a pack.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactReport {
+    /// Loose objects handed to `pack-objects`.
+    pub packed: usize,
+    /// Size of `objects/` before and after, so a caller can report what was actually reclaimed
+    /// rather than what was attempted.
+    pub before_bytes: u64,
+    pub after_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3843,6 +4038,233 @@ mod tests {
             !msg.contains("nothing was changed"),
             "a killed child's partial work must not be described as no change: {msg}"
         );
+    }
+
+    /// Is a usable `git` reachable the same way production reaches it? The object-store tests below
+    /// are pure git plumbing, so on a machine without git they are skipped rather than failed — a
+    /// missing toolchain is not a regression in this module.
+    fn git_available() -> bool {
+        git_cmd()
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Scratch dir for one test, following this crate's convention (no `tempfile` dependency — the
+    /// shipped binary stays dependency-thin). Wiped first so a killed run cannot poison the next.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aizen-tm-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("creating scratch dir");
+        dir
+    }
+
+    /// Run git against `git_dir`, returning trimmed stdout. Panics with git's own stderr so a broken
+    /// fixture reports the real reason instead of an unwrap backtrace.
+    fn git_in(git_dir: &Path, args: &[&str]) -> String {
+        git_in_index(git_dir, None, args)
+    }
+
+    /// As [`git_in`], with an explicit index file for the `update-index`/`write-tree` pair that
+    /// builds a real tree in the fixture.
+    fn git_in_index(git_dir: &Path, index: Option<&Path>, args: &[&str]) -> String {
+        let mut cmd = git_cmd();
+        cmd.env("GIT_DIR", git_dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", null_device())
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@localhost")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@localhost")
+            .args(args);
+        match index {
+            Some(idx) => {
+                cmd.env("GIT_INDEX_FILE", idx);
+            }
+            None => {
+                cmd.env_remove("GIT_INDEX_FILE");
+            }
+        }
+        let out = cmd.output().expect("spawning git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A `RepoContext` pointing at a hand-built store. Only the object-store fields matter here;
+    /// the rest are placeholders, because compaction touches `objects/` and nothing else.
+    fn ctx_for_store(root: &Path, store_git_dir: &Path) -> RepoContext {
+        RepoContext {
+            root: root.to_path_buf(),
+            git_dir: root.join(".git"),
+            common_git_dir: root.join(".git"),
+            store_git_dir: store_git_dir.to_path_buf(),
+            namespace_dir: store_git_dir.join("worktrees").join("wt-test"),
+            repo_id: "repo-test".to_string(),
+            worktree_id: "wt-test".to_string(),
+            ref_prefix: "refs/ng/tm/wt-test".to_string(),
+            hooks_dir: store_git_dir.join("no-hooks"),
+            filters_checked: std::cell::Cell::new(true),
+            reparse_checked: std::cell::Cell::new(true),
+            skip_dirs: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Only genuine loose objects count. `pack/`, `info/`, and git's `tmp_obj_*` scratch files share
+    /// the `objects/` directory, and feeding any of them to `pack-objects` would abort the whole
+    /// compaction on a bad OID — so the filter is the thing that has to be exact, not approximate.
+    #[test]
+    fn loose_object_ids_lists_objects_and_nothing_else() {
+        let tmp = scratch("loose-ids");
+        let store = tmp.join("store.git");
+        let objects = store.join("objects");
+        // One real loose object: fanout dir of 2 hex chars, 38 hex chars of name.
+        let fanout = objects.join("ab");
+        fs::create_dir_all(&fanout).unwrap();
+        let rest = "c".repeat(38);
+        fs::write(fanout.join(&rest), b"x").unwrap();
+        // Everything that must NOT be picked up.
+        fs::create_dir_all(objects.join("pack")).unwrap();
+        fs::write(objects.join("pack").join("pack-abc.pack"), b"x").unwrap();
+        fs::create_dir_all(objects.join("info")).unwrap();
+        fs::write(objects.join("info").join("alternates"), b"/somewhere").unwrap();
+        fs::write(fanout.join("tmp_obj_QWERTY"), b"x").unwrap();
+
+        let ctx = ctx_for_store(&tmp, &store);
+        let ids = ctx.loose_object_ids();
+        assert_eq!(ids, vec![format!("ab{rest}")], "got {ids:?}");
+    }
+
+    /// The regression this compactor exists for.
+    ///
+    /// A checkpoint commit parents on a commit that lives only in the SOURCE repo, borrowed through
+    /// alternates. Delete the source — the ordinary case of a repo being moved, renamed, or removed —
+    /// and `git gc` can no longer walk history, so it packs NOTHING and the store's loose objects grow
+    /// forever. Compaction must still work, because it selects by OID rather than by reachability.
+    #[test]
+    fn a_store_with_a_dangling_parent_still_compacts_where_gc_cannot() {
+        if !git_available() {
+            eprintln!("skipping: no usable git on this machine");
+            return;
+        }
+        let tmp = scratch("dangling-parent");
+        let src = tmp.join("src");
+        let src_git = src.join(".git");
+        fs::create_dir_all(&src).unwrap();
+        git_in(&src_git, &["init", "--quiet", "--bare"]);
+        // A commit in the SOURCE that the checkpoint will parent onto.
+        let empty_tree = git_in(&src_git, &["mktree"]);
+        let src_commit = git_in(&src_git, &["commit-tree", &empty_tree, "-m", "source"]);
+
+        // The private store, alternating onto the source exactly as `open_store` seals it.
+        let store = tmp.join("store.git");
+        git_in(&store, &["init", "--quiet", "--bare"]);
+        let info = store.join("objects").join("info");
+        fs::create_dir_all(&info).unwrap();
+        fs::write(
+            info.join("alternates"),
+            src_git
+                .join("objects")
+                .to_string_lossy()
+                .replace('\\', "/")
+                .as_bytes(),
+        )
+        .unwrap();
+
+        // Objects the STORE owns (a changed blob and the tree holding it), then the checkpoint commit
+        // whose parent is borrowed. This is the shape every real checkpoint has: changed blobs land
+        // in the private store, the parent stays in the source.
+        let payload = tmp.join("a.txt");
+        fs::write(&payload, b"contents that only the private store holds\n").unwrap();
+        let blob = git_in(
+            &store,
+            &["hash-object", "-w", "--", &payload.to_string_lossy()],
+        );
+        let index = tmp.join("fixture.idx");
+        git_in_index(
+            &store,
+            Some(&index),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},a.txt"),
+            ],
+        );
+        let tree = git_in_index(&store, Some(&index), &["write-tree"]);
+        let commit = git_in(
+            &store,
+            &["commit-tree", &tree, "-p", &src_commit, "-m", "checkpoint"],
+        );
+        git_in(&store, &["update-ref", "refs/ng/tm/wt-test/1", &commit]);
+
+        // The source disappears. Its objects are gone; the checkpoint's parent is now dangling.
+        fs::remove_dir_all(&src).unwrap();
+
+        let ctx = ctx_for_store(&tmp, &store);
+        let before = ctx.loose_object_ids().len();
+        assert!(
+            before >= 3,
+            "fixture should have left at least blob+tree+commit loose, found {before}"
+        );
+
+        // Document the reason this module cannot just call `git gc`: it fails outright here.
+        let gc = git_cmd()
+            .env("GIT_DIR", &store)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", null_device())
+            .args(["gc", "--prune=now"])
+            .output()
+            .expect("spawning git gc");
+        assert!(
+            !gc.status.success(),
+            "git gc unexpectedly succeeded — if git learned to survive a dangling parent, \
+             compact_objects can be replaced by it"
+        );
+
+        let report = ctx
+            .compact_objects()
+            .expect("compaction must survive gc's failure");
+        assert_eq!(report.packed, before, "every loose object should be packed");
+        assert_eq!(
+            ctx.loose_object_ids().len(),
+            0,
+            "prune-packed should have dropped every loose copy"
+        );
+        let packs: Vec<_> = fs::read_dir(store.join("objects").join("pack"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+            .collect();
+        assert_eq!(packs.len(), 1, "expected exactly one pack, got {packs:?}");
+        // The objects the store OWNS must still be readable — compaction moves bytes, it never
+        // decides what is garbage.
+        let out = git_cmd()
+            .env("GIT_DIR", &store)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", null_device())
+            .args(["cat-file", "-e", &format!("{commit}^{{tree}}")])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "checkpoint tree became unreadable");
+    }
+
+    /// An empty store is a no-op, not an error: `pack-objects` with no input would fail, and a save
+    /// on a brand-new store must not be able to trip over housekeeping.
+    #[test]
+    fn compacting_an_empty_store_is_a_no_op() {
+        let tmp = scratch("empty-store");
+        let store = tmp.join("store.git");
+        fs::create_dir_all(store.join("objects")).unwrap();
+        let ctx = ctx_for_store(&tmp, &store);
+        let report = ctx.compact_objects().expect("empty store must not error");
+        assert_eq!(report.packed, 0);
+        assert_eq!(report.before_bytes, report.after_bytes);
     }
 
     fn mk(id: u32, parent: Option<u32>) -> Snapshot {

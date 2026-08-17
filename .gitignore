@@ -6,8 +6,6 @@
 # same, for the dense-feature build (`--features dense` pulls model2vec + tokenizers, so it gets its
 # own dir rather than thrashing the plain msvc cache). Multiple GB — never ship it.
 /target-msvc-dense
-# scratch/debug programs left at the repo root (not part of the build)
-/test_*.rs
 *.exe
 
 # local code-review scratch (never ship)

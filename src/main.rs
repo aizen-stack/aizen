@@ -1454,6 +1454,15 @@ fn run_time(cmd: TimeCmd) -> Result<()> {
                     report.checkpoints
                 );
                 println!("  store {}", report.store);
+                // Loose objects are not an "issue" — a store with 15k of them still restores fine.
+                // They are a disk-growth signal, so surface them only once there are enough to matter
+                // and say what fixes it, rather than printing a zero on every healthy run.
+                if report.loose_objects >= 1024 {
+                    println!(
+                        "  {} loose object(s) not packed — run `aizen time gc` to compact",
+                        report.loose_objects
+                    );
+                }
                 for issue in &report.issues {
                     println!("  - {issue}");
                 }
@@ -1504,7 +1513,7 @@ fn run_time(cmd: TimeCmd) -> Result<()> {
                 }
                 Ok(())
             } else {
-                let report = timemachine::doctor_gc()?;
+                let (report, compacted) = timemachine::doctor_gc()?;
                 println!(
                     "{} repo {} · worktree {} · {} checkpoint(s)",
                     style("🧹 time metadata cleaned:").color256(splash::ACCENT),
@@ -1512,6 +1521,17 @@ fn run_time(cmd: TimeCmd) -> Result<()> {
                     report.worktree_id,
                     report.checkpoints
                 );
+                // Report bytes actually returned, not objects touched: packing 14k objects sounds
+                // like work, but the number the user came for is how much smaller the store got.
+                if let Some(c) = compacted.filter(|c| c.packed > 0) {
+                    let mb = |b: u64| b as f64 / 1_048_576.0;
+                    println!(
+                        "  packed {} loose object(s) · {:.1} MB → {:.1} MB",
+                        c.packed,
+                        mb(c.before_bytes),
+                        mb(c.after_bytes)
+                    );
+                }
                 Ok(())
             }
         }

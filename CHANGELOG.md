@@ -45,6 +45,26 @@ development log lives in that monorepo's history.
   review, explain and plan requests are distinguished from action requests up front.
 
 ### Fixed
+- **The Time Machine store grew forever and could never be compacted.** Every checkpoint writes its
+  commit, tree, and changed blobs as loose objects, and nothing ever packed them — measured on the
+  author's machine: **14,868 loose objects, 0 packs, backing 30 live checkpoints** (88 MB across
+  17,336 files). This was structural, not a missing cron: `git gc` and `git repack` select objects by
+  walking history, and a checkpoint's parent commit usually lives only in the source repo, borrowed
+  through the store's sealed alternates pointer. Once the source prunes that commit — or is moved,
+  renamed or deleted — the walk dies with `failed to traverse parents of commit <oid>` and repack
+  aborts having packed nothing. Retention kept deleting refs, so the ledger looked tidy while not one
+  byte came back. Compaction now selects by OID instead: the loose object files the store physically
+  owns are handed to `pack-objects`, which walks nothing, then `prune-packed` drops the redundant
+  loose copies. It runs on `aizen time gc`, and automatically after a save once a store passes 2,048
+  loose objects. On a real store: 18 MB / 1,142 files → **9.7 MB / 83 files**, with every checkpoint
+  still restorable.
+- **`aizen time doctor` reported a store as healthy while it held tens of thousands of files.** It
+  now prints the loose-object count once it passes 1,024, and points at `aizen time gc`.
+- **The agent left compiled scratch files behind.** The prompt now states that a throwaway repro or
+  probe is not part of the deliverable, that probes belong in a temp or build directory, and that a
+  clean `git status` is not evidence — `.gitignore` hides exactly the binaries and logs most likely
+  to be abandoned. (This repo had 42 MB of `test_*.exe` sitting in its root since June, invisible for
+  that reason.)
 - **The provider presets were unreachable once you had a config.** `/config` → Providers went
   straight to "type a base URL", so the preset list — the only place a newly supported provider
   becomes discoverable — was shown by first-run setup and nowhere else. Anyone who installed before
