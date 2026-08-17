@@ -17,6 +17,7 @@ mod core; // types · config · cli_config · approval · net_guard
 mod features; // crawl · timemachine · cron · commands
 mod hostbot; // generic Telegram/Discord daemon
 mod llm; // the OpenAI-compatible chat client
+mod sandbox; // OS-level sandbox under approval/cmd_guard: policy · runner · per-platform backends
 mod skills; // skill store + registry
 mod ui; // tui · theme · markdown · spinner · splash · icons · image_input
 
@@ -105,6 +106,11 @@ async fn main() -> Result<()> {
     // can neither see nor dismiss; with it the child just returns a status we handle. Idempotent.
     suppress_hard_error_dialogs();
     let cli = Cli::parse();
+    // `--sandbox` pins the process-wide sandbox mode before anything can spawn a child. User-only:
+    // nothing the model outputs can reach this flag (or the env/config it overrides).
+    if let Some(mode) = cli.sandbox {
+        sandbox::set_mode(mode);
+    }
     // Before ANY command touches the store: ids the old slugifier cut mid-word are re-slugged whole.
     // Ahead of the `match` so the CLI paths (`memory list`, `memory show`) and the REPL see the same
     // ids — see `run_id_migration_once`.
@@ -175,6 +181,9 @@ async fn main() -> Result<()> {
             if install || uninstall {
                 hostbot::run_serve_service(install, uninstall, user, now).await
             } else {
+                // The daemon is remote autonomous execution: every spawn it makes falls under the
+                // sandbox's unattended fail-closed rule (see `sandbox::process_unattended`).
+                sandbox::set_process_unattended();
                 hostbot::run_serve(bots).await
             }
         }
@@ -187,6 +196,7 @@ async fn main() -> Result<()> {
             println!("{}", where_report());
             Ok(())
         }
+        Commands::Sandbox { cmd } => crate::cli::sandbox_cmd::run_sandbox(cmd),
         Commands::Import { path } => run_import(path).await,
         Commands::Zone { cmd } => run_zone(cmd),
         Commands::Cron { cmd } => cron::handle(cmd).await,

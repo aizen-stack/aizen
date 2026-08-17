@@ -158,6 +158,9 @@ fn remove(name: &str) -> Result<()> {
 }
 
 async fn run(name: &str) -> Result<()> {
+    // A scheduled run has no human at the keyboard: every spawn in this process falls under the
+    // sandbox's unattended fail-closed rule (no kernel backend + no opt-in ⇒ refuse, don't degrade).
+    crate::sandbox::set_process_unattended();
     let spec = std::fs::read_to_string(spec_path(name))
         .with_context(|| format!("no spec for job '{name}' (was it removed?)"))?;
     let job: CronJob = serde_json::from_str(&spec).context("parsing job spec")?;

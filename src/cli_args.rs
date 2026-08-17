@@ -17,6 +17,10 @@ use clap::{Parser, Subcommand};
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
+    /// Override the sandbox mode for this invocation: auto | strict | guarded | off.
+    /// (Also settable via AIZEN_SANDBOX or the `sandbox.mode` config key; see `aizen sandbox`.)
+    #[arg(long, global = true, value_name = "MODE")]
+    pub(crate) sandbox: Option<crate::sandbox::SandboxMode>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -135,6 +139,11 @@ pub(crate) enum Commands {
     },
     /// Show where aizen keeps THIS project's state: root, zone slug, git executable, home dirs.
     Where,
+    /// The OS sandbox around model/repo-influenced commands: status · doctor · explain · run.
+    Sandbox {
+        #[command(subcommand)]
+        cmd: SandboxCliCmd,
+    },
     /// Import a conversation recorded by another CLI (Claude Code or Codex) and resume it here.
     /// With no path, lists every foreign transcript whose cwd belongs to this project. With a path,
     /// loads that file directly.
@@ -1162,6 +1171,35 @@ pub(crate) enum MemoryCmd {
     /// usable model sitting next to it. This lists what discovery actually finds, so "why is dense
     /// not using my model?" is answerable without a source dive.
     ModelList,
+}
+
+// ───────────────────────── sandbox ─────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum SandboxCliCmd {
+    /// What the sandbox enforces on THIS machine, capability by capability — `enforced`,
+    /// `partial`, `advisory`, or `unavailable`. Never inflated: where the platform has no kernel
+    /// mechanism, this says so.
+    Status,
+    /// Self-check: probe the backend, verify the audit log is writable, run an environment-scrub
+    /// self-test, sweep stale private temp directories, and flag risky configuration.
+    Doctor {
+        /// Machine-readable JSON report instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explain how the NEXT `shell_run` would be sandboxed: mode resolution chain, backend,
+    /// filesystem roots, network default, and environment scrubbing counts.
+    Explain,
+    /// Run one command under the sandbox and report what was enforced (a hands-on probe).
+    Run {
+        /// The command line (everything after `--`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+        /// Grant the network capability to this run.
+        #[arg(long)]
+        network: bool,
+    },
 }
 
 // ───────────────────────── project identity (where + zones) ─────────────────────────

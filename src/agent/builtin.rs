@@ -15,7 +15,7 @@ use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,11 +39,17 @@ const SHELL_TIMEOUT_ENV: &str = "AIZEN_SHELL_TIMEOUT_SECS";
 /// two seconds and a partial-output note instead of the whole session.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Resolve the `shell_run` wall-clock cap: env override (clamped 10s..=3600s) or the default.
+/// Resolve the `shell_run` wall-clock cap: env override, else the sandbox config's
+/// `limits.wall_seconds`, else the default. All clamped 10s..=3600s.
 fn shell_timeout_secs() -> u64 {
     std::env::var(SHELL_TIMEOUT_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
+        .or_else(|| {
+            crate::sandbox::policy::settings()
+                .limits
+                .and_then(|l| l.wall_seconds)
+        })
         .map(|v| v.clamp(10, 3600))
         .unwrap_or(SHELL_TIMEOUT_SECS)
 }
@@ -3119,7 +3125,8 @@ impl Tool for ShellRun {
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
-                "cwd": {"type": "string", "description": "optional working dir for the command (a subdir, or a ../ or absolute path elsewhere)"}
+                "cwd": {"type": "string", "description": "optional working dir for the command (a subdir, or a ../ or absolute path elsewhere)"},
+                "network": {"type": "boolean", "description": "request network access (default false — the sandbox denies child sockets where the platform can enforce it). Approval-gated escalation."}
             },
             "required": ["command"],
             "additionalProperties": false
@@ -3140,19 +3147,25 @@ impl Tool for ShellRun {
             Some(c) => confine(&self.root, c, true)?,
             None => self.root.clone(),
         };
-        let mut cmd = if cfg!(windows) {
-            // Switch the cmd instance to the UTF-8 codepage first so `dir` and other legacy
-            // builtins emit UTF-8 (real accented filenames) instead of the OEM codepage that
-            // `drain` can only decode lossily. `>nul` hides chcp's own "Active code page" banner;
-            // `&` chains it before the real command. The whole thing is one `/C` argument.
-            let mut c = Command::new("cmd");
-            c.arg("/C").arg(format!("chcp 65001>nul & {command}"));
-            c
-        } else {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(command);
-            c
-        };
+        let network = args
+            .get("network")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let timeout = Duration::from_secs(shell_timeout_secs());
+        // One construction path for every model-run command: the sandbox runner wraps the platform
+        // shell (same `cmd /C chcp 65001>nul` / `sh -c` shape as always), scrubs the environment,
+        // arms the platform backend, and refuses outright where policy says so (strict without
+        // kernel backing, unattended without opt-in).
+        let mut sbx = crate::sandbox::runner::prepare_std(
+            crate::sandbox::request::SandboxRequest::shell(
+                crate::sandbox::CommandOrigin::ShellRun,
+                command,
+                dir.clone(),
+                self.root.clone(),
+            )
+            .network(network)
+            .wall_timeout(timeout),
+        )?;
         // stdin = null (not inherited): on Windows a shared console-input handle lets `cmd.exe`
         // (and the CRT) call SetConsoleMode on OUR input buffer and reset it on exit — clearing
         // ENABLE_MOUSE_INPUT and re-enabling QuickEdit. That silently kills the retained TUI's mouse
@@ -3161,18 +3174,21 @@ impl Tool for ShellRun {
         // stdin means the child never touches the console input handle, so our mode survives. The
         // command already runs non-interactively (drained pipes, wall-clock timeout), so it has no
         // legitimate use for the terminal's stdin anyway.
-        cmd.current_dir(&dir)
+        sbx.command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // Contain the tree BEFORE anything can go wrong with it: on Windows we spawn a `cmd.exe`
         // wrapper, so killing our direct child leaves the real work (cargo, node, a dev server)
         // orphaned — still running, and still holding the write end of the pipes below.
-        crate::core::proctree::prepare(&mut cmd);
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawning shell for `{command}`"))?;
-        let containment = crate::core::proctree::contain(&child);
+        let mut child = match sbx.command.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                sbx.finish(crate::sandbox::runner::Outcome::SpawnFailed);
+                return Err(e).with_context(|| format!("spawning shell for `{command}`"));
+            }
+        };
+        let containment = sbx.contain(&child);
 
         // Drain the pipes on threads so a chatty command can't deadlock on a full buffer,
         // while we poll with a wall-clock timeout (kill the tree if it overruns).
@@ -3181,7 +3197,6 @@ impl Tool for ShellRun {
         let oh = std::thread::spawn(move || drain(out_pipe));
         let eh = std::thread::spawn(move || drain(err_pipe));
 
-        let timeout = Duration::from_secs(shell_timeout_secs());
         let start = Instant::now();
         let mut next_note = SLOW_NOTE_EVERY_SECS;
         let mut cancelled = false;
@@ -3233,6 +3248,11 @@ impl Tool for ShellRun {
             );
         }
 
+        sbx.finish(match status {
+            None if cancelled => crate::sandbox::runner::Outcome::Cancelled,
+            None => crate::sandbox::runner::Outcome::Timeout,
+            Some(st) => crate::sandbox::runner::Outcome::Exit(st.code()),
+        });
         match status {
             None if cancelled => Ok("error: command cancelled by the user (Esc)".to_string()),
             None => {

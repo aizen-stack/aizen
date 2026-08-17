@@ -94,8 +94,11 @@ fn run_shell_escape(command: &str) -> String {
 /// As `run_shell_escape`, but in an EXPLICIT directory. The hostbot daemon passes its lane's cwd:
 /// several bots share one process, so `/sh` must run where that bot was told to work, not wherever
 /// the process happens to be. `None` ⇒ inherit the process cwd (the REPL's `!cmd`).
+///
+/// Origin split for the sandbox: a REPL `!cmd` is the user at the keyboard (`UserEscape`); a
+/// hostbot `/sh` arrives over a remote lane (`TelegramShell`) and is subject to the unattended
+/// fail-closed rule when no kernel backend exists.
 pub(crate) fn run_shell_escape_in(command: &str, dir: Option<&std::path::Path>) -> String {
-    use std::process::Command;
     use std::time::Duration;
     /// A `!cmd` escape runs on the REPL's own thread, so an unbounded wait freezes the entire UI —
     /// not one tool call. `Command::output()` has no deadline (it waits for pipe EOF, which a
@@ -104,19 +107,31 @@ pub(crate) fn run_shell_escape_in(command: &str, dir: Option<&std::path::Path>) 
     const ESCAPE_TIMEOUT: Duration = Duration::from_secs(120);
     const ESCAPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(format!("chcp 65001>nul & {command}"));
-        c
+    let origin = if dir.is_some() {
+        crate::sandbox::CommandOrigin::TelegramShell
     } else {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(command);
-        c
+        crate::sandbox::CommandOrigin::UserEscape
     };
-    if let Some(dir) = dir {
-        cmd.current_dir(dir);
-    }
-    match crate::core::proctree::output_bounded(&mut cmd, ESCAPE_TIMEOUT, ESCAPE_DRAIN_GRACE) {
+    let cwd = dir
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let mut sbx = match crate::sandbox::runner::prepare_std(
+        crate::sandbox::request::SandboxRequest::shell(origin, command, cwd.clone(), cwd)
+            .private_tmp(false) // a user-typed command writing to %TEMP% should see the real one
+            .wall_timeout(ESCAPE_TIMEOUT),
+    ) {
+        Ok(s) => s,
+        Err(e) => return format!("[refused: {e}]"),
+    };
+    let bounded =
+        crate::core::proctree::output_bounded(&mut sbx.command, ESCAPE_TIMEOUT, ESCAPE_DRAIN_GRACE);
+    sbx.finish(match &bounded {
+        Ok(o) if o.timed_out => crate::sandbox::runner::Outcome::Timeout,
+        Ok(o) => crate::sandbox::runner::Outcome::Exit(o.code),
+        Err(_) => crate::sandbox::runner::Outcome::SpawnFailed,
+    });
+    match bounded {
         Ok(o) => {
             let mut s = o.stdout;
             if !o.stderr.trim().is_empty() {

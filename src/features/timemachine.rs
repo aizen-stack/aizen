@@ -1429,10 +1429,12 @@ fn null_device() -> &'static str {
 /// PATH. Falls back to the literal name only when resolution says Missing — the spawn then fails
 /// with the same ENOENT it always had, and `raw_git`/`discover` classify it as GitMissing.
 fn git_cmd() -> Command {
-    match crate::core::gitx::git_exe() {
+    // Hardened like every internal git spawn: checkpointing a repository must never execute its
+    // hooks/fsmonitor/credential helpers (see `gitx::harden`).
+    crate::core::gitx::harden(match crate::core::gitx::git_exe() {
         Some(p) => Command::new(p),
         None => Command::new("git"),
-    }
+    })
 }
 
 /// Per-invocation git deadline, overridable for slow trees / CI. See [`GIT_OP_TIMEOUT`].

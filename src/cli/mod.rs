@@ -7,6 +7,7 @@ pub mod coop_cmd;
 pub mod memory_cmd;
 pub mod persona_cmd;
 pub mod run_cmds;
+pub mod sandbox_cmd;
 pub mod sessions;
 pub mod skill_cmd;
 pub mod time;

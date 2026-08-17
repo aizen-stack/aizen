@@ -417,6 +417,21 @@ aizen crawl https://example.com --json                # [{url, depth, via}]
 Only GET requests; scope defaults to the seed host (`--scope subs` for subdomains); `--max-pages`
 is a hard ceiling. Also exposed to the agent as the `web_crawl` tool.
 
+### `aizen sandbox` — the OS sandbox around model-run commands
+
+```bash
+aizen sandbox status          # live capability matrix: enforced / partial / advisory / unavailable
+aizen sandbox doctor [--json] # probe backend, audit-log check, real env-scrub self-test, tmp sweep
+aizen sandbox explain         # how the next shell_run would be sandboxed, step by step
+aizen sandbox run -- <cmd>    # run one command under the sandbox by hand
+aizen --sandbox strict …      # per-invocation mode override (also AIZEN_SANDBOX, /sandbox, config)
+```
+
+Modes: `auto` (default — strongest backend, guarded fallback for interactive sessions only) ·
+`strict` (kernel enforcement or refusal) · `guarded` (software guards, said plainly) · `off`.
+Config lives under `"sandbox": {…}` in `~/.aizen/cli-config.json`. Threat model, per-platform
+matrix and limitations: [SANDBOX.md](SANDBOX.md).
+
 ### `/persona` — a character that evolves
 A **persona** is *who the agent is* — a third identity layer alongside **user_memory** (who you are)
 and **skills** (how to do things). Cards live as human-editable markdown under
@@ -670,19 +685,31 @@ aizen bench dialectic                                   # golden set incl. absta
 returns `0` even if it stops on the step limit or divergence — it prints the reason to stderr.
 
 ## Safety model
-File and shell tools are confined to the working directory (a path-traversal guard rejects
-escapes). Destructive ops are approval-gated (non-TTY safe-deny; `--yes` to pre-authorize, which
-applies transitively to sub-agents). Beneath approval sits a **hard safety floor** — a deterministic
-blocklist (`rm -rf /` incl. GNU long flags like `rm --recursive --force /`, `mkfs`, `dd of=/dev/…`,
-fork bombs, `curl|sh`, `format C:`, …) that runs *before* the `/yolo` short-circuit, so catastrophic
-commands are refused **even under auto-approve** (and the same check applies to background `process
-start` + `` !`cmd` `` in custom commands). The web tools (`web_fetch`/`web_crawl`/`aizen crawl`) carry an
-**SSRF floor**: a URL that resolves to a loopback/private/link-local address (incl. the cloud
-metadata endpoint `169.254.169.254`) is refused — set `AIZEN_ALLOW_PRIVATE_NET=1` to allow
-local/internal targets. Long-lived secret files (`cli-config.json`, OAuth/MCP token caches, saved
-sessions) are written owner-only (0600) on Unix. MCP and other external tools are
-destructive-by-default. `shell_run` is wall-clock capped at 120s. Tool results and file contents are
-treated as data, never as instructions.
+Three layers, bottom to top. (1) A **hard safety floor** — a deterministic blocklist (`rm -rf /`
+incl. GNU long flags like `rm --recursive --force /`, `mkfs`, `dd of=/dev/…`, fork bombs,
+`curl|sh`, `format C:`, …) that runs *before* the `/yolo` short-circuit, so catastrophic commands
+are refused **even under auto-approve** (the same check applies to background `process start` +
+`` !`cmd` `` in custom commands). (2) **Approval**: destructive ops are approval-gated (non-TTY
+safe-deny; `--yes` pre-authorizes, transitively for sub-agents); a command that requests the
+`network` capability is an escalation `smart` never auto-clears. (3) An **OS sandbox** under both:
+every model/repo-influenced child runs with Aizen's secrets scrubbed from its environment, a
+private per-run temp, deny-by-default network, and a workspace-write filesystem policy —
+kernel-enforced on Linux (Landlock + seccomp) and macOS (Seatbelt), software-guarded on Windows
+(Job-Object containment + resource ceilings; honestly reported as `partial`). `strict` mode fails
+closed instead of degrading; unattended runs (cron, hosted bots) fail closed by default on
+platforms without a kernel backend. `aizen sandbox status|doctor|explain` show what *your*
+machine enforces; every spawn lands in an owner-only audit log. Full detail: [SANDBOX.md](SANDBOX.md).
+
+File tools resolve paths anywhere on disk by explicit user decision (the old cwd-confinement
+guard was removed) — the sandbox above confines *child processes*, not the file tools. The web
+tools (`web_fetch`/`web_crawl`/`aizen crawl`) carry an **SSRF floor**: a URL that resolves to a
+loopback/private/link-local address (incl. the cloud metadata endpoint `169.254.169.254`) is
+refused — set `AIZEN_ALLOW_PRIVATE_NET=1` to allow local/internal targets. Long-lived secret
+files (`cli-config.json`, OAuth/MCP token caches, saved sessions) are written owner-only. MCP and
+other external tools are destructive-by-default. `shell_run` is wall-clock capped at 120s.
+Internal git plumbing runs with repo hooks, fsmonitor and credential helpers disabled, so a
+checkout's `.git/hooks` never executes because Aizen made a checkpoint. Tool results and file
+contents are treated as data, never as instructions.
 
 ## Remote control & notifications
 `aizen serve` / `aizen discord serve` run long-lived daemons that drive the agent from Telegram or a

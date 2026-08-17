@@ -67,7 +67,7 @@ Cài đặt chỉ có vậy. Không cần biến môi trường, không phải t
 | **Làm trọn việc** | Đọc, sửa, chạy shell của bạn — rồi **xác minh trước khi tuyên bố xong**: nó chạy typecheck và test của bạn, và tự sửa phần nó làm hỏng. |
 | **Nó nhớ về bạn** | Một bộ não ghi nhớ offline xếp hạng bằng BM25, học từ chính việc tái sử dụng — kèm persona, danh tính SOUL bền bỉ, và những skill nó tự viết cho mình sau các công việc thật. |
 | **Chạy ở nơi bạn không có mặt** | `aizen serve` điều khiển agent qua Telegram hoặc Discord và nhờ điện thoại của bạn duyệt các sửa đổi rủi ro. Host trên systemd, Docker, hay Kubernetes — nằm sau NAT, không cần mở cổng vào. |
-| **An toàn ngay từ cấu trúc** | Công cụ bị giới hạn trong thư mục làm việc, secret chỉ chủ sở hữu mới đọc được và không bao giờ bị in ra, và một lớp lệnh chặn cứng khước từ các lệnh thảm hoạ **kể cả khi đang auto-approve**. |
+| **An toàn ngay từ cấu trúc** | Một sandbox cấp HĐH nằm dưới lớp approval: tiến trình con không bao giờ thừa hưởng API key của bạn, network bị chặn mặc định, và chính sách filesystem được kernel cưỡng chế trên Linux (Landlock+seccomp) và macOS (Seatbelt) — Windows có Job-Object containment và được báo cáo trung thực là `partial`, không giả vờ cưỡng chế. Một lớp lệnh chặn cứng khước từ các lệnh thảm hoạ **kể cả khi đang auto-approve**. `aizen sandbox status` cho biết máy *của bạn* cưỡng chế được gì — xem [docs/SANDBOX.md](docs/SANDBOX.md). |
 
 ## Nó làm được gì
 

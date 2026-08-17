@@ -1332,6 +1332,44 @@ pub(crate) async fn handle_slash(
                 tui::emit_line(&style("usage: /approval ask|smart|yolo").dim().to_string());
             }
         }
+        SlashId::Sandbox => {
+            let requested = arg.split_whitespace().next().unwrap_or("");
+            if requested.is_empty() || matches!(requested, "status" | "st") {
+                let mode = crate::sandbox::mode();
+                let report = crate::sandbox::capabilities::probe();
+                tui::emit_line(
+                    &style(format!(
+                        "sandbox: {mode} · backend {} · fs write {} · network deny {} · env {} — `aizen sandbox status` for the full matrix",
+                        report.backend.as_str(),
+                        report.fs_write.as_str(),
+                        report.network_deny.as_str(),
+                        report.env_isolation.as_str(),
+                    ))
+                    .dim()
+                    .to_string(),
+                );
+            } else if let Ok(mode) = requested.parse::<crate::sandbox::SandboxMode>() {
+                crate::sandbox::set_mode(mode);
+                let mut cfg = cli_config::load();
+                let mut s = cfg.sandbox.clone().unwrap_or_default();
+                s.mode = Some(mode);
+                cfg.sandbox = Some(s);
+                match cli_config::save(&cfg) {
+                    Ok(_) => tui::emit_line(
+                        &style(format!("sandbox → {mode}"))
+                            .color256(splash::ACCENT)
+                            .to_string(),
+                    ),
+                    Err(e) => tui::emit_line(&format!("{} {e}", style("sandbox:").red())),
+                }
+            } else {
+                tui::emit_line(
+                    &style("usage: /sandbox status|auto|strict|guarded|off")
+                        .dim()
+                        .to_string(),
+                );
+            }
+        }
         SlashId::Yolo => {
             let mut cfg = cli_config::load();
             let mode = if cfg.persisted_approval_mode() == ApprovalMode::Yolo { ApprovalMode::Ask } else { ApprovalMode::Yolo };

@@ -581,6 +581,9 @@ struct StdioTransport {
     stderr: Arc<std::sync::Mutex<String>>,
     /// Literal secret values (env/header/token) to strip from the stderr tail before it's surfaced.
     secrets: Vec<String>,
+    /// Sandbox bookkeeping (audit already written as `spawned`); holds the server's private temp
+    /// directory alive for the connection's lifetime.
+    _sandbox: crate::sandbox::runner::SpawnGuard,
 }
 
 impl StdioTransport {
@@ -1432,26 +1435,42 @@ async fn connect_stdio(cfg: &ServerConfig) -> Result<Transport> {
         .command
         .as_ref()
         .context("stdio server needs `command`")?;
-    let mut cmd = if cfg!(windows) {
-        let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C").arg(command).args(&cfg.args);
-        c
-    } else {
-        let mut c = tokio::process::Command::new(command);
-        c.args(&cfg.args);
-        c
-    };
-    cmd.envs(&cfg.env)
+    // Through the sandbox runner: an MCP server is a configured integration, so it KEEPS network
+    // and receives its own configured env (`cfg.env`, applied after the scrub) — what it must not
+    // inherit is Aizen's environment (provider keys, bot tokens). The Windows `cmd /C` shim for
+    // `.cmd`/`.bat` runners (npx/uvx/bunx) and the proctree prep both live in the runner now.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut sbx = crate::sandbox::runner::prepare_tokio(
+        crate::sandbox::request::SandboxRequest::exec(
+            crate::sandbox::CommandOrigin::McpStdio,
+            std::path::PathBuf::from(command),
+            cfg.args.clone(),
+            cwd.clone(),
+            cwd,
+        )
+        .cmd_shim(true)
+        .network(true)
+        .extra_env(
+            cfg.env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+    )?;
+    sbx.command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    // Windows: no console window for the `cmd /C npx …` shim (and no desktop-heap allocation that
-    // could trip 0xc0000142). Unix: `setsid` so the tree can be group-killed. See `proctree`.
-    crate::core::proctree::prepare_tokio(&mut cmd);
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawning MCP server `{command}`"))?;
+    let mut child = match sbx.command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            sbx.finish(crate::sandbox::runner::Outcome::SpawnFailed);
+            return Err(e).with_context(|| format!("spawning MCP server `{command}`"));
+        }
+    };
+    let mut server_guard = sbx.into_guard();
+    server_guard.finish(crate::sandbox::runner::Outcome::Spawned);
     let stdin = child.stdin.take().context("child stdin unavailable")?;
     let stdout = child.stdout.take().context("child stdout unavailable")?;
     let stderr_buf: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
@@ -1484,6 +1503,7 @@ async fn connect_stdio(cfg: &ServerConfig) -> Result<Transport> {
         stderr: stderr_buf,
         // Env values commonly carry the child's API key/token — mask them out of the stderr tail.
         secrets: server_secrets(cfg, None),
+        _sandbox: server_guard,
     }))
 }
 

@@ -2837,6 +2837,28 @@ fn gate_and_approve(
         }
         _ => None,
     };
+    // `network: true` is a CAPABILITY ESCALATION, not a normal argument: the sandbox denies child
+    // network by default (kernel-enforced where the platform can), so asking for it must always be
+    // visible. `smart` never auto-clears it (only read-only-shaped commands are auto-cleared, and a
+    // network grant is not read-only in effect); `/yolo` — which pre-authorizes prompts, nothing
+    // else — still lets it through, but the caution line is printed regardless.
+    let network_requested = guarded_command.is_some()
+        && args
+            .get("network")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+    if network_requested {
+        let line = format!(
+            "{} {}",
+            style("⚠ network").color256(crate::ui::theme::WARN).bold(),
+            style("this command requests network access (sandbox default is deny)").dim()
+        );
+        if crate::ui::tui::active() {
+            crate::ui::tui::emit_line(&line);
+        } else if !cfg.quiet {
+            eprintln!("{line}");
+        }
+    }
     if let Some(command) = guarded_command {
         match cmd_guard::classify(command) {
             cmd_guard::Verdict::Blocked(reason) => {
@@ -2878,6 +2900,11 @@ fn gate_and_approve(
         }
     }
 
+    // A network grant disqualifies the smart auto-clear: even a read-only-SHAPED command that
+    // asked for the network must be seen by the user (ask/smart) before it runs.
+    if network_requested {
+        smart_allow = false;
+    }
     if tool.is_destructive()
         && !cfg.approval_mode.approves_all()
         && !smart_allow

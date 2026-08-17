@@ -63,6 +63,7 @@ public  → https://github.com/dawnofcd/aizen.git         (PUBLIC — redirects 
 | `README.md` | the short landing page — install, why, what it does. **Keep it under ~110 lines**; details go to `docs/REFERENCE.md`, not here |
 | `docs/REFERENCE.md` | the full manual: REPL surface, every command, self-hosting, MCP, browser, safety model |
 | `src/features/update.rs` | self-update; `DEFAULT_REPO` lives here |
+| `src/sandbox/` | OS sandbox under approval/cmd_guard: policy · runner · audit · per-platform backends (Landlock/seccomp · Job Object · Seatbelt). Every model/repo-influenced spawn goes through `runner::prepare_*` — never add a bare `Command::new` for those. `docs/SANDBOX.md` is the contract; keep its capability matrix honest |
 | `install.ps1` / `install.sh` | one-line installers; repo slug is hardcoded in both |
 | `.github/workflows/dco.yml` | DCO sign-off check (replaced the CLA bot) |
 | `dist/` | assets for the public download channel |

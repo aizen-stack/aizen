@@ -68,9 +68,35 @@ pub fn git_exe() -> Option<PathBuf> {
 /// the `0xc0000142` loader-init failure the flag exists to avoid.
 pub fn command() -> anyhow::Result<std::process::Command> {
     match git_exe() {
-        Some(p) => Ok(no_window(std::process::Command::new(p))),
+        Some(p) => Ok(harden(no_window(std::process::Command::new(p)))),
         None => Err(anyhow::Error::new(GitMissing)),
     }
+}
+
+/// Harden an INTERNAL git invocation against repository-controlled execution and hangs. Aizen's
+/// own plumbing (time-machine checkpoints, repo probing, the writer lease) must never run code the
+/// repository placed in `.git/hooks`, a configured fsmonitor daemon, or a credential helper — a
+/// checkout is untrusted input, and "aizen made a checkpoint" must not be a code-execution event.
+/// Applied to every spawn built here and to the time machine's own git builder.
+///
+/// * `core.hooksPath` → a directory that never exists, so NO hook fires (repo-local ones included);
+/// * `core.fsmonitor=false` → no repo-configured monitor daemon is started;
+/// * `credential.helper=` (empty) → the helper list is cleared for this invocation;
+/// * `GIT_TERMINAL_PROMPT=0` → an auth-needing operation fails fast instead of hanging on a
+///   prompt nobody can see.
+///
+/// Git ALIASES need no countermeasure: git refuses aliases that shadow builtin commands, and every
+/// internal invocation uses builtins.
+pub fn harden(mut cmd: std::process::Command) -> std::process::Command {
+    let no_hooks = crate::core::config::aizen_home().join("no-hooks-nonexistent");
+    cmd.arg("-c")
+        .arg(format!("core.hooksPath={}", no_hooks.display()))
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg("credential.helper=")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    cmd
 }
 
 /// Apply `CREATE_NO_WINDOW` on Windows; a pass-through elsewhere. Centralizes the flag so every
