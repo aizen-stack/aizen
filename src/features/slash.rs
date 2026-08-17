@@ -123,6 +123,9 @@ pub struct Builtin {
     pub hidden: bool,
     pub description: &'static str,
     pub argument_hint: &'static str,
+    /// The `/help` line. Longer and more specific than `description`, which has to fit inside a
+    /// picker row. Empty falls back to `description`, so a new command is documented either way.
+    pub help: &'static str,
     pub stdin: Stdin,
 }
 
@@ -140,6 +143,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "show commands and tips",
         argument_hint: "",
+        help: "this list",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -150,6 +154,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "index the codebase for semantic search + auto-retrieval",
         argument_hint: "[--force|--status]",
+        help: "index the codebase into a semantic chunk index (SHA-256 incremental, secrets redacted); powers codebase_search + auto per-turn retrieval. --force rebuilds, --status shows state, Esc cancels",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -160,6 +165,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "show project root, zone slug, git, and data locations",
         argument_hint: "",
+        help: "show THIS project's identity: root · zone slug · git executable · where memory/skills/sessions live (also `aizen where`, `aizen zone migrate`)",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -170,6 +176,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "start a fresh thread carrying only what matters",
         argument_hint: "<goal>",
+        help: "",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -180,6 +187,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "run until a goal is done (self-declared + verified)",
         argument_hint: "<text>|off",
+        help: "<text>       run until the goal is done — model self-declares (goal_complete) + verify passes; no iteration cap, auto-retries API errors (incl. empty 200); /goal off to stop, Esc to cancel",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -190,6 +198,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "list and pick the model",
         argument_hint: "",
+        help: "list the provider's models (with context windows) + pick one",
         stdin: Stdin::Always,
     },
     Builtin {
@@ -200,6 +209,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "switch, add, or manage saved endpoint profiles",
         argument_hint: "[name|add|manage]",
+        help: "[name]   one-pick switch; `add` creates and `manage` edits/renames/deletes providers",
         stdin: Stdin::BareOr(&["add", "manage"]),
     },
     Builtin {
@@ -210,6 +220,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "set endpoint, key, model, and provider profiles",
         argument_hint: "",
+        help: "set endpoint + key + model and manage provider profiles",
         stdin: Stdin::Always,
     },
     Builtin {
@@ -220,6 +231,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "inspect and edit what's remembered",
         argument_hint: "[list|show|edit|forget|restore|<query>]",
+        help: "[query]    show your profile, or search memory; /memory remember <fact> to save",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -233,6 +245,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "pick the agent persona",
         argument_hint: "",
+        help: "pick the character the agent role-plays (list · select · new · clear · delete)",
         stdin: Stdin::Always,
     },
     Builtin {
@@ -243,6 +256,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "browse and manage saved skills",
         argument_hint: "",
+        help: "saved procedures the agent can load (list · view · new · delete)",
         stdin: Stdin::Always,
     },
     Builtin {
@@ -253,6 +267,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "list custom markdown slash commands",
         argument_hint: "",
+        help: "your custom slash commands — markdown macros in ~/.aizen/commands/ ($ARGUMENTS · @file · !`cmd`)",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -263,6 +278,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "connect apps through MCP",
         argument_hint: "",
+        help: "connected apps & MCP catalog — Telegram/Discord/Slack/webhook + browser sign-in apps",
         stdin: Stdin::Always,
     },
     Builtin {
@@ -273,6 +289,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "show MCP lifecycle and tools",
         argument_hint: "",
+        help: "MCP servers from ~/.aizen/mcp.json — lifecycle generation, health, pinned schema + tools",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -283,6 +300,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "show browser profiles and routes",
         argument_hint: "[doctor]",
+        help: "browser profile/routes status (when built with --features browser)",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -293,6 +311,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "configure the Telegram integration",
         argument_hint: "",
+        help: "Telegram integration menu (setup · test · status · start daemon · disable)",
         stdin: Stdin::Always,
     },
     Builtin {
@@ -303,6 +322,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "run the host bot daemon",
         argument_hint: "",
+        help: "",
         stdin: Stdin::Always,
     },
     Builtin {
@@ -313,6 +333,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "restore, save, or delete conversations",
         argument_hint: "",
+        help: "saved conversations — restore · save · delete (autosaves into its own file each turn; newest first, labeled by project)",
         stdin: Stdin::Always,
     },
     Builtin {
@@ -323,6 +344,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "resume a conversation started in another CLI (Claude Code / Codex)",
         argument_hint: "",
+        help: "resume a conversation started in another CLI (Claude Code or Codex) — pick from transcripts whose cwd matches this project",
         stdin: Stdin::Always,
     },
     Builtin {
@@ -333,6 +355,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "reopen the last conversation with its context",
         argument_hint: "[name]",
+        help: "reopen the last conversation FROM THIS PROJECT (or a named one); /handoff <goal> starts a fresh thread carrying only what that goal needs",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -347,6 +370,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "show live multi-agent activity (self-refreshing); stop one run",
         argument_hint: "[stop <#id|name>]",
+        help: "multi-agent status — live task/workflow children, sub-agent slots (also /wf)",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -357,6 +381,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "isolated git worktrees, one per session",
         argument_hint: "[list|new <name>|remove <name>]",
+        help: "",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -367,6 +392,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "list and configure specialist agents",
         argument_hint: "",
+        help: "specialist sub-agents — list · set-provider <agent> <provider> [model]",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -377,6 +403,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "restore a crashed session safely",
         argument_hint: "[discard]",
+        help: "a session interrupted by a crash/kill — restore its transcript + unsent draft, or /recover discard",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -390,6 +417,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "browse checkpoints and jump back to that code + chat",
         argument_hint: "",
+        help: "browse every checkpoint (▸ = current) and pick one to jump back to that code + chat; also /timeline · /tm · /undo · /redo",
         stdin: Stdin::Always,
     },
     Builtin {
@@ -403,6 +431,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "save a code restore point",
         argument_hint: "[note]",
+        help: "save a restore point of the working tree now",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -413,6 +442,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "what changed between two points in time",
         argument_hint: "[from] [to] [-p]",
+        help: "what changed in the working tree since a checkpoint (read before you /undo)",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -423,6 +453,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "compress context to free tokens",
         argument_hint: "",
+        help: "summarize older turns to free context now",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -433,6 +464,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "type-aware code navigation and diagnostics",
         argument_hint: "[on|off|status|restart]",
+        help: "type-aware navigation + symbol_replace/insert + diagnostics via a language server (rust-analyzer · pyright · typescript-language-server); default ON (lazy spawn), /lsp off reclaims RAM",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -443,6 +475,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "check web-access backend health",
         argument_hint: "[doctor|status]",
+        help: "web-access channels: live-probe every backend (doctor) or show what served this session (status); web_fetch/web_search route through these",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -453,6 +486,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "set the approval level",
         argument_hint: "[ask|smart|yolo]",
+        help: "approval level — ask every time, auto-run read-only, or pre-authorize",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -463,6 +497,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "set reasoning effort",
         argument_hint: "[auto|off|low|medium|high|xhigh|max]",
+        help: "drag an animated slider (auto · low · medium · high · xhigh · max); or /effort auto|off|low|medium|high|xhigh|max|clear to set it directly",
         stdin: Stdin::WhenBare,
     },
     Builtin {
@@ -473,6 +508,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "toggle maximum-effort orchestration mode",
         argument_hint: "",
+        help: "toggle ultimate mode — max reasoning effort + prefer launching workflows (aizen's ultracode)",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -483,6 +519,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "start a fresh conversation",
         argument_hint: "",
+        help: "start a fresh conversation",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -493,6 +530,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "show session token usage",
         argument_hint: "",
+        help: "show session token usage (context-fill HUD)",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -503,6 +541,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "break down context-window usage",
         argument_hint: "",
+        help: "break down what fills the context window (system prompt · tool schemas · conversation by role)",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -513,6 +552,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "show session token cost",
         argument_hint: "",
+        help: "session usage + $ estimate (real tokens when the provider reports them; set rates via `aizen config set --price-in/--price-out`)",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -523,6 +563,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "show toolset configuration",
         argument_hint: "",
+        help: "",
         stdin: Stdin::WhenArg(&["menu", "toggle"]),
     },
     Builtin {
@@ -533,6 +574,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "show every aizen version and install the one you pick",
         argument_hint: "",
+        help: "show the installed version next to every published one and install the one you pick (newer or older) — the new build starts in your NEXT terminal",
         stdin: Stdin::Always,
     },
     Builtin {
@@ -543,6 +585,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "rewind to the previous checkpoint",
         argument_hint: "",
+        help: "",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -553,6 +596,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "re-apply the next checkpoint",
         argument_hint: "",
+        help: "",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -563,6 +607,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "exit aizen",
         argument_hint: "",
+        help: "exit",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -573,6 +618,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "legacy alias; use /sessions",
         argument_hint: "",
+        help: "",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -583,6 +629,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "legacy approval alias",
         argument_hint: "",
+        help: "",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -593,6 +640,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: true,
         description: "live sessions working this repo — status - claim - handoff",
         argument_hint: "[status|claim|release]",
+        help: "",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -606,6 +654,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: true,
         description: "legacy shortcut for `/approval yolo`",
         argument_hint: "",
+        help: "",
         stdin: Stdin::Never,
     },
 ];
@@ -662,6 +711,48 @@ const FUZZY_MAX_LEN_DELTA: usize = 2;
 
 /// Longest plausible command name — anything longer is prose or a path, not a typo.
 const MAX_NAME_LEN: usize = 32;
+
+/// Everything the `/help` page says that is not a command row.
+///
+/// Kept verbatim: these describe input affordances (`#remember`, `!shell`, `@file`) rather than
+/// commands, so there is no row for them to hang off.
+const INPUT_SHORTCUTS: &str = "\
+Input shortcuts (in a normal message):
+  #<text>            remember <text> as a durable fact (one keystroke into the memory brain) — sends no turn
+  !<cmd>             run <cmd> in the shell and show output (the safety floor still blocks catastrophic commands) — sends no turn
+  @<path>            inline a file's contents into your message
+  !`<cmd>`           splice a read-only command's output into your message
+Anything else you type goes to the agent (it chats and uses tools in one loop).";
+
+/// Column the description starts in, so the page reads as a table.
+const HELP_TEXT_COLUMN: usize = 21;
+
+/// Render the `/help` page from [`BUILTINS`].
+///
+/// This was a hand-written const, and it showed: `/where` was listed twice with two different
+/// descriptions, while `/handoff`, `/save`, `/serve`, `/smart`, `/tools`, `/undo`, `/redo` and
+/// `/work` all worked and were documented nowhere. Generating it means a command that exists is a
+/// command that is listed — there is no second copy left to forget.
+pub fn help_page() -> String {
+    let mut out = String::from("Commands:\n");
+    for b in BUILTINS.iter().filter(|b| !b.hidden) {
+        let label = if b.argument_hint.is_empty() {
+            format!("/{}", b.name)
+        } else {
+            format!("/{} {}", b.name, b.argument_hint)
+        };
+        let text = if b.help.is_empty() {
+            b.description
+        } else {
+            b.help
+        };
+        let pad = HELP_TEXT_COLUMN.saturating_sub(2 + label.len()).max(1);
+        out.push_str(&format!("  {label}{blank:pad$}{text}\n", blank = ""));
+    }
+    out.push('\n');
+    out.push_str(INPUT_SHORTCUTS);
+    out
+}
 
 /// The built-in a spelling resolves to — canonical name, listed alias, or hidden alias alike.
 ///
@@ -931,6 +1022,40 @@ mod tests {
                     "/{spelling} resolves to the wrong command"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_help_page_documents_every_visible_command_exactly_once() {
+        // The hand-written page had drifted both ways at once: /where twice, eight working commands
+        // absent. Neither is expressible now, and this test says so out loud.
+        let page = help_page();
+        for b in BUILTINS {
+            let hits = page
+                .lines()
+                .filter(|l| {
+                    l.starts_with(&format!("  /{} ", b.name))
+                        || l.trim_end() == format!("  /{}", b.name)
+                })
+                .count();
+            assert_eq!(
+                hits,
+                usize::from(!b.hidden),
+                "/{} appears {hits} times on the help page",
+                b.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_without_curated_help_still_gets_a_line() {
+        // `help: ""` must fall back to `description` rather than print an empty column.
+        for b in BUILTINS.iter().filter(|b| !b.hidden && b.help.is_empty()) {
+            assert!(
+                help_page().contains(b.description),
+                "/{} has no help text and no description on the page",
+                b.name
+            );
         }
     }
 

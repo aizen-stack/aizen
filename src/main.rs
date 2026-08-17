@@ -6909,53 +6909,6 @@ async fn slash_menu(history: &mut Vec<Message>, model_label: &mut String) -> Sla
     }
 }
 
-const SLASH_HELP: &str = "\
-Commands:
-  /help              this list
-  /init [--force|--status]  index the codebase into a semantic chunk index (SHA-256 incremental, secrets redacted); powers codebase_search + auto per-turn retrieval. --force rebuilds, --status shows state, Esc cancels
-  /where             show THIS project's identity: root · zone slug · git executable · where memory/skills/sessions live (also `aizen where`, `aizen zone migrate`)
-  /model             list the provider's models (with context windows) + pick one
-  /provider [name]   one-pick switch; `add` creates and `manage` edits/renames/deletes providers
-  /config            set endpoint + key + model and manage provider profiles
-  /memory [query]    show your profile, or search memory; /memory remember <fact> to save
-  /persona           pick the character the agent role-plays (list · select · new · clear · delete)
-  /skills            saved procedures the agent can load (list · view · new · delete)
-  /commands          your custom slash commands — markdown macros in ~/.aizen/commands/ ($ARGUMENTS · @file · !`cmd`)
-  /apps              connected apps & MCP catalog — Telegram/Discord/Slack/webhook + browser sign-in apps
-  /mcp               MCP servers from ~/.aizen/mcp.json — lifecycle generation, health, pinned schema + tools
-  /browser           browser profile/routes status (when built with --features browser)
-  /telegram          Telegram integration menu (setup · test · status · start daemon · disable)
-  /sessions          saved conversations — restore · save · delete (autosaves into its own file each turn; newest first, labeled by project)
-  /resume [name]     reopen the last conversation FROM THIS PROJECT (or a named one); /handoff <goal> starts a fresh thread carrying only what that goal needs
-  /import            resume a conversation started in another CLI (Claude Code or Codex) — pick from transcripts whose cwd matches this project
-  /where             which project/zone you're in, and which file this conversation is saved to
-  /workflows         multi-agent status — live task/workflow children, sub-agent slots (also /wf)
-  /agents            specialist sub-agents — list · set-provider <agent> <provider> [model]
-  /recover           a session interrupted by a crash/kill — restore its transcript + unsent draft, or /recover discard
-  /timemachine       browse every checkpoint (▸ = current) and pick one to jump back to that code + chat; also /timeline · /tm · /undo · /redo
-  /diff              what changed in the working tree since a checkpoint (read before you /undo)
-  /checkpoint [note] save a restore point of the working tree now
-  /compact           summarize older turns to free context now
-  /goal <text>       run until the goal is done — model self-declares (goal_complete) + verify passes; no iteration cap, auto-retries API errors (incl. empty 200); /goal off to stop, Esc to cancel
-  /lsp [on|off|status|restart]  type-aware navigation + symbol_replace/insert + diagnostics via a language server (rust-analyzer · pyright · typescript-language-server); default ON (lazy spawn), /lsp off reclaims RAM
-  /reach [doctor|status]  web-access channels: live-probe every backend (doctor) or show what served this session (status); web_fetch/web_search route through these
-  /approval [ask|smart|yolo]  approval level — ask every time, auto-run read-only, or pre-authorize
-  /ultimate          toggle ultimate mode — max reasoning effort + prefer launching workflows (aizen's ultracode)
-  /effort            drag an animated slider (auto · low · medium · high · xhigh · max); or /effort auto|off|low|medium|high|xhigh|max|clear to set it directly
-  /update            show the installed version next to every published one and install the one you pick (newer or older) — the new build starts in your NEXT terminal
-  /clear             start a fresh conversation
-  /tokens            show session token usage (context-fill HUD)
-  /context           break down what fills the context window (system prompt · tool schemas · conversation by role)
-  /cost              session usage + $ estimate (real tokens when the provider reports them; set rates via `aizen config set --price-in/--price-out`)
-  /quit              exit
-
-Input shortcuts (in a normal message):
-  #<text>            remember <text> as a durable fact (one keystroke into the memory brain) — sends no turn
-  !<cmd>             run <cmd> in the shell and show output (the safety floor still blocks catastrophic commands) — sends no turn
-  @<path>            inline a file's contents into your message
-  !`<cmd>`           splice a read-only command's output into your message
-Anything else you type goes to the agent (it chats and uses tools in one loop).";
-
 /// Slash commands that drive the terminal directly (dialoguer menus, the Telegram daemon) and so
 /// need the sticky box SUSPENDED. Everything else is pure-print: it runs with the box still up and
 /// its `tui::emit_line` output flows into the scroll region (so short output isn't painted over).
@@ -7841,7 +7794,7 @@ async fn handle_slash(
         return slash_custom_or_unknown(name, arg);
     };
     match builtin.id {
-        SlashId::Help => tui::emit_line(&style(SLASH_HELP).dim().to_string()),
+        SlashId::Help => tui::emit_line(&style(slash::help_page()).dim().to_string()),
         SlashId::Quit => return SlashOutcome::Quit,
         SlashId::Clear => {
             rebuild_system(history, model_label);
