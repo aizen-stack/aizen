@@ -1347,6 +1347,18 @@ async fn prompt_validated_api_key(
     current: Option<&str>,
     keys_url: Option<&str>,
 ) -> Result<Option<(String, Vec<client::ModelInfo>)>> {
+    // Codex has no API key to validate: it authenticates with OAuth tokens saved by
+    // `aizen auth login codex`. Prompting here would ask for a secret that does not exist and then
+    // fail verification against an endpoint that has no `GET /models`, so short-circuit with the
+    // same placeholder the provider store uses and the curated catalog.
+    if crate::llm::oauth_codex::is_codex_base_url(base) {
+        if crate::llm::oauth_codex::has_token() {
+            line_ok("using saved ChatGPT/Codex login tokens");
+        } else {
+            line_warn("no Codex login found yet — run `aizen auth login codex` before using this provider");
+        }
+        return Ok(Some(("codex-oauth".to_string(), codex_model_infos())));
+    }
     if let Some(url) = keys_url {
         tui::emit_line(&format!("  {}", style(format!("get a key: {url}")).dim()));
     }

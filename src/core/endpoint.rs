@@ -35,6 +35,13 @@ pub(crate) fn resolve_endpoint(
     Ok((base_url, api_key, model))
 }
 
+/// Codex signs requests with OAuth tokens stored out of band, so there is no API key to resolve.
+/// `cli_config::Provider::new` already stores this same placeholder for Codex profiles — returning it
+/// here keeps a Codex user from being stopped by "no API key" when the key genuinely does not exist.
+fn codex_oauth_api_key(base_url: &str) -> Option<String> {
+    crate::llm::oauth_codex::is_codex_base_url(base_url).then(|| "codex-oauth".to_string())
+}
+
 pub(crate) fn resolve_base_key(
     base_url: Option<String>,
     api_key: Option<String>,
@@ -47,6 +54,7 @@ pub(crate) fn resolve_base_key(
     let api_key = api_key
         .or_else(|| cli_config::branded_env("API_KEY"))
         .or(cfg.api_key)
+        .or_else(|| codex_oauth_api_key(&base_url))
         .context("no API key — run `aizen config`")?;
     Ok((base_url, api_key))
 }
@@ -77,4 +85,18 @@ pub(crate) fn http_client() -> Result<reqwest::Client> {
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()
         .context("building HTTP client")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_base_uses_oauth_placeholder_without_api_key() {
+        assert_eq!(
+            codex_oauth_api_key(crate::llm::oauth_codex::CODEX_BASE_URL).as_deref(),
+            Some("codex-oauth")
+        );
+        assert_eq!(codex_oauth_api_key("https://api.openai.com/v1"), None);
+    }
 }
