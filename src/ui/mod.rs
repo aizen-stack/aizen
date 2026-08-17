@@ -4,6 +4,7 @@
 
 pub mod cards;
 pub mod channel_markdown;
+pub mod config_ui;
 pub mod icons;
 pub mod image_input;
 pub mod links;

@@ -138,7 +138,7 @@ fn plan_for(current_slug: String, candidates: Vec<String>) -> Result<ZonePlan> {
             entries: counts[0],
             review: counts[1],
             archive: counts[2],
-            sessions: crate::count_sessions_of_slug(&slug),
+            sessions: crate::core::session_store::count_sessions_of_slug(&slug),
             slug,
         };
         if !z.is_empty() {
@@ -201,7 +201,9 @@ pub fn apply(plan: &ZonePlan) -> MigrateReport {
         // made `/resume` warn that the user's own transcripts belonged to another project — with no
         // way to heal it, because migrate only ever touched slug-keyed paths.
         let mut session_errs: Vec<String> = Vec::new();
-        let moved = crate::retag_sessions_of_slug(&z.slug, &mut |e| session_errs.push(e));
+        let moved = crate::core::session_store::retag_sessions_of_slug(&z.slug, &mut |e| {
+            session_errs.push(e)
+        });
         if moved > 0 {
             rep.actions.push(format!(
                 "sessions: re-homed {moved} saved conversation(s) {} → {}",
