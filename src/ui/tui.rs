@@ -385,6 +385,7 @@ const TIPS: &[&str] = &[
     "`/approval smart` auto-runs read-only tools; `yolo` pre-authorizes the rest",
     "PgUp/PgDn scrolls back through the transcript, End returns to the live tail",
     "drag over transcript text to copy it; Ctrl-C copies the highlight, or the draft you typed",
+    "click in the input box to move the caret; drag over it to select & copy what you typed",
 ];
 /// Per-session tip cursor — advanced once per submitted turn so tips rotate rather than repeat.
 static TIP_SEED: AtomicUsize = AtomicUsize::new(0);
@@ -571,6 +572,10 @@ pub enum Submission {
 struct Render {
     draft: Vec<char>,
     cursor: usize,
+    /// Mouse highlight inside the input box as `(anchor, cursor)` draft char indices, or `None` when
+    /// nothing is highlighted. Written by the drag handler and by every key that invalidates it; read
+    /// by the renderer (to paint it REVERSED) and by Ctrl-C (to copy just that much).
+    draft_sel: Option<(usize, usize)>,
     images: usize,
     status: String,
     /// Highlighted row in the live slash palette (index into the current matches; 0 = nearest box).
@@ -601,6 +606,7 @@ fn render() -> &'static Mutex<Render> {
         Mutex::new(Render {
             draft: Vec::new(),
             cursor: 0,
+            draft_sel: None,
             images: 0,
             status: String::new(),
             palette_sel: 0,
@@ -619,6 +625,63 @@ fn render() -> &'static Mutex<Render> {
             queued_count: 0,
         })
     })
+}
+
+/// Normalise an input-box highlight into a half-open `[start, end)` range of draft chars, clamped to a
+/// draft of `len` chars.
+///
+/// One implementation for both sides of the module boundary: the renderer paints this range and Ctrl-C
+/// copies it, and a highlight that is drawn differently from what gets copied is worse than no
+/// highlight at all. `None` when there is nothing selected — a bare click leaves `anchor == cursor`,
+/// which must NOT read as a one-char selection, and a stale range against a shorter draft (history
+/// recall, a `/clear`) collapses to nothing rather than pointing at whatever now sits at that index.
+fn normalized_draft_sel(sel: Option<(usize, usize)>, len: usize) -> Option<(usize, usize)> {
+    let (a, b) = sel?;
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let (lo, hi) = (lo.min(len), hi.min(len));
+    (hi > lo).then_some((lo, hi))
+}
+
+/// The input-box highlight as a half-open draft range, if there is one.
+fn draft_selection() -> Option<(usize, usize)> {
+    let r = render().lock().unwrap();
+    normalized_draft_sel(r.draft_sel, r.draft.len())
+}
+
+/// Drop the highlight without touching the text, repainting only if there was one to drop.
+fn clear_draft_selection() {
+    let had = {
+        let mut r = render().lock().unwrap();
+        r.draft_sel.take().is_some()
+    };
+    if had {
+        repaint();
+    }
+}
+
+/// Remove the highlighted chars from the draft and collapse the caret onto where they started.
+///
+/// No repaint of its own: every caller either repaints or is about to insert the char that replaces the
+/// selection, and repainting the intermediate state would flash the deletion on screen.
+fn delete_draft_selection() {
+    let mut r = render().lock().unwrap();
+    if let Some((a, b)) = normalized_draft_sel(r.draft_sel, r.draft.len()) {
+        r.draft.drain(a..b);
+        r.cursor = a;
+        r.palette_sel = 0; // matches changed → reset the palette highlight to the nearest
+        r.at_sel = 0;
+    }
+    r.draft_sel = None;
+}
+
+/// Park the caret at draft index `idx` and set (or clear) the highlight in the same repaint.
+fn set_draft_caret(idx: usize, sel: Option<(usize, usize)>) {
+    {
+        let mut r = render().lock().unwrap();
+        r.cursor = idx.min(r.draft.len());
+        r.draft_sel = sel;
+    }
+    repaint();
 }
 
 /// Submissions not yet consumed by the REPL (incremented on keyboard send, decremented on recv).
@@ -1226,6 +1289,7 @@ pub fn set_draft(text: &str) {
         let mut r = render().lock().unwrap();
         r.draft = text.chars().collect();
         r.cursor = r.draft.len();
+        r.draft_sel = None; // a highlight from the old draft would point into unrelated text
         r.palette_sel = 0;
     }
     repaint_force();
@@ -1310,6 +1374,7 @@ fn retained_input_snapshot() -> retained::InputSnapshot {
     retained::InputSnapshot {
         draft: r.draft.clone(),
         cursor: r.cursor,
+        sel: r.draft_sel,
         images: r.images,
         status: r.status.clone(),
         queued_count: r.queued_count,
@@ -1464,8 +1529,22 @@ fn handle_retained_mouse(
     row: u16,
     selecting: &mut Option<retained::SelectionRange>,
     dragging_scrollbar: &mut bool,
+    dragging_draft: &mut Option<usize>,
 ) {
     use crossterm::event::{MouseButton, MouseEventKind};
+    // The input box gets first refusal on the buttons, and it is checked BEFORE the transcript
+    // geometry gate below: the footer is painted even on a frame where the transcript is still empty,
+    // and clicking into the box you are typing in must work from the very first keystroke.
+    if handle_input_box_mouse(
+        kind,
+        col,
+        row,
+        selecting,
+        dragging_scrollbar,
+        dragging_draft,
+    ) {
+        return;
+    }
     let (start, visible, total, area) = retained::last_transcript_geom();
     if area.width == 0 || area.height == 0 {
         // Nothing painted yet: there is no line/column mapping to hit-test against, and the wheel is
@@ -1637,6 +1716,76 @@ fn handle_retained_mouse(
     }
 }
 
+/// Mouse inside the input box: click to park the caret, drag to select, release to copy. Returns
+/// whether the event belonged to the box (the caller then leaves the transcript alone).
+///
+/// This is the mouse half of editing the draft. Without it the caret could only be walked with ←/→,
+/// which on a draft longer than the box also dragged the whole line under a stationary cursor, and the
+/// only way to copy what you had typed was Ctrl-C taking ALL of it.
+///
+/// The box's highlight and the transcript's are deliberately exclusive — Ctrl-C has one meaning at a
+/// time, so starting one drops the other rather than leaving two highlights on screen competing to be
+/// "the selection".
+fn handle_input_box_mouse(
+    kind: crossterm::event::MouseEventKind,
+    col: u16,
+    row: u16,
+    selecting: &mut Option<retained::SelectionRange>,
+    dragging_scrollbar: &mut bool,
+    dragging_draft: &mut Option<usize>,
+) -> bool {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    match kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(idx) = retained::input_hit(col, row) else {
+                // Clicking anywhere else ends the box's claim on the highlight — including a click that
+                // starts a transcript selection, which the caller goes on to handle.
+                *dragging_draft = None;
+                clear_draft_selection();
+                return false;
+            };
+            *selecting = None;
+            retained::clear_selection();
+            *dragging_scrollbar = false;
+            *dragging_draft = Some(idx);
+            set_draft_caret(idx, None);
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let Some(anchor) = *dragging_draft else {
+                return false;
+            };
+            // Column only, row ignored: the pointer leaves a one-row box constantly while selecting
+            // inside it, and a drag that stopped extending the moment it strayed a row would be
+            // unusable. Off either end of the text it clamps to the nearest edge.
+            if let Some(idx) = retained::input_hit_col(col) {
+                set_draft_caret(idx, Some((anchor, idx)));
+            }
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if dragging_draft.take().is_none() {
+                return false;
+            }
+            // Copy on release, as the transcript does: letting go of the button is the moment the user
+            // has finished saying what they meant. The highlight stays until the next click so it is
+            // still there to retype over.
+            if let Some((a, b)) = draft_selection() {
+                let text: String = {
+                    let r = render().lock().unwrap();
+                    r.draft[a..b].iter().collect()
+                };
+                if !text.is_empty() {
+                    let ok = copy_to_os_clipboard(&text);
+                    note_copied(&text, ok);
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Copy selected transcript text to the OS clipboard, reporting whether it actually landed.
 ///
 /// DESKTOP-ONLY: `arboard` is target-gated to Windows/macOS (Linux would need X11/Wayland libs at
@@ -1696,7 +1845,17 @@ fn ctrl_c_copy_target() -> Option<(String, &'static str)> {
             return Some((text, "selection"));
         }
     }
-    let draft: String = render().lock().unwrap().draft.iter().collect();
+    let r = render().lock().unwrap();
+    // A highlight dragged inside the box is as explicit an act of selection as a transcript one, so it
+    // outranks the whole-draft fallback — selecting three words and pressing Ctrl-C must not put the
+    // entire draft on the clipboard.
+    if let Some((a, b)) = normalized_draft_sel(r.draft_sel, r.draft.len()) {
+        let text: String = r.draft[a..b].iter().collect();
+        if !text.trim().is_empty() {
+            return Some((text, "selection"));
+        }
+    }
+    let draft: String = r.draft.iter().collect();
     if !draft.trim().is_empty() {
         return Some((draft, "draft"));
     }
@@ -1760,6 +1919,9 @@ fn input_loop(
     // `dragging_scrollbar` tracks thumb drag on the right gutter. Cleared on mouse-up / Esc.
     let mut selecting: Option<retained::SelectionRange> = None;
     let mut dragging_scrollbar = false;
+    // Anchor of a left-drag that started INSIDE the input box (draft char index), so the drag extends
+    // the same selection it began. `None` when no such drag is in flight; cleared on release.
+    let mut dragging_draft: Option<usize> = None;
     // Idle screensaver state (retained only). After IDLE_SCREENSAVER secs with no key/mouse activity
     // — and only when idle, not working, and no menu/overlay is open — the render thread blits one
     // static feature card over the alt-screen. The next input event clears it (and is swallowed, so
@@ -1870,6 +2032,9 @@ fn input_loop(
             match ev {
                 Event::Key(ke) if ke.kind == KeyEventKind::Press => {
                     if ke.code == KeyCode::Enter && ke.modifiers.contains(KeyModifiers::SHIFT) {
+                        // Reached before the central selection rule below, so apply it here: a newline
+                        // typed over a highlight replaces it, like any other inserted char.
+                        delete_draft_selection();
                         let mut r = render().lock().unwrap();
                         let cur = r.cursor;
                         r.draft.insert(cur, '\n');
@@ -1897,6 +2062,7 @@ fn input_loop(
                             let mut r = render().lock().unwrap();
                             r.draft.clear();
                             r.cursor = 0;
+                            r.draft_sel = None; // the text it highlighted just left for the agent
                             r.palette_sel = 0;
                             drop(r);
                             if !line.trim().is_empty() {
@@ -1916,6 +2082,13 @@ fn input_loop(
                     // state stays `Some` for the rest of the session — from then on EVERY Esc was eaten
                     // here and cancel never ran. Falling through while a turn is in flight (and clearing
                     // the stale selection on the way) means a missed mouse-up can no longer disarm Esc.
+                    // Esc also disarms a stuck input-box drag. `dragging_draft` is only cleared on a
+                    // left-button RELEASE, and a release the terminal never reports (drag out of the
+                    // window, focus lost mid-drag) would otherwise leave the box swallowing every later
+                    // drag event, killing transcript selection for the rest of the session.
+                    if ke.code == KeyCode::Esc {
+                        dragging_draft = None;
+                    }
                     if ke.code == KeyCode::Esc && selecting.is_some() {
                         selecting = None;
                         retained::clear_selection();
@@ -1937,6 +2110,7 @@ fn input_loop(
                         me.row,
                         &mut selecting,
                         &mut dragging_scrollbar,
+                        &mut dragging_draft,
                     );
                     continue;
                 }
@@ -2043,6 +2217,24 @@ fn input_loop(
                 _ => {}
             }
             continue;
+        }
+        // What a keystroke does to a live input-box highlight, decided in ONE place rather than in each
+        // arm below: typing replaces it, Backspace/Del removes it, and anything else merely drops it.
+        // That is what every editor does, and a highlight the next keystroke ignored would be a lie —
+        // the user would type expecting a replacement and get an insertion beside the still-highlighted
+        // text. Ctrl-C is the exception because copying the highlight is that key's whole job here.
+        if draft_selection().is_some() && !matches!(key, Key::CtrlC | Key::Char('\u{3}')) {
+            match key {
+                Key::Backspace | Key::Del => {
+                    delete_draft_selection();
+                    hist_idx = None;
+                    repaint();
+                    continue;
+                }
+                // Fall through to the insert arm below, which now inserts at the collapsed caret.
+                Key::Char(c) if !c.is_control() => delete_draft_selection(),
+                _ => clear_draft_selection(),
+            }
         }
         match key {
             // A newline INSIDE a paste → a literal newline in the draft, never a submit. This is the
@@ -3423,6 +3615,54 @@ mod tests {
         assert_eq!(HealthKind::Unstable.color_code(), theme::WARN);
         assert_eq!(HealthKind::Down.color_code(), theme::ERR);
         assert_eq!(HealthKind::Unknown.color_code(), theme::MUTED);
+    }
+
+    #[test]
+    fn draft_selection_normalizes_and_ignores_a_bare_click() {
+        // Drag right, drag left — same range either way.
+        assert_eq!(normalized_draft_sel(Some((2, 5)), 10), Some((2, 5)));
+        assert_eq!(normalized_draft_sel(Some((5, 2)), 10), Some((2, 5)));
+        // A plain click leaves anchor == cursor. That is a caret move, NOT a one-char selection — if it
+        // read as one, the next keystroke would silently eat the char under the click.
+        assert_eq!(normalized_draft_sel(Some((3, 3)), 10), None);
+        assert_eq!(normalized_draft_sel(None, 10), None);
+        // A range left over from a longer draft (history recall, Esc, a submit) clamps, and collapses to
+        // nothing rather than pointing at whatever now sits at those indices.
+        assert_eq!(normalized_draft_sel(Some((1, 99)), 4), Some((1, 4)));
+        assert_eq!(normalized_draft_sel(Some((7, 9)), 4), None);
+    }
+
+    /// Typing over a highlight replaces it — asserted through the shared draft state, in one test
+    /// because that state is process-global and splitting it would race across test threads.
+    #[test]
+    fn editing_over_an_input_selection_removes_the_highlighted_chars() {
+        {
+            let mut r = render().lock().unwrap();
+            r.draft = "hello world".chars().collect();
+            r.cursor = 11;
+            r.draft_sel = Some((6, 11)); // "world", dragged right-to-left or left-to-right
+        }
+        assert_eq!(draft_selection(), Some((6, 11)));
+        delete_draft_selection();
+        {
+            let r = render().lock().unwrap();
+            assert_eq!(r.draft.iter().collect::<String>(), "hello ");
+            assert_eq!(
+                r.cursor, 6,
+                "the caret collapses onto where the range started"
+            );
+            assert!(r.draft_sel.is_none(), "and the highlight is gone with it");
+        }
+        // Idempotent: a second call with nothing selected must not eat a char.
+        delete_draft_selection();
+        assert_eq!(
+            render().lock().unwrap().draft.iter().collect::<String>(),
+            "hello "
+        );
+        // Leave the shared state clean for anything else that reads it.
+        let mut r = render().lock().unwrap();
+        r.draft.clear();
+        r.cursor = 0;
     }
 
     #[test]

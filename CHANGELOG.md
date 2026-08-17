@@ -45,6 +45,15 @@ development log lives in that monorepo's history.
   review, explain and plan requests are distinguished from action requests up front.
 
 ### Fixed
+- **The input box ignored the mouse, and a long draft scrolled under a stationary caret.** Clicking a
+  character in the box now puts the caret on it, instead of ←/→ being the only way to get there, and
+  dragging across the box selects draft text — copied to the clipboard on release, or with Ctrl-C,
+  which now copies just the highlight rather than the whole draft. Typing over a selection replaces
+  it and Backspace/Del deletes it, decided in one place so no key can disagree with what is
+  highlighted. The window onto a draft longer than the box is also sticky now: it only slides when
+  the caret would leave it. Before, it was re-derived from the caret every frame, which pinned the
+  caret to the right edge — so each ←/→ dragged the whole line sideways under a motionless cursor,
+  and a click could never land where it was aimed because the text jumped as the caret arrived.
 - **The Time Machine store grew forever and could never be compacted.** Every checkpoint writes its
   commit, tree, and changed blobs as loose objects, and nothing ever packed them — measured on the
   author's machine: **14,868 loose objects, 0 packs, backing 30 live checkpoints** (88 MB across

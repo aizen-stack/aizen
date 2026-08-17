@@ -53,6 +53,10 @@ pub(super) struct InputSnapshot {
     pub status: String,
     pub queued_count: usize,
     pub overlay: Option<OverlaySnapshot>,
+    /// Mouse highlight inside the input box as `(anchor, cursor)` draft char indices — the drag's
+    /// start and where it currently is, in either order. Painted REVERSED; normalised through
+    /// [`super::normalized_draft_sel`] so a bare click (anchor == cursor) is no selection at all.
+    pub sel: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -289,6 +293,14 @@ struct AppState {
     /// How many chars of `work_caption` are revealed so far — advanced one per animation tick for the
     /// typewriter effect, clamped to the caption length.
     work_reveal: usize,
+    /// Draft index of the first char visible in the input box at the last draw.
+    ///
+    /// The window is STICKY: it only slides when the caret would otherwise fall off an edge. Re-deriving
+    /// it from the caret every frame (what this used to do) pinned the caret to the right edge, so on a
+    /// draft longer than the box every ←/→ scrolled the whole line under a stationary cursor instead of
+    /// moving the cursor through stationary text — and a click could never land where it was aimed,
+    /// because the text jumped as soon as the caret moved.
+    input_win_start: usize,
 }
 
 /// Absolute character selection over the flat list of wrapped transcript rows.
@@ -340,6 +352,73 @@ pub(super) fn jump_button_rect() -> Option<Rect> {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     g.jump_button
+}
+
+/// Where the input box's typed text landed on screen at the last draw, so the input thread can turn a
+/// mouse column into a caret position in the draft.
+///
+/// The draft is a `Vec<char>` but the screen is a grid of display CELLS, and the two do not line up:
+/// a CJK char or an emoji is two cells wide, a `\n` is painted as a one-cell `↵`, and only a window of
+/// a long draft is on screen at all. So the mapping is published as the column each visible char was
+/// actually painted at — measured by the code that painted it — rather than recomputed on the input
+/// thread from a width function that might disagree.
+#[derive(Clone, Debug, Default)]
+struct InputGeom {
+    /// Screen rect of the `❯ …` row. `width == 0` means nothing has been painted yet: no mapping.
+    row: Rect,
+    /// Draft index of the first char in the visible window.
+    start: usize,
+    /// Absolute start column of each visible char, plus one entry for the cell just past the last —
+    /// where a click beyond the end of the text parks the caret. Length is `visible chars + 1`.
+    cols: Vec<u16>,
+}
+
+fn input_geom_slot() -> &'static Mutex<InputGeom> {
+    static SLOT: OnceLock<Mutex<InputGeom>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(InputGeom::default()))
+}
+
+/// Draft index a click at column `col` points at, ignoring the row.
+///
+/// Row-blind on purpose: it backs the DRAG half of a selection, where the pointer routinely leaves the
+/// one-row input box while the user is still selecting inside it. `input_hit` is the row-checked
+/// variant that decides whether a click belongs to the box in the first place.
+pub(super) fn input_hit_col(col: u16) -> Option<usize> {
+    let g = input_geom_slot().lock().unwrap_or_else(|e| e.into_inner());
+    if g.row.width == 0 || g.cols.is_empty() {
+        return None;
+    }
+    Some(hit_index(&g.cols, g.start, col))
+}
+
+/// Which draft char the cell at absolute column `col` belongs to, given a published column map. Pure so
+/// the mapping — the one piece of this that an off-by-one would make silently aim one char wrong — is
+/// testable without a terminal.
+///
+/// `cols[i + 1]` is where char `i` ends, so the first char whose end is past the click owns the cell the
+/// click landed on, and the caret goes ON that cell: exactly where the block cursor is then drawn. Both
+/// cells of a double-width char therefore resolve to that char, a click left of the text resolves to the
+/// start of the window, and anything past the end resolves to just after the last visible char.
+fn hit_index(cols: &[u16], start: usize, col: u16) -> usize {
+    let visible = cols.len().saturating_sub(1);
+    for i in 0..visible {
+        if col < cols[i + 1] {
+            return start + i;
+        }
+    }
+    start + visible
+}
+
+/// Draft index a click at (`col`, `row`) points at, or `None` when the click is not on the input row.
+pub(super) fn input_hit(col: u16, row: u16) -> Option<usize> {
+    let on_row = {
+        let g = input_geom_slot().lock().unwrap_or_else(|e| e.into_inner());
+        g.row.width > 0
+            && row == g.row.y
+            && col >= g.row.x
+            && col < g.row.x.saturating_add(g.row.width)
+    };
+    on_row.then(|| input_hit_col(col)).flatten()
 }
 
 /// Where `draw_footer` last asked ratatui to park the input caret (`frame.set_cursor_position`).
@@ -489,6 +568,7 @@ impl AppState {
             work_verb: String::new(),
             work_caption: String::new(),
             work_reveal: 0,
+            input_win_start: 0,
         }
     }
 
@@ -1752,8 +1832,13 @@ fn working_line(state: &AppState) -> Vec<(String, Line<'static>)> {
     vec![(plain, Line::from(spans))]
 }
 
-fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     if area.height < FOOTER_ROWS || area.width == 0 {
+        // No input row was painted, so retire the click map with it — a stale one would keep answering
+        // hit-tests for a row that is no longer on screen.
+        if let Ok(mut slot) = input_geom_slot().lock() {
+            *slot = InputGeom::default();
+        }
         return;
     }
     let rows = Layout::default()
@@ -1856,7 +1941,14 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     };
     let imgtag_w = console::measure_text_width(&imgtag);
     let type_budget = width.saturating_sub(3 + imgtag_w + hint_w);
-    let (shown, cursor_off) = input_line(state, type_budget);
+    let row = input_line(state, type_budget);
+    let InputRow {
+        shown,
+        caret_off: cursor_off,
+        start: win_start,
+        cols: char_cols,
+    } = row;
+    state.input_win_start = win_start; // sticky across frames — see `AppState::input_win_start`
     let shown_w = console::measure_text_width(&shown);
     // Pad between the typed text and the right-aligned hint. `3` = `❯ ` (2) + one right margin.
     let hint_gap = width
@@ -1882,7 +1974,20 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             Style::default().fg(Color::DarkGray),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(prompt_spans)), rows[2]);
+    // Cells from the start of the row to the first char of the visible draft window: `❯ ` plus the
+    // `[Nimg]` chip. Both the highlight (row-relative) and the click map (absolute) hang off this.
+    let text_off = 2 + imgtag_w;
+    let mut prompt_line = Line::from(prompt_spans);
+    // A mouse highlight inside the box, painted the same way the transcript paints its own.
+    if let Some((from_cell, to_cell)) = sel_cells(
+        super::normalized_draft_sel(state.input.sel, state.input.draft.len()),
+        win_start,
+        &char_cols,
+        text_off,
+    ) {
+        reverse_line_cols(&mut prompt_line, from_cell, to_cell);
+    }
+    frame.render_widget(Paragraph::new(prompt_line), rows[2]);
     frame.render_widget(
         Paragraph::new(Line::styled(
             rule,
@@ -1890,6 +1995,22 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         )),
         rows[3],
     );
+    // Publish where each visible char landed so the input thread can map a click to a caret position.
+    if let Ok(mut slot) = input_geom_slot().lock() {
+        *slot = InputGeom {
+            row: rows[2],
+            start: win_start,
+            cols: char_cols
+                .iter()
+                .map(|c| {
+                    rows[2]
+                        .x
+                        .saturating_add(text_off as u16)
+                        .saturating_add(*c as u16)
+                })
+                .collect(),
+        };
+    }
     let cursor_x = rows[2]
         .x
         .saturating_add(2)
@@ -1903,7 +2024,43 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
 }
 
-fn input_line(state: &AppState, budget: usize) -> (String, usize) {
+/// Row cells `[from, to)` that a draft selection covers, clipped to the window actually on screen.
+///
+/// The selection is in DRAFT indices and the window is only part of the draft, so half of it — or all of
+/// it — can be off screen; `cols` maps only what is visible. `None` when nothing of it lands in the
+/// window, which is also what a collapsed selection gives. `text_off` is where the draft text starts
+/// within the row (`❯ ` plus any `[Nimg]` chip), because [`reverse_line_cols`] counts from the row edge.
+fn sel_cells(
+    sel: Option<(usize, usize)>,
+    win_start: usize,
+    cols: &[usize],
+    text_off: usize,
+) -> Option<(usize, usize)> {
+    let (a, b) = sel?;
+    let visible = cols.len().saturating_sub(1);
+    let from = a.saturating_sub(win_start).min(visible);
+    let to = b.saturating_sub(win_start).min(visible);
+    // `b <= win_start` collapses to (0, 0) and a selection entirely to the right collapses to
+    // (visible, visible) — both correctly read as nothing to paint.
+    (to > from).then(|| (text_off + cols[from], text_off + cols[to]))
+}
+
+/// One painted input row: what fits on screen, where the caret goes, and where every visible char
+/// landed. Returned as a struct because the column map is the whole point — see [`InputGeom`].
+struct InputRow {
+    /// The text painted after `❯ ` and the `[Nimg]` chip: the window of the draft that fits, behind the
+    /// `↵N · ` paste chip when the draft is many lines. The placeholder text when the draft is empty.
+    shown: String,
+    /// Display cells from the start of `shown` to the caret.
+    caret_off: usize,
+    /// Draft index of the first char of the visible window (`0` unless a long draft scrolled).
+    start: usize,
+    /// Display cells from the start of `shown` to the start of visible char `i` — i.e. draft char
+    /// `start + i` — plus one trailing entry for the cell just past the last char. Never empty.
+    cols: Vec<usize>,
+}
+
+fn input_line(state: &AppState, budget: usize) -> InputRow {
     if state.input.draft.is_empty() {
         let q = if state.input.queued_count > 0 {
             format!(" · {} queued", state.input.queued_count)
@@ -1922,7 +2079,14 @@ fn input_line(state: &AppState, budget: usize) -> (String, usize) {
         } else {
             format!("Type a message · / commands{q}")
         };
-        return (console::truncate_str(&ph, budget, "…").into_owned(), 0);
+        // No draft ⇒ no chars to map: `cols` carries only the past-the-end entry, so any click on the
+        // placeholder resolves to caret 0 (which is where an empty draft's caret already is).
+        return InputRow {
+            shown: console::truncate_str(&ph, budget, "…").into_owned(),
+            caret_off: 0,
+            start: 0,
+            cols: vec![0],
+        };
     }
     // Khi draft có ≥5 dòng (paste lớn), vẫn hiện prefix compact `↵N ·` để báo hiệu,
     // nhưng KHÔNG ẩn toàn bộ text — window quanh cursor vẫn hiện bình thường để người
@@ -1947,28 +2111,53 @@ fn input_line(state: &AppState, budget: usize) -> (String, usize) {
     let cellw = |c: char| console::measure_text_width(&disp(c).to_string()).max(1);
     // Budget for the text window shrinks by the paste prefix (e.g. `↵12 · `) so both fit on one row.
     let text_budget = budget.saturating_sub(prefix_w);
-    let mut start = cursor;
-    let mut caret = 0usize;
+    let draft = &state.input.draft;
+    // ── Sticky window ──────────────────────────────────────────────────────────────────────────────
+    // Start from where the window was last frame and move it only as far as the caret forces. One cell
+    // is held back from the right edge so the block caret has somewhere to sit at the end of the text.
+    let cap = text_budget.saturating_sub(1);
+    let mut start = state.input_win_start.min(cursor);
+    // Caret past the right edge (typing, or a jump to the end) → scroll right until it fits.
+    let mut to_caret: usize = draft[start..cursor].iter().map(|&c| cellw(c)).sum();
+    while to_caret > cap && start < cursor {
+        to_caret -= cellw(draft[start]);
+        start += 1;
+    }
+    // Tail no longer fills the window (after deleting, or a wider terminal) → pull it back left, so a
+    // scrolled draft never shows dead space on the right with text hidden off the left.
+    let mut tail: usize = draft[start..].iter().map(|&c| cellw(c)).sum();
     while start > 0 {
-        let cw = cellw(state.input.draft[start - 1]);
-        if caret + cw > text_budget.saturating_sub(1) {
+        let cw = cellw(draft[start - 1]);
+        if tail + cw > cap {
             break;
         }
+        tail += cw;
         start -= 1;
-        caret += cw;
     }
     let mut shown = String::new();
+    let mut cols = Vec::with_capacity(text_budget + 1);
     let mut used = 0usize;
-    for &c in &state.input.draft[start..] {
+    for &c in &draft[start..] {
         let cw = cellw(c);
         if used + cw > text_budget {
             break;
         }
+        cols.push(prefix_w + used);
         shown.push(disp(c));
         used += cw;
     }
+    // One entry past the last visible char, so a click beyond the text has a cell to land on.
+    cols.push(prefix_w + used);
+    // Re-measure the caret against the window that was actually chosen: the pull-back loop above can
+    // move `start` left after `to_caret` was computed.
+    let caret: usize = draft[start..cursor].iter().map(|&c| cellw(c)).sum();
     // Prepend the paste-count prefix and offset the cursor position past it.
-    (format!("{paste_prefix}{shown}"), prefix_w + caret)
+    InputRow {
+        shown: format!("{paste_prefix}{shown}"),
+        caret_off: prefix_w + caret,
+        start,
+        cols,
+    }
 }
 
 /// Draw the informational overlay, applying `scroll` (rows hidden above the top) clamped so the last
@@ -2454,7 +2643,11 @@ mod tests {
         state.input.draft = "x\n".chars().collect();
         state.input.cursor = state.input.draft.len();
 
-        let (shown, caret) = input_line(&state, 40);
+        let InputRow {
+            shown,
+            caret_off: caret,
+            ..
+        } = input_line(&state, 40);
 
         assert_eq!(shown, "x↵", "a short Shift+Enter draft is shown inline");
         assert_eq!(caret, 2, "caret advances over the visible newline glyph");
@@ -2472,7 +2665,7 @@ mod tests {
         state.input.draft = "a\nb\nc\nd\ne".chars().collect();
         state.input.cursor = state.input.draft.len();
 
-        let (shown, _) = input_line(&state, 40);
+        let shown = input_line(&state, 40).shown;
 
         // Phải có prefix báo số dòng.
         assert!(
@@ -2484,6 +2677,114 @@ mod tests {
             shown.contains('e'),
             "draft text must follow the prefix: {shown:?}"
         );
+    }
+
+    /// A draft of `text` with the caret at `cursor` and the window last drawn from `win_start`.
+    fn input_state(text: &str, cursor: usize, win_start: usize) -> AppState {
+        let mut state = AppState::new("intro", "status");
+        state.input.draft = text.chars().collect();
+        state.input.cursor = cursor;
+        state.input_win_start = win_start;
+        state
+    }
+
+    #[test]
+    fn window_stays_put_while_the_caret_moves_inside_it() {
+        // THE BUG: the window used to be re-derived from the caret every frame, which pinned the caret
+        // to the right edge — so ←, or a click, scrolled the whole line under a stationary cursor and
+        // you could never land on the char you aimed at. Same draft, caret walked back one char: the
+        // window must not move.
+        let long: String = ('a'..='z').cycle().take(80).collect();
+        let end = input_line(&input_state(&long, 80, 0), 20);
+        assert!(
+            end.start > 0,
+            "a draft 4x the box must scroll at all: {:?}",
+            end.shown
+        );
+        assert_eq!(
+            end.caret_off, 19,
+            "typing at the end keeps the caret at the right edge"
+        );
+
+        let back = input_line(&input_state(&long, 79, end.start), 20);
+        assert_eq!(
+            back.start, end.start,
+            "moving the caret INSIDE the window must not scroll the text"
+        );
+        assert_eq!(back.caret_off, 18, "the caret moved, not the text");
+    }
+
+    #[test]
+    fn window_follows_the_caret_off_either_edge() {
+        let long: String = ('a'..='z').cycle().take(80).collect();
+        // Caret left of the window (Home, or a click after scrolling) → re-anchor on the caret.
+        let home = input_line(&input_state(&long, 0, 60), 20);
+        assert_eq!(home.start, 0);
+        assert_eq!(home.caret_off, 0);
+        // Caret past the right edge (End) → scroll so it fits, one cell short of the width for the
+        // caret cell itself.
+        let end = input_line(&input_state(&long, 80, 0), 20);
+        assert_eq!(end.start, 80 - 19);
+        // Window scrolled but the draft now fits → pull back so no dead space shows on the right.
+        let short = input_line(&input_state("abc", 3, 40), 20);
+        assert_eq!(short.start, 0, "a short draft is never scrolled");
+        assert_eq!(short.shown, "abc");
+    }
+
+    #[test]
+    fn column_map_covers_every_visible_char_and_one_past_the_end() {
+        let row = input_line(&input_state("abc", 3, 0), 20);
+        assert_eq!(
+            row.cols,
+            vec![0, 1, 2, 3],
+            "3 chars + the past-the-end cell"
+        );
+        // A wide char takes two cells, so the map is not a 1:1 index → column relation. `♥` is width 1;
+        // use a CJK char, which every wcwidth table agrees is 2.
+        let wide = input_line(&input_state("a漢b", 3, 0), 20);
+        assert_eq!(wide.cols, vec![0, 1, 3, 4]);
+        // Both cells of the wide char resolve to it; past the end lands after the last char.
+        let cols: Vec<u16> = wide.cols.iter().map(|c| *c as u16).collect();
+        assert_eq!(hit_index(&cols, 0, 1), 1, "left cell of 漢");
+        assert_eq!(
+            hit_index(&cols, 0, 2),
+            1,
+            "right cell of 漢 is the same char"
+        );
+        assert_eq!(hit_index(&cols, 0, 3), 2, "the char after it");
+        assert_eq!(
+            hit_index(&cols, 0, 9),
+            3,
+            "far right of the row → end of text"
+        );
+        assert_eq!(hit_index(&cols, 0, 0), 0, "first cell");
+    }
+
+    #[test]
+    fn hit_index_offsets_by_the_window_start() {
+        // The map only covers what is visible, so the index it yields is relative to the window.
+        let cols: Vec<u16> = vec![10, 11, 12, 13];
+        assert_eq!(hit_index(&cols, 40, 10), 40);
+        assert_eq!(hit_index(&cols, 40, 12), 42);
+        // Left of the text (the `❯ ` prompt) parks the caret at the start of the window, not at 0 —
+        // char 0 of the draft may be scrolled far off screen.
+        assert_eq!(hit_index(&cols, 40, 0), 40);
+    }
+
+    #[test]
+    fn selection_cells_clip_to_the_visible_window() {
+        // Window shows draft chars 10..14 at row cells 2..6 (text_off = 2 for `❯ `).
+        let cols = vec![0, 1, 2, 3, 4];
+        // Fully inside.
+        assert_eq!(sel_cells(Some((11, 13)), 10, &cols, 2), Some((3, 5)));
+        // Starts before the window → clipped to its left edge.
+        assert_eq!(sel_cells(Some((0, 12)), 10, &cols, 2), Some((2, 4)));
+        // Runs past the end → clipped to the last visible cell.
+        assert_eq!(sel_cells(Some((12, 99)), 10, &cols, 2), Some((4, 6)));
+        // Entirely off-window in either direction, and nothing selected at all → nothing painted.
+        assert_eq!(sel_cells(Some((0, 9)), 10, &cols, 2), None);
+        assert_eq!(sel_cells(Some((20, 30)), 10, &cols, 2), None);
+        assert_eq!(sel_cells(None, 10, &cols, 2), None);
     }
 
     #[test]

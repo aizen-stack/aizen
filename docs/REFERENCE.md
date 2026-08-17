@@ -26,6 +26,13 @@ The chat box is a small line editor: type / Backspace / Del at the cursor, **←
 jump, **↑/↓** recall past prompts, Enter sends. A braille spinner (`⠹ thinking`) shows while the
 model is responding, clearing the moment the first token streams.
 
+The **mouse works in the box too**: click to put the caret on the character you clicked instead of
+walking there with ←/→, and drag across the text to select it — the selection is copied to the
+clipboard on release, and **Ctrl-C** copies it too (with nothing selected, Ctrl-C copies the whole
+draft). Typing over a selection replaces it; Backspace/Del deletes it. On a draft longer than the box
+the view only scrolls when the caret would leave it, so the text stays put under the cursor while you
+move around in it.
+
 **Attach an image** (vision) — two ways, because Ctrl-V can't be used (Windows Terminal intercepts
 it for its own paste, so the keystroke never reaches `aizen`):
 - **Ctrl-O** — grab a copied screenshot from the clipboard (Win+Shift+S, or "Copy image" in a
