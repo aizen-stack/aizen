@@ -11171,6 +11171,10 @@ fn resolve_endpoint(
     Ok((base_url, api_key, model))
 }
 
+fn codex_oauth_api_key(base_url: &str) -> Option<String> {
+    crate::llm::oauth_codex::is_codex_base_url(base_url).then(|| "codex-oauth".to_string())
+}
+
 fn resolve_base_key(base_url: Option<String>, api_key: Option<String>) -> Result<(String, String)> {
     let cfg = cli_config::load();
     let base_url = base_url
@@ -11180,6 +11184,7 @@ fn resolve_base_key(base_url: Option<String>, api_key: Option<String>) -> Result
     let api_key = api_key
         .or_else(|| cli_config::branded_env("API_KEY"))
         .or(cfg.api_key)
+        .or_else(|| codex_oauth_api_key(&base_url))
         .context("no API key — run `aizen config`")?;
     Ok((base_url, api_key))
 }
@@ -12735,6 +12740,22 @@ async fn prompt_validated_api_key(
     current: Option<&str>,
     keys_url: Option<&str>,
 ) -> Result<Option<(String, Vec<client::ModelInfo>)>> {
+    if crate::llm::oauth_codex::is_codex_base_url(base) {
+        let infos = crate::llm::codex_models::CODEX_MODELS
+            .iter()
+            .map(|(id, _label)| client::ModelInfo {
+                id: (*id).to_string(),
+                context_length: None,
+                is_free: false,
+            })
+            .collect();
+        if crate::llm::oauth_codex::has_token() {
+            line_ok("using saved ChatGPT/Codex login tokens");
+        } else {
+            line_warn("no Codex login found yet — run `aizen auth login codex` before using this provider");
+        }
+        return Ok(Some(("codex-oauth".to_string(), infos)));
+    }
     if let Some(url) = keys_url {
         tui::emit_line(&format!("  {}", style(format!("get a key: {url}")).dim()));
     }
@@ -16312,6 +16333,15 @@ mod tests {
             "the sample must be a free-tier id, got {}",
             p.sample_model
         );
+    }
+
+    #[test]
+    fn codex_base_uses_oauth_placeholder_without_api_key() {
+        assert_eq!(
+            codex_oauth_api_key(crate::llm::oauth_codex::CODEX_BASE_URL).as_deref(),
+            Some("codex-oauth")
+        );
+        assert_eq!(codex_oauth_api_key("https://api.openai.com/v1"), None);
     }
 
     #[test]

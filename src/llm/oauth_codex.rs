@@ -165,9 +165,12 @@ fn pkce() -> Result<(String, String)> {
 }
 
 fn open_browser(url: &str) {
+    // Do not route the URL through `cmd /C start`: OAuth query strings contain `&`,
+    // which cmd treats as command separators. Use Windows URL protocol handling directly,
+    // so the complete authorize URL is handed to the default browser as one argument.
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
+    let _ = std::process::Command::new("rundll32.exe")
+        .args(["url.dll,FileProtocolHandler", url])
         .spawn();
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
@@ -316,17 +319,13 @@ async fn respond(sock: &mut tokio::net::TcpStream, message: &str) {
     let _ = sock.flush().await;
 }
 
-async fn bind_callback_listener() -> Result<(tokio::net::TcpListener, u16, bool)> {
-    match tokio::net::TcpListener::bind(("127.0.0.1", PREFERRED_CALLBACK_PORT)).await {
-        Ok(l) => Ok((l, PREFERRED_CALLBACK_PORT, false)),
-        Err(_) => {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .context("binding loopback callback port")?;
-            let port = l.local_addr()?.port();
-            Ok((l, port, true))
-        }
-    }
+async fn bind_callback_listener() -> Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(("127.0.0.1", PREFERRED_CALLBACK_PORT))
+        .await
+        .with_context(|| format!(
+            "binding Codex OAuth callback at http://localhost:{PREFERRED_CALLBACK_PORT}/auth/callback; \
+             ensure port {PREFERRED_CALLBACK_PORT} is free and retry"
+        ))
 }
 
 /// Interactive browser login. Returns the saved token set.
@@ -334,13 +333,10 @@ pub async fn login_interactive() -> Result<CodexTokenSet> {
     if codex_disabled() {
         bail!("Codex OAuth disabled via AIZEN_DISABLE_CODEX");
     }
-    let (listener, port, fallback) = bind_callback_listener().await?;
-    if fallback {
-        eprintln!(
-            "note: port {PREFERRED_CALLBACK_PORT} busy — using ephemeral :{port}. If OpenAI rejects the redirect, free {PREFERRED_CALLBACK_PORT} (other Codex CLI) and retry."
-        );
-    }
-    let redirect_uri = format!("http://127.0.0.1:{port}/auth/callback");
+    // Codex registers one fixed callback URI; using an ephemeral fallback port makes
+    // OpenAI reject the authorize request before login with `invalid_authorize_request`.
+    let listener = bind_callback_listener().await?;
+    let redirect_uri = format!("http://localhost:{PREFERRED_CALLBACK_PORT}/auth/callback");
     let (verifier, challenge) = pkce()?;
     let state = rand_b64url(16)?;
     let auth_url = build_authorize_url(&redirect_uri, &state, &challenge);
@@ -710,7 +706,7 @@ mod tests {
 
     #[test]
     fn authorize_url_encodes_scope_spaces_as_percent20() {
-        let u = build_authorize_url("http://127.0.0.1:1455/auth/callback", "st", "ch");
+        let u = build_authorize_url("http://localhost:1455/auth/callback", "st", "ch");
         assert!(u.contains("scope=openid%20profile%20email%20offline_access"));
         assert!(!u.contains("scope=openid+profile"));
         assert!(u.contains("code_challenge_method=S256"));
