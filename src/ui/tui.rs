@@ -3164,52 +3164,15 @@ fn text_overlay_handle_key(key: &Key) -> bool {
 /// Whether this slash command line opens a `dialoguer` menu (or a daemon) that takes over stdin, so
 /// the REPL must [`suspend`] the retained frame before running it.
 ///
-/// ONE table, consumed by the REPL only. The input thread no longer makes this decision — it observes
-/// [`suspend`]/[`resume`] via `KEYBOARD_PARKED` instead. Previously `main.rs::slash_is_interactive`
-/// held a second, drifted copy which matched the whole input line, so `/timeline pick` and
-/// `/tools menu` ran their menus without suspending at all.
+/// The rule itself is a `stdin:` field on the command's row in [`crate::features::slash::BUILTINS`],
+/// so it cannot drift from the command's name or its aliases. This function stays only because the
+/// REPL calls it by this name; it forwards. Two earlier copies of this decision — one here, one in
+/// `main.rs::slash_is_interactive` — had already drifted apart once, which is why it is a field now.
 ///
 /// Takes the FULL command line, because whether stdin is claimed depends on the argument: bare
 /// `/effort` drags a slider, `/effort high` just sets it; `/tools` prints, `/tools menu` picks.
 pub fn slash_takes_stdin(input: &str) -> bool {
-    let mut parts = input.trim().splitn(2, char::is_whitespace);
-    let name = parts.next().unwrap_or("").trim();
-    let arg = parts.next().unwrap_or("").trim();
-    // Only commands which directly own stdin (dialoguer / slider / daemon) qualify. Native overlays
-    // and pure-print commands run with the sticky box still up, so their output flows into the scroll
-    // region instead of being painted over on resume.
-    matches!(
-        name,
-        "config"
-            | "setup"
-            | "persona"
-            | "personas"
-            | "character"
-            | "skills"
-            | "skill"
-            | "apps"
-            | "integrations"
-            | "telegram"
-            | "tg"
-            | "serve"
-            | "sessions"
-            | "import" // same dialoguer Select as /sessions — without this the input thread eats
-            // its arrow keys and the picker can't page or move
-            | "model" // dialoguer Select owns stdin → park the keyboard thread (mirrors /sessions)
-    )
-        // `/timemachine` (and its `timeline`/`tm` aliases) is one command: it always opens the
-        // checkpoint picker, so it claims stdin regardless of what follows.
-        || name == "provider"
-            && (arg.is_empty()
-                || arg.eq_ignore_ascii_case("add")
-                || arg.eq_ignore_ascii_case("manage"))
-        || matches!(name, "timemachine" | "timeline" | "tm")
-        || name == "effort" && arg.is_empty()
-        // `/update` always opens a dialoguer picker over the published versions — it takes no
-        // arguments, so it claims stdin unconditionally.
-        || name == "update"
-        || matches!(name, "tools" | "toolsets")
-            && matches!(arg.split_whitespace().next().unwrap_or(""), "menu" | "toggle")
+    crate::features::slash::takes_stdin(input)
 }
 
 // ── the animated `/effort` slider ─────────────────────────────────────────────

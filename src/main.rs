@@ -30,6 +30,7 @@ use crate::agent::app_catalog;
 use crate::channels::notify;
 use crate::core::session_store::*;
 use crate::core::{cli_config, config, types};
+use crate::features::slash::{self, SlashId};
 use crate::features::{commands, coop, crawl, cron, timemachine};
 use crate::hostbot::platforms::{discord, telegram};
 use crate::llm::client;
@@ -7830,10 +7831,19 @@ async fn handle_slash(
     let mut parts = input.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("").trim();
     let arg = parts.next().unwrap_or("").trim();
-    match name {
-        "help" | "?" | "" => tui::emit_line(&style(SLASH_HELP).dim().to_string()),
-        "quit" | "exit" | "q" => return SlashOutcome::Quit,
-        "clear" | "new" | "reset" => {
+    // Resolve the typed spelling to a command IDENTITY first, then dispatch on that identity. Every
+    // alias therefore reaches the same arm as its canonical name for free, and because the match
+    // below is exhaustive over `SlashId`, a new row in `slash::BUILTINS` does not compile until it
+    // has a handler here. The name lists used to live in five places; this is the only one left.
+    // An empty name still means help: the retained REPL routes a bare `/` to the picker, but the
+    // host bot and the plain REPL can both reach here with nothing after the slash.
+    let Some(builtin) = slash::resolve(if name.is_empty() { "help" } else { name }) else {
+        return slash_custom_or_unknown(name, arg);
+    };
+    match builtin.id {
+        SlashId::Help => tui::emit_line(&style(SLASH_HELP).dim().to_string()),
+        SlashId::Quit => return SlashOutcome::Quit,
+        SlashId::Clear => {
             rebuild_system(history, model_label);
             reset_per_session_state(); // fresh todos/cost/grants/@refs for the new conversation
             set_session_slug(None); // the next turn names + autosaves a brand-new session file
@@ -7841,7 +7851,7 @@ async fn handle_slash(
                                           // immediate window-close after /clear doesn't re-save it
             tui::emit_line(&style("(new conversation)").dim().to_string());
         }
-        "where" => {
+        SlashId::Where => {
             tui::emit_line(&where_report());
             // In the REPL, "where" includes WHICH FILE this conversation is being written to.
             let sess = match current_session_slug() {
@@ -7850,19 +7860,19 @@ async fn handle_slash(
             };
             tui::emit_line(&style(sess).dim().to_string());
         }
-        "tokens" => print_status_line(history, model_label),
-        "context" | "ctx" => print_context(history, model_label),
-        "cost" | "usage" => print_cost(history, model_label),
+        SlashId::Tokens => print_status_line(history, model_label),
+        SlashId::Context => print_context(history, model_label),
+        SlashId::Cost => print_cost(history, model_label),
         // /save + /load folded into /sessions (the current chat autosaves under its own name).
-        "save" | "load" => {
+        SlashId::Save => {
             tui::emit_line(&style("→ use /sessions — restore / save / delete are all there now").dim().to_string());
         }
-        "sessions" => {
+        SlashId::Sessions => {
             if let Err(e) = sessions_menu(history, model_label).await {
                 tui::note_line(&format!("{} {e}", style("sessions:").red()));
             }
         }
-        "import" => {
+        SlashId::Import => {
             if let Err(e) = import_menu(history, model_label).await {
                 tui::note_line(&format!("{} {e}", style("import:").red()));
             }
@@ -7870,7 +7880,7 @@ async fn handle_slash(
         // One keystroke back into the last conversation. `/sessions` could already restore, but it
         // costs a menu and knowing which of a dozen files is the newest — so in practice a reopened
         // terminal started from scratch even though the transcript was on disk the whole time.
-        "resume" | "continue" => {
+        SlashId::Resume => {
             // Bare `/resume` carries the offer's origin label through, so opening another project's
             // conversation (only offered when this project has none) says so on the confirmation
             // line — including for pre-provenance files, where `load_session` has nothing to warn with.
@@ -7907,13 +7917,13 @@ async fn handle_slash(
                 },
             }
         }
-        "workflows" | "workflow" | "wf" | "agents-status" => slash_workflows(arg).await,
+        SlashId::Workflows => slash_workflows(arg).await,
         // Multi-window cooperation: who else is in this repo, what they changed, and committing one
         // window's work. `/work` manages the isolated-worktree mode.
-        "team" | "sessions-live" => slash_team(arg).await,
-        "work" | "worktree" | "worktrees" => slash_work(arg),
-        "agents" | "agent" => slash_agents(arg),
-        "recover" | "recovery" => {
+        SlashId::Team => slash_team(arg).await,
+        SlashId::Work => slash_work(arg),
+        SlashId::Agents => slash_agents(arg),
+        SlashId::Recover => {
             let repo_scope = crate::core::recovery::current_repo_scope();
             let offers = crate::core::recovery::scan_stale(&repo_scope);
             if offers.is_empty() {
@@ -7958,7 +7968,7 @@ async fn handle_slash(
                 }
             }
         }
-        "compact" => {
+        SlashId::Compact => {
             // Harvest what the older turns touched BEFORE they collapse — once summarized their tool
             // calls are gone, so the tree must read the history while it's still whole.
             let tp = agent::compact::context_touchpoints(history);
@@ -7973,7 +7983,7 @@ async fn handle_slash(
                 None => tui::emit_line(&theme::muted("⏹ compact stopped — context unchanged.").to_string()),
             }
         }
-        "handoff" => {
+        SlashId::Handoff => {
             if arg.trim().is_empty() {
                 tui::emit_line(&style("usage: /handoff <new goal> — start a fresh thread carrying only what matters for it").dim().to_string());
             } else {
@@ -8017,7 +8027,7 @@ async fn handle_slash(
                 }
             }
         }
-        "goal" => {
+        SlashId::Goal => {
             // Goal mode: run cap-free with smart retry until the model declares completion
             // (`goal_complete`) AND the verify gate passes. `/goal off` (or bare `/goal`) turns it off.
             let a = arg.trim();
@@ -8041,7 +8051,7 @@ async fn handle_slash(
                 return SlashOutcome::Submit(a.to_string());
             }
         }
-        "lsp" => {
+        SlashId::Lsp => {
             use crate::agent::lsp::LSP;
             let sub = arg.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
             match sub.as_str() {
@@ -8090,7 +8100,7 @@ async fn handle_slash(
                 ),
             }
         }
-        "reach" => {
+        SlashId::Reach => {
             use crate::agent::reach;
             let sub = arg.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
             match sub.as_str() {
@@ -8105,7 +8115,7 @@ async fn handle_slash(
                 ),
             }
         }
-        "update" => {
+        SlashId::Update => {
             // Talks to GitHub, so wrap in `cancellable_slash` for Esc; owns stdin through the
             // dialoguer picker, which is why `tui::slash_takes_stdin` suspends the frame for it.
             match cancellable_slash(features::update::run()).await {
@@ -8114,7 +8124,7 @@ async fn handle_slash(
                 Some(Ok(())) => {}
             }
         }
-        "approval" => {
+        SlashId::Approval => {
             let requested = arg.split_whitespace().next().unwrap_or("status");
             let mut cfg = cli_config::load();
             if requested.is_empty() || matches!(requested, "status" | "st") {
@@ -8129,21 +8139,21 @@ async fn handle_slash(
                 tui::emit_line(&style("usage: /approval ask|smart|yolo").dim().to_string());
             }
         }
-        "yolo" | "auto" | "yes" => {
+        SlashId::Yolo => {
             let mut cfg = cli_config::load();
             let mode = if cfg.persisted_approval_mode() == ApprovalMode::Yolo { ApprovalMode::Ask } else { ApprovalMode::Yolo };
             cfg.set_approval_mode(mode);
             let _ = cli_config::save(&cfg);
             tui::emit_line(&style(format!("approval → {mode} (legacy /yolo alias)")).color256(splash::ACCENT).to_string());
         }
-        "smart" => {
+        SlashId::Smart => {
             let mut cfg = cli_config::load();
             let mode = if cfg.persisted_approval_mode() == ApprovalMode::Smart { ApprovalMode::Ask } else { ApprovalMode::Smart };
             cfg.set_approval_mode(mode);
             let _ = cli_config::save(&cfg);
             tui::emit_line(&style(format!("approval → {mode} (legacy /smart alias)")).color256(splash::ACCENT).to_string());
         }
-        "ultimate" | "ultra" => {
+        SlashId::Ultimate => {
             let mut cfg = cli_config::load();
             let now = !cfg.ultimate.unwrap_or(false);
             cfg.ultimate = Some(now);
@@ -8172,7 +8182,7 @@ async fn handle_slash(
                 tui::emit_line(&style("(note: AIZEN_ULTIMATE is set in your environment — it forces ultimate ON regardless of this toggle)").dim().to_string());
             }
         }
-        "effort" => {
+        SlashId::Effort => {
             let sub = arg.trim().to_ascii_lowercase();
             match sub.as_str() {
                 // No arg → the interactive drag slider (falls back to a text report off-TTY).
@@ -8230,7 +8240,7 @@ async fn handle_slash(
                 ),
             }
         }
-        "provider" | "providers" => {
+        SlashId::Provider => {
             let selected = if arg.eq_ignore_ascii_case("add") || arg.eq_ignore_ascii_case("manage") {
                 let mut cfg = cli_config::load();
                 config_ui::config_edit_providers(&mut cfg).await.and_then(|_| {
@@ -8276,7 +8286,7 @@ async fn handle_slash(
                 Err(e) => tui::note_line(&format!("{} {e}", style("provider:").red())),
             }
         }
-        "model" | "models" => {
+        SlashId::Model => {
             if let Err(e) = slash_model(model_label).await {
                 if tui::active() {
                     tui::emit_line(&format!("{} {e}", style("model:").red()));
@@ -8290,7 +8300,7 @@ async fn handle_slash(
                 refresh_prompt_lanes_in_place(history, model_label);
             }
         }
-        "config" | "setup" => {
+        SlashId::Config => {
             if let Err(e) = config_ui::config_wizard().await {
                 tui::note_line(&format!("{} {e}", style("config:").red()));
             }
@@ -8301,28 +8311,28 @@ async fn handle_slash(
             // Refresh IN PLACE — retuning settings mid-chat must not end the conversation.
             refresh_prompt_lanes_in_place(history, model_label);
         }
-        "memory" | "mem" => {
+        SlashId::Memory => {
             if let Err(e) = slash_memory(arg) {
                 tui::note_line(&format!("{} {e}", style("memory:").red()));
             }
         }
-        "persona" | "personas" | "character" => {
+        SlashId::Persona => {
             if let Err(e) = personas_menu(history, model_label).await {
                 tui::note_line(&format!("{} {e}", style("persona:").red()));
             }
         }
-        "skills" | "skill" => {
+        SlashId::Skills => {
             if let Err(e) = skills_menu().await {
                 tui::note_line(&format!("{} {e}", style("skills:").red()));
             }
         }
-        "apps" | "integrations" => {
+        SlashId::Apps => {
             if let Err(e) = apps_menu().await {
                 tui::note_line(&format!("{} {e}", style("apps:").red()));
             }
         }
-        "mcp" => tui::emit_line(&crate::agent::mcp::summary()),
-        "browser" => {
+        SlashId::Mcp => tui::emit_line(&crate::agent::mcp::summary()),
+        SlashId::Browser => {
             #[cfg(feature = "browser")]
             {
                 if matches!(arg, "doctor" | "check" | "probe") {
@@ -8335,20 +8345,20 @@ async fn handle_slash(
             #[cfg(not(feature = "browser"))]
             tui::emit_line(&style("browser tools are not included in this build (build with --features browser)").dim().to_string());
         }
-        "tools" | "toolsets" => slash_tools(arg).await,
-        "commands" | "cmds" => match commands::summary() {
+        SlashId::Tools => slash_tools(arg).await,
+        SlashId::Commands => match commands::summary() {
             Some(s) => tui::emit_line(&style(s).dim().to_string()),
             None => tui::emit_line(
                 &style("No custom commands yet. Drop a markdown file in ~/.aizen/commands/ (or ./.aizen/commands/ for this project) — see /help.").dim().to_string()
             ),
         },
-        "telegram" | "tg" => {
+        SlashId::Telegram => {
             if let Err(e) = telegram_menu().await {
                 tui::note_line(&format!("{} {e}", style("telegram:").red()));
             }
         }
         // `/serve` kept as a direct shortcut to the daemon (also reachable via the Telegram menu).
-        "serve" => {
+        SlashId::Serve => {
             if let Err(e) = hostbot::run_serve(Vec::new()).await {
                 tui::note_line(&format!("{} {e}", style("serve:").red()));
             }
@@ -8358,7 +8368,7 @@ async fn handle_slash(
         // that code + chat. No `pick`/`restore` argument to remember, no separate read-only print —
         // the list itself shows the history, so browsing and restoring are the same gesture (Esc
         // leaves without touching anything).
-        "timemachine" | "timeline" | "tm" => {
+        SlashId::Timemachine => {
             if let Err(e) = timemachine_menu(history, model_label).await {
                 tui::note_line(&format!("{} {e}", style("time:").red()));
             }
@@ -8366,7 +8376,7 @@ async fn handle_slash(
         // Capture the conversation alongside the tree so a pick in `/timemachine` can rewind chat as
         // well as code — a `/checkpoint` is a deliberate save point where the chat is worth keeping,
         // unlike the loop's per-edit auto-snapshots (which restore files only).
-        "checkpoint" | "snapshot" | "cp" => match timemachine::save_with_chat(arg, false, history) {
+        SlashId::Checkpoint => match timemachine::save_with_chat(arg, false, history) {
             Ok(s) => tui::emit_line(&format!(
                 "{} #{} saved ({})",
                 style("✓ checkpoint").color256(splash::ACCENT),
@@ -8378,7 +8388,7 @@ async fn handle_slash(
         // `/diff` — see what changed before deciding to rewind. Argument forms mirror the CLI:
         // bare = active checkpoint vs disk, `#5` = that checkpoint vs disk, `#1 #2` = the pair.
         // `-p`/`--patch` anywhere switches from stat to hunks; anything after `--` narrows to paths.
-        "diff" | "changes" => {
+        SlashId::Diff => {
             let mut sides: Vec<String> = Vec::new();
             let mut paths: Vec<String> = Vec::new();
             let mut patch = false;
@@ -8403,33 +8413,48 @@ async fn handle_slash(
                 Err(e) => tui::emit_line(&style(format!("diff: {e}")).color256(crate::ui::theme::WARN).to_string()),
             }
         }
-        "undo" => match timemachine::undo() {
+        SlashId::Undo => match timemachine::undo() {
             Ok(s) => tui::emit_line(&format!("{} checkpoint #{}", style("⏪ rewound to").color256(splash::ACCENT), s.id)),
             Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::ui::theme::WARN).to_string()),
         },
-        "redo" => match timemachine::redo() {
+        SlashId::Redo => match timemachine::redo() {
             Ok(s) => tui::emit_line(&format!("{} checkpoint #{}", style("⏩ re-applied").color256(splash::ACCENT), s.id)),
             Err(e) => tui::emit_line(&style(format!("redo: {e}")).color256(crate::ui::theme::WARN).to_string()),
         },
         // Codebase index: scan the repo into a semantic chunk index for `codebase_search` +
         // per-turn retrieval injection. `/init` incrementally refreshes; `/init --force` rebuilds
         // from scratch; `/init --status` shows the current index without scanning. Esc cancels.
-        "init" | "index" => {
+        SlashId::Init => {
             slash_init(arg).await;
         }
-        // A user-defined command (`~/.aizen/commands/<name>.md`) → expand its template and run it
-        // as a normal chat turn. Falls back to "unknown" only when no command matches.
-        other => match commands::find(other) {
-            Some(cmd) => match commands::expand(&cmd, arg) {
-                Ok(prompt) if !prompt.trim().is_empty() => return SlashOutcome::Submit(prompt),
-                Ok(_) => tui::emit_line(&style(format!("/{other} expanded to an empty prompt")).dim().to_string()),
-                Err(e) => tui::emit_line(&format!("{} {e}", style(format!("/{other}:")).red())),
-            },
-            None => tui::emit_line(&style(format!("unknown command /{other} — try /help")).dim().to_string()),
-        },
     }
     SlashOutcome::Continue
 }
+/// Not a built-in: either a user-defined command (`~/.aizen/commands/<name>.md`) whose template we
+/// expand and run as a normal chat turn, or nothing we know at all.
+///
+/// Split out of the dispatch match so that match can be exhaustive over [`SlashId`] — a catch-all
+/// arm would have silently absorbed any command whose handler someone forgot to write.
+fn slash_custom_or_unknown(name: &str, arg: &str) -> SlashOutcome {
+    match commands::find(name) {
+        Some(cmd) => match commands::expand(&cmd, arg) {
+            Ok(prompt) if !prompt.trim().is_empty() => return SlashOutcome::Submit(prompt),
+            Ok(_) => tui::emit_line(
+                &style(format!("/{name} expanded to an empty prompt"))
+                    .dim()
+                    .to_string(),
+            ),
+            Err(e) => tui::emit_line(&format!("{} {e}", style(format!("/{name}:")).red())),
+        },
+        None => tui::emit_line(
+            &style(format!("unknown command /{name} — try /help"))
+                .dim()
+                .to_string(),
+        ),
+    }
+    SlashOutcome::Continue
+}
+
 /// `/sessions` — the conversation manager (replaces the old `/save` + `/load`): pick a saved
 /// conversation to RESTORE, save the current one under a name, or delete one. The live chat
 /// autosaves into its OWN named file after every turn, so there's always something to come back to.

@@ -19,416 +19,596 @@ pub struct SlashCommand {
     pub custom: bool,
 }
 
-struct Builtin {
-    name: &'static str,
-    description: &'static str,
-    argument_hint: &'static str,
+/// Canonical identity of a built-in slash command.
+///
+/// `handle_slash` matches on this EXHAUSTIVELY, so a new variant does not compile until a
+/// handler exists for it. That is the point: name, aliases, help text, whether it takes
+/// arguments and whether it owns stdin all live in ONE row of [`BUILTINS`], and the compiler
+/// refuses to let dispatch drift away from that row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashId {
+    Help,
+    Init,
+    Where,
+    Handoff,
+    Goal,
+    Model,
+    Provider,
+    Config,
+    Memory,
+    Persona,
+    Skills,
+    Commands,
+    Apps,
+    Mcp,
+    Browser,
+    Telegram,
+    Serve,
+    Sessions,
+    Import,
+    Resume,
+    Workflows,
+    Work,
+    Agents,
+    Recover,
+    Timemachine,
+    Checkpoint,
+    Diff,
+    Compact,
+    Lsp,
+    Reach,
+    Approval,
+    Effort,
+    Ultimate,
+    Clear,
+    Tokens,
+    Context,
+    Cost,
+    Tools,
+    Update,
+    Undo,
+    Redo,
+    Quit,
+    Save,
+    Smart,
+    Team,
+    Yolo,
 }
 
-/// Every slash token accepted by `handle_slash`.
+/// When a command takes over stdin (a `dialoguer` menu, the effort slider, a daemon) and the
+/// retained frame therefore has to suspend before it runs.
 ///
-/// Keep the canonical command before its compatibility aliases. The test below checks that this
-/// table is unique; the UI and picker both consume this exact list rather than maintaining copies.
-const BUILTINS: &[Builtin] = &[
+/// Argument-dependent by design: bare `/effort` drags a slider while `/effort high` just sets it,
+/// and `/tools` prints while `/tools menu` opens a picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stdin {
+    /// Pure print — runs with the box still up so its output lands in the scroll region.
+    Never,
+    /// Always opens something that owns the terminal.
+    Always,
+    /// Only with no argument.
+    WhenBare,
+    /// Only when the first argument word is one of these.
+    WhenArg(&'static [&'static str]),
+    /// With no argument, or when the first argument word is one of these.
+    BareOr(&'static [&'static str]),
+}
+
+impl Stdin {
+    fn claims(self, arg: &str) -> bool {
+        let head = arg.split_whitespace().next().unwrap_or("");
+        match self {
+            Stdin::Never => false,
+            Stdin::Always => true,
+            Stdin::WhenBare => arg.is_empty(),
+            Stdin::WhenArg(words) => words.iter().any(|w| head.eq_ignore_ascii_case(w)),
+            Stdin::BareOr(words) => {
+                arg.is_empty() || words.iter().any(|w| head.eq_ignore_ascii_case(w))
+            }
+        }
+    }
+}
+
+/// One built-in command: its identity, every spelling that reaches it, and how it behaves.
+pub struct Builtin {
+    pub id: SlashId,
+    /// Canonical name, without the leading `/`.
+    pub name: &'static str,
+    /// Compatibility spellings that ALSO get their own picker row (so someone who learned the old
+    /// name still finds it), paired with the text that row shows.
+    pub aliases: &'static [(&'static str, &'static str)],
+    /// Accepted, but not advertised — spellings we no longer want to teach.
+    pub hidden_aliases: &'static [&'static str],
+    /// The command itself is dispatchable but unlisted (superseded by a newer name).
+    pub hidden: bool,
+    pub description: &'static str,
+    pub argument_hint: &'static str,
+    pub stdin: Stdin,
+}
+
+/// Every built-in command, in the order the picker shows them.
+///
+/// This is the ONLY place a command name is written down. `classify`, the `/` picker, the
+/// live palette, the stdin-suspend rule and `handle_slash` all read it, so a command cannot
+/// be executable-but-invisible (`/team`, `/providers` both were) or listed-but-dead.
+pub const BUILTINS: &[Builtin] = &[
     Builtin {
+        id: SlashId::Help,
         name: "help",
+        aliases: &[],
+        hidden_aliases: &["?"],
+        hidden: false,
         description: "show commands and tips",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Init,
         name: "init",
+        aliases: &[("index", "alias for /init")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "index the codebase for semantic search + auto-retrieval",
         argument_hint: "[--force|--status]",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Where,
         name: "where",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "show project root, zone slug, git, and data locations",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Handoff,
         name: "handoff",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "start a fresh thread carrying only what matters",
         argument_hint: "<goal>",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Goal,
         name: "goal",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "run until a goal is done (self-declared + verified)",
         argument_hint: "<text>|off",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Model,
         name: "model",
+        aliases: &[("models", "alias for /model")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "list and pick the model",
         argument_hint: "",
+        stdin: Stdin::Always,
     },
     Builtin {
+        id: SlashId::Provider,
         name: "provider",
+        aliases: &[],
+        hidden_aliases: &["providers"],
+        hidden: false,
         description: "switch, add, or manage saved endpoint profiles",
         argument_hint: "[name|add|manage]",
+        stdin: Stdin::BareOr(&["add", "manage"]),
     },
     Builtin {
+        id: SlashId::Config,
         name: "config",
+        aliases: &[("setup", "alias for /config")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "set endpoint, key, model, and provider profiles",
         argument_hint: "",
+        stdin: Stdin::Always,
     },
     Builtin {
+        id: SlashId::Memory,
         name: "memory",
+        aliases: &[("mem", "alias for /memory")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "inspect and edit what's remembered",
         argument_hint: "[list|show|edit|forget|restore|<query>]",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Persona,
         name: "persona",
+        aliases: &[
+            ("personas", "alias for /persona"),
+            ("character", "alias for /persona"),
+        ],
+        hidden_aliases: &[],
+        hidden: false,
         description: "pick the agent persona",
         argument_hint: "",
+        stdin: Stdin::Always,
     },
     Builtin {
+        id: SlashId::Skills,
         name: "skills",
+        aliases: &[("skill", "alias for /skills")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "browse and manage saved skills",
         argument_hint: "",
+        stdin: Stdin::Always,
     },
     Builtin {
+        id: SlashId::Commands,
         name: "commands",
+        aliases: &[("cmds", "alias for /commands")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "list custom markdown slash commands",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Apps,
         name: "apps",
+        aliases: &[("integrations", "alias for /apps")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "connect apps through MCP",
         argument_hint: "",
+        stdin: Stdin::Always,
     },
     Builtin {
+        id: SlashId::Mcp,
         name: "mcp",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "show MCP lifecycle and tools",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Browser,
         name: "browser",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "show browser profiles and routes",
         argument_hint: "[doctor]",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Telegram,
         name: "telegram",
+        aliases: &[("tg", "alias for /telegram")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "configure the Telegram integration",
         argument_hint: "",
+        stdin: Stdin::Always,
     },
     Builtin {
+        id: SlashId::Serve,
         name: "serve",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "run the host bot daemon",
         argument_hint: "",
+        stdin: Stdin::Always,
     },
     Builtin {
+        id: SlashId::Sessions,
         name: "sessions",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "restore, save, or delete conversations",
         argument_hint: "",
+        stdin: Stdin::Always,
     },
     Builtin {
+        id: SlashId::Import,
         name: "import",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "resume a conversation started in another CLI (Claude Code / Codex)",
         argument_hint: "",
+        stdin: Stdin::Always,
     },
     Builtin {
+        id: SlashId::Resume,
         name: "resume",
+        aliases: &[("continue", "alias for /resume")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "reopen the last conversation with its context",
         argument_hint: "[name]",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Workflows,
         name: "workflows",
+        aliases: &[
+            ("workflow", "alias for /workflows"),
+            ("wf", "alias for /workflows"),
+            ("agents-status", "alias for /workflows"),
+        ],
+        hidden_aliases: &[],
+        hidden: false,
         description: "show live multi-agent activity (self-refreshing); stop one run",
         argument_hint: "[stop <#id|name>]",
+        stdin: Stdin::Never,
     },
     Builtin {
-        name: "team",
-        description:
-            "see other aizen windows in this repo, their files, diffs, and commit their work",
-        argument_hint: "[status|diff <s>|claims|task <text>|done|commit <s>]",
-    },
-    Builtin {
+        id: SlashId::Work,
         name: "work",
+        aliases: &[],
+        hidden_aliases: &["worktree", "worktrees"],
+        hidden: false,
         description: "isolated git worktrees, one per session",
         argument_hint: "[list|new <name>|remove <name>]",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Agents,
         name: "agents",
+        aliases: &[("agent", "alias for /agents")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "list and configure specialist agents",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Recover,
         name: "recover",
+        aliases: &[("recovery", "alias for /recover")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "restore a crashed session safely",
         argument_hint: "[discard]",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Timemachine,
         name: "timemachine",
+        aliases: &[
+            ("timeline", "alias for /timemachine"),
+            ("tm", "alias for /timemachine"),
+        ],
+        hidden_aliases: &[],
+        hidden: false,
         description: "browse checkpoints and jump back to that code + chat",
         argument_hint: "",
+        stdin: Stdin::Always,
     },
     Builtin {
+        id: SlashId::Checkpoint,
         name: "checkpoint",
+        aliases: &[
+            ("snapshot", "alias for /checkpoint"),
+            ("cp", "alias for /checkpoint"),
+        ],
+        hidden_aliases: &[],
+        hidden: false,
         description: "save a code restore point",
         argument_hint: "[note]",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Diff,
         name: "diff",
+        aliases: &[],
+        hidden_aliases: &["changes"],
+        hidden: false,
         description: "what changed between two points in time",
         argument_hint: "[from] [to] [-p]",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Compact,
         name: "compact",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "compress context to free tokens",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Lsp,
         name: "lsp",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "type-aware code navigation and diagnostics",
         argument_hint: "[on|off|status|restart]",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Reach,
         name: "reach",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "check web-access backend health",
         argument_hint: "[doctor|status]",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Approval,
         name: "approval",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "set the approval level",
         argument_hint: "[ask|smart|yolo]",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Effort,
         name: "effort",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "set reasoning effort",
         argument_hint: "[auto|off|low|medium|high|xhigh|max]",
+        stdin: Stdin::WhenBare,
     },
     Builtin {
+        id: SlashId::Ultimate,
         name: "ultimate",
+        aliases: &[("ultra", "alias for /ultimate")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "toggle maximum-effort orchestration mode",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Clear,
         name: "clear",
+        aliases: &[("new", "alias for /clear"), ("reset", "alias for /clear")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "start a fresh conversation",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Tokens,
         name: "tokens",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "show session token usage",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Context,
         name: "context",
+        aliases: &[("ctx", "alias for /context")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "break down context-window usage",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Cost,
         name: "cost",
+        aliases: &[("usage", "alias for /cost")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "show session token cost",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Tools,
         name: "tools",
+        aliases: &[("toolsets", "alias for /tools")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "show toolset configuration",
         argument_hint: "",
+        stdin: Stdin::WhenArg(&["menu", "toggle"]),
     },
     Builtin {
+        id: SlashId::Update,
         name: "update",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "show every aizen version and install the one you pick",
         argument_hint: "",
+        stdin: Stdin::Always,
     },
     Builtin {
+        id: SlashId::Undo,
         name: "undo",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "rewind to the previous checkpoint",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Redo,
         name: "redo",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "re-apply the next checkpoint",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Quit,
         name: "quit",
+        aliases: &[("exit", "alias for /quit"), ("q", "alias for /quit")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "exit aizen",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
-        name: "exit",
-        description: "alias for /quit",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "q",
-        description: "alias for /quit",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "index",
-        description: "alias for /init",
-        argument_hint: "[--force|--status]",
-    },
-    Builtin {
-        name: "new",
-        description: "alias for /clear",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "reset",
-        description: "alias for /clear",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "ctx",
-        description: "alias for /context",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "usage",
-        description: "alias for /cost",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "continue",
-        description: "alias for /resume",
-        argument_hint: "[name]",
-    },
-    Builtin {
+        id: SlashId::Save,
         name: "save",
+        aliases: &[("load", "legacy alias; use /sessions")],
+        hidden_aliases: &[],
+        hidden: false,
         description: "legacy alias; use /sessions",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
-        name: "load",
-        description: "legacy alias; use /sessions",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "workflow",
-        description: "alias for /workflows",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "wf",
-        description: "alias for /workflows",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "agents-status",
-        description: "alias for /workflows",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "agent",
-        description: "alias for /agents",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "recovery",
-        description: "alias for /recover",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "ultra",
-        description: "alias for /ultimate",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "auto",
-        description: "legacy approval alias",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "yes",
-        description: "legacy approval alias",
-        argument_hint: "",
-    },
-    Builtin {
+        id: SlashId::Smart,
         name: "smart",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
         description: "legacy approval alias",
         argument_hint: "",
+        stdin: Stdin::Never,
     },
     Builtin {
-        name: "models",
-        description: "alias for /model",
+        id: SlashId::Team,
+        name: "team",
+        aliases: &[],
+        hidden_aliases: &["sessions-live"],
+        hidden: true,
+        description: "live sessions working this repo — status - claim - handoff",
+        argument_hint: "[status|claim|release]",
+        stdin: Stdin::Never,
+    },
+    Builtin {
+        id: SlashId::Yolo,
+        name: "yolo",
+        aliases: &[
+            ("auto", "legacy approval alias"),
+            ("yes", "legacy approval alias"),
+        ],
+        hidden_aliases: &[],
+        hidden: true,
+        description: "legacy shortcut for `/approval yolo`",
         argument_hint: "",
-    },
-    Builtin {
-        name: "setup",
-        description: "alias for /config",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "mem",
-        description: "alias for /memory",
-        argument_hint: "[query]",
-    },
-    Builtin {
-        name: "personas",
-        description: "alias for /persona",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "character",
-        description: "alias for /persona",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "skill",
-        description: "alias for /skills",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "integrations",
-        description: "alias for /apps",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "tg",
-        description: "alias for /telegram",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "toolsets",
-        description: "alias for /tools",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "cmds",
-        description: "alias for /commands",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "timeline",
-        description: "alias for /timemachine",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "tm",
-        description: "alias for /timemachine",
-        argument_hint: "",
-    },
-    Builtin {
-        name: "snapshot",
-        description: "alias for /checkpoint",
-        argument_hint: "[note]",
-    },
-    Builtin {
-        name: "cp",
-        description: "alias for /checkpoint",
-        argument_hint: "[note]",
+        stdin: Stdin::Never,
     },
 ];
-
-/// Dispatch-only aliases: names `handle_slash` accepts but that are deliberately NOT in [`BUILTINS`]
-/// (they are legacy spellings or internal synonyms kept working for muscle memory, without earning a
-/// row in the palette / `/help`).
-///
-/// [`classify`] must consult this table too. Building the "known" set from [`list`] alone would
-/// classify `/yolo` as prose and silently stop dispatching a command that works today — the exact
-/// regression this constant exists to prevent. Keep in sync with the match arms in `handle_slash`.
-const DISPATCH_ALIASES: &[&str] = &[
-    "?",
-    "yolo",
-    "changes",
-    "worktree",
-    "worktrees",
-    "sessions-live",
-];
-
 /// What a line beginning with `/` actually IS.
 ///
 /// Historically every surface did `strip_prefix('/')` and treated the remainder as a command, so a
@@ -483,9 +663,34 @@ const FUZZY_MAX_LEN_DELTA: usize = 2;
 /// Longest plausible command name — anything longer is prose or a path, not a typo.
 const MAX_NAME_LEN: usize = 32;
 
+/// The built-in a spelling resolves to — canonical name, listed alias, or hidden alias alike.
+///
+/// The single entry point from a typed token to a command's identity. Everything downstream
+/// (dispatch, stdin suspension, the prose gate) keys off the returned row, so a name can never be
+/// accepted by one surface and unknown to another.
+pub fn resolve(name: &str) -> Option<&'static Builtin> {
+    BUILTINS.iter().find(|b| {
+        b.name == name
+            || b.aliases.iter().any(|(a, _)| *a == name)
+            || b.hidden_aliases.contains(&name)
+    })
+}
+
+/// Whether the command line `input` opens something that takes over stdin (a `dialoguer` menu, the
+/// effort slider, a daemon), so the retained frame must suspend before running it.
+///
+/// Takes the FULL line because the answer can depend on the argument — bare `/effort` drags a
+/// slider while `/effort high` just sets it. Unknown names are not ours to suspend for.
+pub fn takes_stdin(input: &str) -> bool {
+    let mut parts = input.trim().splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or("").trim();
+    let arg = parts.next().unwrap_or("").trim();
+    resolve(name).is_some_and(|b| b.stdin.claims(arg))
+}
+
 /// Whether `name` is a command the dispatcher will actually handle (catalog + hidden aliases).
 fn is_known(name: &str) -> bool {
-    DISPATCH_ALIASES.contains(&name) || list().iter().any(|c| c.name == name)
+    resolve(name).is_some() || list().iter().any(|c| c.name == name)
 }
 
 /// Whether a token could be a command NAME at all, on shape alone.
@@ -511,12 +716,10 @@ pub fn looks_like_name(tok: &str) -> bool {
 /// Drives the prose gate below: `/clear now` still clears (one stray word), but
 /// `/model của aizen là gì?` is a question about the model, not a request to open the picker.
 fn takes_args(name: &str) -> bool {
-    // Hidden aliases mirror the arg-taking behaviour of the command they alias.
-    match name {
-        "changes" => return true,                // alias of /diff
-        "worktree" | "worktrees" => return true, // aliases of /work
-        "sessions-live" => return true,          // alias of /team
-        _ => {}
+    // An alias resolves to its command's row, so it inherits the behaviour automatically — this
+    // used to be a hand-written mirror list that only covered four of them.
+    if let Some(b) = resolve(name) {
+        return !b.argument_hint.trim().is_empty();
     }
     list()
         .iter()
@@ -583,10 +786,17 @@ pub fn classify(line: &str) -> Verdict {
 
     // 4. Near-miss → suggest, never auto-run (a typo'd `/claer` must not wipe the conversation).
     if name.len() >= FUZZY_MIN_LEN {
+        // Suggest from every spelling that would actually dispatch — listed or not. A hidden alias
+        // is still a real command, so `/yol` should offer `/yolo` rather than nothing.
         let best = list()
             .into_iter()
             .map(|c| c.name)
-            .chain(DISPATCH_ALIASES.iter().map(|s| s.to_string()))
+            .chain(
+                BUILTINS
+                    .iter()
+                    .flat_map(|b| b.hidden_aliases.iter().copied().chain([b.name]))
+                    .map(str::to_string),
+            )
             .filter(|cand| cand.len().abs_diff(name.len()) <= FUZZY_MAX_LEN_DELTA)
             .map(|cand| {
                 let score = strsim::jaro_winkler(&name, &cand);
@@ -608,16 +818,29 @@ pub fn classify(line: &str) -> Verdict {
 /// Built-ins win a name collision because `handle_slash` dispatches them before falling back to
 /// `commands::find`; hiding the custom row avoids presenting a command that cannot be invoked.
 pub fn list() -> Vec<SlashCommand> {
+    // Two blocks, as the catalog has always shown them: the commands themselves, then the alias
+    // spellings kept for muscle memory. Both are derived from the one table, so an alias row can no
+    // longer outlive the command it points at.
+    let row = |name: &str, c: &'static Builtin, desc: String| SlashCommand {
+        name: name.to_string(),
+        description: desc,
+        argument_hint: c.argument_hint.to_string(),
+        custom: false,
+    };
     let mut out: Vec<SlashCommand> = BUILTINS
         .iter()
-        .map(|c| SlashCommand {
-            name: c.name.to_string(),
-            description: c.description.to_string(),
-            argument_hint: c.argument_hint.to_string(),
-            custom: false,
-        })
+        .filter(|c| !c.hidden)
+        .map(|c| row(c.name, c, c.description.to_string()))
         .collect();
-    let builtin_names: std::collections::HashSet<&str> = BUILTINS.iter().map(|c| c.name).collect();
+    out.extend(BUILTINS.iter().flat_map(|c| {
+        c.aliases
+            .iter()
+            .map(move |(a, note)| row(a, c, note.to_string()))
+    }));
+    let builtin_names: std::collections::HashSet<&str> = BUILTINS
+        .iter()
+        .flat_map(|c| std::iter::once(c.name).chain(c.aliases.iter().map(|(a, _)| *a)))
+        .collect();
     out.extend(
         commands::list()
             .into_iter()
@@ -687,15 +910,117 @@ mod tests {
     }
 
     #[test]
-    fn hidden_dispatch_aliases_are_not_reclassified_as_chat() {
-        // These work in `handle_slash` but are absent from BUILTINS on purpose. Deriving the known
-        // set from `list()` alone would break them — that is what DISPATCH_ALIASES exists for.
-        for alias in DISPATCH_ALIASES {
-            let line = format!("/{alias}");
-            assert!(
-                matches!(classify(&line), Verdict::Command { .. }),
-                "/{alias} must stay dispatchable"
-            );
+    fn every_spelling_the_table_lists_is_dispatchable() {
+        // The invariant the old design could not hold. `/team` and `/providers` each had a working
+        // arm in `handle_slash` while `classify` had never heard of them, so typing either one was
+        // answered with "did you mean…" or sent to the model as prose. With one table there is no
+        // second list to fall out of — this test pins that.
+        for b in BUILTINS {
+            for spelling in std::iter::once(b.name)
+                .chain(b.aliases.iter().map(|(a, _)| *a))
+                .chain(b.hidden_aliases.iter().copied())
+            {
+                let line = format!("/{spelling}");
+                assert!(
+                    matches!(classify(&line), Verdict::Command { .. }),
+                    "/{spelling} is in the table but classify() will not dispatch it"
+                );
+                assert_eq!(
+                    resolve(spelling).map(|r| r.id),
+                    Some(b.id),
+                    "/{spelling} resolves to the wrong command"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_spelling_is_claimed_by_two_commands() {
+        let mut seen = std::collections::HashMap::new();
+        for b in BUILTINS {
+            for spelling in std::iter::once(b.name)
+                .chain(b.aliases.iter().map(|(a, _)| *a))
+                .chain(b.hidden_aliases.iter().copied())
+            {
+                if let Some(prev) = seen.insert(spelling, b.name) {
+                    panic!("/{spelling} is claimed by both /{prev} and /{}", b.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aliases_inherit_the_argument_behaviour_of_their_command() {
+        // Used to be a hand-written mirror list covering four aliases; the other twenty-seven were
+        // silently wrong, which fed the prose gate the wrong answer.
+        for b in BUILTINS {
+            for spelling in b
+                .aliases
+                .iter()
+                .map(|(a, _)| *a)
+                .chain(b.hidden_aliases.iter().copied())
+            {
+                assert_eq!(
+                    takes_args(spelling),
+                    takes_args(b.name),
+                    "/{spelling} disagrees with /{} about taking arguments",
+                    b.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stdin_ownership_matches_the_rule_it_replaced() {
+        // Transcribed from the `matches!` block that used to live in `ui::tui::slash_takes_stdin`.
+        // If a row's `stdin:` field is edited by accident, the retained frame either paints over a
+        // dialoguer menu or suspends for a command that only prints — both were live bugs once.
+        for line in [
+            "config",
+            "setup",
+            "persona",
+            "personas",
+            "character",
+            "skills",
+            "skill",
+            "apps",
+            "integrations",
+            "telegram",
+            "tg",
+            "serve",
+            "sessions",
+            "import",
+            "model",
+            "provider",
+            "provider add",
+            "provider manage",
+            "timemachine",
+            "timeline",
+            "tm",
+            "effort",
+            "update",
+            "tools menu",
+            "toolsets toggle",
+        ] {
+            assert!(takes_stdin(line), "/{line} must suspend the retained frame");
+        }
+        for line in [
+            "help",
+            "where",
+            "tokens",
+            "cost",
+            "mcp",
+            "memory",
+            "diff",
+            "effort high",
+            "provider openrouter",
+            "tools",
+            "toolsets",
+            "compact",
+            "undo",
+            "redo",
+        ] {
+            assert!(!takes_stdin(line), "/{line} must run with the box still up");
         }
     }
 
@@ -840,15 +1165,29 @@ mod tests {
     }
 
     #[test]
-    fn every_dispatch_alias_is_absent_from_builtins() {
-        // DISPATCH_ALIASES is only correct while these stay OUT of BUILTINS; if one is promoted to
-        // a catalogued command, it must be removed here or `is_known` double-counts it.
-        let builtins: std::collections::HashSet<&str> = BUILTINS.iter().map(|c| c.name).collect();
-        for alias in DISPATCH_ALIASES {
-            assert!(
-                !builtins.contains(alias),
-                "/{alias} is now catalogued — drop it from DISPATCH_ALIASES"
+    fn the_catalog_shows_every_command_and_every_listed_alias_once() {
+        // `list()` is what the `/` picker and the live palette render. A hidden row is deliberate
+        // (a superseded spelling); anything else missing means a command exists that no surface
+        // will ever show.
+        let shown: Vec<String> = list()
+            .into_iter()
+            .filter(|c| !c.custom)
+            .map(|c| c.name)
+            .collect();
+        for b in BUILTINS {
+            assert_eq!(
+                shown.iter().filter(|n| n.as_str() == b.name).count(),
+                usize::from(!b.hidden),
+                "/{} is listed the wrong number of times",
+                b.name
             );
+            for (a, _) in b.aliases {
+                assert_eq!(
+                    shown.iter().filter(|n| n == a).count(),
+                    1,
+                    "/{a} should appear exactly once in the catalog"
+                );
+            }
         }
     }
 
