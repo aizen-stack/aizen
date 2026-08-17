@@ -190,6 +190,9 @@ pub struct ModelInfo {
     pub id: String,
     /// Context window in tokens, if the provider reported it. `None` ⇒ fall back to a name heuristic.
     pub context_length: Option<usize>,
+    /// Free-tier model when the provider reported zero pricing (OpenRouter) or the id matches a
+    /// known free-tier suffix. Tagged in the picker and `aizen models`.
+    pub is_free: bool,
 }
 
 /// Does `base_url` point at Anthropic's own API host?
@@ -248,9 +251,19 @@ pub fn is_opencode_endpoint(base_url: &str) -> bool {
 /// Free-tier variants on shared gateways (OpenCode zen, OpenRouter) carry a `-free` id suffix.
 /// Names the convention once for the places that care: the key-probe model choice below and the
 /// free tags in model listings.
+pub fn pricing_is_free(prompt: &str, completion: &str) -> bool {
+    fn zeroish(s: &str) -> bool {
+        let t = s.trim();
+        t == "0" || t == "0.0" || t == "0.00" || t.parse::<f64>().map(|n| n == 0.0).unwrap_or(false)
+    }
+    zeroish(prompt) && zeroish(completion)
+}
+
 pub fn is_free_model_id(id: &str) -> bool {
-    // OpenCode zen's free catalog is mostly *-free, plus the unsuffixed free id big-pickle.
-    id.ends_with("-free") || id == "big-pickle"
+    // Shared gateway free-tier conventions: OpenCode zen uses *-free (plus the unsuffixed
+    // big-pickle), OpenRouter uses :free. This helper is the fallback for picker/probe when we
+    // don't have the pricing-derived is_free field (or the id suffix is enough).
+    id.ends_with(":free") || id.ends_with("-free") || id == "big-pickle"
 }
 
 /// Attach auth for `base_url`: always Bearer (what every OpenAI-compatible gateway wants), plus
@@ -351,7 +364,7 @@ async fn check_endpoint_with_deadline(
             // the user off to re-paste a token that was fine.
             let probe_model = infos
                 .iter()
-                .find(|m| is_free_model_id(&m.id))
+                .find(|m| m.is_free || is_free_model_id(&m.id))
                 .or_else(|| infos.first())
                 .map(|m| m.id.as_str())
                 .unwrap_or("gpt-4o-mini");
@@ -489,6 +502,15 @@ async fn parse_models_body(resp: reqwest::Response) -> Result<Vec<ModelInfo>> {
         // OpenRouter nests it here too: `top_provider.context_length`.
         #[serde(default)]
         top_provider: Option<TopProvider>,
+        #[serde(default)]
+        pricing: Option<Pricing>,
+    }
+    #[derive(Deserialize)]
+    struct Pricing {
+        #[serde(default)]
+        prompt: String,
+        #[serde(default)]
+        completion: String,
     }
 
     let parsed: ModelsResp = resp.json().await.context("parsing models response")?;
@@ -503,9 +525,15 @@ async fn parse_models_body(resp: reqwest::Response) -> Result<Vec<ModelInfo>> {
                 .or(m.max_input_tokens)
                 .or_else(|| m.top_provider.and_then(|t| t.context_length))
                 .filter(|&n| n > 0);
+            let is_free = m
+                .pricing
+                .as_ref()
+                .map(|p| pricing_is_free(&p.prompt, &p.completion))
+                .unwrap_or(false);
             ModelInfo {
                 id: m.id,
                 context_length: ctx,
+                is_free,
             }
         })
         .collect())
@@ -1700,6 +1728,48 @@ fn partial_suffix(s: &str, tag: &str) -> usize {
         }
     }
     0
+}
+
+#[test]
+fn openrouter_pricing_free_detection() {
+    assert!(pricing_is_free("0", "0"));
+    assert!(pricing_is_free("0.0", "0.00"));
+    assert!(pricing_is_free("0.00000000", "0"));
+    assert!(!pricing_is_free("0", "0.0000001"));
+    assert!(!pricing_is_free("abc", "0"));
+}
+
+#[test]
+fn free_model_id_matches_openrouter_and_opencode() {
+    assert!(is_free_model_id("meta-llama/llama-3.3-70b:free"));
+    assert!(is_free_model_id("deepseek-v4-flash-free"));
+    assert!(!is_free_model_id("gpt-4o"));
+    assert!(!is_free_model_id(":freebie"));
+}
+
+#[test]
+fn key_probe_prefers_free_pricing_over_paid() {
+    // Simulate an OpenRouter list where a paid id appears before the free counterpart; the
+    // probe must still choose the free one so a real free-tier credential doesn't fail as
+    // "bad key".
+    let infos = vec![
+        ModelInfo {
+            id: "qwen/qwen3-8b".into(),
+            context_length: Some(8000),
+            is_free: false,
+        },
+        ModelInfo {
+            id: "openrouter/free".into(),
+            context_length: Some(128000),
+            is_free: true,
+        },
+    ];
+    let picked = infos
+        .iter()
+        .find(|m| m.is_free || is_free_model_id(&m.id))
+        .map(|m| m.id.as_str())
+        .unwrap();
+    assert_eq!(picked, "openrouter/free");
 }
 
 #[cfg(test)]
