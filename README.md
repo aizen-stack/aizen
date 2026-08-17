@@ -74,6 +74,8 @@ That's the whole setup. No env vars, no config file to hand-edit.
 ## Multi‑Bot Host System
 <img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/9331f184-a829-413e-88b7-adb36432bd75" />
 
+## Time machine
+<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/10582817-8ec4-4924-ae78-b1151c041d05" />
 
 ## Why Aizen
 
