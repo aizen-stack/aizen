@@ -1500,9 +1500,14 @@ fn run_time(cmd: TimeCmd) -> Result<()> {
                         );
                     }
                     if report.applied {
+                        // `--apply` RENAMES; nothing here or anywhere else ever empties the trash.
+                        // Saying only "moved" alongside a "reclaimable" figure reads as though the
+                        // disk came back, and it has not — so name the step that actually frees it.
+                        let trash = report.trash_dir.as_deref().unwrap_or("(trash)");
+                        println!("  → moved to {trash}");
                         println!(
-                            "  → moved to {}",
-                            report.trash_dir.as_deref().unwrap_or("(trash)")
+                            "  {} still on disk until you delete that directory — nothing reaps it for you",
+                            style("note:").bold()
                         );
                     } else {
                         println!(
