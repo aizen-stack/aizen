@@ -14697,7 +14697,7 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
         } else {
             ""
         };
-        let free = if m.is_free || m.is_free || client::is_free_model_id(&m.id) {
+        let free = if m.is_free || client::is_free_model_id(&m.id) {
             "  · free"
         } else {
             ""
