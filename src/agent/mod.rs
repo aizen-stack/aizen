@@ -25,6 +25,7 @@ pub mod mcp_oauth;
 pub mod orchestration;
 pub mod process;
 pub mod project_context;
+pub mod prompt_lanes;
 pub mod query_lang;
 pub mod reach;
 pub mod repo_map;
