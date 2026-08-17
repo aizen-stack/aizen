@@ -7,7 +7,44 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-08-17
+
+An OS-level sandbox underneath the approval layer, and an honest per-platform account of what it
+actually enforces — including where it does not. Contribution terms also change in this release:
+Aizen now asks contributors to agree to a CLA instead of signing off commits.
+
 ### Added
+- **An OS sandbox under every model-influenced process.** Approval asks "did the user agree?" and the
+  `cmd_guard` floor refuses a catastrophic blocklist. Neither answers "if this turn is compromised,
+  what can it reach?" `src/sandbox/` answers that, and it sits below both — `/yolo` skips the prompt,
+  not the sandbox. Every model- or repo-influenced spawn now goes through one constructor: `shell_run`,
+  `process` start, the verify gate, LSP servers, MCP stdio transports, custom-command capture and the
+  `!cmd` REPL escape. What it enforces depends on your kernel, and the report is deliberately
+  unflattering:
+  - **Linux** — kernel-enforced. Landlock (ABI 1–3) confines the filesystem, a classic-BPF seccomp
+    filter denies `socket(AF_INET|AF_INET6)`, plus `no_new_privs` and rlimits. No root, no daemon, and
+    no new dependency: the syscalls are declared locally.
+  - **macOS** — `sandbox-exec` profile, runtime-probed. Filesystem *reads* are only partially
+    contained.
+  - **Windows** — **filesystem and network are NOT kernel-enforced.** There is no AppContainer
+    integration, so those report `advisory` and `unavailable` rather than pretending, and `strict`
+    mode refuses to spawn at all instead of implying a containment it cannot deliver. What Windows
+    does get is real: Job Object limits (process count, memory, user time), tree-kill containment, and
+    environment scrubbing.
+  - **Everywhere** — children no longer inherit variables whose names look like credentials
+    (`KEY`/`TOKEN`/`SECRET`/`PASSWORD`/`CREDENTIAL`/`AUTH`, and the `AWS_`/`AIZEN_` prefixes).
+    Restore specific names with `sandbox.pass_env`. Values are never logged. Note the honest cost: an
+    agent running `git push` over SSH will not see `ssh-agent` unless you pass it through.
+  - Network is deny-by-default. `shell_run` and `process` take a `network` capability that is an
+    approval escalation and disqualifies the smart auto-clear.
+  - Internal git calls are hardened separately (no hooks, no fsmonitor, no credential helper, no
+    terminal prompt).
+- **`aizen sandbox status | doctor | doctor --json | explain | run`**, a global `--sandbox <mode>`
+  flag, and `/sandbox` in the REPL. `status` prints what *your* machine enforces rather than what the
+  docs hope for; `doctor` runs a live environment-scrub self-test. `docs/SANDBOX.md` carries the threat
+  model and the capability matrix.
+- **An owner-only audit log** at `~/.aizen/audit/sandbox.jsonl` — one JSONL line per spawn, with the
+  command redacted and hashed, environment *counts* rather than values, and 5 MB rotation.
 - **OpenCode (free) preset.** OpenCode's zen gateway (`https://opencode.ai/zen/v1`) joins the
   provider picker: the free tier authenticates with the literal shared token `public` (no sign-up),
   and Aizen attaches the `x-opencode-client` header automatically. Free models there are the
@@ -18,6 +55,24 @@ development log lives in that monorepo's history.
 - **ChatGPT Codex OAuth (experimental).** `aizen auth login|status|logout codex` browser PKCE; Codex Responses backend for the agent loop. Kill-switch `AIZEN_DISABLE_CODEX=1`. Private/compatibility surface — see docs RISK.
 
 ### Changed
+- **Contributions now require a CLA instead of a DCO sign-off.** The project's license does not
+  change — Aizen is and stays Apache-2.0. What changes is the inbound terms: contributors agree once
+  to [`CLA.md`](CLA.md) by commenting on their pull request, and `git commit -s` is no longer asked
+  for. Stated plainly because it is a broader ask than Apache-2.0 §5: you keep your copyright and the
+  public source stays Apache-2.0, but §3 also grants the maintainer the right to license your
+  contribution under other terms, **including proprietary commercial ones**. Read §3 before agreeing;
+  if you would rather not, say so on the PR.
+- **`serve` and `cron` now fail closed on Windows.** Both mark the process unattended, and an
+  unattended turn will not fall back to weaker containment silently. Because Windows has no kernel
+  backend, this means **an agent shell driven from Telegram or Discord is refused** until you set
+  `sandbox.allow_guarded_fallback = true`. This is a behaviour change for existing bot hosts on
+  Windows; Linux and macOS hosts are unaffected.
+- **A false safety claim has been removed from the README.** All three READMEs said "tools are
+  confined to the working directory". The cwd-confinement guard was removed in an earlier release, so
+  that sentence had been untrue for some time. It now describes what the code actually enforces, and
+  points at `aizen sandbox status` for the per-machine answer. Note what is still *not* covered: the
+  file tools (`file_write`, `file_edit`, `file_move`) are not sandboxed — the sandbox governs child
+  processes.
 - **The system prompt no longer carries a hand-written tool catalog.** ~7.3 KB of prose listing
   every tool has been replaced by a `# Tool routing` block generated from the registry the session
   actually built, so it can only ever name tools this session advertises. That closes a real gap:
@@ -45,6 +100,17 @@ development log lives in that monorepo's history.
   review, explain and plan requests are distinguished from action requests up front.
 
 ### Fixed
+- **ChatGPT/Codex OAuth login failed on Windows.** Three separate causes, all fixed: the authorize URL
+  was opened through `cmd /C start`, which treats the `&` in an OAuth query string as a command
+  separator and handed the browser a truncated URL (it now goes through
+  `rundll32 url.dll,FileProtocolHandler` as a single argument); the callback listener fell back to an
+  ephemeral port when 1455 was busy, but Codex registers exactly one redirect URI, so OpenAI rejected
+  the request with `invalid_authorize_request` before login could start (the fallback is gone and a
+  bind failure now names the port to free); and the redirect URI now uses the registered `localhost`
+  spelling rather than `127.0.0.1`. Reported and fixed by
+  [@ManhND226677](https://github.com/ManhND226677) in
+  [#10](https://github.com/aizen-stack/aizen/pull/10) — thank you. The live Windows login was verified
+  by the contributor.
 - **The input box ignored the mouse, and a long draft scrolled under a stationary caret.** Clicking a
   character in the box now puts the caret on it, instead of ←/→ being the only way to get there, and
   dragging across the box selects draft text — copied to the clipboard on release, or with Ctrl-C,
