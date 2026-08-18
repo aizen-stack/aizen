@@ -36,7 +36,30 @@ mod retained;
 /// *inside* a paste becomes a literal newline in the draft instead of submitting the line — the fix
 /// for a multi-line paste firing one message per line. Comfortably above buffered-read scheduling
 /// jitter (a few ms) yet far below the gap before a human reaches the Enter key (≥ ~100 ms).
+///
+/// Also the settle window for the paste-repaint throttle: mid-burst keystrokes skip per-char
+/// repaint, then one flush runs once no further key arrives within this gap — without that flush
+/// the draft stays visually stale until the user presses another key (space, arrow, …).
 const PASTE_COALESCE_MS: u64 = 50;
+
+/// Mid-paste keystroke? Skip the per-char repaint (draft buffer still updates).
+#[inline]
+fn paste_in_burst(buffered: bool, prev_buffered: bool) -> bool {
+    buffered && prev_buffered
+}
+
+/// Deferred paste repaint is due once the burst has been idle ≥ `coalesce_ms` (or there is no
+/// last-key timestamp). Pure helper so the settle rule is unit-tested without a real terminal.
+#[inline]
+fn paste_flush_due(pending: bool, idle_since_last_key_ms: Option<u64>, coalesce_ms: u64) -> bool {
+    if !pending {
+        return false;
+    }
+    match idle_since_last_key_ms {
+        None => true,
+        Some(ms) => ms >= coalesce_ms,
+    }
+}
 
 /// Idle seconds before the screensaver card is raised (retained backend only). Reset by any key or
 /// mouse event; gated on !working and no open menu/overlay so it never fires mid-task or over a menu.
@@ -1915,6 +1938,10 @@ fn input_loop(
     let mut last_arrival: Option<Instant> = None;
     // Arrival time TWO keys ago, for detecting paste burst end (when prev was buffered but current is not).
     let mut last_arrival_prev: Option<Instant> = None;
+    // Set when a paste burst skips a per-char repaint. Flushed on the next idle poll once the
+    // inter-key gap exceeds `PASTE_COALESCE_MS` — paste has no trailing keystroke of its own, so
+    // without this the complete draft stays invisible until the user presses another key.
+    let mut paste_repaint_pending = false;
     // Phase 3 mouse drag state (retained only). `selecting` tracks left-drag text selection;
     // `dragging_scrollbar` tracks thumb drag on the right gutter. Cleared on mouse-up / Esc.
     let mut selecting: Option<retained::SelectionRange> = None;
@@ -1984,7 +2011,16 @@ fn input_loop(
             // IDLE_SCREENSAVER_SECS of no input — and only when quiescent (retained, not working, no
             // menu/overlay/approval up) — the render thread blits one static card. A busy turn or an
             // open menu never triggers it. When there IS input the read below returns immediately.
-            let have_event = match event::poll(Duration::from_millis(1000)) {
+            //
+            // While a paste repaint is deferred, poll on the coalesce window so we flush the draft
+            // as soon as the burst settles — a 1s poll would leave a long paste invisible until the
+            // next keystroke (the bug that made users mash Space to "unstick" the box).
+            let poll_ms = if paste_repaint_pending {
+                PASTE_COALESCE_MS
+            } else {
+                1000
+            };
+            let have_event = match event::poll(Duration::from_millis(poll_ms)) {
                 Ok(v) => v,
                 Err(_) => {
                     let _ = sub_tx.send(Submission::Quit);
@@ -1992,6 +2028,12 @@ fn input_loop(
                 }
             };
             if !have_event {
+                // Paste burst ended with no trailing key: one flush shows the complete draft.
+                let idle_ms = last_arrival.map(|t| t.elapsed().as_millis() as u64);
+                if paste_flush_due(paste_repaint_pending, idle_ms, PASTE_COALESCE_MS) {
+                    paste_repaint_pending = false;
+                    repaint();
+                }
                 if !screensaver_up
                     && retained::is_active()
                     // Same sixel gate as the startup card above. Without it this path fires every
@@ -2155,10 +2197,11 @@ fn input_loop(
         // Reset the timestamp chain after Backspace/Del so the next char (IME-committed) is not
         // mistaken for part of a burst.
         last_arrival = if is_ime_edit { None } else { Some(now) };
-        // in_paste_burst: we are mid-burst → skip repaint this keystroke.
-        // paste_just_ended: first keystroke outside the burst → repaint once to flush.
-        let in_paste_burst = buffered && prev_buffered;
-        let _paste_just_ended = !buffered && prev_buffered;
+        // in_paste_burst: mid-burst → skip per-char repaint (draft still updates). The flush runs
+        // from the idle poll once the gap exceeds PASTE_COALESCE_MS — not from the next keystroke
+        // (paste has none of its own). A non-burst key that arrives while a flush is still pending
+        // clears the flag via the normal repaint path below.
+        let in_paste_burst = paste_in_burst(buffered, prev_buffered);
         // If the agent is awaiting a per-action approval, THIS keystroke is the answer — route a
         // y/n/a decision to the blocked gate and never treat it as draft input. Other keys are
         // ignored so a stray press can't accidentally approve.
@@ -2248,6 +2291,9 @@ fn input_loop(
                 r.palette_sel = 0;
                 drop(r);
                 hist_idx = None;
+                // Newline still paints (multiline paste must show line growth); clear the deferred
+                // flag so the idle poll doesn't double-flush right after.
+                paste_repaint_pending = false;
                 repaint();
             }
             Key::Enter => {
@@ -2527,9 +2573,12 @@ fn input_loop(
                 drop(r);
                 hist_idx = None;
                 // Paste throttle: during a paste burst (hundreds of chars arriving <50ms apart), skip
-                // repaint for every char. Only repaint once when the burst ends. Cuts paste lag from
-                // O(n chars) repaints to 1 final repaint showing the complete text instantly.
-                if !in_paste_burst {
+                // repaint for every char and mark a deferred flush. The idle poll paints once the
+                // burst settles — O(1) repaint instead of O(n), without waiting for another key.
+                if in_paste_burst {
+                    paste_repaint_pending = true;
+                } else {
+                    paste_repaint_pending = false;
                     repaint();
                 }
             }
@@ -2542,7 +2591,10 @@ fn input_loop(
                     r.palette_sel = 0;
                     drop(r);
                     hist_idx = None;
-                    if !in_paste_burst {
+                    if in_paste_burst {
+                        paste_repaint_pending = true;
+                    } else {
+                        paste_repaint_pending = false;
                         repaint();
                     }
                 }
@@ -2554,7 +2606,10 @@ fn input_loop(
                     r.draft.remove(cur);
                     r.palette_sel = 0;
                     drop(r);
-                    if !in_paste_burst {
+                    if in_paste_burst {
+                        paste_repaint_pending = true;
+                    } else {
+                        paste_repaint_pending = false;
                         repaint();
                     }
                 }
@@ -3615,6 +3670,47 @@ mod tests {
         assert_eq!(HealthKind::Unstable.color_code(), theme::WARN);
         assert_eq!(HealthKind::Down.color_code(), theme::ERR);
         assert_eq!(HealthKind::Unknown.color_code(), theme::MUTED);
+    }
+
+    /// Paste throttle: only the middle of a burst skips repaint. The first two arrivals still paint
+    /// (not enough history to call it a paste); from the third on we defer.
+    #[test]
+    fn paste_in_burst_needs_two_tight_gaps() {
+        assert!(!paste_in_burst(false, false));
+        assert!(!paste_in_burst(true, false), "second key is not yet a burst");
+        assert!(!paste_in_burst(false, true));
+        assert!(
+            paste_in_burst(true, true),
+            "third+ key in a tight stream is mid-paste"
+        );
+    }
+
+    /// Deferred flush must fire from idle settle — NOT wait for another keystroke. That was the
+    /// "paste then mash Space to see the text" bug: throttle skipped mid-burst repaints and never
+    /// painted again until the next human key arrived.
+    #[test]
+    fn paste_flush_fires_after_coalesce_idle_not_before() {
+        const MS: u64 = PASTE_COALESCE_MS;
+        assert!(
+            !paste_flush_due(false, Some(MS * 10), MS),
+            "nothing pending → never flush"
+        );
+        assert!(
+            !paste_flush_due(true, Some(MS.saturating_sub(1)), MS),
+            "still inside the coalesce window → keep holding"
+        );
+        assert!(
+            paste_flush_due(true, Some(MS), MS),
+            "gap hit coalesce → flush without another key"
+        );
+        assert!(
+            paste_flush_due(true, Some(MS + 1), MS),
+            "gap past coalesce → flush"
+        );
+        assert!(
+            paste_flush_due(true, None, MS),
+            "no last-key stamp (e.g. after IME reset) → flush rather than stall forever"
+        );
     }
 
     #[test]
