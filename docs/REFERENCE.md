@@ -350,8 +350,23 @@ The model reads/edits files, runs shell, and uses memory to finish a task end-to
 aizen agent "add a --version flag and update the help text"
 aizen agent --yes "fix the failing test in src/parse.rs"   # pre-approve file/shell ops
 aizen agent --max-iters 40 "..."                            # raise the step cap
+aizen agent --save-session "..."                            # keep the transcript for /sessions
+aizen agent --effort high "..."                             # this run only; the config is untouched
 ```
 Behavior worth knowing:
+- **Nothing is saved unless you ask.** This subcommand is also the scripting and CI entry point, so
+  it writes no session file by default — a file per invocation would bury the pool `/sessions` reads.
+  With `--save-session` the finished conversation is written to `~/.aizen/sessions` with the same
+  provenance stamp the REPL writes (project key, root and slug), so `/sessions` reopens it without
+  caring which surface produced it, and the path is printed to **stderr** — stdout stays the answer.
+  A run that ends in an error is saved too: it still happened.
+- **Effort is per run, not per config.** `/effort` in the REPL pins a tier by writing
+  `reasoning_effort` into the config; `--effort` arms the same per-turn override the REPL arms and
+  persists nothing, so a front-end can send one hard run and one cheap one without editing the
+  user's settings between them. `--effort auto` runs the same keyword-plus-complexity classifier a
+  typed REPL turn goes through, against the task text. Omit the flag and nothing changes: the
+  configured `reasoning_effort` applies and the request is byte-identical to one from a core that
+  never had the flag. The tier is named on **stderr**, next to the rest of the trace.
 - **How tools reach the model** — the session's tool registry is the single source of truth. Its
   definitions (name, description, JSON Schema) are sent through the provider's **native** tool field:
   OpenAI-compatible gateways and Anthropic get `tools[{type:"function",function:{…}}]`, the ChatGPT

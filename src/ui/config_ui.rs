@@ -71,20 +71,25 @@ fn apply_model_endpoint(cfg: &mut cli_config::CliConfig, spec: &str) -> Result<(
     Ok(())
 }
 
-/// Apply one role's `--<role>-model/-base-url/-api-key-ref` trio to `roles`.
+/// Apply one role's `--<role>-provider/-model/-base-url/-api-key-ref` set to `roles`.
 ///
 /// `None` leaves a field alone; an EMPTY string clears it (the documented way to undo a setting
 /// without hand-editing JSON). When every field of the role ends up cleared, the role object itself
 /// is dropped so the saved config doesn't accumulate `"oracle": {}` husks — which matters beyond
 /// tidiness, because `role_configured("oracle")` (and therefore self-review) keys off presence.
+///
+/// `reasoning_effort` is not settable here, but it is counted: it is a field of the role, and a
+/// role emptied of the fields this function *can* see would otherwise take a hand-written per-role
+/// effort down with it.
 fn apply_role_flags(
     roles: &mut cli_config::RolesConfig,
     role: &str,
+    provider: Option<String>,
     model: Option<String>,
     base_url: Option<String>,
     api_key_ref: Option<String>,
 ) {
-    if model.is_none() && base_url.is_none() && api_key_ref.is_none() {
+    if provider.is_none() && model.is_none() && base_url.is_none() && api_key_ref.is_none() {
         return;
     }
     let slot = match role {
@@ -101,10 +106,16 @@ fn apply_role_flags(
             *field = (!s.is_empty()).then(|| s.to_string());
         }
     };
+    set(&mut rc.provider, provider);
     set(&mut rc.model, model);
     set(&mut rc.base_url, base_url);
     set(&mut rc.api_key_ref, api_key_ref);
-    *slot = (rc.model.is_some() || rc.base_url.is_some() || rc.api_key_ref.is_some()).then_some(rc);
+    *slot = (rc.provider.is_some()
+        || rc.model.is_some()
+        || rc.base_url.is_some()
+        || rc.api_key_ref.is_some()
+        || rc.reasoning_effort.is_some())
+    .then_some(rc);
 }
 
 pub(crate) async fn run_auth(cmd: AuthCmd) -> Result<()> {
@@ -165,15 +176,21 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             api_key,
             model,
             context_window,
+            max_tokens,
+            prompt_cache,
             compact_threshold,
             auto_skill_learn,
             memory_auto_learn,
+            embed_model,
             persona_evolve,
             price_in,
             price_out,
             icons,
             response_visuals,
+            update_check,
+            skill_registry,
             timemachine_keep,
+            timemachine_keep_safety,
             timemachine_max_files,
             timemachine_max_bytes,
             timemachine_max_file_bytes,
@@ -182,70 +199,113 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             approval,
             ultimate,
             adaptive_effort,
+            prompt_tier,
+            eager_tools,
+            self_review,
+            sandbox_mode,
             disabled_toolsets,
             enabled_toolsets,
+            max_subagents,
+            workflow_tool,
+            subagent_provider,
             subagent_model,
             subagent_base_url,
             subagent_api_key_ref,
+            summarizer_provider,
             summarizer_model,
             summarizer_base_url,
             summarizer_api_key_ref,
+            oracle_provider,
             oracle_model,
             oracle_base_url,
             oracle_api_key_ref,
+            apply_provider,
             apply_model,
             apply_base_url,
             apply_api_key_ref,
             model_endpoint,
         } => {
-            // (role, model, base_url, api_key_ref) — one table so the emptiness guard below and the
-            // apply loop further down can never disagree about which flags exist.
+            // (role, provider, model, base_url, api_key_ref) — one table so the emptiness guard
+            // below and the apply loop further down can never disagree about which flags exist.
             let role_flags = [
                 (
                     "subagent_default",
+                    subagent_provider,
                     subagent_model,
                     subagent_base_url,
                     subagent_api_key_ref,
                 ),
                 (
                     "summarizer",
+                    summarizer_provider,
                     summarizer_model,
                     summarizer_base_url,
                     summarizer_api_key_ref,
                 ),
-                ("oracle", oracle_model, oracle_base_url, oracle_api_key_ref),
-                ("apply", apply_model, apply_base_url, apply_api_key_ref),
+                (
+                    "oracle",
+                    oracle_provider,
+                    oracle_model,
+                    oracle_base_url,
+                    oracle_api_key_ref,
+                ),
+                (
+                    "apply",
+                    apply_provider,
+                    apply_model,
+                    apply_base_url,
+                    apply_api_key_ref,
+                ),
             ];
             let any_role_flag = role_flags
                 .iter()
-                .any(|(_, m, b, k)| m.is_some() || b.is_some() || k.is_some());
-            if base_url.is_none()
-                && api_key.is_none()
-                && model.is_none()
-                && context_window.is_none()
-                && compact_threshold.is_none()
-                && auto_skill_learn.is_none()
-                && memory_auto_learn.is_none()
-                && persona_evolve.is_none()
-                && price_in.is_none()
-                && price_out.is_none()
-                && icons.is_none()
-                && response_visuals.is_none()
-                && timemachine_keep.is_none()
-                && timemachine_max_files.is_none()
-                && timemachine_max_bytes.is_none()
-                && timemachine_max_file_bytes.is_none()
-                && auto_effort.is_none()
-                && reasoning_effort.is_none()
-                && approval.is_none()
-                && ultimate.is_none()
-                && adaptive_effort.is_none()
-                && disabled_toolsets.is_none()
-                && enabled_toolsets.is_none()
-                && !any_role_flag
-                && model_endpoint.is_empty()
-            {
-                anyhow::bail!("nothing to set — pass at least one supported --flag (including --timemachine-keep / --timemachine-max-files / --timemachine-max-bytes / --timemachine-max-file-bytes)");
+                .any(|(_, p, m, b, k)| p.is_some() || m.is_some() || b.is_some() || k.is_some());
+            // One list rather than a thirty-term `&&` chain: a flag added to the enum and forgotten
+            // here would make `config set --that-flag` bail with "nothing to set" while quietly
+            // doing nothing, and a chain that long is exactly where that omission hides.
+            let any_scalar_flag = [
+                base_url.is_some(),
+                api_key.is_some(),
+                model.is_some(),
+                context_window.is_some(),
+                max_tokens.is_some(),
+                prompt_cache.is_some(),
+                compact_threshold.is_some(),
+                auto_skill_learn.is_some(),
+                memory_auto_learn.is_some(),
+                embed_model.is_some(),
+                persona_evolve.is_some(),
+                price_in.is_some(),
+                price_out.is_some(),
+                icons.is_some(),
+                response_visuals.is_some(),
+                update_check.is_some(),
+                skill_registry.is_some(),
+                timemachine_keep.is_some(),
+                timemachine_keep_safety.is_some(),
+                timemachine_max_files.is_some(),
+                timemachine_max_bytes.is_some(),
+                timemachine_max_file_bytes.is_some(),
+                auto_effort.is_some(),
+                reasoning_effort.is_some(),
+                approval.is_some(),
+                ultimate.is_some(),
+                adaptive_effort.is_some(),
+                prompt_tier.is_some(),
+                eager_tools.is_some(),
+                self_review.is_some(),
+                sandbox_mode.is_some(),
+                disabled_toolsets.is_some(),
+                enabled_toolsets.is_some(),
+                max_subagents.is_some(),
+                workflow_tool.is_some(),
+            ]
+            .into_iter()
+            .any(|set| set);
+            if !any_scalar_flag && !any_role_flag && model_endpoint.is_empty() {
+                anyhow::bail!(
+                    "nothing to set — pass at least one flag; `aizen config set --help` lists them"
+                );
             }
             let mut cfg = cli_config::load();
             let previous_url = cfg.base_url.clone();
@@ -264,6 +324,21 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             if let Some(w) = context_window {
                 cfg.model_context_window = if w > 0 { Some(w) } else { None };
             }
+            if let Some(n) = max_tokens {
+                cfg.max_tokens = (n > 0).then_some(n); // 0 ⇒ back to the provider's own ceiling
+            }
+            if let Some(v) = prompt_cache {
+                // Three states, not two: `auto` is a real answer here (decide by model id), so it
+                // has to be sayable — a boolean flag could set the field but never unset it.
+                cfg.prompt_cache = match v.trim().to_ascii_lowercase().as_str() {
+                    "auto" => None,
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    other => anyhow::bail!(
+                        "--prompt-cache must be one of: auto, true, false (got '{other}')"
+                    ),
+                };
+            }
             if let Some(t) = compact_threshold {
                 if t != 0 && !(10..=95).contains(&t) {
                     anyhow::bail!("--compact-threshold must be 0 (off) or 10–95");
@@ -275,6 +350,10 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             }
             if let Some(b) = memory_auto_learn {
                 cfg.memory_auto_learn = Some(b);
+            }
+            if let Some(v) = embed_model {
+                let v = v.trim();
+                cfg.embed_model = (!v.is_empty()).then(|| v.to_string());
             }
             if let Some(b) = persona_evolve {
                 cfg.persona_evolve = Some(b);
@@ -304,8 +383,25 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                         .map_err(anyhow::Error::msg)?,
                 );
             }
+            if let Some(b) = update_check {
+                cfg.update_check = Some(b);
+            }
+            if let Some(v) = skill_registry {
+                let v = v.trim().trim_end_matches('/');
+                if v.is_empty() {
+                    cfg.skill_registry = None; // back to the default marketplace
+                } else {
+                    if !v.starts_with("http://") && !v.starts_with("https://") {
+                        anyhow::bail!("--skill-registry must be an http:// or https:// URL");
+                    }
+                    cfg.skill_registry = Some(v.to_string());
+                }
+            }
             if let Some(k) = timemachine_keep {
                 cfg.timemachine_keep = Some(k); // 0 = unlimited
+            }
+            if let Some(k) = timemachine_keep_safety {
+                cfg.timemachine_keep_safety = Some(k);
             }
             if let Some(k) = timemachine_max_files {
                 cfg.timemachine_max_files = Some(k.max(1));
@@ -337,19 +433,71 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             if let Some(b) = adaptive_effort {
                 cfg.adaptive_effort = Some(b);
             }
+            if let Some(v) = prompt_tier {
+                let v = v.trim().to_ascii_lowercase();
+                if v.is_empty() {
+                    cfg.prompt_tier = None; // back to the by-model heuristic
+                } else {
+                    if !["full", "strict"].contains(&v.as_str()) {
+                        anyhow::bail!("--prompt-tier must be one of: full, strict");
+                    }
+                    cfg.prompt_tier = Some(v);
+                }
+            }
+            if let Some(b) = eager_tools {
+                cfg.eager_tools = Some(b);
+            }
+            if let Some(b) = self_review {
+                cfg.self_review = Some(b);
+            }
+            // `sandbox.mode` only — the rest of the sandbox block (roots, pass-env, limits) stays a
+            // hand-edit, because those are lists whose meaning depends on the machine.
+            if let Some(v) = sandbox_mode {
+                let mode = v
+                    .parse::<crate::sandbox::SandboxMode>()
+                    .map_err(anyhow::Error::msg)?;
+                let mut sb = cfg.sandbox.take().unwrap_or_default();
+                sb.mode = Some(mode);
+                cfg.sandbox = Some(sb);
+            }
             if let Some(v) = disabled_toolsets {
                 cfg.disabled_toolsets = parse_toolset_list(&v);
             }
             if let Some(v) = enabled_toolsets {
                 cfg.enabled_toolsets = parse_toolset_list(&v);
             }
+            if let Some(n) = max_subagents {
+                cfg.max_parallel_subagents = (n > 0).then_some(n); // 0 ⇒ machine-derived again
+            }
+            if let Some(b) = workflow_tool {
+                cfg.workflow_tool = Some(b);
+            }
             // Per-role endpoints (`roles.*`): set any of model/base_url/api_key_ref; an empty string
             // CLEARS that field. Editing any sub-field materializes the `roles` object; clearing
             // every field of every role drops it again.
             if any_role_flag {
+                // A profile name that does not exist would route the role to nothing and only show
+                // up as a failed run much later. Refuse it here, where the typo is still on screen.
+                let known: Vec<String> = cfg
+                    .providers
+                    .iter()
+                    .flatten()
+                    .map(|p| p.name.clone())
+                    .collect();
+                for (role, provider, ..) in &role_flags {
+                    let Some(name) = provider.as_deref().map(str::trim).filter(|n| !n.is_empty())
+                    else {
+                        continue;
+                    };
+                    if !known.iter().any(|k| k == name) {
+                        anyhow::bail!(
+                            "no saved provider profile '{name}' for role {role} — see `aizen config provider list`"
+                        );
+                    }
+                }
                 let mut roles = cfg.roles.take().unwrap_or_default();
-                for (role, model, base_url, api_key_ref) in role_flags {
-                    apply_role_flags(&mut roles, role, model, base_url, api_key_ref);
+                for (role, provider, model, base_url, api_key_ref) in role_flags {
+                    apply_role_flags(&mut roles, role, provider, model, base_url, api_key_ref);
                 }
                 cfg.roles = roles.has_any().then_some(roles);
             }

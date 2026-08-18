@@ -7,6 +7,58 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+### Added
+- **`aizen config set` reaches the twelve keys it could not.** `update_check`, `skill_registry`,
+  `max_tokens`, `prompt_cache`, `prompt_tier`, `eager_tools`, `self_review`,
+  `max_parallel_subagents`, `workflow_tool`, `embed_model`, `timemachine_keep_safety` and
+  `sandbox.mode` are all read on every run and were settable by nothing: the interactive wizard
+  does not cover them, so the only way to change one was to hand-edit `cli-config.json` — around
+  the exclusive lock and the corrupt-file backup that `save` exists to provide. Each is now a flag,
+  and each can be put back: `--max-tokens 0` and `--max-subagents 0` return to the provider default
+  and the machine-derived band, an empty value clears `--prompt-tier` / `--skill-registry` /
+  `--embed-model`, and `--prompt-cache auto` restores the by-model-id decision — which is why that
+  one takes `auto|true|false` rather than a bool that could set the field but never unset it.
+  `--sandbox-mode` is named apart from the global `--sandbox` on purpose: that one overrides a
+  single invocation, this one is written down. The "nothing to set" guard became a list rather than
+  a thirty-term `&&` chain, since a flag added to the enum and forgotten in that chain would have
+  made `config set --that-flag` bail while quietly doing nothing.
+- **`aizen config set --{subagent,summarizer,oracle,apply}-provider`.** `RoleModelConfig.provider`
+  documents itself as the way to route a role — point it at a saved profile and the role inherits
+  that endpoint, its key and its default model, instead of repeating them field by field. It was
+  the one field of the four with no flag, so the "preferred" path was the only one you could not
+  take without hand-editing JSON, and `--<role>-base-url` + `--<role>-api-key-ref`, which the
+  struct itself calls legacy, were what a caller was pushed toward. An unknown profile name is
+  refused against `providers[]` rather than written, since a role routed to a profile that does not
+  exist surfaces as a failed run much later and nowhere near the typo. Empty clears, as with the
+  rest of the role fields — and the "is this role still configured?" test now counts `provider` and
+  `reasoning_effort` too, so clearing a role's model no longer silently drops a per-role effort set
+  by hand beside it.
+- **`aizen agent --save-session`.** The non-interactive loop could not leave a transcript behind:
+  autosave lives in the REPL's turn, so every one-shot run — and every run driven by a front-end
+  that shells out to `aizen agent` — vanished when the process exited. The flag writes the finished
+  conversation through the same `save_session` the REPL uses, so the file carries the same
+  provenance (project key, root, slug) and `/sessions` reopens it with no idea which surface
+  produced it. Off by default, because this subcommand is also the scripting and CI entry point and
+  a file per invocation would bury the pool the picker reads. The path is reported on stderr so
+  stdout stays the answer, and a run that ended in an error is saved too — it still happened.
+- **`aizen agent --effort auto|low|medium|high|xhigh|max`.** Reasoning effort was reachable from the
+  REPL only, through `/effort` — which pins a tier by writing the config. A front-end wanting one
+  hard run and one cheap one therefore had to rewrite the user's settings between them. This arms
+  the same per-turn override the REPL arms, for this run and no other: nothing is persisted, and
+  `auto` runs the same keyword-plus-complexity classifier a typed turn goes through. Omitting the
+  flag keeps the old behaviour exactly — the configured `reasoning_effort` applies and the request
+  stays byte-identical to one from a core that never had the flag. The tier is named on stderr.
+
+### Fixed
+- **`/effort`'s top stop did the opposite of its label.** The rail draws seven stops and `ultimate`
+  is the seventh, but `apply_effort_choice` only handled `1..=5`; index 6 fell through to the
+  catch-all, so dragging all the way right and pressing Enter turned auto-detect **on** and cleared
+  the pin — never setting `ultimate` at all. `effort_slider_start` could not return 6 either, so
+  the slider could not open on the mode even once it was on. Both fixed, and every branch now
+  writes `ultimate`: sliding down off the top stop has to turn the mode off, or the rung just
+  chosen is silently overruled each turn by a flag nothing cleared. The input box is recoloured on
+  commit, exactly as `/ultimate` does it.
+
 ## [0.6.5] — 2026-08-17
 
 An OS-level sandbox underneath the approval layer, and an honest per-platform account of what it

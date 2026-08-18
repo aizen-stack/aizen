@@ -48,11 +48,18 @@ pub(crate) fn effort_turn_line(eff: Option<&str>) -> String {
     format!("{} {}", theme::faint("  effort:"), styled)
 }
 
-/// The current effort setting as a slider index: 0 = auto (auto-detect ON, no pinned tier), else the
-/// pinned tier (1=low · 2=medium · 3=high). A pinned-but-unknown effort string, or auto-off with no
-/// pin, both fall back to `auto` so the slider always opens on a valid stop.
+/// The current effort setting as a slider index: 0 = auto (auto-detect ON, no pinned tier), 1..=5
+/// the pinned tier, 6 = ultimate. A pinned-but-unknown effort string, or auto-off with no pin, both
+/// fall back to `auto` so the slider always opens on a valid stop.
+///
+/// Ultimate answers first because it is not a tier: it pins max effort every turn regardless of
+/// what `reasoning_effort` says, so opening the slider anywhere else would be showing a setting
+/// that is not the one in force.
 fn effort_slider_start() -> usize {
     let cfg = cli_config::load();
+    if cli_config::ultimate_enabled() {
+        return ULTIMATE;
+    }
     if cli_config::auto_effort_enabled() {
         return 0; // auto ON ⇒ the "auto" stop, regardless of any stale pinned value
     }
@@ -66,19 +73,38 @@ fn effort_slider_start() -> usize {
     }
 }
 
-/// Apply a slider choice to the config and persist it. `0` ⇒ auto (auto_effort=None, clear the pin);
-/// `1..=5` ⇒ pin low/medium/high/xhigh/max and turn auto off — the exact same writes as `/effort auto`
-/// and `/effort low|medium|high|xhigh|max`, so the slider and the text commands stay in lockstep.
+/// The top stop, `tui::E_TIERS`' last index. Named because it is the one stop that is a mode
+/// rather than a rung, and three places have to agree about which one it is.
+const ULTIMATE: usize = 6;
+
+/// Apply a slider choice to the config and persist it. `0` ⇒ auto (auto_effort=None, clear the
+/// pin); `1..=5` ⇒ pin low/medium/high/xhigh/max and turn auto off; `6` ⇒ ultimate. The same writes
+/// as `/effort auto`, `/effort low|…|max` and `/ultimate`, so the slider and the text commands stay
+/// in lockstep.
+///
+/// Every branch writes `ultimate`, not just the one that turns it on. Sliding down off the top stop
+/// has to turn the mode off too — otherwise the tier you just chose is picked and then silently
+/// overruled every turn by a flag nothing cleared.
 fn apply_effort_choice(idx: usize) {
     let mut cfg = cli_config::load();
     let msg = match idx {
+        ULTIMATE => {
+            cfg.ultimate = Some(true);
+            // Pinned as well as flagged: `ultimate_enabled` is what forces max at turn time, and
+            // this is what `/effort status` and the next slider open both read back.
+            cfg.reasoning_effort = Some("max".to_string());
+            cfg.auto_effort = Some(false);
+            "✦ ultimate ON — max reasoning effort every turn + prefers launching workflows for fan-out-able tasks.".to_string()
+        }
         1..=5 => {
             let tier = ["", "low", "medium", "high", "xhigh", "max"][idx];
+            cfg.ultimate = None;
             cfg.reasoning_effort = Some(tier.to_string());
             cfg.auto_effort = Some(false);
             format!("effort pinned to {tier} (auto off) — every turn now sends reasoning_effort={tier}.")
         }
         _ => {
+            cfg.ultimate = None;
             cfg.auto_effort = None; // None ⇒ auto ON (the default)
             cfg.reasoning_effort = None; // clear any stale pin so auto isn't shadowed
             "effort auto ON — each turn's effort is detected from your message (keyword + complexity).".to_string()
@@ -88,6 +114,10 @@ fn apply_effort_choice(idx: usize) {
         Ok(_) => tui::emit_line(&style(msg).color256(splash::ACCENT).to_string()),
         Err(e) => tui::emit_line(&format!("{} {e}", style("effort:").red())),
     }
+    // Recolour the retained input box, exactly as `/ultimate` does: gold while ultimate is ON,
+    // moonlight when OFF. Reads the effective state, so an `AIZEN_ULTIMATE` in the environment
+    // keeps the box gold even after the slider was dragged down from the top.
+    tui::set_ultimate(cli_config::ultimate_enabled());
 }
 
 /// The plain text status report for `/effort status` (and the off-TTY fallback of the bare `/effort`).
@@ -131,5 +161,74 @@ pub(crate) fn effort_slider_flow() {
     match tui::effort_slider(effort_slider_start()) {
         Some(idx) => apply_effort_choice(idx),
         None => tui::emit_line(&style("(effort unchanged)").dim().to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One temp home per test body, serialised against every other test that reads config.
+    fn isolated(tag: &str) -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-effort-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("AIZEN_HOME", &home);
+        // The env forces ultimate on wherever it is set, which would make every assertion below
+        // pass for the wrong reason.
+        std::env::remove_var("AIZEN_ULTIMATE");
+        std::env::remove_var("AIZEN_AUTO_EFFORT");
+        guard
+    }
+
+    /// The slider's top stop is a real stop. It used to fall through to the catch-all arm, so
+    /// dragging to `ultimate` and pressing Enter turned auto-detect ON — the opposite of the label.
+    #[test]
+    fn the_top_stop_turns_ultimate_on_rather_than_auto() {
+        let _g = isolated("on");
+
+        apply_effort_choice(ULTIMATE);
+
+        let cfg = cli_config::load();
+        assert_eq!(cfg.ultimate, Some(true));
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(cfg.auto_effort, Some(false));
+        assert!(cli_config::ultimate_enabled());
+        // And the slider reopens where it was left, which it could not do before either.
+        assert_eq!(effort_slider_start(), ULTIMATE);
+    }
+
+    /// Sliding back down has to clear the mode, not just choose a tier underneath it: ultimate
+    /// pins max every turn regardless of `reasoning_effort`, so a leftover flag would quietly
+    /// overrule the rung the user just picked.
+    #[test]
+    fn sliding_down_off_the_top_stop_turns_the_mode_off() {
+        let _g = isolated("off");
+
+        apply_effort_choice(ULTIMATE);
+        apply_effort_choice(2);
+
+        let cfg = cli_config::load();
+        assert_eq!(cfg.ultimate, None);
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("medium"));
+        assert!(!cli_config::ultimate_enabled());
+        assert_eq!(effort_slider_start(), 2);
+
+        // All the way back to auto clears the pin as well as the mode.
+        apply_effort_choice(0);
+        let cfg = cli_config::load();
+        assert_eq!(cfg.ultimate, None);
+        assert_eq!(cfg.reasoning_effort, None);
+        assert_eq!(effort_slider_start(), 0);
+    }
+
+    /// The index this module calls the top stop is the index the rail draws it at.
+    #[test]
+    fn the_named_top_stop_is_the_rails_last_one() {
+        assert_eq!(ULTIMATE, tui::E_TIERS.len() - 1);
+        assert_eq!(tui::E_TIERS[ULTIMATE], "ultimate");
     }
 }

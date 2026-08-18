@@ -188,6 +188,7 @@ fn apply_role_flags_sets_clears_then_drops_the_role() {
     apply_role_flags(
         &mut roles,
         "oracle",
+        None,
         Some("strong-model".into()),
         Some("https://oracle/v1".into()),
         None,
@@ -199,7 +200,7 @@ fn apply_role_flags_sets_clears_then_drops_the_role() {
     assert!(roles.has_any());
 
     // A `None` for every field is a no-op, not a wipe.
-    apply_role_flags(&mut roles, "oracle", None, None, None);
+    apply_role_flags(&mut roles, "oracle", None, None, None, None);
     assert_eq!(
         roles.oracle.as_ref().unwrap().model.as_deref(),
         Some("strong-model"),
@@ -207,10 +208,10 @@ fn apply_role_flags_sets_clears_then_drops_the_role() {
     );
 
     // Empty strings clear individual fields; emptying them all drops the role entirely.
-    apply_role_flags(&mut roles, "oracle", Some(String::new()), None, None);
+    apply_role_flags(&mut roles, "oracle", None, Some(String::new()), None, None);
     assert_eq!(roles.oracle.as_ref().unwrap().model, None, "model cleared");
     assert!(roles.oracle.is_some(), "base_url still holds the role open");
-    apply_role_flags(&mut roles, "oracle", None, Some("  ".into()), None);
+    apply_role_flags(&mut roles, "oracle", None, None, Some("  ".into()), None);
     assert!(
         roles.oracle.is_none(),
         "an all-empty role is removed, not left as a husk"
@@ -218,11 +219,51 @@ fn apply_role_flags_sets_clears_then_drops_the_role() {
     assert!(!roles.has_any());
 
     // Each role writes to its own slot.
-    apply_role_flags(&mut roles, "summarizer", Some("cheap".into()), None, None);
-    apply_role_flags(&mut roles, "apply", Some("fast".into()), None, None);
+    apply_role_flags(
+        &mut roles,
+        "summarizer",
+        None,
+        Some("cheap".into()),
+        None,
+        None,
+    );
+    apply_role_flags(&mut roles, "apply", None, Some("fast".into()), None, None);
     assert_eq!(roles.summarizer.unwrap().model.as_deref(), Some("cheap"));
     assert_eq!(roles.apply.unwrap().model.as_deref(), Some("fast"));
     assert!(roles.oracle.is_none() && roles.subagent_default.is_none());
+}
+/// The profile route (`roles.<role>.provider`) holds a role open exactly as the per-field
+/// overrides do, and clears the same way — it is the spelling core's own struct calls preferred,
+/// so it must not be the one with weaker guarantees.
+#[test]
+fn a_role_pinned_to_a_profile_sets_and_clears_like_any_other_field() {
+    let mut roles = cli_config::RolesConfig::default();
+    apply_role_flags(&mut roles, "oracle", Some("work".into()), None, None, None);
+    assert_eq!(
+        roles.oracle.as_ref().unwrap().provider.as_deref(),
+        Some("work")
+    );
+
+    apply_role_flags(&mut roles, "oracle", Some(String::new()), None, None, None);
+    assert!(
+        roles.oracle.is_none(),
+        "the profile was the role's only field, so clearing it drops the role"
+    );
+
+    // A per-role effort nobody can set from the CLI still counts as the role being configured:
+    // clearing the fields we *can* see must not take a hand-written one down with it.
+    let mut roles = cli_config::RolesConfig::default();
+    roles.oracle = Some(cli_config::RoleModelConfig {
+        model: Some("strong".into()),
+        reasoning_effort: Some("xhigh".into()),
+        ..Default::default()
+    });
+    apply_role_flags(&mut roles, "oracle", None, Some(String::new()), None, None);
+    assert_eq!(
+        roles.oracle.as_ref().unwrap().reasoning_effort.as_deref(),
+        Some("xhigh"),
+        "clearing the model must not discard the effort beside it"
+    );
 }
 #[test]
 fn version_suffix_hint_only_when_actually_missing() {

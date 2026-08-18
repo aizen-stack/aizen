@@ -79,6 +79,56 @@ fn agents_set_provider_parses() {
     ));
 }
 
+/// `--save-session` is a switch, not a value.
+///
+/// The task is positional, so a flag that took an optional NAME here would swallow it: the very
+/// natural `aizen agent --save-session "fix the delete button"` would file an empty task under a
+/// session called "fix the delete button". Keeping the flag boolean is what makes that impossible,
+/// and this test is the reason it must stay boolean.
+#[test]
+fn agent_save_session_is_a_switch_and_never_eats_the_task() {
+    let cli = Cli::try_parse_from(["aizen", "agent", "--save-session", "sửa cái nút xoá"])
+        .expect("parse");
+    let Some(Commands::Agent(args)) = cli.command else {
+        panic!("expected the agent subcommand");
+    };
+    assert!(args.save_session);
+    assert_eq!(args.task, "sửa cái nút xoá");
+
+    // Off unless asked: the scripting path must not start writing files because it was upgraded.
+    let plain = Cli::try_parse_from(["aizen", "agent", "chạy test"]).expect("parse");
+    assert!(matches!(plain.command, Some(Commands::Agent(a)) if !a.save_session));
+}
+
+/// The rungs `--effort` accepts are the rungs `reasoning_effort` goes out with, plus `auto`.
+///
+/// Validated by clap rather than at use: a typo like `--effort mediumish` reaching the wire would
+/// come back as a provider error several seconds and one billed prompt later, and that message
+/// would be about the request rather than about the flag.
+#[test]
+fn agent_effort_takes_the_ladder_and_nothing_else() {
+    let effort_of = |argv: &[&str]| -> Option<String> {
+        let cli = Cli::try_parse_from(argv).expect("parse");
+        match cli.command {
+            Some(Commands::Agent(a)) => a.effort,
+            _ => panic!("expected the agent subcommand"),
+        }
+    };
+
+    for tier in ["auto", "low", "medium", "high", "xhigh", "max"] {
+        assert_eq!(
+            effort_of(&["aizen", "agent", "--effort", tier, "việc"]).as_deref(),
+            Some(tier)
+        );
+    }
+
+    // Omitted is its own answer: the configured `reasoning_effort` applies, and the request stays
+    // byte-identical to one from a core that never had this flag.
+    assert_eq!(effort_of(&["aizen", "agent", "việc"]), None);
+
+    assert!(Cli::try_parse_from(["aizen", "agent", "--effort", "mediumish", "việc"]).is_err());
+}
+
 /// `memory list current` and `memory list --scope current` must mean the same thing.
 ///
 /// The REPL has always taken the scope positionally (`/memory list current`), so that is the form

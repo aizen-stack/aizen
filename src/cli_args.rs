@@ -714,6 +714,15 @@ pub(crate) enum ConfigCmd {
         /// Context window in tokens for the `% context` HUD (overrides auto-detect/heuristic).
         #[arg(long)]
         context_window: Option<usize>,
+        /// Cap on the model's OUTPUT tokens per call — a runaway-completion guard, not a way to
+        /// save input tokens. `0` clears it, back to the provider's own default.
+        #[arg(long)]
+        max_tokens: Option<u32>,
+        /// Anthropic prompt-cache breakpoints, which cut billed INPUT tokens on long sessions:
+        /// `auto` (on when the model id looks Anthropic), `true`, or `false`. A no-op on providers
+        /// that do not cache.
+        #[arg(long)]
+        prompt_cache: Option<String>,
         /// Auto-compact threshold as a percent of context (10–95; `0` disables). Default 80.
         #[arg(long)]
         compact_threshold: Option<u8>,
@@ -723,6 +732,10 @@ pub(crate) enum ConfigCmd {
         /// Auto-learn memory: passively learn durable facts from each turn (default on).
         #[arg(long)]
         memory_auto_learn: Option<bool>,
+        /// Dense-retrieval model for memory recall: a directory name under `~/.aizen/models/`, or
+        /// an absolute path. Empty clears (auto-detect). Only meaningful on a `dense` build.
+        #[arg(long)]
+        embed_model: Option<String>,
         /// Persona evolution: record episodes + reflect them into insights (default on).
         #[arg(long)]
         persona_evolve: Option<bool>,
@@ -738,9 +751,21 @@ pub(crate) enum ConfigCmd {
         /// Final-answer visuals: `auto` (when useful), `always` (substantial replies), or `off`.
         #[arg(long)]
         response_visuals: Option<String>,
+        /// Silent background release check at REPL startup (cached 24h, one line at most).
+        /// `AIZEN_NO_UPDATE_CHECK` disables it without touching the file.
+        #[arg(long)]
+        update_check: Option<bool>,
+        /// Skill marketplace base URL for `skill search`/`skill install`. Empty restores the
+        /// default registry.
+        #[arg(long)]
+        skill_registry: Option<String>,
         /// Time-machine checkpoints to keep (oldest auto-pruned past this; `0` = unlimited). Default 50.
         #[arg(long)]
         timemachine_keep: Option<usize>,
+        /// Safety-net checkpoints (`before agent edits`) to keep, pruned before any named
+        /// milestone is touched. Default 5.
+        #[arg(long)]
+        timemachine_keep_safety: Option<usize>,
         /// Maximum number of files in one Time Machine snapshot.
         #[arg(long)]
         timemachine_max_files: Option<u64>,
@@ -768,12 +793,41 @@ pub(crate) enum ConfigCmd {
         /// hardest turns (opt-in; default off).
         #[arg(long)]
         adaptive_effort: Option<bool>,
+        /// System-prompt tier: `full`, or `strict` (the compact numbered-rules prompt for small or
+        /// local models). Empty restores the by-model heuristic.
+        #[arg(long)]
+        prompt_tier: Option<String>,
+        /// Eager tool execution while streaming: read-only calls start as soon as their arguments
+        /// finish streaming (default on). `AIZEN_NO_EAGER` is the env kill-switch.
+        #[arg(long)]
+        eager_tools: Option<bool>,
+        /// One extra self-review turn before Done on runs that edited files. Unset ⇒ off, unless a
+        /// `roles.oracle` model is configured, which turns it on by itself.
+        #[arg(long)]
+        self_review: Option<bool>,
+        /// Persist the sandbox mode (`sandbox.mode`): auto | strict | guarded | off. Unlike the
+        /// global `--sandbox`, which overrides one invocation, this one is written to the config.
+        #[arg(long)]
+        sandbox_mode: Option<String>,
         /// Comma-separated tool bundles to hide.
         #[arg(long)]
         disabled_toolsets: Option<String>,
         /// Comma-separated tool-bundle whitelist.
         #[arg(long)]
         enabled_toolsets: Option<String>,
+        /// Concurrent sub-agent cap for `task` fan-out and workflows. `0` clears it, back to the
+        /// machine-derived band (2–16).
+        #[arg(long)]
+        max_subagents: Option<usize>,
+        /// Register the `workflow` fan-out tool (default on). Off saves its ~350-token schema on
+        /// every top-level turn.
+        #[arg(long)]
+        workflow_tool: Option<bool>,
+        /// Saved provider profile the sub-agent default runs on (`roles.subagent_default.provider`);
+        /// its endpoint and default model are inherited. The preferred way to route a role — the
+        /// base-url/key pair below is the older, per-field spelling. Empty clears.
+        #[arg(long)]
+        subagent_provider: Option<String>,
         /// Default model for dispatched sub-agents (`roles.subagent_default`). Routes through the
         /// model→endpoint registry, so pairing it with `--model-endpoint` runs sub-agents on their
         /// own gateway. Pass an empty string to clear.
@@ -787,6 +841,9 @@ pub(crate) enum ConfigCmd {
         /// key. Empty clears. (`roles.subagent_default.api_key_ref`.)
         #[arg(long)]
         subagent_api_key_ref: Option<String>,
+        /// Saved provider profile the summarizer runs on (`roles.summarizer.provider`). Empty clears.
+        #[arg(long)]
+        summarizer_provider: Option<String>,
         /// Model for compaction/handoff summaries (`roles.summarizer`) — the classic cheap-model
         /// slot. Empty clears.
         #[arg(long)]
@@ -798,6 +855,9 @@ pub(crate) enum ConfigCmd {
         /// Empty clears. (`roles.summarizer.api_key_ref`.)
         #[arg(long)]
         summarizer_api_key_ref: Option<String>,
+        /// Saved provider profile the reviewer runs on (`roles.oracle.provider`). Empty clears.
+        #[arg(long)]
+        oracle_provider: Option<String>,
         /// Model for the self-review reviewer (`roles.oracle`) — a stronger model is the point.
         /// NOTE: configuring this role also TURNS SELF-REVIEW ON unless `self_review` says otherwise.
         /// Empty clears.
@@ -810,6 +870,9 @@ pub(crate) enum ConfigCmd {
         /// Empty clears. (`roles.oracle.api_key_ref`.)
         #[arg(long)]
         oracle_api_key_ref: Option<String>,
+        /// Saved provider profile the apply role runs on (`roles.apply.provider`). Empty clears.
+        #[arg(long)]
+        apply_provider: Option<String>,
         /// Model for the reserved fast-apply edit role (`roles.apply`; config-only today). Empty clears.
         #[arg(long)]
         apply_model: Option<String>,
@@ -962,6 +1025,16 @@ pub(crate) struct AgentArgs {
     /// Hard step cap before the one-shot auto-extend (default 25).
     #[arg(long)]
     pub(crate) max_iters: Option<usize>,
+    /// Save the finished conversation under ~/.aizen/sessions, so /sessions can reopen it.
+    /// Off by default: this subcommand is also the scripting and CI entry point, and a file per
+    /// invocation would bury the pool the picker reads.
+    #[arg(long)]
+    pub(crate) save_session: bool,
+    /// Reasoning effort for this run: auto | low | medium | high | xhigh | max. `auto` classifies
+    /// the task the way the REPL classifies a typed turn. Omitted ⇒ the configured
+    /// `reasoning_effort` is used, exactly as before. This flag never writes the config.
+    #[arg(long, value_parser = ["auto", "low", "medium", "high", "xhigh", "max"])]
+    pub(crate) effort: Option<String>,
 }
 
 #[derive(Parser, Debug)]

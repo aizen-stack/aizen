@@ -3509,7 +3509,7 @@ const NOTCHES: [usize; 7] = [0, 8, 16, 24, 31, 38, 48];
 /// Stop labels, left→right. Index is the value returned by [`effort_slider`]. The last stop,
 /// `ultimate`, is not merely a hotter tier — it's the mode toggle (max effort + orchestrate-by-default),
 /// folded onto the far end of the rail so one drag reaches it.
-const E_TIERS: [&str; 7] = ["auto", "low", "medium", "high", "xhigh", "max", "ultimate"];
+pub(crate) const E_TIERS: [&str; 7] = ["auto", "low", "medium", "high", "xhigh", "max", "ultimate"];
 /// One-line gist shown under the focused stop.
 const E_DESCS: [&str; 7] = [
     "detect per-turn from your wording — keyword + complexity",

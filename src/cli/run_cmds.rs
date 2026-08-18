@@ -11,7 +11,7 @@ use crate::cli_args::*;
 use crate::core::approval::ApprovalMode;
 use crate::core::endpoint::{http_client, resolve_base_key, resolve_endpoint};
 use crate::core::types::ToolDef;
-use crate::core::{cli_config, types};
+use crate::core::{cli_config, session_store, types};
 use crate::features::crawl;
 use crate::llm::client;
 use crate::memory;
@@ -331,6 +331,21 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
     let (base_url, api_key, model) = resolve_endpoint(args.base_url, args.api_key, args.model)?;
     let http = http_client()?;
 
+    // Armed before anything builds a request, and never cleared: a one-shot is one turn, and the
+    // process ends with it. `auto` runs the same classifier a typed REPL turn goes through, so the
+    // two surfaces answer "how hard should this be" the same way.
+    if let Some(want) = args.effort.as_deref() {
+        let tier = match want {
+            "auto" => crate::ui::effort_ui::resolve_turn_effort(args.task.trim()),
+            other => Some(other.to_string()),
+        };
+        eprintln!(
+            "{}",
+            crate::ui::effort_ui::effort_turn_line(tier.as_deref())
+        );
+        cli_config::set_effort_override(tier);
+    }
+
     // Session start: rebuild the always-on core for THIS project slug (STYLE + global prefs
     // only). Do not reuse a stale foreign-repo core.active — refresh_frozen_core is slug-aware.
     let frozen = memory::refresh_frozen_core();
@@ -401,7 +416,17 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         }
     };
 
-    let outcome = agent::run_agent(chat, &cfg, &registry, &system, args.task.trim()).await?;
+    // The transcript is built here rather than inside `run_agent` so this path can still hold it
+    // afterwards: the loop appends every turn — the final answer included — to the vector it is
+    // handed, and `run_agent` is exactly these two opening messages plus that call.
+    let mut history = vec![Message::system(&system), Message::user(args.task.trim())];
+    let result = agent::run_agent_loop(chat, &cfg, &registry, &mut history).await;
+    // Saved before the error is propagated. A run that ended badly still happened, and the REPL
+    // treats persistence as not optional — that promise should not be weaker off a terminal.
+    if args.save_session {
+        save_finished_session(&history, &model);
+    }
+    let outcome = result?;
     match outcome.stop {
         // The final answer was already streamed to stdout during the call.
         StopReason::Done => {}
@@ -438,6 +463,28 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
     Ok(())
 }
 
+/// Put a finished one-shot conversation into core's own session pool, and say where it went.
+///
+/// The stamp is `save_session`'s: project key, root and slug come from `config`, which resolves the
+/// repository this ran in — so a saved one-shot is filed exactly where the same conversation held
+/// in the REPL would have been, and `/sessions` reopens it with no idea which surface produced it.
+///
+/// The line goes to stderr because stdout is the agent's answer: a caller piping it wants the
+/// answer and nothing else.
+fn save_finished_session(history: &[Message], model: &str) {
+    // A run that never got a user turn onto the wire is not a conversation.
+    if !history.iter().any(|m| m.role == "user") {
+        return;
+    }
+    let slug = session_store::allocate_session_slug(history);
+    match session_store::save_session(history, &slug, Some(model)) {
+        Ok(path) => eprintln!("\n[saved as “{slug}” — {path}]"),
+        // Not fatal: the work is done and the answer is already printed. Saying so is the whole
+        // duty here — silence would leave the caller believing there is something to reopen.
+        Err(e) => eprintln!("\n[this session was NOT saved: {e:#}]"),
+    }
+}
+
 pub(crate) async fn run_workflow_cmd(args: WorkflowArgs) -> Result<()> {
     let text = std::fs::read_to_string(&args.spec)
         .with_context(|| format!("reading workflow spec {}", args.spec))?;
@@ -454,4 +501,77 @@ pub(crate) async fn run_workflow_cmd(args: WorkflowArgs) -> Result<()> {
         ApprovalMode::Ask
     };
     agent::workflow::run_workflow(&http, &base_url, &api_key, &model, approval, &spec, trace).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::session_store::{parse_session_bytes, sessions_dir, set_session_slug};
+
+    /// What `--save-session` is FOR: a one-shot run leaves a file the picker can reopen, stamped
+    /// with the project it ran in. The provenance is the point — a transcript on disk that cannot
+    /// say which repo it came from is what makes a per-project session list impossible.
+    #[test]
+    fn a_saved_one_shot_lands_in_the_pool_with_its_provenance() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-oneshot-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        set_session_slug(None);
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+
+        let history = vec![
+            Message::system("lane"),
+            Message::user("fix the delete button"),
+            Message::assistant("done"),
+        ];
+        save_finished_session(&history, "model-x");
+
+        let files: Vec<_> = std::fs::read_dir(sessions_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect();
+        assert_eq!(files.len(), 1, "one run, one file");
+        // Named from the task rather than a timestamp: the picker is read by a person.
+        let stem = files[0].file_stem().unwrap().to_string_lossy().into_owned();
+        assert!(
+            stem.contains("fix"),
+            "slug should come from the task: {stem}"
+        );
+
+        let (msgs, meta) = parse_session_bytes(&std::fs::read(&files[0]).unwrap())
+            .expect("a transcript we wrote ourselves must be readable");
+        assert_eq!(msgs.len(), 3);
+        let meta = meta.expect("a session written today carries meta");
+        assert_eq!(meta.model.as_deref(), Some("model-x"));
+        assert!(
+            meta.project_root.is_some_and(|r| !r.is_empty()),
+            "without a root, no front-end can tell whose session this is"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A run that never got a question onto the wire is not a conversation, and must not litter the
+    /// pool with an empty file the picker would then offer to restore.
+    #[test]
+    fn a_run_with_no_user_turn_writes_nothing() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-oneshot-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        set_session_slug(None);
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+
+        save_finished_session(&[Message::system("lane")], "model-x");
+
+        assert_eq!(std::fs::read_dir(sessions_dir()).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
