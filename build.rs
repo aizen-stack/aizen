@@ -66,6 +66,15 @@ fn main() {
         gen.push_str(&format!("pub static {ident}: &[u8] = &{cipher:?};\n"));
     }
 
-    fs::write(&dest, gen).expect("build.rs: write prompts_obf.rs");
+fs::write(&dest, gen).expect("build.rs: write prompts_obf.rs");
     println!("cargo:rerun-if-changed=build.rs");
+
+// Windows MSVC defaults the main thread to a 1 MiB stack. This crate's clap derive
+    // tree + tokio + first-touch statics overflow that budget before `main` can print
+    // --version or run `sandbox doctor` (STATUS_STACK_OVERFLOW 0xC00000FD) in debug.
+    // Bump the PE stack reserve so CI probes and local `cargo run` survive. Use the
+    // target cfg (not host `cfg(windows)`) so cross-builds stay correct.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-arg=/STACK:16777216");
+    }
 }
