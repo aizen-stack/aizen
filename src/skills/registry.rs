@@ -58,6 +58,9 @@ struct SearchResponse {
     data: Vec<RegistrySkill>,
     #[serde(default)]
     total: usize,
+    /// Whether another page exists — the browse fallback stops rather than asking past the end.
+    #[serde(default, rename = "hasMore")]
+    has_more: bool,
 }
 
 /// The by-slug record, from the route that serves one named skill. It carries the markdown itself
@@ -130,7 +133,92 @@ pub fn registry_base() -> String {
 }
 
 /// Search the registry by keyword. `limit` caps results. SSRF-guarded (see the module doc).
+///
+/// The keyword index is asked first and, when it fails, is not the last word: the catalogue is
+/// still served page by page, and matching the query against those pages here finds the same rows
+/// the index would have. Slower, and only on the failing path — but a registry whose search is
+/// down is not a registry with no skills on it, and for a day of HTTP 500s that is exactly how
+/// this read to everyone using it.
 pub async fn search(query: &str, limit: usize) -> Result<Vec<RegistrySkill>> {
+    let indexed = match search_index(query, limit).await {
+        Ok(hits) => return Ok(hits),
+        Err(e) => e,
+    };
+    // Nothing found by hand does not disprove the index — say what actually went wrong instead of
+    // reporting an empty catalogue.
+    match browse_match(query, limit).await {
+        Ok(hits) if !hits.is_empty() => Ok(hits),
+        _ => Err(indexed),
+    }
+}
+
+/// Every word of the query has to appear somewhere in what the row says about itself — the way a
+/// person reading down the catalogue would match it.
+fn matches(sk: &RegistrySkill, words: &[String]) -> bool {
+    let hay = format!("{} {} {}", sk.id(), sk.name, sk.description).to_lowercase();
+    words.iter().all(|w| hay.contains(w.as_str()))
+}
+
+/// How far down the catalogue the fallback is willing to read. Bounded on purpose: this runs only
+/// when the index is down, and a search that quietly turns into hundreds of requests is its own
+/// kind of outage.
+const BROWSE_PAGES: usize = 12;
+const BROWSE_PAGE_SIZE: usize = 100;
+
+/// Page the listing route and filter locally. Stops at the first full page of results, at the end
+/// of the catalogue, or at `BROWSE_PAGES` — whichever comes first.
+async fn browse_match(query: &str, limit: usize) -> Result<Vec<RegistrySkill>> {
+    let words: Vec<String> = query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let base = registry_base();
+    let client = crate::agent::reach::http::client()?;
+    let mut out: Vec<RegistrySkill> = Vec::new();
+    for page in 1..=BROWSE_PAGES {
+        let url = reqwest::Url::parse_with_params(
+            &format!("{}/api/skills", base.trim_end_matches('/')),
+            &[
+                ("limit", BROWSE_PAGE_SIZE.to_string()),
+                ("page", page.to_string()),
+            ],
+        )
+        .with_context(|| format!("bad registry base '{base}'"))?;
+        crate::core::net_guard::guard_url_async(url.as_str()).await?;
+        let f = crate::agent::reach::http::get(&client, url.as_str(), &[])
+            .await
+            .with_context(|| format!("reading the catalogue on {base}"))?;
+        if !f.is_success() {
+            break;
+        }
+        let Ok(parsed) = serde_json::from_slice::<SearchResponse>(&f.body) else {
+            break;
+        };
+        if parsed.data.is_empty() {
+            break;
+        }
+        let more = parsed.has_more;
+        for sk in parsed.data {
+            if matches(&sk, &words) && !out.iter().any(|o| o.id() == sk.id()) {
+                out.push(sk);
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+        }
+        if !more {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Ask the registry's own keyword index.
+async fn search_index(query: &str, limit: usize) -> Result<Vec<RegistrySkill>> {
     let base = registry_base();
     let url = reqwest::Url::parse_with_params(
         &format!("{}/api/skills", base.trim_end_matches('/')),
@@ -223,13 +311,8 @@ fn save_body(fallback: &str, body_md: &str) -> Result<crate::skills::Skill> {
 pub async fn install(query: &str) -> Result<crate::skills::Skill> {
     let q = query.trim();
     if q.contains('/') {
-        if let Some(direct) = by_slug(q).await? {
-            let fallback = if direct.name.trim().is_empty() {
-                q.rsplit('/').next().unwrap_or(q)
-            } else {
-                direct.name.trim()
-            };
-            return save_body(fallback, &direct.skill_md);
+        if let Some(saved) = install_by_slug(q, q).await? {
+            return Ok(saved);
         }
     }
 
@@ -243,8 +326,36 @@ pub async fn install(query: &str) -> Result<crate::skills::Skill> {
         .find(|s| s.id().to_lowercase() == want || s.name.to_lowercase() == want)
         .unwrap_or(&hits[0])
         .clone();
+
+    // The registry's own copy before GitHub's. Its stored coordinates are a snapshot of where the
+    // file was, and repositories move: `bytedance/frontend-design` is listed at a path that now
+    // answers 404, while the registry still serves the same skill by slug. Falling at that fence
+    // would fail an install for a reason that has nothing to do with the skill.
+    if let Some(saved) = install_by_slug(&chosen.id(), &chosen.name).await? {
+        return Ok(saved);
+    }
     let body_md = fetch_body(&chosen).await?;
     save_body(&chosen.name, &body_md)
+}
+
+/// Fetch `slug` from the registry's by-slug route and save it. `Ok(None)` when that route has
+/// nothing for this slug, which leaves the caller free to try GitHub.
+async fn install_by_slug(slug: &str, name_hint: &str) -> Result<Option<crate::skills::Skill>> {
+    let Some(direct) = by_slug(slug).await? else {
+        return Ok(None);
+    };
+    let fallback = [direct.name.trim(), name_hint.trim()]
+        .into_iter()
+        .find(|n| !n.is_empty())
+        .unwrap_or(slug)
+        .to_string();
+    // A bare `owner/` is not a name to save a file under.
+    let fallback = fallback
+        .rsplit('/')
+        .find(|p| !p.is_empty())
+        .unwrap_or(slug)
+        .to_string();
+    save_body(&fallback, &direct.skill_md).map(Some)
 }
 
 /// Bridge an async future to the sync `Tool::execute` path — the shared cancel-aware bridge
@@ -411,6 +522,49 @@ mod tests {
                 .as_str(),
             "https://agentskill.sh/api/agent/skills/..%2F..%2Fetc/install"
         );
+    }
+
+    /// The fallback matches on what a row says about itself, and only on all of the words —
+    /// otherwise a two-word query returns everything that shares its commonest half.
+    #[test]
+    fn the_browse_fallback_matches_every_word_or_none() {
+        let mut sk = RegistrySkill {
+            name: "frontend-design".into(),
+            slug: "bytedance/frontend-design".into(),
+            description: "Create distinctive, production-grade interfaces".into(),
+            ..Default::default()
+        };
+        let words =
+            |q: &str| -> Vec<String> { q.split_whitespace().map(str::to_lowercase).collect() };
+        assert!(matches(&sk, &words("frontend")));
+        assert!(
+            matches(&sk, &words("FRONTEND")),
+            "case is not a distinction"
+        );
+        assert!(matches(&sk, &words("frontend interfaces")));
+        assert!(
+            matches(&sk, &words("bytedance")),
+            "the owner is part of the row"
+        );
+        assert!(
+            !matches(&sk, &words("frontend rust")),
+            "both words or neither"
+        );
+        assert!(!matches(&sk, &words("kubernetes")));
+        // A row that says nothing about itself matches nothing but its own name.
+        sk.description = String::new();
+        assert!(!matches(&sk, &words("interfaces")));
+    }
+
+    /// The listing's paging flag is read, so the fallback stops at the end of the catalogue rather
+    /// than asking twelve times for a page that is not there.
+    #[test]
+    fn the_listing_says_whether_another_page_exists() {
+        let body = r#"{"data":[],"total":4,"page":2,"limit":100,"hasMore":true}"#;
+        let r: SearchResponse = serde_json::from_str(body).unwrap();
+        assert!(r.has_more);
+        let last: SearchResponse = serde_json::from_str(r#"{"data":[]}"#).unwrap();
+        assert!(!last.has_more, "a response that omits it has no more pages");
     }
 
     /// The by-slug record is the whole install: markdown in hand, no GitHub round trip.
