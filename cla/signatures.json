@@ -1,3 +1,12 @@
 {
-   "signedContributors": []
+  "signedContributors": [
+    {
+      "name": "sarahglassseeen",
+      "id": 146701673,
+      "comment_id": 5329908838,
+      "created_at": "2026-08-18T14:51:06Z",
+      "repoId": 1289932122,
+      "pullRequestNo": 13
+    }
+  ]
 }
