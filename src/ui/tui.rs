@@ -2027,7 +2027,7 @@ fn input_loop(
         // only `Press` (otherwise every key fires twice). With mouse capture on (retained): wheel
         // scrolls the transcript; left-drag selects text (copy-on-release via arboard); the right
         // gutter scrollbar is draggable. Shift+Enter inserts a literal newline into the draft.
-let key = loop {
+        let key = loop {
             // Poll (not a bare blocking read) so the idle clock is checked on a ~1s cadence: after
             // IDLE_SCREENSAVER_SECS of no input — and only when quiescent (retained, not working, no
             // menu/overlay/approval up) — the render thread blits one static card. A busy turn or an
@@ -2085,7 +2085,7 @@ let key = loop {
             // down and SWALLOW this event so the wake keystroke never also edits the draft (mirrors the
             // RETAINED_INFO_OVERLAY key-swallow below).
             last_activity = Instant::now();
-if screensaver_up {
+            if screensaver_up {
                 retained::screensaver(None);
                 screensaver_up = false;
                 continue;
@@ -2185,7 +2185,7 @@ if screensaver_up {
                         // A turn IS running: the highlight is gone, but this Esc still has to reach
                         // the cancel arm below, so don't consume it.
                     }
-match crossterm_to_console_key(ke) {
+                    match crossterm_to_console_key(ke) {
                         Some(k) => break k,
                         None => continue,
                     }
@@ -2242,7 +2242,7 @@ match crossterm_to_console_key(ke) {
                 .map(|t| now.duration_since(t) < Duration::from_millis(PASTE_COALESCE_MS))
                 .unwrap_or(false)
         };
-// Repaint throttle: during a paste burst, skip per-char repaint. Without this, pasting 500
+        // Repaint throttle: during a paste burst, skip per-char repaint. Without this, pasting 500
         // chars queues 500 retained::update_input calls → visible char-by-char lag. The final
         // repaint is flushed on the first idle poll after the burst (pending_paste_repaint), not on
         // the next keystroke — so the full paste appears without needing a space/arrow press.
@@ -2325,17 +2325,14 @@ match crossterm_to_console_key(ke) {
             }
             continue;
         }
-// What a keystroke does to a live input-box highlight, decided in ONE place rather than in each
+        // What a keystroke does to a live input-box highlight, decided in ONE place rather than in each
         // arm below: typing replaces it, Backspace/Del removes it, and anything else merely drops it.
         // That is what every editor does, and a highlight the next keystroke ignored would be a lie —
         // the user would type expecting a replacement and get an insertion beside the still-highlighted
         // text. Ctrl-C keeps the highlight (copy). Ctrl-V also keeps it so paste can replace the
         // selection the way every editor does (`insert_draft_text` drains it).
         if draft_selection().is_some()
-            && !matches!(
-                key,
-                Key::CtrlC | Key::Char('\u{3}') | Key::Char('\u{16}')
-            )
+            && !matches!(key, Key::CtrlC | Key::Char('\u{3}') | Key::Char('\u{16}'))
         {
             match key {
                 Key::Backspace | Key::Del => {
@@ -2602,7 +2599,7 @@ match crossterm_to_console_key(ke) {
                     drop(r);
                     hist_idx = None;
                     repaint();
-}
+                }
             }
             Key::Char('\u{16}') => {
                 // Ctrl-V: paste clipboard TEXT into the draft. Required on classic conhost/CMD
