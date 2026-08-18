@@ -49,6 +49,16 @@ development log lives in that monorepo's history.
   flag keeps the old behaviour exactly — the configured `reasoning_effort` applies and the request
   stays byte-identical to one from a core that never had the flag. The tier is named on stderr.
 
+### Fixed
+- **`/effort`'s top stop did the opposite of its label.** The rail draws seven stops and `ultimate`
+  is the seventh, but `apply_effort_choice` only handled `1..=5`; index 6 fell through to the
+  catch-all, so dragging all the way right and pressing Enter turned auto-detect **on** and cleared
+  the pin — never setting `ultimate` at all. `effort_slider_start` could not return 6 either, so
+  the slider could not open on the mode even once it was on. Both fixed, and every branch now
+  writes `ultimate`: sliding down off the top stop has to turn the mode off, or the rung just
+  chosen is silently overruled each turn by a flag nothing cleared. The input box is recoloured on
+  commit, exactly as `/ultimate` does it.
+
 ## [0.6.5] — 2026-08-17
 
 An OS-level sandbox underneath the approval layer, and an honest per-platform account of what it
