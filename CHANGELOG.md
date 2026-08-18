@@ -186,6 +186,15 @@ post-turn spinner, and a working pill that could wedge after a stream error.
   ids, or `working` for the live tree.
 
 ### Fixed
+- **Pasted prompt text now appears immediately in the TUI input box.** Paste-burst throttling
+  skipped per-char repaints but never flushed when the burst ended (`paste_just_ended` was
+  computed and discarded), so short or long pastes stayed invisible until the next keypress
+  (often Space). The deferred draft is now flushed on the first idle poll after the burst, and
+  terminals that support it get bracketed paste (`Event::Paste`) with a single insert + repaint.
+- **CMD / classic conhost can paste into the TUI input box.** Mouse capture (needed for wheel +
+  selection) steals conhost's Quick-Edit right-click paste, and those hosts neither bracketed-paste
+  nor always inject a key burst for Ctrl-V. The input box now pastes OS clipboard text on
+  **Ctrl-V**, **Shift+Insert**, and **right-click**.
 - **Vietnamese (Telex/VNI) input no longer hides composed characters.** The IME commits `á` as
   `Backspace` + the composed char within ~50 ms, which the paste-burst detector read as a paste
   and skipped the repaint for — the char only appeared at the next keystroke. Backspace/Del now

@@ -321,9 +321,19 @@ pub fn workspace_too_broad(workspace: &Path) -> bool {
     }
     #[cfg(unix)]
     {
+        // Compare against the CANONICAL form of each system dir. macOS (and some
+        // BSDs) resolve `/etc` → `/private/etc`, `/var` → `/private/var`, so a bare
+        // `Path::new("/etc")` never equals a canonicalized workspace and the broad
+        // check silently misses the paths the test (and real mounts) hand us.
         for sys in ["/usr", "/etc", "/bin", "/var", "/home"] {
-            if canon == Path::new(sys) {
+            let sys_path = Path::new(sys);
+            if canon == sys_path {
                 return true;
+            }
+            if let Ok(sys_canon) = sys_path.canonicalize() {
+                if canon == sys_canon {
+                    return true;
+                }
             }
         }
     }
