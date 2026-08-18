@@ -319,7 +319,7 @@ pub fn workspace_too_broad(workspace: &Path) -> bool {
             }
         }
     }
-#[cfg(unix)]
+    #[cfg(unix)]
     {
         // Compare against the CANONICAL form of each system dir. macOS (and some
         // BSDs) resolve `/etc` → `/private/etc`, `/var` → `/private/var`, so a bare
