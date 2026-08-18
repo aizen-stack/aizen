@@ -8,6 +8,9 @@ name: cla
 # A contributor agrees by commenting the exact sentence on their PR:
 #     I have read the CLA Document and I hereby sign the CLA
 #
+# PREREQUISITE: the `cla-signatures` branch must exist and must NOT be protected. The action writes
+# the ledger there but never creates the branch — see the preflight step below for what breaks.
+#
 # This replaced the DCO sign-off check: the CLA covers authorship certification AND the broader
 # relicensing grant in CLA.md §3, so asking for both would put contributors through two gates for
 # overlapping reasons. The allowlist holds bots and the maintainer only — human contributors are not
@@ -34,6 +37,22 @@ jobs:
          contains(github.event.comment.body, 'recheck'))) ||
       github.event_name == 'pull_request_target'
     steps:
+      # The action stores signatures on `cla-signatures` but cannot create that branch: its
+      # persistence layer calls `repos.createOrUpdateFileContents({branch: 'cla-signatures'})`, which
+      # 404s when the branch is absent. It swallows that error, then ends the run with
+      # "Committers of pull request N have to sign the CLA" — blaming the contributor for a repo
+      # misconfiguration, on every PR, no matter who signed. Fail first, and say what is really wrong.
+      - name: Signature storage branch must exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/branches/cla-signatures" >/dev/null 2>&1; then
+            echo "cla-signatures is present."
+            exit 0
+          fi
+          echo "::error::Branch 'cla-signatures' is missing from ${GITHUB_REPOSITORY}. The CLA bot stores signatures there and cannot create it itself, so this check fails for everyone regardless of who signed. Recreate it as an orphan branch containing cla/signatures.json with {\"signedContributors\": []}, and leave it unprotected."
+          exit 1
+
       - name: CLA assistant
         uses: contributor-assistant/github-action@v2.6.1
         env:
