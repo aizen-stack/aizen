@@ -26,7 +26,15 @@ impl TerminalSession {
         let mut stdout = io::stdout();
         // EnableMouseCapture: the terminal reports wheel/click/drag as crossterm mouse events
         // instead of leaking the wheel through as ↑/↓ keys (Windows Terminal "alternateScroll").
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)?;
+        // EnableBracketedPaste: terminals that support it deliver a paste as one Event::Paste
+        // instead of a burst of key events — one insert, one repaint, no coalesce lag.
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            Hide
+        )?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
@@ -39,6 +47,7 @@ impl Drop for TerminalSession {
         let _ = self.terminal.show_cursor();
         let _ = execute!(
             io::stdout(),
+            DisableBracketedPaste,
             DisableMouseCapture,
             Show,
             LeaveAlternateScreen
@@ -65,11 +74,12 @@ pub(crate) fn is_active() -> bool {
 pub(crate) fn emergency_restore() {
     ACTIVE.store(false, Ordering::Relaxed);
     // `\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l` disable mouse reporting (all modes
-    // EnableMouseCapture turns on) · `\x1b[?25h` show cursor · `\x1b[?1049l` leave alternate screen.
-    // Written unconditionally — a terminal not in a given mode just ignores the corresponding reset.
+    // EnableMouseCapture turns on) · `\x1b[?2004l` disable bracketed paste · `\x1b[?25h` show
+    // cursor · `\x1b[?1049l` leave alternate screen. Written unconditionally — a terminal not in a
+    // given mode just ignores the corresponding reset.
     let _ = write!(
         io::stdout(),
-        "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[?1049l"
+        "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[?1049l"
     );
     let _ = io::stdout().flush();
 }

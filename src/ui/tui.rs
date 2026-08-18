@@ -1805,6 +1805,51 @@ fn copy_to_os_clipboard(_text: &str) -> bool {
     false
 }
 
+/// Read plain text from the OS clipboard (for Ctrl-V / right-click / Shift+Insert paste).
+///
+/// Normalizes CRLF → LF so a Windows copy lands as the same newlines Shift+Enter would type.
+/// `None` when the clipboard is empty, holds non-text, or this platform has no clipboard crate.
+#[cfg(any(windows, target_os = "macos"))]
+fn clipboard_text() -> Option<String> {
+    let mut cb = arboard::Clipboard::new().ok()?;
+    let text = cb.get_text().ok()?;
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+#[cfg(not(any(windows, target_os = "macos")))]
+fn clipboard_text() -> Option<String> {
+    None
+}
+
+/// Insert `text` at the draft caret, replacing any live highlight (editor paste semantics).
+fn insert_draft_text(text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    delete_draft_selection();
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut r = render().lock().unwrap();
+    let cur = r.cursor.min(r.draft.len());
+    r.draft.splice(cur..cur, chars);
+    r.cursor = cur + n;
+    r.palette_sel = 0;
+    r.at_sel = 0;
+}
+
+/// Paste OS clipboard text into the draft. Returns whether anything was inserted.
+fn paste_clipboard_into_draft() -> bool {
+    let Some(text) = clipboard_text() else {
+        return false;
+    };
+    insert_draft_text(&text);
+    true
+}
+
 /// Confirm (or honestly deny) a copy with one dim transcript line.
 ///
 /// Routed through `note_line`, never `eprintln!`: a raw write behind the render thread's back lands
@@ -1915,6 +1960,9 @@ fn input_loop(
     let mut last_arrival: Option<Instant> = None;
     // Arrival time TWO keys ago, for detecting paste burst end (when prev was buffered but current is not).
     let mut last_arrival_prev: Option<Instant> = None;
+    // Draft was edited during a paste burst without a repaint. Flushed on the first idle poll after
+    // the burst ends (see short timeout below) so the full paste appears without needing another key.
+    let mut pending_paste_repaint = false;
     // Phase 3 mouse drag state (retained only). `selecting` tracks left-drag text selection;
     // `dragging_scrollbar` tracks thumb drag on the right gutter. Cleared on mouse-up / Esc.
     let mut selecting: Option<retained::SelectionRange> = None;
@@ -1979,12 +2027,21 @@ fn input_loop(
         // only `Press` (otherwise every key fires twice). With mouse capture on (retained): wheel
         // scrolls the transcript; left-drag selects text (copy-on-release via arboard); the right
         // gutter scrollbar is draggable. Shift+Enter inserts a literal newline into the draft.
-        let key = loop {
+let key = loop {
             // Poll (not a bare blocking read) so the idle clock is checked on a ~1s cadence: after
             // IDLE_SCREENSAVER_SECS of no input — and only when quiescent (retained, not working, no
             // menu/overlay/approval up) — the render thread blits one static card. A busy turn or an
             // open menu never triggers it. When there IS input the read below returns immediately.
-            let have_event = match event::poll(Duration::from_millis(1000)) {
+            //
+            // While a paste burst skipped per-char repaints, poll on the coalesce window instead of
+            // 1s: the first idle tick after the burst flushes one repaint so the full paste shows
+            // without the user having to type another key (space, arrow, …).
+            let poll_ms = if pending_paste_repaint {
+                PASTE_COALESCE_MS
+            } else {
+                1000
+            };
+            let have_event = match event::poll(Duration::from_millis(poll_ms)) {
                 Ok(v) => v,
                 Err(_) => {
                     let _ = sub_tx.send(Submission::Quit);
@@ -1992,6 +2049,10 @@ fn input_loop(
                 }
             };
             if !have_event {
+                if pending_paste_repaint {
+                    pending_paste_repaint = false;
+                    repaint();
+                }
                 if !screensaver_up
                     && retained::is_active()
                     // Same sixel gate as the startup card above. Without it this path fires every
@@ -2024,13 +2085,39 @@ fn input_loop(
             // down and SWALLOW this event so the wake keystroke never also edits the draft (mirrors the
             // RETAINED_INFO_OVERLAY key-swallow below).
             last_activity = Instant::now();
-            if screensaver_up {
+if screensaver_up {
                 retained::screensaver(None);
                 screensaver_up = false;
                 continue;
             }
+            // Bracketed paste (when the terminal supports it): one event, whole string, one repaint.
+            // Falls through to the key-burst / clipboard path below on hosts that still synthesize
+            // pastes as key events or offer no paste channel at all (classic conhost/CMD).
+            if let Event::Paste(text) = ev {
+                if !text.is_empty() {
+                    insert_draft_text(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                    hist_idx = None;
+                    last_arrival = None;
+                    last_arrival_prev = None;
+                    pending_paste_repaint = false;
+                    repaint();
+                }
+                continue;
+            }
             match ev {
                 Event::Key(ke) if ke.kind == KeyEventKind::Press => {
+                    // Shift+Insert = paste (classic Windows / terminal convention). Handled here
+                    // because `crossterm_to_console_key` drops the Shift bit on Insert.
+                    if ke.code == KeyCode::Insert && ke.modifiers.contains(KeyModifiers::SHIFT) {
+                        if paste_clipboard_into_draft() {
+                            hist_idx = None;
+                            last_arrival = None;
+                            last_arrival_prev = None;
+                            pending_paste_repaint = false;
+                            repaint();
+                        }
+                        continue;
+                    }
                     if ke.code == KeyCode::Enter && ke.modifiers.contains(KeyModifiers::SHIFT) {
                         // Reached before the central selection rule below, so apply it here: a newline
                         // typed over a highlight replaces it, like any other inserted char.
@@ -2098,12 +2185,26 @@ fn input_loop(
                         // A turn IS running: the highlight is gone, but this Esc still has to reach
                         // the cancel arm below, so don't consume it.
                     }
-                    match crossterm_to_console_key(ke) {
+match crossterm_to_console_key(ke) {
                         Some(k) => break k,
                         None => continue,
                     }
                 }
                 Event::Mouse(me) if retained::is_active() => {
+                    use crossterm::event::{MouseButton, MouseEventKind};
+                    // Right-click paste. conhost/CMD's own Quick-Edit paste never reaches us once
+                    // mouse capture is on (we need capture for wheel + selection), so the app has
+                    // to own the gesture. Down only — Up would double-insert the same clipboard.
+                    if matches!(me.kind, MouseEventKind::Down(MouseButton::Right)) {
+                        if paste_clipboard_into_draft() {
+                            hist_idx = None;
+                            last_arrival = None;
+                            last_arrival_prev = None;
+                            pending_paste_repaint = false;
+                            repaint();
+                        }
+                        continue;
+                    }
                     handle_retained_mouse(
                         me.kind,
                         me.column,
@@ -2114,7 +2215,7 @@ fn input_loop(
                     );
                     continue;
                 }
-                // Release/Repeat key records, other mouse, resize, focus, paste → not actioned here.
+                // Release/Repeat key records, other mouse, resize, focus → not actioned here.
                 _ => continue,
             }
         };
@@ -2141,10 +2242,10 @@ fn input_loop(
                 .map(|t| now.duration_since(t) < Duration::from_millis(PASTE_COALESCE_MS))
                 .unwrap_or(false)
         };
-        // Repaint throttle: during a paste burst, skip per-char repaint. Only redraw when the burst
-        // ends (first event that is NOT buffered after a buffered one). Without this, pasting 500 chars
-        // queues 500 retained::update_input calls → visible char-by-char lag. With it: one final repaint
-        // shows the complete pasted text instantly once the burst settles.
+// Repaint throttle: during a paste burst, skip per-char repaint. Without this, pasting 500
+        // chars queues 500 retained::update_input calls → visible char-by-char lag. The final
+        // repaint is flushed on the first idle poll after the burst (pending_paste_repaint), not on
+        // the next keystroke — so the full paste appears without needing a space/arrow press.
         let prev_buffered = last_arrival
             .and_then(|t| {
                 last_arrival_prev
@@ -2155,10 +2256,16 @@ fn input_loop(
         // Reset the timestamp chain after Backspace/Del so the next char (IME-committed) is not
         // mistaken for part of a burst.
         last_arrival = if is_ime_edit { None } else { Some(now) };
-        // in_paste_burst: we are mid-burst → skip repaint this keystroke.
-        // paste_just_ended: first keystroke outside the burst → repaint once to flush.
+        // in_paste_burst: we are mid-burst → skip repaint this keystroke and mark a deferred flush.
         let in_paste_burst = buffered && prev_buffered;
-        let _paste_just_ended = !buffered && prev_buffered;
+        if in_paste_burst {
+            pending_paste_repaint = true;
+        } else if pending_paste_repaint {
+            // First keystroke after the burst (or a non-burst edit): flush now so the deferred
+            // draft is on screen before this keystroke's own edit is applied + repainted.
+            pending_paste_repaint = false;
+            repaint();
+        }
         // If the agent is awaiting a per-action approval, THIS keystroke is the answer — route a
         // y/n/a decision to the blocked gate and never treat it as draft input. Other keys are
         // ignored so a stray press can't accidentally approve.
@@ -2218,12 +2325,18 @@ fn input_loop(
             }
             continue;
         }
-        // What a keystroke does to a live input-box highlight, decided in ONE place rather than in each
+// What a keystroke does to a live input-box highlight, decided in ONE place rather than in each
         // arm below: typing replaces it, Backspace/Del removes it, and anything else merely drops it.
         // That is what every editor does, and a highlight the next keystroke ignored would be a lie —
         // the user would type expecting a replacement and get an insertion beside the still-highlighted
-        // text. Ctrl-C is the exception because copying the highlight is that key's whole job here.
-        if draft_selection().is_some() && !matches!(key, Key::CtrlC | Key::Char('\u{3}')) {
+        // text. Ctrl-C keeps the highlight (copy). Ctrl-V also keeps it so paste can replace the
+        // selection the way every editor does (`insert_draft_text` drains it).
+        if draft_selection().is_some()
+            && !matches!(
+                key,
+                Key::CtrlC | Key::Char('\u{3}') | Key::Char('\u{16}')
+            )
+        {
             match key {
                 Key::Backspace | Key::Del => {
                     delete_draft_selection();
@@ -2488,6 +2601,21 @@ fn input_loop(
                     r.palette_sel = 0;
                     drop(r);
                     hist_idx = None;
+                    repaint();
+}
+            }
+            Key::Char('\u{16}') => {
+                // Ctrl-V: paste clipboard TEXT into the draft. Required on classic conhost/CMD
+                // (and any host that neither bracketed-pastes nor injects a key burst): mouse
+                // capture steals the terminal's right-click paste, and Ctrl-V arrives here as a
+                // control char rather than as characters. Images stay on Ctrl-O so a screenshot
+                // on the clipboard doesn't silently become a vision attach when the user meant
+                // to paste prose.
+                if paste_clipboard_into_draft() {
+                    hist_idx = None;
+                    last_arrival = None;
+                    last_arrival_prev = None;
+                    pending_paste_repaint = false;
                     repaint();
                 }
             }
