@@ -389,6 +389,12 @@ pub(crate) fn show_clarify(display: &str) {
             tui::emit_line(o);
         }
         tui::emit_line(&hint);
+        // Suggested options → raise the picker over the input box (↑↓/click + Enter submits the
+        // choice as the next user message). The numbered list above STAYS in the transcript: the
+        // menu is dismissible (Esc / just start typing), and the options must survive its dismissal
+        // for the free-text path. No-ops when there are no options to offer.
+        let (q, options) = crate::agent::clarify::parse_display(display);
+        tui::question_menu_open(q, &options);
     } else {
         println!("{head}");
         for o in &opts {

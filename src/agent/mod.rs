@@ -4789,11 +4789,18 @@ fn approve(tool: &str, args: &serde_json::Value, cfg: &AgentConfig) -> bool {
     // until it presses [y]es / [n]o / [a]llow-all-session. (Destructive tools force the serial path,
     // so we're on a tokio worker where block_in_place is valid — same invariant as the telegram bridge.)
     if crate::ui::tui::active() {
+        // Under the retained backend `ask_approval` raises a menu that carries the choices, so the
+        // transcript line only needs the question; keep the key legend for the fallback where no
+        // menu can be painted and y/n/a on the keyboard is the whole interface.
+        let hint = if crate::ui::tui::retained_running() {
+            "— approve?"
+        } else {
+            "— approve? [y]es · [n]o · [a]llow all this session"
+        };
         let prompt = format!(
             "{}  {}",
             tool_call_line(tool, args),
-            style("— approve? [y]es · [n]o · [a]llow all this session")
-                .color256(crate::ui::theme::WARN)
+            style(hint).color256(crate::ui::theme::WARN)
         );
         return tokio::task::block_in_place(|| crate::ui::tui::ask_approval(&prompt));
     }
