@@ -3141,6 +3141,11 @@ impl Tool for ShellRun {
     fn workspace_effect(&self, _args: &Value) -> WorkspaceEffect {
         WorkspaceEffect::OpaqueWorkspace
     }
+    fn command_to_guard(&self, args: &Value) -> Option<String> {
+        args.get("command")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
     fn execute(&self, args: &Value) -> Result<String> {
         let command = str_arg(args, "command")?;
         let dir = match args.get("cwd").and_then(|v| v.as_str()) {
@@ -3299,15 +3304,56 @@ impl Tool for ShellRun {
 /// filenames are not valid UTF-8 → `read_to_string` would silently drop the ENTIRE output and the
 /// agent would see a blank result. Lossy decoding keeps the ASCII structure (paths, sizes, the
 /// listing layout) and only the odd accented byte degrades to `�`.
+///
+/// BOUNDED IN RAM, not just in the transcript: the old `read_to_end` buffered the child's whole
+/// output before `truncate_result` ever saw it, so one `cat`ed multi-gigabyte file OOMed the CLI
+/// (the `process` tool ring-buffers at ingest; this path forgot to). Head + tail are kept —
+/// build/test logs put the verdict at the end — with a marker naming what fell out.
 pub(crate) fn drain<R: std::io::Read>(pipe: Option<R>) -> String {
-    match pipe {
-        Some(mut p) => {
-            let mut bytes = Vec::new();
-            let _ = p.read_to_end(&mut bytes);
-            String::from_utf8_lossy(&bytes).into_owned()
+    /// First bytes kept verbatim (the command header, the first error).
+    const HEAD: usize = 1 << 20; // 1 MB
+    /// Last bytes kept verbatim (the exit summary, the failing test names).
+    const TAIL: usize = 1 << 20; // 1 MB
+    let Some(mut p) = pipe else {
+        return String::new();
+    };
+    let mut head: Vec<u8> = Vec::new();
+    let mut tail: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+    let mut dropped: usize = 0;
+    let mut buf = [0u8; 8192];
+    loop {
+        match p.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let mut chunk = &buf[..n];
+                if head.len() < HEAD {
+                    let take = (HEAD - head.len()).min(chunk.len());
+                    head.extend_from_slice(&chunk[..take]);
+                    chunk = &chunk[take..];
+                }
+                if !chunk.is_empty() {
+                    tail.extend(chunk.iter().copied());
+                    if tail.len() > TAIL {
+                        let excess = tail.len() - TAIL;
+                        tail.drain(..excess);
+                        dropped += excess;
+                    }
+                }
+            }
         }
-        None => String::new(),
     }
+    let mut out = String::from_utf8_lossy(&head).into_owned();
+    if dropped > 0 {
+        out.push_str(&format!(
+            "\n… [{dropped} bytes omitted — output exceeded the in-memory cap; first and last \
+             1 MB kept] …\n"
+        ));
+    }
+    if !tail.is_empty() {
+        let tail_bytes: Vec<u8> = tail.into();
+        out.push_str(&String::from_utf8_lossy(&tail_bytes));
+    }
+    out
 }
 
 // ── skill_load ───────────────────────────────────────────────────────────────
@@ -3652,7 +3698,9 @@ mod tests {
              description or gate a tool rather than raising the ceiling.\n{}",
             dump()
         );
-        if let Some((name, whole)) = rows.first() {
+        // EVERY row, not just the largest: three tools at 1,399 B each used to pass unnoticed
+        // while the ratchet only policed the single worst offender.
+        for (name, whole) in &rows {
             assert!(
                 *whole <= PER_TOOL_CEILING,
                 "tool `{name}` is {whole} B (per-tool ceiling {PER_TOOL_CEILING}) — its \
@@ -3719,12 +3767,14 @@ mod tests {
             "top-level tool schema {total} B exceeds {TOTAL_CEILING} B:\n{}",
             dump()
         );
-        assert!(
-            rows.first()
-                .is_none_or(|(_, bytes)| *bytes <= PER_TOOL_CEILING),
-            "one top-level tool exceeds {PER_TOOL_CEILING} B:\n{}",
-            dump()
-        );
+        // Every row (not just the largest) — same reason as the core ratchet above.
+        for (name, bytes) in &rows {
+            assert!(
+                *bytes <= PER_TOOL_CEILING,
+                "top-level tool `{name}` is {bytes} B (ceiling {PER_TOOL_CEILING}):\n{}",
+                dump()
+            );
+        }
     }
 
     #[test]

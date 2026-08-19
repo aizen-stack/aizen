@@ -48,6 +48,9 @@ pub(crate) fn classify_health_probe(
         Err(e) => match client::classify_api_error(&e) {
             client::ApiErrorKind::Permanent => tui::HealthKind::Down,
             client::ApiErrorKind::Transient => tui::HealthKind::Unstable,
+            // A probe request can't overflow a context window, but the arm must exist; a 413
+            // from a health probe says the endpoint is reachable and objecting — yellow, not red.
+            client::ApiErrorKind::ContextOverflow => tui::HealthKind::Unstable,
         },
     }
 }

@@ -20,7 +20,7 @@
 
 use crate::agent::builtin::{agent_registry, role_registry};
 use crate::agent::task_tool::{build_agent_subagent_prompt, build_subagent_prompt};
-use crate::agent::{run_agent, AgentConfig, StopReason};
+use crate::agent::{run_agent_loop, AgentConfig, StopReason};
 use crate::core::types::{Message, ToolDef};
 use crate::llm::client::{chat_with_tools, stream_chat_with_visual_contract};
 use anyhow::{anyhow, bail, Context, Result};
@@ -192,17 +192,25 @@ async fn run_workflow_with_cancel(
         );
     }
 
-    if results.iter().any(|r| r.status == "cancelled") {
+    // Only the PARENT token ends the whole workflow. A cancelled CHILD (`/workflows stop #id`)
+    // is a per-task outcome: the stop surface promises "siblings keep running", and honoring
+    // that means keeping their finished results too — bailing here used to discard every
+    // sibling's completed work over one stopped child.
+    if cancel.is_cancelled() {
         wf_track.finish_err("cancelled");
         bail!("workflow '{}': cancelled by user", spec.name);
     }
 
-    // If every task errored there is nothing to synthesize — don't spend a synthesis call
-    // feeding the model only "error: …" strings.
-    if results.iter().all(|r| r.status == "error") {
-        wf_track.finish_err("all tasks failed");
+    // If every task errored or was stopped there is nothing to synthesize — don't spend a
+    // synthesis call feeding the model only "error: …" strings.
+    if results
+        .iter()
+        .all(|r| matches!(r.status.as_str(), "error" | "cancelled"))
+    {
+        wf_track.finish_err("all tasks failed or were stopped");
         bail!(
-            "workflow '{}': all {} task(s) failed (see per-task errors above) — nothing to synthesize",
+            "workflow '{}': all {} task(s) failed or were stopped (see per-task lines above) — \
+             nothing to synthesize",
             spec.name,
             results.len()
         );
@@ -311,7 +319,10 @@ pub(crate) fn task_is_writer(role: &str, agent: Option<&str>) -> bool {
             Some(def) => !crate::agent::task_tool::dispatch_is_read_only(
                 &crate::agent::builtin::agent_registry(&def, std::path::Path::new(".")),
             ),
-            None => true, // unresolvable slug → runner uses coder scope → treat as a writer
+            // Unresolvable slug → treat as a writer. Conservative on purpose: the RUNNER falls
+            // back to the task's ROLE scope (default `reviewer`, read-only), so over-counting
+            // here can only refuse/serialize a dispatch that was safe — never the reverse.
+            None => true,
         };
     }
     matches!(role, "coder" | "tester")
@@ -483,14 +494,19 @@ pub(crate) async fn run_workflow_collect(
     .await;
     drop(slots); // explicit: hold the reservation across the whole fan-out, free it here
 
-    if results.iter().any(|r| r.status == "cancelled") {
+    // Same rule as the CLI runner above: only the PARENT token ends the workflow. One stopped
+    // child is a per-task status line; its siblings' results survive into the report/synthesis.
+    if cancel.is_cancelled() {
         wf_track.finish_err("cancelled");
         bail!("workflow '{}': cancelled by user", spec.name);
     }
-    if results.iter().all(|r| r.status == "error") {
-        wf_track.finish_err("all tasks failed");
+    if results
+        .iter()
+        .all(|r| matches!(r.status.as_str(), "error" | "cancelled"))
+    {
+        wf_track.finish_err("all tasks failed or were stopped");
         bail!(
-            "workflow '{}': all {} task(s) failed — nothing to report",
+            "workflow '{}': all {} task(s) failed or were stopped — nothing to report",
             spec.name,
             results.len()
         );
@@ -766,9 +782,11 @@ async fn run_one_task(
         // error used to reduce a whole child's work to `status: "error"` in the synthesis input.
         max_transient_retries: CHILD_TRANSIENT_RETRIES,
         // A workflow child has one total budget; do not present partial work from a multiplied budget.
-        // Stall recovery stays off because it reads the process-global todo list, not ScopedTodo.
         max_continuations: 0,
-        max_stall_recoveries: 0,
+        // ONE stall recovery, same as a `task` child: with todo_poke off the loop grants it
+        // without consulting the (parent-owned) process-global todo list, so a child that goes
+        // flat gets one bounded change-of-approach turn instead of dying on the spot.
+        max_stall_recoveries: 1,
         // The PARENT's resolved window, so tool-result clearing and the wrap-up guard are ON for a
         // child (the clearing/guard knobs themselves come from `AgentConfig::default()` below, which
         // already carries the production percentages — they are inert while this is 0).
@@ -817,7 +835,14 @@ async fn run_one_task(
         wf_trace(&format!("⋯ {} ({label}) {subject} …", task.id));
     }
 
-    match run_agent(chat, &cfg, &registry, &system, &task.prompt).await {
+    // Drive the loop over a LOCAL transcript (what `run_agent` did internally) so both exits
+    // below can hand synthesis a deterministic partial report instead of "(no final answer)" —
+    // a child that hit its deadline after twenty tool turns still reports which files it touched.
+    let mut msgs = vec![
+        Message::system(system.as_str()),
+        Message::user(task.prompt.as_str()),
+    ];
+    match run_agent_loop(chat, &cfg, &registry, &mut msgs).await {
         Ok(o) => {
             let status = match o.stop {
                 StopReason::Done => "done",
@@ -845,13 +870,16 @@ async fn run_one_task(
                 role: label.clone(),
                 model: result_model.clone(),
                 status: status.to_string(),
-                summary: o.final_text.unwrap_or_else(|| {
-                    if status == "cancelled" {
-                        "cancelled by user".to_string()
-                    } else {
-                        "(no final answer)".to_string()
-                    }
-                }),
+                summary: o
+                    .final_text
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        if status == "cancelled" {
+                            "cancelled by user".to_string()
+                        } else {
+                            crate::agent::task_tool::partial_report_from_messages(&msgs)
+                        }
+                    }),
                 iters: o.iters,
             }
         }
@@ -863,7 +891,10 @@ async fn run_one_task(
                 role: label.clone(),
                 model: result_model.clone(),
                 status: "error".to_string(),
-                summary: format!("error: {e}"),
+                summary: format!(
+                    "error: {e}\nPartial progress before the failure:\n{}",
+                    crate::agent::task_tool::partial_report_from_messages(&msgs)
+                ),
                 iters: 0,
             }
         }

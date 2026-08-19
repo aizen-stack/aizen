@@ -259,8 +259,12 @@ pub async fn stream_turn(
     let mut access_account = oauth_codex::bearer_token().await?;
     let body = build_request_body(model, messages, tools, session_id, None);
 
-    // Up to 2 auth attempts (refresh on 401) and a few overload retries.
+    // Up to 2 auth attempts (refresh on 401) and a few transient retries. This path used to be a
+    // second-class transport (raw `.send()`, immediate bail on 429/5xx, linear un-jittered
+    // sleeps); it now mirrors `send_with_retry`'s discipline with the same jittered backoff.
     let mut overload_attempt = 0u32;
+    let mut transient_attempt = 0u32;
+    const TRANSIENT_RETRIES: u32 = 3;
     loop {
         let (access, account) = &access_account;
         let headers = build_headers(access, account.as_deref(), session_id);
@@ -293,13 +297,30 @@ pub async fn stream_turn(
         }
         if status.as_u16() == 429 {
             let text = resp.text().await.unwrap_or_default();
+            // A spent QUOTA is permanent for this window — retrying burns nothing but time.
             if let Some(msg) = parse_usage_limit(&text) {
                 bail!("{msg}");
+            }
+            // Plain rate limiting is transient: back off and retry like every other gateway.
+            if transient_attempt < TRANSIENT_RETRIES {
+                let delay = crate::llm::client::backoff_ms(transient_attempt, 500, 15_000);
+                transient_attempt += 1;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                continue;
             }
             bail!("Codex rate limited (HTTP 429): {}", truncate(&text, 300));
         }
         if !status.is_success() {
+            let code = status.as_u16();
             let text = resp.text().await.unwrap_or_default();
+            if crate::llm::client::is_retryable_status(code)
+                && transient_attempt < TRANSIENT_RETRIES
+            {
+                let delay = crate::llm::client::backoff_ms(transient_attempt, 500, 15_000);
+                transient_attempt += 1;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                continue;
+            }
             bail!("Codex HTTP {status}: {}", truncate(&text, 500));
         }
 
@@ -317,14 +338,18 @@ pub async fn stream_turn(
                 bail!("Codex upstream overloaded — retries exhausted");
             }
             overload_attempt += 1;
-            tokio::time::sleep(Duration::from_secs(
-                2u64.saturating_mul(overload_attempt as u64),
-            ))
-            .await;
+            let delay = crate::llm::client::backoff_ms(overload_attempt - 1, 1_000, 15_000);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
             continue;
         }
 
-        return parse_sse_to_chat_turn(&text);
+        let turn = parse_sse_to_chat_turn(&text)?;
+        // Codex turns used to be invisible to `/cost` and the cache HUD — the one chat path that
+        // never recorded usage. Same meter as the OpenAI-dialect paths.
+        if let Some(u) = &turn.usage {
+            crate::llm::client::cost_meter().record(u);
+        }
+        return Ok(turn);
     }
 }
 
@@ -489,7 +514,12 @@ pub fn parse_sse_to_chat_turn(sse: &str) -> Result<ChatTurn> {
     }
 
     if let Some(e) = err_msg {
-        if text_out.is_empty() && tools.is_empty() {
+        // A failure event fails the turn unless the stream ALSO completed normally afterwards
+        // (`response.completed` sets `finish`). The old gate only bailed when text AND tools were
+        // both empty, so a stream cut down mid-answer returned its partial text as a clean
+        // `finish_reason: "stop"` turn — the caller could not tell a finished answer from a
+        // truncated one. An error the turn recovered from (completed anyway) is still fine.
+        if finish.is_none() {
             bail!("Codex error: {e}");
         }
     }
@@ -590,7 +620,15 @@ fn parse_usage(u: &Value) -> Option<Usage> {
         .or_else(|| u.get("completion_tokens"))
         .and_then(|x| x.as_u64());
     usage.total_tokens = u.get("total_tokens").and_then(|x| x.as_u64());
-    usage.cache_read_input_tokens = u.get("cache_read_input_tokens").and_then(|x| x.as_u64());
+    // The Responses dialect reports cached prompt tokens under `input_tokens_details`; keep the
+    // flat spelling too for gateways that mirror the Anthropic shape.
+    usage.cache_read_input_tokens = u
+        .get("cache_read_input_tokens")
+        .and_then(|x| x.as_u64())
+        .or_else(|| {
+            u.pointer("/input_tokens_details/cached_tokens")
+                .and_then(|x| x.as_u64())
+        });
     Some(usage)
 }
 

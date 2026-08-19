@@ -79,9 +79,43 @@ struct RunManifest {
     started_unix: u64,
     finished_unix: Option<u64>,
     updated_unix: u64,
+    /// Who set this process running, when it was not a person at a terminal.
+    ///
+    /// Empty (and omitted from the file) for every ordinary run: a REPL turn, a one-shot `aizen`
+    /// invocation, the daemon. It is filled only by [`set_origin`], and today the only caller is
+    /// `aizen mcp serve`, which learns the name from the MCP handshake — so a fan-out that Claude
+    /// Code asked for says `Claude Code` because Claude Code said so, not because anything guessed.
+    ///
+    /// Readers must treat it as a label, never as authority: it is a string a client chose for
+    /// itself, so it may name a program that does not exist. It decides what a status view prints
+    /// and nothing else.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    origin: String,
 }
 
 const RUN_SCHEMA: u32 = 1;
+
+/* The origin, set at most once per process.
+`OnceLock` rather than a mutex on purpose: a process serves one client for its whole life, so the
+second caller is a bug rather than a change of mind, and a write that silently loses is a safer
+failure than a run whose author changes halfway through a fan-out. */
+static ORIGIN: OnceLock<String> = OnceLock::new();
+
+/// Name whoever is driving this process, for every run it starts from here on.
+///
+/// Ignored if called twice — see [`ORIGIN`]. The name is trimmed and bounded because it arrives
+/// over a wire from another program.
+pub fn set_origin(who: &str) {
+    let who = safe_text(who.trim(), 60);
+    if who.is_empty() {
+        return;
+    }
+    let _ = ORIGIN.set(who);
+}
+
+fn origin() -> String {
+    ORIGIN.get().cloned().unwrap_or_default()
+}
 
 fn manifest_root() -> PathBuf {
     crate::core::config::aizen_home()
@@ -144,6 +178,7 @@ fn persist_manifest(e: &Entry) {
         started_unix: e.started_unix,
         finished_unix: e.finished_unix,
         updated_unix: unix_now(),
+        origin: origin(),
     }) {
         Ok(bytes) => bytes,
         Err(_) => return,
@@ -260,16 +295,18 @@ struct Store {
 impl Store {
     fn push_live(&mut self, e: Entry) {
         if self.live.len() >= LIVE_SOFT_CAP {
-            // Drop the oldest finished-looking live row if any; else the oldest.
+            // Evict only a FINISHED row. Evicting a still-running one orphaned it: `finish` and
+            // `set_phase` search `live` only, so the evicted run's eventual finish became a
+            // silent no-op, its manifest was never removed, and other processes' `/workflows`
+            // showed a phantom "running" row for the whole stale-sweep window. A fan-out at the
+            // documented max (32 children + their parent) may briefly exceed the soft cap
+            // instead — the cap is a display bound, not a correctness bound.
             if let Some(i) = self
                 .live
                 .iter()
                 .position(|x| matches!(x.phase, Phase::Done | Phase::Failed))
             {
                 let old = self.live.remove(i);
-                self.push_history(old);
-            } else if !self.live.is_empty() {
-                let old = self.live.remove(0);
                 self.push_history(old);
             }
         }
@@ -284,7 +321,11 @@ impl Store {
         }
     }
 
-    fn finish(&mut self, id: u64, phase: Phase, detail: impl Into<String>) {
+    /// Returns whether the row existed — the CALLER then drops the cross-process manifest,
+    /// OUTSIDE the store lock. Manifest IO takes a 1–2s file lock; holding the store mutex
+    /// across it stalled every reader (`/workflows`, the HUD chip, `cancel_matching`) for the
+    /// duration of a contended write.
+    fn finish(&mut self, id: u64, phase: Phase, detail: impl Into<String>) -> bool {
         let detail = detail.into();
         if let Some(pos) = self.live.iter().position(|e| e.id == id) {
             let mut e = self.live.remove(pos);
@@ -294,23 +335,24 @@ impl Store {
             }
             e.finished = Some(Instant::now());
             e.finished_unix = Some(unix_now());
-            // Terminal state → drop the cross-process manifest (the remote view only surfaces
-            // running/synthesizing rows, so a finished file is dead weight and would otherwise
-            // linger until the stale sweep).
-            remove_manifest(e.id);
             self.push_history(e);
+            return true;
         }
+        false
     }
 
-    fn set_phase(&mut self, id: u64, phase: Phase, detail: impl Into<String>) {
+    /// Returns a snapshot of the updated row for the CALLER to persist — same reason as
+    /// [`Store::finish`]: the manifest write must not happen under this lock.
+    fn set_phase(&mut self, id: u64, phase: Phase, detail: impl Into<String>) -> Option<Entry> {
         let detail = detail.into();
         if let Some(e) = self.live.iter_mut().find(|e| e.id == id) {
             e.phase = phase;
             if !detail.is_empty() {
                 e.detail = detail;
             }
-            persist_manifest(e);
+            return Some(e.clone());
         }
+        None
     }
 }
 
@@ -328,28 +370,41 @@ impl Track {
 
     /// Mark successful completion (or a terminal non-error status like `max-iters` still "done-ish").
     pub fn finish_ok(mut self, detail: impl Into<String>) {
-        store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .finish(self.id, Phase::Done, detail);
+        let found =
+            store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .finish(self.id, Phase::Done, detail);
+        if found {
+            // Terminal state → drop the cross-process manifest, OUTSIDE the store lock (its file
+            // lock can block for seconds; see `Store::finish`).
+            remove_manifest(self.id);
+        }
         self.finished = true;
     }
 
     /// Mark failure / error.
     pub fn finish_err(mut self, detail: impl Into<String>) {
-        store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .finish(self.id, Phase::Failed, detail);
+        let found = store().lock().unwrap_or_else(|e| e.into_inner()).finish(
+            self.id,
+            Phase::Failed,
+            detail,
+        );
+        if found {
+            remove_manifest(self.id);
+        }
         self.finished = true;
     }
 
     /// Update phase without finishing (e.g. workflow → synthesizing).
     pub fn set_phase(&self, phase: Phase, detail: impl Into<String>) {
-        store()
+        let snapshot = store()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_phase(self.id, phase, detail);
+        if let Some(e) = snapshot {
+            persist_manifest(&e); // outside the lock — see `Store::set_phase`
+        }
     }
 
     /// Publish a stop handle for this run, so `/workflows stop <id>` can cancel it alone.
@@ -367,11 +422,14 @@ impl Track {
 impl Drop for Track {
     fn drop(&mut self) {
         if !self.finished {
-            store().lock().unwrap_or_else(|e| e.into_inner()).finish(
+            let found = store().lock().unwrap_or_else(|e| e.into_inner()).finish(
                 self.id,
                 Phase::Failed,
                 "aborted",
             );
+            if found {
+                remove_manifest(self.id);
+            }
         }
     }
 }
@@ -683,6 +741,35 @@ pub fn hud_chip() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /* The origin field must be invisible to everything that existed before it.
+    Two directions, both load-bearing: a manifest written by an older aizen (or by any ordinary
+    run today) has no `origin` key and must still parse, and a run with no origin must still
+    SERIALISE without the key — otherwise every `/workflows` row and every desktop office pane on
+    an older reader gains a field it was not built to ignore, for a value that is always empty. */
+    #[test]
+    fn a_manifest_without_an_origin_round_trips_unchanged() {
+        let old = r#"{"schema":1,"run_id":"7","pid":42,"kind":"task","name":"n","label":"l",
+            "phase":"running","detail":"","parent":null,"started_unix":1,"finished_unix":null,
+            "updated_unix":2}"#;
+        let m: RunManifest = serde_json::from_str(old).expect("an older manifest still parses");
+        assert!(m.origin.is_empty());
+        let back = serde_json::to_string(&m).unwrap();
+        assert!(
+            !back.contains("origin"),
+            "an ordinary run writes the same file it always did"
+        );
+    }
+
+    #[test]
+    fn a_manifest_carries_the_name_the_client_gave() {
+        let new = r#"{"schema":1,"run_id":"7","pid":42,"kind":"workflow","name":"n","label":"l",
+            "phase":"running","detail":"","parent":null,"started_unix":1,"finished_unix":null,
+            "updated_unix":2,"origin":"Claude Code"}"#;
+        let m: RunManifest = serde_json::from_str(new).unwrap();
+        assert_eq!(m.origin, "Claude Code");
+        assert!(serde_json::to_string(&m).unwrap().contains("Claude Code"));
+    }
 
     #[test]
     fn track_lifecycle_and_format() {

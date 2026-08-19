@@ -125,7 +125,7 @@ fn apply_cache_breakpoints(messages: &mut [Message], tools: &mut [ToolDef]) {
 }
 
 impl CostMeter {
-    fn record(&self, u: &Usage) {
+    pub(crate) fn record(&self, u: &Usage) {
         // Only count a call as "real" if it carried at least one token field.
         if u.prompt_tokens.is_none() && u.completion_tokens.is_none() && u.total_tokens.is_none() {
             return;
@@ -541,8 +541,16 @@ async fn parse_models_body(resp: reqwest::Response) -> Result<Vec<ModelInfo>> {
 
 /// Transient upstream statuses worth a retry (rate-limit + gateway/server errors). A permanent 4xx
 /// (auth, bad request) is NOT here — retrying it just wastes a round-trip and money.
-fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 429 | 500 | 502 | 503 | 504)
+///
+/// Beyond the obvious five: 408 (the server timed us out — same shape as a transport timeout),
+/// 425 (told to come back later), 522/524 (Cloudflare's origin-timeout pair, common in front of
+/// self-hosted endpoints), and 529 — Anthropic's own "Overloaded" status, which used to skip this
+/// fast `Retry-After`-aware layer and surface as a fatal error.
+pub(crate) fn is_retryable_status(status: u16) -> bool {
+    matches!(
+        status,
+        408 | 425 | 429 | 500 | 502 | 503 | 504 | 522 | 524 | 529
+    )
 }
 
 /// Exponential backoff CEILING (ms): `base * 2^attempt`, capped, floored at 1. Pure + monotonic so
@@ -672,7 +680,7 @@ fn stream_retry_note(reason: &str, attempt: u32, max: u32, delay_ms: u64) {
 
 /// Full-jitter backoff: a uniform delay in `[ceil/2, ceil]`. Jitter spreads retries so a fleet of
 /// callers doesn't thunder back in lock-step after a shared 503.
-fn backoff_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
+pub(crate) fn backoff_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
     let ceil = backoff_ceiling_ms(attempt, base_ms, cap_ms);
     let half = ceil / 2;
     half + (rand_u64() % (ceil - half + 1))
@@ -702,10 +710,29 @@ where
     const MAX_RETRIES: u32 = 3;
     const BASE_MS: u64 = 400;
     const CAP_MS: u64 = 8_000;
+    // TOTAL wall-clock budget for one logical send, retries and backoff included. This is the only
+    // ceiling on the PRE-response phase: the endpoint deliberately has no whole-request `.timeout()`
+    // (a streamed response lives longer than any sane value), and `read_timeout` fires per READ —
+    // a gateway that completes the handshake and then trickles held a call for up to 4×300s before
+    // this existed, and the loop above multiplied that by its own retries. Generous on purpose: a
+    // non-streaming completion legitimately spends its whole generation time before headers arrive.
+    let budget = send_total_budget();
+    let start = std::time::Instant::now();
     let mut attempt: u32 = 0;
     loop {
-        match build().send().await {
-            Ok(resp) => {
+        let remaining = budget.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            bail!(
+                "request exceeded the {}s total send budget (no response headers) — timeout",
+                budget.as_secs()
+            );
+        }
+        match tokio::time::timeout(remaining, build().send()).await {
+            Err(_) => bail!(
+                "request exceeded the {}s total send budget (no response headers) — timeout",
+                budget.as_secs()
+            ),
+            Ok(Ok(resp)) => {
                 let status = resp.status();
                 if status.is_success() {
                     return Ok(resp);
@@ -720,7 +747,7 @@ where
                 let detail = resp.text().await.unwrap_or_default();
                 bail!("upstream returned HTTP {status}: {detail}");
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 if attempt < MAX_RETRIES {
                     let delay = backoff_ms(attempt, BASE_MS, CAP_MS);
                     attempt += 1;
@@ -733,6 +760,17 @@ where
     }
 }
 
+/// The total send budget: `AIZEN_SEND_BUDGET_SECS` clamped to 60s..=3600s, default 600s. The floor
+/// keeps a typo from strangling every call; the ceiling keeps a typo from disabling the guard.
+fn send_total_budget() -> std::time::Duration {
+    let secs = std::env::var("AIZEN_SEND_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.clamp(60, 3600))
+        .unwrap_or(600);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Classification of a `chat()` error for GOAL MODE's smart retry (see the goal loop in
 /// `src/agent/mod.rs`). Goal mode keeps working through API flakiness, but must distinguish a
 /// transient upstream hiccup (retry indefinitely with backoff) from a permanent client error (bad
@@ -743,24 +781,66 @@ where
 pub enum ApiErrorKind {
     /// 429 / 5xx / transport / timeout / mid-stream drop — safe to retry indefinitely with backoff.
     Transient,
-    /// 400 / 401 / 403 / 404 — a client/config error retrying can't fix. Goal mode retries a small
-    /// bounded number of times (the provider may be briefly misbehaving) then stops with the error.
+    /// 4xx client/config errors retrying can't fix (auth, bad request, payment, unprocessable).
+    /// Goal mode retries a small bounded number of times (the provider may be briefly misbehaving)
+    /// then stops with the error.
     Permanent,
+    /// The request was too big for the model's window — a 413, or a 400 whose body says so.
+    /// Neither retrying (it will 4xx identically) nor giving up (the transcript can be shrunk) is
+    /// right: the loop's recovery is an emergency clear/compact, then ONE more try.
+    ContextOverflow,
 }
 
-/// Classify a `chat()` error for goal-mode retry. `send_with_retry` surfaces upstream failures as
-/// `upstream returned HTTP {status}: …` (where `{status}` renders like `400 Bad Request`) and
+/// Classify a `chat()` error for loop-level retry. `send_with_retry` surfaces upstream failures as
+/// `upstream returned HTTP {status}: {body}` (where `{status}` renders like `400 Bad Request`) and
 /// transport failures as `request failed after retries`; the streaming path adds `SSE stream error:
-/// …`. We match the permanent 4xx shapes and treat everything else as Transient — goal mode's whole
-/// point is surviving a flaky API, so the default leans toward retrying, not giving up.
+/// …`. Overflow is tested FIRST because it arrives wearing a permanent status (400/413) while having
+/// its own recovery. After that the real status number decides; anything without one — transport,
+/// timeout, stream drop — is Transient, because goal mode's whole point is surviving a flaky API.
 pub fn classify_api_error(e: &anyhow::Error) -> ApiErrorKind {
     let msg = e.to_string();
-    for code in ["HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404"] {
-        if msg.contains(code) {
-            return ApiErrorKind::Permanent;
-        }
+    if is_overflow_message(&msg) {
+        return ApiErrorKind::ContextOverflow;
     }
-    ApiErrorKind::Transient
+    match extract_http_status(&msg) {
+        // 413 without an overflow-shaped body is still "the request is too large" for a chat
+        // call — same recovery. 402 (billing), 422 (unprocessable), 451 (blocked) used to fall
+        // through to Transient and burn every retry the budget had.
+        Some(413) => ApiErrorKind::ContextOverflow,
+        // The transient 4xx trio comes BEFORE the blanket 4xx arm: 429 is the single most common
+        // retryable status there is.
+        Some(408 | 425 | 429) => ApiErrorKind::Transient,
+        Some(400..=499) => ApiErrorKind::Permanent,
+        // 5xx and any parsed status that isn't a client error: worth another try.
+        Some(_) => ApiErrorKind::Transient,
+        None => ApiErrorKind::Transient,
+    }
+}
+
+/// The first `HTTP {digits}` in a rendered error message, as produced by `send_with_retry`.
+fn extract_http_status(msg: &str) -> Option<u16> {
+    let rest = &msg[msg.find("HTTP ")? + 5..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Does this error body say the prompt outgrew the model's window? Providers word it differently;
+/// the phrases below cover OpenAI (`context_length_exceeded`, "maximum context length"), Anthropic
+/// ("prompt is too long"), and the common gateway paraphrases. Deliberately narrow — a false
+/// positive here would shrink a healthy transcript on an unrelated 400.
+fn is_overflow_message(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "context length",
+        "maximum context",
+        "prompt is too long",
+        "input is too long",
+        "too many tokens",
+        "exceeds the maximum number of tokens",
+    ]
+    .iter()
+    .any(|phrase| m.contains(phrase))
 }
 
 /// Full-jitter backoff (ms) for GOAL MODE's loop-level retry, indexed by attempt. Reuses the exact
@@ -835,7 +915,12 @@ async fn send_chat(
         body.reasoning_effort = None;
     }
     let had_effort = body.reasoning_effort.is_some();
-    match send_with_retry(|| client.post(url).bearer_auth(api_key).json(&body)).await {
+    // `with_provider_auth`, NOT bare `bearer_auth`: Anthropic's native surface wants
+    // `x-api-key` + `anthropic-version`, and OpenCode zen wants `x-opencode-client`. The
+    // `/models` probe already sent them — the actual chat traffic must not be the one path
+    // that forgets. The host test parses the host out of the full URL, so passing the chat
+    // URL (not the base) is fine.
+    match send_with_retry(|| with_provider_auth(client.post(url), url, api_key).json(&body)).await {
         Ok(r) => Ok(r),
         Err(e) => {
             let msg = e.to_string();
@@ -852,7 +937,8 @@ async fn send_chat(
                 } else {
                     eprintln!("{}", crate::ui::theme::faint(note));
                 }
-                send_with_retry(|| client.post(url).bearer_auth(api_key).json(&body)).await
+                send_with_retry(|| with_provider_auth(client.post(url), url, api_key).json(&body))
+                    .await
             } else {
                 Err(e)
             }
@@ -960,11 +1046,15 @@ pub async fn stream_chat_with_visual_contract(
     // BYTES, which keepalive frames defeat entirely. No replay here: this one-shot surface has no
     // eager handles to detach and its caller already prints the error.
     let stall = stream_stall_timeout();
+    // Re-armed only by frames that PARSE, same as the tool-calling path: a `data: {"type":"ping"}`
+    // keepalive reaches this loop as an event but must not keep a dead turn alive.
+    let mut last_useful = std::time::Instant::now();
     // Rate-limit counter, same reason as the tool-calling path: a delta shape we mis-model breaks
     // EVERY frame, and one warn per token buries the reply.
     let mut bad_frames: usize = 0;
     loop {
-        let event = match tokio::time::timeout(stall, stream.next()).await {
+        let remaining = stall.saturating_sub(last_useful.elapsed());
+        let event = match tokio::time::timeout(remaining, stream.next()).await {
             Ok(Some(Ok(e))) => e,
             Ok(Some(Err(e))) => {
                 stream_err = Some(anyhow!("SSE stream error: {e}"));
@@ -990,6 +1080,14 @@ pub async fn stream_chat_with_visual_contract(
 
         match parse_chunk(&event.data) {
             Ok(chunk) => {
+                last_useful = std::time::Instant::now();
+                // Same final-chunk-only guard as the tool-calling path: without it, `aizen chat`
+                // turns were invisible to `/cost` — the one surface that never recorded usage.
+                if let Some(u) = &chunk.usage {
+                    if chunk.choices.is_empty() {
+                        cost_meter().record(u);
+                    }
+                }
                 if let Some(choice) = chunk.choices.first() {
                     if let Some(content) = &choice.delta.content {
                         spin.take(); // clear before the first token prints
@@ -1474,17 +1572,28 @@ pub async fn stream_chat_with_tools_eager(
         let mut stream_err: Option<anyhow::Error> = None;
         // IDLE WATCHDOG. `reqwest`'s `read_timeout` fires only on a socket that delivers no BYTES; a
         // gateway that keeps the connection warm with comment/keepalive frames, or an upstream that
-        // stalls after `role`, satisfies it forever — so the turn hung with no cap at all. Bound the gap
-        // between USEFUL events instead, and re-arm the timer on every one.
+        // stalls after `role`, satisfies it forever — so the turn hung with no cap at all. Bound the
+        // gap between USEFUL events instead: the clock re-arms only when a frame PARSES into a chunk
+        // (`last_useful` below), so a gateway that pings with `data: {"type":"ping"}` frames — which
+        // reach this loop as events but carry nothing — cannot keep a dead turn alive. (Comment-style
+        // `: ping` keepalives never surface as events at all; this closes the data-frame variant.)
         let idle_cap = stream_stall_timeout();
+        let mut last_useful = std::time::Instant::now();
         // Has this stream produced anything a retry would duplicate? Text, a tool-call fragment, or a
         // usage report all count. Governs both the watchdog's error wording and blank-stream replay.
         let mut produced = false;
+        // The reasoning channel, accumulated but never displayed. If the model puts its whole answer
+        // there and leaves `content` empty — the historical "provider spoke, we reported silence" bug,
+        // fixed on the non-streaming path in `resolve_content` — the streaming path must not
+        // re-introduce it. Deliberately NOT counted as `produced`: nothing from this buffer reaches
+        // the display or history mid-stream, so a replay after a mid-reasoning stall duplicates nothing.
+        let mut reasoning = String::new();
         // Unparseable frames seen this stream. Counted so the warn can be rate-limited: the shape that
         // breaks parsing usually breaks EVERY frame, which is one line per token over the live UI.
         let mut bad_frames: usize = 0;
         loop {
-            let event = match tokio::time::timeout(idle_cap, stream.next()).await {
+            let remaining = idle_cap.saturating_sub(last_useful.elapsed());
+            let event = match tokio::time::timeout(remaining, stream.next()).await {
                 Ok(Some(Ok(e))) => e,
                 Ok(Some(Err(e))) => {
                     stream_err = Some(anyhow!("SSE stream error: {e}"));
@@ -1514,10 +1623,11 @@ pub async fn stream_chat_with_tools_eager(
             }
             match parse_chunk(&event.data) {
                 Ok(chunk) => {
-                    // Record usage ONLY on the final chunk (choices empty). Spec-compliant OpenAI sends
-                    // usage=null until then, but some gateways (vLLM/LiteLLM/OpenRouter) attach a
-                    // CUMULATIVE usage object to EVERY chunk — without this guard an N-chunk stream sums it
-                    // N times and inflates /cost (and calls_with_usage) ~N×.
+                    last_useful = std::time::Instant::now(); // a real chunk re-arms the watchdog
+                                                             // Record usage ONLY on the final chunk (choices empty). Spec-compliant OpenAI sends
+                                                             // usage=null until then, but some gateways (vLLM/LiteLLM/OpenRouter) attach a
+                                                             // CUMULATIVE usage object to EVERY chunk — without this guard an N-chunk stream sums it
+                                                             // N times and inflates /cost (and calls_with_usage) ~N×.
                     if let Some(u) = &chunk.usage {
                         if chunk.choices.is_empty() {
                             cost_meter().record(u);
@@ -1527,10 +1637,22 @@ pub async fn stream_chat_with_tools_eager(
                     }
                     if let Some(choice) = chunk.choices.first() {
                         // A dedicated reasoning channel (`reasoning_content`/`reasoning`) is the model
-                        // thinking out loud — suppress it entirely so output is uniform across models.
+                        // thinking out loud — suppressed from the display so output is uniform across
+                        // models, but ACCUMULATED: see `reasoning` above for the empty-content salvage.
+                        // Raw fragments, not `reasoning_text()` — that helper trims each delta, which
+                        // would eat the spaces between streamed words. `.or()` reads whichever spelling
+                        // arrived; a gateway that mirrors both carries the same text, not more of it.
                         // (Clear the spinner: the model IS producing, just not user-facing text yet.)
-                        if choice.delta.reasoning_text().is_some() {
-                            spin.take();
+                        if let Some(raw) = choice
+                            .delta
+                            .reasoning_content
+                            .as_deref()
+                            .or(choice.delta.reasoning.as_deref())
+                        {
+                            if !raw.trim().is_empty() {
+                                spin.take();
+                            }
+                            reasoning.push_str(raw);
                         }
                         if let Some(content) = &choice.delta.content {
                             spin.take(); // stop+clear the spinner before the first token prints
@@ -1647,30 +1769,81 @@ pub async fn stream_chat_with_tools_eager(
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "stream closed with no output".to_string());
             stream_retry_note(&why, blank_attempt, STREAM_BLANK_RETRIES, delay);
-            // Detach any eager handles from the abandoned attempt. They are read-only by policy (the
-            // eager starter refuses destructive/unsafe calls), so dropping them is safe.
-            drop(eager_by_slot);
+            // Abort any eager handles from the abandoned attempt. They are read-only by policy (the
+            // eager starter refuses destructive/unsafe calls), so cutting them short is safe — and
+            // aborting rather than detaching means they stop billing/working for a turn that no
+            // longer exists. (A handle backed by `spawn_blocking` finishes its current body; abort
+            // still prevents anything after it.)
+            for h in eager_by_slot.into_values() {
+                h.abort();
+            }
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             continue;
         }
 
-        // The display is now clean (fence closed, partial line flushed) — surface any transport error
-        // that interrupted the stream. The partial `full` / tool-calls are intentionally discarded: a
-        // truncated tool-call's arguments JSON is unparseable, so feeding it back would be worse than a
-        // clean turn failure the caller can retry.
+        // Map eager handles from accumulator SLOT to final POSITION (what the executor stitches by).
+        // COMPLETE calls only: `finish_indexed` drops any call whose streamed arguments never closed,
+        // so everything here is executable regardless of how the stream ended.
+        let indexed = acc.finish_indexed();
+
+        // The display is now clean (fence closed, partial line flushed) — deal with a transport error
+        // that interrupted the stream. Two cases:
+        //  * At least one COMPLETE tool call arrived → SALVAGE the turn: return it as a tools turn.
+        //    The executor runs the calls and the next request continues naturally — strictly better
+        //    than discarding finished work and re-paying the whole generation. The partial text (if
+        //    any) rides along: it is already on screen, and history matching the display beats a
+        //    retry that re-prints it.
+        //  * No complete call → fail the turn. Partial TEXT alone is not returned as success: that
+        //    would present a cut-off answer as a finished one.
         if let Some(e) = stream_err {
-            return Err(e);
+            if indexed.is_empty() {
+                if produced {
+                    // The loop above will likely retry this turn; the partial text stays on screen
+                    // (retained blocks are append-only), so say why the answer may appear twice.
+                    let note = "⚠ stream dropped mid-answer — on retry the text above may repeat \
+                                on screen (the saved transcript stays clean)";
+                    if crate::ui::tui::active() {
+                        crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
+                    } else {
+                        eprintln!("{note}");
+                    }
+                }
+                for h in eager_by_slot.into_values() {
+                    h.abort();
+                }
+                return Err(e);
+            }
+            let note = format!(
+                "⟳ stream dropped mid-turn — continuing with {} completed tool call(s)",
+                indexed.len()
+            );
+            if crate::ui::tui::active() {
+                crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
+            } else {
+                eprintln!("{note}");
+            }
+            if finish_reason.is_none() {
+                finish_reason = Some("tool_calls".to_string());
+            }
         }
 
-        // Map eager handles from accumulator SLOT to final POSITION (what the executor stitches by).
-        let indexed = acc.finish_indexed();
         let eager: Vec<(usize, tokio::task::JoinHandle<String>)> = indexed
             .iter()
             .enumerate()
             .filter_map(|(pos, (slot, _))| eager_by_slot.remove(slot).map(|h| (pos, h)))
             .collect();
+        // Streaming twin of `resolve_content` (non-streaming): a model that answered ONLY in the
+        // reasoning channel produced an answer, not an empty turn. Same narrow gate — no real
+        // content, no tool calls — so chain-of-thought is never APPENDED to a real answer.
+        let content = if !full.is_empty() {
+            Some(full)
+        } else if indexed.is_empty() && !reasoning.trim().is_empty() {
+            Some(reasoning.trim().to_string())
+        } else {
+            None
+        };
         return Ok(ChatTurn {
-            content: if full.is_empty() { None } else { Some(full) },
+            content,
             tool_calls: indexed.into_iter().map(|(_, tc)| tc).collect(),
             finish_reason,
             usage: final_usage,
@@ -1985,10 +2158,22 @@ mod tests {
                 "{code} must be Permanent"
             );
         }
+        // 402/422/451 were the substring-matcher's blind spot: unfixable client errors that fell
+        // through to Transient and burned every retry the budget had (forever, under /goal).
+        for code in ["HTTP 402", "HTTP 405", "HTTP 422", "HTTP 451"] {
+            let e = anyhow::anyhow!("upstream returned {code} Nope: denied");
+            assert_eq!(
+                classify_api_error(&e),
+                ApiErrorKind::Permanent,
+                "{code} must be Permanent"
+            );
+        }
         // Everything else leans Transient (goal mode's survival bias).
         for msg in [
             "upstream returned HTTP 429 Too Many Requests: slow down",
+            "upstream returned HTTP 408 Request Timeout: too slow",
             "upstream returned HTTP 503 Service Unavailable: try later",
+            "upstream returned HTTP 529 Overloaded: busy",
             "request failed after retries",
             "SSE stream error: connection reset",
             "health probe request failed",
@@ -2000,6 +2185,30 @@ mod tests {
                 "{msg} must be Transient"
             );
         }
+    }
+
+    #[test]
+    fn classify_api_error_names_context_overflow() {
+        // Overflow wears a permanent status (400/413) but has its own recovery — the loop shrinks
+        // the transcript and retries once. Both routes must classify as ContextOverflow: the
+        // status route (413) and the body route (a 400 whose message says the context overflowed).
+        for msg in [
+            "upstream returned HTTP 413 Payload Too Large: request entity too large",
+            "upstream returned HTTP 400 Bad Request: {\"error\":{\"code\":\"context_length_exceeded\"}}",
+            "upstream returned HTTP 400 Bad Request: this model's maximum context length is 128000",
+            "upstream returned HTTP 400 Bad Request: prompt is too long: 210000 tokens",
+        ] {
+            let e = anyhow::anyhow!(msg);
+            assert_eq!(
+                classify_api_error(&e),
+                ApiErrorKind::ContextOverflow,
+                "{msg} must be ContextOverflow"
+            );
+        }
+        // …while an unrelated 400 stays Permanent: a false positive here would shrink a healthy
+        // transcript instead of surfacing a real config error.
+        let e = anyhow::anyhow!("upstream returned HTTP 400 Bad Request: unknown parameter foo");
+        assert_eq!(classify_api_error(&e), ApiErrorKind::Permanent);
     }
 
     #[test]
