@@ -1629,12 +1629,21 @@ mod tests {
 
     #[test]
     fn auto_copy_defaults_on_and_honours_field_and_env() {
+        // `AIZEN_HOME` is process-global, so every test that repoints it takes this lock — without
+        // it this test and any concurrently running home-sandboxed test clobber each other's home
+        // and one of the two fails, whichever loses the race. `EnvGuard` restores `AIZEN_AUTO_COPY`
+        // so an ambient value on the developer's machine survives the run.
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore = crate::core::config::EnvGuard::unset(["AIZEN_AUTO_COPY"]);
         // Isolate from the developer's real ~/.aizen and any ambient AIZEN_AUTO_COPY.
         let dir = std::env::temp_dir().join(format!("aizen-auto-copy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("AIZEN_HOME", &dir);
-        std::env::remove_var("AIZEN_AUTO_COPY");
+        // Guarded, not a raw set_var: this directory is deleted at the end of the test, so leaving
+        // AIZEN_HOME pointing at it would hand every later test a home that does not exist.
+        let _home = crate::core::config::EnvGuard::set([("AIZEN_HOME", &dir)]);
 
         // Never touched → ON (browser-like default the feature shipped with).
         assert!(auto_copy_enabled());
