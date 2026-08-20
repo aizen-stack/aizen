@@ -978,6 +978,16 @@ where
     let mut hill_climb_reframed = false;
     let mut last_hill_climb_reminder = 0usize;
     let mut iter = 0usize;
+    // Identical-re-read short-circuit: sig(file_read args) → what that call answered last time.
+    // Cleared whenever history is rebuilt (compaction / emergency shrink) — the msg_index leg of
+    // the proof dies with the rebuild. Eviction blanks bodies IN PLACE, which the byte-level
+    // intact-check catches per entry, so no clear is needed there.
+    let mut read_cache: std::collections::HashMap<String, ReadCacheEntry> =
+        std::collections::HashMap::new();
+    // Batch-coach streak (see NUDGE_BATCH): consecutive turns whose ONLY call was one read-only
+    // retrieval. One-shot latch per run.
+    let mut single_read_streak = 0usize;
+    let mut batch_nudged = false;
     // GOAL MODE bypasses the iteration cap entirely: `/goal` promises to run until the goal is
     // genuinely finished, so the only exits are Esc (→ Cancelled, via `cancel::race`) or a verified
     // completion (→ Done, via the goal gate + verify gate). Ordinary turns keep `iter < cap`.
@@ -1223,6 +1233,7 @@ where
                             budget_band_shown = None; // …and the running budget signal (P-ctx1)
                             real_anchor = None; // spliced history invalidates the anchor
                             stall.forget_successes(); // summarized-away results must not mark a re-read as stale
+                            read_cache.clear(); // rebuilt indices — the short-circuit proof is void
                             est_now = estimate_tokens(messages) + schema_overhead;
                             if !cfg.quiet {
                                 let line =
@@ -1705,6 +1716,19 @@ where
         // CLASSIFY: the structured tool_calls array is the source of truth (a gateway may
         // emit finish_reason="stop"/"end_turn" alongside tool calls — ignore it here).
         if turn.tool_calls.is_empty() {
+            // MERGED DONE-GATE CASCADE: each gate below APPENDS its demand to `demands` instead of
+            // looping back immediately. One combined round-trip then carries every demand that
+            // fired — the old shape burned one full LLM iteration PER gate (verify → self-review →
+            // todo-poke → confidence could cost 4 sequential round-trips for one "done" claim; the
+            // model can fix all four in one pass). Per-gate budgets/latches are consumed exactly as
+            // before, so the total-work bound is unchanged — only the round-trip count shrinks.
+            // The goal and steering gates stay EXCLUSIVE (evaluated only when nothing else fired):
+            // the goal gate's `take_pending` drain must only happen at a real Done decision, and a
+            // steer left in the mailbox is picked up by the top-of-loop drain for free anyway.
+            let mut demands: Vec<String> = Vec::new();
+            // Set when THIS round's verify ran and failed — self-review must not spend its
+            // once-per-run oracle call reviewing code that is known-broken.
+            let mut verify_failed_now = false;
             // VERIFY/REPAIR GATE (F2 + W8): after an editing run, run a fast typecheck before Done.
             // On failure, record the premature "done", inject the errors, and loop back for a fix.
             // The gate RE-FIRES on EVERY "done" claim until it PASSES or the attempt budget
@@ -1772,6 +1796,7 @@ where
                     };
                     if !gate_passed {
                         verify_attempts += 1;
+                        verify_failed_now = true;
                         // GOAL MODE: a failed verify invalidates any completion claim the model made
                         // this turn — clear it so the stale claim can't leak through the goal gate to
                         // Done after the model fixes the errors. The `goal_complete` ack already tells
@@ -1781,17 +1806,6 @@ where
                         if cfg.goal.is_some() {
                             goal::clear();
                         }
-                        // Record the premature "done" before the user gate-failure message.
-                        // Normalize content to "" (never null): an assistant turn with neither
-                        // content nor tool_calls is malformed (400) on strict gateways.
-                        messages.push(Message {
-                            role: "assistant".to_string(),
-                            content: Some(turn.content.clone().unwrap_or_default()),
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                            images: Vec::new(),
-                            cache_control: None,
-                        });
                         // Once a phase has spent past half its repair budget, offer the rewind as an
                         // explicit escape hatch: patching further is often more costly than dropping
                         // back to the last clean phase mark and re-approaching. Reuses the existing
@@ -1804,34 +1818,38 @@ where
                                 failure_msg.push_str(&hint);
                             }
                         }
-                        messages.push(Message::user(failure_msg));
-                        iter += 1;
-                        continue;
-                    }
-                    // PASSED: latch it so a subsequent no-edit "done" doesn't needlessly re-run the
-                    // gate (a fresh successful edit clears the latch → new work is re-verified).
-                    verify_passed = true;
-                    // A clean verify is the OTHER phase boundary (decision: todo-close AND
-                    // verify-pass both mark phases). This catches the no-todo run — the model edited
-                    // and finished without ever flipping a todo, so `phase_boundary_crossed` never
-                    // fired. Stamp the still-uncheckpointed edits ONCE here as a verified phase.
-                    // Gated on `made_edits_in_phase` so a no-edit "done" (latch already clean) stamps
-                    // nothing; `save` dedups a zero-diff tree so it's free when the last todo boundary
-                    // already captured this exact tree.
-                    if cfg.checkpoint_each_edit && made_edits_in_phase {
-                        phase_counter += 1;
-                        stamp_phase_checkpoint(
-                            cfg.quiet,
-                            &format!("phase {phase_counter} verified"),
-                        );
-                        made_edits_in_phase = false;
-                        phase_todos_before = crate::agent::todo::snapshot();
+                        demands.push(failure_msg);
+                    } else {
+                        // PASSED: latch it so a subsequent no-edit "done" doesn't needlessly re-run
+                        // the gate (a fresh successful edit clears the latch → new work is
+                        // re-verified).
+                        verify_passed = true;
+                        // A clean verify is the OTHER phase boundary (decision: todo-close AND
+                        // verify-pass both mark phases). This catches the no-todo run — the model
+                        // edited and finished without ever flipping a todo, so
+                        // `phase_boundary_crossed` never fired. Stamp the still-uncheckpointed edits
+                        // ONCE here as a verified phase. Gated on `made_edits_in_phase` so a no-edit
+                        // "done" (latch already clean) stamps nothing; `save` dedups a zero-diff
+                        // tree so it's free when the last todo boundary already captured this tree.
+                        if cfg.checkpoint_each_edit && made_edits_in_phase {
+                            phase_counter += 1;
+                            stamp_phase_checkpoint(
+                                cfg.quiet,
+                                &format!("phase {phase_counter} verified"),
+                            );
+                            made_edits_in_phase = false;
+                            phase_todos_before = crate::agent::todo::snapshot();
+                        }
                     }
                 }
             }
+            // Exhausted budget with no pass → end the run honestly. `!verify_failed_now` keeps the
+            // round that SPENT the last attempt on its repair turn (the old `continue` did this by
+            // construction): only the NEXT tool-free claim, with nothing left to spend, returns.
             if cfg.enable_verify_gate
                 && made_any_edits
                 && !verify_passed
+                && !verify_failed_now
                 && verify_attempts >= cfg.max_verify_attempts
             {
                 if let Some(t) = &turn.content {
@@ -1850,7 +1868,9 @@ where
             // mode (roles.oracle configured → closure supplied) has a stronger model review the
             // `git diff` — its findings come back as a fix-or-rebut turn; an LGTM costs nothing
             // extra. Nudge mode makes THIS model re-read its own diff.
-            if cfg.enable_self_review && made_any_edits && !self_review_done {
+            // Skipped (latch UNSPENT) when this round's verify failed: the once-per-run oracle call
+            // must review code that typechecks, not the broken tree the verify demand is about.
+            if cfg.enable_self_review && made_any_edits && !self_review_done && !verify_failed_now {
                 self_review_done = true;
                 match &oracle {
                     // ORACLE MODE: the verify step gates Done. A review with a [BLOCKING] finding
@@ -1860,44 +1880,23 @@ where
                     Some(o) => {
                         if let Some(review) = oracle_review(o, &review_request).await {
                             if review.blocking {
-                                // Record the premature "done" so the review turn reads coherently,
-                                // then hand back a fix-or-rebut turn (the verify step gates Done).
-                                if let Some(t) = &turn.content {
-                                    if !t.trim().is_empty() {
-                                        messages.push(Message::assistant(t.clone()));
-                                    }
-                                }
-                                messages.push(Message::user(format!(
+                                demands.push(format!(
                                     "[self-review]\n{}\n\nFix each [BLOCKING] item above, or state briefly why it does not apply — then give your final answer. [ADVISORY] items are optional.",
                                     review.findings
-                                )));
-                                iter += 1;
-                                continue;
-                            }
-                            // Advisory-only: surface the notes ONCE as a trace (they don't gate
-                            // Done — the model isn't forced to churn on style), then finish this
-                            // turn. Falls through to the shared Done return below, which records the
-                            // final assistant text exactly once (no duplicate).
-                            if !cfg.quiet {
+                                ));
+                            } else if !cfg.quiet {
+                                // Advisory-only: surface the notes ONCE as a trace (they don't gate
+                                // Done — the model isn't forced to churn on style).
                                 emit_trace(&format!(
                                     "  └ self-review: advisory only (no blocking issue)\n{}",
                                     review.findings
                                 ));
                             }
                         }
-                        // else: LGTM / no diff → fall through to Done, no extra turn.
+                        // else: LGTM / no diff → no demand, no extra turn.
                     }
-                    // NUDGE MODE (no oracle): the model re-reads its own diff. One turn, always.
-                    None => {
-                        if let Some(t) = &turn.content {
-                            if !t.trim().is_empty() {
-                                messages.push(Message::assistant(t.clone()));
-                            }
-                        }
-                        messages.push(Message::user(SELF_REVIEW_NUDGE.to_string()));
-                        iter += 1;
-                        continue;
-                    }
+                    // NUDGE MODE (no oracle): the model re-reads its own diff. One demand, always.
+                    None => demands.push(SELF_REVIEW_NUDGE.to_string()),
                 }
             }
 
@@ -1921,28 +1920,18 @@ where
                             eprintln!("{line}");
                         }
                     }
-                    messages.push(Message {
-                        role: "assistant".to_string(),
-                        content: Some(turn.content.clone().unwrap_or_default()),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                        images: Vec::new(),
-                        cache_control: None,
-                    });
-                    messages.push(Message::user(format!(
+                    demands.push(format!(
                         "{TODO_POKE_PREFIX} Session todos are still incomplete — you may not finish yet.\n\n\
                          Incomplete:\n{summary}\n\n\
                          Either (a) finish the remaining items and verify, or (b) mark items done only \
                          if genuinely complete, or (c) clear the todo list to abandon the plan — then stop.\n\
                          Attempt {todo_poke_attempts}/{}.",
                         cfg.max_todo_poke_attempts
-                    )));
-                    iter += 1;
-                    continue;
+                    ));
                 }
             }
 
-            // P0.2 CONFIDENCE GATE: Done + large confidence jump → one-shot re-check turn.
+            // P0.2 CONFIDENCE GATE: Done + large confidence jump → one-shot re-check demand.
             if cfg.enable_confidence_gate && confidence_gate_armed && !confidence_gate_cleared {
                 confidence_gate_cleared = true;
                 if !cfg.quiet {
@@ -1953,6 +1942,21 @@ where
                         eprintln!("{line}");
                     }
                 }
+                demands.push(format!(
+                    "{CONFIDENCE_GATE_PREFIX} You marked todo(s) done with a large confidence jump \
+                     without stepwise evidence.\n\n\
+                     Before finishing: re-run the relevant check (tests / verify / metric). \
+                     If checks pass, keep Done. If not, reopen the todo and fix.\n\
+                     This gate fires once per run."
+                ));
+            }
+
+            // FLUSH the merged cascade: every demand that fired above rides ONE round-trip. The
+            // premature assistant text is recorded once (content normalized to "" — an assistant
+            // turn with neither content nor tool_calls is malformed (400) on strict gateways), then
+            // a single user message carries all demands. With one demand the message is byte-equal
+            // to what the old per-gate loop sent.
+            if !demands.is_empty() {
                 messages.push(Message {
                     role: "assistant".to_string(),
                     content: Some(turn.content.clone().unwrap_or_default()),
@@ -1961,13 +1965,16 @@ where
                     images: Vec::new(),
                     cache_control: None,
                 });
-                messages.push(Message::user(format!(
-                    "{CONFIDENCE_GATE_PREFIX} You marked todo(s) done with a large confidence jump \
-                     without stepwise evidence.\n\n\
-                     Before finishing: re-run the relevant check (tests / verify / metric). \
-                     If checks pass, keep Done. If not, reopen the todo and fix.\n\
-                     This gate fires once per run."
-                )));
+                let combined = if demands.len() == 1 {
+                    demands.pop().expect("non-empty")
+                } else {
+                    format!(
+                        "Multiple checks fired on your \"done\" claim — address ALL of them in this \
+                         pass:\n\n{}",
+                        demands.join("\n\n---\n\n")
+                    )
+                };
+                messages.push(Message::user(combined));
                 iter += 1;
                 continue;
             }
@@ -2157,7 +2164,46 @@ where
         // with approval on THIS future. Eager starts from the streaming path are adopted by
         // position. Results land in ORIGINAL call order. (A DISCARDED turn — divergence/error —
         // simply drops its eager handles: detached, read-only, harmless.)
-        let eager = std::mem::take(&mut turn.eager);
+        let mut eager = std::mem::take(&mut turn.eager);
+        // IDENTICAL-RE-READ SHORT-CIRCUIT: a `file_read` whose canonical args exactly match an
+        // earlier call this run, whose file bytes are unchanged, and whose earlier result is still
+        // verbatim in history would return byte-identical content the model already has. Answer it
+        // with a one-line pointer instead — injected through the eager-adoption path so traces,
+        // ordering and cancellation stay uniform. (Measured sessions: 30% of tool calls re-hit a
+        // target already hit; the byte-identical subset is pure history bloat.) A real eager start
+        // for the same slot wins — its body already ran and its result is at least as good.
+        for (k, tc) in calls.iter().enumerate() {
+            if tc.function.name != "file_read" || eager.iter().any(|(i, _)| *i == k) {
+                continue;
+            }
+            let Some(entry) = read_cache.get(&canonical_args(&tc.function.arguments)) else {
+                continue;
+            };
+            let intact = messages.get(entry.msg_index).is_some_and(|m| {
+                m.role == "tool"
+                    && m.tool_call_id.as_deref() == Some(entry.call_id.as_str())
+                    && m.content.as_deref().is_some_and(|c| {
+                        c.chars().count() == entry.result_chars
+                            && c.starts_with(&entry.result_prefix)
+                    })
+            });
+            if !intact {
+                continue;
+            }
+            let unchanged = std::fs::read(&entry.path)
+                .map(|b| crate::core::persist::FileFingerprint::for_bytes(&b) == entry.fingerprint)
+                .unwrap_or(false);
+            if !unchanged {
+                continue;
+            }
+            let canned = format!(
+                "[unchanged] {} — identical to your earlier file_read this run; that result is \
+                 still in context above and the file has not changed since. Use what you already \
+                 have, or pass a different start/end for another slice.",
+                entry.path.display()
+            );
+            eager.push((k, tokio::task::spawn(async move { canned })));
+        }
         crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::ExecutingTools);
         let results = execute_calls(
             registry,
@@ -2229,6 +2275,95 @@ where
             }
             // Track the latest list so the next boundary is measured against it, moved or not.
             phase_todos_before = phase_todos_after;
+        }
+
+        // Remember this turn's file_read answers for the identical-re-read short-circuit. Only from
+        // turns with NO destructive call: a write in the same turn could have rewritten the file
+        // AFTER the read ran (reads precede the write barrier), and a fingerprint taken now would
+        // then attest to content the cached result does not show. Read-only turns — the dribble
+        // pattern this exists for — all record.
+        let turn_has_write = calls.iter().any(|tc| {
+            registry
+                .get(&tc.function.name)
+                .map(|t| t.is_destructive())
+                .unwrap_or(true)
+        });
+        if !turn_has_write {
+            for (k, (tc, (call_id, result))) in calls.iter().zip(results.iter()).enumerate() {
+                if tc.function.name != "file_read"
+                    || result.starts_with("error:")
+                    || result.starts_with("[unchanged]")
+                {
+                    continue;
+                }
+                let Ok(args) = parse_call_args(&tc.function.arguments) else {
+                    continue;
+                };
+                // The batch (`files:[…]`) form mixes several files in one result — one fingerprint
+                // cannot attest to it. Only the single-path form is cached.
+                if args.get("files").is_some() {
+                    continue;
+                }
+                let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Ok(resolved) =
+                    crate::agent::builtin::confine(&cfg.effective_root(), path, true)
+                else {
+                    continue;
+                };
+                let Ok(bytes) = std::fs::read(&resolved) else {
+                    continue;
+                };
+                if read_cache.len() >= 512 {
+                    read_cache.clear(); // bounded; a dropped entry only costs a re-read
+                }
+                read_cache.insert(
+                    canonical_args(&tc.function.arguments),
+                    ReadCacheEntry {
+                        path: resolved,
+                        fingerprint: crate::core::persist::FileFingerprint::for_bytes(&bytes),
+                        msg_index: base + k,
+                        call_id: call_id.clone(),
+                        result_chars: result.chars().count(),
+                        result_prefix: result.chars().take(48).collect(),
+                    },
+                );
+            }
+        }
+
+        // BATCH-COACH: three consecutive turns that each made exactly ONE read-only retrieval call
+        // is the dribble pattern the system prompt already warns about — name it mid-run, where the
+        // habit is visible. A system nudge rides the NEXT request (zero extra round-trips), once
+        // per run.
+        let is_read_lane = |name: &str| {
+            matches!(
+                name,
+                "file_read"
+                    | "search_files"
+                    | "file_glob"
+                    | "codebase_search"
+                    | "read_symbol"
+                    | "memory_search"
+                    | "web_fetch"
+                    | "web_search"
+            ) || name.starts_with("lsp_")
+        };
+        if calls.len() == 1 && is_read_lane(&calls[0].function.name) {
+            single_read_streak += 1;
+        } else {
+            single_read_streak = 0;
+        }
+        if !batch_nudged && single_read_streak >= BATCH_COACH_AFTER {
+            batch_nudged = true;
+            push_nudge(
+                messages,
+                NUDGE_BATCH,
+                "[batch] Your last few turns each made a single read-only call. Batch independent \
+                 reads/searches into ONE turn as parallel tool calls — file_read takes \
+                 files:[{path,start,end},…], search_files takes context:N — and sequence only when \
+                 one result decides the next call.",
+            );
         }
 
         // EVIDENCE / STALL GUARD: a turn is informative when it adds facts, changes the workspace, or
@@ -3683,6 +3818,26 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
 /// Pagination fields (e.g. file_read's start/end) are DELIBERATELY kept: a different read window is
 /// different work; a re-read returning identical bytes is caught by the content-novelty thrash guard
 /// instead (stripping them would flag legit sequential paging as divergence).
+/// One remembered `file_read` answer for the identical-re-read short-circuit: enough to prove
+/// "this exact call, against this exact file content, already answered — and its answer is still
+/// verbatim in history". All legs must hold; any miss falls back to a normal read. A false
+/// negative costs nothing, a false positive would starve the model of content it needs — so every
+/// check is byte-level.
+struct ReadCacheEntry {
+    /// Resolved on-disk path, for the fingerprint re-check.
+    path: std::path::PathBuf,
+    /// Fingerprint of the file bytes the cached result described. Recorded only from turns with
+    /// NO destructive call, so it provably equals the content at read time (nothing in the same
+    /// turn could have rewritten the file between the read and the record).
+    fingerprint: crate::core::persist::FileFingerprint,
+    /// Where the result message sat when recorded — revalidated against id+len+prefix below, so a
+    /// shifted (compacted) or blanked (evicted) history can never false-match.
+    msg_index: usize,
+    call_id: String,
+    result_chars: usize,
+    result_prefix: String,
+}
+
 fn turn_signature(calls: &[ToolCall]) -> String {
     let mut sigs: Vec<String> = calls
         .iter()
@@ -4494,6 +4649,13 @@ const TODO_POKE_PREFIX: &str = "[todo-poke]";
 const CONFIDENCE_GATE_PREFIX: &str = "[confidence-gate]";
 /// P0.3 hill-climb reframe / remeasure (system nudge via push_nudge).
 const NUDGE_HILL_CLIMB: &str = "[hill-climb]";
+/// Batch-coach (system nudge via push_nudge, once per run): fires after several consecutive
+/// turns that each made exactly ONE read-only call — measured sessions dribble 91% single-call
+/// turns despite the system prompt asking for batching, so the reminder lands mid-run where the
+/// habit is visible, at zero extra round-trips.
+const NUDGE_BATCH: &str = "[batch]";
+/// Consecutive one-read-call turns before the batch coach speaks. Three is a pattern, not luck.
+const BATCH_COACH_AFTER: usize = 3;
 /// GOAL MODE poke (user role — hard block path): the model tried to stop without having declared
 /// completion via `goal_complete`, so we re-inject the goal text and keep it working. Mirrors the
 /// todo-poke gate's shape (a `user` message the model can't ignore), not a soft system nudge.
@@ -9332,6 +9494,176 @@ mod tests {
             "poke lists the open item"
         );
         todo::clear();
+    }
+
+    #[tokio::test]
+    async fn done_gates_merge_into_one_round_trip() {
+        // self-review (nudge mode) + incomplete todos both fire on the SAME "done" claim: the old
+        // cascade spent one LLM round-trip PER gate; the merged flush carries both demands in ONE
+        // combined user message, with each gate's budget/latch consumed exactly as before.
+        let _t = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _h = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        todo::set(vec![todo::Todo::new("open-item", todo::Status::Pending)]);
+        let r = registry();
+        let c = AgentConfig {
+            enable_self_review: true,
+            enable_todo_poke: true,
+            max_todo_poke_attempts: 1,
+            approval_mode: crate::core::approval::ApprovalMode::Yolo,
+            max_iters: 8,
+            auto_extend_to: 8,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("edit something")];
+        let chat = scripted(vec![
+            tool_turn("delete", "{}"), // successful destructive op arms made_any_edits
+            final_turn("first done"),  // BOTH gates fire here — one merged message
+            final_turn("second done"), // both budgets spent → accepted
+        ]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.final_text.as_deref(), Some("second done"));
+        let merged: Vec<&Message> = messages
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with("Multiple checks fired"))
+            })
+            .collect();
+        assert_eq!(merged.len(), 1, "one combined message, not one per gate");
+        let body = merged[0].content.as_deref().unwrap();
+        assert!(body.contains("[self-review]"), "{body}");
+        assert!(body.contains(TODO_POKE_PREFIX), "{body}");
+        // The old one-gate-one-message shape is gone: neither demand went out standalone.
+        assert!(
+            !messages.iter().any(|m| {
+                m.role == "user"
+                    && m.content.as_deref().is_some_and(|c| {
+                        c.starts_with("[self-review]") || c.starts_with(TODO_POKE_PREFIX)
+                    })
+            }),
+            "both demands rode the merged message"
+        );
+        assert_valid_history(&messages);
+        todo::clear();
+    }
+
+    /// A stub named `file_read` — the loop's re-read short-circuit and batch coach key on the tool
+    /// NAME, and the property under test is the LOOP's bookkeeping, not the real reader's slicing.
+    struct StubFileRead;
+    impl Tool for StubFileRead {
+        fn name(&self) -> &str {
+            "file_read"
+        }
+        fn description(&self) -> &str {
+            "stub file reader"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})
+        }
+        fn execute(&self, args: &serde_json::Value) -> Result<String> {
+            let p = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            Ok(std::fs::read_to_string(p)?)
+        }
+    }
+
+    #[tokio::test]
+    async fn identical_re_read_short_circuits_only_while_unchanged() {
+        let dir = std::env::temp_dir().join(format!("aizen-reread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "alpha").unwrap();
+        let args = serde_json::json!({"path": file.to_string_lossy()}).to_string();
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(StubFileRead));
+        let c = AgentConfig {
+            max_iters: 10,
+            auto_extend_to: 10,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("read it")];
+        // Turn 1 reads. Turn 2 repeats the call byte-for-byte → short-circuited. Before turn 3 the
+        // CHAT CLOSURE rewrites the file, so the third identical call must fall through to a real
+        // read (the fingerprint leg fails) — a false "unchanged" here would starve the model.
+        let file_for_chat = file.clone();
+        let turns = Mutex::new(VecDeque::from(vec![
+            tool_turn("file_read", &args),
+            tool_turn("file_read", &args),
+            tool_turn("file_read", &args),
+            final_turn("done"),
+        ]));
+        let chat = move |_m: Vec<Message>, _d: Vec<ToolDef>| {
+            let mut q = turns.lock().unwrap();
+            if q.len() == 2 {
+                // about to hand out the THIRD call — change the file under it
+                std::fs::write(&file_for_chat, "beta").unwrap();
+            }
+            std::future::ready(Ok(q.pop_front().unwrap_or_else(|| final_turn("stop"))))
+        };
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        let tool_bodies: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        assert_eq!(tool_bodies.len(), 3, "{tool_bodies:?}");
+        assert_eq!(tool_bodies[0], "alpha");
+        assert!(
+            tool_bodies[1].starts_with("[unchanged]"),
+            "byte-identical repeat of an unchanged file answers with a pointer: {}",
+            tool_bodies[1]
+        );
+        assert_eq!(
+            tool_bodies[2], "beta",
+            "a changed file must be re-read for real, never short-circuited"
+        );
+        assert_valid_history(&messages);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn batch_coach_nudges_once_after_a_single_read_streak() {
+        let dir = std::env::temp_dir().join(format!("aizen-batchcoach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut turns = Vec::new();
+        for i in 0..4 {
+            let f = dir.join(format!("f{i}.txt"));
+            std::fs::write(&f, format!("body-{i}")).unwrap();
+            let args = serde_json::json!({"path": f.to_string_lossy()}).to_string();
+            turns.push(tool_turn("file_read", &args));
+        }
+        turns.push(final_turn("done"));
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(StubFileRead));
+        let c = AgentConfig {
+            max_iters: 10,
+            auto_extend_to: 10,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("survey the files")];
+        let out = run_agent_loop(scripted(turns), &c, &r, &mut messages)
+            .await
+            .unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        let coach_count = messages
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with(NUDGE_BATCH))
+            })
+            .count();
+        // Fired at streak 3, latched thereafter — the 4th single read must not re-nudge.
+        assert_eq!(coach_count, 1, "one batch-coach nudge per run");
+        assert_valid_history(&messages);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Steering is a process-global mailbox (the keyboard thread has no handle on the running turn),

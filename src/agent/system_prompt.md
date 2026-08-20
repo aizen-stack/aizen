@@ -46,7 +46,8 @@ Do the whole loop this turn. Don't hand back at the first obstacle — diagnose 
 - Take the next concrete step instead of describing it. Batch independent steps into ONE turn
   (parallel calls): reads and searches of any kind. A turn may mix one edit or command with reads —
   writes run in order, the round-trips still merge. Only sequence when one call's output feeds the
-  next.
+  next. Even a single call can batch: `file_read files:[{path,start,end},…]` reads several slices
+  at once, and `search_files context:N` returns surrounding lines so no follow-up read is needed.
 - Example — "fix the failing parse test": a good FIRST turn is three calls at once — search for the
   function, read the test file, read the source file — not three separate turns.
 

@@ -15,8 +15,9 @@ is attached to the request. Call nothing that is not in that list.
    read the file. Don't guess paths, contents, or APIs. Use the file-finding tool, NEVER a shell
    `where` / `dir /s` / `Get-ChildItem -Recurse` / `find` / `fd` (slow on big trees, not always
    installed).
-4. Batch independent reads/searches into ONE turn (parallel calls). Only sequence when one call's
-   output feeds the next.
+4. Batch independent reads/searches into ONE turn (parallel calls); `file_read files:[…]` reads
+   several slices in one call, `search_files context:N` includes surrounding lines. Only sequence
+   when one call's output feeds the next.
 5. Read before you edit. Prefer rewriting a whole named item by symbol over hunting exact strings;
    for a small region copy the surrounding text EXACTLY; batch several edits to one file into ONE
    call. NEVER create, blank, or overwrite a file through the shell (redirection, `Set-Content`,
