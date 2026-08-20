@@ -1673,33 +1673,27 @@ impl FileRead {
         Self { root }
     }
 }
-impl Tool for FileRead {
-    fn name(&self) -> &str {
-        "file_read"
-    }
-    fn description(&self) -> &str {
-        "Read a file (optionally a 1-based line range). Use before editing. Set number:true to \
-         prefix each line with its 1-based number (`N|line`) for orientation — leave it off (the \
-         default) when you'll feed the text back into file_edit's old_string. A relative path \
-         resolves under the working directory; an absolute path or `../` reads elsewhere too. \
-         To learn a file's shape use lsp_document_symbols, and to read ONE named item use \
-         read_symbol — both are far cheaper than dumping the whole file here. Read-only."
-    }
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "start": {"type": "integer", "description": "1-based first line (optional)"},
-                "end": {"type": "integer", "description": "1-based last line (optional)"},
-                "number": {"type": "boolean", "description": "prefix each line with `N|` (default false)"}
-            },
-            "required": ["path"],
-            "additionalProperties": false
-        })
-    }
-    fn execute(&self, args: &Value) -> Result<String> {
-        let path = str_arg(args, "path")?;
+/// Cap on entries honoured in one `files:[…]` batch read. Enough to cover every hit of a search
+/// turn in one call; anything past it is reported (never silently dropped) so the model knows to
+/// call again.
+const MULTI_READ_MAX_FILES: usize = 8;
+
+impl FileRead {
+    /// One file (or slice of it) — the shared body behind both the single `path` form and each
+    /// `files:[…]` entry. `max_lines`/`max_bytes` bound a WHOLE-file read (a batch splits the
+    /// single-call budget across its entries); `symbol_hint` gates the LSP advisory, which only
+    /// the single form emits (once per batch would be spam).
+    #[allow(clippy::too_many_arguments)]
+    fn read_one(
+        &self,
+        path: &str,
+        start: Option<u64>,
+        end: Option<u64>,
+        number: bool,
+        max_lines: usize,
+        max_bytes: usize,
+        symbol_hint: bool,
+    ) -> Result<String> {
         let resolved = confine(&self.root, path, true)?;
         let content = std::fs::read_to_string(&resolved)
             .with_context(|| format!("reading {}", resolved.display()))?;
@@ -1711,25 +1705,21 @@ impl Tool for FileRead {
             &resolved,
             &crate::core::persist::FileFingerprint::for_bytes(content.as_bytes()),
         );
-        let start = args.get("start").and_then(|v| v.as_u64());
-        let end = args.get("end").and_then(|v| v.as_u64());
-        let number = args
-            .get("number")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
         // The whole file — verbatim under budget (the common case; keeps old_string round-trips
         // byte-exact), or a clearly-marked head+tail preview when it's pathologically large.
         if start.is_none() && end.is_none() && !number {
-            let view = budget_view(&content, path, FILE_READ_MAX_LINES, FILE_READ_MAX_BYTES);
+            let view = budget_view(&content, path, max_lines, max_bytes);
             // Retrieval-first nudge (mức 2): a long whole-file SOURCE read the model likely needs
             // one item from. Advisory — the full `view` still follows — and only when the symbol
             // tools it names are actually available (`is_code` + LSP on). Prepended so the model
             // sees it before committing to re-reading the same file next turn.
-            let is_code = crate::agent::lsp::discovery::server_for_path(&resolved).is_some();
-            let lsp_on = crate::agent::lsp::LSP.is_enabled();
-            let line_count = content.lines().count();
-            if let Some(hint) = whole_file_symbol_hint(is_code, lsp_on, line_count) {
-                return Ok(format!("{hint}\n{view}"));
+            if symbol_hint {
+                let is_code = crate::agent::lsp::discovery::server_for_path(&resolved).is_some();
+                let lsp_on = crate::agent::lsp::LSP.is_enabled();
+                let line_count = content.lines().count();
+                if let Some(hint) = whole_file_symbol_hint(is_code, lsp_on, line_count) {
+                    return Ok(format!("{hint}\n{view}"));
+                }
             }
             return Ok(view);
         }
@@ -1750,6 +1740,112 @@ impl Tool for FileRead {
         } else {
             Ok(lines[s - 1..e].join("\n"))
         }
+    }
+
+    /// The `files:[…]` batch form: N files/slices in ONE call — one round-trip instead of a
+    /// read-per-turn dribble. Per-entry errors are reported INLINE (a missing file must not void
+    /// the seven good reads next to it), and whole-file entries split the single-call budget so a
+    /// batch cannot admit N× the bytes one call may return.
+    fn read_many(&self, list: &[Value], args: &Value) -> Result<String> {
+        if list.is_empty() {
+            bail!("files[] is empty — pass at least one {{path,start,end}} entry, or use `path`");
+        }
+        let number = args
+            .get("number")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let shown = &list[..list.len().min(MULTI_READ_MAX_FILES)];
+        let per_lines = (FILE_READ_MAX_LINES / shown.len()).max(200);
+        let per_bytes = (FILE_READ_MAX_BYTES / shown.len()).max(20_000);
+        let mut out: Vec<String> = Vec::with_capacity(shown.len() + 1);
+        for entry in shown {
+            let Some(path) = entry.get("path").and_then(|v| v.as_str()) else {
+                out.push("── (entry missing `path`) ──".to_string());
+                continue;
+            };
+            let start = entry.get("start").and_then(|v| v.as_u64());
+            let end = entry.get("end").and_then(|v| v.as_u64());
+            let header = match (start, end) {
+                (None, None) => format!("── {path} ──"),
+                (s, e) => format!(
+                    "── {path}:{}-{} ──",
+                    s.map_or("1".to_string(), |v| v.to_string()),
+                    e.map_or("end".to_string(), |v| v.to_string()),
+                ),
+            };
+            match self.read_one(path, start, end, number, per_lines, per_bytes, false) {
+                Ok(body) => out.push(format!("{header}\n{body}")),
+                Err(err) => out.push(format!("{header}\nerror: {err:#}")),
+            }
+        }
+        if list.len() > MULTI_READ_MAX_FILES {
+            out.push(format!(
+                "…[{} more file(s) not read — {MULTI_READ_MAX_FILES} per call max; call again for the rest]",
+                list.len() - MULTI_READ_MAX_FILES
+            ));
+        }
+        Ok(out.join("\n"))
+    }
+}
+
+impl Tool for FileRead {
+    fn name(&self) -> &str {
+        "file_read"
+    }
+    fn description(&self) -> &str {
+        "Read a file (optionally a 1-based start/end line range), or SEVERAL files in ONE call via \
+         files:[{path,start,end},…] — batch independent reads instead of one per turn. Use before \
+         editing. Set number:true to prefix each line with its 1-based number (`N|line`) — leave it \
+         off (the default) when you'll feed the text back into file_edit's old_string. A relative \
+         path resolves under the working directory; absolute or `../` paths read elsewhere too. For \
+         ONE named item prefer lsp_document_symbols + read_symbol over dumping the file. Read-only."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "start": {"type": "integer", "description": "1-based first line (optional)"},
+                "end": {"type": "integer", "description": "1-based last line (optional)"},
+                "number": {"type": "boolean", "description": "prefix each line with `N|` (default false)"},
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "start": {"type": "integer"},
+                            "end": {"type": "integer"}
+                        },
+                        "required": ["path"]
+                    },
+                    "description": "batch form: several files/slices in one call (max 8); overrides path"
+                }
+            },
+            "required": [],
+            "additionalProperties": false
+        })
+    }
+    fn execute(&self, args: &Value) -> Result<String> {
+        if let Some(list) = args.get("files").and_then(|v| v.as_array()) {
+            return self.read_many(list, args);
+        }
+        let path = str_arg(args, "path")?;
+        let start = args.get("start").and_then(|v| v.as_u64());
+        let end = args.get("end").and_then(|v| v.as_u64());
+        let number = args
+            .get("number")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        self.read_one(
+            path,
+            start,
+            end,
+            number,
+            FILE_READ_MAX_LINES,
+            FILE_READ_MAX_BYTES,
+            true,
+        )
     }
 }
 
@@ -3657,6 +3753,53 @@ mod tests {
         assert!(whole_file_symbol_hint(false, true, 800).is_none());
         assert!(whole_file_symbol_hint(true, false, 800).is_none());
         assert!(whole_file_symbol_hint(true, true, FILE_READ_MAX_LINES + 1).is_none());
+    }
+
+    #[test]
+    fn file_read_files_batch_reads_slices_and_reports_per_file_errors() {
+        let root = temp_root("multi-read");
+        std::fs::write(root.join("a.txt"), "alpha-1\nalpha-2\nalpha-3\n").unwrap();
+        std::fs::write(root.join("b.txt"), "beta-1\nbeta-2\nbeta-3\nbeta-4\n").unwrap();
+        let t = FileRead::new(root);
+        let out = t
+            .execute(&serde_json::json!({"files": [
+                {"path": "a.txt"},
+                {"path": "b.txt", "start": 2, "end": 3},
+                {"path": "missing.txt"}
+            ]}))
+            .unwrap();
+        // Whole file, a range slice, and an inline per-entry error — all in ONE result.
+        assert!(out.contains("── a.txt ──"), "whole-file header: {out}");
+        assert!(out.contains("alpha-3"), "whole-file body: {out}");
+        assert!(out.contains("── b.txt:2-3 ──"), "range header: {out}");
+        assert!(out.contains("beta-2\nbeta-3"), "range body: {out}");
+        assert!(!out.contains("beta-4"), "range must exclude line 4: {out}");
+        assert!(
+            out.contains("── missing.txt ──\nerror:"),
+            "a missing file reports inline instead of voiding the batch: {out}"
+        );
+    }
+
+    #[test]
+    fn file_read_files_batch_caps_entries_and_says_so() {
+        let root = temp_root("multi-read-cap");
+        for i in 0..10 {
+            std::fs::write(root.join(format!("f{i}.txt")), format!("body-{i}\n")).unwrap();
+        }
+        let files: Vec<serde_json::Value> = (0..10)
+            .map(|i| serde_json::json!({"path": format!("f{i}.txt")}))
+            .collect();
+        let t = FileRead::new(root);
+        let out = t.execute(&serde_json::json!({ "files": files })).unwrap();
+        assert!(out.contains("body-7"), "8th entry still read: {out}");
+        assert!(
+            !out.contains("body-8"),
+            "9th entry must be dropped, not read: {out}"
+        );
+        assert!(
+            out.contains("2 more file(s) not read"),
+            "the drop is REPORTED, never silent: {out}"
+        );
     }
 
     #[test]
