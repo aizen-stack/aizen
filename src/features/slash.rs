@@ -71,7 +71,7 @@ pub enum SlashId {
     Redo,
     Quit,
     Save,
-Smart,
+    Smart,
     Team,
     Yolo,
     AutoCopy,
@@ -992,7 +992,7 @@ mod tests {
     }
 
     #[test]
-fn init_and_currently_omitted_commands_are_catalogued() {
+    fn init_and_currently_omitted_commands_are_catalogued() {
         let names: std::collections::HashSet<String> = list().into_iter().map(|c| c.name).collect();
         for name in [
             "init",
@@ -1011,15 +1011,9 @@ fn init_and_currently_omitted_commands_are_catalogued() {
         ] {
             assert!(names.contains(name), "slash catalog must include /{name}");
         }
-        assert_eq!(
-            resolve("auto-copy").map(|b| b.id),
-            Some(SlashId::AutoCopy)
-        );
+        assert_eq!(resolve("auto-copy").map(|b| b.id), Some(SlashId::AutoCopy));
         assert_eq!(resolve("autocopy").map(|b| b.id), Some(SlashId::AutoCopy));
-        assert_eq!(
-            cmd("/auto-copy off"),
-            ("auto-copy".into(), "off".into())
-        );
+        assert_eq!(cmd("/auto-copy off"), ("auto-copy".into(), "off".into()));
     }
 
     // ── classify ────────────────────────────────────────────────────────────────────────────

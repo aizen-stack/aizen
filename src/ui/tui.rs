@@ -82,7 +82,12 @@ impl PasteEchoDedupe {
     }
 
     /// True → caller must NOT insert `incoming`; it is the other channel's echo of what we already applied.
-    fn should_skip_text(&mut self, incoming: &str, incoming_origin: PasteOrigin, now: Instant) -> bool {
+    fn should_skip_text(
+        &mut self,
+        incoming: &str,
+        incoming_origin: PasteOrigin,
+        now: Instant,
+    ) -> bool {
         if !self.alive(now) || self.origin == incoming_origin || self.text != incoming {
             return false;
         }
@@ -1787,7 +1792,7 @@ fn handle_retained_mouse(
                 }
             }
         }
-MouseEventKind::Up(MouseButton::Left) => {
+        MouseEventKind::Up(MouseButton::Left) => {
             if *dragging_scrollbar {
                 *dragging_scrollbar = false;
             } else if let Some(sel) = selecting.take() {
@@ -1859,7 +1864,7 @@ fn handle_input_box_mouse(
             }
             true
         }
-MouseEventKind::Up(MouseButton::Left) => {
+        MouseEventKind::Up(MouseButton::Left) => {
             if dragging_draft.take().is_none() {
                 return false;
             }
@@ -2079,7 +2084,7 @@ fn input_loop(
     let mut last_arrival: Option<Instant> = None;
     // Arrival time TWO keys ago, for detecting paste burst end (when prev was buffered but current is not).
     let mut last_arrival_prev: Option<Instant> = None;
-// Draft was edited during a paste burst without a repaint. Flushed on the first idle poll after
+    // Draft was edited during a paste burst without a repaint. Flushed on the first idle poll after
     // the burst ends (see short timeout below) so the full paste appears without needing another key.
     let mut pending_paste_repaint = false;
     // Collapses clipboard-gesture paste + terminal echo (bracketed paste / key burst) of the same
@@ -2212,7 +2217,7 @@ fn input_loop(
                 screensaver_up = false;
                 continue;
             }
-// Bracketed paste (when the terminal supports it): one event, whole string, one repaint.
+            // Bracketed paste (when the terminal supports it): one event, whole string, one repaint.
             // Falls through to the key-burst / clipboard path below on hosts that still synthesize
             // pastes as key events or offer no paste channel at all (classic conhost/CMD).
             //
@@ -2228,11 +2233,7 @@ fn input_loop(
                         .unwrap_or(false);
                     if !skip {
                         insert_draft_text(&text);
-                        paste_echo = Some(PasteEchoDedupe::new(
-                            text,
-                            PasteOrigin::Bracketed,
-                            now,
-                        ));
+                        paste_echo = Some(PasteEchoDedupe::new(text, PasteOrigin::Bracketed, now));
                         hist_idx = None;
                         last_arrival = None;
                         last_arrival_prev = None;
@@ -2246,7 +2247,7 @@ fn input_loop(
                 Event::Key(ke) if ke.kind == KeyEventKind::Press => {
                     // Shift+Insert = paste (classic Windows / terminal convention). Handled here
                     // because `crossterm_to_console_key` drops the Shift bit on Insert.
-if ke.code == KeyCode::Insert && ke.modifiers.contains(KeyModifiers::SHIFT) {
+                    if ke.code == KeyCode::Insert && ke.modifiers.contains(KeyModifiers::SHIFT) {
                         if paste_clipboard_into_draft(&mut paste_echo).is_some() {
                             hist_idx = None;
                             last_arrival = None;
@@ -2330,12 +2331,12 @@ if ke.code == KeyCode::Insert && ke.modifiers.contains(KeyModifiers::SHIFT) {
                 }
                 Event::Mouse(me) if retained::is_active() => {
                     use crossterm::event::{MouseButton, MouseEventKind};
-// Right-click paste. conhost/CMD's own Quick-Edit paste never reaches us once
+                    // Right-click paste. conhost/CMD's own Quick-Edit paste never reaches us once
                     // mouse capture is on (we need capture for wheel + selection), so the app has
                     // to own the gesture. Down only — Up would double-insert the same clipboard.
                     // Arm paste_echo so a following Event::Paste / key-burst of the same text
                     // (Windows Terminal) is swallowed instead of doubling the draft.
-if matches!(me.kind, MouseEventKind::Down(MouseButton::Right)) {
+                    if matches!(me.kind, MouseEventKind::Down(MouseButton::Right)) {
                         if paste_clipboard_into_draft(&mut paste_echo).is_some() {
                             hist_idx = None;
                             last_arrival = None;
@@ -2487,7 +2488,7 @@ if matches!(me.kind, MouseEventKind::Down(MouseButton::Right)) {
             }
         }
         match key {
-// A newline INSIDE a paste → a literal newline in the draft, never a submit. This is the
+            // A newline INSIDE a paste → a literal newline in the draft, never a submit. This is the
             // fix for a multi-line paste firing one message per line: the whole paste accumulates in
             // one draft and is sent (and read by the model) as a single message.
             // Same echo-dedupe as Key::Char: a clipboard-gesture paste already inserted the
@@ -2664,7 +2665,7 @@ if matches!(me.kind, MouseEventKind::Down(MouseButton::Right)) {
                                                 // leaving it pending would re-inject it into the NEXT turn out of context (the REPL
                                                 // also flushes the submission queue for the same reason).
                     crate::core::steer::clear();
-} else if matches!(key, Key::CtrlC | Key::Char('\u{3}')) {
+                } else if matches!(key, Key::CtrlC | Key::Char('\u{3}')) {
                     // Ctrl-C (Windows/Linux) and ⌘C (macOS — folded to '\u{3}' above) carry TWO
                     // meanings, and copy takes the first press.
                     //
@@ -2754,7 +2755,7 @@ if matches!(me.kind, MouseEventKind::Down(MouseButton::Right)) {
                     repaint();
                 }
             }
-Key::Char('\u{16}') => {
+            Key::Char('\u{16}') => {
                 // Ctrl-V: paste clipboard TEXT into the draft. Required on classic conhost/CMD
                 // (and any host that neither bracketed-pastes nor injects a key burst): mouse
                 // capture steals the terminal's right-click paste, and Ctrl-V arrives here as a
@@ -2796,7 +2797,7 @@ Key::Char('\u{16}') => {
                 // so nothing is lost — scroll position and draft included.
                 force_redraw();
             }
-Key::Char(c) if c.is_control() => {} // ignore stray control chars
+            Key::Char(c) if c.is_control() => {} // ignore stray control chars
             Key::Char(c) => {
                 // After a clipboard-gesture paste, some hosts also inject the same text as a
                 // key-burst. Swallow those chars so right-click doesn't double the draft.
@@ -4270,13 +4271,14 @@ mod tests {
         assert_ne!(Submission::Quit, Submission::Slash("help".into()));
     }
 
-/// macOS copy is ⌘C (crossterm SUPER), not Ctrl-C. Folding SUPER+letter to the same control
+    /// macOS copy is ⌘C (crossterm SUPER), not Ctrl-C. Folding SUPER+letter to the same control
     /// byte as Ctrl keeps one copy/quit arm and makes `/auto-copy off` usable on Mac terminals
     /// that actually deliver the Command modifier.
     #[test]
     fn super_c_folds_to_the_same_control_byte_as_ctrl_c() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let ctrl = crossterm_to_console_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let ctrl =
+            crossterm_to_console_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         let cmd = crossterm_to_console_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
         let plain = crossterm_to_console_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
         assert_eq!(ctrl, Some(Key::Char('\u{3}')));

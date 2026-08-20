@@ -91,7 +91,7 @@ pub struct CliConfig {
     /// `reasoning_effort` above, if any, is used). The per-turn effort is NEVER persisted here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_effort: Option<bool>,
-/// "Ultimate mode": pin max reasoning effort + prefer launching workflows (orchestrate-by-default).
+    /// "Ultimate mode": pin max reasoning effort + prefer launching workflows (orchestrate-by-default).
     /// The aizen analogue of Claude Code's `ultracode` (xhigh + standing orchestration permission).
     /// `None`/`Some(false)` ⇒ off; `Some(true)` ⇒ on. Toggle live with `/ultimate`, or force via
     /// `AIZEN_ULTIMATE`.
@@ -1627,7 +1627,7 @@ mod tests {
         assert!("sometimes".parse::<ResponseVisuals>().is_err());
     }
 
-#[test]
+    #[test]
     fn auto_copy_defaults_on_and_honours_field_and_env() {
         // Isolate from the developer's real ~/.aizen and any ambient AIZEN_AUTO_COPY.
         let dir = std::env::temp_dir().join(format!("aizen-auto-copy-{}", std::process::id()));
