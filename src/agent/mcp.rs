@@ -581,9 +581,22 @@ struct StdioTransport {
     stderr: Arc<std::sync::Mutex<String>>,
     /// Literal secret values (env/header/token) to strip from the stderr tail before it's surfaced.
     secrets: Vec<String>,
+    /// Whole-TREE containment (Windows Job Object / Unix process group). `kill_on_drop` on
+    /// `_child` reaps only the direct child — the `cmd /C` shim on Windows — so without this the
+    /// real server process it launched outlived the transport, holding pipes open. Terminated in
+    /// `Drop` below.
+    containment: crate::core::proctree::Containment,
     /// Sandbox bookkeeping (audit already written as `spawned`); holds the server's private temp
     /// directory alive for the connection's lifetime.
     _sandbox: crate::sandbox::runner::SpawnGuard,
+}
+
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        // Kill the whole tree, not just the shim. Runs before the fields drop, so `kill_on_drop`
+        // on `_child` afterwards is a harmless second shot at an already-dead process.
+        crate::core::proctree::terminate_tree(&self.containment);
+    }
 }
 
 impl StdioTransport {
@@ -1469,6 +1482,12 @@ async fn connect_stdio(cfg: &ServerConfig) -> Result<Transport> {
             return Err(e).with_context(|| format!("spawning MCP server `{command}`"));
         }
     };
+    // TREE containment, same as every other runner-prepared spawn. `kill_on_drop` alone reaps
+    // only the direct child — which on Windows is the `cmd /C` shim, so dropping the transport
+    // orphaned the real `node.exe`/`python.exe` holding the pipes: exactly the orphan class
+    // `proctree` exists to eliminate. This also arms the sandbox policy's Windows JobLimits,
+    // which ride on containment and were never applied to MCP children before.
+    let containment = sbx.contain_tokio(&child);
     let mut server_guard = sbx.into_guard();
     server_guard.finish(crate::sandbox::runner::Outcome::Spawned);
     let stdin = child.stdin.take().context("child stdin unavailable")?;
@@ -1503,6 +1522,7 @@ async fn connect_stdio(cfg: &ServerConfig) -> Result<Transport> {
         stderr: stderr_buf,
         // Env values commonly carry the child's API key/token — mask them out of the stderr tail.
         secrets: server_secrets(cfg, None),
+        containment,
         _sandbox: server_guard,
     }))
 }

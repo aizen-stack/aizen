@@ -689,6 +689,15 @@ struct Render {
     text_overlay_scroll: usize,
     text_overlay_title: String,
     text_overlay_lines: Vec<String>,
+    /// Destructive-op approval menu (the Claude-style picker over the y/n/a gate). Outranks every
+    /// other overlay: it only exists while the agent loop is BLOCKED waiting on the answer.
+    approval_menu_active: bool,
+    approval_menu_sel: usize,
+    /// `clarify` answer menu: the question's suggested options plus a trailing "type my own" row.
+    question_menu_active: bool,
+    question_menu_sel: usize,
+    question_menu_question: String,
+    question_menu_options: Vec<String>,
     /// Chat/slash submissions waiting while a turn runs (shown in the prompt placeholder).
     queued_count: usize,
 }
@@ -715,6 +724,12 @@ fn render() -> &'static Mutex<Render> {
             text_overlay_scroll: 0,
             text_overlay_title: String::new(),
             text_overlay_lines: Vec::new(),
+            approval_menu_active: false,
+            approval_menu_sel: 0,
+            question_menu_active: false,
+            question_menu_sel: 0,
+            question_menu_question: String::new(),
+            question_menu_options: Vec::new(),
             queued_count: 0,
         })
     })
@@ -864,10 +879,41 @@ pub fn reset_session_allow() {
     SESSION_ALLOW.store(false, Ordering::Relaxed);
 }
 
+/// The approval menu's rows, in the order painted. Index ↔ decision is pinned by
+/// [`approval_menu_decision`]; keep the two in lock-step.
+const APPROVAL_MENU_ROWS: [&str; 4] = [
+    "Yes — run this action",
+    "Yes — allow all destructive actions this session",
+    "No — skip this action (the agent continues)",
+    "No — stop the turn and tell it what to do",
+];
+
+/// Map an approval-menu row to `(answer_char, also_cancel_turn)`. The char is what the blocked
+/// [`ask_approval`] gate receives on its channel ('y' / 'a' / 'n'); `true` in the second slot means
+/// the row ALSO stops the turn (the Esc semantic: deny this call and unwind the loop, so the user
+/// can say what to do instead of watching the agent barrel on).
+fn approval_menu_decision(sel: usize) -> (char, bool) {
+    match sel {
+        0 => ('y', false),
+        1 => ('a', false),
+        2 => ('n', false),
+        _ => ('n', true),
+    }
+}
+
+/// Whether the approval MENU overlay is up (retained surface only — the y/n/a keys work regardless).
+fn approval_menu_showing() -> bool {
+    render().lock().unwrap().approval_menu_active
+}
+
 /// Block until the user answers an in-TUI approval prompt; `true` = allow. Routed through the
 /// keyboard thread so it composes with the pinned box instead of fighting it for stdin. MUST be
 /// called from the SERIAL tool path on a tokio worker (the caller wraps it in `block_in_place`),
 /// never from the parallel scoped-thread batch. Safe-denies if the TUI isn't active.
+///
+/// Under the retained backend this also raises the approval MENU overlay (arrow keys / Enter /
+/// mouse click pick a row); the y/n/a accelerator keys keep working either way, so the menu is a
+/// presentation layer over the same one-char channel, not a second decision path.
 pub fn ask_approval(prompt_line: &str) -> bool {
     if session_allow_all() {
         return true;
@@ -882,8 +928,25 @@ pub fn ask_approval(prompt_line: &str) -> bool {
     let (tx, rx) = stdmpsc::channel::<char>();
     *approval_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     APPROVAL_PENDING.store(true, Ordering::Relaxed);
+    let menu = retained_running();
+    if menu {
+        {
+            let mut r = render().lock().unwrap();
+            r.approval_menu_active = true;
+            r.approval_menu_sel = 0;
+        }
+        repaint_force();
+    }
     let ans = rx.recv().unwrap_or('n'); // a dropped sender (shouldn't happen) → safe-deny
     APPROVAL_PENDING.store(false, Ordering::Relaxed);
+    if menu {
+        {
+            let mut r = render().lock().unwrap();
+            r.approval_menu_active = false;
+            r.approval_menu_sel = 0;
+        }
+        repaint_force();
+    }
     match ans {
         'a' => {
             SESSION_ALLOW.store(true, Ordering::Relaxed);
@@ -892,6 +955,232 @@ pub fn ask_approval(prompt_line: &str) -> bool {
         'y' => true,
         _ => false,
     }
+}
+
+// ── clarify question menu ─────────────────────────────────────────────────────
+// When a `clarify` call pauses the turn WITH suggested options, the sticky REPL raises a picker over
+// the input box (Claude-style): ↑↓/click choose an option, Enter submits it as the next user
+// message through the SAME submission channel a typed answer would use. Esc — or just typing —
+// dismisses the menu and falls back to free-text, so the picker is a shortcut, never a cage.
+
+/// The trailing non-option row: dismisses the menu and hands focus back to the draft.
+const QUESTION_MENU_FREEFORM_ROW: &str = "✎ type my own answer…";
+
+/// Whether the clarify answer menu is up (input thread routes ↑↓/Enter/digits to it).
+pub fn question_menu_active() -> bool {
+    render().lock().unwrap().question_menu_active
+}
+
+/// Raise the clarify answer menu. No-ops outside the sticky TUI or with no options to offer — the
+/// free-text path (type your answer, press Enter) is always available and always correct.
+pub fn question_menu_open(question: &str, options: &[String]) {
+    if !active() || options.is_empty() {
+        return;
+    }
+    question_menu_set(question, options);
+    repaint_force();
+}
+
+/// State half of [`question_menu_open`], separated so tests can drive the menu without a live TUI.
+fn question_menu_set(question: &str, options: &[String]) {
+    let mut r = render().lock().unwrap();
+    r.question_menu_active = true;
+    r.question_menu_sel = 0;
+    r.question_menu_question = question.to_string();
+    r.question_menu_options = options.to_vec();
+}
+
+/// Dismiss the clarify answer menu (picked, Esc'd, or superseded by typing).
+fn question_menu_close() {
+    {
+        let mut r = render().lock().unwrap();
+        r.question_menu_active = false;
+        r.question_menu_sel = 0;
+        r.question_menu_question.clear();
+        r.question_menu_options.clear();
+    }
+    repaint_force();
+}
+
+/// Resolve a pick on the clarify menu: option rows submit the option text as the next user message
+/// (identical to typing it and pressing Enter); the trailing free-form row just dismisses.
+fn question_menu_pick(idx: usize, sub_tx: &UnboundedSender<Submission>) {
+    let text = {
+        let r = render().lock().unwrap();
+        r.question_menu_options.get(idx).cloned()
+    };
+    question_menu_close();
+    if let Some(text) = text {
+        if sub_tx.send(Submission::Chat(text, Vec::new())).is_ok() {
+            note_submission_enqueued();
+        }
+    }
+}
+
+/// Handle one key while the clarify menu is open. Returns `true` if the key was consumed.
+///
+/// Deliberately porous, unlike the other menus: printable chars and Backspace dismiss the menu and
+/// fall THROUGH to draft editing (`false`), because the menu offers suggestions — it must never
+/// stand between the user and typing their real answer. Enter with a non-empty draft also falls
+/// through, so an answer typed or pasted while the menu was up submits normally.
+fn question_menu_handle_key(key: &Key, sub_tx: &UnboundedSender<Submission>) -> bool {
+    if !question_menu_active() {
+        return false;
+    }
+    let (rows, sel) = {
+        let r = render().lock().unwrap();
+        (r.question_menu_options.len() + 1, r.question_menu_sel)
+    };
+    match key {
+        Key::ArrowUp => {
+            if sel > 0 {
+                render().lock().unwrap().question_menu_sel = sel - 1;
+                repaint();
+            }
+            true
+        }
+        Key::ArrowDown => {
+            if sel + 1 < rows {
+                render().lock().unwrap().question_menu_sel = sel + 1;
+                repaint();
+            }
+            true
+        }
+        // Digits highlight (not submit): a stray key must not fire an answer at the agent.
+        Key::Char(c @ '1'..='9') => {
+            let idx = (*c as usize) - ('1' as usize);
+            if idx < rows.saturating_sub(1) {
+                render().lock().unwrap().question_menu_sel = idx;
+                repaint();
+                true
+            } else {
+                // Not an option number → the user is typing an answer that starts with a digit.
+                question_menu_close();
+                false
+            }
+        }
+        Key::Enter => {
+            if !render().lock().unwrap().draft.is_empty() {
+                // A typed/pasted answer outranks the highlight — submit it via the normal path.
+                question_menu_close();
+                return false;
+            }
+            if sel + 1 == rows {
+                question_menu_close(); // "type my own" → back to the draft
+            } else {
+                question_menu_pick(sel, sub_tx);
+            }
+            true
+        }
+        Key::Escape => {
+            question_menu_close();
+            true
+        }
+        // Ctrl-C keeps its global meaning (copy/quit); don't trap the user in the menu.
+        Key::CtrlC | Key::Char('\u{3}') | Key::Char('\u{4}') => {
+            question_menu_close();
+            false
+        }
+        Key::Backspace | Key::Del => {
+            question_menu_close();
+            false
+        }
+        Key::Char(c) if !c.is_control() => {
+            question_menu_close();
+            false
+        }
+        _ => true, // swallow the rest so navigation keys don't scroll/edit under the menu
+    }
+}
+
+/// Route a left-click that landed on row `idx` of the open overlay MENU (per the render thread's
+/// published geometry) to whichever menu is up, in the same priority order the snapshot paints
+/// them. Returns `true` when the click was consumed as a pick/selection.
+///
+/// A click is a full pick (select + confirm) for the dialog menus — approval, clarify, model,
+/// sessions — because their rows are buttons. For the typing-flow overlays (`@` files, slash
+/// palette) it only moves the highlight: their Enter/Tab semantics are entangled with the draft,
+/// and a click that ran a command the user was still reading would be worse than one more keypress.
+fn overlay_menu_click(
+    idx: usize,
+    sub_tx: &UnboundedSender<Submission>,
+    cancel_tx: &UnboundedSender<()>,
+) -> bool {
+    if APPROVAL_PENDING.load(Ordering::Relaxed) && approval_menu_showing() {
+        if idx >= APPROVAL_MENU_ROWS.len() {
+            return true; // dead zone inside the panel — swallow, never start a selection under it
+        }
+        {
+            let mut r = render().lock().unwrap();
+            r.approval_menu_sel = idx;
+        }
+        let (c, cancel) = approval_menu_decision(idx);
+        if let Some(tx) = approval_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = tx.send(c);
+        }
+        if cancel {
+            request_cancel();
+            let _ = cancel_tx.send(());
+            crate::core::steer::clear();
+        }
+        return true;
+    }
+    if question_menu_active() {
+        let options = render().lock().unwrap().question_menu_options.len();
+        if idx < options {
+            question_menu_pick(idx, sub_tx);
+        } else {
+            question_menu_close(); // the "type my own" row (or a stale row) → back to the draft
+        }
+        return true;
+    }
+    if model_menu_active() {
+        let pick = {
+            let mut slot = model_menu_slot().lock().unwrap();
+            let pick = slot.rows.get(idx).map(|r| r.id.clone());
+            if pick.is_some() {
+                slot.sel = idx;
+            }
+            pick
+        };
+        if pick.is_some() {
+            model_menu_finish(pick);
+        }
+        return true;
+    }
+    if sessions_menu_active() {
+        let valid = {
+            let mut slot = sessions_menu_slot().lock().unwrap();
+            let valid = idx < slot.rows.len();
+            if valid {
+                slot.sel = idx;
+            }
+            valid
+        };
+        if valid {
+            sessions_menu_finish(Some(SessionsMenuChoice::Pick(idx)));
+        }
+        return true;
+    }
+    // Draft-derived overlays: move the highlight only (Enter/Tab keep their meaning).
+    let mut r = render().lock().unwrap();
+    if !at_matches(&r.draft).is_empty() {
+        r.at_sel = idx;
+        drop(r);
+        repaint();
+        return true;
+    }
+    if !slash_matches(&r.draft).is_empty() {
+        r.palette_sel = idx;
+        drop(r);
+        repaint();
+        return true;
+    }
+    false
 }
 
 /// The width (columns) the frame is drawn at — the canonical wrap width for streamed output so the
@@ -1400,7 +1689,25 @@ fn repaint() {
 /// still owns editing semantics; only drawing moved to the render thread.
 fn retained_input_snapshot() -> retained::InputSnapshot {
     let r = render().lock().unwrap();
-    let overlay = if r.model_menu_active {
+    let overlay = if r.approval_menu_active {
+        // Highest priority: the agent loop is blocked on this answer, and the full command line is
+        // already in the transcript right above — the panel only has to carry the choices.
+        Some(retained::OverlaySnapshot {
+            title: "approve?".to_string(),
+            lines: APPROVAL_MENU_ROWS.iter().map(|s| s.to_string()).collect(),
+            selected: Some(r.approval_menu_sel.min(APPROVAL_MENU_ROWS.len() - 1)),
+            hint: "↑↓/click pick · Enter confirm · y/a/n direct · Esc stop".to_string(),
+        })
+    } else if r.question_menu_active {
+        let mut lines: Vec<String> = r.question_menu_options.clone();
+        lines.push(QUESTION_MENU_FREEFORM_ROW.to_string());
+        Some(retained::OverlaySnapshot {
+            title: format!("❓ {}", r.question_menu_question),
+            lines,
+            selected: Some(r.question_menu_sel),
+            hint: "↑↓/click pick · Enter answer · Esc/type your own".to_string(),
+        })
+    } else if r.model_menu_active {
         Some(retained::OverlaySnapshot {
             title: "model".to_string(),
             lines: r
@@ -2188,6 +2495,7 @@ fn input_loop(
                     && crate::ui::splash::logo_is_sixel()
                     && !WORKING.load(Ordering::Relaxed)
                     && !APPROVAL_PENDING.load(Ordering::Relaxed)
+                    && !question_menu_active()
                     && !model_menu_active()
                     && !sessions_menu_active()
                     && !text_overlay_active()
@@ -2346,6 +2654,16 @@ fn input_loop(
                         }
                         continue;
                     }
+                    // A left-click on an open menu overlay's rows is a pick, and it must win over
+                    // the transcript handler below — otherwise the click would start a text
+                    // selection UNDER the panel the user is aiming at.
+                    if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        if let Some(idx) = retained::overlay_menu_hit(me.column, me.row) {
+                            if overlay_menu_click(idx, &sub_tx, &cancel_tx) {
+                                continue;
+                            }
+                        }
+                    }
                     handle_retained_mouse(
                         me.kind,
                         me.column,
@@ -2429,6 +2747,42 @@ fn input_loop(
                 crate::core::steer::clear();
                 continue;
             }
+            // Menu navigation (retained surface): ↑↓ move the highlight, Enter confirms the
+            // highlighted row — but ONLY over an empty draft, so Enter on a message typed while the
+            // gate is up still queues it exactly as before the menu existed.
+            if approval_menu_showing() {
+                match key {
+                    Key::ArrowUp | Key::ArrowDown => {
+                        let mut r = render().lock().unwrap();
+                        let last = APPROVAL_MENU_ROWS.len() - 1;
+                        r.approval_menu_sel = match key {
+                            Key::ArrowUp => r.approval_menu_sel.saturating_sub(1),
+                            _ => (r.approval_menu_sel + 1).min(last),
+                        };
+                        drop(r);
+                        repaint();
+                        continue;
+                    }
+                    Key::Enter if render().lock().unwrap().draft.is_empty() => {
+                        let sel = render().lock().unwrap().approval_menu_sel;
+                        let (c, cancel) = approval_menu_decision(sel);
+                        if let Some(tx) = approval_slot()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take()
+                        {
+                            let _ = tx.send(c);
+                        }
+                        if cancel {
+                            request_cancel();
+                            let _ = cancel_tx.send(());
+                            crate::core::steer::clear();
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             let decided = match key {
                 Key::Char('y') | Key::Char('Y') => Some('y'),
                 Key::Char('a') | Key::Char('A') => Some('a'),
@@ -2445,7 +2799,11 @@ fn input_loop(
                 }
                 continue;
             }
-            // y/n/a only — other keys still edit the draft / queue messages (Claude-style).
+            // y/n/a and the menu keys only — other keys still edit the draft / queue messages
+            // (Claude-style).
+        }
+        if question_menu_handle_key(&key, &sub_tx) {
+            continue;
         }
         if model_menu_handle_key(&key) {
             continue;
@@ -4059,6 +4417,109 @@ mod tests {
         );
         reset_session_allow();
         assert!(!session_allow_all(), "reset clears it");
+    }
+
+    /// Serializes the tests below that drive the process-global question/approval menu state —
+    /// cargo runs tests in parallel threads, and two tests opening/closing the same menu would
+    /// interleave.
+    static MENU_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn approval_menu_rows_and_decisions_stay_in_lockstep() {
+        // Every painted row must map to a decision; the mapping is what a click/Enter fires.
+        assert_eq!(APPROVAL_MENU_ROWS.len(), 4);
+        assert_eq!(approval_menu_decision(0), ('y', false), "run once");
+        assert_eq!(approval_menu_decision(1), ('a', false), "session allow");
+        assert_eq!(approval_menu_decision(2), ('n', false), "deny, keep going");
+        assert_eq!(
+            approval_menu_decision(3),
+            ('n', true),
+            "deny AND stop the turn — the Esc semantic as a row"
+        );
+        // Labels and decisions must agree on which half is which: the two allow rows lead.
+        assert!(
+            APPROVAL_MENU_ROWS[0].starts_with("Yes") && APPROVAL_MENU_ROWS[1].starts_with("Yes")
+        );
+        assert!(APPROVAL_MENU_ROWS[2].starts_with("No") && APPROVAL_MENU_ROWS[3].starts_with("No"));
+    }
+
+    #[test]
+    fn question_menu_picks_submit_and_typing_falls_through() {
+        let _g = MENU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Submission>();
+        question_menu_set(
+            "Which file?",
+            &["src/a.rs".to_string(), "src/b.rs".to_string()],
+        );
+        assert!(question_menu_active());
+        {
+            // Enter must read an empty draft to mean "confirm the highlight".
+            let mut r = render().lock().unwrap();
+            r.draft.clear();
+            r.cursor = 0;
+        }
+        // ↓ moves the highlight, Enter submits the highlighted option as a normal chat message.
+        assert!(question_menu_handle_key(&Key::ArrowDown, &tx));
+        assert!(question_menu_handle_key(&Key::Enter, &tx));
+        assert!(!question_menu_active(), "picking closes the menu");
+        match rx.try_recv() {
+            Ok(Submission::Chat(text, imgs)) => {
+                assert_eq!(text, "src/b.rs");
+                assert!(imgs.is_empty());
+            }
+            other => panic!("expected the picked option as a Chat submission, got {other:?}"),
+        }
+        // Typing dismisses the menu and the key falls through to the draft (`false`).
+        question_menu_set("Q?", &["A".to_string()]);
+        assert!(!question_menu_handle_key(&Key::Char('x'), &tx));
+        assert!(!question_menu_active(), "typing dismisses");
+        assert!(rx.try_recv().is_err(), "dismissal submits nothing");
+        // Esc dismisses too, but is consumed (it must never fall through to the Quit arm).
+        question_menu_set("Q?", &["A".to_string()]);
+        assert!(question_menu_handle_key(&Key::Escape, &tx));
+        assert!(!question_menu_active());
+        // The trailing free-form row dismisses without submitting.
+        question_menu_set("Q?", &["A".to_string()]);
+        assert!(question_menu_handle_key(&Key::ArrowDown, &tx)); // onto "type my own"
+        assert!(question_menu_handle_key(&Key::Enter, &tx));
+        assert!(!question_menu_active());
+        assert!(rx.try_recv().is_err(), "free-form row submits nothing");
+    }
+
+    #[test]
+    fn menu_overlays_outrank_the_draft_palettes_in_the_snapshot() {
+        let _g = MENU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Approval outranks question outranks the rest — the agent is BLOCKED on approval, so
+        // nothing may paint over it.
+        {
+            let mut r = render().lock().unwrap();
+            r.approval_menu_active = true;
+            r.approval_menu_sel = 2;
+            r.question_menu_active = true;
+            r.question_menu_options = vec!["A".to_string()];
+        }
+        let snap = retained_input_snapshot();
+        let overlay = snap.overlay.expect("approval menu must paint an overlay");
+        assert_eq!(overlay.title, "approve?");
+        assert_eq!(overlay.lines.len(), APPROVAL_MENU_ROWS.len());
+        assert_eq!(overlay.selected, Some(2));
+        {
+            let mut r = render().lock().unwrap();
+            r.approval_menu_active = false;
+            r.approval_menu_sel = 0;
+        }
+        let snap = retained_input_snapshot();
+        let overlay = snap
+            .overlay
+            .expect("question menu paints once approval is gone");
+        assert!(overlay.title.contains('❓'));
+        assert_eq!(
+            overlay.lines.last().map(String::as_str),
+            Some(QUESTION_MENU_FREEFORM_ROW),
+            "the free-form escape hatch is always the last row"
+        );
+        question_menu_close();
+        assert!(retained_input_snapshot().overlay.is_none() || !question_menu_active());
     }
 
     /// The Esc-responsiveness invariant, pinned end to end.

@@ -470,6 +470,16 @@ impl Tool for Process {
             _ => WorkspaceEffect::None,
         }
     }
+    fn command_to_guard(&self, args: &Value) -> Option<String> {
+        // Only `start` executes a command; kill/logs/wait/write drive an existing handle. Guarded
+        // identically to `shell_run` so going background can't sidestep the hard floor.
+        if args.get("action").and_then(|v| v.as_str()) != Some("start") {
+            return None;
+        }
+        args.get("command")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
     fn execute(&self, args: &Value) -> Result<String> {
         let action = args
             .get("action")

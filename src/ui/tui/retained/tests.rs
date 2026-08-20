@@ -4,6 +4,43 @@
 use super::*;
 
 #[test]
+fn overlay_menu_hit_maps_rows_scroll_and_dead_zones() {
+    let g = OverlayMenuGeom {
+        inner: Rect {
+            x: 10,
+            y: 5,
+            width: 40,
+            height: 6,
+        },
+        scroll: 2,
+        rows: 7,
+    };
+    // Top visible row is index `scroll`; the mapping is row-relative plus scroll.
+    assert_eq!(menu_hit_index(&g, 10, 5), Some(2), "top row, left edge");
+    assert_eq!(
+        menu_hit_index(&g, 49, 9),
+        Some(6),
+        "last pickable row, right edge"
+    );
+    // Inside the panel but past the pickable rows (the hint line) → dead, not a phantom pick.
+    assert_eq!(menu_hit_index(&g, 20, 10), None, "hint row is not pickable");
+    // Outside the panel on every side → None (the click belongs to the transcript handler).
+    assert_eq!(menu_hit_index(&g, 9, 6), None, "left of the panel");
+    assert_eq!(menu_hit_index(&g, 50, 6), None, "right of the panel");
+    assert_eq!(menu_hit_index(&g, 20, 4), None, "above the panel");
+    assert_eq!(menu_hit_index(&g, 20, 11), None, "below the panel");
+    // The published slot round-trips, and clearing it kills the hit-test (stale-rect guard).
+    set_overlay_menu(Some(g));
+    assert_eq!(overlay_menu_hit(10, 5), Some(2));
+    set_overlay_menu(None);
+    assert_eq!(
+        overlay_menu_hit(10, 5),
+        None,
+        "no overlay → no phantom picks"
+    );
+}
+
+#[test]
 fn sanitizes_terminal_control_sequences() {
     let got = sanitize_text("ok\x1b[2J\x1b[31mred\x1b[0m\nnext\r");
     assert_eq!(got, "okred\nnext");

@@ -332,6 +332,14 @@ pub(crate) enum McpCmd {
     Trust,
     /// Stop trusting this repo's project MCP servers.
     Untrust,
+    /// Run AS an MCP server on stdio, so another agent (Claude Code, Codex, Cursor…) can dispatch
+    /// aizen's specialists. Serves the repo it is started in.
+    Serve {
+        /// Allow dispatches that can edit files or run shell. Without it the server refuses any
+        /// coder/tester role and any specialist whose card grants a destructive tool.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

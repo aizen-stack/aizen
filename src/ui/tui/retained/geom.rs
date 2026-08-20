@@ -47,6 +47,52 @@ pub(crate) fn jump_button_rect() -> Option<Rect> {
     g.jump_button
 }
 
+/// Where the last frame put a SELECTABLE overlay's option rows, so the input thread can turn a
+/// left-click into a row index. Present only while a menu overlay (approval, question, model,
+/// sessions, palette) is painted — informational overlays wrap their text, so their screen rows do
+/// not map 1:1 to lines and they publish nothing.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OverlayMenuGeom {
+    /// Inner rect of the overlay panel (inside the border) — option rows start at its top row.
+    pub(crate) inner: Rect,
+    /// Rows hidden above the top at last draw (the clamped scroll actually applied).
+    pub(crate) scroll: usize,
+    /// Number of PICKABLE rows. The hint line painted below them is not one — a click there is dead.
+    pub(crate) rows: usize,
+}
+
+pub(super) fn overlay_menu_slot() -> &'static Mutex<Option<OverlayMenuGeom>> {
+    static SLOT: OnceLock<Mutex<Option<OverlayMenuGeom>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Publish (or clear) the selectable-overlay geometry for this frame. Draw-thread only.
+pub(super) fn set_overlay_menu(g: Option<OverlayMenuGeom>) {
+    *overlay_menu_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = g;
+}
+
+/// Menu row index a click at (`col`, `row`) points at, or `None` when no selectable overlay is on
+/// screen or the click missed its option rows (border, hint line, outside the panel).
+pub(crate) fn overlay_menu_hit(col: u16, row: u16) -> Option<usize> {
+    let g = (*overlay_menu_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()))?;
+    menu_hit_index(&g, col, row)
+}
+
+/// Pure half of [`overlay_menu_hit`], separated so the mapping is testable without a terminal.
+pub(super) fn menu_hit_index(g: &OverlayMenuGeom, col: u16, row: u16) -> Option<usize> {
+    let in_x = col >= g.inner.x && col < g.inner.x.saturating_add(g.inner.width);
+    let in_y = row >= g.inner.y && row < g.inner.y.saturating_add(g.inner.height);
+    if !in_x || !in_y {
+        return None;
+    }
+    let idx = g.scroll.saturating_add((row - g.inner.y) as usize);
+    (idx < g.rows).then_some(idx)
+}
+
 /// Where the input box's typed text landed on screen at the last draw, so the input thread can turn a
 /// mouse column into a caret position in the draft.
 ///

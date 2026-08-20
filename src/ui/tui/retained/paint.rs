@@ -21,9 +21,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     if let Some(overlay) = state.input.overlay.clone() {
         // draw_overlay clamps the requested scroll against the overlay's own visible height and
         // returns the value actually used, so a stored offset past the end snaps back next frame.
+        // It also publishes the menu hit-test geometry (selectable overlays only).
         let (scroll, rect) = draw_overlay(frame, area, &overlay, state.overlay_scroll);
         state.overlay_scroll = scroll;
         occluders.push(rect);
+    } else {
+        // No overlay this frame → no menu rows to click. Without this, a stale rect from the last
+        // open menu would keep swallowing left-clicks as phantom row picks.
+        set_overlay_menu(None);
     }
     if let Ok(mut slot) = occluders_slot().lock() {
         *slot = occluders;
