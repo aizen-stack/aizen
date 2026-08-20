@@ -6,6 +6,13 @@
 
 Closes #
 
+## Base branch
+
+<!-- Feature and fix PRs target `dev`. Only a release/* or hotfix/* branch targets `main`.
+     See docs/BRANCHING.md. -->
+
+- [ ] This PR targets **dev** (or it is a release/hotfix PR targeting `main`).
+
 ## Type of change
 
 - [ ] Bug fix (regression test included)
