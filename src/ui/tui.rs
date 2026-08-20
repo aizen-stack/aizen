@@ -38,6 +38,99 @@ mod retained;
 /// jitter (a few ms) yet far below the gap before a human reaches the Enter key (≥ ~100 ms).
 const PASTE_COALESCE_MS: u64 = 50;
 
+/// How long a clipboard-gesture paste (right-click / Ctrl-V / Shift+Insert) and a terminal
+/// bracketed-paste / key-burst echo of the SAME text are treated as one paste.
+///
+/// Windows Terminal (and some other hosts) deliver BOTH: our handler reads the OS clipboard on
+/// right-click, then the terminal also injects `Event::Paste` or a char burst for the same
+/// gesture — without this window the draft doubles ("Khi" → "KhiKhi"). Long enough to cover
+/// scheduling jitter; short enough that a deliberate second paste of the same text still works.
+const PASTE_ECHO_DEDUPE_MS: u64 = 400;
+
+/// Source of the paste we just applied — used so a clipboard gesture and a bracketed-paste event
+/// for the same text collapse to one insert, regardless of which arrived first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasteOrigin {
+    /// App read the OS clipboard (right-click / Ctrl-V / Shift+Insert).
+    ClipboardGesture,
+    /// Terminal delivered `Event::Paste` (bracketed paste).
+    Bracketed,
+}
+
+/// Recent paste, kept only long enough to drop the host's duplicate delivery of the same text.
+#[derive(Debug, Clone)]
+struct PasteEchoDedupe {
+    text: String,
+    origin: PasteOrigin,
+    at: Instant,
+    /// How many chars of a trailing key-burst echo we have already swallowed (clipboard path only).
+    echo_matched: usize,
+}
+
+impl PasteEchoDedupe {
+    fn new(text: String, origin: PasteOrigin, at: Instant) -> Self {
+        Self {
+            text,
+            origin,
+            at,
+            echo_matched: 0,
+        }
+    }
+
+    fn alive(&self, now: Instant) -> bool {
+        now.duration_since(self.at) < Duration::from_millis(PASTE_ECHO_DEDUPE_MS)
+    }
+
+    /// True → caller must NOT insert `incoming`; it is the other channel's echo of what we already applied.
+    fn should_skip_text(
+        &mut self,
+        incoming: &str,
+        incoming_origin: PasteOrigin,
+        now: Instant,
+    ) -> bool {
+        if !self.alive(now) || self.origin == incoming_origin || self.text != incoming {
+            return false;
+        }
+        // Fully consumed — stop any subsequent key-burst echo too.
+        self.echo_matched = self.text.chars().count();
+        true
+    }
+
+    /// Swallow one key-burst character that retraces a clipboard-gesture paste.
+    ///
+    /// Only arms for [`PasteOrigin::ClipboardGesture`]: bracketed paste already arrives as one
+    /// event, so there is nothing to match char-by-char. Requires the key to look like paste echo
+    /// (arrived soon after the gesture, mid-burst, or already matching) so a user who types the
+    /// same letter right after pasting is not robbed of a keystroke.
+    fn should_skip_key_char(&mut self, c: char, buffered: bool, now: Instant) -> bool {
+        if self.origin != PasteOrigin::ClipboardGesture || !self.alive(now) {
+            return false;
+        }
+        let total = self.text.chars().count();
+        if self.echo_matched >= total {
+            return false;
+        }
+        let expect = self.text.chars().nth(self.echo_matched);
+        if expect != Some(c) {
+            // Diverged from the clipboard text — user is typing something else; stop suppressing.
+            self.echo_matched = total;
+            return false;
+        }
+        let near_gesture = now.duration_since(self.at) < Duration::from_millis(PASTE_COALESCE_MS);
+        let looks_like_echo = near_gesture || buffered || self.echo_matched > 0;
+        if !looks_like_echo {
+            return false;
+        }
+        self.echo_matched += 1;
+        true
+    }
+}
+
+/// CRLF → LF so clipboard bytes and bracketed-paste bytes compare equal across Windows hosts.
+fn normalize_paste_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// Idle seconds before the screensaver card is raised (retained backend only). Reset by any key or
 /// mouse event; gated on !working and no open menu/overlay so it never fires mid-task or over a menu.
 const IDLE_SCREENSAVER_SECS: u64 = 15;
@@ -1468,6 +1561,10 @@ fn recall_history_next(hist_idx: &mut Option<usize>, draft_saved: &[char], histo
 fn crossterm_to_console_key(ev: crossterm::event::KeyEvent) -> Option<Key> {
     use crossterm::event::{KeyCode, KeyModifiers};
     let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+    // SUPER is the macOS Command (⌘) key — and on some Linux desktops the Super/Win key. Map
+    // ⌘C to the same control byte as Ctrl-C so the copy/quit arm below works without a second
+    // code path. Other ⌘+letter chords are left alone (terminals rarely deliver them).
+    let super_key = ev.modifiers.contains(KeyModifiers::SUPER);
     Some(match ev.code {
         KeyCode::Enter => Key::Enter,
         KeyCode::Esc => Key::Escape,
@@ -1485,11 +1582,13 @@ fn crossterm_to_console_key(ev: crossterm::event::KeyEvent) -> Option<Key> {
         KeyCode::BackTab => Key::BackTab,
         KeyCode::Insert => Key::Insert,
         KeyCode::Char(c) => {
-            if ctrl && c.is_ascii_alphabetic() {
-                // Ctrl-A..Ctrl-Z → U+0001..U+001A (Ctrl-C → '\u{3}', matching the old console bytes).
+            if (ctrl || super_key) && c.is_ascii_alphabetic() {
+                // Ctrl/⌘-A..Z → U+0001..U+001A (Ctrl-C / ⌘C → '\u{3}', matching the old console bytes).
+                // On macOS the natural copy chord is ⌘C; without SUPER→control folding here the key
+                // would arrive as a plain 'c' and never hit the copy arm.
                 Key::Char(((c.to_ascii_uppercase() as u8) - b'A' + 1) as char)
-            } else if ctrl {
-                return None; // Ctrl+non-letter: nothing downstream binds it
+            } else if ctrl || super_key {
+                return None; // Ctrl/⌘+non-letter: nothing downstream binds it
             } else {
                 Key::Char(c)
             }
@@ -1697,13 +1796,15 @@ fn handle_retained_mouse(
             if *dragging_scrollbar {
                 *dragging_scrollbar = false;
             } else if let Some(sel) = selecting.take() {
-                // Keep highlight until next click; copy text to the OS clipboard on release and
-                // confirm with a one-line note so the user knows the copy landed.
+                // Keep highlight until next click. Copy-on-release is the default (browser-like);
+                // `/auto-copy off` leaves the highlight for an explicit Ctrl-C / ⌘C copy instead.
                 retained::set_selection(sel);
-                let text = retained::extract_selection_text(sel);
-                if !text.is_empty() {
-                    let ok = copy_to_os_clipboard(&text);
-                    note_copied(&text, ok);
+                if crate::core::cli_config::auto_copy_enabled() {
+                    let text = retained::extract_selection_text(sel);
+                    if !text.is_empty() {
+                        let ok = copy_to_os_clipboard(&text);
+                        note_copied(&text, ok);
+                    }
                 }
             }
         }
@@ -1767,17 +1868,19 @@ fn handle_input_box_mouse(
             if dragging_draft.take().is_none() {
                 return false;
             }
-            // Copy on release, as the transcript does: letting go of the button is the moment the user
-            // has finished saying what they meant. The highlight stays until the next click so it is
-            // still there to retype over.
-            if let Some((a, b)) = draft_selection() {
-                let text: String = {
-                    let r = render().lock().unwrap();
-                    r.draft[a..b].iter().collect()
-                };
-                if !text.is_empty() {
-                    let ok = copy_to_os_clipboard(&text);
-                    note_copied(&text, ok);
+            // Default: copy on release, as the transcript does. `/auto-copy off` keeps the
+            // highlight only — the user copies with Ctrl-C (Win/Linux) or ⌘C (macOS).
+            // Highlight always stays until the next click so it is still there to retype over.
+            if crate::core::cli_config::auto_copy_enabled() {
+                if let Some((a, b)) = draft_selection() {
+                    let text: String = {
+                        let r = render().lock().unwrap();
+                        r.draft[a..b].iter().collect()
+                    };
+                    if !text.is_empty() {
+                        let ok = copy_to_os_clipboard(&text);
+                        note_copied(&text, ok);
+                    }
                 }
             }
             true
@@ -1813,7 +1916,7 @@ fn copy_to_os_clipboard(_text: &str) -> bool {
 fn clipboard_text() -> Option<String> {
     let mut cb = arboard::Clipboard::new().ok()?;
     let text = cb.get_text().ok()?;
-    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let text = normalize_paste_text(&text);
     if text.is_empty() {
         None
     } else {
@@ -1841,13 +1944,29 @@ fn insert_draft_text(text: &str) {
     r.at_sel = 0;
 }
 
-/// Paste OS clipboard text into the draft. Returns whether anything was inserted.
-fn paste_clipboard_into_draft() -> bool {
-    let Some(text) = clipboard_text() else {
-        return false;
-    };
+/// Paste OS clipboard text into the draft, or skip it when it is the echo of a paste we just applied
+/// via the other channel (bracketed paste ↔ clipboard gesture).
+///
+/// On a real insert returns the normalized text so the caller can arm [`PasteEchoDedupe`].
+/// Returns `None` when the clipboard is empty/unavailable OR the text was swallowed as an echo
+/// (caller must not re-arm the guard in that case — the existing entry already covers the window).
+fn paste_clipboard_into_draft(paste_echo: &mut Option<PasteEchoDedupe>) -> Option<String> {
+    let text = clipboard_text()?;
+    let now = Instant::now();
+    if paste_echo
+        .as_mut()
+        .map(|d| d.should_skip_text(&text, PasteOrigin::ClipboardGesture, now))
+        .unwrap_or(false)
+    {
+        return None;
+    }
     insert_draft_text(&text);
-    true
+    *paste_echo = Some(PasteEchoDedupe::new(
+        text.clone(),
+        PasteOrigin::ClipboardGesture,
+        now,
+    ));
+    Some(text)
 }
 
 /// Confirm (or honestly deny) a copy with one dim transcript line.
@@ -1932,16 +2051,21 @@ fn ctrl_c_action(since_copy: Option<Duration>, has_target: bool) -> CtrlC {
     }
 }
 
-/// Confirm a Ctrl-C copy AND say how to still quit — the two meanings of the key now share it, so the
-/// note has to resolve the ambiguity in the same breath it reports the copy.
+/// Confirm a Ctrl-C / ⌘C copy AND say how to still quit — the two meanings of the key now share it,
+/// so the note has to resolve the ambiguity in the same breath it reports the copy.
 fn note_ctrl_c_copy(text: &str, ok: bool, what: &str) {
+    let chord = if cfg!(target_os = "macos") {
+        "⌘C"
+    } else {
+        "Ctrl-C"
+    };
     let msg = if ok {
         format!(
-            "· copied {what} — {} · Ctrl-C again to quit",
+            "· copied {what} — {} · {chord} again to quit",
             copy_size(text)
         )
     } else {
-        "· clipboard unavailable on this platform · Ctrl-C again to quit".to_string()
+        format!("· clipboard unavailable on this platform · {chord} again to quit")
     };
     note_line(&style(msg).dim().to_string());
 }
@@ -1963,6 +2087,9 @@ fn input_loop(
     // Draft was edited during a paste burst without a repaint. Flushed on the first idle poll after
     // the burst ends (see short timeout below) so the full paste appears without needing another key.
     let mut pending_paste_repaint = false;
+    // Collapses clipboard-gesture paste + terminal echo (bracketed paste / key burst) of the same
+    // text into one insert — without this, right-click on Windows Terminal doubles the draft.
+    let mut paste_echo: Option<PasteEchoDedupe> = None;
     // Phase 3 mouse drag state (retained only). `selecting` tracks left-drag text selection;
     // `dragging_scrollbar` tracks thumb drag on the right gutter. Cleared on mouse-up / Esc.
     let mut selecting: Option<retained::SelectionRange> = None;
@@ -2093,14 +2220,26 @@ fn input_loop(
             // Bracketed paste (when the terminal supports it): one event, whole string, one repaint.
             // Falls through to the key-burst / clipboard path below on hosts that still synthesize
             // pastes as key events or offer no paste channel at all (classic conhost/CMD).
+            //
+            // DEDUPE: some hosts (notably Windows Terminal) ALSO fire Event::Paste after we already
+            // applied the same text via right-click / Ctrl-V clipboard read — skip that echo.
             if let Event::Paste(text) = ev {
+                let text = normalize_paste_text(&text);
                 if !text.is_empty() {
-                    insert_draft_text(&text.replace("\r\n", "\n").replace('\r', "\n"));
-                    hist_idx = None;
-                    last_arrival = None;
-                    last_arrival_prev = None;
-                    pending_paste_repaint = false;
-                    repaint();
+                    let now = Instant::now();
+                    let skip = paste_echo
+                        .as_mut()
+                        .map(|d| d.should_skip_text(&text, PasteOrigin::Bracketed, now))
+                        .unwrap_or(false);
+                    if !skip {
+                        insert_draft_text(&text);
+                        paste_echo = Some(PasteEchoDedupe::new(text, PasteOrigin::Bracketed, now));
+                        hist_idx = None;
+                        last_arrival = None;
+                        last_arrival_prev = None;
+                        pending_paste_repaint = false;
+                        repaint();
+                    }
                 }
                 continue;
             }
@@ -2109,7 +2248,7 @@ fn input_loop(
                     // Shift+Insert = paste (classic Windows / terminal convention). Handled here
                     // because `crossterm_to_console_key` drops the Shift bit on Insert.
                     if ke.code == KeyCode::Insert && ke.modifiers.contains(KeyModifiers::SHIFT) {
-                        if paste_clipboard_into_draft() {
+                        if paste_clipboard_into_draft(&mut paste_echo).is_some() {
                             hist_idx = None;
                             last_arrival = None;
                             last_arrival_prev = None;
@@ -2195,8 +2334,10 @@ fn input_loop(
                     // Right-click paste. conhost/CMD's own Quick-Edit paste never reaches us once
                     // mouse capture is on (we need capture for wheel + selection), so the app has
                     // to own the gesture. Down only — Up would double-insert the same clipboard.
+                    // Arm paste_echo so a following Event::Paste / key-burst of the same text
+                    // (Windows Terminal) is swallowed instead of doubling the draft.
                     if matches!(me.kind, MouseEventKind::Down(MouseButton::Right)) {
-                        if paste_clipboard_into_draft() {
+                        if paste_clipboard_into_draft(&mut paste_echo).is_some() {
                             hist_idx = None;
                             last_arrival = None;
                             last_arrival_prev = None;
@@ -2350,7 +2491,16 @@ fn input_loop(
             // A newline INSIDE a paste → a literal newline in the draft, never a submit. This is the
             // fix for a multi-line paste firing one message per line: the whole paste accumulates in
             // one draft and is sent (and read by the model) as a single message.
+            // Same echo-dedupe as Key::Char: a clipboard-gesture paste already inserted the
+            // newlines, so a trailing key-burst must not re-insert them.
             Key::Enter if buffered => {
+                if paste_echo
+                    .as_mut()
+                    .map(|d| d.should_skip_key_char('\n', buffered, now))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let mut r = render().lock().unwrap();
                 let cur = r.cursor;
                 r.draft.insert(cur, '\n');
@@ -2516,9 +2666,10 @@ fn input_loop(
                                                 // also flushes the submission queue for the same reason).
                     crate::core::steer::clear();
                 } else if matches!(key, Key::CtrlC | Key::Char('\u{3}')) {
-                    // Ctrl-C carries TWO meanings, and copy takes the first press.
+                    // Ctrl-C (Windows/Linux) and ⌘C (macOS — folded to '\u{3}' above) carry TWO
+                    // meanings, and copy takes the first press.
                     //
-                    // The terminal's own Ctrl-C-copies-selection never reaches us: mouse capture is on
+                    // The terminal's own copy-selection never reaches us: mouse capture is on
                     // (it has to be — it is what stops `alternateScroll` leaking wheel ticks in as
                     // ↑/↓), so the terminal has no selection of its own to copy, and the key arrives
                     // here as a plain `\u{3}`. Copying therefore has to be implemented on this side.
@@ -2528,6 +2679,9 @@ fn input_loop(
                     // long afterwards is a fresh copy rather than a surprise exit. With nothing to copy
                     // (no highlight, empty draft) the first press quits exactly as before — which is
                     // the state the key is pressed in when someone means to leave.
+                    //
+                    // This is also the ONLY copy path when `/auto-copy off` — mouse-up keeps the
+                    // highlight but does not touch the clipboard.
                     let target = ctrl_c_copy_target();
                     if ctrl_c_action(ctrl_c_armed.map(|t| t.elapsed()), target.is_some())
                         == CtrlC::Copy
@@ -2607,8 +2761,9 @@ fn input_loop(
                 // capture steals the terminal's right-click paste, and Ctrl-V arrives here as a
                 // control char rather than as characters. Images stay on Ctrl-O so a screenshot
                 // on the clipboard doesn't silently become a vision attach when the user meant
-                // to paste prose.
-                if paste_clipboard_into_draft() {
+                // to paste prose. paste_clipboard_into_draft arms paste_echo so a following
+                // Event::Paste of the same text is not inserted a second time.
+                if paste_clipboard_into_draft(&mut paste_echo).is_some() {
                     hist_idx = None;
                     last_arrival = None;
                     last_arrival_prev = None;
@@ -2644,6 +2799,15 @@ fn input_loop(
             }
             Key::Char(c) if c.is_control() => {} // ignore stray control chars
             Key::Char(c) => {
+                // After a clipboard-gesture paste, some hosts also inject the same text as a
+                // key-burst. Swallow those chars so right-click doesn't double the draft.
+                if paste_echo
+                    .as_mut()
+                    .map(|d| d.should_skip_key_char(c, buffered, now))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let mut r = render().lock().unwrap();
                 let cur = r.cursor;
                 r.draft.insert(cur, c);
@@ -3729,6 +3893,99 @@ mod tests {
     use super::*;
 
     #[test]
+    fn normalize_paste_text_collapses_windows_newlines() {
+        assert_eq!(normalize_paste_text("a\r\nb\rc"), "a\nb\nc");
+        assert_eq!(normalize_paste_text("Khi"), "Khi");
+    }
+
+    /// The Windows Terminal double-insert: clipboard gesture then bracketed paste of the same text.
+    #[test]
+    fn paste_echo_skips_bracketed_after_clipboard_gesture() {
+        let t0 = Instant::now();
+        let mut d = PasteEchoDedupe::new("Khi".into(), PasteOrigin::ClipboardGesture, t0);
+        assert!(
+            d.should_skip_text("Khi", PasteOrigin::Bracketed, t0),
+            "same text via the other channel must not insert twice"
+        );
+        // A deliberate second paste of different text is never an echo.
+        assert!(!d.should_skip_text("Khac", PasteOrigin::Bracketed, t0));
+    }
+
+    /// Symmetric: bracketed paste first, then a clipboard-gesture echo of the same bytes.
+    #[test]
+    fn paste_echo_skips_clipboard_after_bracketed() {
+        let t0 = Instant::now();
+        let mut d = PasteEchoDedupe::new("hello\nworld".into(), PasteOrigin::Bracketed, t0);
+        assert!(d.should_skip_text("hello\nworld", PasteOrigin::ClipboardGesture, t0));
+        // Same channel again is a real second paste, not an echo.
+        assert!(!d.should_skip_text("hello\nworld", PasteOrigin::Bracketed, t0));
+    }
+
+    #[test]
+    fn paste_echo_expires_so_a_later_paste_of_the_same_text_still_works() {
+        let t0 = Instant::now();
+        let mut d = PasteEchoDedupe::new("Khi".into(), PasteOrigin::ClipboardGesture, t0);
+        let later = t0 + Duration::from_millis(PASTE_ECHO_DEDUPE_MS + 1);
+        assert!(
+            !d.should_skip_text("Khi", PasteOrigin::Bracketed, later),
+            "after the window a second paste of the same text must insert"
+        );
+    }
+
+    /// Hosts that inject a key-burst instead of Event::Paste after right-click.
+    #[test]
+    fn paste_echo_swallows_key_burst_matching_clipboard_text() {
+        let t0 = Instant::now();
+        let mut d = PasteEchoDedupe::new("Khi".into(), PasteOrigin::ClipboardGesture, t0);
+        // First char arrives within the coalesce window (near_gesture) even if not yet "buffered".
+        assert!(d.should_skip_key_char('K', false, t0));
+        // Subsequent chars of the burst look buffered (< PASTE_COALESCE_MS apart).
+        assert!(d.should_skip_key_char('h', true, t0));
+        assert!(d.should_skip_key_char('i', true, t0));
+        // Burst fully consumed — further matching chars are not suppressed forever.
+        assert!(!d.should_skip_key_char('K', true, t0));
+    }
+
+    #[test]
+    fn paste_echo_key_burst_diverges_on_mismatched_char() {
+        let t0 = Instant::now();
+        let mut d = PasteEchoDedupe::new("Khi".into(), PasteOrigin::ClipboardGesture, t0);
+        assert!(d.should_skip_key_char('K', true, t0));
+        // User types something else mid-window — stop suppressing so typing is never stolen.
+        assert!(!d.should_skip_key_char('x', true, t0));
+        assert!(!d.should_skip_key_char('h', true, t0));
+    }
+
+    #[test]
+    fn paste_echo_does_not_swallow_slow_typing_after_paste() {
+        let t0 = Instant::now();
+        let mut d = PasteEchoDedupe::new("Khi".into(), PasteOrigin::ClipboardGesture, t0);
+        // Human keystroke well after the gesture, not in a burst, first char of paste text.
+        let typed = t0 + Duration::from_millis(PASTE_COALESCE_MS + 20);
+        assert!(
+            !d.should_skip_key_char('K', false, typed),
+            "typing the same letter after a paste must still insert"
+        );
+    }
+
+    #[test]
+    fn paste_echo_key_burst_only_arms_for_clipboard_origin() {
+        let t0 = Instant::now();
+        let mut d = PasteEchoDedupe::new("Khi".into(), PasteOrigin::Bracketed, t0);
+        // Bracketed paste is one event — no char-by-char echo to swallow.
+        assert!(!d.should_skip_key_char('K', true, t0));
+    }
+
+    #[test]
+    fn paste_echo_swallows_newlines_inside_a_multiline_key_burst() {
+        let t0 = Instant::now();
+        let mut d = PasteEchoDedupe::new("a\nb".into(), PasteOrigin::ClipboardGesture, t0);
+        assert!(d.should_skip_key_char('a', true, t0));
+        assert!(d.should_skip_key_char('\n', true, t0));
+        assert!(d.should_skip_key_char('b', true, t0));
+    }
+
+    #[test]
     fn health_kind_labels_and_colours_are_stable() {
         // Idle chip copy + palette must stay distinct so green/yellow/red keep meaning.
         assert_eq!(HealthKind::Ok.label(false), "ready");
@@ -4012,6 +4269,26 @@ mod tests {
         let s = Submission::Chat("hi".into(), vec!["data:...".into()]);
         assert_eq!(s, Submission::Chat("hi".into(), vec!["data:...".into()]));
         assert_ne!(Submission::Quit, Submission::Slash("help".into()));
+    }
+
+    /// macOS copy is ⌘C (crossterm SUPER), not Ctrl-C. Folding SUPER+letter to the same control
+    /// byte as Ctrl keeps one copy/quit arm and makes `/auto-copy off` usable on Mac terminals
+    /// that actually deliver the Command modifier.
+    #[test]
+    fn super_c_folds_to_the_same_control_byte_as_ctrl_c() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let ctrl =
+            crossterm_to_console_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let cmd = crossterm_to_console_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
+        let plain = crossterm_to_console_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(ctrl, Some(Key::Char('\u{3}')));
+        assert_eq!(cmd, Some(Key::Char('\u{3}')), "⌘C must reach the copy arm");
+        assert_eq!(plain, Some(Key::Char('c')), "bare c is still just a letter");
+        // SUPER+non-letter stays unbound (same as Ctrl+non-letter).
+        assert_eq!(
+            crossterm_to_console_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::SUPER)),
+            None
+        );
     }
 
     /// Ctrl-C now means two things, and getting the arbitration wrong costs the user either their

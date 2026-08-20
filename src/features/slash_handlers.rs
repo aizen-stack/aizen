@@ -1370,12 +1370,101 @@ pub(crate) async fn handle_slash(
                 );
             }
         }
-        SlashId::Yolo => {
+SlashId::Yolo => {
             let mut cfg = cli_config::load();
             let mode = if cfg.persisted_approval_mode() == ApprovalMode::Yolo { ApprovalMode::Ask } else { ApprovalMode::Yolo };
             cfg.set_approval_mode(mode);
             let _ = cli_config::save(&cfg);
             tui::emit_line(&style(format!("approval → {mode} (legacy /yolo alias)")).color256(splash::ACCENT).to_string());
+        }
+        SlashId::AutoCopy => {
+            // Copy shortcut wording is OS-specific so the status line teaches the right chord.
+            let copy_chord = if cfg!(target_os = "macos") {
+                "⌘C"
+            } else {
+                "Ctrl-C"
+            };
+            let sub = arg.trim().to_ascii_lowercase();
+            let decide = |on: bool| -> Result<(), anyhow::Error> {
+                let mut cfg = cli_config::load();
+                // Persist the explicit choice (not None) so a user who turned it off keeps that
+                // across restarts; default-ON is only for a never-touched config.
+                cfg.auto_copy = Some(on);
+                cli_config::save(&cfg)?;
+                Ok(())
+            };
+            match sub.as_str() {
+                "" | "toggle" | "t" => {
+                    let now = !cli_config::auto_copy_enabled();
+                    match decide(now) {
+                        Ok(()) if now => tui::emit_line(
+                            &style(format!(
+                                "auto-copy ON — releasing a drag-select copies to the clipboard ({copy_chord} still copies too)"
+                            ))
+                            .color256(splash::ACCENT)
+                            .to_string(),
+                        ),
+                        Ok(()) => tui::emit_line(
+                            &style(format!(
+                                "auto-copy OFF — selection stays highlighted; press {copy_chord} to copy"
+                            ))
+                            .dim()
+                            .to_string(),
+                        ),
+                        Err(e) => tui::emit_line(&format!("{} {e}", style("auto-copy:").red())),
+                    }
+                }
+                "on" | "1" | "true" | "yes" => match decide(true) {
+                    Ok(()) => tui::emit_line(
+                        &style(format!(
+                            "auto-copy ON — releasing a drag-select copies to the clipboard ({copy_chord} still copies too)"
+                        ))
+                        .color256(splash::ACCENT)
+                        .to_string(),
+                    ),
+                    Err(e) => tui::emit_line(&format!("{} {e}", style("auto-copy:").red())),
+                },
+                "off" | "0" | "false" | "no" => match decide(false) {
+                    Ok(()) => tui::emit_line(
+                        &style(format!(
+                            "auto-copy OFF — selection stays highlighted; press {copy_chord} to copy"
+                        ))
+                        .dim()
+                        .to_string(),
+                    ),
+                    Err(e) => tui::emit_line(&format!("{} {e}", style("auto-copy:").red())),
+                },
+                "status" | "st" | "?" => {
+                    let on = cli_config::auto_copy_enabled();
+                    let state = if on { "ON" } else { "OFF" };
+                    let detail = if on {
+                        format!("release copies · {copy_chord} also copies")
+                    } else {
+                        format!("release keeps highlight · {copy_chord} to copy")
+                    };
+                    tui::emit_line(
+                        &style(format!("auto-copy {state} — {detail}"))
+                            .dim()
+                            .to_string(),
+                    );
+                }
+                other => tui::emit_line(
+                    &style(format!(
+                        "usage: /auto-copy on|off|status  (got {other:?})"
+                    ))
+                    .dim()
+                    .to_string(),
+                ),
+            }
+            if std::env::var("AIZEN_AUTO_COPY").is_ok() {
+                tui::emit_line(
+                    &style(
+                        "(note: AIZEN_AUTO_COPY is set in your environment — it overrides this toggle until unset)",
+                    )
+                    .dim()
+                    .to_string(),
+                );
+            }
         }
         SlashId::Smart => {
             let mut cfg = cli_config::load();
