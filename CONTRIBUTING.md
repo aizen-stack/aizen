@@ -65,13 +65,13 @@ Requirements:
 
 ## Making a change
 
-1. **Fork** the repo and create a branch off `main` (`git checkout -b my-fix`).
+1. **Fork** the repo and create a branch off `dev`, the integration branch (`git switch -c my-fix public/dev`). `main` is the release line and only accepts release/hotfix PRs — see [docs/BRANCHING.md](docs/BRANCHING.md).
 2. Make your change. Match the surrounding code — naming, comment density, error handling.
 3. **Add or update tests.** New behavior needs a test; a bug fix needs a test that would have caught it.
 4. Run `cargo test --bin aizen` and make sure it's **green**.
 5. Run `cargo fmt` and `cargo clippy` and clear anything you introduced.
 6. Commit with a clear message (imperative mood: "fix scrollbar drift", not "fixed stuff").
-7. Push and open a PR against `aizen-stack/aizen:main`. Fill in the PR template.
+7. Push and open a PR against `aizen-stack/aizen:dev`. Fill in the PR template.
 
 ## What gets merged
 
