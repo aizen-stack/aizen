@@ -71,9 +71,10 @@ pub enum SlashId {
     Redo,
     Quit,
     Save,
-    Smart,
+Smart,
     Team,
     Yolo,
+    AutoCopy,
 }
 
 /// When a command takes over stdin (a `dialoguer` menu, the effort slider, a daemon) and the
@@ -655,7 +656,7 @@ pub const BUILTINS: &[Builtin] = &[
         help: "",
         stdin: Stdin::Never,
     },
-    Builtin {
+Builtin {
         id: SlashId::Yolo,
         name: "yolo",
         aliases: &[
@@ -667,6 +668,17 @@ pub const BUILTINS: &[Builtin] = &[
         description: "legacy shortcut for `/approval yolo`",
         argument_hint: "",
         help: "",
+        stdin: Stdin::Never,
+    },
+    Builtin {
+        id: SlashId::AutoCopy,
+        name: "auto-copy",
+        aliases: &[("autocopy", "alias for /auto-copy")],
+        hidden_aliases: &[],
+        hidden: false,
+        description: "auto-copy on mouse select release",
+        argument_hint: "[on|off|status]",
+        help: "on (default): releasing a drag-select copies to the clipboard. off: keep the highlight and copy with Ctrl-C (Windows/Linux) or ⌘C (macOS). bare /auto-copy toggles",
         stdin: Stdin::Never,
     },
 ];
@@ -980,14 +992,34 @@ mod tests {
     }
 
     #[test]
-    fn init_and_currently_omitted_commands_are_catalogued() {
+fn init_and_currently_omitted_commands_are_catalogued() {
         let names: std::collections::HashSet<String> = list().into_iter().map(|c| c.name).collect();
         for name in [
-            "init", "handoff", "goal", "lsp", "reach", "agents", "tools", "browser", "undo",
-            "redo", "serve",
+            "init",
+            "handoff",
+            "goal",
+            "lsp",
+            "reach",
+            "agents",
+            "tools",
+            "browser",
+            "undo",
+            "redo",
+            "serve",
+            "auto-copy",
+            "autocopy",
         ] {
             assert!(names.contains(name), "slash catalog must include /{name}");
         }
+        assert_eq!(
+            resolve("auto-copy").map(|b| b.id),
+            Some(SlashId::AutoCopy)
+        );
+        assert_eq!(resolve("autocopy").map(|b| b.id), Some(SlashId::AutoCopy));
+        assert_eq!(
+            cmd("/auto-copy off"),
+            ("auto-copy".into(), "off".into())
+        );
     }
 
     // ── classify ────────────────────────────────────────────────────────────────────────────

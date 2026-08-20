@@ -91,12 +91,18 @@ pub struct CliConfig {
     /// `reasoning_effort` above, if any, is used). The per-turn effort is NEVER persisted here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_effort: Option<bool>,
-    /// "Ultimate mode": pin max reasoning effort + prefer launching workflows (orchestrate-by-default).
+/// "Ultimate mode": pin max reasoning effort + prefer launching workflows (orchestrate-by-default).
     /// The aizen analogue of Claude Code's `ultracode` (xhigh + standing orchestration permission).
     /// `None`/`Some(false)` ⇒ off; `Some(true)` ⇒ on. Toggle live with `/ultimate`, or force via
     /// `AIZEN_ULTIMATE`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ultimate: Option<bool>,
+    /// Auto-copy on mouse-up after a drag-select in the TUI (transcript or draft).
+    /// `None`/`Some(true)` ⇒ ON (default — release copies like a browser).
+    /// `Some(false)` ⇒ OFF — highlight stays; copy only via Ctrl-C (Windows/Linux) or ⌘C (macOS).
+    /// Toggle live with `/auto-copy on|off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_copy: Option<bool>,
     /// Adaptive difficulty→effort routing (P3, opt-in): when on, the per-turn complexity heuristic may
     /// climb past `high` to `xhigh` for the very hardest turns. `None`/`Some(false)` ⇒ off (the
     /// heuristic caps at `high`, unchanged default). Force via `AIZEN_ADAPTIVE_EFFORT`.
@@ -1065,6 +1071,19 @@ pub fn ultimate_enabled() -> bool {
     load().ultimate.unwrap_or(false)
 }
 
+/// Is TUI auto-copy-on-select-release ON?
+///
+/// Default ON so drag-select still copies the moment the button lifts (the long-standing behaviour).
+/// `AIZEN_AUTO_COPY` env wins (`0`/`false`/`off`/`no` ⇒ off; `1`/`true`/`on`/`yes` ⇒ on); otherwise
+/// the `auto_copy` config field (`None` ⇒ on). Live toggle: `/auto-copy on|off`.
+pub fn auto_copy_enabled() -> bool {
+    if let Ok(v) = std::env::var("AIZEN_AUTO_COPY") {
+        let t = v.trim().to_ascii_lowercase();
+        return matches!(t.as_str(), "1" | "true" | "on" | "yes");
+    }
+    load().auto_copy.unwrap_or(true)
+}
+
 /// Is adaptive difficulty→effort routing ON (P3)? `AIZEN_ADAPTIVE_EFFORT` env wins; otherwise the
 /// `adaptive_effort` config field, defaulting to OFF (so the heuristic caps at `high` by default).
 pub fn adaptive_effort_enabled() -> bool {
@@ -1606,6 +1625,66 @@ mod tests {
             );
         }
         assert!("sometimes".parse::<ResponseVisuals>().is_err());
+    }
+
+#[test]
+    fn auto_copy_defaults_on_and_honours_field_and_env() {
+        // Isolate from the developer's real ~/.aizen and any ambient AIZEN_AUTO_COPY.
+        let dir = std::env::temp_dir().join(format!("aizen-auto-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("AIZEN_HOME", &dir);
+        std::env::remove_var("AIZEN_AUTO_COPY");
+
+        // Never touched → ON (browser-like default the feature shipped with).
+        assert!(auto_copy_enabled());
+
+        // Explicit off in config.
+        save(&CliConfig {
+            auto_copy: Some(false),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!auto_copy_enabled());
+
+        // Explicit on in config.
+        save(&CliConfig {
+            auto_copy: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(auto_copy_enabled());
+
+        // Env wins over config (off).
+        std::env::set_var("AIZEN_AUTO_COPY", "0");
+        assert!(!auto_copy_enabled());
+        std::env::set_var("AIZEN_AUTO_COPY", "off");
+        assert!(!auto_copy_enabled());
+        // Env wins over config (on) even if config said off.
+        save(&CliConfig {
+            auto_copy: Some(false),
+            ..Default::default()
+        })
+        .unwrap();
+        std::env::set_var("AIZEN_AUTO_COPY", "on");
+        assert!(auto_copy_enabled());
+
+        // Round-trip: field survives JSON.
+        let json = serde_json::to_string(&CliConfig {
+            auto_copy: Some(false),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(json.contains("auto_copy"));
+        let back: CliConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.auto_copy, Some(false));
+        // Absent field deserializes as None (default ON at the reader).
+        let absent: CliConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.auto_copy, None);
+
+        std::env::remove_var("AIZEN_AUTO_COPY");
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
