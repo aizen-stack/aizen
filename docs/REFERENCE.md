@@ -352,6 +352,7 @@ aizen agent --yes "fix the failing test in src/parse.rs"   # pre-approve file/sh
 aizen agent --max-iters 40 "..."                            # raise the step cap
 aizen agent --save-session "..."                            # keep the transcript for /sessions
 aizen agent --effort high "..."                             # this run only; the config is untouched
+aizen agent --image shot.png "why is this button misaligned?"  # vision: repeat --image for more
 ```
 Behavior worth knowing:
 - **Nothing is saved unless you ask.** This subcommand is also the scripting and CI entry point, so
@@ -367,6 +368,15 @@ Behavior worth knowing:
   typed REPL turn goes through, against the task text. Omit the flag and nothing changes: the
   configured `reasoning_effort` applies and the request is byte-identical to one from a core that
   never had the flag. The tier is named on **stderr**, next to the rest of the trace.
+- **Images are attached, not described.** `--image <PATH>` inlines a PNG/JPEG/GIF/WebP (≤ 8 MB) into
+  the first user message as an `image_url` data part — the same wire shape the REPL produces when you
+  drag a file onto the window or press Ctrl-O to grab a screenshot — so a front-end driving this
+  subcommand gets vision without driving the REPL. Repeat the flag for more than one image. The model
+  must be vision-capable; the files are read **before** the endpoint is resolved, and a path that is
+  not a readable image ends the run there rather than being skipped, because an attachment that
+  silently vanished would yield a confident answer about an image nothing ever sent. Note the
+  difference from the REPL: a typed line only lifts paths that really are images and leaves anything
+  else as prose, which is right for something a human typed — a flag is deliberate, so it is loud.
 - **How tools reach the model** — the session's tool registry is the single source of truth. Its
   definitions (name, description, JSON Schema) are sent through the provider's **native** tool field:
   OpenAI-compatible gateways and Anthropic get `tools[{type:"function",function:{…}}]`, the ChatGPT

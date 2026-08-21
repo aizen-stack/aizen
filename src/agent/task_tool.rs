@@ -627,12 +627,24 @@ impl Tool for TaskTool {
         }
         // Concurrency gate: each sub-agent is a whole model loop — cap how many run at once
         // (below the tool-level MAX_PARALLEL: N loops × N tool threads oversubscribes a CLI).
-        // Over-limit is a SOFT error the model recovers from by retrying serially.
-        let Some(_slot) = SubagentSlot::try_acquire() else {
-            return Ok(
-                "error: sub-agent concurrency limit reached — retry with fewer task calls in one turn"
-                    .to_string(),
-            );
+        // Over-limit is a SOFT error the model recovers from by retrying serially; a BROKEN gate
+        // (unwritable home) is a hard one, and the wording must not invite a retry that cannot
+        // ever succeed.
+        let _slot = match SubagentSlot::try_acquire() {
+            Ok(s) => s,
+            Err(SlotDenied::Full) => {
+                return Ok(
+                    "error: sub-agent concurrency limit reached — retry with fewer task calls in one turn"
+                        .to_string(),
+                );
+            }
+            Err(SlotDenied::Io(e)) => {
+                return Ok(format!(
+                    "error: the sub-agent gate is unavailable on this machine ({e}) — this is NOT \
+                     a concurrency limit and retrying will not help; tell the user their aizen \
+                     home directory appears unwritable or locked"
+                ));
+            }
         };
         let prompt = args
             .get("prompt")
@@ -749,7 +761,11 @@ impl Tool for TaskTool {
             // This delegated run owns one total budget; the core loop's own extension is the only
             // budget grant. Keep its continuation controls off so no second layer can multiply it.
             max_continuations: 0,
-            max_stall_recoveries: 0,
+            // ONE stall recovery, not zero. With zero, a delegated child hard-stopped on its third
+            // uninformative turn with no recourse at all — the top level gets a todo-gated recovery,
+            // and the loop grants a child (todo_poke off) the same single bounded chance without
+            // consulting the parent's todo list.
+            max_stall_recoveries: 1,
             // The deadline is absolute for this one run; it cannot be refreshed by a continuation.
             deadline: subagent_wall_deadline(),
             ..AgentConfig::default()
@@ -799,10 +815,11 @@ impl Tool for TaskTool {
         // pass-through there. Never call `execute` from a plain `#[test]` past the early-return
         // guards (no runtime).
         //
-        // CONTINUATION: the loop is driven over ONE persistent conversation so a budget exhaustion
-        // can be resumed rather than restarted. `run_agent_loop` appends every turn (and, on
-        // MaxIters, its own synthesized summary) to `msgs`, so re-entering with a `[continue]` user
-        // turn keeps the sub-agent's whole context: its plan, its tool results, its edits.
+        // ONE conversation for the whole run: every budget grant the core loop makes (the near-limit
+        // extension, retry nudges) continues over `msgs` with full context. There is NO cross-call
+        // resume — once `execute` returns, the transcript is gone, and a parent that wants more must
+        // dispatch fresh. That is why both exits below hand the parent a partial report built from
+        // `msgs` while it still exists: it is the only continuation surface there is.
         let outcome = tokio::task::block_in_place(|| {
             let _effort = crate::core::cli_config::suppress_effort_override();
             tokio::runtime::Handle::current().block_on(async {
@@ -815,10 +832,15 @@ impl Tool for TaskTool {
                             .iter()
                             .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty())
                             .count();
+                        // The transcript dies with this return — salvage the same partial report
+                        // the Ok path gets. Without it, a child that completed 20 tool turns and
+                        // then hit a terminal API error handed the parent one line and no list of
+                        // what it had already touched.
+                        let partial = partial_report_from_messages(&msgs);
                         return Err(e.context(format!(
                             "after {completed_tool_turns} completed tool turn(s) — the workspace \
                              may already contain partial edits from this sub-agent; inspect before \
-                             retrying"
+                             retrying.\nPartial progress before the failure:\n{partial}"
                         )));
                     }
                 };
@@ -905,8 +927,9 @@ impl Tool for TaskTool {
 }
 
 /// Deterministic fallback when a child stops without a final answer. Uses only bounded, redacted
-/// facts already present in the transcript — no extra model call after the deadline.
-fn partial_report_from_messages(msgs: &[Message]) -> String {
+/// facts already present in the transcript — no extra model call after the deadline. Shared with
+/// the workflow runner (`workflow::run_one_task`), whose children stop the same ways.
+pub(crate) fn partial_report_from_messages(msgs: &[Message]) -> String {
     const MAX_ITEMS: usize = 12;
     const MAX_TEXT: usize = 800;
     let mut targets = Vec::new();
@@ -1044,10 +1067,23 @@ impl TaskTool {
         let model = model.to_string();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                crate::llm::client::chat_with_tools(&client, &base, &key, &model, &[sys, usr], &[])
-                    .await
-                    .ok()
-                    .and_then(|t| t.content)
+                // Same ceiling + cancel discipline as the main chat closure. This call runs AFTER
+                // `run_agent_loop` returned, where neither `cfg.deadline` (a loop-boundary check)
+                // nor the loop's own per-call timeout can reach it — and the sub-agent SLOT is
+                // still held by the caller. Unbounded, a gateway that answers 200 and then drips
+                // here reproduced the exact permanent-slot-strand `SUBAGENT_CALL_TIMEOUT` exists
+                // to prevent: the slot held for the process lifetime, every later dispatch refused.
+                let deadline = subagent_call_timeout();
+                let cancel = crate::core::cancel::current().unwrap_or_default();
+                let msgs = [sys, usr];
+                let call =
+                    crate::llm::client::chat_with_tools(&client, &base, &key, &model, &msgs, &[]);
+                match crate::core::cancel::race(&cancel, tokio::time::timeout(deadline, call)).await
+                {
+                    Some(Ok(Ok(t))) => t.content,
+                    // Timeout, API error, or cancellation — repair is best-effort by contract.
+                    _ => None,
+                }
             })
         })
     }
@@ -1060,22 +1096,29 @@ impl TaskTool {
 /// but they do not mutate repository/workspace state and remain parallel-safe. Repository metadata
 /// writers such as `checkpoint` are excluded from the read-only base entirely.
 pub(crate) fn dispatch_is_read_only(r: &crate::agent::tools::ToolRegistry) -> bool {
-    // Includes symbolic-edit tools granted to coder/specialist sub-agents (see
-    // `register_subagent_lsp`). Missing them here would mis-classify a writer as read-only and let
-    // two symbol_replace dispatches race in parallel.
-    const WRITERS: &[&str] = &[
-        "file_edit",
-        "file_write",
-        "file_move",
-        "shell_run",
-        "skill_save",
-        // One name now covers save/rewind/restore (the read-only `checkpoint_view` is not a writer).
-        "checkpoint",
-        "symbol_replace",
-        "symbol_insert",
-    ];
     WRITERS.iter().all(|w| r.get(w).is_none())
 }
+
+/// The workspace-writing tool names `dispatch_is_read_only` denies on. Includes symbolic-edit
+/// tools granted to coder/specialist sub-agents (see `register_subagent_lsp`) — missing them here
+/// would mis-classify a writer as read-only and let two symbol_replace dispatches race in
+/// parallel. This is a DENYLIST, so an unlisted new writer fails OPEN; the
+/// `writers_denylist_covers_every_destructive_role_tool` test below is what turns that silent
+/// drift into a build failure.
+pub(crate) const WRITERS: &[&str] = &[
+    "file_edit",
+    "file_write",
+    "file_move",
+    "shell_run",
+    // `process` can `action=start` an arbitrary command — command execution is workspace-write
+    // capability even though today it only ever ships alongside `shell_run`.
+    "process",
+    "skill_save",
+    // One name now covers save/rewind/restore (the read-only `checkpoint_view` is not a writer).
+    "checkpoint",
+    "symbol_replace",
+    "symbol_insert",
+];
 
 /// Live count of in-flight sub-agents (process-global; both `task` and the workflow tool draw
 /// from real OS/model resources, so the cap is global too).
@@ -1135,33 +1178,69 @@ pub(crate) struct SubagentSlot {
     _global: crate::core::repo_lock::RepoTxnLock,
 }
 
+/// Why the gate refused a slot. The two causes need OPPOSITE caller behavior, and the old
+/// `Option` collapsed them: a process whose `aizen_home` was unwritable was told "concurrency
+/// limit reached — retry", which for that cause is an invitation to loop forever.
+#[derive(Debug)]
+pub(crate) enum SlotDenied {
+    /// Every slot is genuinely held — soft; the model may retry with fewer calls, or later.
+    Full,
+    /// The slot directory itself is unusable (unwritable home, deleted dir, AV holding the
+    /// files). Permanent for this process: a retry cannot help.
+    Io(String),
+}
+
 impl SubagentSlot {
-    pub(crate) fn try_acquire() -> Option<Self> {
+    pub(crate) fn try_acquire() -> Result<Self, SlotDenied> {
         use std::sync::atomic::Ordering;
         let cap = max_parallel_subagents();
         let prev = ACTIVE_SUBAGENTS.fetch_add(1, Ordering::SeqCst);
         if prev >= cap {
             ACTIVE_SUBAGENTS.fetch_sub(1, Ordering::SeqCst);
-            return None;
+            return Err(SlotDenied::Full);
         }
-        let start = (std::process::id() as usize + prev) % cap;
+        // Probe the whole GLOBAL band, not `0..cap`. The slot files are shared by every aizen
+        // process on this machine, while `cap` is this process's own width — with mismatched
+        // caps, a cap-2 process probing only slots 0–1 starved behind a cap-16 process holding
+        // exactly those two, with the rest of the band free. The per-process cap is enforced by
+        // the atomic above; the files exist to make a slot exclusive machine-wide, not to
+        // re-derive a cross-process cap from whichever process happens to probe.
+        let start = (std::process::id() as usize + prev) % HARD_CEILING;
         let root = crate::core::config::aizen_home()
             .join("locks")
             .join("v1")
             .join("slots")
             .join("subagents");
-        for step in 0..cap {
-            let idx = (start + step) % cap;
+        let mut saw_busy = false;
+        let mut io_err: Option<String> = None;
+        for step in 0..HARD_CEILING {
+            let idx = (start + step) % HARD_CEILING;
             let path = root.join(format!("slot-{idx}.lock"));
-            if let Ok(global) = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+            match crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
                 &path,
                 std::time::Duration::ZERO,
             ) {
-                return Some(Self { _global: global });
+                Ok(global) => return Ok(Self { _global: global }),
+                Err(e)
+                    if e.downcast_ref::<crate::core::repo_lock::LockBusy>()
+                        .is_some() =>
+                {
+                    saw_busy = true;
+                }
+                Err(e) => {
+                    if io_err.is_none() {
+                        io_err = Some(format!("{e:#}"));
+                    }
+                }
             }
         }
         ACTIVE_SUBAGENTS.fetch_sub(1, Ordering::SeqCst);
-        None
+        match (saw_busy, io_err) {
+            // Not one slot was even contested and every attempt failed on I/O: the gate itself
+            // is broken, not full.
+            (false, Some(e)) => Err(SlotDenied::Io(e)),
+            _ => Err(SlotDenied::Full),
+        }
     }
 
     /// Greedily reserve UP TO `want` slots (used by the `workflow` fan-out, which runs several
@@ -1170,7 +1249,7 @@ impl SubagentSlot {
     /// had free (0..=want); an empty Vec means the caller should degrade to a soft "gate full"
     /// error. Each slot releases on drop, so the whole batch frees when the returned Vec drops.
     pub(crate) fn acquire_up_to(want: usize) -> Vec<Self> {
-        (0..want).map_while(|_| Self::try_acquire()).collect()
+        (0..want).map_while(|_| Self::try_acquire().ok()).collect()
     }
 }
 
@@ -1432,6 +1511,41 @@ mod tests {
     }
 
     #[test]
+    fn writers_denylist_covers_every_destructive_role_tool() {
+        // `dispatch_is_read_only` is a DENYLIST: a destructive tool missing from `WRITERS`
+        // silently classifies its registry read-only — parallel-safe, verify gate off, and
+        // allowed through a no-`--yes` `mcp serve`. This sweep turns that drift into a failure:
+        // every destructive tool in every role registry must be a known workspace WRITER or a
+        // known OUTWARD tool (side effects land outside the workspace — aizen's own stores,
+        // notifications — so two of them cannot race on repository state).
+        const OUTWARD_OK: &[&str] = &[
+            "memory_forget",
+            "memory_save",
+            "memory_update",
+            "skill_refine",
+            "skill_forget",
+            "skill_install",
+            "notify",
+            "telegram_send",
+        ];
+        let root = std::env::current_dir().unwrap();
+        for role in ["planner", "reviewer", "coder", "tester"] {
+            let reg = crate::agent::builtin::role_registry(role, &root);
+            for tool in reg.tools() {
+                if tool.is_destructive() {
+                    let name = tool.name();
+                    assert!(
+                        WRITERS.contains(&name) || OUTWARD_OK.contains(&name),
+                        "destructive tool `{name}` (role {role}) is in neither WRITERS nor \
+                         OUTWARD_OK — classify it, or `dispatch_is_read_only` will call its \
+                         registry read-only"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn subagent_gate_caps_reserves_and_releases() {
         // Process-global counter — serialize against any other test that might touch ACTIVE_SUBAGENTS.
         // (Default cargo --test-threads>1 races two gate tests on the same atomic.)
@@ -1462,7 +1576,7 @@ mod tests {
         let a = SubagentSlot::try_acquire().expect("slot 1");
         let b = SubagentSlot::try_acquire().expect("slot 2");
         let c = SubagentSlot::try_acquire().expect("slot 3");
-        assert!(SubagentSlot::try_acquire().is_none(), "cap of 3 enforced");
+        assert!(SubagentSlot::try_acquire().is_err(), "cap of 3 enforced");
         drop(b);
         let d = SubagentSlot::try_acquire().expect("released slot reusable");
         drop(a);
@@ -1475,7 +1589,7 @@ mod tests {
         let batch = SubagentSlot::acquire_up_to(5);
         assert_eq!(batch.len(), 3, "capped at the default cap of 3");
         assert!(
-            SubagentSlot::try_acquire().is_none(),
+            SubagentSlot::try_acquire().is_err(),
             "gate is full after a maxed reservation"
         );
         drop(batch);

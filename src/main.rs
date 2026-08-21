@@ -224,6 +224,12 @@ async fn main() -> Result<()> {
                 println!("{}", crate::agent::mcp::summary());
                 Ok(())
             }
+            // On a blocking thread on purpose: a `task` dispatch bridges to async with
+            // `block_in_place`, and `spawn_blocking` is the context that bridge is verified against
+            // (same as the tool executor's parallel path).
+            McpCmd::Serve { yes } => {
+                tokio::task::spawn_blocking(move || crate::agent::mcp_serve::run(yes)).await?
+            }
             McpCmd::Untrust => {
                 crate::agent::mcp::untrust_project()?;
                 println!(

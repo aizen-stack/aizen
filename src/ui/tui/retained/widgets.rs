@@ -59,12 +59,24 @@ pub(super) fn draw_overlay(
     let visible = inner.height as usize;
     let max_scroll = lines.len().saturating_sub(visible);
     let clamped = scroll.min(max_scroll);
-    frame.render_widget(
+    // A SELECTABLE overlay is a menu: its rows must stay one screen row each so a mouse click can be
+    // mapped back to a row index (`overlay_menu_hit`). Long rows are clipped at the panel edge, not
+    // wrapped — wrapping would break the row↔line mapping the hit-test depends on. Informational
+    // overlays (no selection) keep wrapping and publish no geometry.
+    let selectable = overlay.selected.is_some();
+    let paragraph = if selectable {
+        Paragraph::new(lines).scroll((clamped.min(u16::MAX as usize) as u16, 0))
+    } else {
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .scroll((clamped.min(u16::MAX as usize) as u16, 0)),
+            .scroll((clamped.min(u16::MAX as usize) as u16, 0))
+    };
+    frame.render_widget(paragraph, inner);
+    set_overlay_menu(selectable.then_some(OverlayMenuGeom {
         inner,
-    );
+        scroll: clamped,
+        rows: overlay.lines.len(),
+    }));
     (clamped, rect)
 }
 

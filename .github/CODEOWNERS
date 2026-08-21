@@ -1,0 +1,23 @@
+# Who must review what. With "Require review from Code Owners" enabled on `main` and `dev`, a pull
+# request cannot merge until the owner listed here has approved it — the catch-all covers the whole
+# tree, and the entries below exist to make ownership of the expensive-to-get-wrong areas explicit
+# rather than merely inherited.
+
+*                            @dawnofcd
+
+# Licensing and governance: changing these changes what every downstream user is allowed to do.
+# `LICENSE` is a byte-exact copy of Apache-2.0 — reformatting it breaks license detection.
+/LICENSE                     @dawnofcd
+/NOTICE                      @dawnofcd
+/CLA.md                      @dawnofcd
+
+# CI, release automation and the branch rules themselves.
+/.github/                    @dawnofcd
+
+# The safety boundary: every model-influenced process is spawned through here.
+/src/sandbox/                @dawnofcd
+
+# Self-update points users at a release channel — a wrong repo slug ships them someone else's binary.
+/src/features/update.rs      @dawnofcd
+/install.ps1                 @dawnofcd
+/install.sh                  @dawnofcd

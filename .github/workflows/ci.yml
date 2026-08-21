@@ -1,12 +1,12 @@
 name: ci
 
-# Build + test on every push to main and every pull request, so contributors get fast feedback and
-# a PR can't merge red. Pure-Rust single static binary — no C toolchain needed. Uses the built-in
-# GITHUB_TOKEN only; runs on forks' PRs too (pull_request, not pull_request_target — no secrets
-# exposed to untrusted code).
+# Build + test on every push to main or dev and on every pull request, so contributors get fast
+# feedback and a PR can't merge red. Pure-Rust single static binary — no C toolchain needed. Uses
+# the built-in GITHUB_TOKEN only; runs on forks' PRs too (pull_request, not pull_request_target —
+# no secrets exposed to untrusted code).
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
 
 permissions:

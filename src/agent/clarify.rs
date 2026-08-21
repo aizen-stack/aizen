@@ -66,6 +66,32 @@ fn build(question: &str, options: &[String]) -> (String, String) {
     (display, ack)
 }
 
+/// Inverse of [`build`]'s display half: split a stored display back into the question and its
+/// numbered options, so the sticky REPL can raise a picker over the input box. Lives HERE, next to
+/// `build`, because the two must agree on the format — the round-trip test below pins them
+/// together. A display that doesn't match the shape `build` emits (a hand-written AwaitingInput
+/// string, a multi-line question) yields no options, which safely degrades to the free-text path.
+pub fn parse_display(display: &str) -> (&str, Vec<String>) {
+    let mut lines = display.lines();
+    let q = lines.next().unwrap_or("").trim();
+    let mut opts = Vec::new();
+    for l in lines {
+        let t = l.trim_start();
+        let numbered = t
+            .split_once(". ")
+            .filter(|(n, rest)| {
+                !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && !rest.trim().is_empty()
+            })
+            .map(|(_, rest)| rest.trim().to_string());
+        match numbered {
+            Some(o) => opts.push(o),
+            // Any non-option line means this is NOT build()'s shape — don't guess.
+            None => return (q, Vec::new()),
+        }
+    }
+    (q, opts)
+}
+
 pub struct Clarify;
 
 impl Tool for Clarify {
@@ -150,6 +176,29 @@ mod tests {
             ack.contains("STOP now"),
             "the model must be told to wait, not re-ask: {ack}"
         );
+    }
+
+    #[test]
+    fn parse_display_roundtrips_build() {
+        let opts = vec!["src/a.rs".to_string(), "option 2. with dots".to_string()];
+        let (display, _) = build("Which file?", &opts);
+        let (q, parsed) = parse_display(&display);
+        assert_eq!(q, "Which file?");
+        assert_eq!(parsed, opts, "options must survive the round-trip verbatim");
+        // No options → none parsed.
+        let (display, _) = build("Proceed?", &[]);
+        assert_eq!(parse_display(&display), ("Proceed?", Vec::new()));
+    }
+
+    #[test]
+    fn parse_display_refuses_foreign_shapes() {
+        // A multi-line question that never came from build() must not be misread as options.
+        let (q, opts) = parse_display("What now?\nsome free-form second line");
+        assert_eq!(q, "What now?");
+        assert!(opts.is_empty(), "non-numbered line → no menu: {opts:?}");
+        // A numbered line followed by a stray line → also refuse (all-or-nothing).
+        let (_, opts) = parse_display("Q?\n  1. yes\ntrailing prose");
+        assert!(opts.is_empty());
     }
 
     #[test]

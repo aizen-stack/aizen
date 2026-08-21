@@ -4,6 +4,43 @@
 use super::*;
 
 #[test]
+fn overlay_menu_hit_maps_rows_scroll_and_dead_zones() {
+    let g = OverlayMenuGeom {
+        inner: Rect {
+            x: 10,
+            y: 5,
+            width: 40,
+            height: 6,
+        },
+        scroll: 2,
+        rows: 7,
+    };
+    // Top visible row is index `scroll`; the mapping is row-relative plus scroll.
+    assert_eq!(menu_hit_index(&g, 10, 5), Some(2), "top row, left edge");
+    assert_eq!(
+        menu_hit_index(&g, 49, 9),
+        Some(6),
+        "last pickable row, right edge"
+    );
+    // Inside the panel but past the pickable rows (the hint line) → dead, not a phantom pick.
+    assert_eq!(menu_hit_index(&g, 20, 10), None, "hint row is not pickable");
+    // Outside the panel on every side → None (the click belongs to the transcript handler).
+    assert_eq!(menu_hit_index(&g, 9, 6), None, "left of the panel");
+    assert_eq!(menu_hit_index(&g, 50, 6), None, "right of the panel");
+    assert_eq!(menu_hit_index(&g, 20, 4), None, "above the panel");
+    assert_eq!(menu_hit_index(&g, 20, 11), None, "below the panel");
+    // The published slot round-trips, and clearing it kills the hit-test (stale-rect guard).
+    set_overlay_menu(Some(g));
+    assert_eq!(overlay_menu_hit(10, 5), Some(2));
+    set_overlay_menu(None);
+    assert_eq!(
+        overlay_menu_hit(10, 5),
+        None,
+        "no overlay → no phantom picks"
+    );
+}
+
+#[test]
 fn sanitizes_terminal_control_sequences() {
     let got = sanitize_text("ok\x1b[2J\x1b[31mred\x1b[0m\nnext\r");
     assert_eq!(got, "okred\nnext");
@@ -17,114 +54,135 @@ fn keep_sgr_drops_cursor_moves_but_keeps_colour() {
     assert_eq!(got, "ok\x1b[31mred\x1b[0m\nnext");
 }
 
-#[test]
-fn short_multiline_draft_stays_inline() {
-    let mut state = AppState::new("intro", "status");
-    state.input.draft = "x\n".chars().collect();
-    state.input.cursor = state.input.draft.len();
-
-    let InputRow {
-        shown,
-        caret_off: caret,
-        ..
-    } = input_line(&state, 40);
-
-    assert_eq!(shown, "x↵", "a short Shift+Enter draft is shown inline");
-    assert_eq!(caret, 2, "caret advances over the visible newline glyph");
-    assert!(
-        !shown.contains("lines pasted"),
-        "short text must not look like a paste chip"
-    );
-}
-
-#[test]
-fn large_multiline_draft_uses_paste_chip() {
-    // Fix: paste lớn vẫn hiện prefix compact `↵N ·` + text quanh cursor, KHÔNG ẩn toàn bộ
-    // draft bằng chip cứng. Người dùng vừa paste vừa gõ thêm phải thấy những gì họ gõ.
-    let mut state = AppState::new("intro", "status");
-    state.input.draft = "a\nb\nc\nd\ne".chars().collect();
-    state.input.cursor = state.input.draft.len();
-
-    let shown = input_line(&state, 40).shown;
-
-    // Phải có prefix báo số dòng.
-    assert!(
-        shown.starts_with("↵5 · "),
-        "paste prefix missing: {shown:?}"
-    );
-    // Text thật (ký tự cuối draft là 'e') vẫn hiện sau prefix.
-    assert!(
-        shown.contains('e'),
-        "draft text must follow the prefix: {shown:?}"
-    );
-}
-
-/// A draft of `text` with the caret at `cursor` and the window last drawn from `win_start`.
-fn input_state(text: &str, cursor: usize, win_start: usize) -> AppState {
+/// A draft of `text` with the caret at `cursor` and the box scrolled to wrapped row `row_scroll`.
+fn input_state(text: &str, cursor: usize, row_scroll: usize) -> AppState {
     let mut state = AppState::new("intro", "status");
     state.input.draft = text.chars().collect();
     state.input.cursor = cursor;
-    state.input_win_start = win_start;
+    state.input_row_scroll = row_scroll;
     state
 }
 
-#[test]
-fn window_stays_put_while_the_caret_moves_inside_it() {
-    // THE BUG: the window used to be re-derived from the caret every frame, which pinned the caret
-    // to the right edge — so ←, or a click, scrolled the whole line under a stationary cursor and
-    // you could never land on the char you aimed at. Same draft, caret walked back one char: the
-    // window must not move.
-    let long: String = ('a'..='z').cycle().take(80).collect();
-    let end = input_line(&input_state(&long, 80, 0), 20);
-    assert!(
-        end.start > 0,
-        "a draft 4x the box must scroll at all: {:?}",
-        end.shown
-    );
-    assert_eq!(
-        end.caret_off, 19,
-        "typing at the end keeps the caret at the right edge"
-    );
-
-    let back = input_line(&input_state(&long, 79, end.start), 20);
-    assert_eq!(
-        back.start, end.start,
-        "moving the caret INSIDE the window must not scroll the text"
-    );
-    assert_eq!(back.caret_off, 18, "the caret moved, not the text");
+/// Full text of a laid-out box, rows joined by `|` — enough to assert where the breaks landed.
+fn joined(layout: &InputLayout) -> String {
+    layout
+        .rows
+        .iter()
+        .map(|r| r.shown.clone())
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 #[test]
-fn window_follows_the_caret_off_either_edge() {
+fn a_long_draft_wraps_downward_instead_of_scrolling_away() {
+    // THE BUG: the box was ONE row, so everything before the window slid off the left and could not
+    // be read back or copied. A draft wider than the box must now occupy more rows, with every char
+    // of it still on screen.
     let long: String = ('a'..='z').cycle().take(80).collect();
-    // Caret left of the window (Home, or a click after scrolling) → re-anchor on the caret.
-    let home = input_line(&input_state(&long, 0, 60), 20);
-    assert_eq!(home.start, 0);
-    assert_eq!(home.caret_off, 0);
-    // Caret past the right edge (End) → scroll so it fits, one cell short of the width for the
-    // caret cell itself.
-    let end = input_line(&input_state(&long, 80, 0), 20);
-    assert_eq!(end.start, 80 - 19);
-    // Window scrolled but the draft now fits → pull back so no dead space shows on the right.
-    let short = input_line(&input_state("abc", 3, 40), 20);
-    assert_eq!(short.start, 0, "a short draft is never scrolled");
-    assert_eq!(short.shown, "abc");
+    // width 24 → text area 24 - 2 (`❯ `) - 1 (caret margin) = 21 cells per row.
+    let layout = input_layout(&input_state(&long, 80, 0), 24, 10);
+    assert!(layout.rows.len() > 1, "80 chars at 21 cells must wrap");
+    assert_eq!(layout.total, 4, "80 chars / 21 cells = 4 rows");
+    let painted: String = layout.rows.iter().map(|r| r.shown.clone()).collect();
+    assert_eq!(painted, long, "every char stays on screen, in order");
+    assert_eq!(layout.scroll, 0, "4 rows fit under a 10-row cap");
 }
 
 #[test]
-fn column_map_covers_every_visible_char_and_one_past_the_end() {
-    let row = input_line(&input_state("abc", 3, 0), 20);
+fn wrapping_breaks_on_spaces_but_still_splits_a_long_word() {
+    // Prose wraps at the last space, so a wrapped prompt reads as prose. Width 11 leaves 8 cells of
+    // text (11 - 2 for `❯ ` - 1 for the caret margin), so each word lands on its own row.
+    let layout = input_layout(&input_state("hello world again", 0, 0), 11, 10);
+    assert_eq!(joined(&layout), "hello |world |again");
+    // A single word wider than the box has no space to break on — it breaks hard rather than
+    // producing a row that never ends.
+    let layout = input_layout(&input_state("aaaaaaaaaaaaaaaa", 0, 0), 14, 10);
+    assert_eq!(joined(&layout), "aaaaaaaaaaa|aaaaa");
+}
+
+#[test]
+fn embedded_newlines_start_a_new_row() {
+    // Shift+Enter and pasted blocks break rows on their own, whatever the width. The newline keeps a
+    // cell of its own (painted blank) so a click at the end of a line lands BEFORE the break.
+    let layout = input_layout(&input_state("a\nb\nc", 5, 0), 40, 10);
+    assert_eq!(layout.rows.len(), 3);
+    assert_eq!(joined(&layout), "a |b |c");
+    assert_eq!(layout.rows[1].start, 2, "row 2 starts after the first \\n");
+    // A draft ending in a newline gets the empty row the caret is sitting on.
+    let layout = input_layout(&input_state("a\n", 2, 0), 40, 10);
+    assert_eq!(layout.rows.len(), 2);
+    assert_eq!(layout.caret, (1, 0), "caret on the fresh empty row");
+}
+
+#[test]
+fn the_caret_lands_on_the_row_that_owns_it() {
+    let layout = input_layout(&input_state("abc\ndef", 5, 0), 40, 10);
+    assert_eq!(layout.caret, (1, 1), "second row, one cell in");
+    // End of the draft: the last row, past its last char.
+    let layout = input_layout(&input_state("abc\ndef", 7, 0), 40, 10);
+    assert_eq!(layout.caret, (1, 3));
+    // On the newline itself: still the END of the first row, not the start of the second.
+    let layout = input_layout(&input_state("abc\ndef", 3, 0), 40, 10);
+    assert_eq!(layout.caret, (0, 3));
+}
+
+#[test]
+fn the_box_scrolls_by_rows_only_once_it_hits_its_ceiling() {
+    let many: String = (0..8).map(|i| format!("line{i}\n")).collect();
+    let end = many.chars().count();
+    // 9 wrapped rows (8 newline-terminated + the trailing empty one), box capped at 3.
+    let layout = input_layout(&input_state(&many, end, 0), 40, 3);
+    assert_eq!(layout.total, 9);
+    assert_eq!(layout.rows.len(), 3, "never taller than the cap");
+    assert_eq!(layout.scroll, 6, "the caret's row is the bottom one");
+    assert_eq!(layout.caret.0, 2);
+    // Caret walked back above the window → the window follows it up.
+    let layout = input_layout(&input_state(&many, 0, 6), 40, 3);
+    assert_eq!(layout.scroll, 0);
+    // Caret INSIDE the window → the window does not move, so reading back a long paste is stable.
+    let layout = input_layout(&input_state(&many, end - 1, 6), 40, 3);
     assert_eq!(
-        row.cols,
+        layout.scroll, 6,
+        "a caret already on screen must not scroll"
+    );
+}
+
+#[test]
+fn max_input_rows_leaves_the_transcript_room() {
+    assert_eq!(max_input_rows(40), 10, "capped by MAX_INPUT_TEXT_ROWS");
+    assert_eq!(max_input_rows(10), 4, "10 - 3 chrome - 3 transcript");
+    assert_eq!(max_input_rows(6), 1, "a tiny terminal still gets one row");
+    assert_eq!(max_input_rows(1), 1, "never zero");
+}
+
+#[test]
+fn an_empty_draft_is_one_placeholder_row() {
+    let layout = input_layout(&AppState::new("intro", "status"), 60, 10);
+    assert_eq!(layout.rows.len(), 1);
+    assert!(layout.placeholder);
+    assert!(layout.rows[0].shown.starts_with("Type a message"));
+    assert_eq!(
+        layout.rows[0].cols,
+        vec![0],
+        "the placeholder maps no chars, so a click on it parks the caret at 0"
+    );
+    assert_eq!(layout.hint, "↵ send · Tab complete");
+}
+
+#[test]
+fn column_map_covers_every_char_on_the_row_and_one_past_the_end() {
+    let layout = input_layout(&input_state("abc", 3, 0), 40, 10);
+    assert_eq!(
+        layout.rows[0].cols,
         vec![0, 1, 2, 3],
         "3 chars + the past-the-end cell"
     );
     // A wide char takes two cells, so the map is not a 1:1 index → column relation. `♥` is width 1;
     // use a CJK char, which every wcwidth table agrees is 2.
-    let wide = input_line(&input_state("a漢b", 3, 0), 20);
-    assert_eq!(wide.cols, vec![0, 1, 3, 4]);
+    let wide = input_layout(&input_state("a漢b", 3, 0), 40, 10);
+    assert_eq!(wide.rows[0].cols, vec![0, 1, 3, 4]);
     // Both cells of the wide char resolve to it; past the end lands after the last char.
-    let cols: Vec<u16> = wide.cols.iter().map(|c| *c as u16).collect();
+    let cols: Vec<u16> = wide.rows[0].cols.iter().map(|c| *c as u16).collect();
     assert_eq!(hit_index(&cols, 0, 1), 1, "left cell of 漢");
     assert_eq!(
         hit_index(&cols, 0, 2),
@@ -138,6 +196,31 @@ fn column_map_covers_every_visible_char_and_one_past_the_end() {
         "far right of the row → end of text"
     );
     assert_eq!(hit_index(&cols, 0, 0), 0, "first cell");
+}
+
+#[test]
+fn a_selection_spanning_wrapped_rows_lights_every_row_it_covers() {
+    // The highlight is one range of DRAFT indices but several rows of cells, so each row clips it to
+    // its own slice. Without that, only the row the drag started on would light up.
+    let layout = input_layout(&input_state("hello world again", 0, 0), 11, 10);
+    // Rows: "hello " (0..6), "world " (6..12), "again" (12..17). Select "lo world ag".
+    let sel = Some((3usize, 14usize));
+    let off = layout.text_off;
+    assert_eq!(
+        sel_cells(sel, layout.rows[0].start, &layout.rows[0].cols, off),
+        Some((off + 3, off + 6)),
+        "from the anchor to the end of the first row"
+    );
+    assert_eq!(
+        sel_cells(sel, layout.rows[1].start, &layout.rows[1].cols, off),
+        Some((off, off + 6)),
+        "the whole middle row"
+    );
+    assert_eq!(
+        sel_cells(sel, layout.rows[2].start, &layout.rows[2].cols, off),
+        Some((off, off + 2)),
+        "up to the cursor on the last row"
+    );
 }
 
 #[test]
@@ -932,4 +1015,61 @@ fn verify_line_reads_green_success() {
     };
     let row = plain(&render_verify_line(&v, 80));
     assert_eq!(row, "✓ cargo check — 0 errors · verify gate passed");
+}
+
+/// Paint one whole frame into an in-memory terminal and read the rows back as plain text. Wraps the
+/// only end-to-end check there is that the footer's height, its rules and its text rows agree — the
+/// layout arithmetic being right is no use if the widgets are handed the wrong rects.
+fn painted_rows(state: &mut AppState, w: u16, h: u16) -> Vec<String> {
+    let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    term.draw(|f| draw(f, state)).unwrap();
+    let buf = term.backend().buffer().clone();
+    (0..h)
+        .map(|y| {
+            let row: String = (0..w).map(|x| buf[(x, y)].symbol()).collect();
+            row.trim_end().to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn a_long_prompt_is_painted_down_the_screen_not_off_the_side() {
+    // THE BUG this box exists to fix: a prompt longer than one row scrolled sideways, so most of
+    // what you typed was hidden and there was no way to read it back — or select it to copy.
+    let mut state = AppState::new("intro", "status");
+    let prompt = "hay giup toi viet mot doan van rat dai de kiem tra xem hop nhap co xuong dong";
+    state.input.draft = prompt.chars().collect();
+    state.input.cursor = state.input.draft.len();
+    let rows = painted_rows(&mut state, 40, 12);
+    assert_eq!(rows[8], "❯ hay giup toi viet mot doan van rat");
+    assert_eq!(rows[9], "  dai de kiem tra xem hop nhap co");
+    assert_eq!(rows[10], "  xuong dong");
+    assert_eq!(rows[7], "─".repeat(40), "top rule sits above the text rows");
+    assert_eq!(rows[11], "─".repeat(40), "bottom rule closes the box");
+    // Nothing is dropped: the painted rows re-join into the prompt exactly.
+    let joined = rows[8..=10]
+        .iter()
+        .map(|r| r.trim_start_matches("❯ ").trim_start())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(joined, prompt);
+}
+
+#[test]
+fn a_draft_taller_than_the_box_stops_growing_and_says_what_is_hidden() {
+    // The box grows, but not without limit: the transcript keeps its floor, and the rule reports the
+    // rows behind it so a capped composer never reads as a truncated one.
+    let mut state = AppState::new("intro", "status");
+    let many: String = (0..14).map(|i| format!("dong so {i}\n")).collect();
+    state.input.draft = many.chars().collect();
+    state.input.cursor = 30;
+    let rows = painted_rows(&mut state, 40, 16);
+    assert_eq!(rows[5], "❯ dong so 0");
+    assert_eq!(rows[14], "  dong so 9", "10 text rows is the ceiling");
+    assert!(
+        rows[15].ends_with("↓5 ──"),
+        "the bottom rule counts the hidden rows: {:?}",
+        rows[15]
+    );
+    assert_eq!(rows[0], "intro", "the transcript keeps its floor");
 }

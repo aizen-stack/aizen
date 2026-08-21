@@ -81,6 +81,15 @@ pub trait Tool: Send + Sync {
     fn recovery_effect(&self, args: &Value) -> bool {
         self.is_destructive() || self.workspace_effect(args) != WorkspaceEffect::None
     }
+    /// The shell command line this call would EXECUTE, when this tool runs commands at all. The
+    /// loop's hard `cmd_guard` floor and the network-escalation notice key on this — it used to be
+    /// a hand-written name match in the executor, which meant a future command-running tool
+    /// silently received no floor. Owning it here makes the guard travel with the capability:
+    /// override in every tool that spawns a model-supplied command; the default `None` means
+    /// "executes nothing".
+    fn command_to_guard(&self, _args: &Value) -> Option<String> {
+        None
+    }
     /// Run the tool. `args` is the parsed (object) arguments. Return the result text; return
     /// an `Err` for a real failure — the loop feeds the error back to the model to recover.
     fn execute(&self, args: &Value) -> Result<String>;

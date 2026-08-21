@@ -199,6 +199,12 @@ pub async fn run_verify_gate(cwd: &Path, timeout_secs: u64) -> Option<VerifyGate
     let custom_timeout = custom_verify_timeout(cwd);
     let mut last_pass: Option<VerifyGateResult> = None;
     for cmd in cmds {
+        // The gate can hold the turn for minutes per command; it must not be the one region Esc
+        // cannot reach. Between commands is the cheap, safe boundary — `run_one_verify` also
+        // races its wait against this token.
+        if crate::core::cancel::current().is_some_and(|c| c.is_cancelled()) {
+            return None; // best-effort by contract; the loop's own cancel check ends the run
+        }
         let secs = match cmd {
             VerifyCommand::Custom(_) => custom_timeout.unwrap_or(timeout_secs),
             _ => timeout_secs,
@@ -251,8 +257,26 @@ async fn run_one_verify(
     let containment = sbx.contain_tokio(&child);
     let dur = Duration::from_secs(timeout_secs.max(1));
     // `wait_with_output` consumes the child, so the tree is killed through the containment handle
-    // rather than a `&mut Child` we no longer have.
-    let outcome = timeout(dur, child.wait_with_output()).await;
+    // rather than a `&mut Child` we no longer have. The wait is ALSO raced against the turn's
+    // cancel token: a verify command can hold the turn for minutes, and this used to be the one
+    // long region Esc could not reach — the user watched a `cargo check` they had already
+    // abandoned run to completion.
+    let cancel = crate::core::cancel::current();
+    let waited = timeout(dur, child.wait_with_output());
+    let outcome = match &cancel {
+        Some(c) => {
+            tokio::select! {
+                o = waited => Some(o),
+                _ = c.cancelled() => None,
+            }
+        }
+        None => Some(waited.await),
+    };
+    let Some(outcome) = outcome else {
+        crate::core::proctree::terminate_tree(&containment);
+        sbx.finish(crate::sandbox::runner::Outcome::Cancelled);
+        return None; // best-effort: the loop's own cancel check ends the run right after
+    };
     if outcome.is_err() {
         crate::core::proctree::terminate_tree(&containment);
     }

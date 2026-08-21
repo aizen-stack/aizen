@@ -7,7 +7,33 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+## [0.6.6] — 2026-08-21
+
 ### Added
+- **The composer wraps a long prompt down instead of hiding it.** The input box was ONE physical
+  row: a prompt wider than it scrolled sideways, so everything left of the window was off screen —
+  unreadable, and (the hit-test being single-row) unselectable, which left Ctrl-C taking ALL of it
+  as the only way to get your own text back. It now grows downward. Width breaks prefer the last
+  space on the row so a wrapped prompt reads as prose, a word wider than the box still breaks hard,
+  and an embedded newline keeps a blank cell of its own so a click at the end of a line parks the
+  caret BEFORE the break rather than at the start of the next. The box stops at 10 rows and never
+  leaves the transcript under 3; past that it scrolls by row — stickily, so a caret already on
+  screen never drags the window — and the framing rules carry the hidden-row count (`↑12` / `↓3`),
+  because a capped box that said nothing would read as a truncated one. The click map is multi-row,
+  so a drag now selects across wrapped rows and the copy comes back with its newlines intact. ↑/↓
+  walk the rows of a multi-line draft before they mean history recall: the first ↑ inside a pasted
+  block used to swap the whole block out for the last message.
+- **`aizen agent --image <PATH>`.** Vision was REPL-only — drag a file onto the window, or Ctrl-O
+  for a screenshot — so a front-end driving the headless entry point could describe a picture but
+  never show one. The flag inlines a PNG/JPEG/GIF/WebP (≤ 8 MB) into the first user message as an
+  `image_url` data part, the same wire shape the REPL's attach paths produce; repeat it for more
+  than one. The files are read **before** the endpoint is resolved, so a mistyped path costs a
+  failed open rather than a billed request, and a path that is not a readable image ends the run
+  instead of being skipped: this is the scripting and CI entry point, and an attachment that
+  silently vanished would yield a confident answer about an image nothing ever sent. Note the
+  deliberate difference from the REPL, where a typed line lifts only real image paths and leaves
+  anything else as prose — right for something a human typed, wrong for a flag. Omit it and the
+  request is byte-identical to one from a core that never had it.
 - **`aizen config set` reaches the twelve keys it could not.** `update_check`, `skill_registry`,
   `max_tokens`, `prompt_cache`, `prompt_tier`, `eager_tools`, `self_review`,
   `max_parallel_subagents`, `workflow_tool`, `embed_model`, `timemachine_keep_safety` and

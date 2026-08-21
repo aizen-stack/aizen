@@ -28,6 +28,9 @@ const MAX_LINE_CHARS: usize = 240;
 /// Hard wall-clock cap so a search over a giant tree can't freeze the agent loop (the parallel walk
 /// checks this per file and quits every thread once it trips).
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cap on `context` — ±10 lines already shows a whole function around most matches; more is a
+/// file read wearing a search costume.
+const MAX_CONTEXT: usize = 10;
 
 /// Decode a file's bytes to searchable text, detecting UTF-16 (P2.2). A UTF-16-encoded source file
 /// (common on Windows — PowerShell `>` redirection, some editors, .NET logs) is `byte,0,byte,0…`,
@@ -94,11 +97,11 @@ impl Tool for SearchFiles {
         "search_files"
     }
     fn description(&self) -> &str {
-        "Search file CONTENT by regular expression. Defaults to the working directory but `path` may \
-         be a ../ or absolute directory elsewhere. By default respects .gitignore and skips hidden + \
-         binary files; set hidden:true to also search hidden files and ignored/build dirs. Returns \
-         `path:line: matched text`. This is the canonical content search — do NOT shell out to \
-         grep/ripgrep, and do NOT use file_glob (that matches file NAMES, not content). Read-only."
+        "Search file CONTENT by regular expression (`path` may be a ../ or absolute dir elsewhere). \
+         Respects .gitignore and skips hidden + binary files unless hidden:true. Returns \
+         `path:line: matched text`; context:N adds ±N surrounding lines (grep -C) so a follow-up \
+         file_read is rarely needed. The canonical content search — do NOT shell out to \
+         grep/ripgrep; file_glob matches NAMES, not content. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -110,7 +113,8 @@ impl Tool for SearchFiles {
                 "glob": {"type": "string", "description": "optional file glob to restrict which files are searched, e.g. *.rs or src/**/*.ts"},
                 "ignore_case": {"type": "boolean", "description": "case-insensitive match (default false)"},
                 "hidden": {"type": "boolean", "description": "also search hidden files and .gitignored paths (default false)"},
-                "max_results": {"type": "integer", "description": "cap on matches returned (default 200)"}
+                "max_results": {"type": "integer", "description": "cap on matches returned (default 200)"},
+                "context": {"type": "integer", "description": "lines of context around each match, grep -C style (default 0, max 10)"}
             },
             "required": ["pattern"]
         })
@@ -128,6 +132,11 @@ impl Tool for SearchFiles {
             .get("max_results")
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_MAX_RESULTS as u64) as usize;
+        let ctx = args
+            .get("context")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .min(MAX_CONTEXT as u64) as usize;
         let re = RegexBuilder::new(pattern)
             .case_insensitive(ignore_case)
             .build()
@@ -165,7 +174,12 @@ impl Tool for SearchFiles {
         // over a huge tree can't freeze the agent loop. Results, the match counter, and the
         // skipped-large-file counter are shared behind a `Mutex`/atomics. Per-file work (read →
         // binary/UTF-16 classify → line-scan) happens on the worker thread.
-        let results: Mutex<Vec<(PathBuf, usize, String)>> = Mutex::new(Vec::new());
+        // Per file: (path, rows), each row = (1-based line, clipped text, is_match). With
+        // context=0 the rows are exactly the match lines (the classic flat shape); with context>0
+        // they are the MERGED ±ctx windows around the matches, so an overlapping pair of matches
+        // never prints a line twice.
+        type FileRows = (PathBuf, Vec<(usize, String, bool)>);
+        let results: Mutex<Vec<FileRows>> = Mutex::new(Vec::new());
         let files_hit = AtomicUsize::new(0);
         let match_count = AtomicUsize::new(0);
         let skipped_large = AtomicUsize::new(0);
@@ -208,35 +222,68 @@ impl Tool for SearchFiles {
                     .strip_prefix(&self.root)
                     .unwrap_or(dent.path())
                     .to_path_buf();
-                let mut this_file = false;
+                // Pass 1: collect this file's match line numbers (1-based) under the global cap.
+                let mut hit_lines: Vec<usize> = Vec::new();
                 for (i, line) in text.lines().enumerate() {
                     if re.is_match(line) {
-                        this_file = true;
-                        let trimmed = line.trim_end();
-                        let shown: String = if trimmed.chars().count() > MAX_LINE_CHARS {
-                            trimmed.chars().take(MAX_LINE_CHARS).collect::<String>() + "…"
-                        } else {
-                            trimmed.to_string()
-                        };
                         let n = match_count.fetch_add(1, Ordering::Relaxed);
                         if n >= max_results {
                             truncated.store(true, Ordering::Relaxed);
                             break;
                         }
-                        results.lock().unwrap().push((rel.clone(), i + 1, shown));
+                        hit_lines.push(i + 1);
                     }
                 }
-                if this_file {
-                    files_hit.fetch_add(1, Ordering::Relaxed);
+                if hit_lines.is_empty() {
+                    return WalkState::Continue;
                 }
+                files_hit.fetch_add(1, Ordering::Relaxed);
+                // Pass 2: materialize rows — the match lines alone, or their merged ±ctx windows.
+                let lines: Vec<&str> = text.lines().collect();
+                let clip = |line: &str| -> String {
+                    let trimmed = line.trim_end();
+                    if trimmed.chars().count() > MAX_LINE_CHARS {
+                        trimmed.chars().take(MAX_LINE_CHARS).collect::<String>() + "…"
+                    } else {
+                        trimmed.to_string()
+                    }
+                };
+                let rows: Vec<(usize, String, bool)> = if ctx == 0 {
+                    hit_lines
+                        .iter()
+                        .map(|&n| (n, clip(lines[n - 1]), true))
+                        .collect()
+                } else {
+                    let mut windows: Vec<(usize, usize)> = Vec::new();
+                    for &n in &hit_lines {
+                        let s = n.saturating_sub(ctx).max(1);
+                        let e = (n + ctx).min(lines.len());
+                        match windows.last_mut() {
+                            // Merge overlapping/adjacent windows so no line prints twice.
+                            Some((_, prev_end)) if s <= *prev_end + 1 => {
+                                *prev_end = (*prev_end).max(e)
+                            }
+                            _ => windows.push((s, e)),
+                        }
+                    }
+                    let hits: std::collections::HashSet<usize> =
+                        hit_lines.iter().copied().collect();
+                    windows
+                        .iter()
+                        .flat_map(|&(s, e)| {
+                            (s..=e).map(|n| (n, clip(lines[n - 1]), hits.contains(&n)))
+                        })
+                        .collect()
+                };
+                results.lock().unwrap().push((rel, rows));
                 WalkState::Continue
             })
         });
 
         let mut results = results.into_inner().unwrap();
         // The parallel walk collects in nondeterministic order; sort so output is stable/readable.
-        results.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        results.truncate(max_results);
+        // (Rows within a file are already in line order — built by one worker in one pass.)
+        results.sort_by(|a, b| a.0.cmp(&b.0));
         let files_hit = files_hit.load(Ordering::Relaxed);
         let skipped_large = skipped_large.load(Ordering::Relaxed);
 
@@ -253,11 +300,28 @@ impl Tool for SearchFiles {
             }
             return Ok(msg);
         }
-        let lines: Vec<String> = results
+        let shown_matches: usize = results
             .iter()
-            .map(|(rel, n, shown)| format!("{}:{}: {}", rel.display(), n, shown))
-            .collect();
-        let mut out = format!("{} match(es) in {files_hit} file(s):", lines.len());
+            .map(|(_, rows)| rows.iter().filter(|r| r.2).count())
+            .sum();
+        // grep's own convention: `path:line:` marks a MATCH row, `path-line-` a context row, `--`
+        // separates non-contiguous groups — a shape every model already knows how to read.
+        let mut lines: Vec<String> = Vec::new();
+        for (rel, rows) in &results {
+            let mut prev: Option<usize> = None;
+            for (n, shown, is_match) in rows {
+                if !lines.is_empty() && ctx > 0 && prev.is_none_or(|p| *n != p + 1) {
+                    lines.push("--".to_string());
+                }
+                if *is_match {
+                    lines.push(format!("{}:{}: {}", rel.display(), n, shown));
+                } else {
+                    lines.push(format!("{}-{}- {}", rel.display(), n, shown));
+                }
+                prev = Some(*n);
+            }
+        }
+        let mut out = format!("{shown_matches} match(es) in {files_hit} file(s):");
         out.push('\n');
         out.push_str(&lines.join("\n"));
         if truncated.load(Ordering::Relaxed) {
@@ -383,6 +447,51 @@ mod tests {
             .execute(&serde_json::json!({"pattern": "secret"}))
             .unwrap();
         assert!(out.contains("cfg.ts"), "utf-16 file searched: {out}");
+    }
+
+    #[test]
+    fn context_lines_wrap_matches_and_merge_overlapping_windows() {
+        let root = tmp("context");
+        // Lines 1..=12; matches at 4 and 6 (windows ±2 overlap → ONE merged group 2..=8) and at 12.
+        let body = (1..=12)
+            .map(|i| {
+                if i == 4 || i == 6 || i == 12 {
+                    format!("needle line {i}")
+                } else {
+                    format!("plain line {i}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(root.join("ctx.txt"), body).unwrap();
+        let t = SearchFiles::new(root);
+        let out = t
+            .execute(&serde_json::json!({"pattern": "needle", "context": 2}))
+            .unwrap();
+        assert!(
+            out.starts_with("3 match(es) in 1 file(s):"),
+            "header counts MATCHES, not rows: {out}"
+        );
+        // Match rows use `path:line:`, context rows `path-line-` (grep -C convention).
+        assert!(out.contains("ctx.txt:4: needle line 4"), "{out}");
+        assert!(out.contains("ctx.txt-3- plain line 3"), "{out}");
+        // Overlapping windows merged: line 5 (between the 4 and 6 matches) appears exactly once.
+        assert_eq!(out.matches("plain line 5").count(), 1, "{out}");
+        // Non-contiguous groups separated by `--`: the 2..=8 block vs the 10..=12 block.
+        assert!(out.contains("--"), "{out}");
+        assert!(
+            !out.contains("plain line 9"),
+            "gap line outside both windows: {out}"
+        );
+        // context:0 (default) keeps the classic flat shape.
+        let flat = t2_flat(&t);
+        assert!(flat.contains("ctx.txt:4: needle line 4"), "{flat}");
+        assert!(!flat.contains("-3-"), "no context rows by default: {flat}");
+    }
+
+    fn t2_flat(t: &SearchFiles) -> String {
+        t.execute(&serde_json::json!({"pattern": "needle"}))
+            .unwrap()
     }
 
     #[test]
