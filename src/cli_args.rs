@@ -1043,6 +1043,12 @@ pub(crate) struct AgentArgs {
     /// `reasoning_effort` is used, exactly as before. This flag never writes the config.
     #[arg(long, value_parser = ["auto", "low", "medium", "high", "xhigh", "max"])]
     pub(crate) effort: Option<String>,
+    /// Attach an image for the model to SEE — PNG/JPEG/GIF/WebP, up to 8 MB each. Repeat the flag
+    /// for more than one. Needs a vision-capable model: the file is inlined into the first user
+    /// message as an `image_url` data part, the same shape the REPL's drag-drop and Ctrl-O
+    /// attach produce. A path that is not a readable image fails the run rather than being dropped.
+    #[arg(long = "image", value_name = "PATH")]
+    pub(crate) image: Vec<String>,
 }
 
 #[derive(Parser, Debug)]

@@ -328,6 +328,15 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
     if args.task.trim().is_empty() {
         anyhow::bail!("empty task (pass the task as the first argument)");
     }
+    // Read before the endpoint is resolved, so a mistyped path costs a failed open rather than a
+    // billed request. Loud rather than skipped: this is the scripting and CI entry point, and an
+    // attachment that quietly vanished would produce a confident answer about an image the model
+    // never saw — the one failure mode a vision flag must not have.
+    let images = args
+        .image
+        .iter()
+        .map(|p| crate::ui::image_input::image_file_to_data_url(p))
+        .collect::<Result<Vec<_>>>()?;
     let (base_url, api_key, model) = resolve_endpoint(args.base_url, args.api_key, args.model)?;
     let http = http_client()?;
 
@@ -419,7 +428,18 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
     // The transcript is built here rather than inside `run_agent` so this path can still hold it
     // afterwards: the loop appends every turn — the final answer included — to the vector it is
     // handed, and `run_agent` is exactly these two opening messages plus that call.
-    let mut history = vec![Message::system(&system), Message::user(args.task.trim())];
+    // One user turn either way. With attachments it serializes as a parts array (text first, then
+    // one image_url part each) instead of a plain string, which is the only difference on the wire.
+    let asked = if images.is_empty() {
+        Message::user(args.task.trim())
+    } else {
+        eprintln!(
+            "{}",
+            style(format!("📎 {} image(s) attached", images.len())).dim()
+        );
+        Message::user_with_images(args.task.trim(), images)
+    };
+    let mut history = vec![Message::system(&system), asked];
     let result = agent::run_agent_loop(chat, &cfg, &registry, &mut history).await;
     // Saved before the error is propagated. A run that ended badly still happened, and the REPL
     // treats persistence as not optional — that promise should not be weaker off a terminal.
