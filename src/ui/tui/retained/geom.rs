@@ -93,22 +93,33 @@ pub(super) fn menu_hit_index(g: &OverlayMenuGeom, col: u16, row: u16) -> Option<
     (idx < g.rows).then_some(idx)
 }
 
-/// Where the input box's typed text landed on screen at the last draw, so the input thread can turn a
-/// mouse column into a caret position in the draft.
+/// Where the composer's typed text landed on screen at the last draw, so the input thread can turn a
+/// mouse position into a caret position in the draft.
 ///
 /// The draft is a `Vec<char>` but the screen is a grid of display CELLS, and the two do not line up:
-/// a CJK char or an emoji is two cells wide, a `\n` is painted as a one-cell `↵`, and only a window of
-/// a long draft is on screen at all. So the mapping is published as the column each visible char was
-/// actually painted at — measured by the code that painted it — rather than recomputed on the input
-/// thread from a width function that might disagree.
+/// a CJK char or an emoji is two cells wide, an embedded newline is painted as a blank cell, and a
+/// long draft is wrapped over several rows of which only a window may be on screen. So the mapping is
+/// published as the row and column each visible char was actually painted at — measured by the code
+/// that painted it — rather than recomputed on the input thread from a width function that might
+/// disagree.
 #[derive(Clone, Debug, Default)]
 pub(super) struct InputGeom {
-    /// Screen rect of the `❯ …` row. `width == 0` means nothing has been painted yet: no mapping.
-    pub(crate) row: Rect,
-    /// Draft index of the first char in the visible window.
+    /// Screen rect of the whole text area — every composer row between the framing rules.
+    /// `width == 0` means nothing has been painted yet: no mapping.
+    pub(crate) area: Rect,
+    /// One entry per painted row, top to bottom. Empty until the first frame is drawn.
+    pub(crate) rows: Vec<InputRowGeom>,
+}
+
+/// One painted composer row's mapping: where it is and which draft chars it shows.
+#[derive(Clone, Debug)]
+pub(super) struct InputRowGeom {
+    /// Absolute screen row.
+    pub(crate) y: u16,
+    /// Draft index of the first char on this row.
     pub(crate) start: usize,
-    /// Absolute start column of each visible char, plus one entry for the cell just past the last —
-    /// where a click beyond the end of the text parks the caret. Length is `visible chars + 1`.
+    /// Absolute start column of each char on the row, plus one entry for the cell just past the last —
+    /// where a click beyond the end of the row's text parks the caret. Length is `chars + 1`.
     pub(crate) cols: Vec<u16>,
 }
 
@@ -117,17 +128,29 @@ pub(super) fn input_geom_slot() -> &'static Mutex<InputGeom> {
     SLOT.get_or_init(|| Mutex::new(InputGeom::default()))
 }
 
-/// Draft index a click at column `col` points at, ignoring the row.
+/// Draft index a DRAG at (`col`, `row`) points at, with the row clamped into the box.
 ///
-/// Row-blind on purpose: it backs the DRAG half of a selection, where the pointer routinely leaves the
-/// one-row input box while the user is still selecting inside it. `input_hit` is the row-checked
-/// variant that decides whether a click belongs to the box in the first place.
-pub(crate) fn input_hit_col(col: u16) -> Option<usize> {
+/// Clamped rather than row-checked on purpose: the pointer routinely leaves the box while the user is
+/// still selecting inside it, and a drag that stopped extending the moment it strayed off the last row
+/// would be unusable. Above the box the selection collapses to the start of the first visible row,
+/// below it to the end of the last — which is what dragging past the end of the text means everywhere
+/// else. [`input_hit`] is the row-checked variant that decides whether a CLICK belongs to the box in
+/// the first place.
+pub(crate) fn input_hit_drag(col: u16, row: u16) -> Option<usize> {
     let g = input_geom_slot().lock().unwrap_or_else(|e| e.into_inner());
-    if g.row.width == 0 || g.cols.is_empty() {
+    if g.area.width == 0 {
         return None;
     }
-    Some(hit_index(&g.cols, g.start, col))
+    let first = g.rows.first()?;
+    let last = g.rows.last()?;
+    if row < first.y {
+        return Some(first.start);
+    }
+    if row > last.y {
+        return Some(last.start + last.cols.len().saturating_sub(1));
+    }
+    let r = g.rows.iter().find(|r| r.y == row).unwrap_or(last);
+    Some(hit_index(&r.cols, r.start, col))
 }
 
 /// Which draft char the cell at absolute column `col` belongs to, given a published column map. Pure so
@@ -137,7 +160,7 @@ pub(crate) fn input_hit_col(col: u16) -> Option<usize> {
 /// `cols[i + 1]` is where char `i` ends, so the first char whose end is past the click owns the cell the
 /// click landed on, and the caret goes ON that cell: exactly where the block cursor is then drawn. Both
 /// cells of a double-width char therefore resolve to that char, a click left of the text resolves to the
-/// start of the window, and anything past the end resolves to just after the last visible char.
+/// start of the row, and anything past the end resolves to just after the row's last char.
 pub(super) fn hit_index(cols: &[u16], start: usize, col: u16) -> usize {
     let visible = cols.len().saturating_sub(1);
     for i in 0..visible {
@@ -148,16 +171,15 @@ pub(super) fn hit_index(cols: &[u16], start: usize, col: u16) -> usize {
     start + visible
 }
 
-/// Draft index a click at (`col`, `row`) points at, or `None` when the click is not on the input row.
+/// Draft index a click at (`col`, `row`) points at, or `None` when the click is not on a composer row.
 pub(crate) fn input_hit(col: u16, row: u16) -> Option<usize> {
-    let on_row = {
-        let g = input_geom_slot().lock().unwrap_or_else(|e| e.into_inner());
-        g.row.width > 0
-            && row == g.row.y
-            && col >= g.row.x
-            && col < g.row.x.saturating_add(g.row.width)
-    };
-    on_row.then(|| input_hit_col(col)).flatten()
+    let g = input_geom_slot().lock().unwrap_or_else(|e| e.into_inner());
+    let in_x = g.area.width > 0 && col >= g.area.x && col < g.area.x.saturating_add(g.area.width);
+    if !in_x {
+        return None;
+    }
+    let r = g.rows.iter().find(|r| r.y == row)?;
+    Some(hit_index(&r.cols, r.start, col))
 }
 
 /// Where `draw_footer` last asked ratatui to park the input caret (`frame.set_cursor_position`).
