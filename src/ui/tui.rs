@@ -756,6 +756,51 @@ fn draft_selection() -> Option<(usize, usize)> {
     normalized_draft_sel(r.draft_sel, r.draft.len())
 }
 
+/// Move the draft caret one LOGICAL line up (`dir < 0`) or down, keeping its column. `false` when the
+/// draft has no line that way — the caller then falls through to history recall, which is what ↑/↓
+/// still mean on a one-line draft.
+///
+/// The composer paints a multi-line draft over several rows now, so ↑/↓ walking those rows is what
+/// the box looks like it should do. Without this the first ↑ inside a pasted block swaps the whole
+/// block out for the last message, which reads as losing it.
+fn move_draft_caret_line(dir: i32) -> bool {
+    let mut r = render().lock().unwrap();
+    if !r.draft.contains(&'\n') {
+        return false;
+    }
+    let cursor = r.cursor.min(r.draft.len());
+    let line_start = r.draft[..cursor]
+        .iter()
+        .rposition(|&c| c == '\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let col = cursor - line_start;
+    if dir < 0 {
+        if line_start == 0 {
+            return false; // already on the first line
+        }
+        let prev_start = r.draft[..line_start - 1]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        // The column is clamped to the shorter line, as every editor does.
+        let prev_len = line_start - 1 - prev_start;
+        r.cursor = prev_start + col.min(prev_len);
+    } else {
+        let Some(rel) = r.draft[cursor..].iter().position(|&c| c == '\n') else {
+            return false; // already on the last line
+        };
+        let next_start = cursor + rel + 1;
+        let next_len = r.draft[next_start..]
+            .iter()
+            .position(|&c| c == '\n')
+            .unwrap_or(r.draft.len() - next_start);
+        r.cursor = next_start + col.min(next_len);
+    }
+    true
+}
+
 /// Drop the highlight without touching the text, repainting only if there was one to drop.
 fn clear_draft_selection() {
     let had = {
@@ -2127,9 +2172,9 @@ fn handle_retained_mouse(
 /// Mouse inside the input box: click to park the caret, drag to select, release to copy. Returns
 /// whether the event belonged to the box (the caller then leaves the transcript alone).
 ///
-/// This is the mouse half of editing the draft. Without it the caret could only be walked with ←/→,
-/// which on a draft longer than the box also dragged the whole line under a stationary cursor, and the
-/// only way to copy what you had typed was Ctrl-C taking ALL of it.
+/// This is the mouse half of editing the draft. Without it the caret could only be walked with ←/→
+/// through a draft that may now be wrapped over several rows, and the only way to copy what you had
+/// typed was Ctrl-C taking ALL of it.
 ///
 /// The box's highlight and the transcript's are deliberately exclusive — Ctrl-C has one meaning at a
 /// time, so starting one drops the other rather than leaving two highlights on screen competing to be
@@ -2163,10 +2208,10 @@ fn handle_input_box_mouse(
             let Some(anchor) = *dragging_draft else {
                 return false;
             };
-            // Column only, row ignored: the pointer leaves a one-row box constantly while selecting
-            // inside it, and a drag that stopped extending the moment it strayed a row would be
-            // unusable. Off either end of the text it clamps to the nearest edge.
-            if let Some(idx) = retained::input_hit_col(col) {
+            // The row is CLAMPED into the box rather than required to be on it: the pointer leaves
+            // the box constantly while selecting inside it, and a drag that stopped extending the
+            // moment it strayed would be unusable. Off either end it clamps to the nearest edge.
+            if let Some(idx) = retained::input_hit_drag(col, row) {
                 set_draft_caret(idx, Some((anchor, idx)));
             }
             true
@@ -3274,6 +3319,12 @@ fn input_loop(
                     repaint();
                     continue;
                 }
+                // A multi-line draft is painted over several rows, so ↑ walks those rows first and
+                // only means history once the caret is on the top one.
+                if move_draft_caret_line(-1) {
+                    repaint();
+                    continue;
+                }
                 // ↑ at the prompt recalls the previous message (readline-style), in BOTH backends.
                 // Transcript scrolling lives on PageUp/PageDown, so arrows are never stolen from recall.
                 if history.is_empty() {
@@ -3311,6 +3362,11 @@ fn input_loop(
                         r.palette_sel = r.palette_sel.saturating_sub(1);
                     }
                     drop(r);
+                    repaint();
+                    continue;
+                }
+                // Symmetric to ArrowUp: inside a multi-line draft ↓ walks down its rows first.
+                if move_draft_caret_line(1) {
                     repaint();
                     continue;
                 }

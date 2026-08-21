@@ -129,6 +129,40 @@ fn agent_effort_takes_the_ladder_and_nothing_else() {
     assert!(Cli::try_parse_from(["aizen", "agent", "--effort", "mediumish", "việc"]).is_err());
 }
 
+/// `--image` takes a value, repeats, and must never be mistaken for the task.
+///
+/// The task is positional, so every flag on this subcommand is one bad definition away from
+/// swallowing it. A front-end sends `--image <path> <task>`, and if the flag were ever made
+/// optional-valued clap would read the task as the path: the run would then fail with "not a
+/// PNG/JPEG/GIF/WebP image" naming the user's own sentence, which is a mystifying way to say
+/// nothing was attached. Repeatable because one screenshot is the common case and two is not rare.
+#[test]
+fn agent_image_is_repeatable_and_never_eats_the_task() {
+    let cli = Cli::try_parse_from([
+        "aizen",
+        "agent",
+        "--image",
+        "a.png",
+        "--image",
+        "b.jpg",
+        "cái nút này sai chỗ nào",
+    ])
+    .expect("parse");
+    let Some(Commands::Agent(args)) = cli.command else {
+        panic!("expected the agent subcommand");
+    };
+    assert_eq!(args.image, vec!["a.png".to_string(), "b.jpg".to_string()]);
+    assert_eq!(args.task, "cái nút này sai chỗ nào");
+
+    // Omitted is the old shape exactly: no parts array, no image field, a request byte-identical
+    // to one from a core that never had this flag.
+    let plain = Cli::try_parse_from(["aizen", "agent", "chạy test"]).expect("parse");
+    assert!(matches!(plain.command, Some(Commands::Agent(a)) if a.image.is_empty()));
+
+    // A value is required, so the flag can never stand alone and leave the task unaccounted for.
+    assert!(Cli::try_parse_from(["aizen", "agent", "--image"]).is_err());
+}
+
 /// `memory list current` and `memory list --scope current` must mean the same thing.
 ///
 /// The REPL has always taken the scope positionally (`/memory list current`), so that is the form

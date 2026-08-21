@@ -53,7 +53,15 @@ pub(super) use self::widgets::*;
 #[cfg(test)]
 mod tests;
 
+/// Smallest footer that can be painted at all: HUD + rule + one text row + rule. Below this the
+/// composer is skipped entirely rather than drawn half-formed.
 const FOOTER_ROWS: u16 = 4;
+/// The footer's fixed furniture — the HUD strip and the two framing rules. Everything on top of
+/// this is composer text, which is why the footer's height is decided per frame rather than fixed.
+const FOOTER_CHROME_ROWS: u16 = 3;
+/// Ceiling on how tall the composer may grow. A long prompt wraps DOWN instead of scrolling
+/// sideways out of sight, but past this many rows a pasted wall of text would become the screen.
+const MAX_INPUT_TEXT_ROWS: u16 = 10;
 const CACHE_LIMIT: usize = 512;
 const BLOCK_LIMIT: usize = 2048;
 
@@ -317,14 +325,14 @@ struct AppState {
     /// How many chars of `work_caption` are revealed so far — advanced one per animation tick for the
     /// typewriter effect, clamped to the caption length.
     work_reveal: usize,
-    /// Draft index of the first char visible in the input box at the last draw.
+    /// First WRAPPED ROW of the draft visible in the composer at the last draw.
     ///
-    /// The window is STICKY: it only slides when the caret would otherwise fall off an edge. Re-deriving
-    /// it from the caret every frame (what this used to do) pinned the caret to the right edge, so on a
-    /// draft longer than the box every ←/→ scrolled the whole line under a stationary cursor instead of
-    /// moving the cursor through stationary text — and a click could never land where it was aimed,
-    /// because the text jumped as soon as the caret moved.
-    input_win_start: usize,
+    /// The box grows downward with the draft, so this is only non-zero once the draft is taller than
+    /// the box will go (`MAX_INPUT_TEXT_ROWS`, or what the terminal leaves after the transcript's
+    /// floor). The window is STICKY: it slides only when the caret would otherwise fall off an edge.
+    /// Re-deriving it from the caret every frame would pin the caret to the bottom row, so scrolling
+    /// back up through a long paste would snap away on the next repaint.
+    input_row_scroll: usize,
 }
 
 /// Absolute character selection over the flat list of wrapped transcript rows.
@@ -371,7 +379,7 @@ impl AppState {
             work_verb: String::new(),
             work_caption: String::new(),
             work_reveal: 0,
-            input_win_start: 0,
+            input_row_scroll: 0,
         }
     }
 
